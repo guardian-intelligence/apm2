@@ -186,19 +186,19 @@ fn test_read_session() {
         .unwrap();
 
     // Read session-a
-    let session_a_events = ledger
+    let events_for_a = ledger
         .read_session("session-a", 100)
         .expect("failed to read");
-    assert_eq!(session_a_events.len(), 3);
-    assert_eq!(session_a_events[0].payload, b"a1");
-    assert_eq!(session_a_events[1].payload, b"a2");
-    assert_eq!(session_a_events[2].payload, b"a3");
+    assert_eq!(events_for_a.len(), 3);
+    assert_eq!(events_for_a[0].payload, b"a1");
+    assert_eq!(events_for_a[1].payload, b"a2");
+    assert_eq!(events_for_a[2].payload, b"a3");
 
     // Read session-b
-    let session_b_events = ledger
+    let events_for_b = ledger
         .read_session("session-b", 100)
         .expect("failed to read");
-    assert_eq!(session_b_events.len(), 2);
+    assert_eq!(events_for_b.len(), 2);
 }
 
 #[test]
@@ -311,7 +311,7 @@ fn test_multiple_artifacts_per_event() {
             seq_id,
             vec![i; 32],
             format!("type/{i}"),
-            (i as u64 + 1) * 100,
+            (u64::from(i) + 1) * 100,
             format!("/cas/{i}"),
         );
         ledger.add_artifact_ref(&artifact).unwrap();
