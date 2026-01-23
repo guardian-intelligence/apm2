@@ -1,5 +1,5 @@
 {
-  "name": "APM2 Auto Approve",
+  "name": "APM2 Bot",
   "url": "https://github.com/Anveio/apm2",
   "hook_attributes": {
     "active": false

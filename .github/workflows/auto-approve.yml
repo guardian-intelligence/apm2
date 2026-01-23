@@ -54,5 +54,5 @@ jobs:
               repo: context.repo.repo,
               pull_number: ${{ steps.pr.outputs.result }},
               event: 'APPROVE',
-              body: '✅ Auto-approved by APM2 Bot: CI checks passed'
+              body: '✅ Approved by APM2 Bot: all CI checks passed'
             });
