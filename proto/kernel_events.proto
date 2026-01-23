@@ -15,7 +15,10 @@ import "google/protobuf/timestamp.proto";
 message KernelEvent {
   // Monotonic sequence number within this ledger
   uint64 sequence = 1;
-  // Hash of the previous event (empty for genesis)
+  // Hash of the previous event.
+  // For genesis events: use 32 zero bytes (canonical representation).
+  // Note: The ledger may store NULL for genesis as a storage optimization,
+  // but it must be normalized to 32 zero bytes at API boundaries.
   bytes previous_hash = 2;
   // Timestamp when event was created
   google.protobuf.Timestamp timestamp = 3;

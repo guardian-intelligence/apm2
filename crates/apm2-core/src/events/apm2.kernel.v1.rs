@@ -6,7 +6,10 @@ pub struct KernelEvent {
     /// Monotonic sequence number within this ledger
     #[prost(uint64, tag = "1")]
     pub sequence: u64,
-    /// Hash of the previous event (empty for genesis)
+    /// Hash of the previous event.
+    /// For genesis events: use 32 zero bytes (canonical representation).
+    /// Note: The ledger may store NULL for genesis as a storage optimization,
+    /// but it must be normalized to 32 zero bytes at API boundaries.
     #[prost(bytes = "vec", tag = "2")]
     pub previous_hash: ::prost::alloc::vec::Vec<u8>,
     /// Timestamp when event was created

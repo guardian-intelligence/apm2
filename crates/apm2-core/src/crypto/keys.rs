@@ -5,9 +5,9 @@
 #![allow(clippy::missing_panics_doc)]
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -47,6 +47,15 @@ pub enum KeyManagerError {
     InsecurePermissions {
         /// The path with insecure permissions.
         path: String,
+    },
+
+    /// Invalid actor ID (contains unsafe characters).
+    #[error(
+        "invalid actor ID: {actor_id} (must be alphanumeric with hyphens/underscores, 1-128 chars)"
+    )]
+    InvalidActorId {
+        /// The invalid actor ID.
+        actor_id: String,
     },
 }
 
@@ -103,6 +112,42 @@ enum KeyStorage {
     File { keys_dir: PathBuf },
 }
 
+/// Maximum length for actor IDs.
+const MAX_ACTOR_ID_LEN: usize = 128;
+
+/// Validates an actor ID to prevent path traversal and other attacks.
+///
+/// Valid actor IDs:
+/// - Are 1-128 characters long
+/// - Contain only alphanumeric characters, hyphens, and underscores
+/// - Do not start with a hyphen
+fn validate_actor_id(actor_id: &str) -> Result<(), KeyManagerError> {
+    if actor_id.is_empty() || actor_id.len() > MAX_ACTOR_ID_LEN {
+        return Err(KeyManagerError::InvalidActorId {
+            actor_id: actor_id.to_string(),
+        });
+    }
+
+    // Must not start with a hyphen (could be confused with command flags)
+    if actor_id.starts_with('-') {
+        return Err(KeyManagerError::InvalidActorId {
+            actor_id: actor_id.to_string(),
+        });
+    }
+
+    // Only allow alphanumeric, hyphens, and underscores
+    if !actor_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(KeyManagerError::InvalidActorId {
+            actor_id: actor_id.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 impl KeyManager {
     /// Creates an in-memory key manager for testing.
     ///
@@ -125,11 +170,12 @@ impl KeyManager {
     pub fn new(keys_dir: impl AsRef<Path>) -> Result<Self, KeyManagerError> {
         let keys_dir = keys_dir.as_ref().to_path_buf();
 
-        // Create directory if it doesn't exist
+        // Create directory if it doesn't exist, with secure permissions set atomically
         if !keys_dir.exists() {
-            fs::create_dir_all(&keys_dir)?;
-            // Set directory permissions to 0700
-            fs::set_permissions(&keys_dir, fs::Permissions::from_mode(0o700))?;
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&keys_dir)?;
         }
 
         // Verify directory permissions
@@ -150,9 +196,11 @@ impl KeyManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if a key already exists for the actor or
-    /// if the key cannot be stored.
+    /// Returns an error if a key already exists for the actor,
+    /// if the actor ID is invalid, or if the key cannot be stored.
     pub fn generate_keypair(&self, actor_id: &str) -> Result<SigningKey, KeyManagerError> {
+        validate_actor_id(actor_id)?;
+
         // Check if key already exists
         if self.get_keypair(actor_id).is_ok() {
             return Err(KeyManagerError::KeyAlreadyExists {
@@ -174,17 +222,26 @@ impl KeyManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if the key cannot be stored.
+    /// Returns an error if the actor ID is invalid, a key already exists,
+    /// or the key cannot be stored.
     pub fn store_keypair(
         &self,
         actor_id: &str,
         signing_key: &SigningKey,
     ) -> Result<(), KeyManagerError> {
+        validate_actor_id(actor_id)?;
+
         let keypair = StoredKeypair::new(actor_id, signing_key.clone());
 
         match &self.storage {
             KeyStorage::Memory(map) => {
                 let mut map = map.write().unwrap();
+                // Consistent with file storage: don't allow overwrites
+                if map.contains_key(actor_id) {
+                    return Err(KeyManagerError::KeyAlreadyExists {
+                        actor_id: actor_id.to_string(),
+                    });
+                }
                 map.insert(actor_id.to_string(), keypair);
             },
             KeyStorage::File { keys_dir } => {
@@ -223,8 +280,11 @@ impl KeyManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if the key is not found or cannot be read.
+    /// Returns an error if the actor ID is invalid, key is not found,
+    /// or the key cannot be read.
     pub fn get_keypair(&self, actor_id: &str) -> Result<StoredKeypair, KeyManagerError> {
+        validate_actor_id(actor_id)?;
+
         match &self.storage {
             KeyStorage::Memory(map) => {
                 let map = map.read().unwrap();
@@ -268,8 +328,11 @@ impl KeyManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if the key is not found or cannot be deleted.
+    /// Returns an error if the actor ID is invalid, key is not found,
+    /// or the key cannot be deleted.
     pub fn delete_keypair(&self, actor_id: &str) -> Result<(), KeyManagerError> {
+        validate_actor_id(actor_id)?;
+
         match &self.storage {
             KeyStorage::Memory(map) => {
                 let mut map = map.write().unwrap();
@@ -448,5 +511,125 @@ mod unit_tests {
 
         manager.delete_keypair("actor-1").unwrap();
         assert!(!key_path.exists());
+    }
+
+    // ========== Actor ID Validation Tests ==========
+
+    #[test]
+    fn test_valid_actor_ids() {
+        let manager = KeyManager::in_memory();
+
+        // Valid IDs should work
+        assert!(manager.generate_keypair("actor1").is_ok());
+        assert!(manager.generate_keypair("actor-2").is_ok());
+        assert!(manager.generate_keypair("actor_3").is_ok());
+        assert!(manager.generate_keypair("Actor_4").is_ok());
+        assert!(manager.generate_keypair("ACTOR-5").is_ok());
+        assert!(manager.generate_keypair("a").is_ok());
+        assert!(manager.generate_keypair("123").is_ok());
+    }
+
+    #[test]
+    fn test_path_traversal_rejected() {
+        let manager = KeyManager::in_memory();
+
+        // Path traversal attempts should be rejected
+        assert!(matches!(
+            manager.generate_keypair("../escape"),
+            Err(KeyManagerError::InvalidActorId { .. })
+        ));
+        assert!(matches!(
+            manager.generate_keypair(".."),
+            Err(KeyManagerError::InvalidActorId { .. })
+        ));
+        assert!(matches!(
+            manager.generate_keypair("foo/bar"),
+            Err(KeyManagerError::InvalidActorId { .. })
+        ));
+        assert!(matches!(
+            manager.generate_keypair("foo\\bar"),
+            Err(KeyManagerError::InvalidActorId { .. })
+        ));
+    }
+
+    #[test]
+    fn test_invalid_actor_id_characters() {
+        let manager = KeyManager::in_memory();
+
+        // Special characters should be rejected
+        assert!(matches!(
+            manager.generate_keypair("actor.id"),
+            Err(KeyManagerError::InvalidActorId { .. })
+        ));
+        assert!(matches!(
+            manager.generate_keypair("actor id"),
+            Err(KeyManagerError::InvalidActorId { .. })
+        ));
+        assert!(matches!(
+            manager.generate_keypair("actor@id"),
+            Err(KeyManagerError::InvalidActorId { .. })
+        ));
+        assert!(matches!(
+            manager.generate_keypair("actor:id"),
+            Err(KeyManagerError::InvalidActorId { .. })
+        ));
+    }
+
+    #[test]
+    fn test_empty_actor_id_rejected() {
+        let manager = KeyManager::in_memory();
+
+        assert!(matches!(
+            manager.generate_keypair(""),
+            Err(KeyManagerError::InvalidActorId { .. })
+        ));
+    }
+
+    #[test]
+    fn test_hyphen_start_rejected() {
+        let manager = KeyManager::in_memory();
+
+        // Leading hyphen rejected (could be confused with command flags)
+        assert!(matches!(
+            manager.generate_keypair("-actor"),
+            Err(KeyManagerError::InvalidActorId { .. })
+        ));
+    }
+
+    #[test]
+    fn test_too_long_actor_id_rejected() {
+        let manager = KeyManager::in_memory();
+
+        // ID longer than 128 characters should be rejected
+        let long_id = "a".repeat(129);
+        assert!(matches!(
+            manager.generate_keypair(&long_id),
+            Err(KeyManagerError::InvalidActorId { .. })
+        ));
+
+        // Exactly 128 should work
+        let max_id = "a".repeat(128);
+        assert!(manager.generate_keypair(&max_id).is_ok());
+    }
+
+    #[test]
+    fn test_in_memory_store_overwrite_rejected() {
+        let manager = KeyManager::in_memory();
+
+        // First store should work
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        manager.store_keypair("actor-1", &signing_key).unwrap();
+
+        // Second store with same ID should fail
+        let signing_key2 = SigningKey::generate(&mut rand::thread_rng());
+        let result = manager.store_keypair("actor-1", &signing_key2);
+        assert!(matches!(
+            result,
+            Err(KeyManagerError::KeyAlreadyExists { .. })
+        ));
+
+        // Original key should be unchanged
+        let stored = manager.get_keypair("actor-1").unwrap();
+        assert_eq!(stored.signing_key().to_bytes(), signing_key.to_bytes());
     }
 }

@@ -52,7 +52,9 @@ mod sign;
 #[cfg(test)]
 mod tests;
 
-pub use hash::{EventHasher, HASH_SIZE, Hash, HashChainError};
+pub use hash::{
+    EventHasher, HASH_SIZE, Hash, HashChainError, is_genesis_prev_hash, normalize_prev_hash,
+};
 pub use keys::{KeyManager, KeyManagerError, StoredKeypair};
 pub use sign::{
     SIGNATURE_SIZE, Signature, Signer, SignerError, VerifyingKey, parse_signature,

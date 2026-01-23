@@ -1,4 +1,18 @@
 //! Blake3 hashing and hash-chain primitives.
+//!
+//! # Genesis Previous Hash Convention
+//!
+//! The genesis event (first event in a ledger) has no predecessor. The
+//! canonical representation for its `prev_hash` is 32 zero bytes, defined as
+//! [`EventHasher::GENESIS_PREV_HASH`].
+//!
+//! Different storage layers may use optimized representations:
+//! - **Ledger `SQLite`**: May store `NULL` for genesis `prev_hash`
+//! - **Protocol Buffers**: Empty bytes (`vec![]`) in transit
+//!
+//! These must be normalized to 32 zero bytes at API boundaries for hash chain
+//! verification. Use [`is_genesis_prev_hash`] to check if a value represents
+//! the genesis previous hash in any of these forms.
 
 use thiserror::Error;
 
@@ -36,8 +50,41 @@ pub enum HashChainError {
 /// manages hash-chain linking between sequential events.
 pub struct EventHasher;
 
+/// Checks if a byte slice represents the genesis previous hash.
+///
+/// Returns `true` for any of these representations:
+/// - Empty slice (Protocol Buffers default)
+/// - 32 zero bytes (canonical representation)
+///
+/// This allows code to handle different storage formats uniformly.
+#[must_use]
+pub fn is_genesis_prev_hash(bytes: &[u8]) -> bool {
+    bytes.is_empty() || bytes == [0u8; HASH_SIZE]
+}
+
+/// Normalizes a previous hash to the canonical representation.
+///
+/// Converts empty slices to 32 zero bytes. Returns `None` if the input
+/// is neither empty nor exactly 32 bytes.
+#[must_use]
+pub fn normalize_prev_hash(bytes: &[u8]) -> Option<Hash> {
+    if bytes.is_empty() {
+        Some([0u8; HASH_SIZE])
+    } else if bytes.len() == HASH_SIZE {
+        let mut hash = [0u8; HASH_SIZE];
+        hash.copy_from_slice(bytes);
+        Some(hash)
+    } else {
+        None
+    }
+}
+
 impl EventHasher {
     /// The zero hash used as the previous hash for the genesis event.
+    ///
+    /// This is the canonical representation. Other layers may use optimized
+    /// forms (NULL in SQL, empty bytes in protobuf) that must be normalized
+    /// to this value at API boundaries.
     pub const GENESIS_PREV_HASH: Hash = [0u8; HASH_SIZE];
 
     /// Hashes event content with chain linking.
@@ -231,5 +278,38 @@ mod unit_tests {
 
         let result = EventHasher::verify_chain_link(&hash1, &hash2);
         assert!(matches!(result, Err(HashChainError::ChainBroken { .. })));
+    }
+
+    // ========== Genesis Hash Helper Tests ==========
+
+    #[test]
+    fn test_is_genesis_prev_hash() {
+        // Empty bytes (protobuf default)
+        assert!(is_genesis_prev_hash(&[]));
+
+        // 32 zero bytes (canonical)
+        assert!(is_genesis_prev_hash(&[0u8; HASH_SIZE]));
+
+        // Non-zero hash should not be genesis
+        assert!(!is_genesis_prev_hash(&[1u8; HASH_SIZE]));
+
+        // Wrong size should not be genesis
+        assert!(!is_genesis_prev_hash(&[0u8; 16]));
+    }
+
+    #[test]
+    fn test_normalize_prev_hash() {
+        // Empty normalizes to 32 zeros
+        let normalized = normalize_prev_hash(&[]).unwrap();
+        assert_eq!(normalized, [0u8; HASH_SIZE]);
+
+        // Already 32 bytes returns as-is
+        let data = [42u8; HASH_SIZE];
+        let normalized = normalize_prev_hash(&data).unwrap();
+        assert_eq!(normalized, data);
+
+        // Wrong size returns None
+        assert!(normalize_prev_hash(&[0u8; 16]).is_none());
+        assert!(normalize_prev_hash(&[0u8; 64]).is_none());
     }
 }
