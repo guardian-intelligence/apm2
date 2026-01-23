@@ -69,6 +69,11 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # Database
 rusqlite = { version = "0.31", features = ["bundled"] }
 
+# Protocol Buffers
+prost = "0.13"
+prost-types = "0.13"
+prost-build = "0.13"
+
 # Internal crates
 apm2-core = { version = "0.1.0", path = "crates/apm2-core" }
 

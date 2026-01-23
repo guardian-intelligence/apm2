@@ -35,6 +35,7 @@
 
 pub mod config;
 pub mod credentials;
+pub mod events;
 pub mod health;
 pub mod ipc;
 pub mod ledger;
