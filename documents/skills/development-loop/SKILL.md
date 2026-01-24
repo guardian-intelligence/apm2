@@ -84,7 +84,7 @@ When all tickets are done (no more processable tickets in step 2), report comple
 | `cargo xtask start-ticket {RFC_ID}` | Setup dev environment for next unblocked ticket |
 | `cargo xtask start-ticket {RFC_ID} -p` | Output only worktree path (for `cd "$(...)"`) |
 | `cargo xtask commit "<msg>"` | Verify, sync with main, and commit |
-| `cargo xtask push` | Push, create/update PR, run AI reviews, enable auto-merge, set status to IN_REVIEW |
+| `cargo xtask push` | Push, create/update PR, run AI reviews, enable auto-merge |
 | `cargo xtask push --force-review` | Force re-run reviews even if already completed |
 | `cargo xtask check` | Check CI/review status and get next action |
 | `cargo xtask check --watch` | Continuously poll status every 10s |
