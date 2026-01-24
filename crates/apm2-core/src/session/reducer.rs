@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
-use super::entropy::EntropyBudgetConfig;
 use super::error::SessionError;
 use super::state::{ExitClassification, SessionState};
 use crate::events::{PolicyEvent, SessionEvent, policy_event, session_event};
@@ -239,6 +238,11 @@ impl SessionReducer {
     }
 
     /// Handles a policy violation event by incrementing the violation counter.
+    ///
+    /// Note: This only increments the count. Entropy consumption is tracked
+    /// via `SessionProgress` events which contain the canonical
+    /// `entropy_consumed` value from the actual tracker (which uses the
+    /// session's configured weights).
     fn handle_policy_violation(
         &mut self,
         event: &crate::events::PolicyViolation,
@@ -254,14 +258,12 @@ impl SessionReducer {
         // Can only record violations for Running sessions
         match state {
             SessionState::Running {
-                violation_count,
-                entropy_consumed,
-                ..
+                violation_count, ..
             } => {
                 *violation_count += 1;
-                // Apply default violation weight
-                *entropy_consumed = entropy_consumed
-                    .saturating_add(EntropyBudgetConfig::default().violation_weight);
+                // Note: entropy_consumed is NOT updated here - that's tracked via
+                // SessionProgress events which contain the authoritative value
+                // from the EntropyTracker with the session's configured weights.
                 Ok(())
             },
             other => Err(SessionError::InvalidTransition {
@@ -914,8 +916,9 @@ mod unit_tests {
                 ..
             } => {
                 assert_eq!(*violation_count, 1);
-                // Default violation weight is 50
-                assert_eq!(*entropy_consumed, 50);
+                // entropy_consumed is NOT updated by policy violations directly;
+                // it's updated via SessionProgress events from the tracker
+                assert_eq!(*entropy_consumed, 0);
             },
             _ => panic!("Expected Running state"),
         }
@@ -958,8 +961,8 @@ mod unit_tests {
                 ..
             } => {
                 assert_eq!(*violation_count, 3);
-                // 3 violations * 50 weight = 150
-                assert_eq!(*entropy_consumed, 150);
+                // Violations only increment count; entropy is tracked via SessionProgress
+                assert_eq!(*entropy_consumed, 0);
             },
             _ => panic!("Expected Running state"),
         }
@@ -1107,17 +1110,12 @@ mod unit_tests {
         let start_event = create_event("session.started", "session-1", start_payload);
         reducer.apply(&start_event, &ctx).unwrap();
 
-        // Record violations until budget exceeded
-        for i in 1..=3 {
-            let violation_payload = helpers::policy_violation_payload(
-                "session-1",
-                "UNAUTHORIZED_ACCESS",
-                &format!("rule-{i}"),
-                &format!("violation {i}"),
-            );
-            let violation_event = create_event("policy.violation", "session-1", violation_payload);
-            reducer.apply(&violation_event, &ctx).unwrap();
-        }
+        // Simulate entropy consumption via SessionProgress events
+        // (in real usage, the EntropyTracker emits progress events with updated
+        // entropy)
+        let progress_payload = helpers::session_progress_payload("session-1", 1, "VIOLATION", 150);
+        let progress_event = create_event("session.progress", "session-1", progress_payload);
+        reducer.apply(&progress_event, &ctx).unwrap();
 
         // Check entropy exceeded
         let state = reducer.state().get("session-1").unwrap();
@@ -1163,11 +1161,16 @@ mod unit_tests {
         let start_event = create_event("session.started", "session-1", start_payload);
         reducer.apply(&start_event, &ctx).unwrap();
 
-        // Record various events
+        // Record violation (only increments count)
         let violation_payload =
             helpers::policy_violation_payload("session-1", "UNAUTHORIZED_ACCESS", "rule-1", "test");
         let violation_event = create_event("policy.violation", "session-1", violation_payload);
         reducer.apply(&violation_event, &ctx).unwrap();
+
+        // Record entropy via SessionProgress
+        let progress_payload = helpers::session_progress_payload("session-1", 1, "HEARTBEAT", 50);
+        let progress_event = create_event("session.progress", "session-1", progress_payload);
+        reducer.apply(&progress_event, &ctx).unwrap();
 
         let state = reducer.state().get("session-1").unwrap();
         let summary = state.entropy_summary("session-1").unwrap();
