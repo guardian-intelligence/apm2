@@ -257,9 +257,14 @@ fn run_ai_review(
     // 2. Updating the status check
     match review_type {
         ReviewType::Security => {
-            // Gemini takes input via stdin
-            let escaped_prompt = prompt.replace('\'', "'\\''");
-            let shell_cmd = format!("echo '{escaped_prompt}' | gemini --yolo");
+            // Spawn Gemini with pseudo-TTY for full tool access.
+            // Using script -qec gives Gemini a headed environment where all tools
+            // (including run_shell_command) are available. Without this, headless mode
+            // filters out shell tools causing "Tool not found in registry" errors.
+            let shell_cmd = format!(
+                "script -qec \"gemini --yolo '{}'\" /dev/null",
+                prompt.replace('\'', "'\\''").replace('"', "\\\"")
+            );
             let result = std::process::Command::new("sh")
                 .args(["-c", &shell_cmd])
                 .status();

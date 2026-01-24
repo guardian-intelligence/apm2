@@ -295,11 +295,17 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
             let prompt = prompt_content
                 .replace("$PR_URL", pr_url)
                 .replace("$HEAD_SHA", &head_sha);
-            // Spawn Gemini in background - it will post its own PR comment and status
+            // Spawn Gemini in background with pseudo-TTY for full tool access.
+            // Using script -qec gives Gemini a headed environment where all tools
+            // (including run_shell_command) are available. Without this, headless mode
+            // filters out shell tools causing "Tool not found in registry" errors.
             let _ = std::process::Command::new("sh")
                 .args([
                     "-c",
-                    &format!("echo '{}' | gemini --yolo &", prompt.replace('\'', "'\\''")),
+                    &format!(
+                        "script -qec \"gemini --yolo '{}'\" /dev/null &",
+                        prompt.replace('\'', "'\\''").replace('"', "\\\"")
+                    ),
                 ])
                 .spawn();
             println!("    Security review started in background");
