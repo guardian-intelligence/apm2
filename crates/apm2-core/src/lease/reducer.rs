@@ -343,7 +343,7 @@ impl LeaseReducer {
 
         // Apply renewal
         lease.expires_at = event.new_expires_at;
-        lease.renewal_count += 1;
+        lease.renewal_count = lease.renewal_count.saturating_add(1);
         // Use the event timestamp to record when the renewal occurred
         lease.last_renewed_at = Some(timestamp);
         // Update signature to the latest
