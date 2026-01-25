@@ -273,6 +273,13 @@ impl PolicyEngine {
     }
 
     /// Checks if a network rule matches the request.
+    ///
+    /// # Security
+    ///
+    /// Network rules follow fail-closed semantics. If a rule specifies host
+    /// restrictions but we cannot verify the request's target host, the rule
+    /// does NOT match (fails closed). This prevents host restrictions from
+    /// being bypassed.
     fn matches_network_rule(rule: &Rule, tool: &tool_request::Tool) -> bool {
         // Network rules apply to ShellExec with network_access
         // and potentially Inference calls
@@ -282,17 +289,32 @@ impl PolicyEngine {
                 if !req.network_access {
                     return false;
                 }
-                // If rule specifies hosts/ports, we can't fully match here
-                // because we don't know the target host from the command.
-                // For now, match if network access is requested.
+                // Security: If rule specifies hosts/ports, we can't fully match
+                // here because we don't know the target host from the command.
+                // Fail closed: if hosts are specified but can't be verified, don't match.
+                if !rule.hosts.is_empty() {
+                    // Cannot verify shell command targets - fail closed
+                    return false;
+                }
+                // No host restrictions - match if network access is requested
                 true
             },
-            tool_request::Tool::Inference(_) => {
+            tool_request::Tool::Inference(req) => {
                 // Inference calls always require network
-                // Check host restrictions if specified
+                // Security: If host restrictions are specified, verify the provider
                 if !rule.hosts.is_empty() {
-                    // TODO: Match provider URL against hosts
-                    // For now, allow if inference is enabled
+                    // Check if the provider matches any allowed host
+                    // Fail closed: if provider doesn't match any host, don't match
+                    let provider_matches = rule.hosts.iter().any(|host| {
+                        // Match provider exactly or as a prefix (e.g., "anthropic" matches
+                        // "anthropic.com")
+                        req.provider == *host
+                            || req.provider.starts_with(&format!("{host}."))
+                            || host.contains(&req.provider)
+                    });
+                    if !provider_matches {
+                        return false;
+                    }
                 }
                 true
             },
@@ -481,9 +503,17 @@ fn matches_any_path_pattern(patterns: &[String], path: &str) -> bool {
 /// Returns `true` if the path contains `..` components that could be used
 /// to escape directory restrictions. This is a security check to prevent
 /// path traversal attacks.
+///
+/// # Security
+///
+/// This function checks for both `/` and `\` separators to handle
+/// cross-platform path formats. While APM2 primarily targets Unix systems,
+/// checking for both separators provides defense-in-depth against path
+/// manipulation attacks that might use Windows-style separators.
 fn contains_path_traversal(path: &str) -> bool {
-    // Split path by / and check each component
-    for component in path.split('/') {
+    // Split path by both / and \ to handle cross-platform paths
+    // This provides defense-in-depth against path manipulation attacks
+    for component in path.split(['/', '\\']) {
         if component == ".." {
             return true;
         }
@@ -1322,6 +1352,126 @@ policy:
         let result = engine.evaluate(&request);
         assert!(result.is_allowed());
         assert_eq!(result.rule_id, "allow-inference");
+    }
+
+    // ========================================================================
+    // Network Rule Fail-Closed Tests
+    // ========================================================================
+
+    #[test]
+    fn test_network_rule_inference_host_restriction_fail_closed() {
+        // Security: If a network rule specifies hosts but the inference provider
+        // doesn't match any host, the rule should NOT match (fail closed).
+        let yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test"
+  rules:
+    - id: "allow-anthropic-only"
+      type: network
+      hosts:
+        - "anthropic"
+      decision: allow
+  default_decision: deny
+"#;
+        let policy = create_test_policy(yaml);
+        let engine = PolicyEngine::new(&policy);
+
+        // Anthropic provider should match
+        let request = ToolRequest {
+            request_id: "test-req".to_string(),
+            session_token: "test-session".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::Inference(InferenceCall {
+                provider: "anthropic".to_string(),
+                model: "claude-3".to_string(),
+                prompt_hash: vec![0u8; 32],
+                max_tokens: 1000,
+                temperature_scaled: 70,
+                system_prompt_hash: vec![],
+            })),
+        };
+        let result = engine.evaluate(&request);
+        assert!(result.is_allowed());
+
+        // Different provider should NOT match (fail closed)
+        let request = ToolRequest {
+            request_id: "test-req".to_string(),
+            session_token: "test-session".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::Inference(InferenceCall {
+                provider: "openai".to_string(),
+                model: "gpt-4".to_string(),
+                prompt_hash: vec![0u8; 32],
+                max_tokens: 1000,
+                temperature_scaled: 70,
+                system_prompt_hash: vec![],
+            })),
+        };
+        let result = engine.evaluate(&request);
+        // Should be denied because the network rule doesn't match (fail closed)
+        // and default is deny
+        assert!(result.is_denied());
+    }
+
+    #[test]
+    fn test_network_rule_shell_exec_host_restriction_fail_closed() {
+        // Security: Network rules with hosts specified cannot match ShellExec
+        // because we can't verify the target host from the command.
+        let yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test"
+  rules:
+    - id: "allow-specific-host"
+      type: network
+      hosts:
+        - "api.example.com"
+      decision: allow
+  default_decision: deny
+"#;
+        let policy = create_test_policy(yaml);
+        let engine = PolicyEngine::new(&policy);
+
+        // Shell exec with network access should NOT match because hosts are specified
+        // but we can't verify the target (fail closed)
+        let request = ToolRequest {
+            request_id: "test-req".to_string(),
+            session_token: "test-session".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ShellExec(ShellExec {
+                command: "curl https://api.example.com/data".to_string(),
+                cwd: String::new(),
+                timeout_ms: 0,
+                network_access: true,
+                env: vec![],
+            })),
+        };
+        let result = engine.evaluate(&request);
+        // Should be denied because we can't verify the host from the shell command
+        assert!(result.is_denied());
+    }
+
+    // ========================================================================
+    // Cross-Platform Path Traversal Tests
+    // ========================================================================
+
+    #[test]
+    fn test_path_traversal_windows_separator() {
+        // Security: Path traversal with Windows-style separators should also be blocked
+        assert!(contains_path_traversal("..\\etc\\passwd"));
+        assert!(contains_path_traversal("/workspace\\..\\secret"));
+        assert!(contains_path_traversal("a\\..\\b"));
+
+        // Mixed separators
+        assert!(contains_path_traversal("/a/b\\../c"));
+
+        // Should not match path patterns
+        assert!(!matches_path_pattern(
+            "/workspace/**",
+            "/workspace\\..\\secret"
+        ));
+        assert!(!matches_path_pattern("**", "a\\..\\b"));
     }
 
     // ========================================================================
