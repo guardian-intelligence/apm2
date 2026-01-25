@@ -149,14 +149,33 @@ impl LeaseScope {
 
     /// Returns `true` if this scope allows access to the given namespace path.
     ///
-    /// Namespace matching uses prefix semantics: a scope with namespace
-    /// "project/src" allows access to "project/src/main.rs".
+    /// Namespace matching uses path-aware prefix semantics: a scope with
+    /// namespace "project/src" allows access to "project/src" and
+    /// "project/src/main.rs", but NOT "project/src\_backup" or
+    /// "project/srcfile".
+    ///
+    /// The path separator is `/`.
     #[must_use]
     pub fn allows_namespace(&self, path: &str) -> bool {
         if self.unlimited {
             return true;
         }
-        self.namespaces.iter().any(|ns| path.starts_with(ns))
+        self.namespaces
+            .iter()
+            .any(|ns| Self::is_namespace_prefix(ns, path))
+    }
+
+    /// Checks if `prefix` is a valid namespace prefix of `path`.
+    ///
+    /// Returns true if:
+    /// - `path` equals `prefix`, or
+    /// - `path` starts with `prefix` followed by `/`
+    fn is_namespace_prefix(prefix: &str, path: &str) -> bool {
+        if path == prefix {
+            return true;
+        }
+        // Check if path starts with prefix followed by a path separator
+        path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/')
     }
 
     /// Checks if this scope is a superset of another scope.
@@ -226,20 +245,24 @@ impl LeaseScope {
         }
     }
 
-    /// Intersects namespace sets using prefix matching.
+    /// Intersects namespace sets using path-aware prefix matching.
     fn intersect_namespaces(&self, other: &BTreeSet<String>) -> BTreeSet<String> {
         let mut result = BTreeSet::new();
 
         // For each namespace in self, check if it's allowed by other
         for ns in &self.namespaces {
-            if other.iter().any(|o| ns.starts_with(o)) {
+            if other.iter().any(|o| Self::is_namespace_prefix(o, ns)) {
                 result.insert(ns.clone());
             }
         }
 
         // For each namespace in other, check if it's allowed by self
         for ns in other {
-            if self.namespaces.iter().any(|s| ns.starts_with(s)) {
+            if self
+                .namespaces
+                .iter()
+                .any(|s| Self::is_namespace_prefix(s, ns))
+            {
                 result.insert(ns.clone());
             }
         }
@@ -414,11 +437,38 @@ mod tests {
     fn test_namespace_prefix_matching() {
         let scope = LeaseScope::builder().namespace("project/src").build();
 
+        // Exact match
         assert!(scope.allows_namespace("project/src"));
+        // Valid subpaths
         assert!(scope.allows_namespace("project/src/main.rs"));
         assert!(scope.allows_namespace("project/src/lib/mod.rs"));
+        // Different directories
         assert!(!scope.allows_namespace("project/tests"));
         assert!(!scope.allows_namespace("other/src"));
+        // SECURITY: Must NOT match sibling paths that share a prefix
+        assert!(!scope.allows_namespace("project/src_backup"));
+        assert!(!scope.allows_namespace("project/srcfile"));
+    }
+
+    #[test]
+    fn test_namespace_prefix_security() {
+        // Verify fix for scope prefix vulnerability
+        // A scope for "data" must NOT allow access to "database"
+        let scope = LeaseScope::builder().namespace("data").build();
+
+        assert!(scope.allows_namespace("data"));
+        assert!(scope.allows_namespace("data/file.txt"));
+        assert!(!scope.allows_namespace("database"));
+        assert!(!scope.allows_namespace("database/users"));
+        assert!(!scope.allows_namespace("data_backup"));
+
+        // Another test case: "auth" vs "authority"
+        let auth_scope = LeaseScope::builder().namespace("auth").build();
+
+        assert!(auth_scope.allows_namespace("auth"));
+        assert!(auth_scope.allows_namespace("auth/tokens"));
+        assert!(!auth_scope.allows_namespace("authority"));
+        assert!(!auth_scope.allows_namespace("authorize"));
     }
 
     #[test]
