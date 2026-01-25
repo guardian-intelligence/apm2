@@ -89,6 +89,39 @@ pub fn run(args: LintArgs) -> Result<()> {
 
     println!("Running anti-pattern lint checks...\n");
 
+    let findings = scan_workspace(args)?;
+
+    // Report findings
+    if findings.is_empty() {
+        println!("No anti-patterns found.");
+    } else {
+        println!("Found {} warning(s):\n", findings.len());
+        for finding in &findings {
+            println!("{finding}\n");
+        }
+    }
+
+    // Always return Ok - warnings do not fail the build
+    Ok(())
+}
+
+/// Scan the workspace for lint findings.
+///
+/// This is the main entry point for programmatic lint checking. It scans
+/// Rust source files and optionally markdown documentation for anti-patterns.
+///
+/// # Arguments
+///
+/// * `args` - The lint command arguments controlling what to scan
+///
+/// # Returns
+///
+/// A vector of `LintFinding` structs describing each violation found.
+///
+/// # Errors
+///
+/// Returns an error only if file operations fail (e.g., cannot read files).
+pub fn scan_workspace(args: LintArgs) -> Result<Vec<LintFinding>> {
     let mut findings: Vec<LintFinding> = Vec::new();
 
     // Find all Rust source files in crates/ and xtask/src/
@@ -105,22 +138,10 @@ pub fn run(args: LintArgs) -> Result<()> {
 
     // Check markdown files if --include-docs is passed
     if args.include_docs {
-        println!("Scanning documentation markdown files...\n");
         check_markdown_examples(&mut findings)?;
     }
 
-    // Report findings
-    if findings.is_empty() {
-        println!("No anti-patterns found.");
-    } else {
-        println!("Found {} warning(s):\n", findings.len());
-        for finding in &findings {
-            println!("{finding}\n");
-        }
-    }
-
-    // Always return Ok - warnings do not fail the build
-    Ok(())
+    Ok(findings)
 }
 
 /// Check markdown files in documentation directories for anti-patterns.
