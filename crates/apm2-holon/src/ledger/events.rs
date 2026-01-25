@@ -50,6 +50,38 @@ use crate::stop::StopCondition;
 /// IDs.
 pub const MAX_ID_LENGTH: usize = 256;
 
+/// Maximum length for goal specification strings.
+///
+/// This limit prevents resource exhaustion attacks through excessively large
+/// goal specifications. 4KB is sufficient for detailed task descriptions
+/// while preventing memory abuse.
+pub const MAX_GOAL_SPEC_LENGTH: usize = 4096;
+
+/// Validates a goal specification string.
+///
+/// # Rules
+///
+/// - Can be empty (optional field)
+/// - Must not exceed `MAX_GOAL_SPEC_LENGTH` bytes
+/// - Must not contain null bytes
+///
+/// # Errors
+///
+/// Returns `HolonError::InvalidInput` if validation fails.
+pub fn validate_goal_spec(goal_spec: &str) -> Result<(), HolonError> {
+    if goal_spec.len() > MAX_GOAL_SPEC_LENGTH {
+        return Err(HolonError::invalid_input(format!(
+            "goal_spec exceeds maximum length of {MAX_GOAL_SPEC_LENGTH} bytes"
+        )));
+    }
+    if goal_spec.contains('\0') {
+        return Err(HolonError::invalid_input(
+            "goal_spec contains null byte".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validates an ID string.
 ///
 /// # Rules
@@ -1131,5 +1163,52 @@ mod tests {
 
         // Contains null
         assert!(validate_id("id\0with\0nulls", "test").is_err());
+    }
+
+    // ========================================================================
+    // SECURITY TESTS: Goal Spec Validation (Finding - Unbounded String)
+    // ========================================================================
+
+    /// SECURITY TEST: Verify `validate_goal_spec` accepts valid goal specs.
+    #[test]
+    fn test_validate_goal_spec_accepts_valid() {
+        assert!(validate_goal_spec("").is_ok()); // Empty is allowed
+        assert!(validate_goal_spec("Simple goal").is_ok());
+        assert!(validate_goal_spec(&"x".repeat(MAX_GOAL_SPEC_LENGTH)).is_ok()); // Max length
+    }
+
+    /// SECURITY TEST: Verify `validate_goal_spec` rejects overly long specs.
+    ///
+    /// Finding: MEDIUM - Unbounded `goal_spec` string could cause OOM/ledger
+    /// bloat. Fix: Added `MAX_GOAL_SPEC_LENGTH` validation.
+    #[test]
+    fn test_validate_goal_spec_rejects_too_long() {
+        let long_spec = "x".repeat(MAX_GOAL_SPEC_LENGTH + 1);
+        let result = validate_goal_spec(&long_spec);
+        assert!(
+            result.is_err(),
+            "validate_goal_spec should reject specs exceeding max length"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("goal_spec") && err.contains("maximum length"),
+            "Error should mention 'goal_spec' and 'maximum length': {err}"
+        );
+    }
+
+    /// SECURITY TEST: Verify `validate_goal_spec` rejects specs with null
+    /// bytes.
+    #[test]
+    fn test_validate_goal_spec_rejects_null_bytes() {
+        let result = validate_goal_spec("goal\0spec");
+        assert!(
+            result.is_err(),
+            "validate_goal_spec should reject specs with null bytes"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("goal_spec") && err.contains("null"),
+            "Error should mention 'goal_spec' and 'null': {err}"
+        );
     }
 }

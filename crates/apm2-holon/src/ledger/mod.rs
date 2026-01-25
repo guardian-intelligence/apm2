@@ -48,6 +48,6 @@
 mod events;
 
 pub use events::{
-    EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeStarted, MAX_ID_LENGTH,
-    validate_id,
+    EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeStarted, MAX_GOAL_SPEC_LENGTH,
+    MAX_ID_LENGTH, validate_goal_spec, validate_id,
 };

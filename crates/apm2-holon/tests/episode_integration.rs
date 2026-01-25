@@ -674,3 +674,91 @@ fn test_event_serialization() {
         let _: EpisodeEvent = serde_json::from_str(&json).expect("should deserialize");
     }
 }
+
+// ============================================================================
+// Security Tests: Input Validation at Entry Point
+// ============================================================================
+
+/// SECURITY TEST: Verify `run_episode_loop` rejects invalid `work_id`.
+///
+/// Finding: HIGH - Input validation bypass
+/// Fix: Added `validate_id` check in `run_episode_loop` before processing.
+#[test]
+fn test_run_episode_loop_rejects_invalid_work_id() {
+    let controller =
+        EpisodeController::new(EpisodeControllerConfig::default().with_emit_events(true));
+
+    let mut holon = CountingHolon::new(1);
+    let mut lease = test_lease(100, 10_000);
+
+    let clock = mock_clock();
+
+    // Test with work_id containing '/' (path traversal)
+    let result = controller.run_episode_loop(
+        &mut holon,
+        "work/../../etc/passwd",
+        &mut lease,
+        None,
+        1,
+        clock,
+    );
+
+    assert!(result.is_err(), "Should reject work_id containing '/'");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("work_id"),
+        "Error should mention 'work_id': {err}"
+    );
+}
+
+/// SECURITY TEST: Verify `run_episode_loop` rejects empty `work_id`.
+#[test]
+fn test_run_episode_loop_rejects_empty_work_id() {
+    let controller =
+        EpisodeController::new(EpisodeControllerConfig::default().with_emit_events(true));
+
+    let mut holon = CountingHolon::new(1);
+    let mut lease = test_lease(100, 10_000);
+
+    let clock = mock_clock();
+
+    let result = controller.run_episode_loop(&mut holon, "", &mut lease, None, 1, clock);
+
+    assert!(result.is_err(), "Should reject empty work_id");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("work_id") && err.contains("empty"),
+        "Error should mention 'work_id' and 'empty': {err}"
+    );
+}
+
+/// SECURITY TEST: Verify `run_episode_loop` rejects overly long `goal_spec`.
+#[test]
+fn test_run_episode_loop_rejects_long_goal_spec() {
+    use apm2_holon::ledger::MAX_GOAL_SPEC_LENGTH;
+
+    let controller =
+        EpisodeController::new(EpisodeControllerConfig::default().with_emit_events(true));
+
+    let mut holon = CountingHolon::new(1);
+    let mut lease = test_lease(100, 10_000);
+
+    let clock = mock_clock();
+    let long_goal = "x".repeat(MAX_GOAL_SPEC_LENGTH + 1);
+
+    let result = controller.run_episode_loop(
+        &mut holon,
+        "work-001",
+        &mut lease,
+        Some(&long_goal),
+        1,
+        clock,
+    );
+
+    assert!(result.is_err(), "Should reject overly long goal_spec");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("goal_spec") && err.contains("maximum length"),
+        "Error should mention 'goal_spec' and 'maximum length': {err}"
+    );
+}

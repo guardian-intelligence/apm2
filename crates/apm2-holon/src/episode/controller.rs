@@ -446,6 +446,11 @@ impl EpisodeController {
     ///
     /// # Errors
     ///
+    /// Returns `HolonError::InvalidInput` if:
+    /// - `work_id` fails ID validation (empty, too long, contains `/` or null)
+    /// - `lease_id` fails ID validation
+    /// - `goal_spec` exceeds maximum length or contains null bytes
+    ///
     /// Returns `HolonError` if a fatal error occurs during execution.
     // Note: This function manages the episode loop state machine. Further
     // decomposition would hurt readability by spreading the control flow.
@@ -463,6 +468,13 @@ impl EpisodeController {
         H: Holon,
         F: FnMut() -> u64,
     {
+        // Validate inputs before processing
+        crate::ledger::validate_id(work_id, "work_id")?;
+        crate::ledger::validate_id(lease.lease_id(), "lease_id")?;
+        if let Some(spec) = goal_spec {
+            crate::ledger::validate_goal_spec(spec)?;
+        }
+
         let mut events = Vec::new();
         let mut episode_number: u64 = initial_episode_number.max(1);
         let mut total_tokens_consumed: u64 = 0;
