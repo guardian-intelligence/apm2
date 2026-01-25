@@ -211,14 +211,20 @@ impl Default for EnvironmentConfig {
     fn default() -> Self {
         Self {
             variables: Vec::new(),
-            inherit: true,
+            // Default to false for security (default-deny).
+            // Users must explicitly opt-in to environment inheritance.
+            inherit: false,
             exclude: vec![
                 // Sensitive variables that should never be passed
+                // These are excluded even if inherit is later set to true
                 "AWS_SECRET_ACCESS_KEY".to_string(),
+                "AWS_ACCESS_KEY_ID".to_string(),
                 "ANTHROPIC_API_KEY".to_string(),
                 "OPENAI_API_KEY".to_string(),
                 "GITHUB_TOKEN".to_string(),
                 "NPM_TOKEN".to_string(),
+                "DOCKER_PASSWORD".to_string(),
+                "SSH_PRIVATE_KEY".to_string(),
             ],
         }
     }
@@ -270,12 +276,23 @@ mod tests {
     #[test]
     fn test_default_environment_config() {
         let config = EnvironmentConfig::default();
-        assert!(config.inherit);
+        // Default-deny: inherit is false
+        assert!(!config.inherit);
         assert!(config.exclude.contains(&"ANTHROPIC_API_KEY".to_string()));
         assert!(
             config
                 .exclude
                 .contains(&"AWS_SECRET_ACCESS_KEY".to_string())
+        );
+    }
+
+    #[test]
+    fn test_environment_default_deny() {
+        // Security requirement: default configuration must not inherit parent env
+        let config = EnvironmentConfig::default();
+        assert!(
+            !config.inherit,
+            "Security: default config must use default-deny (inherit=false)"
         );
     }
 }

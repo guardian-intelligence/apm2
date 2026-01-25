@@ -123,11 +123,21 @@ impl FilesystemWatcher {
     }
 
     /// Adds a file snapshot to the state.
+    ///
+    /// Uses `symlink_metadata` to avoid following symlinks, preventing
+    /// infinite recursion on symlink loops.
     fn add_file_snapshot(&mut self, path: &Path) -> Result<(), AdapterError> {
-        let metadata = std::fs::metadata(path).map_err(|e| AdapterError::WatchPathFailed {
-            path: path.to_path_buf(),
-            reason: e.to_string(),
-        })?;
+        // Use symlink_metadata to avoid following symlinks (security: prevent loops)
+        let metadata =
+            std::fs::symlink_metadata(path).map_err(|e| AdapterError::WatchPathFailed {
+                path: path.to_path_buf(),
+                reason: e.to_string(),
+            })?;
+
+        // Skip symlinks entirely to prevent symlink-based attacks
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
 
         let snapshot = FileSnapshot {
             modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
@@ -240,42 +250,57 @@ impl FilesystemWatcher {
     }
 
     /// Collects the current state of files into the given map.
+    ///
+    /// Uses `symlink_metadata` to avoid following symlinks, preventing
+    /// infinite recursion on symlink loops.
     fn collect_current_state(
         &self,
         path: &Path,
         snapshots: &mut BTreeMap<PathBuf, FileSnapshot>,
     ) -> Result<(), AdapterError> {
-        if !path.exists() {
+        // Use symlink_metadata to avoid following symlinks (security)
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return Ok(()); // Path doesn't exist or is inaccessible
+        };
+
+        // Skip symlinks entirely to prevent symlink-based attacks
+        if metadata.file_type().is_symlink() {
             return Ok(());
         }
 
-        if path.is_file() {
+        if metadata.is_file() {
             if !self.should_ignore(path) {
-                if let Ok(metadata) = std::fs::metadata(path) {
-                    let snapshot = FileSnapshot {
-                        modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                        size: metadata.len(),
-                        is_dir: metadata.is_dir(),
-                    };
-                    snapshots.insert(path.to_path_buf(), snapshot);
-                }
+                let snapshot = FileSnapshot {
+                    modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                    size: metadata.len(),
+                    is_dir: false,
+                };
+                snapshots.insert(path.to_path_buf(), snapshot);
             }
-        } else if path.is_dir() {
+        } else if metadata.is_dir() {
             if let Ok(entries) = std::fs::read_dir(path) {
                 for entry in entries.flatten() {
                     let entry_path = entry.path();
                     if !self.should_ignore(&entry_path) {
-                        if entry_path.is_file() {
-                            if let Ok(metadata) = std::fs::metadata(&entry_path) {
+                        // Get metadata for entry without following symlinks
+                        if let Ok(entry_meta) = std::fs::symlink_metadata(&entry_path) {
+                            // Skip symlinks
+                            if entry_meta.file_type().is_symlink() {
+                                continue;
+                            }
+
+                            if entry_meta.is_file() {
                                 let snapshot = FileSnapshot {
-                                    modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                                    size: metadata.len(),
-                                    is_dir: metadata.is_dir(),
+                                    modified: entry_meta
+                                        .modified()
+                                        .unwrap_or(SystemTime::UNIX_EPOCH),
+                                    size: entry_meta.len(),
+                                    is_dir: false,
                                 };
                                 snapshots.insert(entry_path, snapshot);
+                            } else if entry_meta.is_dir() && self.config.recursive {
+                                self.collect_current_state(&entry_path, snapshots)?;
                             }
-                        } else if entry_path.is_dir() && self.config.recursive {
-                            self.collect_current_state(&entry_path, snapshots)?;
                         }
                     }
                 }
@@ -487,5 +512,38 @@ mod tests {
         // Polling should return empty when stopped
         let changes = watcher.poll().unwrap();
         assert!(changes.is_empty());
+    }
+
+    /// Security test: verify symlink loops don't cause infinite recursion.
+    #[cfg(unix)]
+    #[test]
+    fn test_watcher_symlink_loop_protection() {
+        use std::os::unix::fs::symlink;
+
+        // Create a directory with a symlink loop: loop -> .
+        let dir = tempfile::tempdir().unwrap();
+        let loop_path = dir.path().join("loop");
+
+        // ln -s . loop (creates a symlink that points to the same directory)
+        symlink(dir.path(), &loop_path).unwrap();
+
+        let config = FilesystemConfig {
+            watch_paths: vec![dir.path().to_path_buf()],
+            ignore_patterns: Vec::new(),
+            ..Default::default()
+        };
+
+        let mut watcher = FilesystemWatcher::new(config);
+
+        // This should not hang or crash - if it does, the test will timeout
+        watcher.initialize().unwrap();
+        let changes = watcher.poll().unwrap();
+
+        // Should not detect the symlink itself as a file since we skip symlinks
+        // The changes list should be empty (no real files, only the symlink)
+        assert!(
+            changes.is_empty(),
+            "Should not report symlinks as file changes"
+        );
     }
 }

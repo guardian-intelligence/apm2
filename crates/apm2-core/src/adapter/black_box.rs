@@ -275,7 +275,8 @@ impl BlackBoxAdapter {
         }
 
         // Poll filesystem for changes
-        let changes = watcher.poll()?;
+        // Use block_in_place to prevent blocking the async executor with filesystem I/O
+        let changes = tokio::task::block_in_place(|| watcher.poll())?;
         if !changes.is_empty() {
             *last_activity = Instant::now();
 
