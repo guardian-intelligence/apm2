@@ -70,8 +70,9 @@ pub struct BudgetTracker {
 
 **Invariants:**
 - [INV-0003] Consumption counters use saturating arithmetic (no overflow)
-- [INV-0004] Time budget tracks wall-clock time from session start
+- [INV-0004] Time budget tracks **active execution time** (not wall-clock session duration)
 - [INV-0005] Time cannot be charged directly (tracked automatically)
+- [INV-0006] For wall-clock session expiry, use `started_at_ns` with external `SystemTime` comparisons
 
 **Contracts:**
 - [CTR-0005] `charge()` returns `Err(BudgetChargeError::TimeCannotBeCharged)` for `BudgetType::Time` (time is tracked automatically)

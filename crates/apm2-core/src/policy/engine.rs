@@ -270,6 +270,12 @@ impl PolicyEngine {
     }
 
     /// Checks if a `tool_allow`/`tool_deny` rule matches the request.
+    ///
+    /// # Security
+    ///
+    /// This function always blocks path traversal attempts in filesystem
+    /// operations, even when no specific path restrictions are configured.
+    /// This prevents "allow all fs operations" rules from being exploited.
     fn matches_tool_rule(rule: &Rule, tool: &tool_request::Tool, tool_name: &str) -> bool {
         // Check tool name pattern
         if let Some(ref pattern) = rule.tool {
@@ -281,16 +287,28 @@ impl PolicyEngine {
         // Check path patterns for filesystem operations
         match tool {
             tool_request::Tool::FileRead(req) => {
+                // Security: Always block traversal, even with empty paths
+                if contains_path_traversal(&req.path) {
+                    return false;
+                }
                 if !rule.paths.is_empty() {
                     return matches_any_path_pattern(&rule.paths, &req.path);
                 }
             },
             tool_request::Tool::FileWrite(req) => {
+                // Security: Always block traversal, even with empty paths
+                if contains_path_traversal(&req.path) {
+                    return false;
+                }
                 if !rule.paths.is_empty() {
                     return matches_any_path_pattern(&rule.paths, &req.path);
                 }
             },
             tool_request::Tool::FileEdit(req) => {
+                // Security: Always block traversal, even with empty paths
+                if contains_path_traversal(&req.path) {
+                    return false;
+                }
                 if !rule.paths.is_empty() {
                     return matches_any_path_pattern(&rule.paths, &req.path);
                 }
@@ -313,6 +331,12 @@ impl PolicyEngine {
     }
 
     /// Checks if a filesystem rule matches the request.
+    ///
+    /// # Security
+    ///
+    /// This function always checks for path traversal components (`..`) even
+    /// when no specific paths are configured. This ensures that an "allow all
+    /// paths" rule cannot be exploited via directory traversal attacks.
     fn matches_filesystem_rule(rule: &Rule, tool: &tool_request::Tool) -> bool {
         // Filesystem rules apply to FileRead, FileWrite, FileEdit
         let path = match tool {
@@ -322,8 +346,16 @@ impl PolicyEngine {
             _ => return false,
         };
 
+        // Security: Always block path traversal attempts, even for rules
+        // that don't specify explicit path restrictions. This prevents
+        // "allow all" rules from being exploited via ../../../etc/passwd.
+        if contains_path_traversal(path) {
+            return false;
+        }
+
         if rule.paths.is_empty() {
             // No paths specified - matches all filesystem operations
+            // (traversal already blocked above)
             return true;
         }
 
@@ -1758,6 +1790,45 @@ policy:
             })),
         };
         assert!(engine.evaluate(&request).is_allowed());
+    }
+
+    #[test]
+    fn test_tool_rule_empty_paths_blocks_traversal() {
+        // Security: A tool_allow rule with empty paths (allow all fs operations)
+        // must still block path traversal attempts. This prevents
+        // ../../../etc/passwd from bypassing security via an "allow all" rule.
+        let yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test"
+  rules:
+    - id: "allow-all-fs"
+      type: tool_allow
+      tool: "fs.*"
+      decision: allow
+  default_decision: deny
+"#;
+        let policy = create_test_policy(yaml);
+        let engine = PolicyEngine::new(&policy);
+
+        // Normal paths should be allowed
+        let request = create_file_read_request("/home/user/file.txt");
+        assert!(engine.evaluate(&request).is_allowed());
+
+        // Path traversal must be blocked even with empty paths list
+        let request = create_file_read_request("/workspace/../etc/passwd");
+        let result = engine.evaluate(&request);
+        assert!(
+            result.is_denied(),
+            "Path traversal should be denied even with empty paths rule"
+        );
+
+        // More traversal attempts
+        let request = create_file_read_request("../../../etc/shadow");
+        assert!(engine.evaluate(&request).is_denied());
+
+        let request = create_file_write_request("/safe/../../dangerous");
+        assert!(engine.evaluate(&request).is_denied());
     }
 
     // ========================================================================

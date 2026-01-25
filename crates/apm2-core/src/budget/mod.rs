@@ -4,7 +4,7 @@
 //! Sessions operate under explicit budgets for:
 //! - **Tokens**: Maximum inference tokens consumed
 //! - **Tool calls**: Maximum number of tool invocations
-//! - **Time**: Maximum elapsed time for the session
+//! - **Time**: Maximum active execution time for the session
 //!
 //! # Security Model
 //!
@@ -12,6 +12,21 @@
 //! - Requests are denied when any budget is exceeded
 //! - Budget checks occur before tool execution
 //! - Exceeding a budget results in a `BudgetExceeded` event
+//!
+//! # Time Budget Semantics
+//!
+//! **IMPORTANT**: The time budget tracks **active execution time**, not
+//! wall-clock session duration. This means:
+//!
+//! - Time is measured using `std::time::Instant::elapsed()` from process start
+//! - For restored sessions, `time_offset_ms` is added to account for previous
+//!   execution time
+//! - System suspends, process restarts, or network delays do NOT count against
+//!   the time budget unless explicitly restored
+//!
+//! If you need wall-clock session expiry (e.g., "session must end within 1 hour
+//! of creation regardless of activity"), use `started_at_ns` with external
+//! `SystemTime` comparisons instead of the built-in time budget enforcement.
 //!
 //! # Design
 //!
