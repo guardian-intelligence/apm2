@@ -97,12 +97,14 @@
 //! - Processes are spawned with minimal capabilities
 //! - All observations are treated as untrusted
 //! - Failures result in session termination
+//! - On Linux, seccomp-bpf filtering restricts syscalls (defense in depth)
 
 mod black_box;
 mod claude_code;
 mod config;
 mod error;
 mod event;
+pub mod seccomp;
 mod traits;
 mod watcher;
 
@@ -122,8 +124,11 @@ pub use config::{
 pub use error::AdapterError;
 pub use event::{
     AdapterEvent, AdapterEventPayload, DetectionMethod, ExitClassification, FileChangeType,
-    FilesystemChange, ProcessExited, ProcessStarted, ProgressSignal, ProgressType, StallDetected,
-    ToolRequestDetected,
+    FilesystemChange, ProcessExited, ProcessStarted, ProgressSignal, ProgressType,
+    SeccompViolation, StallDetected, ToolRequestDetected,
+};
+pub use seccomp::{
+    SeccompError, SeccompProfile, SeccompProfileLevel, SeccompResult, apply_seccomp_filter,
 };
 pub use traits::{Adapter, AdapterExt, BoxFuture};
 pub use watcher::{FilesystemWatcher, WatcherHandle};
