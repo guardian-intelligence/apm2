@@ -122,6 +122,7 @@ dependencies = [
  "humantime",
  "keyring",
  "libc",
+ "memchr",
  "nix",
  "once_cell",
  "proptest",
@@ -2369,6 +2370,7 @@ dependencies = [
  "shell-escape",
  "sysinfo",
  "tempfile",
+ "wait-timeout",
  "xshell",
 ]
 

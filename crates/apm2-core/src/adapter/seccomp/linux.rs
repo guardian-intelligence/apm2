@@ -83,8 +83,19 @@ mod syscall {
     // Memory-related dangerous syscalls
     pub const MEMFD_CREATE: i64 = libc::SYS_memfd_create;
 
-    // io_uring syscalls (newer, may not be in all libc versions)
-    // These are hardcoded for x86_64 as they may not be in older libc
+    // io_uring syscalls (Linux 5.1+)
+    //
+    // These are hardcoded for x86_64 because:
+    // 1. Older libc versions may not define them
+    // 2. The syscall numbers are stable (verified against
+    //    linux/include/uapi/asm-generic/unistd.h)
+    //
+    // Values verified against kernel headers:
+    // - io_uring_setup:    425 (since Linux 5.1)
+    // - io_uring_enter:    426 (since Linux 5.1)
+    // - io_uring_register: 427 (since Linux 5.1)
+    //
+    // Reference: https://github.com/torvalds/linux/blob/master/include/uapi/asm-generic/unistd.h
     pub const IO_URING_SETUP: i64 = 425;
     pub const IO_URING_ENTER: i64 = 426;
     pub const IO_URING_REGISTER: i64 = 427;
@@ -149,16 +160,18 @@ pub fn apply_seccomp_filter(profile: &SeccompProfile) -> Result<SeccompResult, S
     };
 
     // Build the filter
-    // match_action: action taken when a rule matches (blocked syscalls)
-    // mismatch_action: default action when no rule matches (allow everything else)
+    //
+    // SeccompFilter::new signature: (rules, mismatch_action, match_action, arch)
+    //   - mismatch_action: action for syscalls NOT in our rules (allow by default)
+    //   - match_action: action for syscalls that ARE in our rules (block them)
     //
     // Note: This is a BLOCKLIST approach - we block specific syscalls and allow
     // everything else. This is less secure than a whitelist but more practical
     // for general-purpose agent processes.
     let filter = SeccompFilter::new(
         rules,
-        block_action,         // Action for rules that match (blocked syscalls)
-        SeccompAction::Allow, // Default action (allow everything else)
+        SeccompAction::Allow, // mismatch_action: allow syscalls not in our blocklist
+        block_action,         // match_action: block syscalls in our blocklist
         TargetArch::x86_64,   // Hardcoded to x86_64 - this module only supports x86_64
     )
     .map_err(|e| SeccompError::new(format!("failed to create seccomp filter: {e}")))?;
@@ -368,10 +381,11 @@ mod tests {
             .map(|nr| (nr, vec![]))
             .collect();
 
+        // SeccompFilter::new(rules, mismatch_action, match_action, arch)
         let filter = SeccompFilter::new(
             rules,
-            SeccompAction::Trap,
-            SeccompAction::Allow,
+            SeccompAction::Allow, // mismatch: allow non-blocked syscalls
+            SeccompAction::Trap,  // match: trap blocked syscalls
             TargetArch::x86_64,
         )
         .expect("filter creation should succeed");
@@ -389,10 +403,11 @@ mod tests {
             .map(|nr| (nr, vec![]))
             .collect();
 
+        // SeccompFilter::new(rules, mismatch_action, match_action, arch)
         let filter = SeccompFilter::new(
             rules,
-            SeccompAction::KillProcess,
-            SeccompAction::Allow,
+            SeccompAction::Allow,       // mismatch: allow non-blocked syscalls
+            SeccompAction::KillProcess, // match: kill on blocked syscalls
             TargetArch::x86_64,
         )
         .expect("filter creation should succeed");
@@ -410,10 +425,11 @@ mod tests {
             .map(|nr| (nr, vec![]))
             .collect();
 
+        // SeccompFilter::new(rules, mismatch_action, match_action, arch)
         let filter = SeccompFilter::new(
             rules,
-            SeccompAction::Trap,
-            SeccompAction::Allow,
+            SeccompAction::Allow, // mismatch: allow non-blocked syscalls
+            SeccompAction::Trap,  // match: trap blocked syscalls
             TargetArch::x86_64,
         )
         .expect("filter creation should succeed");
