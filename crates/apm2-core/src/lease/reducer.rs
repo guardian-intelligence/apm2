@@ -117,6 +117,52 @@ impl LeaseReducerState {
     pub fn has_active_lease(&self, work_id: &str) -> bool {
         self.active_leases_by_work.contains_key(work_id)
     }
+
+    /// Returns the number of terminal (released or expired) leases.
+    #[must_use]
+    pub fn terminal_count(&self) -> usize {
+        self.leases.values().filter(|l| l.is_terminal()).count()
+    }
+
+    /// Removes all terminal (released/expired) leases from state.
+    ///
+    /// Returns the number of leases pruned. This prevents unbounded memory
+    /// growth in long-running systems. The ledger retains full history.
+    pub fn prune_terminal_leases(&mut self) -> usize {
+        let terminal_ids: Vec<String> = self
+            .leases
+            .iter()
+            .filter(|(_, l)| l.is_terminal())
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        let count = terminal_ids.len();
+        for id in terminal_ids {
+            self.leases.remove(&id);
+        }
+        count
+    }
+
+    /// Removes terminal leases that were terminated before the given timestamp.
+    ///
+    /// Returns the number of leases pruned. Useful for retaining recent
+    /// terminal leases while pruning older ones.
+    pub fn prune_terminal_leases_before(&mut self, before_timestamp: u64) -> usize {
+        let terminal_ids: Vec<String> = self
+            .leases
+            .iter()
+            .filter(|(_, l)| {
+                l.is_terminal() && l.terminated_at.is_some_and(|t| t < before_timestamp)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        let count = terminal_ids.len();
+        for id in terminal_ids {
+            self.leases.remove(&id);
+        }
+        count
+    }
 }
 
 /// Reducer for lease lifecycle events.
@@ -200,6 +246,17 @@ impl LeaseReducer {
             return Err(LeaseError::MissingSignature { lease_id });
         }
 
+        // Validate lease duration: expiration must be after issuance
+        if event.expires_at <= event.issued_at {
+            return Err(LeaseError::InvalidInput {
+                field: "expires_at".to_string(),
+                reason: format!(
+                    "expires_at ({}) must be after issued_at ({})",
+                    event.expires_at, event.issued_at
+                ),
+            });
+        }
+
         // Create the lease
         let lease = Lease::new(
             lease_id.clone(),
@@ -218,7 +275,11 @@ impl LeaseReducer {
     }
 
     /// Handles a lease renewed event.
-    fn handle_renewed(&mut self, event: crate::events::LeaseRenewed) -> Result<(), LeaseError> {
+    fn handle_renewed(
+        &mut self,
+        event: crate::events::LeaseRenewed,
+        timestamp: u64,
+    ) -> Result<(), LeaseError> {
         let lease_id = &event.lease_id;
 
         if lease_id.len() > MAX_ID_LEN {
@@ -269,9 +330,8 @@ impl LeaseReducer {
         // Apply renewal
         lease.expires_at = event.new_expires_at;
         lease.renewal_count += 1;
-        // Use the new expiration time minus old expiration as a proxy for
-        // "when" (we don't have an explicit timestamp in the renewal event)
-        lease.last_renewed_at = Some(event.new_expires_at);
+        // Use the event timestamp to record when the renewal occurred
+        lease.last_renewed_at = Some(timestamp);
         // Update signature to the latest
         lease.registrar_signature = event.registrar_signature;
 
@@ -411,7 +471,7 @@ impl Reducer for LeaseReducer {
 
         match lease_event.event {
             Some(lease_event::Event::Issued(e)) => self.handle_issued(e),
-            Some(lease_event::Event::Renewed(e)) => self.handle_renewed(e),
+            Some(lease_event::Event::Renewed(e)) => self.handle_renewed(e, timestamp),
             Some(lease_event::Event::Released(ref e)) => {
                 self.handle_released(e, &event.actor_id, timestamp)
             },

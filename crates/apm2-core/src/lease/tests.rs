@@ -1054,3 +1054,153 @@ fn test_lease_summary() {
     assert_eq!(summary.expires_at, 3_000_000_000);
     assert_eq!(summary.renewal_count, 1);
 }
+
+// =============================================================================
+// State Pruning Tests
+// =============================================================================
+
+#[test]
+fn test_prune_terminal_leases() {
+    let mut reducer = LeaseReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Create 3 leases
+    for i in 1u8..=3 {
+        let payload = helpers::lease_issued_payload(
+            &format!("lease-{i}"),
+            &format!("work-{i}"),
+            "actor-1",
+            1_000_000_000,
+            2_000_000_000,
+            vec![i],
+        );
+        reducer
+            .apply(&create_event("lease.issued", "s", payload), &ctx)
+            .unwrap();
+    }
+
+    // Release lease-1, expire lease-2
+    let release = helpers::lease_released_payload("lease-1", "COMPLETED");
+    reducer
+        .apply(&create_event("lease.released", "s", release), &ctx)
+        .unwrap();
+
+    let expire = helpers::lease_expired_payload("lease-2", 2_000_000_000);
+    reducer
+        .apply(&create_event("lease.expired", "s", expire), &ctx)
+        .unwrap();
+
+    assert_eq!(reducer.state().len(), 3);
+    assert_eq!(reducer.state().terminal_count(), 2);
+    assert_eq!(reducer.state().active_count(), 1);
+
+    // Prune terminal leases
+    let pruned = reducer.state_mut().prune_terminal_leases();
+    assert_eq!(pruned, 2);
+    assert_eq!(reducer.state().len(), 1);
+    assert_eq!(reducer.state().terminal_count(), 0);
+    assert!(reducer.state().get("lease-3").is_some());
+}
+
+#[test]
+fn test_prune_terminal_leases_before_timestamp() {
+    let mut reducer = LeaseReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Create leases
+    for i in 1u8..=3 {
+        let payload = helpers::lease_issued_payload(
+            &format!("lease-{i}"),
+            &format!("work-{i}"),
+            "actor-1",
+            1_000_000_000,
+            2_000_000_000,
+            vec![i],
+        );
+        reducer
+            .apply(&create_event("lease.issued", "s", payload), &ctx)
+            .unwrap();
+    }
+
+    // Release at different times
+    let release1 = helpers::lease_released_payload("lease-1", "COMPLETED");
+    let release1_event = create_event_at("lease.released", "s", release1, 1_500_000_000);
+    reducer.apply(&release1_event, &ctx).unwrap();
+
+    let release2 = helpers::lease_released_payload("lease-2", "COMPLETED");
+    let release2_event = create_event_at("lease.released", "s", release2, 2_500_000_000);
+    reducer.apply(&release2_event, &ctx).unwrap();
+
+    assert_eq!(reducer.state().terminal_count(), 2);
+
+    // Prune only leases terminated before 2_000_000_000
+    let pruned = reducer
+        .state_mut()
+        .prune_terminal_leases_before(2_000_000_000);
+    assert_eq!(pruned, 1);
+    assert!(reducer.state().get("lease-1").is_none()); // Pruned
+    assert!(reducer.state().get("lease-2").is_some()); // Retained
+}
+
+// =============================================================================
+// Duration Validation Tests
+// =============================================================================
+
+#[test]
+fn test_lease_issued_invalid_duration_rejected() {
+    let mut reducer = LeaseReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // expires_at == issued_at (zero duration)
+    let payload = helpers::lease_issued_payload(
+        "lease-1",
+        "work-1",
+        "actor-1",
+        1_000_000_000,
+        1_000_000_000, // Same as issued_at
+        vec![1, 2, 3],
+    );
+    let result = reducer.apply(&create_event("lease.issued", "s", payload), &ctx);
+    assert!(matches!(result, Err(LeaseError::InvalidInput { .. })));
+
+    // expires_at < issued_at (negative duration)
+    let payload2 = helpers::lease_issued_payload(
+        "lease-2",
+        "work-2",
+        "actor-1",
+        2_000_000_000,
+        1_000_000_000, // Before issued_at
+        vec![1, 2, 3],
+    );
+    let result2 = reducer.apply(&create_event("lease.issued", "s", payload2), &ctx);
+    assert!(matches!(result2, Err(LeaseError::InvalidInput { .. })));
+}
+
+#[test]
+fn test_renewal_uses_event_timestamp() {
+    let mut reducer = LeaseReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Issue lease
+    let issue_payload = helpers::lease_issued_payload(
+        "lease-1",
+        "work-1",
+        "actor-1",
+        1_000_000_000,
+        2_000_000_000,
+        vec![1, 2, 3],
+    );
+    reducer
+        .apply(&create_event("lease.issued", "s", issue_payload), &ctx)
+        .unwrap();
+
+    // Renew at a specific timestamp
+    let renew_payload = helpers::lease_renewed_payload("lease-1", 3_000_000_000, vec![4, 5, 6]);
+    let renew_event = create_event_at("lease.renewed", "s", renew_payload, 1_800_000_000);
+    reducer.apply(&renew_event, &ctx).unwrap();
+
+    let lease = reducer.state().get("lease-1").unwrap();
+    // last_renewed_at should be the event timestamp, not the new_expires_at
+    assert_eq!(lease.last_renewed_at, Some(1_800_000_000));
+    assert_eq!(lease.expires_at, 3_000_000_000);
+}
