@@ -270,6 +270,13 @@ impl Lease {
     /// - Budget bounded by this lease's remaining budget
     /// - Expiration at or before this lease's expiration
     ///
+    /// # Budget Conservation
+    ///
+    /// This method **deducts** the requested budget from the parent lease's
+    /// remaining budget. This prevents "resource inflation" attacks where
+    /// multiple children are derived that collectively exceed the parent's
+    /// total budget.
+    ///
     /// # Arguments
     ///
     /// * `child_lease_id` - Unique ID for the child lease
@@ -285,7 +292,7 @@ impl Lease {
     /// exceed this lease's constraints.
     #[allow(clippy::too_many_arguments)]
     pub fn derive(
-        &self,
+        &mut self,
         child_lease_id: impl Into<String>,
         child_holder_id: impl Into<String>,
         requested_scope: &LeaseScope,
@@ -303,12 +310,31 @@ impl Lease {
         // Validate scope
         self.scope.validate_derivation(requested_scope)?;
 
-        // Validate budget
+        // Validate budget - this also checks if the parent has enough remaining
         if !self.budget.can_accommodate(requested_budget) {
             return Err(ResourceError::invalid_derivation(
                 "derived lease budget exceeds parent remaining budget",
             ));
         }
+
+        // Deduct the budget from the parent to prevent resource inflation.
+        // This is atomic - if deduction fails, no changes are made.
+        self.budget.deduct(
+            requested_budget.initial_episodes(),
+            requested_budget.initial_tool_calls(),
+            requested_budget.initial_tokens(),
+            requested_budget.initial_duration_ms(),
+        )?;
+
+        // Create the child's budget as a fresh budget with the requested values.
+        // Note: We already validated that the parent can accommodate and deducted
+        // from the parent, so the child gets exactly what was requested.
+        let child_budget = Budget::new(
+            requested_budget.initial_episodes(),
+            requested_budget.initial_tool_calls(),
+            requested_budget.initial_tokens(),
+            requested_budget.initial_duration_ms(),
+        );
 
         // Create the derived lease
         Ok(Self {
@@ -316,7 +342,7 @@ impl Lease {
             issuer_id: self.issuer_id.clone(),
             holder_id: child_holder_id.into(),
             scope: self.scope.derive_sub_scope(requested_scope),
-            budget: self.budget.derive_sub_budget(requested_budget),
+            budget: child_budget,
             issued_at_ns,
             expires_at_ns: requested_expires_at_ns.min(self.expires_at_ns),
             parent_lease_id: Some(self.id.clone()),
@@ -577,7 +603,7 @@ mod tests {
 
     #[test]
     fn test_derive_lease() {
-        let parent = test_lease();
+        let mut parent = test_lease();
 
         let child = parent
             .derive(
@@ -599,11 +625,15 @@ mod tests {
         assert!(child.is_derived());
         assert_eq!(child.expires_at_ns(), 1_800_000_000);
         assert_eq!(child.budget().remaining_episodes(), 5);
+
+        // Verify parent's budget was deducted (prevents resource inflation)
+        assert_eq!(parent.budget().remaining_episodes(), 5); // 10 - 5
+        assert_eq!(parent.budget().remaining_tool_calls(), 50); // 100 - 50
     }
 
     #[test]
     fn test_derive_expiration_bounded() {
-        let parent = test_lease();
+        let mut parent = test_lease();
 
         // Request expiration after parent - should be capped
         let child = parent.derive(
@@ -621,7 +651,7 @@ mod tests {
 
     #[test]
     fn test_derive_scope_bounded() {
-        let parent = test_lease();
+        let mut parent = test_lease();
 
         // Request work ID not in parent scope
         let result = parent.derive(
@@ -642,7 +672,7 @@ mod tests {
 
     #[test]
     fn test_derive_budget_bounded() {
-        let parent = test_lease();
+        let mut parent = test_lease();
 
         // Request budget exceeding parent
         let result = parent.derive(
@@ -659,6 +689,68 @@ mod tests {
             result,
             Err(ResourceError::InvalidDerivation { .. })
         ));
+    }
+
+    #[test]
+    fn test_derive_prevents_double_spending() {
+        // SECURITY: Verify that deriving multiple children depletes parent budget
+        // and prevents creating children that collectively exceed parent's budget.
+        let mut parent = test_lease(); // Budget: 10 episodes, 100 tool_calls, etc.
+
+        // First child takes 6 episodes
+        let child1 = parent
+            .derive(
+                "lease-002",
+                "agent-002",
+                &LeaseScope::builder().work_ids(["work-001"]).build(),
+                &Budget::new(6, 50, 5_000, 30_000),
+                1_800_000_000,
+                1_500_000_000,
+            )
+            .unwrap();
+
+        assert_eq!(child1.budget().remaining_episodes(), 6);
+        assert_eq!(parent.budget().remaining_episodes(), 4); // 10 - 6 = 4
+
+        // Second child tries to take 6 episodes, but parent only has 4 remaining
+        let child2_result = parent.derive(
+            "lease-003",
+            "agent-003",
+            &LeaseScope::builder().work_ids(["work-001"]).build(),
+            &Budget::new(6, 50, 5_000, 30_000), // 6 > 4 remaining
+            1_800_000_000,
+            1_500_000_000,
+        );
+
+        // Should fail due to insufficient budget
+        assert!(child2_result.is_err());
+
+        // Second child with smaller budget should succeed
+        let child2 = parent
+            .derive(
+                "lease-003",
+                "agent-003",
+                &LeaseScope::builder().work_ids(["work-001"]).build(),
+                &Budget::new(4, 50, 5_000, 30_000), // 4 <= 4 remaining
+                1_800_000_000,
+                1_500_000_000,
+            )
+            .unwrap();
+
+        assert_eq!(child2.budget().remaining_episodes(), 4);
+        assert_eq!(parent.budget().remaining_episodes(), 0); // Fully depleted
+
+        // Cannot derive any more children with budget
+        let child3_result = parent.derive(
+            "lease-004",
+            "agent-004",
+            &LeaseScope::builder().work_ids(["work-001"]).build(),
+            &Budget::new(1, 1, 1, 1), // Any budget > 0
+            1_800_000_000,
+            1_500_000_000,
+        );
+
+        assert!(child3_result.is_err());
     }
 
     #[test]

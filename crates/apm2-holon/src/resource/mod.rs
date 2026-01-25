@@ -45,7 +45,7 @@
 //!
 //! let budget = Budget::new(10, 100, 10_000, 60_000);
 //!
-//! let parent = Lease::builder()
+//! let mut parent = Lease::builder()
 //!     .lease_id("parent-lease")
 //!     .issuer_id("registrar")
 //!     .holder_id("parent-agent")
@@ -55,7 +55,9 @@
 //!     .build()
 //!     .unwrap();
 //!
-//! // Derive a child lease with reduced permissions
+//! // Derive a child lease with reduced permissions.
+//! // NOTE: This deducts the budget from the parent, preventing
+//! // resource inflation from deriving multiple children.
 //! let child = parent
 //!     .derive(
 //!         "child-lease",
@@ -72,6 +74,8 @@
 //!
 //! assert!(child.is_derived());
 //! assert_eq!(child.parent_lease_id(), Some("parent-lease"));
+//! // Parent's budget was deducted
+//! assert_eq!(parent.budget().remaining_episodes(), 5); // 10 - 5
 //! ```
 
 mod budget;
@@ -103,7 +107,7 @@ mod integration_tests {
 
         let root_budget = Budget::new(100, 1000, 100_000, 600_000);
 
-        let root_lease = Lease::builder()
+        let mut root_lease = Lease::builder()
             .lease_id("root-lease")
             .issuer_id("registrar")
             .holder_id("root-agent")
@@ -115,7 +119,7 @@ mod integration_tests {
             .unwrap();
 
         // Derive first-level child
-        let child1 = root_lease
+        let mut child1 = root_lease
             .derive(
                 "child-1",
                 "agent-1",
@@ -133,6 +137,9 @@ mod integration_tests {
         assert!(child1.is_derived());
         assert_eq!(child1.parent_lease_id(), Some("root-lease"));
         assert_eq!(child1.budget().remaining_episodes(), 50);
+
+        // Verify root's budget was deducted
+        assert_eq!(root_lease.budget().remaining_episodes(), 50); // 100 - 50
 
         // Derive second-level child from first child
         let child2 = child1
@@ -152,6 +159,9 @@ mod integration_tests {
         assert!(child2.is_derived());
         assert_eq!(child2.parent_lease_id(), Some("child-1"));
         assert_eq!(child2.budget().remaining_episodes(), 10);
+
+        // Verify child1's budget was deducted
+        assert_eq!(child1.budget().remaining_episodes(), 40); // 50 - 10
 
         // Child 2 should have reduced permissions
         assert!(child2.scope().allows_work_id("work-001"));
@@ -263,7 +273,7 @@ mod integration_tests {
     /// Tests that derived leases cannot exceed parent constraints.
     #[test]
     fn test_derivation_constraints() {
-        let parent = Lease::builder()
+        let mut parent = Lease::builder()
             .lease_id("parent")
             .issuer_id("registrar")
             .holder_id("parent-agent")
