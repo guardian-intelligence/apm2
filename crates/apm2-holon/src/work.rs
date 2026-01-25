@@ -61,6 +61,18 @@ pub type ArtifactId = String;
 /// Unique identifier for an episode.
 pub type EpisodeId = String;
 
+/// Maximum number of attempts allowed per work object.
+///
+/// This limit prevents unbounded growth of the attempts vector, which
+/// could lead to denial-of-service during serialization or storage.
+pub const MAX_ATTEMPTS: usize = 100;
+
+/// Maximum number of metadata entries allowed per work object.
+///
+/// This limit prevents unbounded growth of metadata, which could lead
+/// to denial-of-service during serialization or storage.
+pub const MAX_METADATA_ENTRIES: usize = 50;
+
 /// The lifecycle states of a work object.
 ///
 /// This enum represents all possible states in the work lifecycle.
@@ -385,6 +397,18 @@ impl fmt::Display for AttemptOutcome {
 /// - Requirement bindings for traceability
 /// - Produced artifact references for evidence
 /// - Execution attempt history with episode provenance
+/// - Version for optimistic concurrency control
+///
+/// # Limits
+///
+/// To prevent unbounded state growth:
+/// - Maximum [`MAX_ATTEMPTS`] attempts are stored (oldest pruned when exceeded)
+/// - Maximum [`MAX_METADATA_ENTRIES`] metadata entries allowed
+///
+/// # Timestamp Precision
+///
+/// Timestamps are stored as nanoseconds since Unix epoch in a `u64`. This will
+/// overflow around year 2554, which is acceptable for the foreseeable future.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkObject {
     /// Unique identifier for this work item.
@@ -396,6 +420,13 @@ pub struct WorkObject {
     /// Current lifecycle state.
     lifecycle: WorkLifecycle,
 
+    /// Monotonically increasing version for optimistic concurrency control.
+    ///
+    /// This version increments on every state transition or mutation,
+    /// providing a reliable way to detect concurrent modifications in
+    /// distributed systems (independent of wall-clock time).
+    version: u64,
+
     /// The lease ID currently assigned to this work.
     lease_id: Option<String>,
 
@@ -405,7 +436,7 @@ pub struct WorkObject {
     /// Artifact IDs produced by this work.
     artifact_ids: Vec<ArtifactId>,
 
-    /// History of execution attempts.
+    /// History of execution attempts (limited to [`MAX_ATTEMPTS`]).
     attempts: Vec<AttemptRecord>,
 
     /// When the work was created (nanoseconds since epoch).
@@ -420,7 +451,8 @@ pub struct WorkObject {
     /// Reason for the current state (e.g., block reason, failure reason).
     state_reason: Option<String>,
 
-    /// Additional metadata as key-value pairs.
+    /// Additional metadata as key-value pairs (limited to
+    /// [`MAX_METADATA_ENTRIES`]).
     metadata: Vec<(String, String)>,
 }
 
@@ -433,6 +465,7 @@ impl WorkObject {
             id: id.into(),
             title: title.into(),
             lifecycle: WorkLifecycle::Created,
+            version: 1,
             lease_id: None,
             requirement_ids: Vec::new(),
             artifact_ids: Vec::new(),
@@ -458,6 +491,7 @@ impl WorkObject {
             id: id.into(),
             title: title.into(),
             lifecycle: WorkLifecycle::Created,
+            version: 1,
             lease_id: None,
             requirement_ids: Vec::new(),
             artifact_ids: Vec::new(),
@@ -486,6 +520,15 @@ impl WorkObject {
     #[must_use]
     pub const fn lifecycle(&self) -> WorkLifecycle {
         self.lifecycle
+    }
+
+    /// Returns the version number for optimistic concurrency control.
+    ///
+    /// This version monotonically increments on every mutation, providing
+    /// a reliable way to detect concurrent modifications.
+    #[must_use]
+    pub const fn version(&self) -> u64 {
+        self.version
     }
 
     /// Returns the lease ID, if assigned.
@@ -589,12 +632,36 @@ impl WorkObject {
         self.artifact_ids.push(artifact_id.into());
     }
 
-    /// Adds a metadata key-value pair.
-    pub fn set_metadata(&mut self, key: impl Into<String>, value: impl Into<String>) {
+    /// Adds or updates a metadata key-value pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HolonError::ResourceExhausted` if adding a new key would
+    /// exceed [`MAX_METADATA_ENTRIES`].
+    pub fn set_metadata(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<(), HolonError> {
         let key = key.into();
-        // Remove existing entry with same key
-        self.metadata.retain(|(k, _)| k != &key);
+
+        // Check if key already exists (update case - no limit check needed)
+        if let Some(entry) = self.metadata.iter_mut().find(|(k, _)| k == &key) {
+            entry.1 = value.into();
+            self.version = self.version.saturating_add(1);
+            return Ok(());
+        }
+
+        // New key - check limit
+        if self.metadata.len() >= MAX_METADATA_ENTRIES {
+            return Err(HolonError::resource_exhausted(format!(
+                "metadata limit exceeded: maximum {MAX_METADATA_ENTRIES} entries allowed"
+            )));
+        }
+
         self.metadata.push((key, value.into()));
+        self.version = self.version.saturating_add(1);
+        Ok(())
     }
 
     /// Gets a metadata value by key.
@@ -625,6 +692,7 @@ impl WorkObject {
         }
         let previous = self.lifecycle;
         self.lifecycle = target;
+        self.version = self.version.saturating_add(1);
         self.updated_at_ns = current_timestamp_ns();
         Ok(previous)
     }
@@ -646,6 +714,7 @@ impl WorkObject {
         }
         let previous = self.lifecycle;
         self.lifecycle = target;
+        self.version = self.version.saturating_add(1);
         self.updated_at_ns = timestamp_ns;
         Ok(previous)
     }
@@ -836,7 +905,9 @@ impl WorkObject {
 
     /// Starts a new execution attempt.
     ///
-    /// The work must be in `InProgress` state to start an attempt.
+    /// The work must be in `InProgress` state to start an attempt. If the
+    /// number of attempts exceeds [`MAX_ATTEMPTS`], the oldest attempt is
+    /// pruned to make room for the new one.
     ///
     /// # Errors
     ///
@@ -864,8 +935,14 @@ impl WorkObject {
             .clone()
             .ok_or_else(|| HolonError::missing_context("lease_id"))?;
 
+        // Prune oldest attempts if at limit
+        while self.attempts.len() >= MAX_ATTEMPTS {
+            self.attempts.remove(0);
+        }
+
         let attempt = AttemptRecord::new(attempt_id, episode_id, lease_id, current_timestamp_ns());
         self.attempts.push(attempt);
+        self.version = self.version.saturating_add(1);
 
         // SAFETY: We just pushed an element, so last_mut will always succeed.
         // Using unwrap_unchecked would require unsafe, so we use expect with a
@@ -877,6 +954,9 @@ impl WorkObject {
     }
 
     /// Starts a new execution attempt with a specific timestamp.
+    ///
+    /// If the number of attempts exceeds [`MAX_ATTEMPTS`], the oldest attempt
+    /// is pruned to make room for the new one.
     ///
     /// # Errors
     ///
@@ -905,8 +985,14 @@ impl WorkObject {
             .clone()
             .ok_or_else(|| HolonError::missing_context("lease_id"))?;
 
+        // Prune oldest attempts if at limit
+        while self.attempts.len() >= MAX_ATTEMPTS {
+            self.attempts.remove(0);
+        }
+
         let attempt = AttemptRecord::new(attempt_id, episode_id, lease_id, timestamp_ns);
         self.attempts.push(attempt);
+        self.version = self.version.saturating_add(1);
 
         // SAFETY: We just pushed an element, so last_mut will always succeed.
         Ok(self
@@ -1256,9 +1342,9 @@ mod unit_tests {
     #[test]
     fn test_work_object_metadata() {
         let mut work = WorkObject::new("work-1", "Test");
-        work.set_metadata("key1", "value1");
-        work.set_metadata("key2", "value2");
-        work.set_metadata("key1", "updated"); // Update existing
+        work.set_metadata("key1", "value1").unwrap();
+        work.set_metadata("key2", "value2").unwrap();
+        work.set_metadata("key1", "updated").unwrap(); // Update existing
 
         assert_eq!(work.get_metadata("key1"), Some("updated"));
         assert_eq!(work.get_metadata("key2"), Some("value2"));
@@ -1272,6 +1358,77 @@ mod unit_tests {
 
         work.set_parent_work_id("parent-1");
         assert_eq!(work.parent_work_id(), Some("parent-1"));
+    }
+
+    #[test]
+    fn test_version_increments_on_transition() {
+        let mut work = WorkObject::new_with_timestamp("work-1", "Test", 1000);
+        assert_eq!(work.version(), 1);
+
+        work.transition_to_leased_at("lease-1", 2000).unwrap();
+        assert_eq!(work.version(), 2);
+
+        work.transition_to_in_progress_at(3000).unwrap();
+        assert_eq!(work.version(), 3);
+
+        work.transition_to_completed_at(4000).unwrap();
+        assert_eq!(work.version(), 4);
+    }
+
+    #[test]
+    fn test_version_increments_on_metadata_change() {
+        let mut work = WorkObject::new_with_timestamp("work-1", "Test", 1000);
+        assert_eq!(work.version(), 1);
+
+        work.set_metadata("key1", "value1").unwrap();
+        assert_eq!(work.version(), 2);
+
+        // Update existing key also increments version
+        work.set_metadata("key1", "updated").unwrap();
+        assert_eq!(work.version(), 3);
+    }
+
+    #[test]
+    fn test_metadata_limit_enforced() {
+        let mut work = WorkObject::new("work-1", "Test");
+
+        // Fill to the limit
+        for i in 0..MAX_METADATA_ENTRIES {
+            work.set_metadata(format!("key{i}"), "value").unwrap();
+        }
+
+        // Next new key should fail
+        let result = work.set_metadata("one_more_key", "value");
+        assert!(result.is_err());
+
+        // Updating existing key should still work
+        let result = work.set_metadata("key0", "updated");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_attempts_pruned_at_limit() {
+        let mut work = WorkObject::new_with_timestamp("work-1", "Test", 1000);
+        work.transition_to_leased_at("lease-1", 2000).unwrap();
+        work.transition_to_in_progress_at(3000).unwrap();
+
+        // Create MAX_ATTEMPTS + 5 attempts
+        for i in 0..(MAX_ATTEMPTS + 5) {
+            work.start_attempt_at(format!("att-{i}"), format!("ep-{i}"), 4000 + i as u64)
+                .unwrap();
+        }
+
+        // Should have exactly MAX_ATTEMPTS
+        assert_eq!(work.attempt_count(), MAX_ATTEMPTS);
+
+        // Oldest attempts should have been pruned - first attempt should be att-5
+        assert_eq!(work.attempts()[0].attempt_id(), "att-5");
+
+        // Most recent should be the last one added
+        assert_eq!(
+            work.current_attempt().unwrap().attempt_id(),
+            format!("att-{}", MAX_ATTEMPTS + 4)
+        );
     }
 
     // =========================================================================
