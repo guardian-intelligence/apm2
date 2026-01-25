@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-25"
-  template_version: "2026-01-25"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00081"
     title: "Document sccache setup in CONTRIBUTING.md"
@@ -11,7 +11,8 @@ ticket_meta:
       - requirement_id: "PERF-002"
         requirement_ref: "documents/rfcs/RFC-0007/01_problem_and_imports.yaml#rfc_local_requirements.requirements[1]"
     evidence_artifacts:
-      - "EVID-7002"
+      - evidence_id: "EVID-7002"
+        artifact_ref: "documents/work/tickets/TCK-00081.md#evidence"
   custody:
     agent_roles:
       - "AGENT_IMPLEMENTER"

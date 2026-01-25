@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-25"
-  template_version: "2026-01-25"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00080"
     title: "Configure mold linker in .cargo/config.toml"
@@ -11,7 +11,8 @@ ticket_meta:
       - requirement_id: "PERF-001"
         requirement_ref: "documents/rfcs/RFC-0007/01_problem_and_imports.yaml#rfc_local_requirements.requirements[0]"
     evidence_artifacts:
-      - "EVID-7001"
+      - evidence_id: "EVID-7001"
+        artifact_ref: "documents/rfcs/RFC-0007/05_evidence_definitions.yaml#evidence_definitions.evidence_artifacts[0]"
   custody:
     agent_roles:
       - "AGENT_IMPLEMENTER"

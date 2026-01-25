@@ -24,7 +24,7 @@ ticket_meta:
       - "TCK-00080"
   scope:
     in_scope:
-      - "Add section explaining CI vs local build settings"
+      - "Add section explaining CI vs local build settings to CONTRIBUTING.md"
       - "Explain CARGO_INCREMENTAL=0 in CI (for reproducibility)"
       - "Recommend CARGO_INCREMENTAL=1 locally (for speed)"
       - "Provide complete shell profile snippet"
