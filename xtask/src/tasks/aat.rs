@@ -264,10 +264,14 @@ fn generate_hypotheses(
     // Create a summary of the diff (truncate if too large for AI context)
     let diff_summary = create_diff_summary(diff);
 
-    // Substitute placeholders in the prompt template
+    // Substitute placeholders in the prompt template.
+    // Note: We replace $DIFF_SUMMARY first, then $PR_DESCRIPTION, to prevent
+    // potential injection where a malicious PR description contains
+    // "$DIFF_SUMMARY". This order ensures user content ($PR_DESCRIPTION) is
+    // substituted last, so it cannot reference other placeholders.
     let prompt = prompt_template
-        .replace("$PR_DESCRIPTION", pr_description)
-        .replace("$DIFF_SUMMARY", &diff_summary);
+        .replace("$DIFF_SUMMARY", &diff_summary)
+        .replace("$PR_DESCRIPTION", pr_description);
 
     // Write prompt to secure temp file
     let mut prompt_file =
@@ -412,9 +416,21 @@ fn build_ai_script_command(prompt_path: &Path, tool_config: &AatToolConfig) -> S
 /// The AI is expected to return a JSON array of hypothesis objects.
 /// This function extracts the JSON from the output (which may contain
 /// other text like markdown formatting) and parses it.
+///
+/// Parsing strategy (in order):
+/// 1. Try to parse the entire trimmed output as JSON directly
+/// 2. Try to extract JSON from a markdown code block
+/// 3. Try to find a JSON array in the text (string-aware bracket matching)
 fn parse_ai_response(output: &str) -> Result<Vec<RawHypothesis>> {
-    // The AI might wrap the JSON in markdown code blocks or include other text.
-    // We need to find and extract the JSON array.
+    let trimmed = output.trim();
+
+    // Strategy 1: Try to parse the entire output as JSON directly
+    // This handles the clean case where AI returns raw JSON without any wrapper
+    if let Ok(hypotheses) = serde_json::from_str::<Vec<RawHypothesis>>(trimmed) {
+        return Ok(hypotheses);
+    }
+
+    // Strategy 2 & 3: Extract JSON from wrapped content
     let json_str = extract_json_array(output).with_context(|| {
         format!(
             "Could not find JSON array in AI response\n\
@@ -444,28 +460,57 @@ fn parse_ai_response(output: &str) -> Result<Vec<RawHypothesis>> {
 /// - Wrapped in markdown code blocks (```json ... ```)
 /// - Preceded or followed by other text
 /// - The entire output
+///
+/// This function properly handles brackets inside JSON strings by tracking
+/// string context (respecting escaped quotes and escape sequences).
 fn extract_json_array(text: &str) -> Option<&str> {
     // First, try to find JSON in a markdown code block
     if let Some(json) = extract_from_code_block(text) {
         return Some(json);
     }
 
-    // Otherwise, find the first '[' and matching ']'
+    // Otherwise, find the first '[' and matching ']' with string awareness
     let start = text.find('[')?;
+    let bytes = &text.as_bytes()[start..];
     let mut depth = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
     let mut end = None;
 
-    for (i, c) in text[start..].char_indices() {
-        match c {
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(start + i + 1);
-                    break;
-                }
-            },
-            _ => {},
+    for (i, &byte) in bytes.iter().enumerate() {
+        let c = byte as char;
+
+        if escape_next {
+            // Skip this character, it's escaped
+            escape_next = false;
+            continue;
+        }
+
+        if c == '\\' && in_string {
+            // Next character is escaped
+            escape_next = true;
+            continue;
+        }
+
+        if c == '"' {
+            // Toggle string context
+            in_string = !in_string;
+            continue;
+        }
+
+        // Only count brackets outside of strings
+        if !in_string {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(start + i + 1);
+                        break;
+                    }
+                },
+                _ => {},
+            }
         }
     }
 
@@ -1058,5 +1103,90 @@ These hypotheses cover the main scenarios."#;
         let input = "```json\n{\"not\": \"array\"}\n```";
         let result = extract_from_code_block(input);
         assert!(result.is_none()); // Not an array
+    }
+
+    // -------------------------------------------------------------------------
+    // Edge case tests for JSON extraction (brackets in strings)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_json_array_brackets_in_string() {
+        // This tests the case where brackets appear inside a JSON string value
+        // The old implementation would fail on this because it didn't track string
+        // context
+        let input = r#"[{"id": "H-001", "pattern": "[a-z]+", "tests_error_handling": false}]"#;
+        let result = extract_json_array(input);
+        assert!(result.is_some(), "Should handle brackets inside strings");
+        let json = result.unwrap();
+        assert_eq!(json, input, "Should extract the entire array");
+    }
+
+    #[test]
+    fn test_extract_json_array_single_bracket_in_string() {
+        // Edge case: single '[' in a string should not break parsing
+        let input = r#"["["]"#;
+        let result = extract_json_array(input);
+        assert!(result.is_some(), "Should handle single bracket in string");
+        assert_eq!(result.unwrap(), input);
+    }
+
+    #[test]
+    fn test_extract_json_array_escaped_quote_in_string() {
+        // Test that escaped quotes inside strings are handled properly
+        let input =
+            r#"[{"id": "H-001", "text": "He said \"hello\"", "tests_error_handling": false}]"#;
+        let result = extract_json_array(input);
+        assert!(result.is_some(), "Should handle escaped quotes in strings");
+        assert_eq!(result.unwrap(), input);
+    }
+
+    #[test]
+    fn test_extract_json_array_backslash_before_bracket() {
+        // Test backslash handling: backslash before bracket inside string
+        let input = r#"[{"path": "C:\\Users\\[test]"}]"#;
+        let result = extract_json_array(input);
+        assert!(result.is_some(), "Should handle backslash sequences");
+        assert_eq!(result.unwrap(), input);
+    }
+
+    #[test]
+    fn test_parse_ai_response_direct_json() {
+        // Test that clean JSON without any wrapper is parsed correctly
+        let input = r#"[
+            {"id": "H-001", "prediction": "test", "verification_method": "cmd", "tests_error_handling": true},
+            {"id": "H-002", "prediction": "test2", "verification_method": "cmd2", "tests_error_handling": false},
+            {"id": "H-003", "prediction": "test3", "verification_method": "cmd3", "tests_error_handling": false}
+        ]"#;
+        let result = parse_ai_response(input);
+        assert!(result.is_ok(), "Should parse clean JSON directly");
+        assert_eq!(result.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_parse_ai_response_with_whitespace() {
+        // Test that JSON with leading/trailing whitespace is parsed correctly
+        let input = "  \n\n  [{\"id\": \"H-001\", \"prediction\": \"test\", \"verification_method\": \"cmd\", \"tests_error_handling\": true}, {\"id\": \"H-002\", \"prediction\": \"test2\", \"verification_method\": \"cmd2\", \"tests_error_handling\": false}, {\"id\": \"H-003\", \"prediction\": \"test3\", \"verification_method\": \"cmd3\", \"tests_error_handling\": false}]  \n\n  ";
+        let result = parse_ai_response(input);
+        assert!(
+            result.is_ok(),
+            "Should parse JSON with surrounding whitespace"
+        );
+    }
+
+    #[test]
+    fn test_parse_ai_response_brackets_in_verification_method() {
+        // Test that brackets in verification_method (e.g., regex) don't break parsing
+        let input = r#"[
+            {"id": "H-001", "prediction": "Pattern matches", "verification_method": "grep '[0-9]+' file.txt", "tests_error_handling": false},
+            {"id": "H-002", "prediction": "Error on invalid", "verification_method": "echo '[error]'", "tests_error_handling": true},
+            {"id": "H-003", "prediction": "Build works", "verification_method": "cargo build", "tests_error_handling": false}
+        ]"#;
+        let result = parse_ai_response(input);
+        assert!(
+            result.is_ok(),
+            "Should handle brackets in verification_method"
+        );
+        let hypotheses = result.unwrap();
+        assert_eq!(hypotheses[0].verification_method, "grep '[0-9]+' file.txt");
     }
 }
