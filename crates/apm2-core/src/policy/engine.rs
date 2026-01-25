@@ -305,12 +305,21 @@ impl PolicyEngine {
                 if !rule.hosts.is_empty() {
                     // Check if the provider matches any allowed host
                     // Fail closed: if provider doesn't match any host, don't match
+                    //
+                    // Security: Use strict matching to prevent confusion attacks.
+                    // - Exact match: "anthropic" matches only "anthropic"
+                    // - Subdomain match: "anthropic" also allows "api.anthropic" (provider ends
+                    //   with ".{host}")
+                    // - Full domain match: "anthropic.com" matches "anthropic.com" or
+                    //   "api.anthropic.com"
+                    //
+                    // NEVER use `contains` - it would allow "google.malicious.com"
+                    // to match a rule allowing "google".
                     let provider_matches = rule.hosts.iter().any(|host| {
-                        // Match provider exactly or as a prefix (e.g., "anthropic" matches
-                        // "anthropic.com")
+                        // Exact match
                         req.provider == *host
-                            || req.provider.starts_with(&format!("{host}."))
-                            || host.contains(&req.provider)
+                            // Provider is a subdomain of host (e.g., "api.anthropic" for "anthropic")
+                            || req.provider.ends_with(&format!(".{host}"))
                     });
                     if !provider_matches {
                         return false;
@@ -1412,6 +1421,119 @@ policy:
         // Should be denied because the network rule doesn't match (fail closed)
         // and default is deny
         assert!(result.is_denied());
+    }
+
+    #[test]
+    fn test_inference_host_confusion_attack_prevention() {
+        // Security: Test that inference host matching prevents confusion attacks.
+        // If "google" is allowed, "google.malicious.com" must NOT match.
+        // If "anthropic.com" is allowed, providers containing "thropic" must NOT match.
+        let yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test"
+  rules:
+    - id: "allow-google-only"
+      type: network
+      hosts:
+        - "google"
+      decision: allow
+  default_decision: deny
+"#;
+        let policy = create_test_policy(yaml);
+        let engine = PolicyEngine::new(&policy);
+
+        // Exact match should work
+        let request = ToolRequest {
+            request_id: "test-req".to_string(),
+            session_token: "test-session".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::Inference(InferenceCall {
+                provider: "google".to_string(),
+                model: "gemini".to_string(),
+                prompt_hash: vec![0u8; 32],
+                max_tokens: 1000,
+                temperature_scaled: 70,
+                system_prompt_hash: vec![],
+            })),
+        };
+        assert!(engine.evaluate(&request).is_allowed());
+
+        // Subdomain of allowed host should work (api.google)
+        let request = ToolRequest {
+            request_id: "test-req".to_string(),
+            session_token: "test-session".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::Inference(InferenceCall {
+                provider: "api.google".to_string(),
+                model: "gemini".to_string(),
+                prompt_hash: vec![0u8; 32],
+                max_tokens: 1000,
+                temperature_scaled: 70,
+                system_prompt_hash: vec![],
+            })),
+        };
+        assert!(engine.evaluate(&request).is_allowed());
+
+        // SECURITY: Malicious domain with allowed name as prefix MUST be rejected
+        // "google.malicious.com" should NOT match "google"
+        let request = ToolRequest {
+            request_id: "test-req".to_string(),
+            session_token: "test-session".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::Inference(InferenceCall {
+                provider: "google.malicious.com".to_string(),
+                model: "fake-model".to_string(),
+                prompt_hash: vec![0u8; 32],
+                max_tokens: 1000,
+                temperature_scaled: 70,
+                system_prompt_hash: vec![],
+            })),
+        };
+        assert!(
+            engine.evaluate(&request).is_denied(),
+            "google.malicious.com should NOT match allowed host 'google'"
+        );
+
+        // SECURITY: Similar name should NOT match via contains
+        // "google-proxy" should NOT match "google"
+        let request = ToolRequest {
+            request_id: "test-req".to_string(),
+            session_token: "test-session".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::Inference(InferenceCall {
+                provider: "google-proxy".to_string(),
+                model: "fake-model".to_string(),
+                prompt_hash: vec![0u8; 32],
+                max_tokens: 1000,
+                temperature_scaled: 70,
+                system_prompt_hash: vec![],
+            })),
+        };
+        assert!(
+            engine.evaluate(&request).is_denied(),
+            "google-proxy should NOT match allowed host 'google'"
+        );
+
+        // SECURITY: Substring match should NOT work
+        // "oogle" should NOT match "google"
+        let request = ToolRequest {
+            request_id: "test-req".to_string(),
+            session_token: "test-session".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::Inference(InferenceCall {
+                provider: "oogle".to_string(),
+                model: "fake-model".to_string(),
+                prompt_hash: vec![0u8; 32],
+                max_tokens: 1000,
+                temperature_scaled: 70,
+                system_prompt_hash: vec![],
+            })),
+        };
+        assert!(
+            engine.evaluate(&request).is_denied(),
+            "oogle should NOT match allowed host 'google'"
+        );
     }
 
     #[test]
