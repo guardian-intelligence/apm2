@@ -203,3 +203,17 @@ rfc_problem_and_imports:
         verification:
           command: "grep -A5 'export RUSTC_WRAPPER' CONTRIBUTING.md"
           pass_condition: "Shell snippet exists"
+
+      - id: PERF-006
+        type: PERFORMANCE
+        title: "Add release build job to CI workflow"
+        statement: |
+          The project MUST have a CI job that performs explicit release builds
+          to catch optimization-related bugs not visible in debug builds.
+        acceptance_criteria:
+          - "CI workflow contains 'Release Build' job"
+          - "Job runs cargo build --workspace --release"
+          - "Job passes on all PRs"
+        verification:
+          command: "grep -q 'cargo build --workspace --release' .github/workflows/ci.yml"
+          pass_condition: "Release build job exists"

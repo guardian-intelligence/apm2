@@ -158,6 +158,42 @@ rfc_ticket_decomposition:
         evidence_ids:
         - EVID-7004
 
+    # =================================================================
+    # PHASE 2: CI Enhancement
+    # =================================================================
+    - ticket_id: TCK-00084
+      title: "Add release build job to CI workflow"
+      ticket_files:
+        meta_ref: "documents/work/tickets/TCK-00084.yaml#ticket_meta"
+        body_path: "documents/work/tickets/TCK-00084.md"
+      scope:
+        in_scope:
+        - "Add new 'Release Build' job to .github/workflows/ci.yml"
+        - "Use ubuntu-24.04 runner for consistency"
+        - "Install protobuf-compiler for protoc dependency"
+        - "Run cargo build --workspace --release"
+        out_of_scope:
+        - "Modifying existing CI jobs"
+        - "Adding release build artifacts to releases"
+        - "Cross-compilation targets"
+      binds:
+        requirement_ids:
+        - PERF-006
+        evidence_ids:
+        - EVID-7005
+      custody_agent_roles:
+      - AGENT_IMPLEMENTER
+      responsibility_domains:
+      - DOMAIN_BUILD_RELEASE
+      dependencies: []
+      definition_of_done:
+        criteria:
+        - "CI workflow contains 'Release Build' job"
+        - "Job runs cargo build --workspace --release"
+        - "Release build passes on PR CI"
+        evidence_ids:
+        - EVID-7005
+
   dependency_graph: |
     Phase 0 (Configuration):
     +-------------+
@@ -173,8 +209,15 @@ rfc_ticket_decomposition:
     |  docs       |  docs       |  settings   |
     +-------------+-------------+-------------+
 
+    Phase 2 (CI Enhancement):
+    +-------------+
+    |  TCK-00084  |  Release build CI job
+    |  ci.yml     |
+    +-------------+
+
     Phase 1 tickets can run in parallel after TCK-00080 completes.
     They all modify CONTRIBUTING.md but in separate sections.
+    Phase 2 (TCK-00084) is independent and can run in parallel with all other phases.
 
   requirement_coverage:
     notes: |
@@ -184,6 +227,7 @@ rfc_ticket_decomposition:
       - PERF-003: TCK-00082 (nextest documentation)
       - PERF-004: TCK-00083 (CI vs local settings)
       - PERF-005: TCK-00083 (shell profile snippet)
+      - PERF-006: TCK-00084 (release build CI job)
     uncovered_requirements: []
 
   notes: |
