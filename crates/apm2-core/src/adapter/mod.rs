@@ -124,8 +124,8 @@ pub use config::{
 pub use error::AdapterError;
 pub use event::{
     AdapterEvent, AdapterEventPayload, DetectionMethod, ExitClassification, FileChangeType,
-    FilesystemChange, ProcessExited, ProcessStarted, ProgressSignal, ProgressType,
-    SeccompViolation, StallDetected, ToolRequestDetected,
+    FilesystemChange, ProcessExited, ProcessStarted, ProgressSignal, ProgressType, StallDetected,
+    ToolRequestDetected,
 };
 pub use seccomp::{
     SeccompError, SeccompProfile, SeccompProfileLevel, SeccompResult, apply_seccomp_filter,

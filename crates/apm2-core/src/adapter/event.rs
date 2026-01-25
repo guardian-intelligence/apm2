@@ -60,12 +60,6 @@ pub enum AdapterEventPayload {
 
     /// Diagnostic event for protocol violations and security issues.
     Diagnostic(Diagnostic),
-
-    /// Seccomp policy violation detected (Linux only).
-    ///
-    /// This event is emitted when a process attempts a blocked syscall.
-    /// The process will be terminated after this event is logged.
-    SeccompViolation(SeccompViolation),
 }
 
 /// Diagnostic event for protocol violations and security issues.
@@ -363,28 +357,6 @@ pub struct StallDetected {
 
     /// Number of stalls detected for this session.
     pub stall_count: u32,
-}
-
-/// Seccomp policy violation event.
-///
-/// Emitted when a sandboxed process attempts to execute a blocked syscall.
-/// This is logged before the process is terminated (fail-closed behavior).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SeccompViolation {
-    /// OS process ID of the violating process.
-    pub pid: u32,
-
-    /// The syscall number that was blocked.
-    pub syscall_number: i32,
-
-    /// Human-readable name of the syscall (if known).
-    pub syscall_name: Option<String>,
-
-    /// The seccomp profile level that was active.
-    pub profile_level: String,
-
-    /// Instruction pointer where the violation occurred (if available).
-    pub instruction_pointer: Option<u64>,
 }
 
 #[cfg(test)]
