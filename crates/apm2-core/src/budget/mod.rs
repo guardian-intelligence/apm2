@@ -535,6 +535,70 @@ impl std::fmt::Display for BudgetExceededError {
 
 impl std::error::Error for BudgetExceededError {}
 
+// ============================================================================
+// Event Integration
+// ============================================================================
+
+use crate::events::{self, PolicyEvent, policy_event};
+
+/// Creates a `BudgetExceeded` policy event from a budget check result.
+///
+/// This should be called when a budget is exceeded to emit an event to the
+/// ledger.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use apm2_core::budget::{BudgetTracker, BudgetType, create_budget_exceeded_event};
+///
+/// let tracker = BudgetTracker::new("session-123", BudgetConfig::default());
+/// // ... after budget exceeded ...
+/// if let Some(exceeded) = tracker.first_exceeded() {
+///     let event = create_budget_exceeded_event(&tracker, exceeded);
+///     // Emit event to ledger...
+/// }
+/// ```
+#[must_use]
+pub fn create_budget_exceeded_event(
+    tracker: &BudgetTracker,
+    budget_type: BudgetType,
+) -> PolicyEvent {
+    PolicyEvent {
+        event: Some(policy_event::Event::BudgetExceeded(
+            events::BudgetExceeded {
+                session_id: tracker.session_id().to_string(),
+                budget_type: budget_type.as_str().to_string(),
+                limit: tracker.limit(budget_type),
+                consumed: tracker.consumed(budget_type),
+            },
+        )),
+    }
+}
+
+/// Creates a `BudgetExceeded` policy event from components.
+///
+/// This is useful when you have the individual components rather than a
+/// tracker.
+#[must_use]
+#[allow(clippy::missing_const_for_fn)] // Cannot be const due to heap allocations
+pub fn create_budget_exceeded_event_from_parts(
+    session_id: String,
+    budget_type: BudgetType,
+    limit: u64,
+    consumed: u64,
+) -> PolicyEvent {
+    PolicyEvent {
+        event: Some(policy_event::Event::BudgetExceeded(
+            events::BudgetExceeded {
+                session_id,
+                budget_type: budget_type.as_str().to_string(),
+                limit,
+                consumed,
+            },
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,5 +816,83 @@ mod tests {
         let config = BudgetConfig::default();
         let mut tracker = BudgetTracker::new("session-1", config);
         tracker.charge(BudgetType::Time, 100);
+    }
+
+    // ========================================================================
+    // Event Integration Tests
+    // ========================================================================
+
+    #[test]
+    fn test_create_budget_exceeded_event() {
+        use crate::events::policy_event;
+
+        let config = BudgetConfig::builder()
+            .token_budget(1000)
+            .tool_call_budget(100)
+            .build();
+        let mut tracker = BudgetTracker::new("session-123", config);
+
+        // Exceed the token budget
+        tracker.charge(BudgetType::Token, 1500);
+
+        let event = super::create_budget_exceeded_event(&tracker, BudgetType::Token);
+
+        match event.event {
+            Some(policy_event::Event::BudgetExceeded(exceeded)) => {
+                assert_eq!(exceeded.session_id, "session-123");
+                assert_eq!(exceeded.budget_type, "TOKEN");
+                assert_eq!(exceeded.limit, 1000);
+                assert_eq!(exceeded.consumed, 1500);
+            },
+            _ => panic!("Expected BudgetExceeded event"),
+        }
+    }
+
+    #[test]
+    fn test_create_budget_exceeded_event_from_parts() {
+        use crate::events::policy_event;
+
+        let event = super::create_budget_exceeded_event_from_parts(
+            "session-456".to_string(),
+            BudgetType::ToolCalls,
+            500,
+            750,
+        );
+
+        match event.event {
+            Some(policy_event::Event::BudgetExceeded(exceeded)) => {
+                assert_eq!(exceeded.session_id, "session-456");
+                assert_eq!(exceeded.budget_type, "TOOL_CALLS");
+                assert_eq!(exceeded.limit, 500);
+                assert_eq!(exceeded.consumed, 750);
+            },
+            _ => panic!("Expected BudgetExceeded event"),
+        }
+    }
+
+    #[test]
+    fn test_create_budget_exceeded_event_time() {
+        use crate::events::policy_event;
+
+        // Create a tracker with a very short time budget
+        let config = BudgetConfig::builder()
+            .time_budget_ms(1)  // 1ms
+            .build();
+        let tracker = BudgetTracker::new("session-789", config);
+
+        // Wait briefly to exceed
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let event = super::create_budget_exceeded_event(&tracker, BudgetType::Time);
+
+        match event.event {
+            Some(policy_event::Event::BudgetExceeded(exceeded)) => {
+                assert_eq!(exceeded.session_id, "session-789");
+                assert_eq!(exceeded.budget_type, "TIME");
+                assert_eq!(exceeded.limit, 1);
+                assert!(exceeded.consumed >= 1); // Should have elapsed at least 1ms
+            },
+            _ => panic!("Expected BudgetExceeded event"),
+        }
     }
 }

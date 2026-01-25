@@ -72,11 +72,15 @@ use std::sync::Arc;
 
 use super::parser::LoadedPolicy;
 use super::schema::{Decision, Rule, RuleType};
+use crate::budget::BudgetTracker;
 use crate::events::ToolDecided;
 use crate::tool::{ToolRequest, tool_request};
 
 /// Special rule ID for default-deny decisions.
 pub const DEFAULT_DENY_RULE_ID: &str = "DEFAULT_DENY";
+
+/// Rule ID used when a request is denied due to budget exceeded.
+pub const BUDGET_EXCEEDED_RULE_ID: &str = "BUDGET_EXCEEDED";
 
 /// Rationale code for default-deny decisions.
 pub const DEFAULT_DENY_RATIONALE: &str = "NO_MATCHING_RULE";
@@ -156,6 +160,60 @@ impl PolicyEngine {
 
         // No rule matched - apply default decision
         self.apply_default_decision(&tool_name)
+    }
+
+    /// Evaluates a tool request against the policy with budget enforcement.
+    ///
+    /// This method first checks if any budget is exceeded. If so, the request
+    /// is immediately denied with the `BUDGET_EXCEEDED` rule ID. Otherwise,
+    /// normal policy evaluation proceeds.
+    ///
+    /// # Budget Enforcement
+    ///
+    /// Budget checks are performed **before** policy evaluation as a
+    /// fail-closed gate. This ensures that:
+    /// - Requests are denied when any budget is exceeded
+    /// - Policy rules cannot override budget limits
+    /// - Budget exhaustion is caught even for otherwise-allowed operations
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use apm2_core::budget::{BudgetConfig, BudgetTracker};
+    /// use apm2_core::policy::{LoadedPolicy, PolicyEngine};
+    ///
+    /// let policy = LoadedPolicy::from_yaml("...").unwrap();
+    /// let engine = PolicyEngine::new(&policy);
+    /// let tracker = BudgetTracker::new("session-123", BudgetConfig::default());
+    ///
+    /// let result = engine.evaluate_with_budget(&request, &tracker);
+    /// if result.is_denied() && result.rule_id == "BUDGET_EXCEEDED" {
+    ///     // Handle budget exceeded - emit BudgetExceeded event
+    /// }
+    /// ```
+    #[must_use]
+    pub fn evaluate_with_budget(
+        &self,
+        request: &ToolRequest,
+        budget_tracker: &BudgetTracker,
+    ) -> EvaluationResult {
+        // Check budget first (fail-closed gate)
+        if let Some(exceeded_type) = budget_tracker.first_exceeded() {
+            return EvaluationResult::denied(
+                BUDGET_EXCEEDED_RULE_ID.to_string(),
+                format!("{}_BUDGET_EXCEEDED", exceeded_type.as_str()),
+                self.policy.content_hash,
+                format!(
+                    "{} budget exceeded: consumed {} of {} limit",
+                    exceeded_type,
+                    budget_tracker.consumed(exceeded_type),
+                    budget_tracker.limit(exceeded_type)
+                ),
+            );
+        }
+
+        // Budget OK - proceed with normal policy evaluation
+        self.evaluate(request)
     }
 
     /// Evaluates a single rule against a tool request.
@@ -1700,6 +1758,207 @@ policy:
             })),
         };
         assert!(engine.evaluate(&request).is_allowed());
+    }
+
+    // ========================================================================
+    // Budget Integration Tests
+    // ========================================================================
+
+    #[test]
+    fn test_evaluate_with_budget_allows_when_budget_ok() {
+        use crate::budget::{BudgetConfig, BudgetTracker};
+
+        let yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test"
+  rules:
+    - id: "allow-all"
+      type: tool_allow
+      tool: "*"
+      paths:
+        - "**"
+      decision: allow
+  default_decision: deny
+"#;
+        let policy = create_test_policy(yaml);
+        let engine = PolicyEngine::new(&policy);
+        let tracker = BudgetTracker::new("session-123", BudgetConfig::default());
+
+        let request = create_file_read_request("/any/file.txt");
+        let result = engine.evaluate_with_budget(&request, &tracker);
+
+        assert!(result.is_allowed());
+        assert_eq!(result.rule_id, "allow-all");
+    }
+
+    #[test]
+    fn test_evaluate_with_budget_denies_when_token_budget_exceeded() {
+        use crate::budget::{BudgetConfig, BudgetTracker, BudgetType};
+
+        let yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test"
+  rules:
+    - id: "allow-all"
+      type: tool_allow
+      tool: "*"
+      paths:
+        - "**"
+      decision: allow
+  default_decision: deny
+"#;
+        let policy = create_test_policy(yaml);
+        let engine = PolicyEngine::new(&policy);
+
+        let config = BudgetConfig::builder().token_budget(1000).build();
+        let mut tracker = BudgetTracker::new("session-123", config);
+
+        // Exceed the token budget
+        tracker.charge(BudgetType::Token, 1500);
+
+        let request = create_file_read_request("/any/file.txt");
+        let result = engine.evaluate_with_budget(&request, &tracker);
+
+        // Should be denied due to budget exceeded
+        assert!(result.is_denied());
+        assert_eq!(result.rule_id, BUDGET_EXCEEDED_RULE_ID);
+        assert_eq!(result.rationale_code, "TOKEN_BUDGET_EXCEEDED");
+        assert!(result.message.contains("TOKEN budget exceeded"));
+    }
+
+    #[test]
+    fn test_evaluate_with_budget_denies_when_tool_call_budget_exceeded() {
+        use crate::budget::{BudgetConfig, BudgetTracker, BudgetType};
+
+        let yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test"
+  rules:
+    - id: "allow-all"
+      type: tool_allow
+      tool: "*"
+      decision: allow
+  default_decision: deny
+"#;
+        let policy = create_test_policy(yaml);
+        let engine = PolicyEngine::new(&policy);
+
+        let config = BudgetConfig::builder().tool_call_budget(10).build();
+        let mut tracker = BudgetTracker::new("session-456", config);
+
+        // Exceed the tool call budget
+        for _ in 0..15 {
+            tracker.charge(BudgetType::ToolCalls, 1);
+        }
+
+        let request = create_shell_exec_request("cargo test");
+        let result = engine.evaluate_with_budget(&request, &tracker);
+
+        assert!(result.is_denied());
+        assert_eq!(result.rule_id, BUDGET_EXCEEDED_RULE_ID);
+        assert_eq!(result.rationale_code, "TOOL_CALLS_BUDGET_EXCEEDED");
+    }
+
+    #[test]
+    fn test_evaluate_with_budget_denies_when_time_budget_exceeded() {
+        use crate::budget::{BudgetConfig, BudgetTracker};
+
+        let yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test"
+  rules:
+    - id: "allow-all"
+      type: tool_allow
+      tool: "*"
+      decision: allow
+  default_decision: deny
+"#;
+        let policy = create_test_policy(yaml);
+        let engine = PolicyEngine::new(&policy);
+
+        // Create a tracker with a very short time budget
+        let config = BudgetConfig::builder()
+            .time_budget_ms(1)  // 1ms
+            .build();
+        let tracker = BudgetTracker::new("session-789", config);
+
+        // Wait for time budget to expire
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let request = create_file_read_request("/any/file.txt");
+        let result = engine.evaluate_with_budget(&request, &tracker);
+
+        assert!(result.is_denied());
+        assert_eq!(result.rule_id, BUDGET_EXCEEDED_RULE_ID);
+        assert_eq!(result.rationale_code, "TIME_BUDGET_EXCEEDED");
+    }
+
+    #[test]
+    fn test_evaluate_with_budget_budget_check_precedes_policy() {
+        use crate::budget::{BudgetConfig, BudgetTracker, BudgetType};
+
+        // Even with a deny-all policy, budget exceeded should take precedence
+        let yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test"
+  rules:
+    - id: "deny-all"
+      type: tool_deny
+      tool: "*"
+      decision: deny
+  default_decision: deny
+"#;
+        let policy = create_test_policy(yaml);
+        let engine = PolicyEngine::new(&policy);
+
+        let config = BudgetConfig::builder().token_budget(100).build();
+        let mut tracker = BudgetTracker::new("session-123", config);
+        tracker.charge(BudgetType::Token, 200);
+
+        let request = create_file_read_request("/any/file.txt");
+        let result = engine.evaluate_with_budget(&request, &tracker);
+
+        // Should be denied due to budget, not the deny-all rule
+        assert!(result.is_denied());
+        assert_eq!(result.rule_id, BUDGET_EXCEEDED_RULE_ID);
+        // NOT "deny-all"
+    }
+
+    #[test]
+    fn test_evaluate_with_budget_unlimited_budget_allows() {
+        use crate::budget::{BudgetConfig, BudgetTracker, BudgetType};
+
+        let yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test"
+  rules:
+    - id: "allow-all"
+      type: tool_allow
+      tool: "*"
+      decision: allow
+  default_decision: deny
+"#;
+        let policy = create_test_policy(yaml);
+        let engine = PolicyEngine::new(&policy);
+
+        // Unlimited budgets should not trigger exceeded
+        let config = BudgetConfig::unlimited();
+        let mut tracker = BudgetTracker::new("session-123", config);
+
+        // Even with massive consumption, unlimited means not exceeded
+        tracker.charge(BudgetType::Token, u64::MAX - 10);
+        tracker.charge(BudgetType::ToolCalls, u64::MAX - 10);
+
+        let request = create_file_read_request("/any/file.txt");
+        let result = engine.evaluate_with_budget(&request, &tracker);
+
+        assert!(result.is_allowed());
     }
 
     // ========================================================================

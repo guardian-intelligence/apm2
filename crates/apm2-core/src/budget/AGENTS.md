@@ -149,40 +149,55 @@ if tracker.is_any_exceeded() {
 
 ### With Policy Layer (TCK-00010)
 
-The policy engine should check budgets before allowing tool requests:
+The `PolicyEngine::evaluate_with_budget()` method integrates budget enforcement with policy evaluation:
 
 ```rust
-// In policy evaluation
-fn evaluate_tool_request(request: &ToolRequest, tracker: &BudgetTracker) -> PolicyDecision {
-    // Check if any budget is exceeded
-    if let Some(exceeded) = tracker.first_exceeded() {
-        return PolicyDecision::Deny {
-            rule_id: "BUDGET_EXCEEDED".to_string(),
-            rationale_code: format!("{}_BUDGET_EXCEEDED", exceeded.as_str()),
-            message: format!("{} budget exceeded", exceeded),
-        };
-    }
+use apm2_core::budget::{BudgetConfig, BudgetTracker};
+use apm2_core::policy::{LoadedPolicy, PolicyEngine, BUDGET_EXCEEDED_RULE_ID};
 
-    // Continue with normal policy evaluation...
+let policy = LoadedPolicy::from_yaml("...").unwrap();
+let engine = PolicyEngine::new(&policy);
+let tracker = BudgetTracker::new("session-123", BudgetConfig::default());
+
+// Evaluate with budget checking (budget is checked BEFORE policy rules)
+let result = engine.evaluate_with_budget(&request, &tracker);
+
+if result.is_denied() && result.rule_id == BUDGET_EXCEEDED_RULE_ID {
+    // Budget exceeded - emit BudgetExceeded event
+    let event = create_budget_exceeded_event(&tracker, tracker.first_exceeded().unwrap());
 }
 ```
 
+**Key properties:**
+- Budget checks occur BEFORE policy rule evaluation (fail-closed gate)
+- Budget exceeded decisions use `rule_id = "BUDGET_EXCEEDED"`
+- Budget exceeded decisions use `rationale_code = "{TYPE}_BUDGET_EXCEEDED"`
+- Policy rules cannot override budget limits
+
 ### With Event Emission
 
-When a budget is exceeded, emit a `BudgetExceeded` event:
+Use the helper functions to create `BudgetExceeded` events:
 
 ```rust
-use apm2_core::events::{BudgetExceeded, PolicyEvent, policy_event};
+use apm2_core::budget::{BudgetTracker, BudgetType, create_budget_exceeded_event};
 
 if let Some(exceeded) = tracker.first_exceeded() {
-    let event = BudgetExceeded {
-        session_id: tracker.session_id().to_string(),
-        budget_type: exceeded.as_str().to_string(),
-        limit: tracker.limit(exceeded),
-        consumed: tracker.consumed(exceeded),
-    };
+    let event = create_budget_exceeded_event(&tracker, exceeded);
     // Emit to ledger...
 }
+```
+
+Or create events from parts:
+
+```rust
+use apm2_core::budget::{BudgetType, create_budget_exceeded_event_from_parts};
+
+let event = create_budget_exceeded_event_from_parts(
+    "session-123".to_string(),
+    BudgetType::Token,
+    100_000,  // limit
+    150_000,  // consumed
+);
 ```
 
 ### With Session Lifecycle
