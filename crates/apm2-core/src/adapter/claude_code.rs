@@ -125,6 +125,10 @@ const SECRET_ARG_PATTERNS: &[&str] = &[
 /// Reads a line from the reader with a maximum length limit.
 ///
 /// This prevents memory exhaustion attacks from extremely long lines.
+/// The function reads raw bytes until a newline is found or the limit is
+/// reached, then converts to UTF-8 at the end to avoid issues with multi-byte
+/// characters split across buffer boundaries.
+///
 /// Returns the number of bytes read (0 indicates EOF).
 async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
@@ -134,12 +138,24 @@ async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
     use tokio::io::AsyncBufReadExt;
 
     buf.clear();
+
+    // Read into bytes to handle UTF-8 correctly across buffer boundaries
+    let mut bytes = Vec::with_capacity(max_len.min(8192));
     let mut total_read = 0;
 
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
-            // EOF
+            // EOF - convert accumulated bytes to string
+            if !bytes.is_empty() {
+                match String::from_utf8(bytes) {
+                    Ok(s) => *buf = s,
+                    Err(e) => {
+                        // Best effort: use lossy conversion for invalid UTF-8
+                        *buf = String::from_utf8_lossy(e.as_bytes()).into_owned();
+                    },
+                }
+            }
             return Ok(total_read);
         }
 
@@ -151,25 +167,23 @@ async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
         let remaining_capacity = max_len.saturating_sub(total_read);
         let to_consume = used.min(remaining_capacity);
 
-        // Append to buffer (only valid UTF-8)
+        // Append raw bytes to our buffer
         if to_consume > 0 {
-            if let Ok(s) = std::str::from_utf8(&available[..to_consume]) {
-                buf.push_str(s);
-            } else {
-                // Invalid UTF-8 - skip this segment but consume it
-                reader.consume(used);
-                total_read += used;
-                if done {
-                    return Ok(total_read);
-                }
-                continue;
-            }
+            bytes.extend_from_slice(&available[..to_consume]);
         }
 
         reader.consume(used);
         total_read += used;
 
         if done || total_read >= max_len {
+            // Convert accumulated bytes to string
+            match String::from_utf8(bytes) {
+                Ok(s) => *buf = s,
+                Err(e) => {
+                    // Best effort: use lossy conversion for invalid UTF-8
+                    *buf = String::from_utf8_lossy(e.as_bytes()).into_owned();
+                },
+            }
             return Ok(total_read);
         }
     }
@@ -598,10 +612,12 @@ impl ClaudeCodeAdapter {
         // Add user-specified arguments
         cmd.args(&self.config.args);
 
-        // Configure stdio for hook communication
+        // Configure stdio for hook communication.
+        // stderr is set to null to prevent deadlocks - if we piped stderr without
+        // reading it, the process would block when the OS pipe buffer fills.
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .kill_on_drop(true);
 
         // Set working directory
@@ -1978,6 +1994,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes, 0);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_read_line_bounded_utf8_split_across_buffer() {
+        use std::io::Cursor;
+
+        use tokio::io::BufReader;
+
+        // Test with multi-byte UTF-8 characters that may be split across buffer
+        // boundaries. The Japanese word "hello" (konnichiwa) contains 3-byte
+        // UTF-8 characters.
+        let data = "\u{3053}\u{3093}\u{306B}\u{3061}\u{306F}\n";
+        let cursor = Cursor::new(data.as_bytes().to_vec());
+        // Use a tiny buffer (2 bytes) to force UTF-8 characters to be split
+        let mut reader = BufReader::with_capacity(2, cursor);
+        let mut buf = String::new();
+
+        let bytes_read = read_line_bounded(&mut reader, &mut buf, MAX_LINE_LENGTH)
+            .await
+            .unwrap();
+
+        // Each hiragana character is 3 bytes, plus 1 byte for newline = 16 bytes
+        assert_eq!(bytes_read, 16);
+        // The string should be preserved correctly despite buffer splits
+        assert_eq!(buf, "\u{3053}\u{3093}\u{306B}\u{3061}\u{306F}\n");
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_read_line_bounded_invalid_utf8() {
+        use std::io::Cursor;
+
+        use tokio::io::BufReader;
+
+        // Test with invalid UTF-8 bytes - should use lossy conversion
+        let data: Vec<u8> = vec![0xFF, 0xFE, b'h', b'e', b'l', b'l', b'o', b'\n'];
+        let cursor = Cursor::new(data);
+        let mut reader = BufReader::new(cursor);
+        let mut buf = String::new();
+
+        let bytes_read = read_line_bounded(&mut reader, &mut buf, MAX_LINE_LENGTH)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes_read, 8);
+        // Invalid bytes should be replaced with the replacement character
+        assert!(buf.contains('\u{FFFD}')); // Unicode replacement character
+        assert!(buf.contains("hello"));
     }
 
     #[test]
