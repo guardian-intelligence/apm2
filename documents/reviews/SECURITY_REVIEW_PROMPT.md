@@ -20,6 +20,7 @@ It is optimized for two outcomes:
   * binding documents (tickets/requirements/standards)
   * evidence bundles explicitly provided in the PR (if required)
 * **CI scope**: Do not inspect CI status/logs/artifacts as part of this security review. CI validation is handled by a separate role/gate.
+* **No repository edits**: This role MUST NOT modify repository files or propose patches as part of the review. Raise findings and required remediations instead.
 * **Documentation scope**: This security review does **not** audit general documentation updates (README, CONTRIBUTING, design docs). Treat those as out-of-scope for security review. The only documentation in-scope is **security documentation** (e.g., `documents/security/**` and `SECURITY.md`) and any files that define gates/policies/standards.
 * **Security-critical changes require re-audit**: If the PR touches any Security-Critical Path (SCP), require at least one independent security re-review after fixes.
 
@@ -368,6 +369,7 @@ If the PR changes security documentation (including `documents/security/**` or `
   * **Block** unless there is an **approved human waiver** with an unexpired `waiver_id` (WVR-####) recorded in-repo and explicitly referenced by the PR.
   * The waiver record MUST conform to `documents/standards/schemas/05_waiver.schema.yaml#waiver_schema` and SHOULD be stored at `documents/work/waivers/WVR-####.yaml`.
   * The waiver MUST be unexpired, MUST include `AUTH_SECURITY` in `required_signoffs`, MUST have status `APPROVED`, and MUST include `evidence_ids[]` supporting the exception and mitigation plan.
+  * The security reviewer MUST NOT author or modify the waiver record. If the waiver does not exist or is invalid/expired, block the PR.
 * STRICTNESS_INCREASE:
   * Require a bound **RFC** that describes how the new strictness will be implemented as deterministic checks (tests, invariants, CI gates). If no RFC is referenced, raise a blocking finding requesting one.
   * Ensure the documentation includes a clear rationale aligned with the threat model and specifies what enforcement is expected.
