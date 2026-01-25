@@ -43,6 +43,9 @@ fn test_publish_and_reduce_evidence() {
         "TEST_RESULTS",
         result.artifact_hash.to_vec(),
         vec!["CMD-001".to_string()],
+        "INTERNAL",
+        content.len() as u64,
+        vec![],
     );
     let event = make_event_record("evidence.published", payload, 1_000_000_000);
     let ctx = ReducerContext::new(1);
@@ -58,10 +61,38 @@ fn test_publish_and_reduce_evidence() {
     assert_eq!(evidence.category, EvidenceCategory::TestResults);
     assert_eq!(evidence.artifact_hash, result.artifact_hash);
     assert_eq!(evidence.verification_command_ids, vec!["CMD-001"]);
+    assert_eq!(evidence.classification, DataClassification::Internal);
+    assert_eq!(evidence.artifact_size, content.len());
 
     // Verify content can be retrieved
     let retrieved = publisher.retrieve(&result.artifact_hash).unwrap();
     assert_eq!(retrieved, content);
+}
+
+#[test]
+fn test_classification_preserved_in_reducer() {
+    let mut reducer = EvidenceReducer::new();
+
+    // Publish RESTRICTED evidence
+    let payload = helpers::evidence_published_payload(
+        "evid-001",
+        "work-123",
+        "SECURITY_SCANS",
+        vec![1u8; 32],
+        vec![],
+        "RESTRICTED",
+        512,
+        vec!["scan_type=vulnerability".to_string()],
+    );
+    let event = make_event_record("evidence.published", payload, 1_000_000);
+    reducer.apply(&event, &ReducerContext::new(1)).unwrap();
+
+    // Verify classification is preserved
+    let evidence = reducer.state().get("evid-001").unwrap();
+    assert_eq!(evidence.classification, DataClassification::Restricted);
+    assert_eq!(evidence.artifact_size, 512);
+    assert!(evidence.requires_progressive_disclosure());
+    assert_eq!(evidence.get_metadata("scan_type"), Some("vulnerability"));
 }
 
 #[test]
@@ -94,6 +125,9 @@ fn test_multiple_evidence_for_work() {
             "work-123",
             category.as_str(),
             result.artifact_hash.to_vec(),
+            vec![],
+            "INTERNAL",
+            content.len() as u64,
             vec![],
         );
         (result, payload)
@@ -148,6 +182,9 @@ fn test_evidence_bundle_assembly() {
             "work-123",
             "TEST_RESULTS",
             result.artifact_hash.to_vec(),
+            vec![],
+            "INTERNAL",
+            content.len() as u64,
             vec![],
         );
         let event = make_event_record("evidence.published", payload, 1_000_000);
@@ -217,6 +254,30 @@ fn test_cas_deduplication_across_works() {
 
     // Only one copy in CAS
     assert_eq!(cas.len(), 1);
+}
+
+#[test]
+fn test_cas_storage_full() {
+    // Create a CAS with a very small limit (100 bytes)
+    let cas = MemoryCas::with_max_size(100);
+
+    // First store should succeed (50 bytes)
+    let content1 = vec![1u8; 50];
+    let result1 = cas.store(&content1);
+    assert!(result1.is_ok());
+
+    // Second store should also succeed (40 bytes, total 90)
+    let content2 = vec![2u8; 40];
+    let result2 = cas.store(&content2);
+    assert!(result2.is_ok());
+
+    // Third store should fail (would exceed 100 byte limit)
+    let content3 = vec![3u8; 20];
+    let result3 = cas.store(&content3);
+    assert!(matches!(
+        result3,
+        Err(crate::evidence::CasError::StorageFull { .. })
+    ));
 }
 
 // ============================================================
@@ -303,6 +364,9 @@ fn test_reducer_rejects_duplicate_evidence_id() {
         "TEST_RESULTS",
         vec![0u8; 32],
         vec![],
+        "INTERNAL",
+        100,
+        vec![],
     );
 
     // First event succeeds
@@ -326,6 +390,9 @@ fn test_reducer_rejects_empty_evidence_id() {
         "TEST_RESULTS",
         vec![0u8; 32],
         vec![],
+        "INTERNAL",
+        100,
+        vec![],
     );
 
     let event = make_event_record("evidence.published", payload, 1_000_000);
@@ -343,6 +410,9 @@ fn test_reducer_rejects_invalid_hash_size() {
         "work-123",
         "TEST_RESULTS",
         vec![0u8; 16], // wrong size (should be 32)
+        vec![],
+        "INTERNAL",
+        100,
         vec![],
     );
 
@@ -374,6 +444,9 @@ fn test_reducer_reset() {
         "work-123",
         "TEST_RESULTS",
         vec![0u8; 32],
+        vec![],
+        "INTERNAL",
+        100,
         vec![],
     );
 
@@ -433,6 +506,9 @@ fn test_state_get_by_work() {
             "TEST_RESULTS",
             vec![id.as_bytes()[5]; 32], // unique hash per evidence
             vec![],
+            "INTERNAL",
+            100,
+            vec![],
         );
         let event = make_event_record("evidence.published", payload, 1_000_000);
         reducer.apply(&event, &ReducerContext::new(1)).unwrap();
@@ -444,6 +520,9 @@ fn test_state_get_by_work() {
         "work-2",
         "LINT_REPORTS",
         vec![3u8; 32],
+        vec![],
+        "INTERNAL",
+        100,
         vec![],
     );
     let event = make_event_record("evidence.published", payload, 1_000_000);
@@ -468,6 +547,9 @@ fn test_state_get_by_category() {
             "TEST_RESULTS",
             vec![hash_byte; 32],
             vec![],
+            "INTERNAL",
+            100,
+            vec![],
         );
         let event = make_event_record("evidence.published", payload, 1_000_000);
         reducer.apply(&event, &ReducerContext::new(1)).unwrap();
@@ -479,6 +561,9 @@ fn test_state_get_by_category() {
         "work-1",
         "LINT_REPORTS",
         vec![3u8; 32],
+        vec![],
+        "INTERNAL",
+        100,
         vec![],
     );
     let event = make_event_record("evidence.published", payload, 1_000_000);
@@ -515,6 +600,9 @@ fn test_bundle_hash_is_deterministic() {
             "work-123",
             "TEST_RESULTS",
             vec![hash_byte; 32],
+            vec![],
+            "INTERNAL",
+            100,
             vec![],
         );
         let event = make_event_record("evidence.published", payload, 1_000_000);

@@ -27,6 +27,9 @@ use crate::crypto::{EventHasher, HASH_SIZE, Hash};
 /// Maximum artifact size (100 MB).
 pub const MAX_ARTIFACT_SIZE: usize = 100 * 1024 * 1024;
 
+/// Default maximum total size for in-memory CAS (1 GB).
+pub const DEFAULT_MAX_TOTAL_SIZE: usize = 1024 * 1024 * 1024;
+
 /// Errors that can occur during CAS operations.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -84,6 +87,19 @@ pub enum CasError {
     StorageError {
         /// Description of the error.
         message: String,
+    },
+
+    /// Total storage capacity exceeded.
+    #[error(
+        "storage full: total size {current_size} + {new_size} exceeds limit of {max_size} bytes"
+    )]
+    StorageFull {
+        /// Current total size.
+        current_size: usize,
+        /// Size of new content.
+        new_size: usize,
+        /// Maximum allowed total size.
+        max_size: usize,
     },
 }
 
@@ -176,6 +192,8 @@ pub trait ContentAddressedStore: Send + Sync {
 pub struct MemoryCas {
     /// Content storage, keyed by hash.
     storage: Arc<RwLock<HashMap<Hash, Vec<u8>>>>,
+    /// Maximum total size allowed.
+    max_total_size: usize,
 }
 
 impl Default for MemoryCas {
@@ -185,11 +203,18 @@ impl Default for MemoryCas {
 }
 
 impl MemoryCas {
-    /// Creates a new in-memory CAS.
+    /// Creates a new in-memory CAS with the default size limit.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_max_size(DEFAULT_MAX_TOTAL_SIZE)
+    }
+
+    /// Creates a new in-memory CAS with a custom size limit.
+    #[must_use]
+    pub fn with_max_size(max_total_size: usize) -> Self {
         Self {
             storage: Arc::new(RwLock::new(HashMap::new())),
+            max_total_size,
         }
     }
 
@@ -242,6 +267,7 @@ impl Clone for MemoryCas {
     fn clone(&self) -> Self {
         Self {
             storage: Arc::clone(&self.storage),
+            max_total_size: self.max_total_size,
         }
     }
 }
@@ -262,6 +288,16 @@ impl ContentAddressedStore for MemoryCas {
         // Compute hash
         let hash = EventHasher::hash_content(content);
         let size = content.len();
+
+        // Check total size limit (before acquiring write lock)
+        let current_size = self.total_size();
+        if current_size.saturating_add(size) > self.max_total_size {
+            return Err(CasError::StorageFull {
+                current_size,
+                new_size: size,
+                max_size: self.max_total_size,
+            });
+        }
 
         // Store with deduplication
         let mut storage = self.storage.write().expect("lock poisoned");

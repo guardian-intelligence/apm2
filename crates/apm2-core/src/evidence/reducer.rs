@@ -102,12 +102,14 @@ impl EvidenceReducerState {
     }
 
     /// Returns the total size of all evidence for a work ID.
+    ///
+    /// Uses saturating addition to prevent overflow. Returns `usize::MAX` if
+    /// the total would overflow.
     #[must_use]
     pub fn total_size_by_work(&self, work_id: &str) -> usize {
         self.get_by_work(work_id)
             .iter()
-            .map(|e| e.artifact_size)
-            .sum()
+            .fold(0usize, |acc, e| acc.saturating_add(e.artifact_size))
     }
 
     /// Returns all distinct categories for a work ID.
@@ -211,18 +213,38 @@ impl EvidenceReducer {
             });
         }
 
-        // Create evidence (classification and metadata are derived from
-        // the tool request, not the event, so we use defaults here)
+        // Parse classification from event (default to Internal if empty for backward
+        // compat)
+        let classification = if event.classification.is_empty() {
+            DataClassification::Internal
+        } else {
+            DataClassification::parse(&event.classification)?
+        };
+
+        // Parse metadata from "key=value" strings
+        let metadata: Vec<(String, String)> = event
+            .metadata
+            .iter()
+            .filter_map(|s| {
+                let parts: Vec<&str> = s.splitn(2, '=').collect();
+                if parts.len() == 2 {
+                    Some((parts[0].to_string(), parts[1].to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Create evidence with data from the event
         let evidence = Evidence::new(
             evidence_id.clone(),
             work_id.clone(),
             category,
             artifact_hash,
-            0,                            /* Size will be populated when content is fetched from
-                                           * CAS */
-            DataClassification::Internal, // Default; actual classification from tool request
+            usize::try_from(event.artifact_size).unwrap_or(usize::MAX),
+            classification,
             event.verification_command_ids.clone(),
-            Vec::new(), // Metadata from tool request
+            metadata,
             timestamp,
             actor_id.to_string(),
         );
@@ -337,12 +359,16 @@ pub mod helpers {
 
     /// Creates an `EvidencePublished` event payload.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn evidence_published_payload(
         evidence_id: &str,
         work_id: &str,
         category: &str,
         artifact_hash: Vec<u8>,
         verification_command_ids: Vec<String>,
+        classification: &str,
+        artifact_size: u64,
+        metadata: Vec<String>,
     ) -> Vec<u8> {
         let published = EvidencePublished {
             evidence_id: evidence_id.to_string(),
@@ -350,6 +376,9 @@ pub mod helpers {
             category: category.to_string(),
             artifact_hash,
             verification_command_ids,
+            classification: classification.to_string(),
+            artifact_size,
+            metadata,
         };
         let event = EvidenceEvent {
             event: Some(evidence_event::Event::Published(published)),
