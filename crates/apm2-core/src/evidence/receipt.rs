@@ -78,11 +78,12 @@ const MAX_ID_LEN: usize = 256;
 /// serialization or could be used for injection attacks.
 ///
 /// - `|` is the field separator in canonical format
+/// - `,` is the evidence ID separator in canonical format
 /// - `/` and `\` could enable path traversal
 /// - `..` sequences could enable directory traversal (handled separately)
 /// - Control characters (< 0x20) could be used for log injection
 /// - Newlines and carriage returns break log formatting
-const FORBIDDEN_ID_CHARS: &[char] = &['|', '/', '\\', '\n', '\r', '\0'];
+const FORBIDDEN_ID_CHARS: &[char] = &['|', ',', '/', '\\', '\n', '\r', '\0'];
 
 /// Validates an identifier string for use in gate receipts.
 ///
@@ -151,6 +152,28 @@ fn validate_gate_id(gate_id: &str) -> Result<(), EvidenceError> {
 fn validate_receipt_id(receipt_id: &str) -> Result<(), EvidenceError> {
     validate_id(receipt_id, "receipt ID")
         .map_err(|reason| EvidenceError::InvalidReceiptId { value: reason })
+}
+
+/// Validates a work ID from an evidence bundle.
+///
+/// This is a defense-in-depth check - the reducer should already validate
+/// work IDs, but we re-validate here since they're included in the
+/// cryptographic canonical format.
+fn validate_work_id(work_id: &str) -> Result<(), EvidenceError> {
+    validate_id(work_id, "work ID").map_err(|reason| EvidenceError::InvalidWorkId { value: reason })
+}
+
+/// Validates all evidence IDs from a bundle.
+///
+/// This is a defense-in-depth check - the reducer should already validate
+/// evidence IDs, but we re-validate here since they're included in the
+/// cryptographic canonical format.
+fn validate_evidence_ids(evidence_ids: &[String]) -> Result<(), EvidenceError> {
+    for (i, evidence_id) in evidence_ids.iter().enumerate() {
+        validate_id(evidence_id, &format!("evidence ID at index {i}"))
+            .map_err(|reason| EvidenceError::InvalidEvidenceId { value: reason })?;
+    }
+    Ok(())
 }
 
 /// Encodes bytes as a hex string.
@@ -520,14 +543,21 @@ impl GateReceiptGenerator {
     /// # Errors
     ///
     /// Returns [`EvidenceError::InvalidGateId`] if the gate ID is invalid.
+    /// Returns [`EvidenceError::InvalidWorkId`] if the bundle's work ID is
+    /// invalid. Returns [`EvidenceError::InvalidEvidenceId`] if any evidence
+    /// ID in the bundle is invalid.
     pub fn generate(
         &self,
         gate_id: &str,
         bundle: &EvidenceBundle,
         timestamp: u64,
     ) -> Result<GateReceipt, EvidenceError> {
-        // Validate gate ID first (fail-closed)
+        // Validate all IDs first (fail-closed, defense-in-depth)
+        // These should already be validated by the reducer, but we re-check
+        // since they're used in the cryptographic canonical format.
         validate_gate_id(gate_id)?;
+        validate_work_id(&bundle.work_id)?;
+        validate_evidence_ids(&bundle.evidence_ids)?;
 
         // Generate receipt ID deterministically from bundle hash and gate
         let receipt_id = self.generate_receipt_id(gate_id, &bundle.bundle_hash);
@@ -575,7 +605,9 @@ impl GateReceiptGenerator {
     ///
     /// Returns [`EvidenceError::InvalidReceiptId`] if the receipt ID is
     /// invalid. Returns [`EvidenceError::InvalidGateId`] if the gate ID is
-    /// invalid.
+    /// invalid. Returns [`EvidenceError::InvalidWorkId`] if the bundle's
+    /// work ID is invalid. Returns [`EvidenceError::InvalidEvidenceId`] if
+    /// any evidence ID in the bundle is invalid.
     pub fn generate_with_id(
         &self,
         receipt_id: &str,
@@ -583,9 +615,11 @@ impl GateReceiptGenerator {
         bundle: &EvidenceBundle,
         timestamp: u64,
     ) -> Result<GateReceipt, EvidenceError> {
-        // Validate both IDs first (fail-closed)
+        // Validate all IDs first (fail-closed, defense-in-depth)
         validate_receipt_id(receipt_id)?;
         validate_gate_id(gate_id)?;
+        validate_work_id(&bundle.work_id)?;
+        validate_evidence_ids(&bundle.evidence_ids)?;
 
         let (result, reason_code) = self.evaluate_bundle(bundle);
 
@@ -1321,6 +1355,143 @@ mod tests {
         // 257 bytes should fail
         let over_max_gate_id = "g".repeat(257);
         let result = generator.generate(&over_max_gate_id, &bundle, 2_000_000_000);
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // Security tests for bundle data validation (defense-in-depth)
+    // =========================================================================
+
+    #[test]
+    fn test_generate_rejects_work_id_with_pipe() {
+        let signer = Signer::generate();
+        let requirements = GateRequirements::default();
+        let generator = GateReceiptGenerator::new(signer, requirements);
+
+        // Create bundle with malicious work_id containing pipe
+        let bundle = EvidenceBundle::new(
+            "work|injection".to_string(),
+            [1u8; 32],
+            vec!["evid-001".to_string()],
+            vec![EvidenceCategory::TestResults],
+            1024,
+            1_000_000_000,
+        );
+
+        let result = generator.generate("gate-001", &bundle, 2_000_000_000);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EvidenceError::InvalidWorkId { .. }
+        ));
+    }
+
+    #[test]
+    fn test_generate_rejects_evidence_id_with_comma() {
+        let signer = Signer::generate();
+        let requirements = GateRequirements::default();
+        let generator = GateReceiptGenerator::new(signer, requirements);
+
+        // Create bundle with malicious evidence_id containing comma
+        let bundle = EvidenceBundle::new(
+            "work-123".to_string(),
+            [1u8; 32],
+            vec!["evid,injection".to_string()],
+            vec![EvidenceCategory::TestResults],
+            1024,
+            1_000_000_000,
+        );
+
+        let result = generator.generate("gate-001", &bundle, 2_000_000_000);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EvidenceError::InvalidEvidenceId { .. }
+        ));
+    }
+
+    #[test]
+    fn test_generate_rejects_work_id_with_path_traversal() {
+        let signer = Signer::generate();
+        let requirements = GateRequirements::default();
+        let generator = GateReceiptGenerator::new(signer, requirements);
+
+        // Create bundle with malicious work_id containing path traversal
+        let bundle = EvidenceBundle::new(
+            "work/../attack".to_string(),
+            [1u8; 32],
+            vec!["evid-001".to_string()],
+            vec![EvidenceCategory::TestResults],
+            1024,
+            1_000_000_000,
+        );
+
+        let result = generator.generate("gate-001", &bundle, 2_000_000_000);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EvidenceError::InvalidWorkId { .. }
+        ));
+    }
+
+    #[test]
+    fn test_generate_rejects_evidence_id_with_path_traversal() {
+        let signer = Signer::generate();
+        let requirements = GateRequirements::default();
+        let generator = GateReceiptGenerator::new(signer, requirements);
+
+        // Create bundle with malicious evidence_id containing path traversal
+        let bundle = EvidenceBundle::new(
+            "work-123".to_string(),
+            [1u8; 32],
+            vec!["evid-001".to_string(), "evid/../attack".to_string()],
+            vec![EvidenceCategory::TestResults],
+            1024,
+            1_000_000_000,
+        );
+
+        let result = generator.generate("gate-001", &bundle, 2_000_000_000);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EvidenceError::InvalidEvidenceId { .. }
+        ));
+    }
+
+    #[test]
+    fn test_generate_with_id_rejects_invalid_bundle_data() {
+        let signer = Signer::generate();
+        let requirements = GateRequirements::default();
+        let generator = GateReceiptGenerator::new(signer, requirements);
+
+        // Test with invalid work_id
+        let bundle = EvidenceBundle::new(
+            "work|attack".to_string(),
+            [1u8; 32],
+            vec!["evid-001".to_string()],
+            vec![EvidenceCategory::TestResults],
+            1024,
+            1_000_000_000,
+        );
+
+        let result = generator.generate_with_id("rcpt-001", "gate-001", &bundle, 2_000_000_000);
+        assert!(result.is_err());
+
+        // Test with invalid evidence_id
+        let bundle = EvidenceBundle::new(
+            "work-123".to_string(),
+            [1u8; 32],
+            vec!["evid,attack".to_string()],
+            vec![EvidenceCategory::TestResults],
+            1024,
+            1_000_000_000,
+        );
+
+        let result = generator.generate_with_id("rcpt-001", "gate-001", &bundle, 2_000_000_000);
         assert!(result.is_err());
     }
 }
