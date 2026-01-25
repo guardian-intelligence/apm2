@@ -368,11 +368,16 @@ pub mod helpers {
         event.encode_to_vec()
     }
 
-    /// Creates a `WorkTransitioned` event payload.
+    /// Creates a `WorkTransitioned` event payload for the **first transition
+    /// only**.
     ///
-    /// Set `previous_transition_count` to the work item's current
-    /// `transition_count` for replay protection, or 0 to skip validation
-    /// (backward compatibility).
+    /// This helper sets `previous_transition_count` to 0, which is only valid
+    /// for the first transition from the Open state (where `transition_count`
+    /// is 0).
+    ///
+    /// For subsequent transitions, use
+    /// [`work_transitioned_payload_with_sequence`] with the work item's
+    /// current `transition_count`.
     #[must_use]
     pub fn work_transitioned_payload(
         work_id: &str,

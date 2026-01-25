@@ -232,8 +232,9 @@ pub struct WorkTransitioned {
     #[prost(string, tag = "4")]
     pub rationale_code: ::prost::alloc::string::String,
     /// Previous transition count for replay protection.
-    /// Must match work.transition_count before this transition.
-    /// Zero is treated as "unchecked" for backward compatibility.
+    /// MUST match work.transition_count before this transition.
+    /// This field is strictly validated to prevent replay attacks.
+    /// For the first transition (Open -> Claimed), use 0.
     #[prost(uint32, tag = "5")]
     pub previous_transition_count: u32,
 }
