@@ -11,6 +11,24 @@
 //! - **Fail-closed**: Any evaluation error results in denial
 //! - **Deterministic**: Same policy + request always produces same decision
 //! - **Audit trail**: Every decision includes `rule_id` for traceability
+//! - **Path traversal protection**: Paths containing `..` are always rejected
+//!
+//! # Path Pattern Limitations
+//!
+//! The current implementation supports limited glob patterns:
+//!
+//! - **Exact match**: `/path/to/file.txt`
+//! - **Double-star** (`**`): Matches any number of path components
+//!   - `**` or `**/*` - matches everything
+//!   - `/prefix/**` - matches anything under prefix
+//! - **Single-star** (`*`): Matches a single path component (no slashes)
+//!   - `/dir/*.txt` - matches files ending in `.txt` directly in `/dir`
+//!
+//! **Not supported** (patterns fall back to exact match):
+//! - Multiple wildcards: `src/*/*.rs`, `test/**/*.json`
+//! - Complex patterns: `{a,b}`, `[0-9]`
+//!
+//! For complex matching needs, consider using multiple simpler rules.
 //!
 //! # Example
 //!
@@ -458,8 +476,36 @@ fn matches_any_path_pattern(patterns: &[String], path: &str) -> bool {
     false
 }
 
+/// Checks if a path contains path traversal components.
+///
+/// Returns `true` if the path contains `..` components that could be used
+/// to escape directory restrictions. This is a security check to prevent
+/// path traversal attacks.
+fn contains_path_traversal(path: &str) -> bool {
+    // Split path by / and check each component
+    for component in path.split('/') {
+        if component == ".." {
+            return true;
+        }
+    }
+    false
+}
+
 /// Checks if a path matches a single path pattern.
+///
+/// # Security
+///
+/// This function rejects paths containing `..` components to prevent
+/// path traversal attacks. A path like `/workspace/../etc/passwd` will
+/// never match a pattern like `/workspace/**` even though it textually
+/// starts with `/workspace/`.
 fn matches_path_pattern(pattern: &str, path: &str) -> bool {
+    // Security: reject paths with traversal components
+    // This prevents attacks like /workspace/../etc/passwd matching /workspace/**
+    if contains_path_traversal(path) {
+        return false;
+    }
+
     // Handle common cases
     if pattern == path {
         return true;
@@ -883,6 +929,108 @@ policy:
             "/workspace/*.txt",
             "/workspace/nested/file.txt"
         ));
+    }
+
+    // ========================================================================
+    // Path Traversal Security Tests
+    // ========================================================================
+
+    #[test]
+    fn test_path_traversal_blocked() {
+        // Path traversal attempts should never match any pattern
+        // This is a critical security property to prevent directory escape
+
+        // Basic traversal attempts
+        assert!(!matches_path_pattern(
+            "/workspace/**",
+            "/workspace/../etc/passwd"
+        ));
+        assert!(!matches_path_pattern(
+            "/workspace/**",
+            "/workspace/src/../../../etc/passwd"
+        ));
+        assert!(!matches_path_pattern(
+            "/safe/**",
+            "/safe/../dangerous/file.txt"
+        ));
+
+        // Even if the path textually starts with the allowed prefix
+        assert!(!matches_path_pattern(
+            "/allowed/**",
+            "/allowed/../forbidden/secret.key"
+        ));
+
+        // Traversal at various positions
+        assert!(!matches_path_pattern("**", "/workspace/../outside"));
+        assert!(!matches_path_pattern("/a/b/**", "/a/b/../c/file.txt"));
+        assert!(!matches_path_pattern(
+            "/root/**",
+            "/root/sub/../../../etc/shadow"
+        ));
+
+        // Single dot is OK (current directory)
+        assert!(matches_path_pattern(
+            "/workspace/**",
+            "/workspace/./file.txt"
+        ));
+        assert!(matches_path_pattern(
+            "/workspace/**",
+            "/workspace/src/./main.rs"
+        ));
+    }
+
+    #[test]
+    fn test_contains_path_traversal() {
+        // Should detect .. components
+        assert!(contains_path_traversal("/a/../b"));
+        assert!(contains_path_traversal("../relative"));
+        assert!(contains_path_traversal("/absolute/.."));
+        assert!(contains_path_traversal("/path/to/../../../escape"));
+
+        // Should not flag legitimate paths
+        assert!(!contains_path_traversal("/normal/path/file.txt"));
+        assert!(!contains_path_traversal("/workspace/src/main.rs"));
+        assert!(!contains_path_traversal("relative/path"));
+        assert!(!contains_path_traversal("/path/with./dots.in.name"));
+        assert!(!contains_path_traversal("/path/.hidden/file"));
+
+        // Single dot is OK
+        assert!(!contains_path_traversal("/path/./current"));
+        assert!(!contains_path_traversal("./relative"));
+    }
+
+    #[test]
+    fn test_path_traversal_denied_in_policy() {
+        // Integration test: verify policy engine denies traversal attempts
+        let yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test"
+  rules:
+    - id: "allow-workspace"
+      type: tool_allow
+      tool: "fs.read"
+      paths:
+        - "/workspace/**"
+      decision: allow
+  default_decision: deny
+"#;
+        let policy = create_test_policy(yaml);
+        let engine = PolicyEngine::new(&policy);
+
+        // Normal access should be allowed
+        let request = create_file_read_request("/workspace/src/main.rs");
+        assert!(engine.evaluate(&request).is_allowed());
+
+        // Traversal attempt should be denied
+        let request = create_file_read_request("/workspace/../etc/passwd");
+        let result = engine.evaluate(&request);
+        assert!(result.is_denied());
+        assert_eq!(result.rule_id, DEFAULT_DENY_RULE_ID);
+
+        // More complex traversal
+        let request = create_file_read_request("/workspace/deep/../../etc/shadow");
+        assert!(engine.evaluate(&request).is_denied());
     }
 
     // ========================================================================
@@ -1436,6 +1584,66 @@ policy:
                 let result1 = matches_path_pattern(&pattern, &path);
                 let result2 = matches_path_pattern(&pattern, &path);
                 prop_assert_eq!(result1, result2);
+            }
+
+            /// Property: Path traversal attempts should always be denied
+            ///
+            /// This is a critical security property: any path containing ".."
+            /// must never match any pattern, regardless of the pattern used.
+            #[test]
+            fn prop_path_traversal_always_denied(
+                prefix in "/[a-z]{1,10}",
+                traversal_depth in 1usize..5,
+                suffix in "[a-z]{1,10}"
+            ) {
+                // Construct a path with traversal: /prefix/../../../suffix
+                let traversal = "../".repeat(traversal_depth);
+                let malicious_path = format!("{prefix}/{traversal}{suffix}");
+
+                // This should never match any pattern
+                assert!(!matches_path_pattern("**", &malicious_path));
+                let prefix_pattern = format!("{prefix}/**");
+                assert!(!matches_path_pattern(&prefix_pattern, &malicious_path));
+                assert!(!matches_path_pattern("/**", &malicious_path));
+
+                // Verify the helper function detects it
+                assert!(contains_path_traversal(&malicious_path));
+            }
+
+            /// Property: Path traversal in policy evaluation should always deny
+            #[test]
+            fn prop_policy_denies_traversal(
+                allowed_dir in "/[a-z]{1,8}",
+                traversal_depth in 1usize..4,
+                target_file in "[a-z]{1,8}/[a-z]{1,8}"
+            ) {
+                let yaml = format!(r#"
+policy:
+  version: "1.0.0"
+  name: "test"
+  rules:
+    - id: "allow-dir"
+      type: tool_allow
+      tool: "fs.read"
+      paths:
+        - "{allowed_dir}/**"
+      decision: allow
+  default_decision: deny
+"#);
+                if let Ok(policy) = LoadedPolicy::from_yaml(&yaml) {
+                    let engine = PolicyEngine::new(&policy);
+
+                    // Normal access within allowed dir should work
+                    let safe_path = format!("{allowed_dir}/file.txt");
+                    let safe_request = create_file_read_request(&safe_path);
+                    assert!(engine.evaluate(&safe_request).is_allowed());
+
+                    // Traversal attempt should be denied
+                    let traversal = "../".repeat(traversal_depth);
+                    let malicious_path = format!("{allowed_dir}/{traversal}{target_file}");
+                    let malicious_request = create_file_read_request(&malicious_path);
+                    assert!(engine.evaluate(&malicious_request).is_denied());
+                }
             }
         }
     }
