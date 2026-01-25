@@ -62,7 +62,10 @@ rfc_risks_and_open_questions:
       question: "Should we configure mold for macOS as well?"
       status: DEFERRED
       notes: |
-        mold supports macOS but requires separate configuration.
+        mold supports macOS but requires separate configuration:
+        - Target: [target.aarch64-apple-darwin] for Apple Silicon
+        - Target: [target.x86_64-apple-darwin] for Intel Macs
+        - macOS uses sold (mold for macOS) which has some limitations
         Current RFC focuses on Linux where the tooling is already
         installed. macOS support can be added in a follow-up.
 

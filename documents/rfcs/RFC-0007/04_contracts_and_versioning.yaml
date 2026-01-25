@@ -48,12 +48,16 @@ rfc_contracts_and_versioning:
         incremental builds. CI uses CARGO_INCREMENTAL=0 for reproducibility.
       interface:
         variable: "CARGO_INCREMENTAL"
-        local_value: "1 (recommended)"
-        ci_value: "0 (set in ci.yml)"
+        valid_values:
+          - "0 - Disable incremental compilation"
+          - "1 - Enable incremental compilation (default when unset)"
+        local_value: "1 (recommended, also the default)"
+        ci_value: "0 (set in ci.yml for reproducibility)"
       backward_compatible: true
       notes: |
         Default Cargo behavior is incremental=1, so this only matters if
         developers have explicitly set it to 0 in their environment.
+        Setting CARGO_INCREMENTAL=1 explicitly documents the intent.
 
     - id: CONTRACT-004
       name: "cargo nextest run command"

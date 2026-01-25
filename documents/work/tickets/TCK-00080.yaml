@@ -60,6 +60,13 @@ ticket_meta:
       No security implications. mold is a standard, widely-used linker that
       produces functionally identical binaries to ld. The configuration only
       affects the build process, not the resulting binaries' behavior.
+    fallback_behavior: |
+      The configuration is target-specific (x86_64-unknown-linux-gnu only):
+      - macOS developers: Unaffected, uses default macOS linker (ld64)
+      - Windows developers: Unaffected, uses default MSVC linker
+      - ARM64 Linux: Unaffected unless separate target section is added
+      - If mold/clang missing: Build fails with clear error message
+        Developer can comment out the section to use default linker
     implementation_details: |
       The .cargo/config.toml should look like this after the change:
 

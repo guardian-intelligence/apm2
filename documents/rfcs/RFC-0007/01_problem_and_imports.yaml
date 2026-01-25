@@ -109,11 +109,16 @@ rfc_problem_and_imports:
         Incremental compilation allows rustc to reuse work from previous
         compilations. CI disables this (CARGO_INCREMENTAL=0) for reproducibility,
         but local development benefits from having it enabled.
-      local_setting: "export CARGO_INCREMENTAL=1"
+      local_setting: "export CARGO_INCREMENTAL=1  # or simply unset (1 is the default)"
       ci_setting: "CARGO_INCREMENTAL=0 (correct for CI)"
+      valid_values:
+        - "0: Disable incremental compilation (CI setting)"
+        - "1: Enable incremental compilation (local default)"
       note: |
         Developers should NOT copy CI environment settings directly.
         Local development and CI have different optimization goals.
+        When CARGO_INCREMENTAL is unset, Cargo defaults to incremental=1
+        for debug builds. Explicitly setting it documents intent.
 
   imports:
     prd_requirements: []

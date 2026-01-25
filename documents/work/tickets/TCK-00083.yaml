@@ -75,12 +75,15 @@ ticket_meta:
 
       **Recommended shell profile settings:**
 
-      Add to your `~/.bashrc` or `~/.zshrc`:
+      Add to your `~/.bashrc`, `~/.zshrc`, or `~/.profile`:
       ```bash
       # Rust build optimization for apm2 development
+      # Requires: cargo install sccache
       export RUSTC_WRAPPER=sccache    # Shared compilation cache
-      export CARGO_INCREMENTAL=1       # Enable incremental compilation
+      export CARGO_INCREMENTAL=1       # Enable incremental compilation (explicit)
       ```
+
+      After adding, reload your shell: `source ~/.bashrc` (or restart terminal)
 
       **Why these differ from CI:**
       - `CARGO_INCREMENTAL=0` in CI ensures builds are reproducible and

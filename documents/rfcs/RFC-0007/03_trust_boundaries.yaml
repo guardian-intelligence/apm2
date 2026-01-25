@@ -76,6 +76,12 @@ rfc_trust_boundaries:
     4. **Configuration files**: .cargo/config.toml is checked into the
        repository and subject to code review. No secrets stored.
 
+    5. **Tool installation security**: Tools are installed via trusted sources:
+       - mold: System package manager (apt/dnf/pacman) or Homebrew
+       - sccache: crates.io via cargo install (verified checksums)
+       - cargo-nextest: crates.io via cargo install (verified checksums)
+       All installations use standard package verification mechanisms.
+
     No credentials are involved. No network services are exposed. All tools
     operate within the developer's local environment with the same
     permissions as the developer.

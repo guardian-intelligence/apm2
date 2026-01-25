@@ -100,3 +100,20 @@ rfc_rollout_and_ops:
         Install and use cargo-nextest:
         cargo install cargo-nextest
         cargo nextest run
+
+    - issue: "mold config ignored on ARM64 Linux"
+      cause: "Config only targets x86_64-unknown-linux-gnu"
+      solution: |
+        For ARM64 Linux (aarch64-unknown-linux-gnu), add a separate
+        target section to .cargo/config.toml:
+        [target.aarch64-unknown-linux-gnu]
+        linker = "clang"
+        rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+    - issue: "Error: linker 'clang' not found"
+      cause: "clang not in PATH or not installed"
+      solution: |
+        Install clang or use gcc as alternative:
+        - Ubuntu: apt install clang
+        - Or change linker = "clang" to linker = "gcc" in config.toml
+        Note: gcc works but clang provides slightly better diagnostics

@@ -74,8 +74,10 @@ ticket_meta:
 
       **Usage:**
       ```bash
-      cargo nextest run              # Run all tests
-      cargo nextest run -p apm2-core # Run tests for specific crate
+      cargo nextest run                    # Run all tests
+      cargo nextest run -p apm2-core       # Run tests for specific crate
+      cargo nextest run --workspace        # Run all workspace tests
+      cargo nextest run -- test_name       # Run specific test by name
       ```
 
       **Why it's faster:**

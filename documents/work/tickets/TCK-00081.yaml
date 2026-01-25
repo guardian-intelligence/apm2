@@ -98,6 +98,12 @@ ticket_meta:
       - No file locking conflicts (unlike shared CARGO_TARGET_DIR)
       - Automatic cache management
       - Cache stored at `~/.cache/sccache`
+
+      **Troubleshooting:**
+      If you experience cache-related issues, clear the cache:
+      ```bash
+      rm -rf ~/.cache/sccache
+      ```
       ```
     affected_files: |
       Modified: CONTRIBUTING.md (add sccache documentation)
