@@ -62,6 +62,7 @@ mod generated {
     include!("apm2.tool.v1.rs");
 }
 
+pub mod fs;
 mod validation;
 
 #[cfg(test)]
