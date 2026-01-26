@@ -1,13 +1,31 @@
 ---
 name: modes-of-reasoning
 description: Reference taxonomy of reasoning modes for selecting appropriate inference patterns, uncertainty representations, problem-solving methods, and domain styles. Use when choosing how to reason about a problem, designing hybrid reasoning workflows, or understanding why reasoning approaches conflict.
-user-invocable: false
-disable-model-invocation: false
+user-invocable: true
+argument-hint: "[<mode-number> | <keyword> | recommend <problem-type> | empty]"
 ---
 
 # Modes of Reasoning
 
 A practical taxonomy of reasoning modes. For background on how these modes relate and when to combine them, see [introduction](references/introduction.md).
+
+## Invocation
+
+```
+/modes-of-reasoning                     # Browse full table
+/modes-of-reasoning 13                  # Look up mode #13 (abductive)
+/modes-of-reasoning bayesian            # Search by keyword
+/modes-of-reasoning recommend diagnosis # Get recommendations for a problem type
+```
+
+## Argument Handling
+
+Parse `$ARGUMENTS`:
+
+- **Empty or omitted** → Display the quick reference table below
+- **Number (1-80)** → Read and return the corresponding reference file
+- **`recommend <problem-type>`** → Suggest relevant modes for the problem type (e.g., forecasting, debugging, governance, strategy)
+- **Keyword** → Search mode names/descriptions and return matching entries
 
 ## Quick Reference Table
 

@@ -186,7 +186,15 @@ Depth is **computed from PRD metadata**, not chosen by the author. This prevents
 LIGHT:    all dimensions = low
 STANDARD: any dimension = medium, none = high
 DEEP:     any dimension = high
+COUNCIL:  blast_radius = system_wide AND (net_new_abstractions > 2 OR north_star_alignment_requested)
 ```
+
+**Manual Override:**
+```
+/prd-review review PRD-XXXX --depth COUNCIL
+```
+
+The `--depth` flag bypasses computed depth and forces the specified level. Use COUNCIL for PRDs requiring multi-perspective deliberation or strategic alignment assessment.
 
 - `requirement_count` and `external_dependencies` are **computed by GATE-PRD-SCHEMA** (not declared).
 - `blast_radius` is **computed by cross-referencing** requirement locations against `component_atlas.yaml`.
@@ -252,6 +260,69 @@ The adversarial pass MUST produce an **Adversarial Evidence Bundle** containing:
 4. **Meta-Improvement Proposal:** One specific update to `ANGLE_PROMPTS.md` or `SKILL.md` derived from this review.
 
 **Failure Mode:** If adversarial pass finds a BLOCKER-severity gaming vector with no countermeasure, the PRD verdict is `NEEDS_REMEDIATION` regardless of other gate statuses.
+
+### R2.2. COUNCIL Protocol (COUNCIL depth only)
+
+For COUNCIL depth reviews, execute the multi-agent deliberation protocol from `references/COUNCIL_PROTOCOL.md`.
+
+**Overview:**
+- 3 subagents with emergent specializations
+- Each subagent selects 5 reasoning modes from the 80 available (see `documents/skills/modes-of-reasoning/SKILL.md`)
+- 3 iterative review cycles: BROAD → REMEDIATE → CONVERGE
+- Inter-cycle onboarding notes guide focus areas
+- 2/3 quorum required for contested findings
+
+**Cycle Behavior:**
+
+| Cycle | Name | Purpose |
+|-------|------|---------|
+| 1 | BROAD | Cast wide net; all modes applied independently |
+| 2 | REMEDIATE | Focus on BLOCKER/MAJOR; propose remediations |
+| 3 | CONVERGE | Vote on contested findings; reach quorum |
+
+**Mode Selection Requirements:**
+- Each subagent selects exactly 5 modes
+- At least one subagent MUST include a Meta-Level mode (75-80)
+- Modes selected for complementary coverage (overlap penalized)
+- Emergent role labels auto-generated from mode clusters
+
+**North Star Awareness:**
+
+All council members load and affirm `references/NORTH_STAR.md`. Every cycle produces:
+- Phase scores (0.0-1.0) for each of the 5 phases
+- Strategic recommendations for advancing toward next phase
+- Violation detection (PHASE_REGRESSION, PHASE_SKIP, MISSION_DRIFT, VALUE_EXTRACTION)
+
+**Council Evidence Bundle:**
+
+COUNCIL reviews produce an enhanced evidence bundle including:
+
+```json
+{
+  "review_depth": "COUNCIL",
+  "council_metadata": {
+    "session_id": "COUNCIL-PRD-XXXX-{timestamp}",
+    "subagents": [
+      {"agent_id": "SA-1", "emergent_role": "Formal Rigorist", "selected_modes": [1, 7, 8, 43, 75]}
+    ],
+    "cycles_completed": 3,
+    "quorum_achieved": true
+  },
+  "north_star_assessment": {
+    "phase_scores": [0.7, 0.3, 0.1, 0.0, 0.0],
+    "primary_phase_alignment": 1,
+    "strategic_recommendations": [],
+    "violations": []
+  }
+}
+```
+
+**Terminal States:**
+- `CONVERGED`: All blockers resolved, quorum achieved
+- `DEADLOCKED`: Quorum failed → escalate to AUTH_PRODUCT
+- `ABORTED`: Timeout (1 hour) or budget exhausted → emit partial findings
+
+Session state persisted to: `evidence/prd/{PRD_ID}/reviews/council_session_{timestamp}.yaml`
 
 ### R3. Emit evidence bundle (always)
 
@@ -402,8 +473,12 @@ This prevents "Alert Fatigue" — the Pragmatist's concern.
 - `references/COUNTERMEASURE_PATTERNS.md`: recurrence → countermeasure patterns
 - `references/CREATE_PRD_PROMPT.md`: end-to-end drafting guidance
 - `references/ADVERSARIAL_REVIEW_PROMPT.md`: adversarial meta-review protocol
+- `references/NORTH_STAR.md`: 5-phase vision document for council alignment assessment
+- `references/COUNCIL_PROTOCOL.md`: multi-agent council orchestration instructions
+- `references/COUNCIL_STATE_SCHEMA.md`: YAML schemas for council session state
 - `documents/architecture/component_atlas.yaml`: authoritative CCP for cousin prevention
 - `documents/skills/holonic-agent-network/references/principia-holonic.md`: axiomatic foundation (Existence, Truth, Economy)
+- `documents/skills/modes-of-reasoning/SKILL.md`: 80 reasoning modes for council mode selection
 
 ## Gemini Meta-Review (How to get Gemini to improve PRDs and this skill)
 
