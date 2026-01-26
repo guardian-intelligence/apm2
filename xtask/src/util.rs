@@ -20,7 +20,7 @@ use xshell::{Shell, cmd};
 ///
 /// Where XXXX is 4 digits and XXXXX is 5 digits.
 static TICKET_BRANCH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^ticket/(?:(RFC-\d{4})/)?(TCK-\d{5})$")
+    Regex::new(r"^(?:ticket/(?:(RFC-\d{4})/)?|feat/)(TCK-\d{5}|[\w\-]+)$")
         .expect("Invalid regex pattern for ticket branch")
 });
 
