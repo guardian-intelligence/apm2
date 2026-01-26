@@ -46,7 +46,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::episode::{EpisodeController, EpisodeControllerConfig, EpisodeLoopOutcome};
 use crate::error::HolonError;
-use crate::ledger::{EpisodeEvent, EventHash, EventType, LedgerEvent, validate_id};
+use crate::ledger::{
+    EpisodeEvent, EventHash, EventType, LedgerEvent, validate_goal_spec, validate_id,
+};
 use crate::resource::{Budget, Lease, LeaseScope};
 use crate::traits::Holon;
 use crate::work::WorkObject;
@@ -180,7 +182,8 @@ impl SpawnConfigBuilder {
     ///
     /// Returns `HolonError::MissingContext` if any required field is not set.
     /// Returns `HolonError::InvalidInput` if any ID fails validation (empty,
-    /// exceeds 256 bytes, contains `/` or null bytes).
+    /// exceeds 256 bytes, contains `/` or null bytes), or if `goal_spec`
+    /// exceeds 4KB or contains null bytes.
     pub fn build(self) -> Result<SpawnConfig, HolonError> {
         let work_id = self
             .work_id
@@ -206,6 +209,12 @@ impl SpawnConfigBuilder {
         validate_id(&work_id, "work_id")?;
         validate_id(&issuer_id, "issuer_id")?;
         validate_id(&holder_id, "holder_id")?;
+
+        // SECURITY: Validate goal_spec to prevent resource exhaustion from
+        // excessively large strings and reject null bytes.
+        if let Some(ref spec) = self.goal_spec {
+            validate_goal_spec(spec)?;
+        }
 
         Ok(SpawnConfig {
             work_id,
@@ -367,22 +376,40 @@ const DEFAULT_LEASE_DURATION_NS: u64 = 3_600_000_000_000;
 ///
 /// Uses a rolling hash: `H = BLAKE3(H_prev || event_bytes)` for each event,
 /// starting with zero bytes.
-fn compute_episode_aggregate_hash(episode_events: &[EpisodeEvent]) -> EventHash {
+///
+/// # Errors
+///
+/// Returns `HolonError::Internal` if any event fails to serialize. This ensures
+/// that all events in the hash chain are properly committed and prevents silent
+/// exclusion of events from the commitment.
+///
+/// # Security
+///
+/// SECURITY: This function MUST fail if serialization fails. Silently skipping
+/// events would violate the commitment property of the hash chain, allowing
+/// malformed or corrupted events to be excluded without detection.
+fn compute_episode_aggregate_hash(
+    episode_events: &[EpisodeEvent],
+) -> Result<EventHash, HolonError> {
     if episode_events.is_empty() {
-        return EventHash::ZERO;
+        return Ok(EventHash::ZERO);
     }
 
     // Compute rolling hash over all episode events
     let mut hasher = blake3::Hasher::new();
-    for event in episode_events {
+    for (idx, event) in episode_events.iter().enumerate() {
         // Serialize event to JSON bytes for hashing
         // Using serde_jcs for deterministic serialization
-        if let Ok(bytes) = serde_jcs::to_vec(event) {
-            hasher.update(&bytes);
-        }
+        // SECURITY: Fail if serialization fails - do not silently skip events
+        let bytes = serde_jcs::to_vec(event).map_err(|e| {
+            HolonError::internal(format!(
+                "failed to serialize episode event {idx} for hash computation: {e}",
+            ))
+        })?;
+        hasher.update(&bytes);
     }
     let hash = hasher.finalize();
-    EventHash::from_bytes(*hash.as_bytes())
+    Ok(EventHash::from_bytes(*hash.as_bytes()))
 }
 
 /// Combines two hashes to produce a single hash that commits to both.
@@ -412,6 +439,14 @@ fn combine_hashes(chain_hash: EventHash, episode_hash: EventHash) -> EventHash {
 /// 5. **Artifact Emission**: Collects ledger events from execution
 /// 6. **Escalation Handling**: Forwards escalation reasons to the caller
 ///
+/// # New Work Only
+///
+/// This function is intended for **starting new work**, not resuming
+/// previously started work. Episode numbering always begins at 1. If you need
+/// to resume work from a previous state (e.g., after budget exhaustion), a
+/// separate resumption API should be used that accepts an
+/// `initial_episode_number` parameter.
+///
 /// # Arguments
 ///
 /// * `holon` - The holon to spawn and execute
@@ -430,6 +465,7 @@ fn combine_hashes(chain_hash: EventHash, episode_hash: EventHash) -> EventHash {
 /// - Lease creation fails
 /// - The holon's intake method fails
 /// - A fatal error occurs during episode execution
+/// - Event serialization fails during hash computation (commitment violation)
 ///
 /// # Example
 ///
@@ -540,13 +576,17 @@ where
     work.transition_to_in_progress_at(transition_ns)?;
 
     // Step 6: Run the episode loop
+    // DESIGN NOTE: Episode numbering starts at 1 because this function is for new
+    // work only. Work resumption (e.g., after budget exhaustion) requires a
+    // separate API that accepts an initial_episode_number parameter to maintain
+    // proper episode sequencing across sessions.
     let controller = EpisodeController::new(config.episode_config);
     let loop_result = controller.run_episode_loop(
         holon,
         &config.work_id,
         &mut lease,
         config.goal_spec.as_deref(),
-        1, // Start at episode 1
+        1, // New work always starts at episode 1
         &mut clock,
     )?;
 
@@ -563,7 +603,11 @@ where
     //   1. The LeaseIssued event hash (last_hash)
     //   2. The aggregate episode events hash (episode_aggregate_hash)
     // Combined via: H(last_hash || episode_aggregate_hash)
-    let episode_aggregate_hash = compute_episode_aggregate_hash(&episode_events);
+    //
+    // SECURITY: If serialization fails, we fail the entire spawn operation.
+    // This ensures the commitment property is maintained - no event can be
+    // silently excluded from the hash chain.
+    let episode_aggregate_hash = compute_episode_aggregate_hash(&episode_events)?;
     let execution_committed_hash = combine_hashes(last_hash, episode_aggregate_hash);
 
     // Step 7: Transition work to final state based on outcome
@@ -1026,6 +1070,112 @@ mod unit_tests {
     }
 
     // =========================================================================
+    // SECURITY TESTS: goal_spec Validation (Round 2 - Finding 2)
+    // =========================================================================
+
+    /// SECURITY TEST: Verify `SpawnConfigBuilder::build()` rejects `goal_spec`
+    /// exceeding max length.
+    ///
+    /// Finding: MEDIUM - Unvalidated `goal_spec`
+    /// Fix: Added `validate_goal_spec()` call in `build()`.
+    #[test]
+    fn test_spawn_config_builder_goal_spec_too_long() {
+        use crate::ledger::MAX_GOAL_SPEC_LENGTH;
+
+        let huge_string = "x".repeat(MAX_GOAL_SPEC_LENGTH + 1);
+        let result = SpawnConfig::builder()
+            .work_id("work-001")
+            .work_title("Test")
+            .issuer_id("registrar-001")
+            .holder_id("agent-001")
+            .scope(LeaseScope::unlimited())
+            .budget(Budget::new(1, 1, 1, 1))
+            .goal_spec(&huge_string)
+            .build();
+
+        assert!(
+            result.is_err(),
+            "build() should reject goal_spec exceeding MAX_GOAL_SPEC_LENGTH"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("goal_spec") && err.contains("maximum length"),
+            "Error should mention 'goal_spec' and 'maximum length': {err}"
+        );
+    }
+
+    /// SECURITY TEST: Verify `SpawnConfigBuilder::build()` rejects `goal_spec`
+    /// with null bytes.
+    #[test]
+    fn test_spawn_config_builder_goal_spec_null_bytes() {
+        let result = SpawnConfig::builder()
+            .work_id("work-001")
+            .work_title("Test")
+            .issuer_id("registrar-001")
+            .holder_id("agent-001")
+            .scope(LeaseScope::unlimited())
+            .budget(Budget::new(1, 1, 1, 1))
+            .goal_spec("goal\0with\0nulls")
+            .build();
+
+        assert!(
+            result.is_err(),
+            "build() should reject goal_spec containing null bytes"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("goal_spec") && err.contains("null"),
+            "Error should mention 'goal_spec' and 'null': {err}"
+        );
+    }
+
+    /// SECURITY TEST: Verify `SpawnConfigBuilder::build()` accepts valid
+    /// `goal_spec`.
+    #[test]
+    fn test_spawn_config_builder_goal_spec_valid() {
+        use crate::ledger::MAX_GOAL_SPEC_LENGTH;
+
+        // Test with no goal_spec (None)
+        let result = SpawnConfig::builder()
+            .work_id("work-001")
+            .work_title("Test")
+            .issuer_id("registrar-001")
+            .holder_id("agent-001")
+            .scope(LeaseScope::unlimited())
+            .budget(Budget::new(1, 1, 1, 1))
+            .build();
+        assert!(result.is_ok(), "build() should accept no goal_spec");
+
+        // Test with valid goal_spec at max length
+        let max_spec = "x".repeat(MAX_GOAL_SPEC_LENGTH);
+        let result = SpawnConfig::builder()
+            .work_id("work-002")
+            .work_title("Test")
+            .issuer_id("registrar-001")
+            .holder_id("agent-001")
+            .scope(LeaseScope::unlimited())
+            .budget(Budget::new(1, 1, 1, 1))
+            .goal_spec(&max_spec)
+            .build();
+        assert!(
+            result.is_ok(),
+            "build() should accept goal_spec at max length"
+        );
+
+        // Test with normal goal_spec
+        let result = SpawnConfig::builder()
+            .work_id("work-003")
+            .work_title("Test")
+            .issuer_id("registrar-001")
+            .holder_id("agent-001")
+            .scope(LeaseScope::unlimited())
+            .budget(Budget::new(1, 1, 1, 1))
+            .goal_spec("Complete the given task efficiently")
+            .build();
+        assert!(result.is_ok(), "build() should accept normal goal_spec");
+    }
+
+    // =========================================================================
     // SECURITY TESTS: Hash Chain Integrity (Finding 2 - Disjoint Hash Chain)
     // =========================================================================
 
@@ -1123,7 +1273,7 @@ mod unit_tests {
     /// SECURITY TEST: Verify helper functions for hash chain commitment.
     #[test]
     fn test_compute_episode_aggregate_hash_empty() {
-        let hash = compute_episode_aggregate_hash(&[]);
+        let hash = compute_episode_aggregate_hash(&[]).expect("empty list should not fail");
         assert!(
             hash.is_zero(),
             "Empty episode events should produce zero hash"
@@ -1149,8 +1299,8 @@ mod unit_tests {
             )),
         ];
 
-        let hash1 = compute_episode_aggregate_hash(&events);
-        let hash2 = compute_episode_aggregate_hash(&events);
+        let hash1 = compute_episode_aggregate_hash(&events).expect("serialization should succeed");
+        let hash2 = compute_episode_aggregate_hash(&events).expect("serialization should succeed");
 
         assert_eq!(hash1, hash2, "Aggregate hash should be deterministic");
         assert!(
