@@ -1,0 +1,402 @@
+{
+  "contents": {
+    "example_files": [
+      "examples/aat_receipt.example.json",
+      "examples/admission_receipt.example.json",
+      "examples/budget_profile.example.json",
+      "examples/capabilities_manifest.example.json",
+      "examples/context_pack_manifest.example.json",
+      "examples/context_pack_spec.example.json",
+      "examples/defect_record.example.json",
+      "examples/export_manifest.example.json",
+      "examples/holon_contract.example.json",
+      "examples/patch_record_stream.example.jsonl",
+      "examples/policy_profile.example.json",
+      "examples/schema_definition.example.json",
+      "examples/skill_spec.example.json",
+      "examples/vendor_profile_claude_code.example.json"
+    ],
+    "files": [
+      {
+        "bytes": 14055,
+        "path": "MANIFEST.json",
+        "sha256": "2d3e1c2450da7373570d6c873efb62343259ede0e735e75929e4440c57ea8039"
+      },
+      {
+        "bytes": 66312,
+        "path": "MASTER.json",
+        "sha256": "a3137c4c16fe14243d484bc5d9b68b2b29982b1b3d0dc876ad54d900a36a6bb1"
+      },
+      {
+        "bytes": 3655,
+        "path": "build/assembly_trace.json",
+        "sha256": "dda0be2b0819ea1c81349b481c871fd88458efc12ec1e9db680036f9d94d3720"
+      },
+      {
+        "bytes": 1357,
+        "path": "build/merge_rationale.json",
+        "sha256": "265c5156492105ecf35b87fcabdb2a6b77cc157fe75be56ea2c82fa0a8c11b61"
+      },
+      {
+        "bytes": 1767,
+        "path": "examples/aat_receipt.example.json",
+        "sha256": "fe14832427355bdd4514bd06e08126d7beddae013271f10356a6ea12bda72086"
+      },
+      {
+        "bytes": 1361,
+        "path": "examples/admission_receipt.example.json",
+        "sha256": "731398c8eead11e638943d47bed4b9ed19e00b53b010f60a0c9305bdf05782f3"
+      },
+      {
+        "bytes": 590,
+        "path": "examples/budget_profile.example.json",
+        "sha256": "13be690110b13556dd3d54d0763d0d9d2e17e183997fa013c7a690e522ecf0d9"
+      },
+      {
+        "bytes": 2213,
+        "path": "examples/capabilities_manifest.example.json",
+        "sha256": "e14a1a1bf19af174f808dfb932a60b04aefb02c4e43a5ca52e80370f23654f52"
+      },
+      {
+        "bytes": 1948,
+        "path": "examples/context_pack_manifest.example.json",
+        "sha256": "2899200a15b5a3319d06e4bee027fce44b61bef1413c32f7906817a467a70807"
+      },
+      {
+        "bytes": 1278,
+        "path": "examples/context_pack_spec.example.json",
+        "sha256": "a482366e5ac21c1936f5ced62c503503daf1463b533e0d9c657f23708945b7ae"
+      },
+      {
+        "bytes": 1473,
+        "path": "examples/defect_record.example.json",
+        "sha256": "359c59b04f288463a4e01b7f07327046cca59236fe9d595f83ff38cb241c1d42"
+      },
+      {
+        "bytes": 1152,
+        "path": "examples/export_manifest.example.json",
+        "sha256": "edec4fe61bc3033ed5a1be7a9794f6cbff99dd06929652a8ade9d449b2717a99"
+      },
+      {
+        "bytes": 1012,
+        "path": "examples/holon_contract.example.json",
+        "sha256": "9ca66bce09e13087d83f684849500ac0576b5a89319c22513d3bb70c90e7c05d"
+      },
+      {
+        "bytes": 1588,
+        "path": "examples/patch_record_stream.example.jsonl",
+        "sha256": "55719ab9fc0305ec96f0ad6dbb8d07a75be97d76e8ffdac9ddbf41a508c6ceb8"
+      },
+      {
+        "bytes": 1225,
+        "path": "examples/policy_profile.example.json",
+        "sha256": "4c3581997a130771cf42418f6cf743ba57c68d6e6b9703675acbfcbc9b7d532a"
+      },
+      {
+        "bytes": 774,
+        "path": "examples/schema_definition.example.json",
+        "sha256": "339b6ae26d04cc48539a0fba21e533b40ab602250097e3442d5d5614bd3d7392"
+      },
+      {
+        "bytes": 1701,
+        "path": "examples/skill_spec.example.json",
+        "sha256": "c8a55e1fdb826df5f371f40fdfa310e12a50c57dcbfa99edf33708c916e2b4a9"
+      },
+      {
+        "bytes": 1924,
+        "path": "examples/vendor_profile_claude_code.example.json",
+        "sha256": "c18c164a61425e7738c7d7878a69da50fb034c7ec4e3c969d6bc1efa446eed07"
+      },
+      {
+        "bytes": 1464,
+        "path": "parallel/option_A.json",
+        "sha256": "b294e553b4db4f0433af7299866d471526e17eaeec609fd504e0a452e16ce9fd"
+      },
+      {
+        "bytes": 1545,
+        "path": "parallel/option_B.json",
+        "sha256": "9b833e0a9a2d138fc3ca61e60a0f5a4f706f305626c97d5a77fd58616cb71543"
+      },
+      {
+        "bytes": 1391,
+        "path": "parallel/option_C.json",
+        "sha256": "02ed74831445ccbd88364adc557bd72f93689d54087e8325479fe08523a3d40f"
+      },
+      {
+        "bytes": 3896,
+        "path": "schemas/apm2.prd.cac.v1.schema.json",
+        "sha256": "ccd3fb23365923cc9c50dde4d074e2b3ae6f6a336b7a2bff3a213a142e1bc5c9"
+      },
+      {
+        "bytes": 1509,
+        "path": "schemas/apm2.prd.volume.v1.schema.json",
+        "sha256": "42943f5fdb94026408b6cea411493c3962f8f40d33455ff633c86ed09a9892ba"
+      },
+      {
+        "bytes": 2902,
+        "path": "schemas/cac.aat_receipt.v1.schema.json",
+        "sha256": "f38a0385de925c93dacd61cb7de0c2c0f8b5ef14e525a30d7d81b40e4f6498d8"
+      },
+      {
+        "bytes": 2205,
+        "path": "schemas/cac.admission_receipt.v1.schema.json",
+        "sha256": "56e8cca05c563ea0f44fcc10bc99cace6424aaa70797d664488f2f47f124ba61"
+      },
+      {
+        "bytes": 2440,
+        "path": "schemas/cac.artifact.envelope.v1.schema.json",
+        "sha256": "d13168291ffa392d4f80c389ebb82503daef3cf49fee5ca0fad398cd4699a328"
+      },
+      {
+        "bytes": 1319,
+        "path": "schemas/cac.budget_profile.v1.schema.json",
+        "sha256": "6cca3771822d2f0d4faf48f3003c2e2a51a3e6ed8071a622543b4ce218a708e5"
+      },
+      {
+        "bytes": 2692,
+        "path": "schemas/cac.capabilities_manifest.v1.schema.json",
+        "sha256": "0449fb9fa0dafa938d34a74c33509ed198b1497cdd210fc8ea7165e53d27c7c0"
+      },
+      {
+        "bytes": 975,
+        "path": "schemas/cac.common.v1.schema.json",
+        "sha256": "d1f1a46a3f037fe34c80056e0b634c6b67e83a1cc9f8993e321f44cfdeb2c61b"
+      },
+      {
+        "bytes": 2915,
+        "path": "schemas/cac.context_pack_manifest.v1.schema.json",
+        "sha256": "3e6d68ac6a9b18fb4556bd8f385181fca42e651b3aabb9d2da49d9bda693aacf"
+      },
+      {
+        "bytes": 2751,
+        "path": "schemas/cac.context_pack_spec.v1.schema.json",
+        "sha256": "b379fd55c3870f0029a6d1f4d733c793bd1548e864b9afaae25bcef422b699cb"
+      },
+      {
+        "bytes": 2904,
+        "path": "schemas/cac.defect_record.v1.schema.json",
+        "sha256": "6d1e3dc80b64dceb51de8234732ab274886a1e54d59ca88a4e2968f878c8b0eb"
+      },
+      {
+        "bytes": 2423,
+        "path": "schemas/cac.export_manifest.v1.schema.json",
+        "sha256": "1d2c864f8f6c27a82fe67c8dac5ddc2cff7343e6347a0b330f28451c750f9011"
+      },
+      {
+        "bytes": 2111,
+        "path": "schemas/cac.holon_contract.v1.schema.json",
+        "sha256": "084e3cab586a4f063a94d6ebab872af460e12bd359fd2d8adb2419d7ea235581"
+      },
+      {
+        "bytes": 3240,
+        "path": "schemas/cac.patch_record.v1.schema.json",
+        "sha256": "8f1a775cfd606822c566c5037425418990670c54e35f84847266345676766d16"
+      },
+      {
+        "bytes": 1947,
+        "path": "schemas/cac.policy_profile.v1.schema.json",
+        "sha256": "dc45003a0e32dbacc0ef4a7f866f756eeff45e28c1169db5457ca07147e8ac39"
+      },
+      {
+        "bytes": 1986,
+        "path": "schemas/cac.schema_definition.v1.schema.json",
+        "sha256": "90745e3d4b71d88735d7ee281b8692984f6765c92725d08c246da86535a4366c"
+      },
+      {
+        "bytes": 2314,
+        "path": "schemas/cac.skill_spec.v1.schema.json",
+        "sha256": "cf32e7584a006eaec57761035cad0c39b38c91c1583560bb7d259b77363dd2d8"
+      },
+      {
+        "bytes": 4554,
+        "path": "schemas/cac.vendor_profile.v1.schema.json",
+        "sha256": "3f210418baccede3174d296290a331082d2e9100c18a75e2388658828ac8e65b"
+      },
+      {
+        "bytes": 13306,
+        "path": "volumes/V00_Executive_Summary_Problem_Goals_Principles.json",
+        "sha256": "61d8a18173d8946fd9127412b38344f20ea4fa99a2e8b7b0e693db11ebf35fc8"
+      },
+      {
+        "bytes": 6614,
+        "path": "volumes/V01_System_Model.json",
+        "sha256": "723b1bc1232d88b30036b00870d34402a4e403c7820a60fb903ee70f918dc65f"
+      },
+      {
+        "bytes": 11321,
+        "path": "volumes/V02_Formats_Canonicalization_Artifact_Kinds_Schema_Registry.json",
+        "sha256": "9fddb3f7a78fa4cce1a378cbe274c0b090f6ed0cee6e36b5452ad922c7384ba4"
+      },
+      {
+        "bytes": 9669,
+        "path": "volumes/V03_End-to-End_Pipeline.json",
+        "sha256": "f2cc293c249856b4ba1366fcbf5f3a9f434cee3b9af5afbc546289d8eeb84fab"
+      },
+      {
+        "bytes": 6166,
+        "path": "volumes/V04_Messaging_Integration.json",
+        "sha256": "91116614c4218f837b9b0b84e34270e24976cf1507c377eb70f06ca8c398a201"
+      },
+      {
+        "bytes": 5468,
+        "path": "volumes/V05_Security_and_Integrity.json",
+        "sha256": "d0b45e4e0f3927e882b285126caef18290be30dbac0bad75e34e93f5eeeaf782"
+      },
+      {
+        "bytes": 8515,
+        "path": "volumes/V06_Implementation_Plan.json",
+        "sha256": "db459fa70304bb02471d17d57283c3019f5682cbe55bbb908466db9ae9beb80a"
+      },
+      {
+        "bytes": 6847,
+        "path": "volumes/V07_Testing_Rollout_and_Metrics.json",
+        "sha256": "83ac1f75fd74138308f47c3643934ca71d43cd3a0a1bac166d4d79dde2c961b4"
+      },
+      {
+        "bytes": 7356,
+        "path": "volumes/V08_Parallel_Designs_and_Selection.json",
+        "sha256": "0e3162953087458d02e32e9943baa4673a3a6b0bbf3f3cbe6fbbfc1e2f331f06"
+      },
+      {
+        "bytes": 6976,
+        "path": "volumes/V09_Risks_Open_Questions_Definition_of_Done_References.json",
+        "sha256": "3f4c8f311dbc9e042b2cd67f0553cb19d0b6cefd3ef183ab8f8508a28826362e"
+      },
+      {
+        "bytes": 1226,
+        "path": "workspace/fragments/00_doc_meta.json",
+        "sha256": "4334b2f822aeb990d2d9be406dd2a829838a752d6b3daac2da1318753c4b9db8"
+      },
+      {
+        "bytes": 1132,
+        "path": "workspace/fragments/01_summary.json",
+        "sha256": "a47194205f6f673816f99e64b5a4b07b7e9f0107768111e2b1eb37754b30f5d9"
+      },
+      {
+        "bytes": 3256,
+        "path": "workspace/fragments/02_problem.json",
+        "sha256": "34a0bcf7af9492cceb36e137cff6a7e75a5e38f863a21cf8b9c9b87646263dd7"
+      },
+      {
+        "bytes": 3229,
+        "path": "workspace/fragments/03_goals.json",
+        "sha256": "8c7c4bc16dc3c206d0f6fb5bce4ff5a3573f77f7927a9b6c481bc60170a1bc30"
+      },
+      {
+        "bytes": 2440,
+        "path": "workspace/fragments/04_principles.json",
+        "sha256": "2b1452c57773adf184ae58efa591c9546f003aa68bd914995a1f55cbe4a3b116"
+      },
+      {
+        "bytes": 5818,
+        "path": "workspace/fragments/05_system_model.json",
+        "sha256": "ca5f7cf72209eb6981d485e9603d74050be1a52e3de8621f614b570ebb2fb963"
+      },
+      {
+        "bytes": 4206,
+        "path": "workspace/fragments/06_format_policy.json",
+        "sha256": "981d1fc5689b44b132f214896c89d912b9cbefffde16bff88534bcf6187dc806"
+      },
+      {
+        "bytes": 3667,
+        "path": "workspace/fragments/07_artifact_kinds.json",
+        "sha256": "cc930dd9dc834411eee861f5bf02ebdb38655d7421b0706755a54a6cdd43e16a"
+      },
+      {
+        "bytes": 1962,
+        "path": "workspace/fragments/08_schema_registry.json",
+        "sha256": "2a62b8ea27448d96f5849d63fd4558a6c4ce5daee9e7f7ae65a30fb35138b266"
+      },
+      {
+        "bytes": 8414,
+        "path": "workspace/fragments/09_pipeline.json",
+        "sha256": "3f99d700ddd8485afa6ef7c6c51528bedef20e113f815967e780786956b83109"
+      },
+      {
+        "bytes": 5252,
+        "path": "workspace/fragments/10_messaging_integration.json",
+        "sha256": "d8c07441499e1255e5203ad4a7dc78cb11f3c261a74ab96a291a2eedc4efd43a"
+      },
+      {
+        "bytes": 4746,
+        "path": "workspace/fragments/11_security.json",
+        "sha256": "615d2dce71f2ae65182c4945f3a5f19a6f50413a836503d9db271c2515ab642c"
+      },
+      {
+        "bytes": 7442,
+        "path": "workspace/fragments/12_implementation.json",
+        "sha256": "ae37231b64a831b82fe6e63c86da1f7452b6f3ba36907ebd9c3969ea470a663e"
+      },
+      {
+        "bytes": 5939,
+        "path": "workspace/fragments/13_testing_rollout_metrics.json",
+        "sha256": "f3669812b63c4977bd32e4869a5bcdb5080f6fa28af4f8dd0caa2a343eaed978"
+      },
+      {
+        "bytes": 3180,
+        "path": "workspace/fragments/14_risks_open_questions.json",
+        "sha256": "132b19b661b92f2fa242c04b86c1b7a6a7d4dce20df6e0df82293d4797a737b5"
+      },
+      {
+        "bytes": 1635,
+        "path": "workspace/fragments/15_definition_of_done.json",
+        "sha256": "8a4872abd394beecb9f2e8d3a7b8109db1dce26b0cfde03339ca12d718cb0b60"
+      },
+      {
+        "bytes": 1070,
+        "path": "workspace/fragments/16_references.json",
+        "sha256": "55e36c7b68b5876f2ce2ba53f5d8feb02273158788aa366333047d242a6a50e3"
+      }
+    ],
+    "parallel_designs": [
+      "parallel/option_A.json",
+      "parallel/option_B.json",
+      "parallel/option_C.json"
+    ],
+    "schema_files": [
+      "schemas/apm2.prd.cac.v1.schema.json",
+      "schemas/apm2.prd.volume.v1.schema.json",
+      "schemas/cac.aat_receipt.v1.schema.json",
+      "schemas/cac.admission_receipt.v1.schema.json",
+      "schemas/cac.artifact.envelope.v1.schema.json",
+      "schemas/cac.budget_profile.v1.schema.json",
+      "schemas/cac.capabilities_manifest.v1.schema.json",
+      "schemas/cac.common.v1.schema.json",
+      "schemas/cac.context_pack_manifest.v1.schema.json",
+      "schemas/cac.context_pack_spec.v1.schema.json",
+      "schemas/cac.defect_record.v1.schema.json",
+      "schemas/cac.export_manifest.v1.schema.json",
+      "schemas/cac.holon_contract.v1.schema.json",
+      "schemas/cac.patch_record.v1.schema.json",
+      "schemas/cac.policy_profile.v1.schema.json",
+      "schemas/cac.schema_definition.v1.schema.json",
+      "schemas/cac.skill_spec.v1.schema.json",
+      "schemas/cac.vendor_profile.v1.schema.json"
+    ],
+    "volume_files": [
+      "volumes/V00_Executive_Summary_Problem_Goals_Principles.json",
+      "volumes/V01_System_Model.json",
+      "volumes/V02_Formats_Canonicalization_Artifact_Kinds_Schema_Registry.json",
+      "volumes/V03_End-to-End_Pipeline.json",
+      "volumes/V04_Messaging_Integration.json",
+      "volumes/V05_Security_and_Integrity.json",
+      "volumes/V06_Implementation_Plan.json",
+      "volumes/V07_Testing_Rollout_and_Metrics.json",
+      "volumes/V08_Parallel_Designs_and_Selection.json",
+      "volumes/V09_Risks_Open_Questions_Definition_of_Done_References.json"
+    ]
+  },
+  "package": {
+    "entrypoints": {
+      "examples_dir": "examples/",
+      "master_prd": "MASTER.json",
+      "schemas_dir": "schemas/",
+      "volumes_dir": "volumes/"
+    },
+    "generated_at": "2026-01-26",
+    "name": "cac_context_as_code_prd",
+    "root": "."
+  },
+  "schema": "apm2.package.manifest.v1",
+  "schema_version": "1.0.0"
+}

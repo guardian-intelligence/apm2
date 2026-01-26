@@ -1,0 +1,55 @@
+{
+  "$id": "cac.budget_profile.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "$ref": "cac.artifact.envelope.v1.schema.json"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "budget.profile"
+        },
+        "payload": {
+          "additionalProperties": false,
+          "properties": {
+            "budget_name": {
+              "type": "string"
+            },
+            "limits": {
+              "additionalProperties": false,
+              "properties": {
+                "time_ms": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "tokens": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "tool_calls": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "tool_calls",
+                "time_ms"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "budget_name",
+            "limits"
+          ],
+          "type": "object"
+        },
+        "schema": {
+          "const": "cac.budget_profile.v1"
+        }
+      }
+    }
+  ],
+  "title": "CAC BudgetProfile v1"
+}
