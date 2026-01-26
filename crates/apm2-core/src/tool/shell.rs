@@ -43,7 +43,7 @@ impl ShellTool {
         }
 
         let resolved = self.workspace_root.join(path);
-        
+
         // Canonicalize to verify existence and confinement
         let canonical = resolved.canonicalize().map_err(|e| ToolError {
             error_code: "INVALID_CWD".to_string(),
@@ -68,15 +68,17 @@ impl ShellTool {
     ///
     /// # Errors
     ///
-    /// Returns a `ToolError` if execution fails, times out, or returns a non-zero exit code.
+    /// Returns a `ToolError` if execution fails, times out, or returns a
+    /// non-zero exit code.
     pub async fn execute(&self, req: &ShellExec) -> Result<Vec<u8>, ToolError> {
         info!("Executing command: '{}'", req.command);
 
         let cwd = self.resolve_cwd(&req.cwd)?;
         debug!("Working directory: {:?}", cwd);
 
-        // TODO: Enforce network_access flag via seccomp/unshare if strictly required here.
-        // For now, we rely on the container environment or policy to restrict network.
+        // TODO: Enforce network_access flag via seccomp/unshare if strictly required
+        // here. For now, we rely on the container environment or policy to
+        // restrict network.
         if !req.network_access {
             debug!("Network access not requested (enforcement delegated to environment)");
         }
@@ -89,14 +91,14 @@ impl ShellTool {
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
-           .arg(&req.command)
-           .current_dir(cwd)
-           .stdin(Stdio::null())
-           .stdout(Stdio::piped())
-           .stderr(Stdio::piped());
+            .arg(&req.command)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         // Set environment variables
-        // Clear existing env to ensure hermetic execution? 
+        // Clear existing env to ensure hermetic execution?
         // Or inherit? Usually we want a controlled environment.
         // We'll clear and set only provided + minimal PATH/TERM.
         cmd.env_clear();
@@ -123,7 +125,7 @@ impl ShellTool {
             Ok(Ok(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                
+
                 let combined = if stderr.is_empty() {
                     stdout.into_owned()
                 } else {
@@ -159,9 +161,9 @@ impl ShellTool {
                 // We might need to kill it manually if we held the child handle.
                 // But wait_with_output takes ownership.
                 // So we can't kill it easily if it times out inside wait_with_output?
-                // Actually, if the future is dropped, the background task might linger if not careful.
-                // But wait_with_output handles reading pipes. 
-                
+                // Actually, if the future is dropped, the background task might linger if not
+                // careful. But wait_with_output handles reading pipes.
+
                 // For robust timeout kill, we usually spawn, then select! on wait.
                 // But let's return error first.
                 Err(ToolError {
@@ -170,15 +172,16 @@ impl ShellTool {
                     retryable: true,
                     retry_after_ms: 1000,
                 })
-            }
+            },
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_execute_success() {
