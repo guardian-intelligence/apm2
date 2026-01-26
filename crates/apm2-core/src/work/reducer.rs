@@ -128,8 +128,8 @@ impl WorkReducerState {
     ///
     /// # CI Gating
     ///
-    /// Only these work items can be claimed by agents. Work items in `CiPending`
-    /// or `Blocked` states cannot be claimed.
+    /// Only these work items can be claimed by agents. Work items in
+    /// `CiPending` or `Blocked` states cannot be claimed.
     #[must_use]
     pub fn claimable_work(&self) -> Vec<&Work> {
         self.work_items

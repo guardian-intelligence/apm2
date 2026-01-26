@@ -50,15 +50,32 @@ impl WorkType {
 }
 
 /// The lifecycle state of a work item.
+///
+/// # Discriminant Stability
+///
+/// Explicit discriminant values are used to maintain semver compatibility.
+/// New variants MUST be assigned new discriminant values; existing variants
+/// MUST NOT have their discriminants changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
+#[repr(u8)]
 pub enum WorkState {
     /// Work is open and available for claiming.
-    Open,
+    Open              = 0,
     /// Work has been claimed by an agent.
-    Claimed,
+    Claimed           = 1,
     /// Work is actively being processed.
-    InProgress,
+    InProgress        = 2,
+    /// Work is under review.
+    Review            = 3,
+    /// Work is blocked waiting for input.
+    NeedsInput        = 4,
+    /// Work requires adjudication (human decision).
+    NeedsAdjudication = 5,
+    /// Work has been successfully completed.
+    Completed         = 6,
+    /// Work has been aborted.
+    Aborted           = 7,
     /// Work is waiting for CI completion (not claimable).
     ///
     /// # CI Gating
@@ -67,14 +84,14 @@ pub enum WorkState {
     /// Agents cannot claim work in this state. The work will transition to
     /// `ReadyForReview` (CI success) or `Blocked` (CI failure) based on
     /// `CIWorkflowCompleted` events.
-    CiPending,
+    CiPending         = 8,
     /// Work is ready for review after CI passed (claimable).
     ///
     /// # CI Gating
     ///
     /// Work enters this state after `CIWorkflowCompleted` with `Success`
     /// conclusion. Review agents can claim work in this state.
-    ReadyForReview,
+    ReadyForReview    = 9,
     /// Work is blocked due to CI failure or other issues (not claimable).
     ///
     /// # CI Gating
@@ -82,17 +99,7 @@ pub enum WorkState {
     /// Work enters this state after `CIWorkflowCompleted` with `Failure`
     /// conclusion. The work can transition back to `CiPending` when CI is
     /// retried (e.g., after a fix is pushed).
-    Blocked,
-    /// Work is under review.
-    Review,
-    /// Work is blocked waiting for input.
-    NeedsInput,
-    /// Work requires adjudication (human decision).
-    NeedsAdjudication,
-    /// Work has been successfully completed.
-    Completed,
-    /// Work has been aborted.
-    Aborted,
+    Blocked           = 10,
 }
 
 impl std::fmt::Display for WorkState {
@@ -270,10 +277,10 @@ pub struct Work {
     ///
     /// # CI Gating
     ///
-    /// When an agent creates a PR for this work, the PR number is recorded here.
-    /// This enables matching `CIWorkflowCompleted` events to work items so that
-    /// CI completion can trigger phase transitions (e.g., `CiPending` ->
-    /// `ReadyForReview`).
+    /// When an agent creates a PR for this work, the PR number is recorded
+    /// here. This enables matching `CIWorkflowCompleted` events to work
+    /// items so that CI completion can trigger phase transitions (e.g.,
+    /// `CiPending` -> `ReadyForReview`).
     ///
     /// A value of `None` indicates no PR has been created yet.
     pub pr_number: Option<u64>,
@@ -421,7 +428,10 @@ mod unit_tests {
             WorkState::parse("IN_PROGRESS").unwrap(),
             WorkState::InProgress
         );
-        assert_eq!(WorkState::parse("CI_PENDING").unwrap(), WorkState::CiPending);
+        assert_eq!(
+            WorkState::parse("CI_PENDING").unwrap(),
+            WorkState::CiPending
+        );
         assert_eq!(
             WorkState::parse("ci_pending").unwrap(),
             WorkState::CiPending

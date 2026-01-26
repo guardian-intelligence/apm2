@@ -25,7 +25,8 @@
 //! - [CTR-CIQ001] Work items must be in `CiPending` state to be transitioned.
 //! - [CTR-CIQ002] Only one work item per PR number at a time.
 //! - [CTR-CIQ003] Transitions are idempotent (duplicate events are skipped).
-//! - [CTR-CIQ004] `WorkReadyForNextPhase` events are emitted for all transitions.
+//! - [CTR-CIQ004] `WorkReadyForNextPhase` events are emitted for all
+//!   transitions.
 
 use uuid::Uuid;
 
@@ -182,7 +183,12 @@ pub struct CiTransitionBuilder {
 impl CiTransitionBuilder {
     /// Creates a new transition builder.
     #[must_use]
-    pub const fn new(work_id: String, from_state: WorkState, to_state: WorkState, triggered_by: Uuid) -> Self {
+    pub const fn new(
+        work_id: String,
+        from_state: WorkState,
+        to_state: WorkState,
+        triggered_by: Uuid,
+    ) -> Self {
         Self {
             work_id,
             from_state,
@@ -362,9 +368,7 @@ mod tests {
         });
 
         match result {
-            CiQueueProcessResult::Transitioned {
-                next_phase, ..
-            } => {
+            CiQueueProcessResult::Transitioned { next_phase, .. } => {
                 assert_eq!(next_phase, WorkState::Blocked);
             },
             other => panic!("Expected Transitioned, got {other:?}"),

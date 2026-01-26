@@ -1650,8 +1650,13 @@ fn test_ci_gated_work_query() {
     reducer
         .apply(&create_event("work.transitioned", "s", ci2), &ctx)
         .unwrap();
-    let blocked2 =
-        helpers::work_transitioned_payload_with_sequence("work-2", "CI_PENDING", "BLOCKED", "ci_failed", 3);
+    let blocked2 = helpers::work_transitioned_payload_with_sequence(
+        "work-2",
+        "CI_PENDING",
+        "BLOCKED",
+        "ci_failed",
+        3,
+    );
     reducer
         .apply(&create_event("work.transitioned", "s", blocked2), &ctx)
         .unwrap();
