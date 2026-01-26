@@ -20,6 +20,65 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use clap::Parser;
 use pulldown_cmark::{CodeBlockKind, Event, Parser as MdParser, Tag, TagEnd};
+use serde::Deserialize;
+
+// =============================================================================
+// YAML Schema Definitions for RFC files
+// =============================================================================
+
+/// Root structure for `06_ticket_decomposition.yaml` files.
+#[derive(Debug, Deserialize)]
+struct TicketDecompositionFile {
+    rfc_ticket_decomposition: Option<TicketDecomposition>,
+}
+
+/// Ticket decomposition schema.
+#[derive(Debug, Deserialize)]
+struct TicketDecomposition {
+    #[serde(default)]
+    tickets: Vec<Ticket>,
+    #[serde(default)]
+    ticket_plan: Option<TicketPlan>,
+}
+
+/// Ticket plan containing tickets.
+#[derive(Debug, Deserialize)]
+struct TicketPlan {
+    #[serde(default)]
+    tickets: Vec<Ticket>,
+}
+
+/// Individual ticket definition.
+#[derive(Debug, Deserialize)]
+struct Ticket {
+    #[serde(default)]
+    files_to_create: Vec<String>,
+    // Note: files_to_modify is parsed but not currently used by lint rules.
+    // Kept for schema completeness and potential future use.
+    #[serde(default)]
+    #[allow(dead_code)]
+    files_to_modify: Vec<String>,
+}
+
+/// Root structure for `05_rollout_and_ops.yaml` files.
+#[derive(Debug, Deserialize)]
+struct RolloutAndOpsFile {
+    rfc_rollout_and_ops: Option<RolloutAndOps>,
+}
+
+/// Rollout and ops schema.
+#[derive(Debug, Deserialize)]
+struct RolloutAndOps {
+    #[serde(default)]
+    deletion_plan: Vec<DeletionPlanItem>,
+}
+
+/// Individual deletion plan item.
+#[derive(Debug, Deserialize)]
+struct DeletionPlanItem {
+    item: String,
+    plan: String,
+}
 
 /// Arguments for the lint command.
 #[derive(Parser, Debug, Clone, Copy)]
@@ -678,6 +737,9 @@ fn get_new_mod_files() -> Result<Vec<String>> {
 }
 
 /// Load justified file paths from RFC ticket decomposition files.
+///
+/// Uses `serde_yaml` to parse the YAML structure and extract `files_to_create`
+/// entries from all tickets.
 fn load_rfc_justified_paths() -> Result<Vec<String>> {
     let mut justified = Vec::new();
 
@@ -686,21 +748,46 @@ fn load_rfc_justified_paths() -> Result<Vec<String>> {
     let glob_pattern = glob::glob(pattern).context("Invalid RFC glob pattern")?;
 
     for entry in glob_pattern.flatten() {
-        if let Ok(content) = std::fs::read_to_string(&entry) {
-            // Extract files_to_create entries using simple pattern matching
-            // Look for lines like "        - crates/apm2-core/src/determinism/mod.rs"
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("- ") && trimmed.contains('/') {
-                    let path = trimmed.trim_start_matches("- ").trim();
-                    if std::path::Path::new(path)
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
-                    {
-                        justified.push(path.to_string());
-                    }
+        let file_path = entry.display().to_string();
+        match std::fs::read_to_string(&entry) {
+            Ok(content) => {
+                match serde_yaml::from_str::<TicketDecompositionFile>(&content) {
+                    Ok(decomp_file) => {
+                        if let Some(decomp) = decomp_file.rfc_ticket_decomposition {
+                            // Extract from top-level tickets
+                            for ticket in &decomp.tickets {
+                                for path in &ticket.files_to_create {
+                                    if std::path::Path::new(path)
+                                        .extension()
+                                        .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+                                    {
+                                        justified.push(path.clone());
+                                    }
+                                }
+                            }
+                            // Extract from ticket_plan.tickets if present
+                            if let Some(plan) = &decomp.ticket_plan {
+                                for ticket in &plan.tickets {
+                                    for path in &ticket.files_to_create {
+                                        if std::path::Path::new(path)
+                                            .extension()
+                                            .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+                                        {
+                                            justified.push(path.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("warning: Failed to parse YAML in {file_path}: {e}");
+                    },
                 }
-            }
+            },
+            Err(e) => {
+                eprintln!("warning: Failed to read file {file_path}: {e}");
+            },
         }
     }
 
@@ -771,9 +858,14 @@ fn collect_type_definitions() -> Result<Vec<TypeDefinition>> {
         let glob_pattern = glob::glob(pattern).context("Invalid glob pattern")?;
 
         for entry in glob_pattern.flatten() {
-            if let Ok(content) = std::fs::read_to_string(&entry) {
-                let file_path = entry.display().to_string();
-                extract_type_definitions(&content, &file_path, &mut definitions);
+            let file_path = entry.display().to_string();
+            match std::fs::read_to_string(&entry) {
+                Ok(content) => {
+                    extract_type_definitions(&content, &file_path, &mut definitions);
+                },
+                Err(e) => {
+                    eprintln!("warning: Failed to read file {file_path}: {e}");
+                },
             }
         }
     }
@@ -897,8 +989,13 @@ fn check_deletion_plan_required(findings: &mut Vec<LintFinding>) -> Result<()> {
     let deletion_plans = load_rfc_deletion_plans()?;
 
     for file_path in new_files {
-        if let Ok(content) = std::fs::read_to_string(&file_path) {
-            check_pub_items_for_deletion_plan(&content, &file_path, &deletion_plans, findings);
+        match std::fs::read_to_string(&file_path) {
+            Ok(content) => {
+                check_pub_items_for_deletion_plan(&content, &file_path, &deletion_plans, findings);
+            },
+            Err(e) => {
+                eprintln!("warning: Failed to read file {file_path}: {e}");
+            },
         }
     }
 
@@ -946,7 +1043,8 @@ fn get_new_rust_files() -> Result<Vec<String>> {
 
 /// Load deletion plans from RFC files.
 ///
-/// Returns a map of item names to their deletion plan descriptions.
+/// Uses `serde_yaml` to parse the YAML structure and extract `deletion_plan`
+/// entries. Returns a map of item names to their deletion plan descriptions.
 fn load_rfc_deletion_plans() -> Result<HashMap<String, String>> {
     let mut plans = HashMap::new();
 
@@ -955,47 +1053,23 @@ fn load_rfc_deletion_plans() -> Result<HashMap<String, String>> {
     let glob_pattern = glob::glob(pattern).context("Invalid RFC glob pattern")?;
 
     for entry in glob_pattern.flatten() {
-        if let Ok(content) = std::fs::read_to_string(&entry) {
-            // Simple YAML parsing: look for deletion_plan sections
-            // Format expected:
-            // deletion_plan:
-            //   - item: "FunctionName" plan: "Will be removed in v2.0"
-            let mut in_deletion_plan = false;
-            let mut current_item = String::new();
-
-            for line in content.lines() {
-                let trimmed = line.trim();
-
-                if trimmed == "deletion_plan:" || trimmed.starts_with("deletion_plan:") {
-                    in_deletion_plan = true;
-                    continue;
-                }
-
-                if in_deletion_plan {
-                    if !line.starts_with(' ') && !line.starts_with('\t') && !trimmed.is_empty() {
-                        // End of deletion_plan section
-                        in_deletion_plan = false;
-                        continue;
+        let file_path = entry.display().to_string();
+        match std::fs::read_to_string(&entry) {
+            Ok(content) => match serde_yaml::from_str::<RolloutAndOpsFile>(&content) {
+                Ok(rollout_file) => {
+                    if let Some(rollout) = rollout_file.rfc_rollout_and_ops {
+                        for plan_item in &rollout.deletion_plan {
+                            plans.insert(plan_item.item.clone(), plan_item.plan.clone());
+                        }
                     }
-
-                    if trimmed.starts_with("- item:") || trimmed.starts_with("item:") {
-                        current_item = trimmed
-                            .trim_start_matches("- item:")
-                            .trim_start_matches("item:")
-                            .trim()
-                            .trim_matches('"')
-                            .to_string();
-                    } else if trimmed.starts_with("plan:") && !current_item.is_empty() {
-                        let plan = trimmed
-                            .trim_start_matches("plan:")
-                            .trim()
-                            .trim_matches('"')
-                            .to_string();
-                        plans.insert(current_item.clone(), plan);
-                        current_item.clear();
-                    }
-                }
-            }
+                },
+                Err(e) => {
+                    eprintln!("warning: Failed to parse YAML in {file_path}: {e}");
+                },
+            },
+            Err(e) => {
+                eprintln!("warning: Failed to read file {file_path}: {e}");
+            },
         }
     }
 
