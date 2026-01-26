@@ -19,6 +19,16 @@
 //! by design: complex keys are rare in practice and require explicit handling
 //! by the caller.
 //!
+//! # Float Keys
+//!
+//! Float values as map keys are rejected because they cannot be reliably
+//! normalized to a canonical string representation (e.g., `1.0` vs `1.00`).
+//!
+//! # Recursion Limit
+//!
+//! To prevent stack overflow from deeply nested input, a maximum recursion
+//! depth of 128 levels is enforced.
+//!
 //! # Example
 //!
 //! ```
@@ -37,10 +47,14 @@
 //! assert_eq!(canonical, "apple: 2\nzebra: 1\n");
 //! ```
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use serde_yaml::Value;
 use thiserror::Error;
+
+/// Maximum recursion depth for canonicalization to prevent stack overflow.
+const MAX_DEPTH: usize = 128;
 
 /// Errors that can occur during YAML canonicalization.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -56,12 +70,97 @@ pub enum CanonicalizeError {
         /// "mapping").
         key_type: &'static str,
     },
+
+    /// A float key was encountered in a YAML mapping.
+    ///
+    /// Float keys are rejected because they cannot be reliably normalized to
+    /// a canonical string representation (e.g., `1.0` vs `1.00` may produce
+    /// different strings despite being semantically identical).
+    #[error("unsupported float YAML key: float keys cannot be reliably canonicalized")]
+    UnsupportedFloatKey,
+
+    /// The recursion depth limit was exceeded.
+    ///
+    /// This error is returned when the YAML structure is nested deeper than
+    /// the maximum allowed depth (128 levels). This limit exists to prevent
+    /// stack overflow attacks from maliciously crafted input.
+    #[error("recursion limit exceeded: YAML nested deeper than {max_depth} levels")]
+    RecursionLimitExceeded {
+        /// The maximum depth that was exceeded.
+        max_depth: usize,
+    },
+}
+
+/// A typed key representation that preserves type information for sorting.
+///
+/// This ensures that keys of different types (e.g., integer `123` and string
+/// `"123"`) are kept distinct and sorted separately, preventing data loss from
+/// key collisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypedKey {
+    /// Null key
+    Null,
+    /// Boolean key
+    Bool(bool),
+    /// Integer key (i64)
+    Int(i64),
+    /// String key
+    String(String),
+}
+
+impl TypedKey {
+    /// Returns the type tag for ordering different types.
+    /// Types are ordered: Null < Bool < Int < String
+    const fn type_order(&self) -> u8 {
+        match self {
+            Self::Null => 0,
+            Self::Bool(_) => 1,
+            Self::Int(_) => 2,
+            Self::String(_) => 3,
+        }
+    }
+
+    /// Converts the key back to a YAML `Value` for output.
+    fn to_value(&self) -> Value {
+        match self {
+            Self::Null => Value::Null,
+            Self::Bool(b) => Value::Bool(*b),
+            Self::Int(n) => Value::Number((*n).into()),
+            Self::String(s) => Value::String(s.clone()),
+        }
+    }
+}
+
+impl Ord for TypedKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // First compare by type
+        let type_cmp = self.type_order().cmp(&other.type_order());
+        if type_cmp != Ordering::Equal {
+            return type_cmp;
+        }
+
+        // Then compare within the same type
+        match (self, other) {
+            (Self::Bool(a), Self::Bool(b)) => a.cmp(b),
+            (Self::Int(a), Self::Int(b)) => a.cmp(b),
+            (Self::String(a), Self::String(b)) => a.cmp(b),
+            // Null == Null, and any other combinations should never happen
+            // due to type_order check above
+            _ => Ordering::Equal,
+        }
+    }
+}
+
+impl PartialOrd for TypedKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Canonicalizes a YAML value to a deterministic string representation.
 ///
 /// The output has the following properties:
-/// - All mapping keys are sorted lexicographically
+/// - All mapping keys are sorted by type first, then by value within each type
 /// - Uses 2-space indentation
 /// - No trailing whitespace
 /// - Idempotent: `canonicalize_yaml(parse(canonicalize_yaml(v))) ==
@@ -74,14 +173,20 @@ pub enum CanonicalizeError {
 /// # Returns
 ///
 /// A canonical string representation of the YAML value, or an error if the
-/// value contains unsupported complex keys (sequences or mappings as keys).
+/// value contains unsupported keys or exceeds the recursion limit.
 ///
 /// # Errors
 ///
 /// Returns [`CanonicalizeError::UnsupportedComplexKey`] if the YAML value
 /// contains a mapping with a sequence or mapping as a key.
+///
+/// Returns [`CanonicalizeError::UnsupportedFloatKey`] if a float is used as a
+/// map key.
+///
+/// Returns [`CanonicalizeError::RecursionLimitExceeded`] if the YAML structure
+/// is nested deeper than 128 levels.
 pub fn canonicalize_yaml(value: &Value) -> Result<String, CanonicalizeError> {
-    let sorted = sort_keys_recursive(value)?;
+    let sorted = sort_keys_recursive(value, 0)?;
     let mut output = String::new();
     emit_value(&sorted, 0, true, &mut output);
     Ok(output)
@@ -89,55 +194,92 @@ pub fn canonicalize_yaml(value: &Value) -> Result<String, CanonicalizeError> {
 
 /// Recursively sorts all mapping keys in a YAML value.
 ///
+/// # Arguments
+///
+/// * `value` - The YAML value to process
+/// * `depth` - Current recursion depth (starts at 0)
+///
 /// # Errors
 ///
 /// Returns an error if any mapping contains a complex key (sequence or
-/// mapping).
-fn sort_keys_recursive(value: &Value) -> Result<Value, CanonicalizeError> {
+/// mapping), a float key, or if the recursion limit is exceeded.
+fn sort_keys_recursive(value: &Value, depth: usize) -> Result<Value, CanonicalizeError> {
+    // Check recursion limit
+    if depth > MAX_DEPTH {
+        return Err(CanonicalizeError::RecursionLimitExceeded {
+            max_depth: MAX_DEPTH,
+        });
+    }
+
     match value {
         Value::Mapping(map) => {
-            // Convert to BTreeMap for sorted iteration
-            let mut sorted: BTreeMap<String, Value> = BTreeMap::new();
+            // Convert to BTreeMap with TypedKey for type-safe sorted iteration
+            let mut sorted: BTreeMap<TypedKey, Value> = BTreeMap::new();
             for (k, v) in map {
-                let key = yaml_key_to_string(k)?;
-                let value = sort_keys_recursive(v)?;
+                let key = yaml_key_to_typed(k)?;
+                let value = sort_keys_recursive(v, depth + 1)?;
                 sorted.insert(key, value);
             }
 
             // Convert back to a Mapping with sorted keys
             let mut result = serde_yaml::Mapping::new();
             for (key, val) in sorted {
-                result.insert(Value::String(key), val);
+                result.insert(key.to_value(), val);
             }
             Ok(Value::Mapping(result))
         },
         Value::Sequence(seq) => {
-            let sorted: Result<Vec<Value>, CanonicalizeError> =
-                seq.iter().map(sort_keys_recursive).collect();
+            let sorted: Result<Vec<Value>, CanonicalizeError> = seq
+                .iter()
+                .map(|v| sort_keys_recursive(v, depth + 1))
+                .collect();
             Ok(Value::Sequence(sorted?))
         },
         other => Ok(other.clone()),
     }
 }
 
-/// Converts a YAML key to a string for sorting purposes.
+/// Converts a YAML key to a `TypedKey` for type-safe sorting.
 ///
 /// # Errors
 ///
-/// Returns an error if the key is a complex type (sequence or mapping).
-fn yaml_key_to_string(key: &Value) -> Result<String, CanonicalizeError> {
+/// Returns an error if the key is a complex type (sequence or mapping) or a
+/// float.
+fn yaml_key_to_typed(key: &Value) -> Result<TypedKey, CanonicalizeError> {
     match key {
-        Value::String(s) => Ok(s.clone()),
-        Value::Number(n) => Ok(n.to_string()),
-        Value::Bool(b) => Ok(b.to_string()),
-        Value::Null => Ok("null".to_string()),
+        Value::String(s) => Ok(TypedKey::String(s.clone())),
+        Value::Number(n) => {
+            // Reject floats - they cannot be reliably normalized
+            if n.is_f64() && !n.is_i64() && !n.is_u64() {
+                return Err(CanonicalizeError::UnsupportedFloatKey);
+            }
+            // Handle integers: try i64 first, then u64
+            n.as_i64().map_or_else(
+                || {
+                    n.as_u64()
+                        .map_or(Err(CanonicalizeError::UnsupportedFloatKey), |u| {
+                            // u64 values that fit in i64
+                            i64::try_from(u).map_or_else(
+                                |_| {
+                                    // Large u64 values - convert to string representation
+                                    Ok(TypedKey::String(u.to_string()))
+                                },
+                                |i| Ok(TypedKey::Int(i)),
+                            )
+                        })
+                },
+                |i| Ok(TypedKey::Int(i)),
+            )
+        },
+        Value::Bool(b) => Ok(TypedKey::Bool(*b)),
+        Value::Null => Ok(TypedKey::Null),
         Value::Sequence(_) => Err(CanonicalizeError::UnsupportedComplexKey {
             key_type: "sequence",
         }),
         Value::Mapping(_) => Err(CanonicalizeError::UnsupportedComplexKey {
             key_type: "mapping",
         }),
-        Value::Tagged(tagged) => yaml_key_to_string(&tagged.value),
+        Value::Tagged(tagged) => yaml_key_to_typed(&tagged.value),
     }
 }
 
@@ -672,6 +814,215 @@ level1:
             CanonicalizeError::UnsupportedComplexKey {
                 key_type: "sequence"
             }
+        );
+    }
+
+    // =========================================================================
+    // Security fix tests (TCK-00110)
+    // =========================================================================
+
+    /// CRITICAL: Test that integer and string keys with same representation
+    /// are NOT collapsed (data loss prevention).
+    #[test]
+    fn test_type_collision_int_vs_string_keys_preserved() {
+        // Create a mapping with integer 123 and string "123" as separate keys
+        let mut map = serde_yaml::Mapping::new();
+        map.insert(Value::Number(123.into()), Value::String("int".to_string()));
+        map.insert(
+            Value::String("123".to_string()),
+            Value::String("str".to_string()),
+        );
+        let value = Value::Mapping(map);
+
+        let canonical = canonicalize_yaml(&value).unwrap();
+
+        // Both keys must be present in output - no collision/data loss
+        assert!(
+            canonical.contains("int") && canonical.contains("str"),
+            "Both integer 123 and string '123' keys must be preserved, got:\n{canonical}"
+        );
+
+        // Verify the output can be reparsed and contains both entries
+        let reparsed: Value = serde_yaml::from_str(&canonical).unwrap();
+        if let Value::Mapping(m) = reparsed {
+            assert_eq!(
+                m.len(),
+                2,
+                "Reparsed mapping should have 2 entries, got {}",
+                m.len()
+            );
+        } else {
+            panic!("Expected mapping");
+        }
+    }
+
+    /// Test that bool and string keys are kept distinct
+    #[test]
+    fn test_type_collision_bool_vs_string_keys_preserved() {
+        let mut map = serde_yaml::Mapping::new();
+        map.insert(Value::Bool(true), Value::String("bool".to_string()));
+        map.insert(
+            Value::String("true".to_string()),
+            Value::String("str".to_string()),
+        );
+        let value = Value::Mapping(map);
+
+        let canonical = canonicalize_yaml(&value).unwrap();
+
+        // Both values must be present
+        assert!(
+            canonical.contains("bool") && canonical.contains("str"),
+            "Both bool true and string 'true' keys must be preserved, got:\n{canonical}"
+        );
+    }
+
+    /// Test that null and string "null" keys are kept distinct
+    #[test]
+    fn test_type_collision_null_vs_string_keys_preserved() {
+        let mut map = serde_yaml::Mapping::new();
+        map.insert(Value::Null, Value::String("null_key".to_string()));
+        map.insert(
+            Value::String("null".to_string()),
+            Value::String("str_key".to_string()),
+        );
+        let value = Value::Mapping(map);
+
+        let canonical = canonicalize_yaml(&value).unwrap();
+
+        // Both values must be present
+        assert!(
+            canonical.contains("null_key") && canonical.contains("str_key"),
+            "Both null and string 'null' keys must be preserved, got:\n{canonical}"
+        );
+    }
+
+    /// HIGH: Test that deeply nested YAML returns an error instead of crashing.
+    #[test]
+    fn test_recursion_limit_exceeded() {
+        // Build a deeply nested structure that exceeds MAX_DEPTH (128)
+        let mut value = Value::String("deep".to_string());
+        for i in 0..150 {
+            let mut map = serde_yaml::Mapping::new();
+            map.insert(Value::String(format!("level{i}")), value);
+            value = Value::Mapping(map);
+        }
+
+        let result = canonicalize_yaml(&value);
+        assert!(result.is_err(), "Should return error for deep nesting");
+        assert_eq!(
+            result.unwrap_err(),
+            CanonicalizeError::RecursionLimitExceeded { max_depth: 128 }
+        );
+    }
+
+    /// Test that structures at exactly `MAX_DEPTH` succeed
+    #[test]
+    fn test_recursion_at_limit_succeeds() {
+        // Build a structure at exactly MAX_DEPTH (128) - should succeed
+        let mut value = Value::String("leaf".to_string());
+        for i in 0..128 {
+            let mut map = serde_yaml::Mapping::new();
+            map.insert(Value::String(format!("level{i}")), value);
+            value = Value::Mapping(map);
+        }
+
+        let result = canonicalize_yaml(&value);
+        assert!(
+            result.is_ok(),
+            "Should succeed at exactly MAX_DEPTH: {:?}",
+            result.err()
+        );
+    }
+
+    /// MEDIUM: Test that float keys are rejected (normalization ambiguity).
+    #[test]
+    fn test_float_key_rejected() {
+        let mut map = serde_yaml::Mapping::new();
+        map.insert(
+            Value::Number(serde_yaml::Number::from(1.5)),
+            Value::String("value".to_string()),
+        );
+        let value = Value::Mapping(map);
+
+        let result = canonicalize_yaml(&value);
+        assert!(result.is_err(), "Float keys should be rejected");
+        assert_eq!(result.unwrap_err(), CanonicalizeError::UnsupportedFloatKey);
+    }
+
+    /// Test that integer keys (which could be confused with floats) work fine
+    #[test]
+    fn test_integer_key_works() {
+        let mut map = serde_yaml::Mapping::new();
+        map.insert(Value::Number(42.into()), Value::String("value".to_string()));
+        let value = Value::Mapping(map);
+
+        let result = canonicalize_yaml(&value);
+        assert!(
+            result.is_ok(),
+            "Integer keys should work: {:?}",
+            result.err()
+        );
+        let canonical = result.unwrap();
+        assert!(canonical.contains("42:"), "Should contain integer key 42");
+    }
+
+    /// Test that keys are sorted by type first, then by value
+    #[test]
+    fn test_typed_key_ordering() {
+        let mut map = serde_yaml::Mapping::new();
+        // Add keys in random order
+        map.insert(
+            Value::String("z".to_string()),
+            Value::String("s1".to_string()),
+        );
+        map.insert(Value::Bool(false), Value::String("b1".to_string()));
+        map.insert(Value::Number(100.into()), Value::String("n1".to_string()));
+        map.insert(Value::Null, Value::String("null1".to_string()));
+        map.insert(
+            Value::String("a".to_string()),
+            Value::String("s2".to_string()),
+        );
+        map.insert(Value::Bool(true), Value::String("b2".to_string()));
+        map.insert(Value::Number(1.into()), Value::String("n2".to_string()));
+
+        let value = Value::Mapping(map);
+        let canonical = canonicalize_yaml(&value).unwrap();
+
+        // Expected order: null < bool(false) < bool(true) < int(1) < int(100) < str(a)
+        // < str(z)
+        let null_pos = canonical.find("null1").unwrap();
+        let b1_pos = canonical.find("b1").unwrap();
+        let b2_pos = canonical.find("b2").unwrap();
+        let n2_pos = canonical.find("n2").unwrap();
+        let n1_pos = canonical.find("n1").unwrap();
+        let s2_pos = canonical.find("s2").unwrap();
+        let s1_pos = canonical.find("s1").unwrap();
+
+        assert!(null_pos < b1_pos, "null should come before bool(false)");
+        assert!(b1_pos < b2_pos, "bool(false) should come before bool(true)");
+        assert!(b2_pos < n2_pos, "bool(true) should come before int(1)");
+        assert!(n2_pos < n1_pos, "int(1) should come before int(100)");
+        assert!(n1_pos < s2_pos, "int(100) should come before str(a)");
+        assert!(s2_pos < s1_pos, "str(a) should come before str(z)");
+    }
+
+    /// Test recursion limit with sequences
+    #[test]
+    fn test_recursion_limit_with_sequences() {
+        // Build deeply nested sequences
+        let mut value = Value::String("deep".to_string());
+        for _ in 0..150 {
+            value = Value::Sequence(vec![value]);
+        }
+
+        let result = canonicalize_yaml(&value);
+        assert!(
+            result.is_err(),
+            "Should return error for deeply nested sequences"
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            CanonicalizeError::RecursionLimitExceeded { max_depth: 128 }
         );
     }
 }
