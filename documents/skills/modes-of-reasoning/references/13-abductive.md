@@ -13,7 +13,7 @@ Abduction is the *generative* engine behind hypothesis formation. It produces ca
 | Artifact | Description | Produced by step |
 |----------|-------------|------------------|
 | **Observation set** | Anomalous or surprising facts requiring explanation | Step 1 |
-| **Hypothesis pool** | ≥3 candidate explanations ranked by explanatory criteria | Step 2 |
+| **Hypothesis pool** | >=3 candidate explanations ranked by explanatory criteria | Step 2 |
 | **Best-explanation selection** | Top hypothesis with explicit criteria scoring | Step 3 |
 | **Test predictions** | Observable consequences that distinguish hypotheses | Step 4 |
 | **Confidence qualifier** | Explicit statement of remaining uncertainty | Step 5 |
@@ -24,18 +24,21 @@ Abduction is the *generative* engine behind hypothesis formation. It produces ca
    - *Test:* Can you state the observation without interpretation? "The server returned 500 errors" not "the server crashed because of load."
    - *Output:* Numbered list of observations.
 
-2. **Generate candidate hypotheses** - Brainstorm ≥3 explanations that would make the observations unsurprising. Include at least one "mundane" explanation and one "structural" explanation.
+2. **Generate candidate hypotheses** - Brainstorm >=3 explanations that would make the observations unsurprising. Include at least one "mundane" explanation (measurement error, coincidence, known cause) and one "structural" explanation (novel mechanism, hidden interaction).
    - *Criteria for good hypotheses:*
      - **Explanatory scope:** Does it explain all observations or just some?
-     - **Simplicity:** Does it minimize new assumptions?
+     - **Simplicity:** Does it minimize new assumptions? (Prefer Occam)
      - **Coherence:** Does it fit with background knowledge?
      - **Testability:** Does it make distinct predictions we can check?
+     - **Mechanism:** Does it specify *how* the cause produces the effect?
+   - *Technique:* Ask "What would have to be true for this to happen?" for each observation.
    - *Test:* For each hypothesis, ask "If this were true, would I expect exactly these observations?"
-   - *Output:* ≥3 hypotheses with brief fit rationale.
+   - *Output:* >=3 hypotheses with brief fit rationale.
 
-3. **Rank by explanatory power** - Score each hypothesis on scope, simplicity, coherence, and testability. Select the best explanation, but hold it tentatively.
+3. **Rank by explanatory power** - Score each hypothesis on scope, simplicity, coherence, testability, and mechanism (1-3 scale each, max 15). Select the best explanation, but hold it tentatively.
+   - *Weighting heuristic:* In early investigation, weight testability heavily (need discriminating tests). In mature investigation, weight scope and coherence (need integration with known facts).
    - *Warning:* "Best" means best-supported, not most satisfying or most actionable.
-   - *Output:* Ranked list with top hypothesis identified.
+   - *Output:* Scored table with top hypothesis identified.
 
 4. **Derive test predictions** - For the top 2-3 hypotheses, list observations that would distinguish them. What would you see if H1 is true but H2 is false?
    - *Test:* Are the predictions genuinely discriminating, or would any hypothesis predict them?
@@ -47,12 +50,13 @@ Abduction is the *generative* engine behind hypothesis formation. It produces ca
 ## Quick checklist
 
 - [ ] Explanandum stated as specific observations (not interpretations)
-- [ ] ≥3 candidate hypotheses generated
-- [ ] Each hypothesis scored on scope, simplicity, coherence, testability
-- [ ] Best explanation selected with explicit criteria
-- [ ] Distinguishing predictions derived for top hypotheses
+- [ ] >=3 candidate hypotheses generated (including at least one mundane option)
+- [ ] Each hypothesis scored on scope, simplicity, coherence, testability, mechanism (1-3 each)
+- [ ] Best explanation selected with explicit criteria scores
+- [ ] Distinguishing predictions derived for top 2-3 hypotheses
 - [ ] Confidence qualified (not asserted as certain)
 - [ ] Next testing step identified
+- [ ] Labeled as "candidate explanation" not "confirmed root cause"
 
 ## Micro-example
 
@@ -60,11 +64,22 @@ Abduction is the *generative* engine behind hypothesis formation. It produces ca
 
 | Step | Action | Output |
 |------|--------|--------|
-| 1. Explanandum | Latency 10x normal at 2:47 PM ±2 min; no deployment; no traffic spike | "Latency spike at consistent time, no obvious trigger" |
+| 1. Explanandum | Latency 10x normal at 2:47 PM +/-2 min; no deployment; no traffic spike | "Latency spike at consistent time, no obvious trigger" |
 | 2. Hypotheses | (a) Cron job competing for I/O, (b) Backup process starting, (c) Index rebuild scheduled, (d) External service timeout causing retry storms | 4 candidates |
-| 3. Ranking | (b) Backup: high scope (explains timing), high simplicity, fits ops knowledge, testable. Score: 9/12. Others: 5-7. | Backup = top hypothesis |
-| 4. Test predictions | If backup: should see disk I/O spike at 2:47. If cron: should see CPU spike. Check both. | Decision tree: I/O spike → backup; CPU spike → cron |
+| 3. Ranking | See scoring table below | Backup = top hypothesis (12/15) |
+| 4. Test predictions | If backup: should see disk I/O spike at 2:47. If cron: should see CPU spike. Check both. | Decision tree: I/O spike -> backup; CPU spike -> cron |
 | 5. Confidence | "Moderate confidence in backup hypothesis. Would revise if I/O normal at 2:47. Next: monitor disk I/O during spike." | Action plan |
+
+**Scoring table for Step 3:**
+
+| Hypothesis | Scope | Simplicity | Coherence | Testability | Mechanism | Total |
+|------------|-------|------------|-----------|-------------|-----------|-------|
+| (a) Cron job | 2 | 2 | 2 | 3 | 2 | 11 |
+| (b) Backup | 3 | 3 | 3 | 3 | 3 | **12** |
+| (c) Index rebuild | 2 | 2 | 2 | 3 | 2 | 11 |
+| (d) Retry storms | 1 | 1 | 2 | 2 | 2 | 8 |
+
+*Rationale:* Backup scores highest because it explains the precise timing (scope), requires no new assumptions beyond known ops setup (simplicity), aligns with standard backup scheduling (coherence), predicts distinct disk I/O patterns (testability), and has clear causal path: backup -> disk write contention -> query latency (mechanism).
 
 **Outcome:** Disk I/O monitoring confirmed backup hypothesis. Moved backup to 3 AM.
 
@@ -72,7 +87,7 @@ Abduction is the *generative* engine behind hypothesis formation. It produces ca
 
 | Mode | Abduction differs because... |
 |------|------------------------------|
-| [Inductive reasoning](09-inductive.md) | Induction generalizes from instances to patterns ("all observed swans are white → swans are white"). Abduction explains observations via hidden causes ("this swan is white → it belongs to species X"). Induction seeks regularities; abduction seeks mechanisms. |
+| [Inductive reasoning](09-inductive.md) | Induction generalizes from instances to patterns ("all observed swans are white -> swans are white"). Abduction explains observations via hidden causes ("this swan is white -> it belongs to species X"). Induction seeks regularities; abduction seeks mechanisms. |
 | [Deductive reasoning](01-deductive-reasoning.md) | Deduction derives conclusions contained in premises (truth-preserving). Abduction introduces new content (hypothesis not in observations). Deduction verifies; abduction generates. |
 | [Diagnostic reasoning](41-diagnostic.md) | Diagnostic reasoning is **abduction applied to troubleshooting** with domain-specific protocols (symptom trees, fault models). Use diagnostic mode when you have a structured fault space; use abduction when the problem is novel or unstructured. |
 | [Causal inference](37-causal-inference.md) | Causal inference tests and quantifies causal relationships using data (experiments, observational methods). Abduction generates causal hypotheses; causal inference confirms them. Abduction is upstream of causal inference in the science workflow. |
@@ -81,7 +96,7 @@ Abduction is the *generative* engine behind hypothesis formation. It produces ca
 
 **Common confusions:**
 
-1. *Abduction vs. induction:* Both go beyond the data, but induction extrapolates patterns ("more of the same") while abduction posits hidden structure ("something behind this"). "The sun rose every day → it will rise tomorrow" is induction. "The sun rises → there's an astronomical mechanism" is abduction.
+1. *Abduction vs. induction:* Both go beyond the data, but induction extrapolates patterns ("more of the same") while abduction posits hidden structure ("something behind this"). "The sun rose every day -> it will rise tomorrow" is induction. "The sun rises -> there's an astronomical mechanism" is abduction.
 
 2. *Abduction vs. guessing:* Abduction is constrained by explanatory criteria (scope, simplicity, coherence, testability). A guess can be arbitrary; an abductive hypothesis must make the observations less surprising.
 
@@ -112,10 +127,10 @@ Abduction is the *generative* engine behind hypothesis formation. It produces ca
 
 ### Mitigations
 
-1. **Force multiple hypotheses** - Never accept a single explanation. Generate ≥3 candidates before evaluating. Include at least one "boring" hypothesis (mundane cause, measurement error, coincidence).
+1. **Force multiple hypotheses** - Never accept a single explanation. Generate >=3 candidates before evaluating. Include at least one "boring" hypothesis (mundane cause, measurement error, coincidence).
    - *Test:* Can you name two alternatives you seriously considered?
 
-2. **Score explicitly** - Rate each hypothesis on scope, simplicity, coherence, and testability (1-5 scale). Don't just intuit "best."
+2. **Score explicitly** - Rate each hypothesis on scope, simplicity, coherence, testability, and mechanism (1-3 scale). Don't just intuit "best."
    - *Test:* Can you show the scoring to a skeptic?
 
 3. **Seek disconfirmation** - For your favored hypothesis, actively look for observations that would rule it out. This is the antidote to confirmation bias.
@@ -134,7 +149,7 @@ Abduction is the *generative* engine behind hypothesis formation. It produces ca
 
 | Anti-pattern | What it looks like | Fix |
 |--------------|-------------------|-----|
-| **Single-hypothesis fixation** | First plausible explanation accepted without alternatives | Generate ≥3 before evaluating |
+| **Single-hypothesis fixation** | First plausible explanation accepted without alternatives | Generate >=3 before evaluating |
 | **Narrative seduction** | Choosing the most story-like explanation | Score on criteria, not appeal |
 | **Explanation-as-proof** | "We explained it, so it's confirmed" | Explicitly label as candidate; plan tests |
 | **Scope creep** | Expanding hypothesis to explain everything, losing testability | Keep hypotheses minimal and falsifiable |
@@ -150,3 +165,15 @@ Abduction is the *generative* engine behind hypothesis formation. It produces ca
 - [Mechanistic reasoning](40-mechanistic.md) - explaining via underlying mechanisms (often follows abduction)
 - [Bayesian probabilistic reasoning](11-bayesian-probabilistic.md) - updating hypothesis probabilities with evidence
 - [Explanation-based learning](16-explanation-based-learning.md) - using explanations to generalize from examples
+- [Case-based reasoning](15-case-based.md) - retrieving known explanations vs. generating novel ones
+- [Sensemaking](63-sensemaking-frame-building.md) - framing the situation (precedes abduction in ambiguous contexts)
+
+## Position in hybrid workflows
+
+Abduction rarely stands alone. In practice, it appears in these hybrid patterns:
+
+- **Science/Experimentation:** abduction (hypothesis) -> deduction (predictions) -> statistical test -> belief revision
+- **Incident Response:** abduction + mechanistic model + VoI tests -> satisficing under time pressure -> postmortem counterfactuals
+- **Root Cause Analysis:** abduction (candidate causes) -> causal inference (quantify effects) -> mechanistic (trace pathway)
+
+See [hybrid-patterns.md](hybrid-patterns.md) for full workflow diagrams.
