@@ -599,9 +599,15 @@ where
         output: loop_result.output,
         episodes_executed: loop_result.outcome.episodes_executed(),
         tokens_consumed: match &loop_result.outcome {
-            EpisodeLoopOutcome::Completed { tokens_consumed, .. }
-            | EpisodeLoopOutcome::BudgetExhausted { tokens_consumed, .. }
-            | EpisodeLoopOutcome::MaxEpisodesReached { tokens_consumed, .. } => *tokens_consumed,
+            EpisodeLoopOutcome::Completed {
+                tokens_consumed, ..
+            }
+            | EpisodeLoopOutcome::BudgetExhausted {
+                tokens_consumed, ..
+            }
+            | EpisodeLoopOutcome::MaxEpisodesReached {
+                tokens_consumed, ..
+            } => *tokens_consumed,
             _ => 0,
         },
     })
@@ -819,7 +825,7 @@ mod unit_tests {
 
 #[cfg(test)]
 mod integration_tests {
-    //! Integration tests for spawn_holon with MockHolon.
+    //! Integration tests for `spawn_holon` with `MockHolon`.
     //!
     //! These tests verify the complete orchestration flow as specified
     //! in TCK-00045 definition of done.
@@ -829,7 +835,7 @@ mod integration_tests {
     use crate::traits::MockHolon;
     use crate::work::WorkLifecycle;
 
-    /// Integration test: spawn_holon creates work and issues lease.
+    /// Integration test: `spawn_holon` creates work and issues lease.
     #[test]
     fn test_integration_spawn_creates_work_and_lease() {
         let mut holon = MockHolon::new("integration-holon").with_episodes_until_complete(1);
