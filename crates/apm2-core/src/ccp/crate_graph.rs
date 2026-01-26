@@ -639,7 +639,7 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
+            .map(Path::to_path_buf)
             .expect("Could not find workspace root")
     }
 
@@ -678,8 +678,10 @@ mod tests {
         // Should find at least apm2-core, apm2-daemon, apm2-cli
         assert!(crates.len() >= 3, "Should find at least 3 workspace crates");
 
-        let crate_names: Vec<&str> = crates.iter().map(|c| c.name.as_str()).collect();
-        assert!(crate_names.contains(&"apm2-core"), "Should find apm2-core");
+        assert!(
+            crates.iter().any(|c| c.name == "apm2-core"),
+            "Should find apm2-core"
+        );
     }
 
     /// UT-112-03: Test dependency edges are correctly extracted.
