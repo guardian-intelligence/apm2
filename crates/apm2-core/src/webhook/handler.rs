@@ -10,9 +10,9 @@
 //!
 //! # Event Emission
 //!
-//! After successful webhook validation, the handler emits a `CIWorkflowCompleted`
-//! ledger event using the [`CIEventEmitter`]. Event emission is controlled by
-//! the `CI_EVENTS_ENABLED` environment variable.
+//! After successful webhook validation, the handler emits a
+//! `CIWorkflowCompleted` ledger event using the [`CIEventEmitter`]. Event
+//! emission is controlled by the `CI_EVENTS_ENABLED` environment variable.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -140,7 +140,8 @@ impl WebhookHandler {
 
     /// Returns a reference to the event emitter.
     ///
-    /// This can be used to access the event store for querying persisted events.
+    /// This can be used to access the event store for querying persisted
+    /// events.
     #[must_use]
     pub fn event_emitter(&self) -> &CIEventEmitter {
         &self.state.event_emitter
@@ -221,15 +222,15 @@ async fn webhook_handler(
     {
         EmitResult::Emitted { event_id } => {
             tracing::debug!(event_id = %event_id, "CI event emitted");
-        }
+        },
         EmitResult::Disabled => {
             tracing::debug!("CI events disabled, event not emitted");
-        }
+        },
         EmitResult::Duplicate => {
             tracing::debug!("duplicate delivery, returning OK");
             // Return OK for idempotent duplicate handling
             return Ok(StatusCode::OK);
-        }
+        },
     }
 
     // Return 202 Accepted (webhook received and will be processed)

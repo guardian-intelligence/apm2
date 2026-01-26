@@ -15,9 +15,9 @@
 //!
 //! # CI Workflow Events
 //!
-//! The [`ci`] submodule provides ledger event types for CI workflow completions,
-//! separate from the Protocol Buffer-based kernel events. These are JSON-serializable
-//! events for audit logging and downstream processing.
+//! The [`ci`] submodule provides ledger event types for CI workflow
+//! completions, separate from the Protocol Buffer-based kernel events. These
+//! are JSON-serializable events for audit logging and downstream processing.
 //!
 //! # Canonical Encoding
 //!

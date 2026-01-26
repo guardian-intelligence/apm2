@@ -21,8 +21,8 @@ use std::sync::Arc;
 use super::error::WebhookError;
 use super::payload::WorkflowRunCompleted;
 use crate::events::ci::{
-    CIConclusion, CIWorkflowCompleted, CIWorkflowPayload, DeliveryIdStore, EventStore,
-    InMemoryDeliveryIdStore, InMemoryEventStore, is_ci_events_enabled,
+    CIConclusion, CIEventsConfig, CIWorkflowCompleted, CIWorkflowPayload, DeliveryIdStore,
+    EventStore, InMemoryDeliveryIdStore, InMemoryEventStore,
 };
 
 /// Result of attempting to emit a CI event.
@@ -58,6 +58,7 @@ pub enum EmitResult {
 /// // let result = emitter.emit(&completed, true, "delivery-123");
 /// ```
 pub struct CIEventEmitter {
+    config: CIEventsConfig,
     delivery_store: Arc<dyn DeliveryIdStore>,
     event_store: Arc<dyn EventStore>,
 }
@@ -67,6 +68,7 @@ impl CIEventEmitter {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            config: CIEventsConfig::default(),
             delivery_store: Arc::new(InMemoryDeliveryIdStore::new()),
             event_store: Arc::new(InMemoryEventStore::new()),
         }
@@ -81,6 +83,24 @@ impl CIEventEmitter {
         event_store: Arc<dyn EventStore>,
     ) -> Self {
         Self {
+            config: CIEventsConfig::default(),
+            delivery_store,
+            event_store,
+        }
+    }
+
+    /// Creates a new event emitter with custom configuration and stores.
+    ///
+    /// This allows injecting a `CIEventsConfig` for testing without
+    /// modifying global environment variables.
+    #[must_use]
+    pub fn with_config(
+        config: CIEventsConfig,
+        delivery_store: Arc<dyn DeliveryIdStore>,
+        event_store: Arc<dyn EventStore>,
+    ) -> Self {
+        Self {
+            config,
             delivery_store,
             event_store,
         }
@@ -96,7 +116,8 @@ impl CIEventEmitter {
     ///
     /// # Returns
     ///
-    /// - `Ok(EmitResult::Emitted { event_id })` if the event was successfully created
+    /// - `Ok(EmitResult::Emitted { event_id })` if the event was successfully
+    ///   created
     /// - `Ok(EmitResult::Disabled)` if CI events are disabled
     /// - `Ok(EmitResult::Duplicate)` if the delivery ID was already seen
     /// - `Err(WebhookError)` if event persistence failed
@@ -111,7 +132,7 @@ impl CIEventEmitter {
         delivery_id: &str,
     ) -> Result<EmitResult, WebhookError> {
         // 1. Check feature flag (CTR-EE003)
-        if !is_ci_events_enabled() {
+        if !self.config.enabled {
             tracing::debug!("CI events disabled, skipping event emission");
             return Ok(EmitResult::Disabled);
         }
@@ -206,7 +227,7 @@ mod tests {
                 assert_eq!(event.payload.commit_sha, "abc123def456");
                 assert_eq!(event.payload.conclusion, CIConclusion::Success);
                 assert!(event.signature_verified);
-            }
+            },
             _ => panic!("Expected Emitted result"),
         }
     }
@@ -253,7 +274,7 @@ mod tests {
             EmitResult::Emitted { event_id } => {
                 let event = emitter.event_store().get(event_id).unwrap();
                 assert_eq!(event.payload.conclusion, CIConclusion::Failure);
-            }
+            },
             _ => panic!("Expected Emitted result"),
         }
     }
@@ -270,7 +291,7 @@ mod tests {
             EmitResult::Emitted { event_id } => {
                 let event = emitter.event_store().get(event_id).unwrap();
                 assert_eq!(event.payload.pr_number, None);
-            }
+            },
             _ => panic!("Expected Emitted result"),
         }
     }
@@ -286,7 +307,7 @@ mod tests {
             EmitResult::Emitted { event_id } => {
                 let event = emitter.event_store().get(event_id).unwrap();
                 assert!(!event.signature_verified);
-            }
+            },
             _ => panic!("Expected Emitted result"),
         }
     }
@@ -295,6 +316,26 @@ mod tests {
     fn test_default_impl() {
         let emitter = CIEventEmitter::default();
         assert_eq!(emitter.event_store().count(), 0);
+        assert!(emitter.delivery_store().is_empty());
+    }
+
+    #[test]
+    fn test_emit_disabled_via_config() {
+        use crate::events::ci::CIEventsConfig;
+
+        let emitter = CIEventEmitter::with_config(
+            CIEventsConfig::disabled(),
+            Arc::new(InMemoryDeliveryIdStore::new()),
+            Arc::new(InMemoryEventStore::new()),
+        );
+        let completed = sample_completed();
+
+        let result = emitter.emit(&completed, true, "delivery-123").unwrap();
+        assert_eq!(result, EmitResult::Disabled);
+
+        // No event should be stored
+        assert_eq!(emitter.event_store().count(), 0);
+        // Delivery ID should not be marked (since we returned early)
         assert!(emitter.delivery_store().is_empty());
     }
 }

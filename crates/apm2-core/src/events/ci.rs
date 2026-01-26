@@ -30,7 +30,16 @@
 //!
 //! Event emission can be controlled via the `CI_EVENTS_ENABLED` environment
 //! variable. When disabled (default: enabled), webhook handlers skip event
-//! emission.
+//! emission. The flag is cached on first access to avoid hot-path lookups.
+//!
+//! # Bounded Memory
+//!
+//! Both [`InMemoryEventStore`] and [`InMemoryDeliveryIdStore`] enforce memory
+//! bounds via configurable limits ([CTR-CI005]):
+//!
+//! - Events use a ring-buffer policy (oldest events are evicted first)
+//! - Delivery IDs use O(1) eviction via insertion-order tracking with
+//!   `VecDeque`
 //!
 //! # Contracts
 //!
@@ -38,15 +47,17 @@
 //! - [CTR-CI002] Delivery IDs are checked before event emission.
 //! - [CTR-CI003] Event IDs are unique (UUID v4).
 //! - [CTR-CI004] Timestamps use UTC.
+//! - [CTR-CI005] Memory usage is bounded by configurable limits.
 //!
 //! # Invariants
 //!
 //! - [INV-CI001] Delivery ID store is thread-safe.
 //! - [INV-CI002] Event store is thread-safe.
 //! - [INV-CI003] TTL cleanup bounds memory usage.
+//! - [INV-CI004] Eviction is O(1) for both stores.
 
-use std::collections::HashMap;
-use std::sync::RwLock;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -68,7 +79,9 @@ use crate::webhook::WorkflowConclusion;
 /// # Example
 ///
 /// ```rust
-/// use apm2_core::events::ci::{CIWorkflowCompleted, CIWorkflowPayload, CIConclusion};
+/// use apm2_core::events::ci::{
+///     CIConclusion, CIWorkflowCompleted, CIWorkflowPayload,
+/// };
 /// use chrono::Utc;
 /// use uuid::Uuid;
 ///
@@ -308,13 +321,31 @@ struct DeliveryIdEntry {
     inserted_at: Instant,
 }
 
+/// Internal state for the delivery ID store, protected by `RwLock`.
+struct DeliveryIdState {
+    /// Map from delivery ID to entry (for O(1) lookup).
+    entries: HashMap<String, DeliveryIdEntry>,
+    /// Queue tracking insertion order for O(1) eviction ([INV-CI004]).
+    insertion_order: VecDeque<String>,
+}
+
+impl DeliveryIdState {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
+        }
+    }
+}
+
 /// In-memory delivery ID store with TTL support.
 ///
 /// Thread-safe implementation using `RwLock` ([INV-CI001]).
 /// Memory is bounded by `max_entries` and TTL cleanup ([INV-CI003]).
+/// Eviction is O(1) using insertion-order tracking ([INV-CI004]).
 pub struct InMemoryDeliveryIdStore {
     config: DeliveryIdConfig,
-    entries: RwLock<HashMap<String, DeliveryIdEntry>>,
+    state: RwLock<DeliveryIdState>,
     check_count: std::sync::atomic::AtomicU64,
 }
 
@@ -330,7 +361,7 @@ impl InMemoryDeliveryIdStore {
     pub fn with_config(config: DeliveryIdConfig) -> Self {
         Self {
             config,
-            entries: RwLock::new(HashMap::new()),
+            state: RwLock::new(DeliveryIdState::new()),
             check_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -340,12 +371,21 @@ impl InMemoryDeliveryIdStore {
         let now = Instant::now();
         let ttl = self.config.ttl;
 
-        let mut entries = self
-            .entries
+        let mut state = self
+            .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        entries.retain(|_, entry| now.duration_since(entry.inserted_at) < ttl);
+        // Remove expired entries from the map
+        state
+            .entries
+            .retain(|_, entry| now.duration_since(entry.inserted_at) < ttl);
+
+        // Rebuild insertion_order to only include non-expired entries
+        // This is O(N) but only runs periodically during cleanup
+        // We clone the keys to avoid borrowing issues with the retain closure
+        let valid_keys: std::collections::HashSet<String> = state.entries.keys().cloned().collect();
+        state.insertion_order.retain(|id| valid_keys.contains(id));
     }
 }
 
@@ -369,12 +409,12 @@ impl DeliveryIdStore for InMemoryDeliveryIdStore {
 
         // Check if already exists (read lock)
         {
-            let entries = self
-                .entries
+            let state = self
+                .state
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-            if let Some(entry) = entries.get(delivery_id) {
+            if let Some(entry) = state.entries.get(delivery_id) {
                 // Check if still within TTL
                 if now.duration_since(entry.inserted_at) < self.config.ttl {
                     return false; // Duplicate
@@ -384,42 +424,45 @@ impl DeliveryIdStore for InMemoryDeliveryIdStore {
         }
 
         // Insert new entry (write lock)
-        let mut entries = self
-            .entries
+        let mut state = self
+            .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Double-check after acquiring write lock (race condition)
-        if let Some(entry) = entries.get(delivery_id) {
+        if let Some(entry) = state.entries.get(delivery_id) {
             if now.duration_since(entry.inserted_at) < self.config.ttl {
                 return false; // Another thread inserted it
             }
+            // Entry expired, remove from insertion_order (will be re-added)
+            state.insertion_order.retain(|id| id != delivery_id);
         }
 
-        // Enforce max_entries limit
-        if entries.len() >= self.config.max_entries {
-            // Remove oldest entry
-            if let Some(oldest_key) = entries
-                .iter()
-                .min_by_key(|(_, e)| e.inserted_at)
-                .map(|(k, _)| k.clone())
-            {
-                entries.remove(&oldest_key);
+        // Enforce max_entries limit with O(1) eviction ([INV-CI004])
+        while state.entries.len() >= self.config.max_entries {
+            // Pop oldest from the front of the queue
+            if let Some(oldest_key) = state.insertion_order.pop_front() {
+                state.entries.remove(&oldest_key);
+            } else {
+                break; // Queue empty, shouldn't happen if invariants hold
             }
         }
 
-        entries.insert(
+        // Insert the new entry
+        state.entries.insert(
             delivery_id.to_string(),
             DeliveryIdEntry { inserted_at: now },
         );
+        state.insertion_order.push_back(delivery_id.to_string());
 
         true // New entry
     }
 
     fn len(&self) -> usize {
-        self.entries
+        self.state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
             .len()
     }
 }
@@ -518,22 +561,67 @@ pub trait EventStore: Send + Sync {
     fn count(&self) -> usize;
 }
 
-/// In-memory event store implementation.
+/// Configuration for the in-memory event store.
+#[derive(Debug, Clone)]
+pub struct EventStoreConfig {
+    /// Maximum number of events to retain (ring-buffer eviction).
+    /// Default: 10,000 events.
+    pub max_events: usize,
+}
+
+impl Default for EventStoreConfig {
+    fn default() -> Self {
+        Self { max_events: 10_000 }
+    }
+}
+
+/// Internal state for the event store, protected by a single `RwLock`.
+struct EventStoreState {
+    /// Events stored as a `VecDeque` for O(1) eviction from front.
+    events: VecDeque<CIWorkflowCompleted>,
+    /// Index mapping event IDs to their position in the deque.
+    /// Note: positions are relative to the logical start (front = 0).
+    index_by_id: HashMap<Uuid, usize>,
+    /// Counter for total events ever added (used for stable indexing).
+    total_added: usize,
+    /// Counter for total events evicted (used for stable indexing).
+    total_evicted: usize,
+}
+
+impl EventStoreState {
+    fn new() -> Self {
+        Self {
+            events: VecDeque::new(),
+            index_by_id: HashMap::new(),
+            total_added: 0,
+            total_evicted: 0,
+        }
+    }
+}
+
+/// In-memory event store implementation with bounded capacity.
 ///
 /// Thread-safe using `RwLock` ([INV-CI002]).
-/// Events are stored in insertion order.
+/// Events are stored in insertion order with ring-buffer eviction
+/// when `max_events` is reached ([CTR-CI005], [INV-CI004]).
 pub struct InMemoryEventStore {
-    events: RwLock<Vec<CIWorkflowCompleted>>,
-    index_by_id: RwLock<HashMap<Uuid, usize>>,
+    config: EventStoreConfig,
+    state: RwLock<EventStoreState>,
 }
 
 impl InMemoryEventStore {
-    /// Creates a new in-memory event store.
+    /// Creates a new in-memory event store with default configuration.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_config(EventStoreConfig::default())
+    }
+
+    /// Creates a new in-memory event store with custom configuration.
+    #[must_use]
+    pub fn with_config(config: EventStoreConfig) -> Self {
         Self {
-            events: RwLock::new(Vec::new()),
-            index_by_id: RwLock::new(HashMap::new()),
+            config,
+            state: RwLock::new(EventStoreState::new()),
         }
     }
 }
@@ -546,36 +634,41 @@ impl Default for InMemoryEventStore {
 
 impl EventStore for InMemoryEventStore {
     fn persist(&self, event: &CIWorkflowCompleted) -> Result<(), EventStoreError> {
-        let mut events = self
-            .events
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let mut index = self
-            .index_by_id
+        let mut state = self
+            .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Check for duplicate
-        if index.contains_key(&event.event_id) {
+        if state.index_by_id.contains_key(&event.event_id) {
             return Err(EventStoreError::DuplicateEvent(event.event_id));
         }
 
-        // Insert event
-        let idx = events.len();
-        events.push(event.clone());
-        index.insert(event.event_id, idx);
+        // Enforce max_events limit with O(1) ring-buffer eviction ([CTR-CI005])
+        while state.events.len() >= self.config.max_events {
+            if let Some(evicted) = state.events.pop_front() {
+                state.index_by_id.remove(&evicted.event_id);
+                state.total_evicted += 1;
+            }
+        }
+
+        // Calculate the logical index for this event
+        let logical_idx = state.total_added;
+        state.events.push_back(event.clone());
+        state.index_by_id.insert(event.event_id, logical_idx);
+        state.total_added += 1;
 
         Ok(())
     }
 
     fn query(&self, query: &EventQuery) -> Vec<CIWorkflowCompleted> {
-        let events = self
-            .events
+        let state = self
+            .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let mut results: Vec<CIWorkflowCompleted> = events
+        let mut results: Vec<CIWorkflowCompleted> = state
+            .events
             .iter()
             .filter(|event| {
                 // Filter by event type
@@ -618,23 +711,26 @@ impl EventStore for InMemoryEventStore {
     }
 
     fn get(&self, event_id: Uuid) -> Option<CIWorkflowCompleted> {
-        let events = self
-            .events
+        let state = self
+            .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let index = self
-            .index_by_id
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        index.get(&event_id).map(|&idx| events[idx].clone())
+        // Look up the logical index
+        if let Some(&logical_idx) = state.index_by_id.get(&event_id) {
+            // Convert logical index to deque index
+            let deque_idx = logical_idx.saturating_sub(state.total_evicted);
+            state.events.get(deque_idx).cloned()
+        } else {
+            None
+        }
     }
 
     fn count(&self) -> usize {
-        self.events
+        self.state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .events
             .len()
     }
 }
@@ -646,24 +742,68 @@ impl EventStore for InMemoryEventStore {
 /// Environment variable name for the CI events feature flag.
 pub const CI_EVENTS_ENABLED_ENV: &str = "CI_EVENTS_ENABLED";
 
+/// Cached value of the CI events enabled flag.
+///
+/// Using `OnceLock` to read the environment variable only once,
+/// avoiding hot-path `env::var` calls which are relatively expensive.
+static CI_EVENTS_ENABLED_CACHE: OnceLock<bool> = OnceLock::new();
+
+/// Parses the CI events enabled flag from an environment variable value.
+///
+/// Returns `true` unless the value is explicitly "false", "0", or "no".
+fn parse_ci_events_enabled(value: Option<&str>) -> bool {
+    // Enabled by default (None case), disabled only if explicitly set to false/0/no
+    value.is_none_or(|val| {
+        let val_lower = val.to_lowercase();
+        // Not disabled: return true if not one of the disable values
+        !(val_lower == "false" || val_lower == "0" || val_lower == "no")
+    })
+}
+
 /// Checks if CI event emission is enabled.
 ///
-/// Reads the `CI_EVENTS_ENABLED` environment variable.
-/// Returns `true` if the variable is set to "true", "1", or "yes" (case-insensitive).
-/// Returns `true` by default if the variable is not set.
+/// Reads and caches the `CI_EVENTS_ENABLED` environment variable on first call.
+/// Subsequent calls return the cached value for O(1) performance on hot paths.
+///
+/// Returns `true` if the variable is set to "true", "1", or "yes"
+/// (case-insensitive). Returns `true` by default if the variable is not set.
 #[must_use]
 pub fn is_ci_events_enabled() -> bool {
-    match std::env::var(CI_EVENTS_ENABLED_ENV) {
-        Ok(val) => {
-            let val_lower = val.to_lowercase();
-            // Explicitly disabled
-            if val_lower == "false" || val_lower == "0" || val_lower == "no" {
-                return false;
-            }
-            // Any other value (including empty) is considered enabled
-            true
+    *CI_EVENTS_ENABLED_CACHE.get_or_init(|| {
+        let value = std::env::var(CI_EVENTS_ENABLED_ENV).ok();
+        parse_ci_events_enabled(value.as_deref())
+    })
+}
+
+/// Configuration for CI events feature behavior.
+///
+/// This struct allows injecting configuration for testing without
+/// modifying global environment variables (which is unsafe in Rust 2024).
+#[derive(Debug, Clone)]
+pub struct CIEventsConfig {
+    /// Whether CI events are enabled.
+    pub enabled: bool,
+}
+
+impl Default for CIEventsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: is_ci_events_enabled(),
         }
-        Err(_) => true, // Enabled by default
+    }
+}
+
+impl CIEventsConfig {
+    /// Creates a new config with events enabled.
+    #[must_use]
+    pub const fn enabled() -> Self {
+        Self { enabled: true }
+    }
+
+    /// Creates a new config with events disabled.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self { enabled: false }
     }
 }
 
@@ -786,8 +926,9 @@ mod tests {
     }
 
     mod idempotency_tests {
-        use super::*;
         use std::thread;
+
+        use super::*;
 
         #[test]
         fn test_new_delivery_id_accepted() {
@@ -922,11 +1063,8 @@ mod tests {
             let store = InMemoryEventStore::new();
 
             for i in 0..5 {
-                let event = CIWorkflowCompleted::new(
-                    sample_payload(),
-                    true,
-                    format!("delivery-{i}"),
-                );
+                let event =
+                    CIWorkflowCompleted::new(sample_payload(), true, format!("delivery-{i}"));
                 store.persist(&event).unwrap();
             }
 
@@ -943,8 +1081,7 @@ mod tests {
             for i in 0..3 {
                 let mut payload = sample_payload();
                 payload.pr_number = Some(100 + i);
-                let event =
-                    CIWorkflowCompleted::new(payload, true, format!("delivery-{i}"));
+                let event = CIWorkflowCompleted::new(payload, true, format!("delivery-{i}"));
                 store.persist(&event).unwrap();
             }
 
@@ -959,11 +1096,8 @@ mod tests {
             let store = InMemoryEventStore::new();
 
             for i in 0..10 {
-                let event = CIWorkflowCompleted::new(
-                    sample_payload(),
-                    true,
-                    format!("delivery-{i}"),
-                );
+                let event =
+                    CIWorkflowCompleted::new(sample_payload(), true, format!("delivery-{i}"));
                 store.persist(&event).unwrap();
             }
 
@@ -1017,11 +1151,8 @@ mod tests {
             assert_eq!(store.count(), 0);
 
             for i in 0..5 {
-                let event = CIWorkflowCompleted::new(
-                    sample_payload(),
-                    true,
-                    format!("delivery-{i}"),
-                );
+                let event =
+                    CIWorkflowCompleted::new(sample_payload(), true, format!("delivery-{i}"));
                 store.persist(&event).unwrap();
             }
 
@@ -1034,61 +1165,99 @@ mod tests {
             let result = store.get(Uuid::new_v4());
             assert!(result.is_none());
         }
+
+        /// Tests that InMemoryEventStore enforces max_events limit
+        /// ([CTR-CI005]).
+        #[test]
+        fn test_event_store_bounded() {
+            let config = EventStoreConfig { max_events: 5 };
+            let store = InMemoryEventStore::with_config(config);
+
+            // Add 5 events (at capacity)
+            let mut event_ids = Vec::new();
+            for i in 0..5 {
+                let event =
+                    CIWorkflowCompleted::new(sample_payload(), true, format!("delivery-{i}"));
+                event_ids.push(event.event_id);
+                store.persist(&event).unwrap();
+            }
+            assert_eq!(store.count(), 5);
+
+            // All 5 events should be retrievable
+            for &id in &event_ids {
+                assert!(store.get(id).is_some());
+            }
+
+            // Add 6th event - should evict the oldest
+            let event6 = CIWorkflowCompleted::new(sample_payload(), true, "delivery-5".to_string());
+            let event6_id = event6.event_id;
+            store.persist(&event6).unwrap();
+
+            // Count should still be 5
+            assert_eq!(store.count(), 5);
+
+            // First event should be evicted
+            assert!(store.get(event_ids[0]).is_none());
+
+            // Events 2-5 and event 6 should still be present
+            for &id in &event_ids[1..] {
+                assert!(store.get(id).is_some());
+            }
+            assert!(store.get(event6_id).is_some());
+
+            // Add 2 more events - should evict events 2 and 3
+            let event7 = CIWorkflowCompleted::new(sample_payload(), true, "delivery-6".to_string());
+            let event8 = CIWorkflowCompleted::new(sample_payload(), true, "delivery-7".to_string());
+            store.persist(&event7).unwrap();
+            store.persist(&event8).unwrap();
+
+            assert_eq!(store.count(), 5);
+            assert!(store.get(event_ids[1]).is_none()); // Evicted
+            assert!(store.get(event_ids[2]).is_none()); // Evicted
+            assert!(store.get(event_ids[3]).is_some()); // Still present
+            assert!(store.get(event_ids[4]).is_some()); // Still present
+        }
     }
 
-    // These tests modify environment variables and require unsafe blocks.
-    // The unsafe is acceptable here because:
-    // 1. Tests run serially by default when touching global state
-    // 2. This is test-only code that doesn't affect production
-    #[allow(unsafe_code)]
     mod feature_flag_tests {
         use super::*;
-        use std::env;
 
-        // Note: These tests modify environment variables and should not run in parallel.
-        // In Rust 2024 edition, env::set_var and env::remove_var are unsafe because
-        // they can cause data races when run concurrently.
+        // These tests use the parse_ci_events_enabled function directly
+        // to avoid unsafe env var manipulation and OnceLock caching issues.
 
         #[test]
-        fn test_feature_flag_default_enabled() {
-            // Remove the env var to test default behavior
-            // SAFETY: This test runs in isolation (cargo test runs tests serially by default
-            // when they touch global state like env vars). The env var is only used by this
-            // test module.
-            unsafe { env::remove_var(CI_EVENTS_ENABLED_ENV) };
-            assert!(is_ci_events_enabled());
+        fn test_parse_feature_flag_default_enabled() {
+            // When env var is not set (None), should be enabled by default
+            assert!(parse_ci_events_enabled(None));
         }
 
         #[test]
-        fn test_feature_flag_explicitly_enabled() {
-            // SAFETY: See above - test isolation ensures no concurrent access
-            unsafe { env::set_var(CI_EVENTS_ENABLED_ENV, "true") };
-            assert!(is_ci_events_enabled());
-
-            unsafe { env::set_var(CI_EVENTS_ENABLED_ENV, "1") };
-            assert!(is_ci_events_enabled());
-
-            unsafe { env::set_var(CI_EVENTS_ENABLED_ENV, "yes") };
-            assert!(is_ci_events_enabled());
-
-            // Cleanup
-            unsafe { env::remove_var(CI_EVENTS_ENABLED_ENV) };
+        fn test_parse_feature_flag_explicitly_enabled() {
+            assert!(parse_ci_events_enabled(Some("true")));
+            assert!(parse_ci_events_enabled(Some("1")));
+            assert!(parse_ci_events_enabled(Some("yes")));
+            assert!(parse_ci_events_enabled(Some("TRUE")));
+            assert!(parse_ci_events_enabled(Some("Yes")));
+            // Empty string is considered enabled (not explicitly disabled)
+            assert!(parse_ci_events_enabled(Some("")));
         }
 
         #[test]
-        fn test_feature_flag_disabled() {
-            // SAFETY: See above - test isolation ensures no concurrent access
-            unsafe { env::set_var(CI_EVENTS_ENABLED_ENV, "false") };
-            assert!(!is_ci_events_enabled());
+        fn test_parse_feature_flag_disabled() {
+            assert!(!parse_ci_events_enabled(Some("false")));
+            assert!(!parse_ci_events_enabled(Some("0")));
+            assert!(!parse_ci_events_enabled(Some("no")));
+            assert!(!parse_ci_events_enabled(Some("FALSE")));
+            assert!(!parse_ci_events_enabled(Some("No")));
+        }
 
-            unsafe { env::set_var(CI_EVENTS_ENABLED_ENV, "0") };
-            assert!(!is_ci_events_enabled());
+        #[test]
+        fn test_ci_events_config() {
+            let enabled = CIEventsConfig::enabled();
+            assert!(enabled.enabled);
 
-            unsafe { env::set_var(CI_EVENTS_ENABLED_ENV, "no") };
-            assert!(!is_ci_events_enabled());
-
-            // Cleanup
-            unsafe { env::remove_var(CI_EVENTS_ENABLED_ENV) };
+            let disabled = CIEventsConfig::disabled();
+            assert!(!disabled.enabled);
         }
     }
 }

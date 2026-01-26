@@ -324,7 +324,10 @@ mod event_emitter_tests {
         // (idempotent operation)
         use axum::http::StatusCode;
 
-        assert_eq!(WebhookError::DuplicateDelivery.status_code(), StatusCode::OK);
+        assert_eq!(
+            WebhookError::DuplicateDelivery.status_code(),
+            StatusCode::OK
+        );
     }
 }
 
