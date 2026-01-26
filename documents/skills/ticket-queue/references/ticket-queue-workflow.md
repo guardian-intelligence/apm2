@@ -5,13 +5,10 @@ decision_tree:
   nodes[1]:
     - id: INIT
       purpose: "Initialize orchestration posture, then loop until all tickets are merged."
-      context_files[6]:
-        - path: AGENTS.md
-          purpose: "Repo-wide agent constraints and philosophy."
-        - path: CONTRIBUTING.md
-          purpose: "Canonical dev workflow (`cargo xtask ...`) and time budgets."
+      context_files[5]:
+        - path: README.md
+          purpose: "Root-level module index, repository-wide constraints, and canonical dev workflow."
         - path: documents/work/tickets/STATUS_TRACKING.md
-          purpose: "How ticket status is derived (merged PRs + branches)."
         - path: documents/skills/dev-eng-ticket/SKILL.md
           purpose: "Implementer workflow the subagent should follow."
         - path: xtask/src/tasks/check.rs
