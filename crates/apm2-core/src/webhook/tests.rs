@@ -282,6 +282,7 @@ mod event_emitter_tests {
         let emitter = enabled_emitter();
         let completed = WorkflowRunCompleted {
             workflow_run_id: 12345,
+            workflow_name: "CI".to_string(),
             commit_sha: "abc123".to_string(),
             branch: "main".to_string(),
             conclusion: WorkflowConclusion::Success,
@@ -311,6 +312,7 @@ mod event_emitter_tests {
         let emitter = enabled_emitter();
         let completed = WorkflowRunCompleted {
             workflow_run_id: 12345,
+            workflow_name: "CI".to_string(),
             commit_sha: "abc123".to_string(),
             branch: "main".to_string(),
             conclusion: WorkflowConclusion::Failure,

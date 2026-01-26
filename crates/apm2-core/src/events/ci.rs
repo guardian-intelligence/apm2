@@ -176,8 +176,12 @@ impl CIWorkflowCompleted {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CIWorkflowPayload {
-    /// The pull request number, if any.
-    pub pr_number: Option<u64>,
+    /// All pull request numbers associated with this workflow run.
+    ///
+    /// A workflow run can be associated with multiple PRs (e.g., stacked PRs,
+    /// merge queues, or commits affecting multiple branches). Storing all PR
+    /// numbers ensures no audit information is lost.
+    pub pr_numbers: Vec<u64>,
 
     /// The commit SHA that triggered the workflow.
     ///
@@ -203,6 +207,14 @@ pub struct CIWorkflowPayload {
     pub workflow_run_id: u64,
 
     /// Individual check results within the workflow.
+    ///
+    /// # Note
+    ///
+    /// Currently populated as an empty list. Resolving individual check results
+    /// requires additional GitHub API calls (list check runs for a commit)
+    /// which is out of scope for the current implementation. This will be
+    /// addressed in a future ticket when detailed check-level auditing is
+    /// needed.
     pub checks: Vec<CheckResult>,
 }
 
@@ -512,7 +524,7 @@ pub struct EventQuery {
     /// Filter by time range end (exclusive).
     pub to: Option<DateTime<Utc>>,
 
-    /// Filter by PR number.
+    /// Filter by PR number (matches if any PR in the event's list matches).
     pub pr_number: Option<u64>,
 
     /// Maximum number of results to return.
@@ -723,9 +735,9 @@ impl EventStore for InMemoryEventStore {
                     }
                 }
 
-                // Filter by PR number
+                // Filter by PR number (matches if any PR in the event's list matches)
                 if let Some(pr_number) = query.pr_number {
-                    if event.payload.pr_number != Some(pr_number) {
+                    if !event.payload.pr_numbers.contains(&pr_number) {
                         return false;
                     }
                 }
@@ -845,7 +857,7 @@ mod tests {
 
     fn sample_payload() -> CIWorkflowPayload {
         CIWorkflowPayload {
-            pr_number: Some(42),
+            pr_numbers: vec![42],
             commit_sha: "abc123def456".to_string(),
             conclusion: CIConclusion::Success,
             workflow_name: "CI".to_string(),
@@ -871,7 +883,7 @@ mod tests {
             assert_eq!(event.source, CIWorkflowCompleted::SOURCE);
             assert!(event.signature_verified);
             assert_eq!(event.delivery_id, "delivery-123");
-            assert_eq!(event.payload.pr_number, Some(42));
+            assert_eq!(event.payload.pr_numbers, vec![42]);
             assert_eq!(event.payload.conclusion, CIConclusion::Success);
         }
 
@@ -886,7 +898,7 @@ mod tests {
             assert_eq!(event.event_id, deserialized.event_id);
             assert_eq!(event.event_type, deserialized.event_type);
             assert_eq!(event.delivery_id, deserialized.delivery_id);
-            assert_eq!(event.payload.pr_number, deserialized.payload.pr_number);
+            assert_eq!(event.payload.pr_numbers, deserialized.payload.pr_numbers);
         }
 
         #[test]
@@ -907,7 +919,7 @@ mod tests {
 
             // Verify payload structure
             let payload = &json["payload"];
-            assert_eq!(payload["pr_number"], 42);
+            assert_eq!(payload["pr_numbers"], serde_json::json!([42]));
             assert_eq!(payload["commit_sha"], "abc123def456");
             assert_eq!(payload["conclusion"], "success");
             assert_eq!(payload["workflow_name"], "CI");
@@ -927,7 +939,7 @@ mod tests {
                 "timestamp": "2024-01-01T00:00:00Z",
                 "source": "github_webhook",
                 "payload": {
-                    "pr_number": 42,
+                    "pr_numbers": [42],
                     "commit_sha": "abc123",
                     "conclusion": "success",
                     "workflow_name": "CI",
@@ -952,7 +964,7 @@ mod tests {
         #[test]
         fn test_deny_unknown_fields_ci_workflow_payload() {
             let json = r#"{
-                "pr_number": 42,
+                "pr_numbers": [42],
                 "commit_sha": "abc123",
                 "conclusion": "success",
                 "workflow_name": "CI",
@@ -1185,7 +1197,7 @@ mod tests {
             // Create events with different PR numbers
             for i in 0..3 {
                 let mut payload = sample_payload();
-                payload.pr_number = Some(100 + i);
+                payload.pr_numbers = vec![100 + i];
                 let event = CIWorkflowCompleted::new(payload, true, format!("delivery-{i}"));
                 store.persist(&event).unwrap();
             }
@@ -1193,7 +1205,41 @@ mod tests {
             let query = EventQuery::new().with_pr_number(101);
             let results = store.query(&query);
             assert_eq!(results.len(), 1);
-            assert_eq!(results[0].payload.pr_number, Some(101));
+            assert_eq!(results[0].payload.pr_numbers, vec![101]);
+        }
+
+        #[test]
+        fn test_query_by_pr_number_in_multiple_prs() {
+            let store = InMemoryEventStore::new();
+
+            // Create an event with multiple PR numbers
+            let mut payload = sample_payload();
+            payload.pr_numbers = vec![100, 101, 102];
+            let event = CIWorkflowCompleted::new(payload, true, "delivery-1".to_string());
+            store.persist(&event).unwrap();
+
+            // Event with a different set of PRs
+            let mut payload2 = sample_payload();
+            payload2.pr_numbers = vec![200, 201];
+            let event2 = CIWorkflowCompleted::new(payload2, true, "delivery-2".to_string());
+            store.persist(&event2).unwrap();
+
+            // Query should match event with PR 101
+            let query = EventQuery::new().with_pr_number(101);
+            let results = store.query(&query);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].delivery_id, "delivery-1");
+
+            // Query should match event with PR 200
+            let query = EventQuery::new().with_pr_number(200);
+            let results = store.query(&query);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].delivery_id, "delivery-2");
+
+            // Query should match no event
+            let query = EventQuery::new().with_pr_number(999);
+            let results = store.query(&query);
+            assert_eq!(results.len(), 0);
         }
 
         #[test]

@@ -148,12 +148,12 @@ impl CIEventEmitter {
 
         // 3. Create event
         let payload = CIWorkflowPayload {
-            pr_number: completed.pull_request_numbers.first().copied(),
+            pr_numbers: completed.pull_request_numbers.clone(),
             commit_sha: completed.commit_sha.clone(),
             conclusion: CIConclusion::from(completed.conclusion),
-            workflow_name: "workflow".to_string(), // GitHub doesn't include name in basic payload
+            workflow_name: completed.workflow_name.clone(),
             workflow_run_id: completed.workflow_run_id,
-            checks: vec![], // Individual check results require additional API calls
+            checks: vec![], // Individual check results require additional API calls (out of scope)
         };
 
         let event = CIWorkflowCompleted::new(payload, signature_verified, delivery_id.to_string());
@@ -167,7 +167,8 @@ impl CIEventEmitter {
         tracing::info!(
             event_id = %event_id,
             delivery_id = %delivery_id,
-            pr_number = ?event.payload.pr_number,
+            pr_numbers = ?event.payload.pr_numbers,
+            workflow_name = %event.payload.workflow_name,
             conclusion = %event.payload.conclusion,
             "CI workflow event emitted"
         );
@@ -203,6 +204,7 @@ mod tests {
     fn sample_completed() -> WorkflowRunCompleted {
         WorkflowRunCompleted {
             workflow_run_id: 12345,
+            workflow_name: "CI".to_string(),
             commit_sha: "abc123def456".to_string(),
             branch: "feature/test".to_string(),
             conclusion: WorkflowConclusion::Success,
@@ -237,7 +239,7 @@ mod tests {
                 assert!(stored.is_some());
 
                 let event = stored.unwrap();
-                assert_eq!(event.payload.pr_number, Some(42));
+                assert_eq!(event.payload.pr_numbers, vec![42]);
                 assert_eq!(event.payload.commit_sha, "abc123def456");
                 assert_eq!(event.payload.conclusion, CIConclusion::Success);
                 assert!(event.signature_verified);
@@ -304,7 +306,41 @@ mod tests {
         match result {
             EmitResult::Emitted { event_id } => {
                 let event = emitter.event_store().get(event_id).unwrap();
-                assert_eq!(event.payload.pr_number, None);
+                assert!(event.payload.pr_numbers.is_empty());
+            },
+            _ => panic!("Expected Emitted result"),
+        }
+    }
+
+    #[test]
+    fn test_emit_multiple_pr_numbers() {
+        let emitter = enabled_emitter();
+        let mut completed = sample_completed();
+        completed.pull_request_numbers = vec![42, 43, 44];
+
+        let result = emitter.emit(&completed, true, "delivery-123").unwrap();
+
+        match result {
+            EmitResult::Emitted { event_id } => {
+                let event = emitter.event_store().get(event_id).unwrap();
+                assert_eq!(event.payload.pr_numbers, vec![42, 43, 44]);
+            },
+            _ => panic!("Expected Emitted result"),
+        }
+    }
+
+    #[test]
+    fn test_emit_workflow_name() {
+        let emitter = enabled_emitter();
+        let mut completed = sample_completed();
+        completed.workflow_name = "Build and Test".to_string();
+
+        let result = emitter.emit(&completed, true, "delivery-123").unwrap();
+
+        match result {
+            EmitResult::Emitted { event_id } => {
+                let event = emitter.event_store().get(event_id).unwrap();
+                assert_eq!(event.payload.workflow_name, "Build and Test");
             },
             _ => panic!("Expected Emitted result"),
         }
