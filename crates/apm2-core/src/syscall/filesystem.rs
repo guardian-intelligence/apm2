@@ -573,7 +573,7 @@ impl FilesystemHandler {
             options.create(true);
             options.truncate(!append);
         }
-        
+
         options.append(append);
 
         let mut file = options.open(&canonical).map_err(|e| {
@@ -673,12 +673,15 @@ impl FilesystemHandler {
 
         // Validate and resolve path
         let canonical = self.validate_path(path, true)?;
-        
-        // Use the parent directory for the temp file to ensure it's on the same filesystem
-        let parent_dir = canonical.parent().ok_or_else(|| SyscallError::PathValidation {
-             path: canonical.clone(),
-             reason: "file has no parent directory".to_string() 
-        })?;
+
+        // Use the parent directory for the temp file to ensure it's on the same
+        // filesystem
+        let parent_dir = canonical
+            .parent()
+            .ok_or_else(|| SyscallError::PathValidation {
+                path: canonical.clone(),
+                reason: "file has no parent directory".to_string(),
+            })?;
 
         // Read existing content
         let existing = fs::read_to_string(&canonical).map_err(|e| SyscallError::Io {
@@ -706,22 +709,27 @@ impl FilesystemHandler {
         let new_file_content = existing.replacen(old_content, new_content, 1);
 
         // Write atomically by writing to temp file and renaming
-        // Security: Use NamedTempFile::new_in to avoid predictable names and ensure atomic creation
+        // Security: Use NamedTempFile::new_in to avoid predictable names and ensure
+        // atomic creation
         let mut temp_file = NamedTempFile::new_in(parent_dir).map_err(|e| SyscallError::Io {
             path: parent_dir.to_path_buf(),
             source: e,
         })?;
-        
-        temp_file.write_all(new_file_content.as_bytes()).map_err(|e| SyscallError::Io {
-            path: temp_file.path().to_path_buf(),
-            source: e,
-        })?;
-        
+
+        temp_file
+            .write_all(new_file_content.as_bytes())
+            .map_err(|e| SyscallError::Io {
+                path: temp_file.path().to_path_buf(),
+                source: e,
+            })?;
+
         // Persist the temp file to the target path
-        temp_file.persist(&canonical).map_err(|e| SyscallError::Io {
-            path: canonical.clone(),
-            source: e.error,
-        })?;
+        temp_file
+            .persist(&canonical)
+            .map_err(|e| SyscallError::Io {
+                path: canonical.clone(),
+                source: e.error,
+            })?;
 
         // Get hash after edit
         let hash_after = blake3::hash(new_file_content.as_bytes());
@@ -823,7 +831,8 @@ fn hash_file(path: &Path) -> Result<[u8; 32], SyscallError> {
     })?;
 
     let mut hasher = blake3::Hasher::new();
-    // Allocate buffer on heap to avoid large stack allocation (clippy::large_stack_arrays)
+    // Allocate buffer on heap to avoid large stack allocation
+    // (clippy::large_stack_arrays)
     let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
 
     loop {
@@ -1200,64 +1209,47 @@ mod tests {
         // After hash should be different
         assert_ne!(record.hash_after, initial_hash);
 
-                // After hash should match new content
+        // After hash should match new content
 
-                let final_hash = handler.read_file(&file_path, 0, 0).unwrap().content_hash;
+        let final_hash = handler.read_file(&file_path, 0, 0).unwrap().content_hash;
 
-                assert_eq!(record.hash_after, final_hash);
+        assert_eq!(record.hash_after, final_hash);
+    }
 
-            }
+    #[test]
 
-        
+    fn test_hash_large_file_streaming() {
+        let (temp_dir, _handler) = setup_workspace();
 
-            #[test]
+        // Create a file larger than HASH_BUFFER_SIZE (64KB)
 
-            fn test_hash_large_file_streaming() {
+        // 1MB = 1024 * 1024 bytes
 
-                let (temp_dir, _handler) = setup_workspace();
+        let size = 1024 * 1024;
 
-                
+        let mut content = Vec::with_capacity(size);
 
-                // Create a file larger than HASH_BUFFER_SIZE (64KB)
-
-                // 1MB = 1024 * 1024 bytes
-
-                let size = 1024 * 1024;
-
-                let mut content = Vec::with_capacity(size);
-
-                for i in 0..size {
-
-                    content.push((i % 256) as u8);
-
-                }
-
-                
-
-                let file_path = temp_dir.path().join("large_hash.txt");
-
-                fs::write(&file_path, &content).unwrap();
-
-                
-
-                // Calculate expected hash
-
-                let expected = blake3::hash(&content);
-
-                
-
-                // Calculate actual hash using our streaming function
-
-                // We need to access the private hash_file function, so this test stays in this module
-
-                let actual = hash_file(&file_path).unwrap();
-
-                
-
-                assert_eq!(actual, *expected.as_bytes());
-
-            }
-
+        for i in 0..size {
+            // Safe: i % 256 is always in range 0..256, which fits in u8
+            #[allow(clippy::cast_possible_truncation)]
+            content.push((i % 256) as u8);
         }
 
-        
+        let file_path = temp_dir.path().join("large_hash.txt");
+
+        fs::write(&file_path, &content).unwrap();
+
+        // Calculate expected hash
+
+        let expected = blake3::hash(&content);
+
+        // Calculate actual hash using our streaming function
+
+        // We need to access the private hash_file function, so this test stays in this
+        // module
+
+        let actual = hash_file(&file_path).unwrap();
+
+        assert_eq!(actual, *expected.as_bytes());
+    }
+}
