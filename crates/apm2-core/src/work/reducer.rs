@@ -11,6 +11,19 @@ use crate::events::{WorkEvent, work_event};
 use crate::ledger::EventRecord;
 use crate::reducer::{Reducer, ReducerContext};
 
+/// The designated actor ID for the CI system processor.
+///
+/// Only events signed by this actor can transition work items from CI-gated
+/// states (`CiPending`). This prevents arbitrary agents from bypassing CI
+/// gating by emitting `WorkTransitioned` events.
+///
+/// # Security
+///
+/// This constant defines the system-level identity that the CI event processor
+/// must use when signing transition events. The value uses a `system:` prefix
+/// to distinguish it from regular agent identities.
+pub const CI_SYSTEM_ACTOR_ID: &str = "system:ci-processor";
+
 /// State maintained by the work reducer.
 ///
 /// Maps work IDs to their current state.
@@ -196,10 +209,17 @@ impl WorkReducer {
     }
 
     /// Handles a work transitioned event.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The transition event payload
+    /// * `timestamp` - Event timestamp
+    /// * `actor_id` - The actor ID from the event record (signer identity)
     fn handle_transitioned(
         &mut self,
         event: crate::events::WorkTransitioned,
         timestamp: u64,
+        actor_id: &str,
     ) -> Result<(), WorkError> {
         let work_id = &event.work_id;
 
@@ -254,16 +274,27 @@ impl WorkReducer {
             });
         }
 
-        // Security check: CI-gated transitions require authorized rationale codes.
+        // Security check: CI-gated transitions require both:
+        // 1. Authorized rationale codes (ci_passed/ci_failed)
+        // 2. Authorized actor ID (system:ci-processor)
         // This prevents agents from bypassing CI gating by directly emitting
-        // WorkTransitioned events with arbitrary rationale codes.
+        // WorkTransitioned events.
         if from_state == WorkState::CiPending {
+            // Check rationale code
             let rationale = &event.rationale_code;
             if rationale != "ci_passed" && rationale != "ci_failed" {
                 return Err(WorkError::CiGatedTransitionUnauthorized {
                     from_state,
                     to_state,
                     rationale_code: rationale.clone(),
+                });
+            }
+
+            // Check actor ID - only the CI system processor can sign these events
+            if actor_id != CI_SYSTEM_ACTOR_ID {
+                return Err(WorkError::CiGatedTransitionUnauthorizedActor {
+                    from_state,
+                    actor_id: actor_id.to_string(),
                 });
             }
         }
@@ -438,10 +469,13 @@ impl Reducer for WorkReducer {
 
         let work_event = WorkEvent::decode(&event.payload[..])?;
         let timestamp = event.timestamp_ns;
+        let actor_id = &event.actor_id;
 
         match work_event.event {
             Some(work_event::Event::Opened(e)) => self.handle_opened(e, timestamp),
-            Some(work_event::Event::Transitioned(e)) => self.handle_transitioned(e, timestamp),
+            Some(work_event::Event::Transitioned(e)) => {
+                self.handle_transitioned(e, timestamp, actor_id)
+            },
             Some(work_event::Event::Completed(e)) => self.handle_completed(e, timestamp),
             Some(work_event::Event::Aborted(e)) => self.handle_aborted(e, timestamp),
             Some(work_event::Event::PrAssociated(ref e)) => self.handle_pr_associated(e),

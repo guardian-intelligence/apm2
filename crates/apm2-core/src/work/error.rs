@@ -128,4 +128,22 @@ pub enum WorkError {
         /// The rationale code provided.
         rationale_code: String,
     },
+
+    /// CI-gated transition requires authorized actor.
+    ///
+    /// # Security
+    ///
+    /// Transitions from CI-gated states (`CiPending`) can only be performed
+    /// by the designated CI system actor. This prevents arbitrary agents from
+    /// bypassing CI gating by emitting `WorkTransitioned` events with the
+    /// correct rationale code but an unauthorized actor identity.
+    #[error(
+        "CI-gated transition from {from_state} requires authorized CI actor, got actor '{actor_id}'"
+    )]
+    CiGatedTransitionUnauthorizedActor {
+        /// The current (CI-gated) state.
+        from_state: WorkState,
+        /// The actor ID that attempted the transition.
+        actor_id: String,
+    },
 }

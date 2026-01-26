@@ -152,6 +152,7 @@ pub enum WorkError {
     PrAssociationNotAllowed { work_id: String, current_state: WorkState },
     PrNumberAlreadyAssociated { pr_number: u64, existing_work_id: String },
     CiGatedTransitionUnauthorized { from_state: WorkState, to_state: WorkState, rationale_code: String },
+    CiGatedTransitionUnauthorizedActor { from_state: WorkState, actor_id: String },
 }
 ```
 
@@ -376,7 +377,11 @@ let duplicate_pr = helpers::work_pr_associated_payload("WORK-002", 42, "sha456")
 
 3. **Commit SHA Storage**: The commit SHA is stored alongside the PR number to enable verification that CI results match the specific commit pushed by the agent (preventing stale CI results from triggering transitions).
 
-4. **CI-Gated Transition Authorization**: Transitions from CI-gated states (`CiPending`) require authorized rationale codes (`ci_passed` or `ci_failed`) that only the CI processor emits. This prevents agents from bypassing CI gating by directly emitting `WorkTransitioned` events.
+4. **CI-Gated Transition Authorization**: Transitions from CI-gated states (`CiPending`) require BOTH:
+   - **Authorized rationale codes** (`ci_passed` or `ci_failed`) that only the CI processor emits
+   - **Authorized actor ID** (`system:ci-processor`) that identifies the CI event processor
+
+This two-layer check prevents agents from bypassing CI gating by directly emitting `WorkTransitioned` events with the correct rationale code but an unauthorized actor identity.
 
 ```rust
 // WorkError::CiGatedTransitionUnauthorized - unauthorized rationale
@@ -384,6 +389,13 @@ let bypass_attempt = helpers::work_transitioned_payload_with_sequence(
     "WORK-001", "CI_PENDING", "READY_FOR_REVIEW", "manual_bypass", 3
 );
 // Fails because "manual_bypass" is not an authorized CI rationale code
+
+// WorkError::CiGatedTransitionUnauthorizedActor - unauthorized actor
+// Even with correct rationale, wrong actor is rejected
+let actor_bypass = helpers::work_transitioned_payload_with_sequence(
+    "WORK-001", "CI_PENDING", "READY_FOR_REVIEW", "ci_passed", 3
+);
+// Fails if signed by actor other than "system:ci-processor"
 ```
 
 5. **Commit SHA Verification in CI Queue**: The CI event processor verifies that the CI event's `commit_sha` matches the work item's stored `commit_sha`. This prevents stale CI results (from old commits) from incorrectly transitioning work items that have been updated with new commits.

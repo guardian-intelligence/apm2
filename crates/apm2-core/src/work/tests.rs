@@ -1,13 +1,22 @@
 //! Tests for the work module.
 
 use super::error::WorkError;
-use super::reducer::{WorkReducer, helpers};
+use super::reducer::{CI_SYSTEM_ACTOR_ID, WorkReducer, helpers};
 use super::state::WorkState;
 use crate::ledger::EventRecord;
 use crate::reducer::{Reducer, ReducerContext};
 
 fn create_event(event_type: &str, session_id: &str, payload: Vec<u8>) -> EventRecord {
     EventRecord::with_timestamp(event_type, session_id, "test-actor", payload, 1_000_000_000)
+}
+
+fn create_event_with_actor(
+    event_type: &str,
+    session_id: &str,
+    actor_id: &str,
+    payload: Vec<u8>,
+) -> EventRecord {
+    EventRecord::with_timestamp(event_type, session_id, actor_id, payload, 1_000_000_000)
 }
 
 // =============================================================================
@@ -1281,7 +1290,7 @@ fn test_work_transition_ci_pending_to_ready_for_review() {
     // Setup: Open -> Claimed -> InProgress -> CiPending
     setup_ci_pending_work(&mut reducer, &ctx, "work-1");
 
-    // CI passed, transition to ReadyForReview
+    // CI passed, transition to ReadyForReview (must use CI system actor)
     let ready_payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
         "CI_PENDING",
@@ -1291,7 +1300,12 @@ fn test_work_transition_ci_pending_to_ready_for_review() {
     );
     reducer
         .apply(
-            &create_event("work.transitioned", "session-1", ready_payload),
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                ready_payload,
+            ),
             &ctx,
         )
         .unwrap();
@@ -1310,7 +1324,7 @@ fn test_work_transition_ci_pending_to_blocked() {
     // Setup: Open -> Claimed -> InProgress -> CiPending
     setup_ci_pending_work(&mut reducer, &ctx, "work-1");
 
-    // CI failed, transition to Blocked
+    // CI failed, transition to Blocked (must use CI system actor)
     let blocked_payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
         "CI_PENDING",
@@ -1320,7 +1334,12 @@ fn test_work_transition_ci_pending_to_blocked() {
     );
     reducer
         .apply(
-            &create_event("work.transitioned", "session-1", blocked_payload),
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                blocked_payload,
+            ),
             &ctx,
         )
         .unwrap();
@@ -1339,7 +1358,7 @@ fn test_work_transition_blocked_to_ci_pending_retry() {
     // Setup: Open -> Claimed -> InProgress -> CiPending -> Blocked
     setup_ci_pending_work(&mut reducer, &ctx, "work-1");
 
-    // CI failed, transition to Blocked
+    // CI failed, transition to Blocked (must use CI system actor)
     let blocked_payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
         "CI_PENDING",
@@ -1349,12 +1368,18 @@ fn test_work_transition_blocked_to_ci_pending_retry() {
     );
     reducer
         .apply(
-            &create_event("work.transitioned", "session-1", blocked_payload),
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                blocked_payload,
+            ),
             &ctx,
         )
         .unwrap();
 
     // Fix pushed, retry CI (transition back to CiPending)
+    // Note: Blocked -> CiPending is NOT a CI-gated transition, any actor can retry
     let retry_payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
         "BLOCKED",
@@ -1383,7 +1408,7 @@ fn test_work_transition_ready_for_review_to_review() {
     // Setup: Open -> Claimed -> InProgress -> CiPending -> ReadyForReview
     setup_ci_pending_work(&mut reducer, &ctx, "work-1");
 
-    // CI passed, transition to ReadyForReview
+    // CI passed, transition to ReadyForReview (must use CI system actor)
     let ready_payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
         "CI_PENDING",
@@ -1393,12 +1418,17 @@ fn test_work_transition_ready_for_review_to_review() {
     );
     reducer
         .apply(
-            &create_event("work.transitioned", "session-1", ready_payload),
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                ready_payload,
+            ),
             &ctx,
         )
         .unwrap();
 
-    // Review agent claims work
+    // Review agent claims work (not a CI-gated transition, any actor can claim)
     let review_payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
         "READY_FOR_REVIEW",
@@ -1447,7 +1477,12 @@ fn test_blocked_not_claimable() {
     );
     reducer
         .apply(
-            &create_event("work.transitioned", "session-1", blocked_payload),
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                blocked_payload,
+            ),
             &ctx,
         )
         .unwrap();
@@ -1473,7 +1508,12 @@ fn test_ready_for_review_is_claimable() {
     );
     reducer
         .apply(
-            &create_event("work.transitioned", "session-1", ready_payload),
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                ready_payload,
+            ),
             &ctx,
         )
         .unwrap();
@@ -1656,7 +1696,10 @@ fn test_ci_gated_work_query() {
         3,
     );
     reducer
-        .apply(&create_event("work.transitioned", "s", blocked2), &ctx)
+        .apply(
+            &create_event_with_actor("work.transitioned", "s", CI_SYSTEM_ACTOR_ID, blocked2),
+            &ctx,
+        )
         .unwrap();
 
     // work-3 stays in Open state
@@ -1705,7 +1748,12 @@ fn test_work_aborted_from_blocked() {
     );
     reducer
         .apply(
-            &create_event("work.transitioned", "session-1", blocked_payload),
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                blocked_payload,
+            ),
             &ctx,
         )
         .unwrap();
@@ -1740,7 +1788,12 @@ fn test_work_aborted_from_ready_for_review() {
     );
     reducer
         .apply(
-            &create_event("work.transitioned", "session-1", ready_payload),
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                ready_payload,
+            ),
             &ctx,
         )
         .unwrap();
@@ -1856,7 +1909,12 @@ fn test_pr_association_fails_from_blocked() {
     );
     reducer
         .apply(
-            &create_event("work.transitioned", "session-1", blocked_payload),
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                blocked_payload,
+            ),
             &ctx,
         )
         .unwrap();
@@ -2038,7 +2096,7 @@ fn test_ci_gated_transition_requires_authorized_rationale_ci_passed() {
     let work = reducer.state().get("work-1").unwrap();
     assert_eq!(work.state, WorkState::CiPending);
 
-    // CI-gated transition with authorized rationale "ci_passed" (should succeed)
+    // CI-gated transition with authorized rationale and actor (should succeed)
     let payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
         "CI_PENDING",
@@ -2047,7 +2105,12 @@ fn test_ci_gated_transition_requires_authorized_rationale_ci_passed() {
         3, // transition_count after CiPending
     );
     let result = reducer.apply(
-        &create_event("work.transitioned", "session-1", payload),
+        &create_event_with_actor(
+            "work.transitioned",
+            "session-1",
+            CI_SYSTEM_ACTOR_ID,
+            payload,
+        ),
         &ctx,
     );
     assert!(result.is_ok());
@@ -2064,7 +2127,7 @@ fn test_ci_gated_transition_requires_authorized_rationale_ci_failed() {
     // Setup: Open -> Claimed -> InProgress -> CiPending
     setup_ci_pending_work(&mut reducer, &ctx, "work-1");
 
-    // CI-gated transition with authorized rationale "ci_failed" (should succeed)
+    // CI-gated transition with authorized rationale and actor (should succeed)
     let payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
         "CI_PENDING",
@@ -2073,7 +2136,12 @@ fn test_ci_gated_transition_requires_authorized_rationale_ci_failed() {
         3,
     );
     let result = reducer.apply(
-        &create_event("work.transitioned", "session-1", payload),
+        &create_event_with_actor(
+            "work.transitioned",
+            "session-1",
+            CI_SYSTEM_ACTOR_ID,
+            payload,
+        ),
         &ctx,
     );
     assert!(result.is_ok());
@@ -2142,6 +2210,40 @@ fn test_ci_gated_transition_rejects_empty_rationale() {
         result,
         Err(WorkError::CiGatedTransitionUnauthorized { .. })
     ));
+}
+
+#[test]
+fn test_ci_gated_transition_rejects_unauthorized_actor() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // Try to transition with correct rationale but WRONG actor (should fail)
+    // This prevents agents from bypassing CI gating even with correct rationale
+    let payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "READY_FOR_REVIEW",
+        "ci_passed", // Correct rationale
+        3,
+    );
+    let result = reducer.apply(
+        // Use "malicious-agent" instead of CI_SYSTEM_ACTOR_ID
+        &create_event_with_actor("work.transitioned", "session-1", "malicious-agent", payload),
+        &ctx,
+    );
+
+    // Should fail with CiGatedTransitionUnauthorizedActor
+    assert!(matches!(
+        result,
+        Err(WorkError::CiGatedTransitionUnauthorizedActor { .. })
+    ));
+
+    // Work should still be in CiPending state
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::CiPending);
 }
 
 #[test]
