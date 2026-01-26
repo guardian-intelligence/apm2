@@ -63,6 +63,7 @@ mod generated {
 }
 
 pub mod fs;
+pub mod shell;
 mod validation;
 
 #[cfg(test)]
