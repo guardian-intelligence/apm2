@@ -34,7 +34,7 @@
 //! ",
 //! )
 //! .unwrap();
-//! let canonical = canonicalize_yaml(&yaml);
+//! let canonical = canonicalize_yaml(&yaml).unwrap();
 //! assert!(canonical.starts_with("apple:"));
 //!
 //! // Classify changes between versions
@@ -55,7 +55,7 @@ mod diff_classify;
 
 // Re-export primary API
 pub use atomic_write::{AtomicWriteError, write_atomic};
-pub use canonicalize::canonicalize_yaml;
+pub use canonicalize::{CanonicalizeError, canonicalize_yaml};
 pub use diff_classify::{
     DEFAULT_FREE_TEXT_FIELDS, DiffClassification, classify_diff, classify_diff_with_fields,
 };
@@ -84,7 +84,7 @@ mango:
 ";
 
         let value: Value = serde_yaml::from_str(input).unwrap();
-        let canonical = canonicalize_yaml(&value);
+        let canonical = canonicalize_yaml(&value).unwrap();
 
         // Write atomically
         write_atomic(&target, canonical.as_bytes()).unwrap();
@@ -116,7 +116,7 @@ status: READY
 
         // Write original
         let orig_value: Value = serde_yaml::from_str(original).unwrap();
-        let orig_canonical = canonicalize_yaml(&orig_value);
+        let orig_canonical = canonicalize_yaml(&orig_value).unwrap();
         write_atomic(&target, orig_canonical.as_bytes()).unwrap();
 
         // Modify only the description
@@ -128,7 +128,7 @@ status: READY
 ";
 
         let mod_value: Value = serde_yaml::from_str(modified).unwrap();
-        let mod_canonical = canonicalize_yaml(&mod_value);
+        let mod_canonical = canonicalize_yaml(&mod_value).unwrap();
 
         // Classify the diff
         let classification = classify_diff(&orig_canonical, &mod_canonical);
@@ -149,7 +149,7 @@ description: Description
 
         // Write original
         let orig_value: Value = serde_yaml::from_str(original).unwrap();
-        let orig_canonical = canonicalize_yaml(&orig_value);
+        let orig_canonical = canonicalize_yaml(&orig_value).unwrap();
         write_atomic(&target, orig_canonical.as_bytes()).unwrap();
 
         // Modify the id (structural change)
@@ -160,7 +160,7 @@ description: Description
 ";
 
         let mod_value: Value = serde_yaml::from_str(modified).unwrap();
-        let mod_canonical = canonicalize_yaml(&mod_value);
+        let mod_canonical = canonicalize_yaml(&mod_value).unwrap();
 
         // Classify the diff
         let classification = classify_diff(&orig_canonical, &mod_canonical);
@@ -180,7 +180,7 @@ description: Description
         let mut canonicals: Vec<String> = Vec::new();
         for input in &inputs {
             let value: Value = serde_yaml::from_str(input).unwrap();
-            canonicals.push(canonicalize_yaml(&value));
+            canonicals.push(canonicalize_yaml(&value).unwrap());
         }
 
         // All should produce identical output
@@ -213,7 +213,7 @@ notes: This is a test document
 
         // Parse, canonicalize, and write
         let value: Value = serde_yaml::from_str(doc).unwrap();
-        let canonical = canonicalize_yaml(&value);
+        let canonical = canonicalize_yaml(&value).unwrap();
 
         let target = temp_dir.path().join("ticket.yaml");
         write_atomic(&target, canonical.as_bytes()).unwrap();
@@ -224,7 +224,7 @@ notes: This is a test document
 
         // Re-parse and re-canonicalize should be identical (idempotent)
         let reparsed: Value = serde_yaml::from_str(&content).unwrap();
-        let recanonical = canonicalize_yaml(&reparsed);
+        let recanonical = canonicalize_yaml(&reparsed).unwrap();
         assert_eq!(canonical, recanonical);
 
         // Diff with itself should be identical

@@ -12,6 +12,13 @@
 //! 4. Consistent quoting: simple strings are unquoted, complex strings quoted
 //! 5. Null values are represented as `null`
 //!
+//! # Complex Keys
+//!
+//! YAML allows sequences and mappings as keys, but this canonicalizer does not
+//! support them. If a complex key is encountered, an error is returned. This is
+//! by design: complex keys are rare in practice and require explicit handling
+//! by the caller.
+//!
 //! # Example
 //!
 //! ```
@@ -26,13 +33,30 @@
 //! )
 //! .unwrap();
 //!
-//! let canonical = canonicalize_yaml(&yaml);
+//! let canonical = canonicalize_yaml(&yaml).unwrap();
 //! assert_eq!(canonical, "apple: 2\nzebra: 1\n");
 //! ```
 
 use std::collections::BTreeMap;
 
 use serde_yaml::Value;
+use thiserror::Error;
+
+/// Errors that can occur during YAML canonicalization.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CanonicalizeError {
+    /// A complex key (sequence or mapping) was encountered in a YAML mapping.
+    ///
+    /// YAML allows sequences and mappings as keys, but this canonicalizer does
+    /// not support them because they cannot be reliably sorted as strings.
+    #[error("unsupported complex YAML key: {key_type} keys cannot be canonicalized")]
+    UnsupportedComplexKey {
+        /// The type of complex key that was encountered ("sequence" or
+        /// "mapping").
+        key_type: &'static str,
+    },
+}
 
 /// Canonicalizes a YAML value to a deterministic string representation.
 ///
@@ -49,49 +73,71 @@ use serde_yaml::Value;
 ///
 /// # Returns
 ///
-/// A canonical string representation of the YAML value.
-#[must_use]
-pub fn canonicalize_yaml(value: &Value) -> String {
-    let sorted = sort_keys_recursive(value);
+/// A canonical string representation of the YAML value, or an error if the
+/// value contains unsupported complex keys (sequences or mappings as keys).
+///
+/// # Errors
+///
+/// Returns [`CanonicalizeError::UnsupportedComplexKey`] if the YAML value
+/// contains a mapping with a sequence or mapping as a key.
+pub fn canonicalize_yaml(value: &Value) -> Result<String, CanonicalizeError> {
+    let sorted = sort_keys_recursive(value)?;
     let mut output = String::new();
     emit_value(&sorted, 0, true, &mut output);
-    output
+    Ok(output)
 }
 
 /// Recursively sorts all mapping keys in a YAML value.
-fn sort_keys_recursive(value: &Value) -> Value {
+///
+/// # Errors
+///
+/// Returns an error if any mapping contains a complex key (sequence or
+/// mapping).
+fn sort_keys_recursive(value: &Value) -> Result<Value, CanonicalizeError> {
     match value {
         Value::Mapping(map) => {
             // Convert to BTreeMap for sorted iteration
-            let sorted: BTreeMap<String, Value> = map
-                .iter()
-                .filter_map(|(k, v)| {
-                    let key = yaml_key_to_string(k)?;
-                    Some((key, sort_keys_recursive(v)))
-                })
-                .collect();
+            let mut sorted: BTreeMap<String, Value> = BTreeMap::new();
+            for (k, v) in map {
+                let key = yaml_key_to_string(k)?;
+                let value = sort_keys_recursive(v)?;
+                sorted.insert(key, value);
+            }
 
             // Convert back to a Mapping with sorted keys
             let mut result = serde_yaml::Mapping::new();
             for (key, val) in sorted {
                 result.insert(Value::String(key), val);
             }
-            Value::Mapping(result)
+            Ok(Value::Mapping(result))
         },
-        Value::Sequence(seq) => Value::Sequence(seq.iter().map(sort_keys_recursive).collect()),
-        other => other.clone(),
+        Value::Sequence(seq) => {
+            let sorted: Result<Vec<Value>, CanonicalizeError> =
+                seq.iter().map(sort_keys_recursive).collect();
+            Ok(Value::Sequence(sorted?))
+        },
+        other => Ok(other.clone()),
     }
 }
 
 /// Converts a YAML key to a string for sorting purposes.
-fn yaml_key_to_string(key: &Value) -> Option<String> {
+///
+/// # Errors
+///
+/// Returns an error if the key is a complex type (sequence or mapping).
+fn yaml_key_to_string(key: &Value) -> Result<String, CanonicalizeError> {
     match key {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        Value::Bool(b) => Some(b.to_string()),
-        Value::Null => Some("null".to_string()),
-        // Complex keys are not supported for sorting
-        _ => None,
+        Value::String(s) => Ok(s.clone()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Null => Ok("null".to_string()),
+        Value::Sequence(_) => Err(CanonicalizeError::UnsupportedComplexKey {
+            key_type: "sequence",
+        }),
+        Value::Mapping(_) => Err(CanonicalizeError::UnsupportedComplexKey {
+            key_type: "mapping",
+        }),
+        Value::Tagged(tagged) => yaml_key_to_string(&tagged.value),
     }
 }
 
@@ -331,9 +377,9 @@ list:
 
         for input in &inputs {
             let value: Value = serde_yaml::from_str(input).unwrap();
-            let canonical1 = canonicalize_yaml(&value);
+            let canonical1 = canonicalize_yaml(&value).unwrap();
             let reparsed: Value = serde_yaml::from_str(&canonical1).unwrap();
-            let canonical2 = canonicalize_yaml(&reparsed);
+            let canonical2 = canonicalize_yaml(&reparsed).unwrap();
             assert_eq!(
                 canonical1, canonical2,
                 "Canonicalization should be idempotent"
@@ -352,7 +398,7 @@ outer:
     ant: value
 ";
         let value: Value = serde_yaml::from_str(input).unwrap();
-        let canonical = canonicalize_yaml(&value);
+        let canonical = canonicalize_yaml(&value).unwrap();
 
         // Verify outer keys are sorted
         let apple_pos = canonical.find("apple:").unwrap();
@@ -384,7 +430,7 @@ parent:
     grandchild: value
 ";
         let value: Value = serde_yaml::from_str(input).unwrap();
-        let canonical = canonicalize_yaml(&value);
+        let canonical = canonicalize_yaml(&value).unwrap();
 
         // Check that grandchild is indented with 4 spaces (2 levels * 2 spaces)
         assert!(
@@ -402,7 +448,7 @@ nested:
   inner: value
 ";
         let value: Value = serde_yaml::from_str(input).unwrap();
-        let canonical = canonicalize_yaml(&value);
+        let canonical = canonicalize_yaml(&value).unwrap();
 
         for (i, line) in canonical.lines().enumerate() {
             assert!(
@@ -416,14 +462,14 @@ nested:
     #[test]
     fn test_empty_mapping() {
         let value = Value::Mapping(serde_yaml::Mapping::new());
-        let canonical = canonicalize_yaml(&value);
+        let canonical = canonicalize_yaml(&value).unwrap();
         assert_eq!(canonical, "{}");
     }
 
     #[test]
     fn test_empty_sequence() {
         let value = Value::Sequence(vec![]);
-        let canonical = canonicalize_yaml(&value);
+        let canonical = canonicalize_yaml(&value).unwrap();
         assert_eq!(canonical, "[]");
     }
 
@@ -431,7 +477,7 @@ nested:
     fn test_null_value() {
         let input = "key: null";
         let value: Value = serde_yaml::from_str(input).unwrap();
-        let canonical = canonicalize_yaml(&value);
+        let canonical = canonicalize_yaml(&value).unwrap();
         assert_eq!(canonical, "key: null\n");
     }
 
@@ -442,7 +488,7 @@ yes_val: true
 no_val: false
 ";
         let value: Value = serde_yaml::from_str(input).unwrap();
-        let canonical = canonicalize_yaml(&value);
+        let canonical = canonicalize_yaml(&value).unwrap();
         assert!(canonical.contains("no_val: false"));
         assert!(canonical.contains("yes_val: true"));
     }
@@ -458,7 +504,7 @@ no_val: false
 
         for (input, expected) in &cases {
             let value: Value = serde_yaml::from_str(input).unwrap();
-            let canonical = canonicalize_yaml(&value);
+            let canonical = canonicalize_yaml(&value).unwrap();
             assert_eq!(
                 &canonical, expected,
                 "Input {input:?} should produce {expected:?}, got {canonical:?}",
@@ -476,7 +522,7 @@ items:
   - single: value
 ";
         let value: Value = serde_yaml::from_str(input).unwrap();
-        let canonical = canonicalize_yaml(&value);
+        let canonical = canonicalize_yaml(&value).unwrap();
 
         // Verify keys in each mapping are sorted
         let a_pos = canonical.find("a:").unwrap();
@@ -498,8 +544,8 @@ b: 2
 ";
         let value1: Value = serde_yaml::from_str(input1).unwrap();
         let value2: Value = serde_yaml::from_str(input2).unwrap();
-        let canonical1 = canonicalize_yaml(&value1);
-        let canonical2 = canonicalize_yaml(&value2);
+        let canonical1 = canonicalize_yaml(&value1).unwrap();
+        let canonical2 = canonicalize_yaml(&value2).unwrap();
 
         assert_eq!(
             canonical1, canonical2,
@@ -515,7 +561,7 @@ b: 2
             Value::String("line1\nline2\nline3".to_string()),
         );
         let value = Value::Mapping(map);
-        let canonical = canonicalize_yaml(&value);
+        let canonical = canonicalize_yaml(&value).unwrap();
 
         // Should be quoted with escaped newlines
         assert!(
@@ -532,7 +578,7 @@ float: 3.14
 negative: -10
 ";
         let value: Value = serde_yaml::from_str(input).unwrap();
-        let canonical = canonicalize_yaml(&value);
+        let canonical = canonicalize_yaml(&value).unwrap();
 
         assert!(canonical.contains("float: 3.14"));
         assert!(canonical.contains("integer: 42"));
@@ -549,7 +595,7 @@ level1:
         value: deep
 ";
         let value: Value = serde_yaml::from_str(input).unwrap();
-        let canonical = canonicalize_yaml(&value);
+        let canonical = canonicalize_yaml(&value).unwrap();
 
         // Verify proper indentation at each level
         assert!(canonical.contains("level1:\n"));
@@ -557,5 +603,75 @@ level1:
         assert!(canonical.contains("    level3:\n"));
         assert!(canonical.contains("      level4:\n"));
         assert!(canonical.contains("        value: deep"));
+    }
+
+    #[test]
+    fn test_complex_key_sequence_error() {
+        // Create a mapping with a sequence as a key
+        let mut map = serde_yaml::Mapping::new();
+        let key = Value::Sequence(vec![Value::String("a".to_string())]);
+        map.insert(key, Value::String("value".to_string()));
+        let value = Value::Mapping(map);
+
+        let result = canonicalize_yaml(&value);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(
+            err,
+            CanonicalizeError::UnsupportedComplexKey {
+                key_type: "sequence"
+            }
+        );
+        assert!(err.to_string().contains("sequence"));
+    }
+
+    #[test]
+    fn test_complex_key_mapping_error() {
+        // Create a mapping with a mapping as a key
+        let mut inner_map = serde_yaml::Mapping::new();
+        inner_map.insert(
+            Value::String("nested".to_string()),
+            Value::String("key".to_string()),
+        );
+        let key = Value::Mapping(inner_map);
+
+        let mut map = serde_yaml::Mapping::new();
+        map.insert(key, Value::String("value".to_string()));
+        let value = Value::Mapping(map);
+
+        let result = canonicalize_yaml(&value);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(
+            err,
+            CanonicalizeError::UnsupportedComplexKey {
+                key_type: "mapping"
+            }
+        );
+        assert!(err.to_string().contains("mapping"));
+    }
+
+    #[test]
+    fn test_complex_key_in_nested_mapping_error() {
+        // Create a nested structure with a complex key deeper in the tree
+        let mut inner_map = serde_yaml::Mapping::new();
+        let key = Value::Sequence(vec![Value::Number(1.into())]);
+        inner_map.insert(key, Value::String("value".to_string()));
+
+        let mut outer_map = serde_yaml::Mapping::new();
+        outer_map.insert(
+            Value::String("outer".to_string()),
+            Value::Mapping(inner_map),
+        );
+        let value = Value::Mapping(outer_map);
+
+        let result = canonicalize_yaml(&value);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            CanonicalizeError::UnsupportedComplexKey {
+                key_type: "sequence"
+            }
+        );
     }
 }
