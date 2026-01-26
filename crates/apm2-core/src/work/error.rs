@@ -108,4 +108,24 @@ pub enum WorkError {
         /// The work ID that already has this PR number.
         existing_work_id: String,
     },
+
+    /// CI-gated transition requires authorized rationale code.
+    ///
+    /// # Security
+    ///
+    /// Transitions from CI-gated states (`CiPending`) can only be performed
+    /// by the CI event processor using specific rationale codes (`ci_passed`
+    /// or `ci_failed`). This prevents agents from bypassing CI gating by
+    /// directly emitting `WorkTransitioned` events.
+    #[error(
+        "CI-gated transition from {from_state} requires authorized rationale code, got '{rationale_code}'"
+    )]
+    CiGatedTransitionUnauthorized {
+        /// The current (CI-gated) state.
+        from_state: WorkState,
+        /// The attempted target state.
+        to_state: WorkState,
+        /// The rationale code provided.
+        rationale_code: String,
+    },
 }

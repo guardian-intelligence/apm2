@@ -254,6 +254,20 @@ impl WorkReducer {
             });
         }
 
+        // Security check: CI-gated transitions require authorized rationale codes.
+        // This prevents agents from bypassing CI gating by directly emitting
+        // WorkTransitioned events with arbitrary rationale codes.
+        if from_state == WorkState::CiPending {
+            let rationale = &event.rationale_code;
+            if rationale != "ci_passed" && rationale != "ci_failed" {
+                return Err(WorkError::CiGatedTransitionUnauthorized {
+                    from_state,
+                    to_state,
+                    rationale_code: rationale.clone(),
+                });
+            }
+        }
+
         // Apply the transition
         work.state = to_state;
         work.last_transition_at = timestamp;

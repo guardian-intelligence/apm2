@@ -69,6 +69,22 @@ pub enum CiQueueProcessResult {
 
     /// The CI event had no PR numbers.
     NoPrNumbers,
+
+    /// The CI event's commit SHA does not match the work item's stored SHA.
+    ///
+    /// # Security
+    ///
+    /// This prevents stale CI results from transitioning work items. A CI run
+    /// for a new commit (SHA B) should not transition a work item that is
+    /// still associated with an old commit (SHA A).
+    CommitShaMismatch {
+        /// The work item ID.
+        work_id: String,
+        /// The commit SHA expected by the work item.
+        expected_sha: String,
+        /// The commit SHA from the CI event.
+        actual_sha: String,
+    },
 }
 
 /// Determines the target phase for a work item based on CI conclusion.
@@ -86,6 +102,17 @@ pub const fn target_phase_for_conclusion(conclusion: CIConclusion) -> WorkState 
     }
 }
 
+/// Work item lookup result containing state and commit SHA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkLookupResult {
+    /// The work item ID.
+    pub work_id: String,
+    /// The current state of the work item.
+    pub state: WorkState,
+    /// The commit SHA associated with the work item (if any).
+    pub commit_sha: Option<String>,
+}
+
 /// Processes a CI workflow completion event for a single work item.
 ///
 /// This is the core logic for the CI-gated queue processor. It:
@@ -94,7 +121,8 @@ pub const fn target_phase_for_conclusion(conclusion: CIConclusion) -> WorkState 
 /// 2. Verifies the event has PR numbers
 /// 3. Looks up the work item by PR number
 /// 4. Validates the work item is in `CiPending` state
-/// 5. Creates the transition event
+/// 5. Verifies the commit SHA matches (prevents stale CI results)
+/// 6. Creates the transition event
 ///
 /// # Arguments
 ///
@@ -111,7 +139,7 @@ pub fn process_ci_event<F>(
     lookup_work_by_pr: F,
 ) -> CiQueueProcessResult
 where
-    F: FnOnce(u64) -> Option<(String, WorkState)>,
+    F: FnOnce(u64) -> Option<WorkLookupResult>,
 {
     // Check feature flag
     if !config.enabled {
@@ -124,9 +152,12 @@ where
     };
 
     // Look up work item by PR number
-    let Some((work_id, current_state)) = lookup_work_by_pr(pr_number) else {
+    let Some(work_lookup) = lookup_work_by_pr(pr_number) else {
         return CiQueueProcessResult::NoWorkItem { pr_number };
     };
+
+    let work_id = work_lookup.work_id;
+    let current_state = work_lookup.state;
 
     // Verify work item is in CiPending state [CTR-CIQ001]
     if current_state != WorkState::CiPending {
@@ -134,6 +165,20 @@ where
             work_id,
             current_state,
         };
+    }
+
+    // Security check: Verify commit SHA matches to prevent stale CI results
+    // from transitioning work items. A CI run for a new commit should not
+    // transition a work item associated with an old commit.
+    if let Some(expected_sha) = work_lookup.commit_sha {
+        let actual_sha = &event.payload.commit_sha;
+        if expected_sha != *actual_sha {
+            return CiQueueProcessResult::CommitShaMismatch {
+                work_id,
+                expected_sha,
+                actual_sha: actual_sha.clone(),
+            };
+        }
     }
 
     // Determine target phase based on CI conclusion
@@ -315,7 +360,11 @@ mod tests {
         let config = CIGatedQueueConfig::enabled();
 
         let result = process_ci_event(&event, &config, |_| {
-            Some(("work-123".to_string(), WorkState::InProgress))
+            Some(WorkLookupResult {
+                work_id: "work-123".to_string(),
+                state: WorkState::InProgress,
+                commit_sha: Some("abc123".to_string()),
+            })
         });
 
         assert_eq!(
@@ -334,7 +383,11 @@ mod tests {
 
         let result = process_ci_event(&event, &config, |pr| {
             if pr == 42 {
-                Some(("work-123".to_string(), WorkState::CiPending))
+                Some(WorkLookupResult {
+                    work_id: "work-123".to_string(),
+                    state: WorkState::CiPending,
+                    commit_sha: Some("abc123".to_string()),
+                })
             } else {
                 None
             }
@@ -364,12 +417,64 @@ mod tests {
         let config = CIGatedQueueConfig::enabled();
 
         let result = process_ci_event(&event, &config, |_| {
-            Some(("work-123".to_string(), WorkState::CiPending))
+            Some(WorkLookupResult {
+                work_id: "work-123".to_string(),
+                state: WorkState::CiPending,
+                commit_sha: Some("abc123".to_string()),
+            })
         });
 
         match result {
             CiQueueProcessResult::Transitioned { next_phase, .. } => {
                 assert_eq!(next_phase, WorkState::Blocked);
+            },
+            other => panic!("Expected Transitioned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_process_ci_event_commit_sha_mismatch() {
+        // CI event has SHA "abc123" (from sample_ci_event)
+        let event = sample_ci_event(CIConclusion::Success, vec![42]);
+        let config = CIGatedQueueConfig::enabled();
+
+        // Work item has a different SHA
+        let result = process_ci_event(&event, &config, |_| {
+            Some(WorkLookupResult {
+                work_id: "work-123".to_string(),
+                state: WorkState::CiPending,
+                commit_sha: Some("def456".to_string()), // Different SHA!
+            })
+        });
+
+        assert_eq!(
+            result,
+            CiQueueProcessResult::CommitShaMismatch {
+                work_id: "work-123".to_string(),
+                expected_sha: "def456".to_string(),
+                actual_sha: "abc123".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_process_ci_event_no_commit_sha_on_work_item() {
+        // If work item has no commit_sha, we allow the transition (graceful
+        // degradation)
+        let event = sample_ci_event(CIConclusion::Success, vec![42]);
+        let config = CIGatedQueueConfig::enabled();
+
+        let result = process_ci_event(&event, &config, |_| {
+            Some(WorkLookupResult {
+                work_id: "work-123".to_string(),
+                state: WorkState::CiPending,
+                commit_sha: None, // No SHA stored
+            })
+        });
+
+        match result {
+            CiQueueProcessResult::Transitioned { work_id, .. } => {
+                assert_eq!(work_id, "work-123");
             },
             other => panic!("Expected Transitioned, got {other:?}"),
         }

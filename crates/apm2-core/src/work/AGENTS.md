@@ -151,6 +151,7 @@ pub enum WorkError {
     ProtobufDecode(#[from] prost::DecodeError),
     PrAssociationNotAllowed { work_id: String, current_state: WorkState },
     PrNumberAlreadyAssociated { pr_number: u64, existing_work_id: String },
+    CiGatedTransitionUnauthorized { from_state: WorkState, to_state: WorkState, rationale_code: String },
 }
 ```
 
@@ -374,6 +375,18 @@ let duplicate_pr = helpers::work_pr_associated_payload("WORK-002", 42, "sha456")
 ```
 
 3. **Commit SHA Storage**: The commit SHA is stored alongside the PR number to enable verification that CI results match the specific commit pushed by the agent (preventing stale CI results from triggering transitions).
+
+4. **CI-Gated Transition Authorization**: Transitions from CI-gated states (`CiPending`) require authorized rationale codes (`ci_passed` or `ci_failed`) that only the CI processor emits. This prevents agents from bypassing CI gating by directly emitting `WorkTransitioned` events.
+
+```rust
+// WorkError::CiGatedTransitionUnauthorized - unauthorized rationale
+let bypass_attempt = helpers::work_transitioned_payload_with_sequence(
+    "WORK-001", "CI_PENDING", "READY_FOR_REVIEW", "manual_bypass", 3
+);
+// Fails because "manual_bypass" is not an authorized CI rationale code
+```
+
+5. **Commit SHA Verification in CI Queue**: The CI event processor verifies that the CI event's `commit_sha` matches the work item's stored `commit_sha`. This prevents stale CI results (from old commits) from incorrectly transitioning work items that have been updated with new commits.
 
 ### WorkReadyForNextPhase Event
 

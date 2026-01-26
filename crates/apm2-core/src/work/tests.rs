@@ -2021,3 +2021,152 @@ fn test_pr_association_idempotent_same_pr() {
     let work = reducer.state().get("work-1").unwrap();
     assert_eq!(work.pr_number, Some(42));
 }
+
+// =============================================================================
+// CI-Gated Transition Authorization Tests
+// =============================================================================
+
+#[test]
+fn test_ci_gated_transition_requires_authorized_rationale_ci_passed() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // Verify work is in CiPending state
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::CiPending);
+
+    // CI-gated transition with authorized rationale "ci_passed" (should succeed)
+    let payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "READY_FOR_REVIEW",
+        "ci_passed",
+        3, // transition_count after CiPending
+    );
+    let result = reducer.apply(
+        &create_event("work.transitioned", "session-1", payload),
+        &ctx,
+    );
+    assert!(result.is_ok());
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::ReadyForReview);
+}
+
+#[test]
+fn test_ci_gated_transition_requires_authorized_rationale_ci_failed() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // CI-gated transition with authorized rationale "ci_failed" (should succeed)
+    let payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "BLOCKED",
+        "ci_failed",
+        3,
+    );
+    let result = reducer.apply(
+        &create_event("work.transitioned", "session-1", payload),
+        &ctx,
+    );
+    assert!(result.is_ok());
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Blocked);
+}
+
+#[test]
+fn test_ci_gated_transition_rejects_unauthorized_rationale() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // Try to transition with unauthorized rationale (should fail)
+    // This prevents agents from bypassing CI gating by directly emitting
+    // transitions
+    let payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "READY_FOR_REVIEW",
+        "manual_bypass_attempt", // Unauthorized rationale!
+        3,
+    );
+    let result = reducer.apply(
+        &create_event("work.transitioned", "session-1", payload),
+        &ctx,
+    );
+
+    // Should fail with CiGatedTransitionUnauthorized
+    assert!(matches!(
+        result,
+        Err(WorkError::CiGatedTransitionUnauthorized { .. })
+    ));
+
+    // Work should still be in CiPending state
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::CiPending);
+}
+
+#[test]
+fn test_ci_gated_transition_rejects_empty_rationale() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // Try to transition with empty rationale (should fail)
+    let payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "READY_FOR_REVIEW",
+        "", // Empty rationale!
+        3,
+    );
+    let result = reducer.apply(
+        &create_event("work.transitioned", "session-1", payload),
+        &ctx,
+    );
+
+    // Should fail with CiGatedTransitionUnauthorized
+    assert!(matches!(
+        result,
+        Err(WorkError::CiGatedTransitionUnauthorized { .. })
+    ));
+}
+
+#[test]
+fn test_non_ci_gated_transition_allows_any_rationale() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress
+    setup_in_progress_work(&mut reducer, &ctx, "work-1");
+
+    // Non-CI-gated transition (InProgress -> Review) with arbitrary rationale
+    // (should succeed)
+    let payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "IN_PROGRESS",
+        "REVIEW",
+        "any_rationale_is_fine",
+        2,
+    );
+    let result = reducer.apply(
+        &create_event("work.transitioned", "session-1", payload),
+        &ctx,
+    );
+    assert!(result.is_ok());
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Review);
+}
