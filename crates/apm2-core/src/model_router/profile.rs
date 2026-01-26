@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -41,6 +41,9 @@ const DEFAULT_INITIAL_DELAY_MS: u64 = 1000;
 
 /// Default backoff multiplier.
 const DEFAULT_BACKOFF_MULTIPLIER: f64 = 2.0;
+
+/// Maximum allowed retries per schema constraint.
+const MAX_ALLOWED_RETRIES: u32 = 10;
 
 /// Errors that can occur during profile parsing.
 #[derive(Debug, Error)]
@@ -125,6 +128,17 @@ pub enum ProfileError {
         path: String,
         /// Reason for the failure.
         reason: String,
+    },
+
+    /// Invalid retry policy.
+    #[error("invalid retry policy for stage {stage}: max_retries {value} exceeds limit of {max}")]
+    InvalidRetryPolicy {
+        /// Stage name.
+        stage: String,
+        /// The invalid value.
+        value: u32,
+        /// Maximum allowed value.
+        max: u32,
     },
 }
 
@@ -382,7 +396,7 @@ impl RoutingProfile {
             });
         }
 
-        // Validate timeout values for all stages
+        // Validate timeout values and retry policies for all stages
         for (stage_name, config) in &self.stages {
             if config.timeout_ms < MIN_TIMEOUT_MS || config.timeout_ms > MAX_TIMEOUT_MS {
                 return Err(ProfileError::InvalidTimeout {
@@ -390,6 +404,15 @@ impl RoutingProfile {
                     value: config.timeout_ms,
                     min: MIN_TIMEOUT_MS,
                     max: MAX_TIMEOUT_MS,
+                });
+            }
+
+            // Validate max_retries does not exceed schema limit
+            if config.retry_policy.max_retries > MAX_ALLOWED_RETRIES {
+                return Err(ProfileError::InvalidRetryPolicy {
+                    stage: stage_name.clone(),
+                    value: config.retry_policy.max_retries,
+                    max: MAX_ALLOWED_RETRIES,
                 });
             }
 
@@ -437,14 +460,64 @@ fn is_valid_profile_id(id: &str) -> bool {
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
-/// Validates that a path doesn't contain traversal characters.
+/// Validates that a path doesn't contain directory traversal attempts.
+///
+/// This function uses `std::path::Component` analysis to robustly detect
+/// path traversal attempts. It rejects:
+/// - Parent directory components (`..`)
+/// - Null bytes
+///
+/// It allows:
+/// - Absolute paths (needed for internal use with resolved paths)
+/// - Filenames that happen to contain `..` (like `v1..v2.yaml`) because those
+///   are normal filenames, not path traversal attempts.
 fn validate_profile_path(path: &str) -> Result<(), ProfileError> {
-    if path.contains("..") || path.contains('\0') {
+    // Check for null bytes which could be used for truncation attacks
+    if path.contains('\0') {
         return Err(ProfileError::PathTraversalError {
             path: path.to_string(),
-            reason: "path contains invalid characters".to_string(),
+            reason: "path contains null byte".to_string(),
         });
     }
+
+    let path_obj = Path::new(path);
+
+    // Check each component for parent directory traversal
+    for component in path_obj.components() {
+        if component == Component::ParentDir {
+            return Err(ProfileError::PathTraversalError {
+                path: path.to_string(),
+                reason: "parent directory traversal is not allowed".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Validates that a user-provided relative path is safe.
+///
+/// This is stricter than `validate_profile_path` and additionally rejects
+/// absolute paths, ensuring the path stays within the intended directory.
+///
+/// Used for user-controllable input like profile IDs or relative paths.
+/// Currently unused but available for future API endpoints that accept
+/// user-provided paths.
+#[allow(dead_code)]
+fn validate_relative_profile_path(path: &str) -> Result<(), ProfileError> {
+    // First do standard traversal validation
+    validate_profile_path(path)?;
+
+    let path_obj = Path::new(path);
+
+    // Reject absolute paths for user input
+    if path_obj.is_absolute() {
+        return Err(ProfileError::PathTraversalError {
+            path: path.to_string(),
+            reason: "absolute paths are not allowed".to_string(),
+        });
+    }
+
     Ok(())
 }
 
@@ -821,6 +894,165 @@ routing_profile:
         assert!(
             (config.retry_policy.backoff_multiplier - DEFAULT_BACKOFF_MULTIPLIER).abs()
                 < f64::EPSILON
+        );
+    }
+
+    /// UT-118-SEC-01: Test robust path validation accepts valid paths.
+    #[test]
+    fn test_path_validation_valid_paths() {
+        // Simple filename
+        assert!(validate_profile_path("local.yaml").is_ok());
+
+        // Filename with double dots (not traversal)
+        assert!(validate_profile_path("v1..v2.yaml").is_ok());
+
+        // Subdirectory path
+        assert!(validate_profile_path("profiles/test.yaml").is_ok());
+
+        // Deep nested path
+        assert!(validate_profile_path("a/b/c/profile.yaml").is_ok());
+
+        // Current directory prefix (allowed)
+        assert!(validate_profile_path("./local.yaml").is_ok());
+    }
+
+    /// UT-118-SEC-02: Test robust path validation rejects traversal attempts.
+    #[test]
+    fn test_path_validation_rejects_traversal() {
+        // Simple parent traversal
+        let result = validate_profile_path("../evil.yaml");
+        assert!(matches!(
+            result,
+            Err(ProfileError::PathTraversalError { .. })
+        ));
+
+        // Deep traversal attempt
+        let result = validate_profile_path("profiles/../../../etc/passwd");
+        assert!(matches!(
+            result,
+            Err(ProfileError::PathTraversalError { .. })
+        ));
+
+        // Traversal in the middle
+        let result = validate_profile_path("profiles/../secret.yaml");
+        assert!(matches!(
+            result,
+            Err(ProfileError::PathTraversalError { .. })
+        ));
+    }
+
+    /// UT-118-SEC-03: Test relative path validation rejects absolute paths.
+    #[test]
+    fn test_relative_path_validation_rejects_absolute_paths() {
+        // Unix absolute path
+        let result = validate_relative_profile_path("/etc/passwd");
+        assert!(matches!(
+            result,
+            Err(ProfileError::PathTraversalError { .. })
+        ));
+
+        // Root path
+        let result = validate_relative_profile_path("/");
+        assert!(matches!(
+            result,
+            Err(ProfileError::PathTraversalError { .. })
+        ));
+    }
+
+    /// UT-118-SEC-03b: Test that `load_profile` accepts absolute paths (for
+    /// internal use).
+    #[test]
+    fn test_load_profile_accepts_absolute_paths() {
+        // validate_profile_path should allow absolute paths
+        assert!(validate_profile_path("/tmp/test.yaml").is_ok());
+        assert!(validate_profile_path("/home/user/profiles/test.yaml").is_ok());
+    }
+
+    /// UT-118-SEC-04: Test path validation rejects null bytes.
+    #[test]
+    fn test_path_validation_rejects_null_bytes() {
+        let result = validate_profile_path("profile\0.yaml");
+        assert!(matches!(
+            result,
+            Err(ProfileError::PathTraversalError { .. })
+        ));
+    }
+
+    /// UT-118-SEC-05: Test invalid retry policy exceeding `max_retries` limit.
+    #[test]
+    fn test_invalid_retry_policy() {
+        let temp_dir = TempDir::new().unwrap();
+        let content = r"
+routing_profile:
+  profile_id: retry-excessive
+  description: Profile with excessive retries.
+  stages:
+    test_stage:
+      provider: anthropic
+      model: claude-3-5-sonnet
+      timeout_ms: 60000
+      retry_policy:
+        max_retries: 15
+";
+        let path = create_test_profile(temp_dir.path(), content);
+        let result = load_profile(&path);
+
+        assert!(
+            matches!(
+                result,
+                Err(ProfileError::InvalidRetryPolicy {
+                    value: 15,
+                    max: 10,
+                    ..
+                })
+            ),
+            "Expected InvalidRetryPolicy error with value 15 and max 10, got: {result:?}"
+        );
+    }
+
+    /// UT-118-SEC-06: Test `max_retries` at boundary (10 is valid, 11 is not).
+    #[test]
+    fn test_retry_policy_boundary() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // max_retries = 10 should be valid
+        let content_valid = r"
+routing_profile:
+  profile_id: retry-boundary-valid
+  description: Profile with max retries at limit.
+  stages:
+    test_stage:
+      provider: anthropic
+      model: claude-3-5-sonnet
+      timeout_ms: 60000
+      retry_policy:
+        max_retries: 10
+";
+        let path = create_test_profile(temp_dir.path(), content_valid);
+        assert!(
+            load_profile(&path).is_ok(),
+            "max_retries=10 should be valid"
+        );
+
+        // max_retries = 11 should be invalid
+        let content_invalid = r"
+routing_profile:
+  profile_id: retry-boundary-invalid
+  description: Profile with max retries exceeding limit.
+  stages:
+    test_stage:
+      provider: anthropic
+      model: claude-3-5-sonnet
+      timeout_ms: 60000
+      retry_policy:
+        max_retries: 11
+";
+        let path = temp_dir.path().join("test2.yaml");
+        std::fs::write(&path, content_invalid).unwrap();
+        let result = load_profile(&path);
+        assert!(
+            matches!(result, Err(ProfileError::InvalidRetryPolicy { .. })),
+            "max_retries=11 should be invalid"
         );
     }
 }
