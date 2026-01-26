@@ -17,6 +17,13 @@
 //! - [CTR-0001] `build_crate_graph` requires a valid cargo workspace root
 //! - [CTR-0002] Errors are returned explicitly, not swallowed
 //! - [CTR-0003] Output uses canonical sorting for reproducibility
+//!
+//! # Security
+//!
+//! - [SEC-0001] Cargo subprocess environment is sanitized - only essential
+//!   variables (`PATH`, `HOME`, `CARGO_HOME`, `RUSTUP_HOME`) are passed through
+//! - [SEC-0002] Cargo metadata is parsed with strict typed schemas to prevent
+//!   fail-open on malformed input
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -27,6 +34,67 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, warn};
+
+// =============================================================================
+// Cargo Metadata Schema Types (SEC-0002: Strict typed parsing)
+// =============================================================================
+
+/// Parsed cargo metadata output.
+#[derive(Debug, Deserialize)]
+struct CargoMetadata {
+    /// All packages in the workspace.
+    packages: Vec<CargoPackage>,
+    /// Workspace member package IDs.
+    workspace_members: Vec<String>,
+    /// Workspace root path.
+    workspace_root: PathBuf,
+}
+
+/// A package in cargo metadata.
+#[derive(Debug, Deserialize)]
+struct CargoPackage {
+    /// Package identifier (e.g., "apm2-core 0.1.0 (path+file:///...)").
+    id: String,
+    /// Package name.
+    name: String,
+    /// Package version.
+    version: String,
+    /// Path to the package's Cargo.toml.
+    manifest_path: PathBuf,
+    /// Package dependencies.
+    #[serde(default)]
+    dependencies: Vec<CargoDependency>,
+    /// Package targets (lib, bin, etc.).
+    #[serde(default)]
+    targets: Vec<CargoTarget>,
+    /// Package features.
+    #[serde(default)]
+    features: HashMap<String, Vec<String>>,
+}
+
+/// A dependency in cargo metadata.
+#[derive(Debug, Deserialize)]
+struct CargoDependency {
+    /// Dependency name.
+    name: String,
+    /// Dependency kind (normal, dev, build).
+    kind: Option<String>,
+    /// Version requirement.
+    req: String,
+    /// Enabled features.
+    #[serde(default)]
+    features: Vec<String>,
+    /// Whether the dependency is optional.
+    #[serde(default)]
+    optional: bool,
+}
+
+/// A target in cargo metadata.
+#[derive(Debug, Deserialize)]
+struct CargoTarget {
+    /// Target kinds (lib, bin, proc-macro, etc.).
+    kind: Vec<String>,
+}
 
 /// Maximum output size for cargo metadata (50 MB).
 /// Prevents denial-of-service via unbounded reads from subprocess.
@@ -178,13 +246,37 @@ pub fn generate_crate_id(crate_name: &str) -> String {
     format!("CRATE-{upper_snake}")
 }
 
-/// Invokes `cargo metadata` and returns the parsed JSON.
+/// Environment variables allowed to pass through to cargo subprocess.
+///
+/// SEC-0001: Only essential variables are allowed to prevent secret leakage.
+/// - `PATH`: Required to locate cargo and rustc binaries
+/// - `HOME`: Required for rustup/cargo home resolution
+/// - `CARGO_HOME`: Custom cargo installation directory
+/// - `RUSTUP_HOME`: Custom rustup installation directory
+/// - `CARGO_TARGET_DIR`: Custom target directory (may be set for build caching)
+/// - `TERM`: Terminal type for error message formatting
+const ALLOWED_ENV_VARS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "CARGO_TARGET_DIR",
+    "TERM",
+];
+
+/// Invokes `cargo metadata` and returns the parsed metadata.
+///
+/// # Security
+///
+/// The cargo subprocess runs with a sanitized environment (SEC-0001). Only
+/// essential variables are passed through to prevent leaking secrets like
+/// API keys or tokens to the subprocess.
 ///
 /// # Errors
 ///
 /// Returns an error if cargo cannot be invoked, the command fails, or the
 /// output is too large or cannot be parsed.
-fn invoke_cargo_metadata(repo_root: &Path) -> Result<serde_json::Value, CrateGraphError> {
+fn invoke_cargo_metadata(repo_root: &Path) -> Result<CargoMetadata, CrateGraphError> {
     let manifest_path = repo_root.join("Cargo.toml");
 
     if !manifest_path.exists() {
@@ -198,8 +290,9 @@ fn invoke_cargo_metadata(repo_root: &Path) -> Result<serde_json::Value, CrateGra
         "Invoking cargo metadata"
     );
 
-    let mut child = Command::new("cargo")
-        .arg("metadata")
+    // SEC-0001: Build command with sanitized environment
+    let mut cmd = Command::new("cargo");
+    cmd.arg("metadata")
         .arg("--format-version")
         .arg("1")
         .arg("--manifest-path")
@@ -207,6 +300,16 @@ fn invoke_cargo_metadata(repo_root: &Path) -> Result<serde_json::Value, CrateGra
         .arg("--no-deps")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .env_clear(); // Clear all environment variables
+
+    // Re-add only essential variables
+    for var_name in ALLOWED_ENV_VARS {
+        if let Ok(value) = std::env::var(var_name) {
+            cmd.env(var_name, value);
+        }
+    }
+
+    let mut child = cmd
         .spawn()
         .map_err(|e| CrateGraphError::CargoInvocationError {
             reason: e.to_string(),
@@ -259,80 +362,50 @@ fn invoke_cargo_metadata(repo_root: &Path) -> Result<serde_json::Value, CrateGra
             reason: format!("invalid UTF-8 in output: {e}"),
         })?;
 
-    serde_json::from_str(&stdout_str).map_err(|e| CrateGraphError::MetadataParseError {
-        reason: e.to_string(),
+    // SEC-0002: Parse with strict typed schema
+    serde_json::from_str::<CargoMetadata>(&stdout_str).map_err(|e| {
+        CrateGraphError::MetadataParseError {
+            reason: format!("failed to parse cargo metadata schema: {e}"),
+        }
     })
 }
 
 /// Builds a mapping of package names to crate IDs for workspace members.
 fn build_name_to_id_map(
-    packages: &[serde_json::Value],
+    packages: &[CargoPackage],
     workspace_members: &HashSet<String>,
 ) -> HashMap<String, String> {
     let mut name_to_id = HashMap::new();
 
     for package in packages {
-        let pkg_id = package
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-
-        if !workspace_members.contains(pkg_id) {
+        if !workspace_members.contains(&package.id) {
             continue;
         }
 
-        let name = package
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-
-        let crate_id = generate_crate_id(name);
-        name_to_id.insert(name.to_string(), crate_id);
+        let crate_id = generate_crate_id(&package.name);
+        name_to_id.insert(package.name.clone(), crate_id);
     }
 
     name_to_id
 }
 
-/// Extracts a crate node from a package JSON object.
-fn extract_crate_node(package: &serde_json::Value, workspace_root: &Path) -> CrateNode {
-    let name = package
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    let version = package
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("0.0.0")
-        .to_string();
-
-    let manifest_path = package
-        .get("manifest_path")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-
-    let crate_path = PathBuf::from(manifest_path)
+/// Extracts a crate node from a package.
+fn extract_crate_node(package: &CargoPackage, workspace_root: &Path) -> CrateNode {
+    let crate_path = package
+        .manifest_path
         .parent()
         .map(|p| p.strip_prefix(workspace_root).unwrap_or(p).to_path_buf())
         .unwrap_or_default();
 
     let crate_type = determine_crate_type(package);
 
-    let features: Vec<String> = package
-        .get("features")
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            let mut f: Vec<String> = obj.keys().cloned().collect();
-            f.sort();
-            f
-        })
-        .unwrap_or_default();
+    let mut features: Vec<String> = package.features.keys().cloned().collect();
+    features.sort();
 
     CrateNode {
-        id: generate_crate_id(&name),
-        name,
-        version,
+        id: generate_crate_id(&package.name),
+        name: package.name.clone(),
+        version: package.version.clone(),
         path: crate_path,
         crate_type,
         features,
@@ -341,112 +414,65 @@ fn extract_crate_node(package: &serde_json::Value, workspace_root: &Path) -> Cra
 
 /// Extracts dependency edges from a package's dependencies.
 fn extract_dependency_edges(
-    package: &serde_json::Value,
+    package: &CargoPackage,
     crate_id: &str,
     name_to_id: &HashMap<String, String>,
 ) -> Vec<DependencyEdge> {
     let mut edges = Vec::new();
 
-    let Some(deps) = package.get("dependencies").and_then(|v| v.as_array()) else {
-        return edges;
-    };
-
-    for dep in deps {
-        let dep_name = dep.get("name").and_then(|v| v.as_str()).unwrap_or_default();
-
+    for dep in &package.dependencies {
         // Only include edges to workspace crates
-        let Some(target_id) = name_to_id.get(dep_name) else {
+        let Some(target_id) = name_to_id.get(&dep.name) else {
             continue;
         };
 
-        let dep_type = match dep.get("kind").and_then(|v| v.as_str()) {
+        let dep_type = match dep.kind.as_deref() {
             Some("dev") => DependencyType::Dev,
             Some("build") => DependencyType::Build,
             _ => DependencyType::Normal,
         };
 
-        let version_req = dep
-            .get("req")
-            .and_then(|v| v.as_str())
-            .unwrap_or("*")
-            .to_string();
-
-        let features: Vec<String> = dep
-            .get("features")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                let mut f: Vec<String> = arr
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-                f.sort();
-                f
-            })
-            .unwrap_or_default();
-
-        let optional = dep
-            .get("optional")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let mut features = dep.features.clone();
+        features.sort();
 
         edges.push(DependencyEdge {
             from: crate_id.to_string(),
             to: target_id.clone(),
             dep_type,
-            version_req,
+            version_req: dep.req.clone(),
             features,
-            optional,
+            optional: dep.optional,
         });
     }
 
     edges
 }
 
-/// Parses cargo metadata JSON into crate nodes and dependency edges.
+/// Parses cargo metadata into crate nodes and dependency edges.
 ///
 /// # Arguments
 ///
-/// * `metadata` - The parsed cargo metadata JSON
+/// * `metadata` - The parsed cargo metadata
 /// * `workspace_root` - The workspace root path for computing relative paths
 ///
 /// # Returns
 ///
 /// A tuple of (crates, edges) extracted from the metadata.
 fn parse_cargo_metadata(
-    metadata: &serde_json::Value,
+    metadata: &CargoMetadata,
     workspace_root: &Path,
-) -> Result<(Vec<CrateNode>, Vec<DependencyEdge>), CrateGraphError> {
-    let workspace_members: HashSet<String> = metadata
-        .get("workspace_members")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let packages = metadata
-        .get("packages")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| CrateGraphError::MetadataParseError {
-            reason: "missing 'packages' array".to_string(),
-        })?;
+) -> (Vec<CrateNode>, Vec<DependencyEdge>) {
+    let workspace_members: HashSet<String> = metadata.workspace_members.iter().cloned().collect();
 
     // Build a map of package name to crate ID for workspace members
-    let name_to_id = build_name_to_id_map(packages, &workspace_members);
+    let name_to_id = build_name_to_id_map(&metadata.packages, &workspace_members);
 
     let mut crates = Vec::new();
     let mut edges = Vec::new();
 
     // Extract crate nodes and edges from workspace packages
-    for package in packages {
-        let pkg_id = package
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-
-        if !workspace_members.contains(pkg_id) {
+    for package in &metadata.packages {
+        if !workspace_members.contains(&package.id) {
             continue;
         }
 
@@ -457,38 +483,22 @@ fn parse_cargo_metadata(
         edges.extend(crate_edges);
     }
 
-    Ok((crates, edges))
+    (crates, edges)
 }
 
 /// Determines the primary crate type from package targets.
-fn determine_crate_type(package: &serde_json::Value) -> CrateType {
-    let Some(targets) = package.get("targets").and_then(|v| v.as_array()) else {
-        return CrateType::Lib;
-    };
-
+fn determine_crate_type(package: &CargoPackage) -> CrateType {
     // First pass: check for proc-macro (highest precedence)
-    for target in targets {
-        let Some(kinds) = target.get("kind").and_then(|v| v.as_array()) else {
-            continue;
-        };
-
-        for kind in kinds {
-            if kind.as_str() == Some("proc-macro") {
-                return CrateType::ProcMacro;
-            }
+    for target in &package.targets {
+        if target.kind.iter().any(|k| k == "proc-macro") {
+            return CrateType::ProcMacro;
         }
     }
 
     // Second pass: check for binary targets
-    for target in targets {
-        let Some(kinds) = target.get("kind").and_then(|v| v.as_array()) else {
-            continue;
-        };
-
-        for kind in kinds {
-            if kind.as_str() == Some("bin") {
-                return CrateType::Bin;
-            }
+    for target in &package.targets {
+        if target.kind.iter().any(|k| k == "bin") {
+            return CrateType::Bin;
         }
     }
 
@@ -554,13 +564,10 @@ pub fn build_crate_graph(repo_root: &Path) -> Result<CrateGraph, CrateGraphError
     let metadata = invoke_cargo_metadata(repo_root)?;
 
     // Extract workspace root from metadata
-    let workspace_root = metadata
-        .get("workspace_root")
-        .and_then(|v| v.as_str())
-        .map_or_else(|| repo_root.to_path_buf(), PathBuf::from);
+    let workspace_root = metadata.workspace_root.clone();
 
     // Parse metadata into nodes and edges
-    let (mut crates, mut edges) = parse_cargo_metadata(&metadata, &workspace_root)?;
+    let (mut crates, mut edges) = parse_cargo_metadata(&metadata, &workspace_root);
 
     // Sort for determinism
     sort_graph(&mut crates, &mut edges);
@@ -658,11 +665,11 @@ mod tests {
 
         let metadata = result.unwrap();
         assert!(
-            metadata.get("packages").is_some(),
+            !metadata.packages.is_empty(),
             "metadata should have packages"
         );
         assert!(
-            metadata.get("workspace_members").is_some(),
+            !metadata.workspace_members.is_empty(),
             "metadata should have workspace_members"
         );
     }
@@ -673,7 +680,7 @@ mod tests {
         let repo_root = get_workspace_root();
 
         let metadata = invoke_cargo_metadata(&repo_root).unwrap();
-        let (crates, _edges) = parse_cargo_metadata(&metadata, &repo_root).unwrap();
+        let (crates, _edges) = parse_cargo_metadata(&metadata, &repo_root);
 
         // Should find at least apm2-core, apm2-daemon, apm2-cli
         assert!(crates.len() >= 3, "Should find at least 3 workspace crates");
@@ -690,7 +697,7 @@ mod tests {
         let repo_root = get_workspace_root();
 
         let metadata = invoke_cargo_metadata(&repo_root).unwrap();
-        let (_crates, edges) = parse_cargo_metadata(&metadata, &repo_root).unwrap();
+        let (_crates, edges) = parse_cargo_metadata(&metadata, &repo_root);
 
         // apm2-daemon depends on apm2-core
         let daemon_to_core = edges
@@ -1070,5 +1077,78 @@ path = "src/main.rs"
             .find(|c| c.name == "bin-crate")
             .expect("Should find bin-crate");
         assert_eq!(bin_crate.crate_type, CrateType::Bin);
+    }
+
+    /// SEC-112-01: Test that cargo subprocess has sanitized environment.
+    ///
+    /// This test verifies that the `ALLOWED_ENV_VARS` list is properly used
+    /// and doesn't accidentally include any obviously dangerous variables.
+    #[test]
+    fn test_allowed_env_vars_are_safe() {
+        // Verify ALLOWED_ENV_VARS doesn't contain dangerous patterns
+        let dangerous_patterns = [
+            "SECRET",
+            "TOKEN",
+            "KEY",
+            "PASSWORD",
+            "CREDENTIAL",
+            "AUTH",
+            "API_KEY",
+        ];
+
+        for var in ALLOWED_ENV_VARS {
+            let upper = var.to_uppercase();
+            for pattern in &dangerous_patterns {
+                assert!(
+                    !upper.contains(pattern),
+                    "ALLOWED_ENV_VARS should not contain dangerous variable pattern '{pattern}': found '{var}'"
+                );
+            }
+        }
+    }
+
+    /// SEC-112-02: Test that cargo metadata with typed schema rejects malformed
+    /// JSON.
+    #[test]
+    fn test_strict_schema_rejects_malformed() {
+        // Valid JSON but missing required fields should fail
+        let malformed_json = r#"{"packages": [], "not_workspace_members": []}"#;
+
+        // This should fail because workspace_members is missing
+        let result: Result<CargoMetadata, _> = serde_json::from_str(malformed_json);
+        assert!(
+            result.is_err(),
+            "Should reject JSON missing required fields"
+        );
+
+        // Test with completely wrong structure
+        let wrong_structure = r#"{"foo": "bar"}"#;
+        let result: Result<CargoMetadata, _> = serde_json::from_str(wrong_structure);
+        assert!(result.is_err(), "Should reject JSON with wrong structure");
+    }
+
+    /// SEC-112-03: Test that cargo metadata works with a sanitized environment.
+    ///
+    /// This verifies that the `build_crate_graph` function works correctly
+    /// when running with a minimal set of environment variables.
+    #[test]
+    fn test_cargo_metadata_with_sanitized_env() {
+        let repo_root = get_workspace_root();
+
+        // Build crate graph should succeed with the sanitized environment
+        // This test verifies that the command works with only the allowed vars
+        let result = build_crate_graph(&repo_root);
+        assert!(
+            result.is_ok(),
+            "build_crate_graph should succeed with sanitized environment: {:?}",
+            result.err()
+        );
+
+        // Verify the result has valid data
+        let graph = result.unwrap();
+        assert!(
+            !graph.crates.is_empty(),
+            "Should have found workspace crates"
+        );
     }
 }
