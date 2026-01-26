@@ -9,6 +9,7 @@
 //! - Uses constant-time comparison to prevent timing attacks (CTR-WH001)
 //! - The secret is wrapped in `SecretString` to prevent accidental logging
 //! - Signature comparison uses the `subtle` crate for constant-time equality
+//! - Hex decoding uses the well-tested `hex` crate
 
 use hmac::{Hmac, Mac};
 use secrecy::{ExposeSecret, SecretString};
@@ -65,8 +66,8 @@ impl SignatureValidator {
             .strip_prefix("sha256=")
             .ok_or_else(|| WebhookError::InvalidSignatureFormat("missing sha256= prefix".into()))?;
 
-        // Decode the hex signature
-        let expected_signature = hex_decode(signature_hex)
+        // Decode the hex signature using the well-tested hex crate
+        let expected_signature = hex::decode(signature_hex)
             .map_err(|e| WebhookError::InvalidSignatureFormat(format!("invalid hex: {e}")))?;
 
         // Compute the HMAC-SHA256
@@ -90,51 +91,6 @@ impl SignatureValidator {
 
         mac.update(payload);
         mac.finalize().into_bytes().to_vec()
-    }
-}
-
-/// Decodes a hex string into bytes.
-///
-/// Returns an error if the input contains invalid hex characters or has odd
-/// length.
-fn hex_decode(hex: &str) -> Result<Vec<u8>, HexDecodeError> {
-    if hex.len() % 2 != 0 {
-        return Err(HexDecodeError::OddLength);
-    }
-
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    let mut chars = hex.chars();
-
-    while let (Some(hi), Some(lo)) = (chars.next(), chars.next()) {
-        let hi = hex_char_to_nibble(hi)?;
-        let lo = hex_char_to_nibble(lo)?;
-        bytes.push((hi << 4) | lo);
-    }
-
-    Ok(bytes)
-}
-
-const fn hex_char_to_nibble(c: char) -> Result<u8, HexDecodeError> {
-    match c {
-        '0'..='9' => Ok(c as u8 - b'0'),
-        'a'..='f' => Ok(c as u8 - b'a' + 10),
-        'A'..='F' => Ok(c as u8 - b'A' + 10),
-        _ => Err(HexDecodeError::InvalidChar(c)),
-    }
-}
-
-#[derive(Debug)]
-enum HexDecodeError {
-    OddLength,
-    InvalidChar(char),
-}
-
-impl std::fmt::Display for HexDecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OddLength => write!(f, "odd number of hex characters"),
-            Self::InvalidChar(c) => write!(f, "invalid hex character: '{c}'"),
-        }
     }
 }
 
@@ -246,19 +202,19 @@ mod tests {
 
     #[test]
     fn test_hex_decode_valid() {
-        let result = hex_decode("48656c6c6f").unwrap();
+        let result = hex::decode("48656c6c6f").unwrap();
         assert_eq!(result, b"Hello");
     }
 
     #[test]
     fn test_hex_decode_uppercase() {
-        let result = hex_decode("48656C6C6F").unwrap();
+        let result = hex::decode("48656C6C6F").unwrap();
         assert_eq!(result, b"Hello");
     }
 
     #[test]
     fn test_hex_decode_empty() {
-        let result = hex_decode("").unwrap();
+        let result = hex::decode("").unwrap();
         assert!(result.is_empty());
     }
 }

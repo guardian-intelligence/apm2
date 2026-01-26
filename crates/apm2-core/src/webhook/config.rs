@@ -224,6 +224,7 @@ mod tests {
         let rate_config = RateLimitConfig {
             max_requests: 100,
             window_secs: 120,
+            ..Default::default()
         };
 
         let config = WebhookConfig::builder()

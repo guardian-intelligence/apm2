@@ -13,13 +13,22 @@
 //! The rate limiter is thread-safe using `RwLock` for the internal state.
 //! This is required because axum handlers may run concurrently.
 //!
+//! # Memory Management
+//!
+//! To prevent unbounded memory growth from attackers spoofing IP addresses,
+//! the rate limiter calls `cleanup()` probabilistically on every Nth request
+//! (default: every 100 requests). This removes entries for IPs that have no
+//! recent requests within the time window.
+//!
 //! # Invariant
 //!
 //! - [INV-WH002] Rate limiter state is thread-safe.
+//! - [INV-WH003] Cleanup is called periodically to bound memory usage.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use super::error::WebhookError;
@@ -32,6 +41,13 @@ pub struct RateLimitConfig {
 
     /// Size of the sliding window in seconds.
     pub window_secs: u64,
+
+    /// How often to run cleanup (every N requests).
+    ///
+    /// A lower value means more frequent cleanup but slightly higher overhead.
+    /// A higher value means less frequent cleanup but more potential memory
+    /// usage. Default: 100 requests.
+    pub cleanup_interval: u64,
 }
 
 impl Default for RateLimitConfig {
@@ -40,6 +56,8 @@ impl Default for RateLimitConfig {
             // Allow 60 requests per minute by default (reasonable for CI webhooks)
             max_requests: 60,
             window_secs: 60,
+            // Run cleanup every 100 requests to bound memory growth
+            cleanup_interval: 100,
         }
     }
 }
@@ -48,10 +66,15 @@ impl Default for RateLimitConfig {
 ///
 /// The rate limiter tracks request timestamps per IP address and rejects
 /// requests that exceed the configured limit within the time window.
+///
+/// To prevent unbounded memory growth (denial of service via IP spoofing), the
+/// limiter calls `cleanup()` probabilistically based on `cleanup_interval`.
 pub struct RateLimiter {
     config: RateLimitConfig,
     // Maps IP addresses to a list of request timestamps
     state: RwLock<HashMap<IpAddr, Vec<Instant>>>,
+    // Counter for probabilistic cleanup (INV-WH003)
+    request_count: AtomicU64,
 }
 
 impl RateLimiter {
@@ -61,6 +84,7 @@ impl RateLimiter {
         Self {
             config,
             state: RwLock::new(HashMap::new()),
+            request_count: AtomicU64::new(0),
         }
     }
 
@@ -68,6 +92,10 @@ impl RateLimiter {
     ///
     /// If allowed, records the request and returns `Ok(())`.
     /// If rate limited, returns `Err(WebhookError::RateLimitExceeded)`.
+    ///
+    /// This method also calls `cleanup()` probabilistically (every N requests,
+    /// configured by `cleanup_interval`) to prevent unbounded memory growth
+    /// from IP address spoofing attacks (INV-WH003).
     ///
     /// # Arguments
     ///
@@ -81,6 +109,19 @@ impl RateLimiter {
         let now = Instant::now();
         let window_duration = std::time::Duration::from_secs(self.config.window_secs);
         let cutoff = now.checked_sub(window_duration).unwrap_or(now);
+
+        // Probabilistic cleanup to bound memory growth (INV-WH003)
+        // We use fetch_add with Relaxed ordering because:
+        // 1. We don't need synchronization with other memory operations
+        // 2. The occasional missed or duplicate cleanup is acceptable
+        let count = self.request_count.fetch_add(1, Ordering::Relaxed);
+        if count > 0 && count % self.config.cleanup_interval == 0 {
+            tracing::debug!(
+                request_count = count,
+                "running periodic rate limiter cleanup"
+            );
+            self.cleanup();
+        }
 
         // First, try to read and check without write lock
         {
@@ -185,6 +226,7 @@ mod tests {
         let config = RateLimitConfig {
             max_requests: 5,
             window_secs: 60,
+            ..Default::default()
         };
         let limiter = RateLimiter::new(config);
         let ip = test_ip();
@@ -200,6 +242,7 @@ mod tests {
         let config = RateLimitConfig {
             max_requests: 3,
             window_secs: 60,
+            ..Default::default()
         };
         let limiter = RateLimiter::new(config);
         let ip = test_ip();
@@ -219,6 +262,7 @@ mod tests {
         let config = RateLimitConfig {
             max_requests: 2,
             window_secs: 60,
+            ..Default::default()
         };
         let limiter = RateLimiter::new(config);
         let ip1 = test_ip();
@@ -247,6 +291,7 @@ mod tests {
             max_requests: 2,
             // Use a very short window for testing
             window_secs: 1,
+            ..Default::default()
         };
         let limiter = RateLimiter::new(config);
         let ip = test_ip();
@@ -271,6 +316,7 @@ mod tests {
         let config = RateLimitConfig {
             max_requests: 10,
             window_secs: 1,
+            ..Default::default()
         };
         let limiter = RateLimiter::new(config);
 
@@ -295,6 +341,7 @@ mod tests {
         let config = RateLimitConfig::default();
         assert_eq!(config.max_requests, 60);
         assert_eq!(config.window_secs, 60);
+        assert_eq!(config.cleanup_interval, 100);
     }
 
     #[test]
@@ -304,6 +351,7 @@ mod tests {
         let config = RateLimitConfig {
             max_requests: 100,
             window_secs: 60,
+            ..Default::default()
         };
         let limiter = Arc::new(RateLimiter::new(config));
         let ip = test_ip();
@@ -329,5 +377,73 @@ mod tests {
             limiter.check(ip),
             Err(WebhookError::RateLimitExceeded)
         ));
+    }
+
+    /// Test that cleanup is called probabilistically to prevent memory
+    /// exhaustion.
+    ///
+    /// This test verifies INV-WH003: cleanup is called periodically to bound
+    /// memory usage. It simulates an attacker sending requests from many
+    /// unique IP addresses and verifies that old entries are cleaned up
+    /// after the window expires.
+    #[test]
+    fn test_probabilistic_cleanup_bounds_memory() {
+        let config = RateLimitConfig {
+            max_requests: 100,
+            // Short window so entries expire quickly
+            window_secs: 1,
+            // Cleanup every 10 requests for faster testing
+            cleanup_interval: 10,
+        };
+        let limiter = RateLimiter::new(config);
+
+        // Simulate requests from 50 unique IPs (simulating IP spoofing attack)
+        for i in 0..50 {
+            let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, i));
+            limiter.check(ip).unwrap();
+        }
+
+        // Should have 50 tracked IPs
+        assert_eq!(limiter.tracked_ips(), 50);
+
+        // Wait for window to expire
+        thread::sleep(Duration::from_millis(1100));
+
+        // Send more requests to trigger cleanup (at request 60, 70, etc.)
+        // Since we're at request 50, the next cleanup will be at request 60
+        for i in 50..65 {
+            let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, i));
+            limiter.check(ip).unwrap();
+        }
+
+        // After cleanup, old expired entries should be removed.
+        // We added 15 new IPs (50..65), and cleanup should have removed
+        // the 50 expired entries. We should have around 15 IPs tracked.
+        let tracked = limiter.tracked_ips();
+        assert!(
+            tracked <= 20,
+            "Expected cleanup to remove expired entries, but got {tracked} tracked IPs"
+        );
+    }
+
+    /// Test that request counter increments correctly and triggers cleanup.
+    #[test]
+    fn test_request_counter_increments() {
+        let config = RateLimitConfig {
+            max_requests: 100,
+            window_secs: 60,
+            cleanup_interval: 5,
+        };
+        let limiter = RateLimiter::new(config);
+        let ip = test_ip();
+
+        // Make 6 requests
+        for _ in 0..6 {
+            limiter.check(ip).unwrap();
+        }
+
+        // Verify counter has incremented (cleanup should have run at request 5)
+        let count = limiter.request_count.load(Ordering::Relaxed);
+        assert_eq!(count, 6);
     }
 }

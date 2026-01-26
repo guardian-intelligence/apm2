@@ -49,6 +49,7 @@
 //!
 //! - [INV-WH001] Feature flag state is immutable after handler construction.
 //! - [INV-WH002] Rate limiter state is thread-safe.
+//! - [INV-WH003] Cleanup is called periodically to bound memory usage.
 
 mod config;
 mod error;

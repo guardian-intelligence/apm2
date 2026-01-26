@@ -135,6 +135,7 @@ mod rate_limit_tests {
         let config = RateLimitConfig {
             max_requests: 10,
             window_secs: 60,
+            ..Default::default()
         };
         let limiter = RateLimiter::new(config);
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
@@ -157,6 +158,7 @@ mod rate_limit_tests {
         let config = RateLimitConfig {
             max_requests: 2,
             window_secs: 60,
+            ..Default::default()
         };
         let limiter = RateLimiter::new(config);
 
@@ -301,6 +303,7 @@ mod proptest_tests {
             let config = RateLimitConfig {
                 max_requests: 100,
                 window_secs: 60,
+                ..Default::default()
             };
             let limiter = RateLimiter::new(config);
             let ip = IpAddr::V4(Ipv4Addr::new(a, b, c, d));

@@ -2,13 +2,18 @@
 //!
 //! This module implements the HTTP handler for the webhook endpoint.
 //! It validates signatures, parses payloads, and applies rate limiting.
+//!
+//! # Request Body Limit
+//!
+//! The router enforces a 100KB request body limit to prevent memory exhaustion
+//! from oversized payloads. This is configured via `DefaultBodyLimit` layer.
 
 use std::net::IpAddr;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 
@@ -26,6 +31,13 @@ const EVENT_HEADER: &str = "x-github-event";
 
 /// Header name for the GitHub delivery ID.
 const DELIVERY_HEADER: &str = "x-github-delivery";
+
+/// Maximum request body size in bytes (100KB).
+///
+/// This limit prevents memory exhaustion from oversized payloads.
+/// GitHub webhook payloads are typically small (a few KB), so 100KB
+/// provides ample headroom while limiting attack surface.
+const MAX_BODY_SIZE: usize = 100 * 1024;
 
 /// Shared state for the webhook handler.
 struct WebhookState {
@@ -65,6 +77,13 @@ impl WebhookHandler {
     /// The router handles `POST /webhooks/github` and expects to receive
     /// `ConnectInfo<SocketAddr>` for rate limiting by IP.
     ///
+    /// # Security Features
+    ///
+    /// - **Body Size Limit**: Enforces a 100KB limit via `DefaultBodyLimit` to
+    ///   prevent memory exhaustion from oversized payloads.
+    /// - **Rate Limiting**: Applied per source IP before signature validation.
+    /// - **Signature Validation**: HMAC-SHA256 with constant-time comparison.
+    ///
     /// # Example
     ///
     /// ```rust,no_run
@@ -90,6 +109,7 @@ impl WebhookHandler {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/webhooks/github", post(webhook_handler))
+            .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
             .with_state(Arc::clone(&self.state))
     }
 

@@ -188,6 +188,41 @@ Signature comparison uses the `subtle` crate's `ConstantTimeEq` trait to prevent
 
 Rate limiting is applied BEFORE signature validation (CTR-WH003) to prevent attackers from using the endpoint for DoS attacks or signature oracle attacks.
 
+The rate limiter includes automatic cleanup of stale entries (INV-WH003) to prevent memory exhaustion from IP address spoofing attacks. Cleanup runs probabilistically every N requests (configurable via `cleanup_interval`, default: 100).
+
+### Request Body Limit
+
+The router enforces a 100KB request body limit via `DefaultBodyLimit` to prevent memory exhaustion from oversized payloads. GitHub webhook payloads are typically a few KB, so this limit provides ample headroom.
+
+### Load Balancer / Reverse Proxy Deployment
+
+**IMPORTANT**: The rate limiter uses `ConnectInfo<SocketAddr>` to obtain the client IP address. This has implications for deployment:
+
+#### Direct Exposure (Recommended for Simplicity)
+
+If the webhook handler is exposed directly to the internet (no load balancer/reverse proxy):
+- Rate limiting works correctly using the actual client IP
+- No additional configuration needed
+
+#### Behind a Load Balancer / Reverse Proxy
+
+If deployed behind a load balancer, `ConnectInfo<SocketAddr>` will return the load balancer's IP address, causing:
+1. **Shared rate limiting**: All clients share the same rate limit (the LB's IP), potentially causing legitimate requests to be rejected
+2. **Ineffective rate limiting**: An attacker can exhaust the shared limit, causing DoS for all legitimate clients
+
+**Mitigation Options**:
+
+1. **Configure the load balancer to forward real client IP**: Most load balancers can add the `X-Forwarded-For` header. The application would need to be modified to read this header when running behind a trusted proxy.
+
+2. **Use a dedicated IP allowlist**: If GitHub webhook IPs are known, configure the load balancer to allow only those IPs and disable rate limiting, relying on signature validation alone.
+
+3. **Deploy directly**: Expose the webhook endpoint directly without a reverse proxy, using firewall rules to restrict access to GitHub's IP ranges.
+
+**Current Implementation**: This handler currently uses `ConnectInfo<SocketAddr>` only. If you need `X-Forwarded-For` support, you must:
+- Verify the request comes from a trusted proxy
+- Parse and validate the `X-Forwarded-For` header carefully (it can be spoofed if not from a trusted proxy)
+- Consider using the `axum-client-ip` crate or similar for robust client IP extraction
+
 ### Error Messages
 
 Error responses contain generic messages that do not leak internal details (CTR-WH002). For example, signature failures always return "Invalid signature" regardless of whether the issue was format or verification.
