@@ -65,7 +65,7 @@
           1
         ],
         "inputs": [
-          "vendor_profile_json"
+          "target_profile_json"
         ],
         "outputs": [
           "export_manifest_json"
@@ -90,11 +90,17 @@
     "schemas_supported": [
       "cac.skill_spec.v1",
       "cac.context_pack_spec.v1",
-      "cac.vendor_profile.v1",
-      "cac.capabilities_manifest.v1"
+      "cac.target_profile.v1",
+      "cac.capabilities_manifest.v1",
+      "cac.canonicalizer_vectors.v1",
+      "cac.changeset_report.v1",
+      "cac.run_receipt.v1"
     ],
     "selftest_receipt_hash": "b3-256:f1dc33aab00b3c636cf38946d604201256dde986f1e470bebaaf4473314bb0f4",
     "selftest_receipt_stable_id": "dcp://apm2.local/receipts/aat/apm2_cli@2026-01-26",
+    "target_profiles_supported": [
+      "dcp://apm2.local/targets/claude_code@v1"
+    ],
     "tool_protocol_version": "0.1.0"
   },
   "schema": "cac.capabilities_manifest.v1",

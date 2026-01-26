@@ -16,9 +16,18 @@
   "payload": {
     "budget_name": "production_research_v1",
     "limits": {
-      "time_ms": 900000,
-      "tokens": 500000,
-      "tool_calls": 200
+      "time_ms": {
+        "unit": "ms",
+        "value_i64": 900000
+      },
+      "tokens": {
+        "unit": "tokens",
+        "value_i64": 500000
+      },
+      "tool_calls": {
+        "unit": "count",
+        "value_i64": 200
+      }
     }
   },
   "schema": "cac.budget_profile.v1",

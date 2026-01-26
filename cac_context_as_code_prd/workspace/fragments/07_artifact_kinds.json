@@ -38,9 +38,23 @@
       },
       {
         "consume_allowed": true,
-        "kind_id": "vendor.profile",
+        "kind_id": "target.profile",
         "normative": true,
-        "purpose": "Defines how to compile internal artifacts into vendor ABIs (layouts/templates/tests).",
+        "purpose": "Defines rendering, retrieval, and delivery constraints independent of model intelligence; drives compilation.",
+        "schema_id": "cac.target_profile.v1"
+      },
+      {
+        "consume_allowed": true,
+        "kind_id": "canonicalizer.vectors",
+        "normative": true,
+        "purpose": "Governed canonicalization test vectors pinned in the bootstrap trust root.",
+        "schema_id": "cac.canonicalizer_vectors.v1"
+      },
+      {
+        "consume_allowed": true,
+        "kind_id": "vendor.profile",
+        "normative": false,
+        "purpose": "Derived vendor delivery profile compiled from TargetProfile (compatibility surface, not normative).",
         "schema_id": "cac.vendor_profile.v1"
       },
       {
@@ -73,6 +87,13 @@
       },
       {
         "consume_allowed": true,
+        "kind_id": "changeset.report",
+        "normative": false,
+        "purpose": "Standardized semantic delta report for patch admissions and compaction.",
+        "schema_id": "cac.changeset_report.v1"
+      },
+      {
+        "consume_allowed": true,
         "kind_id": "receipt.admission",
         "normative": false,
         "purpose": "Evidence receipt proving an artifact was admitted (validated, canonicalized, stored, indexed).",
@@ -84,6 +105,13 @@
         "normative": false,
         "purpose": "Evidence receipt proving acceptance/selftests passed with bounded resources.",
         "schema_id": "cac.aat_receipt.v1"
+      },
+      {
+        "consume_allowed": true,
+        "kind_id": "receipt.run",
+        "normative": false,
+        "purpose": "Evidence receipt for consumption runs (pack sufficiency, misses, and budget usage).",
+        "schema_id": "cac.run_receipt.v1"
       },
       {
         "consume_allowed": true,

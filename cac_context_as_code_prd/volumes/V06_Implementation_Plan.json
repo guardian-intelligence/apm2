@@ -25,7 +25,8 @@
             "responsibilities": [
               "Validate artifacts against JSON Schemas (draft 2020-12 minimum).",
               "Enforce validator profile: unknown fields rejected, size/depth bounds.",
-              "Validate PatchRecord streams."
+              "Validate PatchRecord streams.",
+              "Enforce typed-quantity constraints and ContextPack budget ceilings."
             ],
             "type": "rust_library"
           },
@@ -45,7 +46,7 @@
             "responsibilities": [
               "Apply JSON Patch / Merge Patch to canonical JSON trees.",
               "Enforce replay protection via expected_base_hash.",
-              "Emit machine-readable diffs (optional) for review."
+              "Emit ChangeSetReport (semantic delta) for review and compaction."
             ],
             "type": "rust_library"
           },
@@ -55,7 +56,8 @@
             "responsibilities": [
               "Resolve stable_id -> pinned content_hash + schema refs.",
               "Provide deterministic reads for consumption mode via ArtifactFetch.",
-              "Reconstruct index from ledger events."
+              "Reconstruct index from ledger events.",
+              "Provide dependency graph closure for pack compilation."
             ],
             "type": "projection_service_or_library"
           },
@@ -65,7 +67,7 @@
               "apm2 cac fmt",
               "apm2 cac apply-patch",
               "apm2 pack compile",
-              "apm2 export --profile <vendor>",
+              "apm2 export --profile <target>",
               "apm2 capabilities --json",
               "apm2 selftest"
             ],
@@ -79,7 +81,8 @@
             "name": "Context Compiler",
             "responsibilities": [
               "Compile ContextPackSpec into ContextPackManifest + derived artifacts.",
-              "Compile vendor exports per VendorProfile.",
+              "Deep-pin transitive dependencies to produce self-contained packs.",
+              "Compile target payloads per TargetProfile (vendor layouts, model IRs).",
               "Emit receipts and evidence."
             ],
             "type": "service_or_library"
@@ -106,9 +109,12 @@
             "Patch admission pipeline (apply-patch) with replay protection and admission receipts.",
             "DCP stable-ID resolution index (projection).",
             "ArtifactFetch tool protocol extension (or equivalent deterministic read surface).",
-            "ContextPack spec + compiler producing manifest and derived pack artifacts.",
+            "ContextPack spec + compiler producing deep-pinned manifests and derived pack artifacts.",
+            "TargetProfile schema + compiler integration (rendering, retrieval, budgets).",
             "CapabilityManifest generator + selftest receipt pipeline (AAT).",
-            "Vendor export pipeline (at least one profile: Claude Code skills) with export manifest + conformance tests."
+            "Target delivery pipeline (at least one profile: Claude Code skills) with export manifest + conformance tests.",
+            "ChangeSetReport emission for patch admissions.",
+            "RunReceipt emission for consumption runs (pack sufficiency + misses)."
           ]
         },
         "phases": [
@@ -130,7 +136,8 @@
             "deliverables": [
               "CAC-JSON profile + canonicalizer (with vectors)",
               "Schema bootstrap registry + validator",
-              "PatchRecord schema + JSONL tooling"
+              "PatchRecord schema + JSONL tooling",
+              "Typed quantity standard in common schema"
             ],
             "exit_criteria": [
               "Canonicalization idempotence tests pass",
@@ -144,7 +151,8 @@
             "deliverables": [
               "apm2 cac apply-patch end-to-end: validate -> apply -> canonicalize -> store -> evidence -> ledger",
               "AdmissionReceipt schema and emission",
-              "DCP resolver MVP"
+              "DCP resolver MVP",
+              "ChangeSetReport emission and storage"
             ],
             "exit_criteria": [
               "Artifacts become resolvable by stable ID with pinned hash",
@@ -156,7 +164,8 @@
           {
             "deliverables": [
               "Tool protocol extension: ArtifactFetch (and optional DcpResolve)",
-              "Policy rules to enforce consumption hermeticity"
+              "Policy rules to enforce consumption hermeticity",
+              "RunReceipt emission with context_pack_miss + sufficiency"
             ],
             "exit_criteria": [
               "Consumption holon can fetch required context only by stable ID",
@@ -169,26 +178,28 @@
             "deliverables": [
               "ContextPackSpec schema",
               "pack compile producing manifests + derived prompt packs",
-              "PackCompilationReceipt emission"
+              "PackCompilationReceipt emission",
+              "TargetProfile integration + deep-pinning closure"
             ],
             "exit_criteria": [
               "Consumption tasks run without discretionary context discovery",
-              "Pack outputs are deterministic and provenanced"
+              "Pack outputs are deterministic and provenanced",
+              "Packs are self-contained under transitive closure"
             ],
             "name": "ContextPack Compiler",
             "phase_id": "CAC-IMP-04"
           },
           {
             "deliverables": [
-              "VendorProfile schema + claude_code/v1 profile",
-              "apm2 export produces vendor tree + ExportManifest + conformance tests",
+              "TargetProfile schema + claude_code/v1 target profile",
+              "apm2 export produces delivery payloads + ExportManifest + conformance tests",
               "apm2 capabilities --json + apm2 selftest + AATReceipt gating"
             ],
             "exit_criteria": [
-              "Vendor export is deterministic and CI-enforced",
+              "Target delivery is deterministic and CI-enforced",
               "Capabilities manifest matches reality (selftested)"
             ],
-            "name": "Vendor Export + Capabilities Truthing",
+            "name": "Target Delivery + Capabilities Truthing",
             "phase_id": "CAC-IMP-05"
           }
         ]

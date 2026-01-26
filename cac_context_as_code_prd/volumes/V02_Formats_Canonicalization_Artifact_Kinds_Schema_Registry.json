@@ -9,6 +9,23 @@
           "hash_id_format": "b3-256:<hex>",
           "note": "Align with existing APM2 Evidence/CAS hashing to keep the stack coherent."
         },
+        "typed_quantities": {
+          "note": "All budgets, timeouts, costs, and probabilities must use typed quantities with explicit units to avoid ad hoc string formats.",
+          "schema_ref": "cac.common.v1#/$defs/quantity",
+          "unit_rules": [
+            "Units must be explicit (e.g., ms, bytes, tokens, count, percent, usd).",
+            "Values are integers; scaling is expressed via the scale field.",
+            "Probabilities are represented as scaled integers (e.g., percent or ppm)."
+          ]
+        },
+        "canonicalizer_metadata": {
+          "required_fields": [
+            "canonicalizer_id",
+            "canonicalizer_version",
+            "vectors_ref"
+          ],
+          "rule": "Every normative artifact envelope and receipt must record the canonicalizer id/version and reference the governed test-vector artifact."
+        },
         "derived_formats": [
           {
             "id": "FMT-TOON",
@@ -40,7 +57,7 @@
             "canonicalization": {
               "id": "CANON-JCS",
               "name": "JSON Canonicalization Scheme (JCS-like)",
-              "note": "Adopt RFC 8785 JCS where feasible; if deviating, publish explicit test vectors and treat canonicalizer as a versioned component.",
+              "note": "Adopt RFC 8785 JCS where feasible; if deviating, publish explicit test vectors as governed artifacts and treat the canonicalizer as a versioned component.",
               "requirements": [
                 "Deterministic object member ordering.",
                 "Deterministic number rendering (for allowed integers: minimal decimal form).",
@@ -154,9 +171,23 @@
           },
           {
             "consume_allowed": true,
-            "kind_id": "vendor.profile",
+            "kind_id": "target.profile",
             "normative": true,
-            "purpose": "Defines how to compile internal artifacts into vendor ABIs (layouts/templates/tests).",
+            "purpose": "Defines rendering, retrieval, and delivery constraints independent of model intelligence; drives compilation.",
+            "schema_id": "cac.target_profile.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "canonicalizer.vectors",
+            "normative": true,
+            "purpose": "Governed canonicalization test vectors pinned in the bootstrap trust root.",
+            "schema_id": "cac.canonicalizer_vectors.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "vendor.profile",
+            "normative": false,
+            "purpose": "Derived vendor delivery profile compiled from TargetProfile (compatibility surface, not normative).",
             "schema_id": "cac.vendor_profile.v1"
           },
           {
@@ -189,6 +220,13 @@
           },
           {
             "consume_allowed": true,
+            "kind_id": "changeset.report",
+            "normative": false,
+            "purpose": "Standardized semantic delta report for patch admissions and compaction.",
+            "schema_id": "cac.changeset_report.v1"
+          },
+          {
+            "consume_allowed": true,
             "kind_id": "receipt.admission",
             "normative": false,
             "purpose": "Evidence receipt proving an artifact was admitted (validated, canonicalized, stored, indexed).",
@@ -200,6 +238,13 @@
             "normative": false,
             "purpose": "Evidence receipt proving acceptance/selftests passed with bounded resources.",
             "schema_id": "cac.aat_receipt.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "receipt.run",
+            "normative": false,
+            "purpose": "Evidence receipt for consumption runs (pack sufficiency, misses, and budget usage).",
+            "schema_id": "cac.run_receipt.v1"
           },
           {
             "consume_allowed": true,
@@ -250,7 +295,7 @@
           ]
         },
         "schema_discovery": {
-          "bootstrap": "Kernel/CLI ships with a minimal bootstrap schema bundle pinned by hash in the binary (schema_definition + PatchRecord + AdmissionReceipt + shared refs). This Phase-0 trust root is immutable via the standard patch pipeline.",
+          "bootstrap": "Kernel/CLI ships with a minimal bootstrap schema bundle pinned by hash in the binary (schema_definition + PatchRecord + AdmissionReceipt + shared refs + canonicalizer vectors). This Phase-0 trust root is immutable via the standard patch pipeline.",
           "immutability_policy": "Admission rejects patches or artifacts that attempt to modify or shadow bootstrap stable IDs.",
           "upgrade_path": "Bootstrap changes occur only via a new binary release (or a separately authorized bootstrap-upgrade flow), never via PatchRecord admission.",
           "mechanism": "Schema refs are stable IDs resolvable in DCP; schemas are themselves control artifacts."

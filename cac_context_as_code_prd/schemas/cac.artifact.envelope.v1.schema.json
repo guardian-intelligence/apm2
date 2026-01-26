@@ -13,6 +13,26 @@
         "classification": {
           "$ref": "cac.common.v1.schema.json#/$defs/classification"
         },
+        "canonicalizer": {
+          "additionalProperties": false,
+          "properties": {
+            "canonicalizer_id": {
+              "type": "string"
+            },
+            "canonicalizer_version": {
+              "type": "string"
+            },
+            "vectors_ref": {
+              "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
+            }
+          },
+          "required": [
+            "canonicalizer_id",
+            "canonicalizer_version",
+            "vectors_ref"
+          ],
+          "type": "object"
+        },
         "created_at": {
           "format": "date-time",
           "type": "string"

@@ -3,7 +3,7 @@
     "open_questions": [
       {
         "id": "CAC-OQ-0001",
-        "question": "Exact canonicalization spec: strict RFC 8785 JCS vs a stricter CAC profile; how to publish and version test vectors?"
+        "question": "Exact canonicalization spec: strict RFC 8785 JCS vs a stricter CAC profile; how to publish, pin, and version test vectors and canonicalizer IDs?"
       },
       {
         "id": "CAC-OQ-0002",
@@ -20,6 +20,14 @@
       {
         "id": "CAC-OQ-0005",
         "question": "Should defect records be first-class kernel events or remain evidence artifacts referenced by events?"
+      },
+      {
+        "id": "CAC-OQ-0006",
+        "question": "TargetProfile schema: what is the minimal stage taxonomy (plan/implement/review/ops) and which policies must be mandatory vs optional?"
+      },
+      {
+        "id": "CAC-OQ-0007",
+        "question": "Compaction policy: when does patch depth require snapshotting, and how are ChangeSet summaries preserved across compaction?"
       }
     ],
     "risks": [
@@ -47,11 +55,11 @@
         "id": "CAC-RISK-0003",
         "impact": "External agent tooling stops working or requires urgent changes.",
         "mitigations": [
-          "Version vendor profiles and pin in packs.",
+          "Version target profiles and pin in packs.",
           "Conformance tests run in AAT; failures become defects.",
           "Maintain fallback exports for critical vendors."
         ],
-        "name": "Vendor ABI churn breaks export pipeline"
+        "name": "Target delivery churn breaks export pipeline"
       },
       {
         "id": "CAC-RISK-0004",
@@ -72,6 +80,26 @@
           "Include compaction checkpoints."
         ],
         "name": "Indexing DCP from ledger becomes performance bottleneck"
+      },
+      {
+        "id": "CAC-RISK-0006",
+        "impact": "Patch history grows unbounded; review and replay become slow or error-prone.",
+        "mitigations": [
+          "Define compaction thresholds (depth/time/size) per artifact kind.",
+          "Require ChangeSet summaries to accompany compaction snapshots.",
+          "Maintain provenance links from snapshots back to patch chains."
+        ],
+        "name": "Patch soup without compaction"
+      },
+      {
+        "id": "CAC-RISK-0007",
+        "impact": "TargetProfile budgets or rendering policies are miscalibrated, causing frequent failures for weaker models.",
+        "mitigations": [
+          "Default to conservative budgets; adjust via measured RunReceipt data.",
+          "Maintain per-model profiles and gate by capability manifest.",
+          "Automate profile tuning based on sufficiency metrics."
+        ],
+        "name": "Target profile miscalibration"
       }
     ]
   }

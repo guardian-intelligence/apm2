@@ -33,12 +33,12 @@
                   "notes": {
                     "type": "string"
                   },
-                  "vendor_profile_id": {
+                  "target_profile_id": {
                     "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
                   }
                 },
                 "required": [
-                  "vendor_profile_id"
+                  "target_profile_id"
                 ],
                 "type": "object"
               },
@@ -81,12 +81,16 @@
             "pack_name": {
               "minLength": 1,
               "type": "string"
+            },
+            "target_profile_id": {
+              "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
             }
           },
           "required": [
             "pack_name",
             "mode",
-            "includes"
+            "includes",
+            "target_profile_id"
           ],
           "type": "object"
         },

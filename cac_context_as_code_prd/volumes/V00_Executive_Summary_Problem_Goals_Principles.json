@@ -39,7 +39,6 @@
             }
           ],
           "priority": "P0",
-          "revision": "v1.0-draft",
           "scope_tags": [
             "context-as-code",
             "canonical-json",
@@ -64,12 +63,13 @@
           "Today, the system still relies on implicit or prose-driven contracts (README/Markdown/scripts) and unverified assumptions about CLI functionality.",
           "This creates unplanned context discovery, brittle agent behavior, and a slow innermost loop (code+review)."
         ],
-        "one_line": "Make context the authoritative program: canonicalize, validate, version, and compile it into deterministic packs and vendor ABIs, with full provenance recorded as kernel messages.",
+        "one_line": "Make context the authoritative program: a content-addressed context graph compiled through target profiles into deterministic packs and delivery payloads, with full provenance recorded as kernel messages.",
         "thesis": {
           "implications": [
             "If context is complete and correct, code can be generated deterministically (or within controlled nondeterminism).",
             "Therefore, the highest-leverage engineering work is to make context machine-native, canonical, and enforceable.",
-            "All boundary crossings (agent↔kernel, kernel↔vendor) must be mediated by schemas and evidence."
+            "All boundary crossings (agent\u2194kernel, kernel\u2194runtime targets) must be mediated by schemas and evidence.",
+            "Model capability is treated as a compile-time TargetProfile contract, not a runtime assumption."
           ],
           "statement": "In an agent-native factory, code is a compiled artifact; context is the source program."
         }
@@ -134,7 +134,7 @@
           }
         ],
         "primary_bottleneck": {
-          "definition": "The cycle time and defect rate of the tight loop: change intent → code generation → review → merge → verification.",
+          "definition": "The cycle time and defect rate of the tight loop: change intent \u2192 code generation \u2192 review \u2192 merge \u2192 verification.",
           "name": "Innermost loop throughput",
           "why_context_blocks_it": [
             "Agents spend time searching or asking for context that should have been pre-packaged.",
@@ -180,7 +180,9 @@
             "name": "Hermetic consumption with deterministic reads",
             "success_criteria": [
               "Consumption holons can complete tasks using only preauthorized stable-ID fetches plus actuation tools.",
-              "Discretionary context discovery during consumption is denied and/or defect-emitting by policy."
+              "Discretionary context discovery during consumption is denied and/or defect-emitting by policy.",
+              "ContextPack manifests include transitive dependency closure (deep pinning).",
+              "Run receipts capture context_pack_miss and context_pack_sufficiency; misses gate consumption unless explicitly escalated."
             ]
           },
           {
@@ -188,14 +190,16 @@
             "name": "Bounded context production with replayable evidence",
             "success_criteria": [
               "Production holons operate under explicit leases/budgets and publish replayable evidence (snapshots, extraction logs, diffs).",
-              "Tool calls are classified as planned/unplanned and feed defect signals into pack compiler improvement."
+              "Tool calls are classified as planned/unplanned and feed defect signals into pack compiler improvement.",
+              "Admissions include a ChangeSet report to summarize semantic deltas and enable compaction."
             ]
           },
           {
             "id": "CAC-G-0005",
-            "name": "Vendor interoperability without drift",
+            "name": "Target interoperability without drift",
             "success_criteria": [
-              "Vendor ABIs (e.g., Markdown + folder layouts) are compiled deterministically from CAC sources and never treated as normative.",
+              "Target profiles define rendering, retrieval, and delivery constraints independent of model intelligence.",
+              "Target payloads (vendor layouts, model IRs) are compiled deterministically from CAC sources and never treated as normative.",
               "Export manifests provide provenance and are verified by conformance tests."
             ]
           },
@@ -215,6 +219,22 @@
               "PR cycle time and defect recurrence improve after adoption.",
               "AAT receipts gate critical operations with high pass rates."
             ]
+          },
+          {
+            "id": "CAC-G-0008",
+            "name": "Typed quantities and context budgets",
+            "success_criteria": [
+              "Budgets, timeouts, costs, and probabilities are expressed as typed quantities with explicit units.",
+              "ContextPack compilation and validation reject packs exceeding token/artifact/byte budgets."
+            ]
+          },
+          {
+            "id": "CAC-G-0009",
+            "name": "Canonicalizer governance",
+            "success_criteria": [
+              "Canonicalizer id/version are recorded in envelopes and receipts for all normative artifacts.",
+              "Canonicalization test vectors are governed artifacts pinned in the bootstrap bundle."
+            ]
           }
         ],
         "non_goals": [
@@ -232,7 +252,7 @@
           },
           {
             "id": "CAC-NG-0004",
-            "statement": "Building a universal cross-vendor standard; we compile to vendor ABIs instead."
+            "statement": "Building a universal cross-vendor standard; we compile to target profiles and delivery payloads instead."
           }
         ]
       },
@@ -273,11 +293,11 @@
         {
           "corollaries": [
             "No direct edits to generated ABI trees in mainline.",
-            "ABI conformance is tested and versioned via vendor profiles."
+            "Delivery conformance is tested and versioned via target profiles."
           ],
           "id": "CAC-P-PRIN-0006",
-          "name": "Foreign ABIs are compiled outputs",
-          "statement": "External vendor-required formats (Markdown layouts, proprietary conventions) are treated as foreign ABIs and generated deterministically from internal IR."
+          "name": "Target profiles are the ABI contract",
+          "statement": "Rendering, retrieval, and delivery are governed by target profiles; vendor or model-specific payloads are deterministic projections, never normative sources."
         },
         {
           "id": "CAC-P-PRIN-0007",
@@ -288,6 +308,20 @@
           "id": "CAC-P-PRIN-0008",
           "name": "Message-level provenance and replay",
           "statement": "All state transitions are represented as signed kernel messages referencing immutable hashes; projections are derived, reconstructable, and auditable."
+        },
+        {
+          "corollaries": [
+            "All transitive dependencies are resolved and pinned before consumption.",
+            "ContextPack manifests are closure views over the context graph."
+          ],
+          "id": "CAC-P-PRIN-0009",
+          "name": "Context graph closure",
+          "statement": "Dependencies are explicit and closed; hermetic consumption operates on deep-pinned graph closures, not open-ended discovery."
+        },
+        {
+          "id": "CAC-P-PRIN-0010",
+          "name": "Typed, bounded quantities",
+          "statement": "Budgets, timeouts, costs, and probabilities use typed quantities with explicit units and enforced bounds to ensure deterministic cross-language behavior."
         }
       ],
       "section_id": "PRINCIPLES",

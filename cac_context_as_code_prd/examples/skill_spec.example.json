@@ -51,7 +51,10 @@
         "git.diff"
       ],
       "tool_budget": {
-        "tool_calls": 0
+        "tool_calls": {
+          "unit": "count",
+          "value_i64": 0
+        }
       }
     }
   },

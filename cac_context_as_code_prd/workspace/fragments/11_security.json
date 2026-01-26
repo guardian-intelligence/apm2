@@ -14,6 +14,12 @@
         "type": "preventative"
       },
       {
+        "details": "Canonicalizer id/version and test-vector reference are recorded in envelopes/receipts; vectors are governed artifacts pinned in the bootstrap bundle.",
+        "id": "SEC-CTRL-0009",
+        "name": "Canonicalizer governance metadata",
+        "type": "preventative"
+      },
+      {
         "details": "Validator profile rejects unknown fields; schemas use unevaluatedProperties=false.",
         "id": "SEC-CTRL-0003",
         "name": "Schema strictness (unknown field rejection)",

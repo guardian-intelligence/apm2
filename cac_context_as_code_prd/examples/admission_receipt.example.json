@@ -17,7 +17,9 @@
   "payload": {
     "base_hash": "b3-256:a65b3b76c8238ad81db3926da6ce92590c0669fea1c4fa8bedc7b21d3534646f",
     "canonicalization": "CANON-JCS",
+    "canonicalizer_id": "cac-canon",
     "canonicalizer_version": "cac-canon/1.0.0",
+    "canonicalizer_vectors_ref": "dcp://apm2.local/canonicalizers/jcs_vectors@v1",
     "decision": "ADMIT",
     "new_hash": "b3-256:8f9969d8f0fa47a9f099447166718be0ade9d9e592457179b9e4e4589d05e906",
     "notes": [

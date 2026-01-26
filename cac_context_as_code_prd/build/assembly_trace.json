@@ -49,7 +49,11 @@
       "examples/policy_profile.example.json",
       "examples/schema_definition.example.json",
       "examples/skill_spec.example.json",
-      "examples/vendor_profile_claude_code.example.json"
+      "examples/vendor_profile_claude_code.example.json",
+      "examples/target_profile.example.json",
+      "examples/changeset_report.example.json",
+      "examples/run_receipt.example.json",
+      "examples/canonicalizer_vectors.example.json"
     ],
     "master_prd": "MASTER.json",
     "schemas": [
@@ -70,7 +74,11 @@
       "schemas/cac.policy_profile.v1.schema.json",
       "schemas/cac.schema_definition.v1.schema.json",
       "schemas/cac.skill_spec.v1.schema.json",
-      "schemas/cac.vendor_profile.v1.schema.json"
+      "schemas/cac.vendor_profile.v1.schema.json",
+      "schemas/cac.target_profile.v1.schema.json",
+      "schemas/cac.changeset_report.v1.schema.json",
+      "schemas/cac.run_receipt.v1.schema.json",
+      "schemas/cac.canonicalizer_vectors.v1.schema.json"
     ],
     "volumes": [
       "volumes/V00_Executive_Summary_Problem_Goals_Principles.json",

@@ -6,7 +6,8 @@
         "ContextPack compiler rules",
         "Schema evolution (tighten or expand)",
         "Capability manifest updates",
-        "Vendor profile updates"
+        "Target profile updates",
+        "ChangeSet compaction rules"
       ],
       "signals": [
         "PolicyViolation events",
@@ -16,7 +17,7 @@
         "Export conformance failures"
       ]
     },
-    "overview": "A closed-loop, message-native context pipeline: machines propose patches; kernel admits canonical artifacts; compiler produces packs and vendor ABIs; consumption is hermetic; misses create defects; improvements feed back into pack compilation and schema evolution.",
+    "overview": "A closed-loop, message-native context pipeline: machines propose patches with semantic deltas; kernel admits canonical artifacts; compiler builds deep-pinned packs and target-specific payloads; consumption is hermetic and budgeted; misses create defects; improvements feed back into pack compilation and target profiles.",
     "stages": [
       {
         "default_tool_budget": {
@@ -40,6 +41,7 @@
         "name": "Patch Authoring",
         "outputs": [
           "PatchRecord (JSONL record)",
+          "ChangeSetReport (semantic delta summary)",
           "optional supporting evidence (CAS refs)"
         ],
         "stage_id": "CAC-STAGE-01"
@@ -54,7 +56,8 @@
         "invariants": [
           "Fail-closed on schema mismatch, unknown fields, forbidden constructs, size/depth limits.",
           "Reject patch if expected_base_hash does not match current artifact hash.",
-          "Policy profile may deny patching certain paths/fields without adjudication."
+          "Policy profile may deny patching certain paths/fields without adjudication.",
+          "Admission requires a ChangeSetReport for patch streams."
         ],
         "kernel_messages": [
           {
@@ -75,12 +78,12 @@
         "inputs": [
           "validated PatchRecord",
           "base artifact (canonical)",
-          "canonicalizer version"
+          "canonicalizer id/version"
         ],
         "invariants": [
           "Canonicalization is deterministic and idempotent.",
           "New artifact must validate against target schema after patching and canonicalization.",
-          "AdmissionReceipt references: patch record hash, base hash, new hash, schema hash, canonicalizer version."
+          "AdmissionReceipt references: patch record hash, base hash, new hash, schema hash, canonicalizer id/version."
         ],
         "kernel_messages": [
           {
@@ -110,7 +113,8 @@
         "invariants": [
           "CAS blobs are immutable and verified by hash.",
           "DCP is derived: stable_id -> content_hash mapping is reconstructable from ledger events.",
-          "No artifact becomes visible to consumption mode until its stable_id resolves to a pinned content_hash."
+          "No artifact becomes visible to consumption mode until its stable_id resolves to a pinned content_hash.",
+          "Dependency edges are recorded for graph closure queries."
         ],
         "mode": "KERNEL",
         "name": "Publish to CAS + Update DCP",
@@ -126,11 +130,13 @@
           "ContextPackSpec (stable_id)",
           "resolved stable_ids",
           "lease/budget refs",
-          "compiler profile"
+          "TargetProfile (stable_id)"
         ],
         "invariants": [
-          "Compilation is deterministic given resolved inputs and compiler profile.",
+          "Compilation is deterministic given resolved inputs and target profile.",
           "Manifest lists every stable_id with pinned content_hash; no floating refs.",
+          "Transitive dependency closure is resolved and pinned (deep pinning).",
+          "Context budgets (tokens, artifacts, bytes) are enforced during compilation.",
           "Compiler must emit evidence snapshots for any tool-derived sources."
         ],
         "kernel_messages": [
@@ -151,11 +157,12 @@
       },
       {
         "inputs": [
-          "VendorProfile (stable_id)",
+          "TargetProfile (stable_id)",
           "SkillSpec and other inputs (stable_ids)",
           "export target (workspace dir)"
         ],
         "invariants": [
+          "Rendering is deterministic and constrained by the target profile.",
           "Export is deterministic from inputs; output tree is byte-identical for identical inputs.",
           "Generated files embed provenance (stable_ids, hashes) where possible (e.g., YAML frontmatter).",
           "Conformance tests are required and their results are published as evidence."
@@ -173,9 +180,9 @@
           }
         ],
         "mode": "PRODUCE",
-        "name": "Foreign ABI Export (Vendor Profiles)",
+        "name": "Target Delivery Rendering",
         "outputs": [
-          "vendor filesystem tree",
+          "delivery payloads (vendor layouts, model IRs)",
           "ExportManifest",
           "ExportReceipt",
           "conformance test report"
@@ -223,12 +230,14 @@
         "invariants": [
           "All context reads must be stable-ID fetches from DCP via deterministic tools.",
           "Discretionary discovery attempts are denied or defect-emitting.",
-          "Any required extra context is classified as a pack compiler failure defect."
+          "Any required extra context is classified as a pack compiler failure defect.",
+          "context_pack_miss emits a defect and fails the run unless explicitly in escalation-allowed mode."
         ],
         "mode": "CONSUME",
         "name": "Consume (Execution/Review/Ops)",
         "outputs": [
           "work outputs (code, reviews, ops actions)",
+          "RunReceipt (context_pack_miss + sufficiency)",
           "evidence artifacts",
           "ledger events"
         ],

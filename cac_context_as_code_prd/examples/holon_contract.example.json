@@ -24,9 +24,18 @@
       "dcp.resolve"
     ],
     "budgets": {
-      "time_ms": 300000,
-      "tokens": 100000,
-      "tool_calls": 0
+      "time_ms": {
+        "unit": "ms",
+        "value_i64": 300000
+      },
+      "tokens": {
+        "unit": "tokens",
+        "value_i64": 100000
+      },
+      "tool_calls": {
+        "unit": "count",
+        "value_i64": 0
+      }
     },
     "inputs": [
       "context_pack.manifest",

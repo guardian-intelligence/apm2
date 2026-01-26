@@ -32,11 +32,11 @@
     {
       "corollaries": [
         "No direct edits to generated ABI trees in mainline.",
-        "ABI conformance is tested and versioned via vendor profiles."
+        "Delivery conformance is tested and versioned via target profiles."
       ],
       "id": "CAC-P-PRIN-0006",
-      "name": "Foreign ABIs are compiled outputs",
-      "statement": "External vendor-required formats (Markdown layouts, proprietary conventions) are treated as foreign ABIs and generated deterministically from internal IR."
+      "name": "Target profiles are the ABI contract",
+      "statement": "Rendering, retrieval, and delivery are governed by target profiles; vendor or model-specific payloads are deterministic projections, never normative sources."
     },
     {
       "id": "CAC-P-PRIN-0007",
@@ -47,6 +47,20 @@
       "id": "CAC-P-PRIN-0008",
       "name": "Message-level provenance and replay",
       "statement": "All state transitions are represented as signed kernel messages referencing immutable hashes; projections are derived, reconstructable, and auditable."
+    },
+    {
+      "corollaries": [
+        "All transitive dependencies are resolved and pinned before consumption.",
+        "ContextPack manifests are closure views over the context graph."
+      ],
+      "id": "CAC-P-PRIN-0009",
+      "name": "Context graph closure",
+      "statement": "Dependencies are explicit and closed; hermetic consumption operates on deep-pinned graph closures, not open-ended discovery."
+    },
+    {
+      "id": "CAC-P-PRIN-0010",
+      "name": "Typed, bounded quantities",
+      "statement": "Budgets, timeouts, costs, and probabilities use typed quantities with explicit units and enforced bounds to ensure deterministic cross-language behavior."
     }
   ]
 }

@@ -23,7 +23,9 @@
       "name": "Hermetic consumption with deterministic reads",
       "success_criteria": [
         "Consumption holons can complete tasks using only preauthorized stable-ID fetches plus actuation tools.",
-        "Discretionary context discovery during consumption is denied and/or defect-emitting by policy."
+        "Discretionary context discovery during consumption is denied and/or defect-emitting by policy.",
+        "ContextPack manifests include transitive dependency closure (deep pinning).",
+        "Run receipts capture context_pack_miss and context_pack_sufficiency; misses gate consumption unless explicitly escalated."
       ]
     },
     {
@@ -31,14 +33,16 @@
       "name": "Bounded context production with replayable evidence",
       "success_criteria": [
         "Production holons operate under explicit leases/budgets and publish replayable evidence (snapshots, extraction logs, diffs).",
-        "Tool calls are classified as planned/unplanned and feed defect signals into pack compiler improvement."
+        "Tool calls are classified as planned/unplanned and feed defect signals into pack compiler improvement.",
+        "Admissions include a ChangeSet report to summarize semantic deltas and enable compaction."
       ]
     },
     {
       "id": "CAC-G-0005",
-      "name": "Vendor interoperability without drift",
+      "name": "Target interoperability without drift",
       "success_criteria": [
-        "Vendor ABIs (e.g., Markdown + folder layouts) are compiled deterministically from CAC sources and never treated as normative.",
+        "Target profiles define rendering, retrieval, and delivery constraints independent of model intelligence.",
+        "Target payloads (vendor layouts, model IRs) are compiled deterministically from CAC sources and never treated as normative.",
         "Export manifests provide provenance and are verified by conformance tests."
       ]
     },
@@ -58,6 +62,22 @@
         "PR cycle time and defect recurrence improve after adoption.",
         "AAT receipts gate critical operations with high pass rates."
       ]
+    },
+    {
+      "id": "CAC-G-0008",
+      "name": "Typed quantities and context budgets",
+      "success_criteria": [
+        "Budgets, timeouts, costs, and probabilities are expressed as typed quantities with explicit units.",
+        "ContextPack compilation and validation reject packs exceeding token/artifact/byte budgets."
+      ]
+    },
+    {
+      "id": "CAC-G-0009",
+      "name": "Canonicalizer governance",
+      "success_criteria": [
+        "Canonicalizer id/version are recorded in envelopes and receipts for all normative artifacts.",
+        "Canonicalization test vectors are governed artifacts pinned in the bootstrap bundle."
+      ]
     }
   ],
   "non_goals": [
@@ -75,7 +95,7 @@
     },
     {
       "id": "CAC-NG-0004",
-      "statement": "Building a universal cross-vendor standard; we compile to vendor ABIs instead."
+      "statement": "Building a universal cross-vendor standard; we compile to target profiles and delivery payloads instead."
     }
   ]
 }

@@ -78,13 +78,20 @@
             },
             "tool_protocol_version": {
               "type": "string"
+            },
+            "target_profiles_supported": {
+              "items": {
+                "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
+              },
+              "type": "array"
             }
           },
           "required": [
             "apm2_version",
             "tool_protocol_version",
             "command_inventory",
-            "schemas_supported"
+            "schemas_supported",
+            "target_profiles_supported"
           ],
           "type": "object"
         },

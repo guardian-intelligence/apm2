@@ -7,13 +7,17 @@
         "budget.profile",
         "holon.contract",
         "skill.spec",
+        "target.profile",
+        "canonicalizer.vectors",
         "vendor.profile",
         "capabilities.manifest",
         "context_pack.spec",
         "context_pack.manifest",
         "export.manifest",
+        "changeset.report",
         "receipt.admission",
         "receipt.aat",
+        "receipt.run",
         "defect.record"
       ],
       "type": "string"
@@ -42,6 +46,28 @@
       "description": "Stable schema identifier (e.g., cac.common.v1).",
       "pattern": "^[a-z0-9.-]+\\.v[0-9]+$",
       "type": "string"
+    },
+    "quantity": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "scale": {
+          "type": "integer"
+        },
+        "unit": {
+          "type": "string"
+        },
+        "value_i64": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "value_i64",
+        "unit"
+      ],
+      "type": "object"
     },
     "stable_id": {
       "description": "Stable ID in the DCP namespace. Versioned IDs are recommended; consumption must pin to a specific version.",

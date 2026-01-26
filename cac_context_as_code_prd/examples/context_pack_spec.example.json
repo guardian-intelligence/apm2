@@ -17,14 +17,14 @@
   "payload": {
     "allowlist": [
       "dcp://apm2.local/skills/*@*",
-      "dcp://apm2.local/vendor_profiles/*@*"
+      "dcp://apm2.local/targets/*@*"
     ],
     "description": "Minimal context pack for code+review loop with hermetic consumption.",
     "exports": [
       {
         "export_kind": "skills",
         "notes": "Export skills to Claude Code ABI.",
-        "vendor_profile_id": "dcp://apm2.local/vendor_profiles/claude_code@v1"
+        "target_profile_id": "dcp://apm2.local/targets/claude_code@v1"
       }
     ],
     "includes": [
@@ -35,12 +35,13 @@
       },
       {
         "pin_policy": "pin_required",
-        "purpose": "vendor export rules",
-        "stable_id": "dcp://apm2.local/vendor_profiles/claude_code@v1"
+        "purpose": "target profile",
+        "stable_id": "dcp://apm2.local/targets/claude_code@v1"
       }
     ],
     "mode": "CONSUME",
-    "pack_name": "inner_loop_review"
+    "pack_name": "inner_loop_review",
+    "target_profile_id": "dcp://apm2.local/targets/claude_code@v1"
   },
   "schema": "cac.context_pack_spec.v1",
   "schema_version": "1.0.0"

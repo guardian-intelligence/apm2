@@ -31,7 +31,7 @@
       }
     ],
     "vendor_id": "claude_code",
-    "vendor_profile_id": "dcp://apm2.local/vendor_profiles/claude_code@v1"
+    "target_profile_id": "dcp://apm2.local/targets/claude_code@v1"
   },
   "schema": "cac.export_manifest.v1",
   "schema_version": "1.0.0"

@@ -10,7 +10,8 @@
         "command_inventory",
         "schemas_supported",
         "tool_protocol_version",
-        "selftest_receipt_ref"
+        "selftest_receipt_ref",
+        "target_profiles_supported"
       ]
     },
     "current_messaging_assets": {
@@ -50,10 +51,14 @@
         "SCHEMA_DEFINITION",
         "CONTEXT_PACK",
         "PROMPT_PACK",
+        "TARGET_PROFILE",
         "VENDOR_EXPORT",
         "CAPABILITY_MANIFEST",
         "AAT_RECEIPT",
-        "ADMISSION_RECEIPT"
+        "ADMISSION_RECEIPT",
+        "CHANGESET_REPORT",
+        "RUN_RECEIPT",
+        "CANONICALIZER_VECTORS"
       ],
       "metadata_encoding": {
         "format": "key=value strings (aligns with EvidencePublished.metadata)",
@@ -69,7 +74,9 @@
         "schema_id",
         "schema_hash",
         "canonicalization",
-        "canonicalizer_version"
+        "canonicalizer_id",
+        "canonicalizer_version",
+        "target_profile_id"
       ]
     },
     "optional_kernel_schema_extensions": [

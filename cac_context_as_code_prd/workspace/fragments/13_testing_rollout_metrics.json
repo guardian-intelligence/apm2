@@ -14,7 +14,7 @@
       "required_aat_suites": [
         {
           "max_duration_ms": 60000,
-          "purpose": "Validate bootstrap trust root, CAC admission pipeline, canonicalization, schema validation, and replay protection.",
+          "purpose": "Validate bootstrap trust root, CAC admission pipeline, canonicalization metadata, schema validation, and replay protection.",
           "suite_id": "AAT-CAC-CORE"
         },
         {
@@ -24,7 +24,7 @@
         },
         {
           "max_duration_ms": 60000,
-          "purpose": "Validate vendor export determinism and conformance.",
+          "purpose": "Validate target delivery determinism and conformance.",
           "suite_id": "AAT-CAC-EXPORT"
         },
         {
@@ -100,6 +100,38 @@
         ],
         "id": "CAC-AT-0008",
         "name": "Bootstrap trust root"
+      },
+      {
+        "asserts": [
+          "TargetProfile budgets are enforced during pack compilation",
+          "Rendering policy is honored for derived payloads"
+        ],
+        "id": "CAC-AT-0009",
+        "name": "Target profile enforcement"
+      },
+      {
+        "asserts": [
+          "Transitive dependencies are included in ContextPack manifests",
+          "Consumption does not require additional discretionary reads"
+        ],
+        "id": "CAC-AT-0010",
+        "name": "Deep pinning closure"
+      },
+      {
+        "asserts": [
+          "context_pack_miss triggers DefectRecord and run failure by default",
+          "RunReceipt records sufficiency and budget deltas"
+        ],
+        "id": "CAC-AT-0011",
+        "name": "Run receipt gating"
+      },
+      {
+        "asserts": [
+          "Typed quantities reject unknown units",
+          "Scaled integer quantities round-trip deterministically"
+        ],
+        "id": "CAC-AT-0012",
+        "name": "Typed quantity validation"
       }
     ],
     "metrics": {
@@ -131,6 +163,18 @@
           "target": "increase toward 99%+"
         },
         {
+          "definition": "Rate of context_pack_miss entries per run receipt.",
+          "id": "CAC-M-LEAD-0004",
+          "name": "ContextPack miss rate",
+          "target": "decrease toward zero"
+        },
+        {
+          "definition": "Fraction of runs where context_pack_sufficiency=true.",
+          "id": "CAC-M-LEAD-0005",
+          "name": "ContextPack sufficiency rate",
+          "target": "increase toward 99%+"
+        },
+        {
           "definition": "Schema/canonicalization/replay/policy rejection counts.",
           "id": "CAC-M-LEAD-0003",
           "name": "Admission rejection rate by category",
@@ -155,13 +199,13 @@
         {
           "ci_behavior": "fail on discretionary reads; file defects automatically",
           "duration_days": 14,
-          "name": "Hermetic consumption gates enabled",
+          "name": "Hermetic consumption + run receipt gating",
           "phase_id": "CAC-R-03"
         },
         {
           "ci_behavior": "fail on export drift; require passing AATReceipt for cutover",
           "duration_days": 14,
-          "name": "Vendor export + capabilities gating for CLI cutover",
+          "name": "Target delivery + capabilities gating for CLI cutover",
           "phase_id": "CAC-R-04"
         }
       ],

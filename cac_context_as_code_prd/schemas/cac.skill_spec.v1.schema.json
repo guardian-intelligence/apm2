@@ -68,6 +68,24 @@
                   "type": "array"
                 },
                 "tool_budget": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "artifacts": {
+                      "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                    },
+                    "bytes": {
+                      "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                    },
+                    "time_ms": {
+                      "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                    },
+                    "tokens": {
+                      "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                    },
+                    "tool_calls": {
+                      "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                    }
+                  },
                   "type": "object"
                 }
               },

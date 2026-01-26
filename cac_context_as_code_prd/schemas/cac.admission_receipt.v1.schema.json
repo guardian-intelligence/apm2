@@ -19,8 +19,14 @@
             "canonicalization": {
               "type": "string"
             },
+            "canonicalizer_id": {
+              "type": "string"
+            },
             "canonicalizer_version": {
               "type": "string"
+            },
+            "canonicalizer_vectors_ref": {
+              "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
             },
             "decision": {
               "enum": [
@@ -68,7 +74,9 @@
             "new_hash",
             "patch_record_hash",
             "schema_id",
-            "canonicalizer_version"
+            "canonicalizer_id",
+            "canonicalizer_version",
+            "canonicalizer_vectors_ref"
           ],
           "type": "object"
         },

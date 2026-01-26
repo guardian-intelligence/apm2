@@ -30,7 +30,7 @@
       ]
     },
     "schema_discovery": {
-      "bootstrap": "Kernel/CLI ships with a minimal bootstrap schema bundle pinned by hash in the binary (schema_definition + PatchRecord + AdmissionReceipt + shared refs). This Phase-0 trust root is immutable via the standard patch pipeline.",
+      "bootstrap": "Kernel/CLI ships with a minimal bootstrap schema bundle pinned by hash in the binary (schema_definition + PatchRecord + AdmissionReceipt + shared refs + canonicalizer vectors). This Phase-0 trust root is immutable via the standard patch pipeline.",
       "immutability_policy": "Admission rejects patches or artifacts that attempt to modify or shadow bootstrap stable IDs.",
       "upgrade_path": "Bootstrap changes occur only via a new binary release (or a separately authorized bootstrap-upgrade flow), never via PatchRecord admission.",
       "mechanism": "Schema refs are stable IDs resolvable in DCP; schemas are themselves control artifacts."

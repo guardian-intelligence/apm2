@@ -5,6 +5,23 @@
       "hash_id_format": "b3-256:<hex>",
       "note": "Align with existing APM2 Evidence/CAS hashing to keep the stack coherent."
     },
+    "typed_quantities": {
+      "note": "All budgets, timeouts, costs, and probabilities must use typed quantities with explicit units to avoid ad hoc string formats.",
+      "schema_ref": "cac.common.v1#/$defs/quantity",
+      "unit_rules": [
+        "Units must be explicit (e.g., ms, bytes, tokens, count, percent, usd).",
+        "Values are integers; scaling is expressed via the scale field.",
+        "Probabilities are represented as scaled integers (e.g., percent or ppm)."
+      ]
+    },
+    "canonicalizer_metadata": {
+      "required_fields": [
+        "canonicalizer_id",
+        "canonicalizer_version",
+        "vectors_ref"
+      ],
+      "rule": "Every normative artifact envelope and receipt must record the canonicalizer id/version and reference the governed test-vector artifact."
+    },
     "derived_formats": [
       {
         "id": "FMT-TOON",
@@ -36,7 +53,7 @@
         "canonicalization": {
           "id": "CANON-JCS",
           "name": "JSON Canonicalization Scheme (JCS-like)",
-          "note": "Adopt RFC 8785 JCS where feasible; if deviating, publish explicit test vectors and treat canonicalizer as a versioned component.",
+          "note": "Adopt RFC 8785 JCS where feasible; if deviating, publish explicit test vectors as governed artifacts and treat the canonicalizer as a versioned component.",
           "requirements": [
             "Deterministic object member ordering.",
             "Deterministic number rendering (for allowed integers: minimal decimal form).",

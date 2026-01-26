@@ -19,6 +19,26 @@
             "compiler_version": {
               "type": "string"
             },
+            "dependency_closure": {
+              "additionalProperties": false,
+              "properties": {
+                "edge_count": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "mode": {
+                  "enum": [
+                    "transitive_required"
+                  ],
+                  "type": "string"
+                },
+                "node_count": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            },
             "derived_artifacts": {
               "items": {
                 "additionalProperties": false,
@@ -45,6 +65,9 @@
               "type": "array"
             },
             "pack_spec_stable_id": {
+              "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
+            },
+            "target_profile_id": {
               "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
             },
             "receipts": {
@@ -85,6 +108,7 @@
           },
           "required": [
             "pack_spec_stable_id",
+            "target_profile_id",
             "resolved_at",
             "resolved_inputs"
           ],

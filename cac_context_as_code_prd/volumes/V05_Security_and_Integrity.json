@@ -18,6 +18,12 @@
             "type": "preventative"
           },
           {
+            "details": "Canonicalizer id/version and test-vector reference are recorded in envelopes/receipts; vectors are governed artifacts pinned in the bootstrap bundle.",
+            "id": "SEC-CTRL-0009",
+            "name": "Canonicalizer governance metadata",
+            "type": "preventative"
+          },
+          {
             "details": "Validator profile rejects unknown fields; schemas use unevaluatedProperties=false.",
             "id": "SEC-CTRL-0003",
             "name": "Schema strictness (unknown field rejection)",
@@ -42,18 +48,18 @@
             "type": "detective"
           },
           {
-          "details": "Hard bounds: max bytes, max depth, max array length, max schema complexity.",
-          "id": "SEC-CTRL-0007",
-          "name": "DoS limits in parsers and validators",
-          "type": "preventative"
-        },
-        {
-          "details": "Bootstrap schema bundle is embedded and pinned by hash; admission rejects modifications or shadowing; validator refuses to operate if bootstrap verification fails.",
-          "id": "SEC-CTRL-0008",
-          "name": "Bootstrap trust root immutability",
-          "type": "preventative"
-        }
-      ],
+            "details": "Hard bounds: max bytes, max depth, max array length, max schema complexity.",
+            "id": "SEC-CTRL-0007",
+            "name": "DoS limits in parsers and validators",
+            "type": "preventative"
+          },
+          {
+            "details": "Bootstrap schema bundle is embedded and pinned by hash; admission rejects modifications or shadowing; validator refuses to operate if bootstrap verification fails.",
+            "id": "SEC-CTRL-0008",
+            "name": "Bootstrap trust root immutability",
+            "type": "preventative"
+          }
+        ],
         "cryptography_plan": {
           "current": {
             "artifact_hashing": "BLAKE3-256",
