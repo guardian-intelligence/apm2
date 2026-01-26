@@ -29,12 +29,13 @@ use tracing::{debug, info};
 use super::adjudication::{AdjudicationResult, adjudicate_mappings};
 use super::mapper::{
     ImpactMapError, MappedRequirement, RequirementMatcher, load_components_from_ccp,
-    parse_requirements,
+    parse_requirements, validate_prd_id,
 };
 use crate::determinism::{CanonicalizeError, canonicalize_yaml, write_atomic};
 
 /// Summary of the impact map generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImpactMapSummary {
     /// Total requirements processed.
     pub total_requirements: usize,
@@ -46,10 +47,33 @@ pub struct ImpactMapSummary {
     pub duplication_risks: usize,
     /// Net-new requirements.
     pub net_new_count: usize,
+    /// Requirements that could not be resolved and need human/LLM review.
+    pub unresolved_count: usize,
+}
+
+/// An unresolved requirement that needs human or LLM-assisted review.
+///
+/// When exact matching and Jaccard similarity both fail to produce confident
+/// matches, the requirement is marked as unresolved. Future implementations
+/// may use LLM-assisted matching to resolve these.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnresolvedMapping {
+    /// Requirement ID.
+    pub requirement_id: String,
+    /// Requirement title.
+    pub requirement_title: String,
+    /// Requirement statement (truncated for output).
+    pub requirement_statement: String,
+    /// Reason why the requirement could not be resolved.
+    pub reason: String,
+    /// Suggested next steps for resolution.
+    pub suggested_action: String,
 }
 
 /// The complete impact map structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImpactMap {
     /// Schema version for this impact map format.
     pub schema_version: String,
@@ -65,6 +89,8 @@ pub struct ImpactMap {
     pub summary: ImpactMapSummary,
     /// Requirement mappings.
     pub requirement_mappings: Vec<MappedRequirement>,
+    /// Unresolved mappings that need human or LLM-assisted review.
+    pub unresolved_mappings: Vec<UnresolvedMapping>,
     /// Adjudication result.
     pub adjudication: AdjudicationResult,
 }
@@ -145,6 +171,9 @@ pub enum OutputError {
 
 /// Reads the CCP index hash from the CCP index file.
 fn read_ccp_index_hash(repo_root: &Path, prd_id: &str) -> Result<String, OutputError> {
+    // Validate PRD ID to prevent path traversal
+    validate_prd_id(prd_id)?;
+
     let index_path = repo_root
         .join("evidence")
         .join("prd")
@@ -183,17 +212,20 @@ fn read_ccp_index_hash(repo_root: &Path, prd_id: &str) -> Result<String, OutputE
 /// Computes the content hash for the impact map.
 fn compute_content_hash(
     mappings: &[MappedRequirement],
+    unresolved: &[UnresolvedMapping],
     adjudication: &AdjudicationResult,
 ) -> Result<String, OutputError> {
     // Create a hashable structure excluding timestamps
     #[derive(Serialize)]
     struct HashableContent<'a> {
         mappings: &'a [MappedRequirement],
+        unresolved: &'a [UnresolvedMapping],
         adjudication: &'a AdjudicationResult,
     }
 
     let content = HashableContent {
         mappings,
+        unresolved,
         adjudication,
     };
 
@@ -291,6 +323,9 @@ pub fn build_impact_map(
     prd_id: &str,
     options: &ImpactMapBuildOptions,
 ) -> Result<ImpactMapBuildResult, OutputError> {
+    // Validate PRD ID to prevent path traversal
+    validate_prd_id(prd_id)?;
+
     info!(
         repo_root = %repo_root.display(),
         prd_id = %prd_id,
@@ -320,15 +355,38 @@ pub fn build_impact_map(
     // Match requirements to components
     debug!("Matching requirements to components");
     let matcher = RequirementMatcher::new(components);
-    let mut mappings: Vec<MappedRequirement> = requirements
+
+    // Separate resolved and unresolved mappings
+    // Unresolved: no candidates at all or all candidates have similarity < 0.3
+    let (resolved, unresolved_raw): (Vec<_>, Vec<_>) = requirements
         .iter()
         .map(|req| matcher.match_requirement(req))
+        .partition(|m| !m.candidates.is_empty());
+
+    // Convert unresolved to UnresolvedMapping structs
+    let mut unresolved_mappings: Vec<UnresolvedMapping> = unresolved_raw
+        .into_iter()
+        .map(|m| UnresolvedMapping {
+            requirement_id: m.requirement_id,
+            requirement_title: m.requirement_title,
+            requirement_statement: m.requirement_statement,
+            reason: "No component matches found (Jaccard similarity below threshold)".to_string(),
+            suggested_action:
+                "Requires human review or LLM-assisted matching to determine target component"
+                    .to_string(),
+        })
         .collect();
 
-    // Sort mappings by requirement ID for determinism
+    // Sort for determinism
+    let mut mappings = resolved;
     mappings.sort_by(|a, b| a.requirement_id.cmp(&b.requirement_id));
+    unresolved_mappings.sort_by(|a, b| a.requirement_id.cmp(&b.requirement_id));
 
-    debug!(mapping_count = mappings.len(), "Mappings generated");
+    debug!(
+        mapping_count = mappings.len(),
+        unresolved_count = unresolved_mappings.len(),
+        "Mappings generated"
+    );
 
     // Adjudicate mappings
     debug!("Adjudicating mappings");
@@ -340,15 +398,16 @@ pub fn build_impact_map(
     );
 
     // Compute content hash
-    let content_hash = compute_content_hash(&mappings, &adjudication)?;
+    let content_hash = compute_content_hash(&mappings, &unresolved_mappings, &adjudication)?;
 
     // Build summary
     let summary = ImpactMapSummary {
-        total_requirements: mappings.len(),
+        total_requirements: mappings.len() + unresolved_mappings.len(),
         high_confidence_matches: adjudication.high_confidence_count,
         needs_review: adjudication.needs_review_count,
         duplication_risks: adjudication.duplication_risks.len(),
         net_new_count: adjudication.net_new_requirements.len(),
+        unresolved_count: unresolved_mappings.len(),
     };
 
     // Create impact map
@@ -360,6 +419,7 @@ pub fn build_impact_map(
         content_hash,
         summary,
         requirement_mappings: mappings,
+        unresolved_mappings,
         adjudication,
     };
 
@@ -513,6 +573,8 @@ mod tests {
             needs_review: false,
         }];
 
+        let unresolved: Vec<UnresolvedMapping> = vec![];
+
         let adjudication = AdjudicationResult {
             duplication_risks: vec![],
             net_new_requirements: vec![],
@@ -521,9 +583,45 @@ mod tests {
             needs_review_count: 0,
         };
 
-        let hash1 = compute_content_hash(&mappings, &adjudication).unwrap();
-        let hash2 = compute_content_hash(&mappings, &adjudication).unwrap();
+        let hash1 = compute_content_hash(&mappings, &unresolved, &adjudication).unwrap();
+        let hash2 = compute_content_hash(&mappings, &unresolved, &adjudication).unwrap();
 
         assert_eq!(hash1, hash2, "Content hash should be deterministic");
+    }
+
+    /// Test path traversal rejection in PRD ID.
+    #[test]
+    fn test_prd_id_path_traversal_rejected() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Try various path traversal attempts
+        let malicious_ids = [
+            "PRD-../../etc/passwd",
+            "PRD/../../../root/.ssh/id_rsa",
+            "PRD-TEST/../other",
+            "PRD\\..\\windows",
+            "../PRD-0001",
+        ];
+
+        for malicious_id in &malicious_ids {
+            let result = build_impact_map(root, malicious_id, &ImpactMapBuildOptions::default());
+            assert!(
+                result.is_err(),
+                "Should reject path traversal attempt: {malicious_id}"
+            );
+
+            // Verify it's the right error type
+            if let Err(OutputError::ImpactMapError(ImpactMapError::PathTraversalError {
+                path,
+                reason,
+            })) = result
+            {
+                assert_eq!(path, *malicious_id);
+                assert!(reason.contains("invalid characters"));
+            } else {
+                panic!("Expected PathTraversalError for {malicious_id}, got: {result:?}");
+            }
+        }
     }
 }

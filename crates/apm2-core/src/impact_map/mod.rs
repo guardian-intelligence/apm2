@@ -71,9 +71,9 @@ pub use adjudication::{
 };
 pub use mapper::{
     CandidateComponent, FitScore, ImpactMapError, MappedRequirement, RequirementMatcher,
-    parse_requirements,
+    parse_requirements, validate_prd_id,
 };
 pub use output::{
-    ImpactMap, ImpactMapBuildOptions, ImpactMapBuildResult, ImpactMapSummary, build_impact_map,
-    write_impact_map,
+    ImpactMap, ImpactMapBuildOptions, ImpactMapBuildResult, ImpactMapSummary, UnresolvedMapping,
+    build_impact_map, write_impact_map,
 };

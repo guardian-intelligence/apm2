@@ -109,10 +109,12 @@ pub enum ImpactMapError {
     },
 
     /// Path traversal attempt detected.
-    #[error("path traversal detected: {path} is outside repo root")]
+    #[error("path traversal detected: {path} - {reason}")]
     PathTraversalError {
         /// The path that attempted traversal.
         path: String,
+        /// Reason for the failure.
+        reason: String,
     },
 
     /// No requirements found.
@@ -125,6 +127,7 @@ pub enum ImpactMapError {
 
 /// A parsed PRD requirement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ParsedRequirement {
     /// Requirement ID (e.g., "REQ-0001").
     pub id: String,
@@ -142,11 +145,13 @@ pub struct ParsedRequirement {
 
 /// Raw YAML structure for requirement files.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RequirementYaml {
     prd_requirement: RequirementContent,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RequirementContent {
     id: String,
     #[serde(rename = "type")]
@@ -157,9 +162,18 @@ struct RequirementContent {
     acceptance_criteria: Vec<String>,
     #[serde(default)]
     evidence: Option<EvidenceBlock>,
+    /// Schema version (optional, not used but accepted for compatibility).
+    #[serde(default)]
+    #[allow(dead_code)]
+    schema_version: Option<String>,
+    /// Template version (optional, not used but accepted for compatibility).
+    #[serde(default)]
+    #[allow(dead_code)]
+    template_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EvidenceBlock {
     #[serde(default)]
     evidence_ids: Vec<String>,
@@ -203,6 +217,7 @@ impl FitScore {
 
 /// A candidate component for a requirement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CandidateComponent {
     /// Component ID (e.g., "COMP-CLI").
     pub component_id: String,
@@ -220,6 +235,7 @@ pub struct CandidateComponent {
 
 /// A requirement with its mapped candidate components.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MappedRequirement {
     /// Requirement ID.
     pub requirement_id: String,
@@ -338,9 +354,9 @@ impl RequirementMatcher {
         let needs_review =
             candidates.is_empty() || !candidates.iter().any(|c| c.fit_score == FitScore::High);
 
-        // Truncate statement for output
-        let statement_truncated = if requirement.statement.len() > 200 {
-            format!("{}...", &requirement.statement[..197])
+        // Truncate statement for output (safely handle multi-byte characters)
+        let statement_truncated = if requirement.statement.chars().count() > 200 {
+            format!("{}...", safe_truncate(&requirement.statement, 197))
         } else {
             requirement.statement.clone()
         };
@@ -418,6 +434,17 @@ impl RequirementMatcher {
     }
 }
 
+/// Safely truncates a string to a maximum number of characters.
+///
+/// This function handles multi-byte UTF-8 characters correctly, ensuring
+/// we never split in the middle of a character.
+fn safe_truncate(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
 /// Extracts words from text for Jaccard comparison.
 fn extract_words(text: &str) -> HashSet<String> {
     text.to_lowercase()
@@ -444,6 +471,21 @@ fn jaccard_similarity(set1: &HashSet<String>, set2: &HashSet<String>) -> f64 {
     }
 }
 
+/// Validates that a PRD ID does not contain path traversal characters.
+///
+/// # Errors
+///
+/// Returns `PathTraversalError` if the PRD ID contains `/`, `\`, or `..`.
+pub fn validate_prd_id(prd_id: &str) -> Result<(), ImpactMapError> {
+    if prd_id.contains('/') || prd_id.contains('\\') || prd_id.contains("..") {
+        return Err(ImpactMapError::PathTraversalError {
+            path: prd_id.to_string(),
+            reason: "PRD ID contains invalid characters".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Validates that a path is within the repository root.
 fn validate_path_within_repo(path: &Path, repo_root: &Path) -> Result<(), ImpactMapError> {
     let canonical_path = path.canonicalize().map_err(|e| ImpactMapError::ReadError {
@@ -461,6 +503,7 @@ fn validate_path_within_repo(path: &Path, repo_root: &Path) -> Result<(), Impact
     if !canonical_path.starts_with(&canonical_root) {
         return Err(ImpactMapError::PathTraversalError {
             path: path.display().to_string(),
+            reason: "path is outside repo root".to_string(),
         });
     }
 
@@ -520,6 +563,9 @@ pub fn parse_requirements(
     repo_root: &Path,
     prd_id: &str,
 ) -> Result<Vec<ParsedRequirement>, ImpactMapError> {
+    // Validate PRD ID to prevent path traversal
+    validate_prd_id(prd_id)?;
+
     let requirements_dir = repo_root
         .join("documents")
         .join("prds")
@@ -620,6 +666,9 @@ pub fn load_components_from_ccp(
     repo_root: &Path,
     prd_id: &str,
 ) -> Result<Vec<ComponentInfo>, ImpactMapError> {
+    // Validate PRD ID to prevent path traversal
+    validate_prd_id(prd_id)?;
+
     let atlas_path = repo_root
         .join("evidence")
         .join("prd")
@@ -1053,5 +1102,101 @@ pub mod tests {
         assert_eq!(FitScore::from_similarity(0.2, false), None);
         // Exact match always high
         assert_eq!(FitScore::from_similarity(0.2, true), Some(FitScore::High));
+    }
+
+    /// Test safe truncation with multibyte characters.
+    #[test]
+    fn test_safe_truncate() {
+        // ASCII string
+        let ascii = "Hello, World!";
+        assert_eq!(safe_truncate(ascii, 5), "Hello");
+        assert_eq!(safe_truncate(ascii, 100), ascii);
+
+        // String with multibyte emoji at various positions
+        let emoji = "Hello World!";
+        assert_eq!(safe_truncate(emoji, 5), "Hello");
+
+        // String with emoji that would be at the truncation boundary
+        // 196 regular chars + emoji (4 bytes)
+        let boundary_test = format!("{}X", "a".repeat(196));
+        let truncated = safe_truncate(&boundary_test, 197);
+        assert_eq!(truncated.len(), 197);
+        assert_eq!(truncated.chars().count(), 197);
+    }
+
+    /// Test multibyte truncation is safe - no panic on emoji at position ~197.
+    #[test]
+    fn test_multibyte_truncation_safe() {
+        // Create a statement with emojis around position 197
+        // Each emoji is multiple bytes, so this tests the safe truncation
+        let prefix = "a".repeat(195);
+        let emoji_suffix = "abcdef"; // emojis at byte positions that would cause panic
+        let long_statement = format!("{prefix}{emoji_suffix}");
+
+        let requirement = ParsedRequirement {
+            id: "REQ-EMOJI".to_string(),
+            requirement_type: "FUNCTIONAL".to_string(),
+            title: "Test emoji truncation".to_string(),
+            statement: long_statement,
+            acceptance_criteria: vec![],
+            evidence_ids: vec![],
+        };
+
+        // Create a matcher with no components - we just want to test truncation
+        let matcher = RequirementMatcher::new(vec![]);
+
+        // This should not panic even though the string has multibyte chars
+        let mapping = matcher.match_requirement(&requirement);
+
+        // Verify truncation happened safely
+        assert!(mapping.requirement_statement.ends_with("..."));
+        assert_eq!(mapping.requirement_statement.chars().count(), 200); // 197 + "..."
+
+        // Now test with emoji exactly at character position 197
+        // This creates a string of 250 characters with an emoji at position 197
+        let before_emoji = "A".repeat(197);
+        let after_emoji = "B".repeat(49);
+        let emoji_at_boundary = format!("{before_emoji}x{after_emoji}");
+        let requirement2 = ParsedRequirement {
+            id: "REQ-BOUNDARY".to_string(),
+            requirement_type: "FUNCTIONAL".to_string(),
+            title: "Test boundary".to_string(),
+            statement: emoji_at_boundary,
+            acceptance_criteria: vec![],
+            evidence_ids: vec![],
+        };
+
+        // This should also not panic (string is > 200 chars so will be truncated)
+        let mapping2 = matcher.match_requirement(&requirement2);
+        assert!(mapping2.requirement_statement.ends_with("..."));
+        // The truncation should produce exactly 200 characters (197 + "...")
+        assert_eq!(mapping2.requirement_statement.chars().count(), 200);
+    }
+
+    /// Test PRD ID validation rejects path traversal.
+    #[test]
+    fn test_validate_prd_id_rejects_traversal() {
+        // Should reject forward slash
+        assert!(matches!(
+            validate_prd_id("PRD-../../etc/passwd"),
+            Err(ImpactMapError::PathTraversalError { .. })
+        ));
+
+        // Should reject backslash
+        assert!(matches!(
+            validate_prd_id("PRD\\..\\windows"),
+            Err(ImpactMapError::PathTraversalError { .. })
+        ));
+
+        // Should reject double-dot
+        assert!(matches!(
+            validate_prd_id(".."),
+            Err(ImpactMapError::PathTraversalError { .. })
+        ));
+
+        // Should accept valid PRD IDs
+        assert!(validate_prd_id("PRD-0001").is_ok());
+        assert!(validate_prd_id("PRD-TEST").is_ok());
+        assert!(validate_prd_id("PRD-2026-01-26").is_ok());
     }
 }

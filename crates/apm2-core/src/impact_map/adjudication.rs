@@ -39,6 +39,7 @@ pub enum DuplicationSeverity {
 
 /// A duplication risk identified during adjudication.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DuplicationRisk {
     /// Requirement ID with the duplication risk.
     pub requirement_id: String,
@@ -56,6 +57,7 @@ pub struct DuplicationRisk {
 
 /// Classification for requirements without strong component matches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetNewClassification {
     /// Requirement ID classified as net-new.
     pub requirement_id: String,
@@ -69,6 +71,7 @@ pub struct NetNewClassification {
 
 /// Result of adjudication analysis.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdjudicationResult {
     /// Duplication risks identified.
     pub duplication_risks: Vec<DuplicationRisk>,
