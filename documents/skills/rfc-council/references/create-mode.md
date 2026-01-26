@@ -1,10 +1,19 @@
 title: RFC CREATE Mode
 
+# Execution Context
+#
+# This file serves two modes with conditional execution:
+# - CREATE mode: Executes PHASE_1 -> PHASE_2 -> PHASE_4 -> PHASE_5 (skips PHASE_3)
+# - DECOMPOSE mode: Jumps directly to PHASE_3 only (ticket generation)
+#
+# The `condition` field on each step indicates which mode(s) execute it.
+# Steps without a condition are executed by all modes.
+
 decision_tree:
   entrypoint: CREATE_FLOW
   nodes[1]:
     - id: CREATE_FLOW
-      purpose: "Generate RFC and tickets from PRD."
+      purpose: "Generate RFC and tickets from PRD. Also handles DECOMPOSE mode for ticket generation."
       steps[6]:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables; replace <PRD_ID> and <RFC_ID> placeholders before running commands."
@@ -42,10 +51,16 @@ decision_tree:
             (see COUNCIL_PROTOCOL.md Step 3: Stochastic Mode Selection for algorithm).
 
         - id: PHASE_3_TICKET_CREATION
+          condition: "mode is DECOMPOSE"
           action: |
             Generate engineering tickets from approved RFC v4:
-            (This phase is invoked directly by DECOMPOSE mode via rfc-council-workflow.md)
+            (DECOMPOSE mode jumps directly to this step via rfc-council-workflow.md)
 
+            Prerequisites:
+            - RFC is at version v4 (Standard phase)
+            - 06_ticket_decomposition.yaml has planned ticket structure
+
+            Steps:
             1. Read `06_ticket_decomposition.yaml` for planned ticket structure.
             2. For each planned ticket:
                a. Create `documents/work/tickets/TCK-XXXXX.yaml`
@@ -58,14 +73,17 @@ decision_tree:
                git add documents/work/tickets/TCK-*.yaml
                git commit -m "docs(RFC-XXXX): Generate engineering tickets from v4"
                ```
+            5. Return to caller (do not proceed to PHASE_4/PHASE_5).
 
         - id: PHASE_4_SELF_REVIEW
+          condition: "mode is CREATE"
           action: |
             Execute REVIEW mode on v0:
             - Focus on GATE-TCK-SCOPE-COVERAGE and GATE-TCK-SCHEMA.
             - Accept failing gates for ATOMICITY/IMPLEMENTABILITY if documented as open questions in 08_risks_and_open_questions.yaml.
 
         - id: PHASE_5_COMMIT
+          condition: "mode is CREATE"
           action: |
             Stage and commit:
             ```bash
