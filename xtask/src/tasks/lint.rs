@@ -1019,9 +1019,9 @@ fn get_new_rust_files() -> Result<Vec<String>> {
 
     let untracked = String::from_utf8_lossy(&output.stdout);
 
-    // Get staged new/modified files
+    // Get staged new files only (not modified)
     let output = Command::new("git")
-        .args(["diff", "--cached", "--name-only", "--diff-filter=AM"])
+        .args(["diff", "--cached", "--name-only", "--diff-filter=A"])
         .output()
         .context("Failed to run git diff --cached")?;
 
@@ -1176,6 +1176,30 @@ fn check_pub_items_for_deletion_plan(
                 let name = item_mod.ident.to_string();
                 let line = item_mod.ident.span().start().line;
                 (name, line, "module")
+            },
+            syn::Item::Enum(item_enum) if matches!(item_enum.vis, syn::Visibility::Public(_)) => {
+                let name = item_enum.ident.to_string();
+                let line = item_enum.ident.span().start().line;
+                (name, line, "enum")
+            },
+            syn::Item::Const(item_const)
+                if matches!(item_const.vis, syn::Visibility::Public(_)) =>
+            {
+                let name = item_const.ident.to_string();
+                let line = item_const.ident.span().start().line;
+                (name, line, "constant")
+            },
+            syn::Item::Static(item_static)
+                if matches!(item_static.vis, syn::Visibility::Public(_)) =>
+            {
+                let name = item_static.ident.to_string();
+                let line = item_static.ident.span().start().line;
+                (name, line, "static")
+            },
+            syn::Item::Type(item_type) if matches!(item_type.vis, syn::Visibility::Public(_)) => {
+                let name = item_type.ident.to_string();
+                let line = item_type.ident.span().start().line;
+                (name, line, "type alias")
             },
             _ => continue,
         };
