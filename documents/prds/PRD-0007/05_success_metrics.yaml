@@ -2,7 +2,7 @@ prd_success_metrics:
   schema_version: "2026-01-23"
   template_version: "2026-01-23"
   metrics:
-    - id: MET-0001
+    - id: CAC-M-LEAD-0001
       name: Unplanned context reads in consumption mode
       description: Count of denied or defect-emitting context reads per work item.
       baseline: "Baseline established from first 30 days post-deployment; expected >50 per 1000 work items."
@@ -10,7 +10,7 @@ prd_success_metrics:
       measurement_method: "Aggregate PolicyViolation and DefectRecord events from ledger; compute rate per 1000 work items with Wilson score interval."
       evidence_ids:
         - EVID-0005
-    - id: MET-0002
+    - id: CAC-M-LEAD-0002
       name: ContextPack completeness rate
       description: Fraction of work items completed without unplanned reads.
       baseline: "Baseline established from first 30 days; expected <50% initially."
@@ -18,7 +18,7 @@ prd_success_metrics:
       measurement_method: "RunReceipt analysis for context_pack_sufficiency=true; Clopper-Pearson exact confidence interval."
       evidence_ids:
         - EVID-0011
-    - id: MET-0003
+    - id: CAC-M-LEAD-0004
       name: ContextPack miss rate
       description: Rate of context_pack_miss entries per run receipt.
       baseline: "Baseline established from first 30 days; expected >2 misses per run."
@@ -26,7 +26,7 @@ prd_success_metrics:
       measurement_method: "Aggregate context_pack_miss counts from RunReceipts; Poisson rate with exact confidence interval."
       evidence_ids:
         - EVID-0011
-    - id: MET-0004
+    - id: CAC-M-LEAD-0005
       name: ContextPack sufficiency rate
       description: Fraction of runs where context_pack_sufficiency=true.
       baseline: "Baseline established from first 30 days; expected <50% initially."
@@ -34,7 +34,7 @@ prd_success_metrics:
       measurement_method: "RunReceipt aggregation with Clopper-Pearson exact confidence interval."
       evidence_ids:
         - EVID-0011
-    - id: MET-0005
+    - id: CAC-M-LEAD-0003
       name: Admission rejection rate by category
       description: Schema/canonicalization/replay/policy rejection counts.
       baseline: "Expected >30% rejection rate in first 30 days during adoption."
@@ -43,7 +43,7 @@ prd_success_metrics:
       evidence_ids:
         - EVID-0002
         - EVID-0003
-    - id: MET-0006
+    - id: CAC-M-LAG-0001
       name: PR cycle time
       description: Median time from work opened to work completed and merged.
       baseline: "Current baseline to be measured via EVID-0013 methodology."
@@ -51,7 +51,7 @@ prd_success_metrics:
       measurement_method: "WorkEvent timeline analysis from ledger with stratification by PR complexity and work type."
       evidence_ids:
         - EVID-0013
-    - id: MET-0007
+    - id: CAC-M-LAG-0002
       name: Defect recurrence rate (missing-context class)
       description: Repeat incidence of UNPLANNED_CONTEXT_READ defects on similar work types.
       baseline: "Baseline established from first 30 days of DefectRecord collection."

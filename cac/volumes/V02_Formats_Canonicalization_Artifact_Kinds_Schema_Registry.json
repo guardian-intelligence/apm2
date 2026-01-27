@@ -7,7 +7,11 @@
         "artifact_hashing_policy": {
           "algorithm": "BLAKE3-256",
           "hash_id_format": "b3-256:<hex>",
-          "note": "Align with existing APM2 Evidence/CAS hashing to keep the stack coherent."
+          "note": "Align with existing APM2 Evidence/CAS hashing to keep the stack coherent.",
+          "collision_resistance": "128-bit (birthday bound)",
+          "security_level_requirement": "≥256-bit per SEC-PROP-0005",
+          "upgrade_timeline": "BLAKE3-256 adequate for initial deployment. Upgrade to BLAKE3-512 or quantum-resistant hash required before 2035 or when NIST deprecates BLAKE3-256 collision resistance, whichever comes first.",
+          "monitoring": "Tracked via SEC-PROP-0005 upgrade_policy"
         },
         "typed_quantities": {
           "note": "All budgets, timeouts, costs, and probabilities must use typed quantities with explicit units to avoid ad hoc string formats.",

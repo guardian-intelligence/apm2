@@ -186,18 +186,21 @@ prd_risks_questions:
           recommendation: Not recommended; security posture insufficient
       coordinated_mitigation:
         rollout_phases:
-          - phase: "Week 1-3"
+          - phase: "CAC-R-01 (7 days)"
             mode: WARN
-            description: "All violations logged but not blocking"
-          - phase: "Week 4-6"
-            mode: SOFT_FAIL
-            description: "High-severity violations block; others warn"
-          - phase: "Week 7-8"
-            mode: HARD_FAIL
-            description: "All violations block; escalation available"
+            description: "Warn-only linting + bootstrap schemas; all violations logged but not blocking."
+          - phase: "CAC-R-02 (14 days)"
+            mode: ADMISSION_FAIL
+            description: "Admission pipeline enabled; fail on admission violations for new artifacts."
+          - phase: "CAC-R-03 (14 days)"
+            mode: CONSUMPTION_FAIL
+            description: "Hermetic consumption + run receipt gating; fail on discretionary reads."
+          - phase: "CAC-R-04 (14 days)"
+            mode: RELEASE_FAIL
+            description: "Target delivery + capabilities gating; fail on export drift; require AATReceipt."
         acceleration_clause: |
-          If MET-0002 (pack completeness) >85% at week 5, advance to HARD_FAIL at week 6.
-          Data-driven acceleration rewards faster-than-expected adoption.
+          If CAC-M-LEAD-0002 (pack completeness) >85% at week 5, advance to CAC-R-03/04
+          acceleration. Data-driven acceleration rewards faster-than-expected adoption.
         rollout_sla:
           during_rollout: "24h standard, 4h emergency"
           post_rollout: "48h standard, 4h emergency"

@@ -180,89 +180,72 @@ prd_solution_overview:
         schema_id: cac.target_profile.v1
         normative: true
         consume_allowed: true
-        purpose: Defines rendering, retrieval, and delivery constraints.
+        purpose: Defines rendering, retrieval, and delivery constraints independent of model intelligence; drives compilation.
       - kind_id: canonicalizer.vectors
         schema_id: cac.canonicalizer_vectors.v1
         normative: true
         consume_allowed: true
         purpose: Governed canonicalization test vectors pinned in the bootstrap trust root.
+      - kind_id: vendor.profile
+        schema_id: cac.vendor_profile.v1
+        normative: false
+        consume_allowed: true
+        purpose: Derived vendor delivery profile compiled from TargetProfile (compatibility surface, not normative).
       - kind_id: capabilities.manifest
         schema_id: cac.capabilities_manifest.v1
         normative: true
         consume_allowed: true
-        purpose: Declares what the CLI/kernel actually supports.
-      - kind_id: typed_quantity.definition
-        schema_id: cac.typed_quantity.v1
-        normative: true
-        consume_allowed: true
-        purpose: |
-          Canonical schema for quantities with explicit units. All artifact schemas
-          referencing quantities (budgets, timeouts, costs, probabilities) MUST
-          use $ref to this schema.
-        schema_fields:
-          value: "int64 (REQUIRED)"
-          unit: "enum [TOKENS, BYTES, SECONDS, MILLISECONDS, PROBABILITY, COUNT] (REQUIRED)"
-          confidence: "probability (OPTIONAL, for uncertain quantities)"
+        purpose: Declares what the CLI/kernel actually supports (truth surface for agents).
       - kind_id: context_pack.spec
         schema_id: cac.context_pack_spec.v1
         normative: true
         consume_allowed: true
-        purpose: Defines which stable IDs constitute a ContextPack.
-        dependency_trust_boundary:
-          description: |
-            Pack specs referencing stable_ids MUST capture resolved hashes at review time
-            via dependency_review_hash field. Compilation warns/fails if resolved hash
-            differs from reviewed hash, preventing timing-based injection attacks.
-            Additionally, provenance review captures WHO authored each dependency.
-          required_fields:
-            - field: dependency_review_hash
-              type: "map<stable_id, content_hash>"
-              purpose: "Captures resolved hashes at review time"
-            - field: dependency_review_timestamp
-              type: "ISO-8601 timestamp"
-              purpose: "Records when dependency hashes were captured"
-            - field: dependency_provenance
-              type: "map<stable_id, ProvenanceEntry>"
-              purpose: "Captures author identity and admission receipt for each dependency"
-            - field: ProvenanceEntry
-              type: "object"
-              schema:
-                author_identity: "string - hash of producer's signing key"
-                admission_receipt_hash: "string - CAS hash of admission receipt"
-                reviewed_at: "ISO-8601 timestamp"
-          compilation_behavior:
-            on_hash_mismatch: "FAIL by default; WARN with --allow-hash-drift flag"
-            on_unknown_author: "WARN if author_identity not on approved producer list"
-            audit_event: "DependencyHashDrift emitted with old_hash, new_hash, stable_id"
+        purpose: Defines which stable IDs constitute a ContextPack and the pack's consumption contract.
+        prd_refinement:
+          dependency_trust_boundary: |
+            Pack specs MUST capture resolved hashes at review time via dependency_review_hash
+            field. Compilation fails if resolved hash differs from reviewed hash.
       - kind_id: context_pack.manifest
         schema_id: cac.context_pack_manifest.v1
         normative: false
         consume_allowed: true
-        purpose: Compiled output listing resolved stable IDs and hashes.
+        purpose: Compiled output listing resolved stable IDs, hashes, and derived pack artifacts.
+      - kind_id: export.manifest
+        schema_id: cac.export_manifest.v1
+        normative: false
+        consume_allowed: true
+        purpose: Derived output describing a vendor export tree and its provenance.
+      - kind_id: changeset.report
+        schema_id: cac.changeset_report.v1
+        normative: false
+        consume_allowed: true
+        purpose: Standardized semantic delta report for patch admissions and compaction.
       - kind_id: receipt.admission
         schema_id: cac.admission_receipt.v1
         normative: false
         consume_allowed: true
-        purpose: Evidence receipt proving artifact admission.
+        purpose: Evidence receipt proving an artifact was admitted (validated, canonicalized, stored, indexed).
       - kind_id: receipt.aat
         schema_id: cac.aat_receipt.v1
         normative: false
         consume_allowed: true
-        purpose: Evidence receipt proving acceptance/selftests passed.
+        purpose: Evidence receipt proving acceptance/selftests passed with bounded resources.
       - kind_id: receipt.run
         schema_id: cac.run_receipt.v1
         normative: false
         consume_allowed: true
-        purpose: Evidence receipt for consumption runs.
-      - kind_id: escalation.policy
-        schema_id: cac.escalation_policy.v1
-        normative: true
+        purpose: Evidence receipt for consumption runs (pack sufficiency, misses, and budget usage).
+      - kind_id: defect.record
+        schema_id: cac.defect_record.v1
+        normative: false
         consume_allowed: true
-        purpose: |
-          Defines escalation governance for pack misses: authority_role (who can authorize),
-          escalation_criteria (what conditions allow escalation), escalation_ttl (max duration
-          before re-evaluation), audit_event_type (how escalations are recorded), and
-          escalation_count_metric (feedback signal for pack specification improvement).
+        purpose: Evidence-backed defect records feeding improvement loops.
+    common_types:
+      typed_quantity:
+        schema_id: cac.common.v1#/$defs/quantity
+        note: |
+          All budgets, timeouts, costs, and probabilities MUST use this typed quantity
+          standard with explicit units (ms, bytes, tokens, count, percent, usd).
   pipeline:
     overview: |
       A closed-loop, message-native context pipeline: machines propose patches with semantic
@@ -301,49 +284,39 @@ prd_solution_overview:
       - stage_id: CAC-STAGE-08
         name: Consume (Execution/Review/Ops)
         mode: CONSUME
-        description: Hermetic consumption with RunReceipt emission and defect tracking.
-      - stage_id: CAC-STAGE-09
-        name: Feedback Loop - Defect-to-Improvement
-        mode: PRODUCE
         description: |
-          DefectRecords aggregate into improvement signals. Pack specifications are
-          reviewed when thresholds trigger. Feedback latency SLA is enforced.
-    feedback_loop:
+          Hermetic consumption with RunReceipt emission and defect tracking.
+          Unplanned reads/tool calls are treated as compiler defects.
+    closed_loop:
       description: |
-        Closed-loop mechanism that converts DefectRecords from consumption into
-        pack specification improvements. This operationalizes the conceptual
-        feedback mentioned in the pipeline overview.
-      aggregation:
+        The system treats unplanned reads/tool calls in consumption mode as compiler
+        defects, not execution necessities. These signals feed back into the
+        pipeline to drive systematic improvements.
+      feedback_targets:
+        - ContextPack compiler rules
+        - Schema evolution (tighten or expand)
+        - Capability manifest updates
+        - Target profile updates
+        - ChangeSet compaction rules
+      signals:
+        - PolicyViolation events
+        - BudgetExceeded events
+        - Unplanned tool call attempts in consumption mode
+        - Selftest/AAT failures
+        - Export conformance failures
+      operational_refinement:
+        description: |
+          Operational triggers for defect aggregation and pack review (PRD elaboration).
         trigger_conditions:
           - id: TRIGGER-SIGNATURE-THRESHOLD
             condition: "Same defect signature occurs ≥3 times within 7 days"
             action: "Emit PACK_SPEC_REVIEW_NEEDED event"
           - id: TRIGGER-ESCALATION-FREQUENCY
-            condition: "Same stable_id escalated ≥2 times within 14 days"
-            action: "Prioritize stable_id in pack spec review queue"
-          - id: TRIGGER-MISS-RATE-SPIKE
-            condition: "context_pack_miss rate increases >50% week-over-week"
-            action: "Alert DOMAIN_COMPILER team; emergency pack review"
-        aggregation_window: "Rolling 7-day window with daily snapshots"
-        clustering_algorithm: "Jaccard similarity on stable_id patterns"
-      pack_review:
-        cadence: "Weekly review of triggered pack specs; daily for emergency triggers"
-        review_queue_priority:
-          - "Emergency triggers (miss rate spike)"
-          - "High-frequency escalation stable_ids"
-          - "Recurring signature patterns"
+            threshold: "≥2 escalations for same stable_id within 14 days"
+            action: "Emergency pack review"
         sla:
-          during_rollout:
-            standard_review: "24 hours from trigger to pack spec update"
-            emergency_review: "4 hours from trigger to pack spec update"
-          post_rollout:
-            standard_review: "48 hours from trigger to pack spec update"
-            emergency_review: "4 hours from trigger to pack spec update"
-          transition: "Post-rollout SLA applies after week 8 of graduated enforcement"
-      metrics:
-        pack_spec_evolution_rate: "Count of pack spec updates per week"
-        trigger_to_resolution_time: "Time from PACK_SPEC_REVIEW_NEEDED to merged update"
-        feedback_effectiveness: "Reduction in defect recurrence after pack update"
+          standard_review: "48 hours from trigger to pack spec update"
+          emergency_review: "4 hours from trigger to pack spec update"
   interfaces:
     external_apis:
       - name: ArtifactFetch Tool Protocol

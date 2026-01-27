@@ -97,10 +97,16 @@ prd_constraints_invariants:
             description: "All three signatories must complete signoffs within a shared ceremony window"
             shared_nonce: "All signatories MUST sign the same nonce to bind the ceremony"
             ceremony_timeout: "If all 3 signatories do not complete within 15-minute window, ceremony is invalid and must restart"
+            atomic_initiation: |
+              First signatory MUST acquire the emergency_override_ceremony_lock.
+              Lock acquisition: (1) Verify no active ceremony, (2) Atomically set lock
+              with ceremony_nonce and ceremony_start_timestamp. Only one ceremony
+              active globally at any time.
             ceremony_binding:
               - "Ceremony begins when first signatory generates ceremony_start_timestamp and ceremony_nonce"
               - "All subsequent signatories MUST reference the same ceremony_start_timestamp and ceremony_nonce"
               - "Ceremony expires if third signatory does not complete within 15 minutes of ceremony_start_timestamp"
+              - "Lock prevents any other ceremony initiation during active ceremony window"
           signoff_protocol:
             description: "Cryptographically bound triple-signoff ceremony"
             input_fields:
@@ -122,11 +128,13 @@ prd_constraints_invariants:
               - "System verifies: (e) all three signoffs completed within 15-minute ceremony window"
               - "System verifies: (f) no emergency override used within past 24 hours (cooldown)"
               - "Signoffs are single-use and expire after 1 hour"
+              - "System MUST reject signoffs if timestamp corresponds to non-active ceremony (lock released/expired)"
             audit_requirements:
               - "All emergency override attempts logged with full input tuple"
               - "Both successful and failed attempts emit audit events"
               - "Nonce registry persisted to prevent replay after restart"
               - "Cooldown violations logged with attempted override details"
+              - "Fallback audit buffering supported if external sink unreachable (SEC-CTRL-0011)"
           external_audit_sink:
             description: "Near-real-time external audit event delivery for emergency overrides"
             requirements:
@@ -134,7 +142,36 @@ prd_constraints_invariants:
               - "Maximum delivery latency: 5 seconds from event emission"
               - "Audit events MUST include: ceremony_nonce, all three authority identities, timestamps, outcome"
               - "Failed delivery MUST block emergency override activation"
+              - "Bootstrap-safe-mode audit supports direct write bypassing bus (SEC-CTRL-0012)"
             delivery_guarantee: "At-least-once delivery with deduplication by ceremony_nonce"
+        post_override_obligations:
+          description: "Mandatory actions after emergency override execution"
+          purpose: "Ensure emergency override triggers accountability and remediation"
+          immediate_obligations:
+            - obligation_id: "OBL-OVERRIDE-001"
+              responsible_role: "AUTH_SECURITY"
+              action: "Initiate incident investigation within 4 hours"
+            - obligation_id: "OBL-OVERRIDE-002"
+              responsible_role: "All three signatory authorities"
+              action: "Initial incident report within 24 hours"
+          investigation_obligations:
+            - obligation_id: "OBL-OVERRIDE-003"
+              responsible_role: "AUTH_SECURITY"
+              action: "Complete incident investigation within 72 hours"
+          governance_obligations:
+            - obligation_id: "OBL-OVERRIDE-004"
+              responsible_role: "DOMAIN_GOVERNANCE"
+              action: "Review incident report and determine corrective actions within 7 days"
+          recurrence_obligations:
+            - obligation_id: "OBL-OVERRIDE-005"
+              responsible_role: "DOMAIN_GOVERNANCE + Board"
+              action: "Board briefing if used ≥2 times within 90 days"
+          prohibition:
+            - prohibition_id: "PROH-OVERRIDE-001"
+              statement: "Emergency override CANNOT be used for the same root cause twice without board approval."
+          enforcement:
+            incomplete_investigation_consequence: "MAJOR defect emitted if deadlines missed"
+            recurrence_without_remediation_consequence: "CRITICAL defect + automatic board escalation"
         state_repair_protocol:
           description: "Offline tooling for ledger state inspection and repair in cold-start scenarios"
           components:
@@ -175,7 +212,7 @@ prd_constraints_invariants:
           constraint: "Delegates cannot be same person as primary for any role"
           sla_commitment: "99.9%+ availability for recovery path"
         tiered_recovery_protocol:
-          description: "Three-tier recovery protocol with escalation path for authority unavailability"
+          description: "Four-tier recovery protocol with escalation path for authority unavailability"
           purpose: "Prevents permanent lockout while maintaining security controls appropriate to degraded state"
           state_machine:
             TIER_1:
@@ -211,9 +248,21 @@ prd_constraints_invariants:
                 - "Full incident report"
                 - "Root cause analysis"
                 - "Post-mortem with preventive measures"
+              ttl: "48 hours maximum before TIER_4 activation"
+            TIER_4:
+              name: "Dead Man's Switch - Ultimate Fallback"
+              activation_conditions:
+                - "TIER_3 board escalation exceeds 48 hours without resolution"
+                - "OR all recovery paths exhausted"
+              capabilities: "READ_ONLY_ARCHIVE mode; state export to cold storage"
+              restrictions: "No state mutations; no new event emissions"
+              recovery_path: "Manual cold-start rebuild from checkpoint (expected latency >72h)"
+              audit_requirements: "CRITICAL severity incident; board must authorize rebuild"
           transitions:
             - "TIER_1 → TIER_2: Primary authority unavailability >4 hours"
             - "TIER_2 → TIER_3: Degraded state >24 hours OR critical failure"
+            - "TIER_3 → TIER_4: Resolution failure >48 hours"
+            - "TIER_4 → TIER_1: Manual restoration completed"
             - "TIER_3 → TIER_1: Board resolution + authority availability restored"
             - "TIER_2 → TIER_1: Authority availability restored"
         external_witness:
@@ -356,9 +405,29 @@ prd_constraints_invariants:
         - EVID-0011
     - id: SEC-PROP-0005
       name: Algorithm agility
-      statement: Cryptographic mechanisms and canonicalization engines are versioned and upgradable.
+      statement: |
+        Cryptographic mechanisms and canonicalization engines are versioned and upgradable.
+        Hash algorithms MUST provide ≥256-bit collision resistance or use hybrid
+        classical+quantum-resistant scheme.
       evidence_ids:
         - EVID-0001
+      upgrade_policy:
+        description: Hash algorithm upgrade when collision resistance degrades
+        trigger: |
+          Bootstrap schema bundle upgrade MUST mandate hash algorithm upgrade when
+          collision resistance degrades below 256-bit security level.
+        monitoring:
+          - Track NIST cryptographic security deprecation timelines
+          - Emit warning when hash algorithm within 5 years of deprecation
+          - Emit CRITICAL alert when hash algorithm deprecated
+        upgrade_procedure:
+          - New bootstrap schema bundle with upgraded hash algorithm
+          - Binary release required (not runtime patch per CNS-0006)
+          - Ledger migration to re-hash all artifacts with new algorithm
+        rationale: |
+          BLAKE3-256 currently provides 128-bit collision resistance (birthday bound).
+          While adequate for short-term (5-10 years), long-term operation requires
+          explicit commitment to upgrade before collision attacks become feasible.
     - id: SEC-PROP-0006
       name: Dependency trust boundary integrity
       statement: Pack specs pin dependency hashes at review time; compilation rejects drift.
@@ -402,26 +471,85 @@ prd_constraints_invariants:
       type: preventative
       details: Canonicalizer id/version and test-vector reference recorded in envelopes/receipts.
     - id: SEC-CTRL-0010
+      name: Atomic ceremony initiation (race condition prevention)
+      type: preventative
+      details: |
+        Emergency override ceremonies use atomic initiation with distributed lock to
+        prevent concurrent ceremonies. Only one ceremony can be active globally at any time.
+      implementation:
+        lock_id: emergency_override_ceremony_lock
+        lock_acquisition: |
+          First signatory must acquire lock before generating ceremony_start_timestamp.
+          Lock acquisition includes: (1) Verify no active ceremony (lock available),
+          (2) Atomically set lock with ceremony_nonce and ceremony_start_timestamp,
+          (3) Lock expires automatically after 15 minutes.
+        requirements:
+          - Only ONE ceremony can be active globally at any time.
+          - Ceremony lock released after ceremony completes or expires.
+          - System MUST reject signoffs if timestamp corresponds to non-active ceremony.
+    - id: SEC-CTRL-0011
+      name: Degraded audit mode for emergency override
+      type: detective+compensating
+      details: |
+        Fallback audit mechanism when external sink is unreachable. Emergency override
+        MAY proceed with local audit buffering.
+      requirements:
+        - Audit events buffered with HMAC-SHA256 integrity protection.
+        - Buffer size limited to 1000 events (prevent DoS).
+        - Post-recovery: buffered events MUST be force-pushed to external sink.
+        - Failed delivery triggers INCIDENT with board escalation.
+        - Degraded mode limited to 72 hours maximum.
+    - id: SEC-CTRL-0012
+      name: Bootstrap-safe-mode audit
+      type: detective+compensating
+      details: |
+        Minimal audit capability for bootstrap-safe-mode to resolve circular dependency.
+      capabilities:
+        - Bootstrap-safe-mode MUST support emergency override audit emission.
+        - Degraded audit-only operations (no admission/compilation).
+        - Direct write to external audit sink bypassing kernel event bus.
+    - id: SEC-CTRL-0013
+      name: TIER_4 Dead Man's Switch - Ultimate Fallback
+      type: corrective+detective
+      details: |
+        Ultimate fallback when all recovery paths exhausted.
+      activation_conditions:
+        - TIER_3 board escalation exceeds 48 hours without resolution.
+        - OR all recovery paths exhausted.
+      capabilities:
+        - System enters READ_ONLY_ARCHIVE mode.
+        - All state exported to content-addressed cold storage.
+        - External audit receives cryptographic proof-of-state snapshot.
+      restrictions:
+        - No state mutations permitted.
+        - No new event emissions.
+      recovery_path:
+        process: Human operator initiates offline manual recovery.
+        expected_latency: ">72 hours"
+        requirements: Requires cold-start rebuild from last known-good checkpoint.
+        sla_ceiling: |
+          If bootstrap recovery exceeds 72 hours, system considered permanently compromised.
+    - id: SEC-CTRL-0014
       name: Dependency trust boundary protection
       type: preventative
       details: |
         Pack specs capture dependency_review_hash at review time. Compilation fails if
         resolved hash differs from reviewed hash, preventing timing-based injection where
         an adversary modifies stable_id content between review and compilation.
-    - id: SEC-CTRL-0011
+    - id: SEC-CTRL-0015
       name: Dependency hash drift auditing
       type: detective
       details: |
         DependencyHashDrift events emitted when compilation detects hash mismatch. Events
         include old_hash, new_hash, stable_id, and review_timestamp for investigation.
-    - id: SEC-CTRL-0012
+    - id: SEC-CTRL-0016
       name: AATReceipt binary binding
       type: preventative
       details: |
         AATReceipts MUST be cryptographically bound to binary hash. Required fields:
         binary_hash (BLAKE3-256 of apm2 binary), capability_manifest_hash, test_suite_version,
         execution_timestamp. Receipts for mismatched binaries are rejected.
-    - id: SEC-CTRL-0013
+    - id: SEC-CTRL-0017
       name: Content-hash-only fetch restriction
       type: preventative
       details: |

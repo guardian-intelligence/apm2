@@ -2,54 +2,54 @@ prd_goals_scope:
   schema_version: "2026-01-23"
   template_version: "2026-01-23"
   goals:
-    - id: G-0001
+    - id: CAC-G-0001
       statement: Canonical context substrate (CAC-JSON) - All normative control artifacts are stored, validated, and canonicalized as CAC-JSON.
       measurable_outcomes:
         - All normative control artifacts are stored as CAC-JSON and canonicalized to stable bytes prior to admission.
         - Artifacts validate against versioned schemas with fail-closed behavior (unknown fields rejected).
         - Artifacts are addressable by stable IDs and immutable content hashes (CAS).
-    - id: G-0002
+    - id: CAC-G-0002
       statement: Patch-first machine authoring - Machines produce typed patch streams with replay protection and admission receipts.
       measurable_outcomes:
         - Machines produce patch streams (JSON Patch / Merge Patch) rather than whole-document rewrites.
         - Admission enforces replay protection via expected base hash.
         - Every accepted patch produces an admission receipt (evidence) and emits ledger provenance.
-    - id: G-0003
+    - id: CAC-G-0003
       statement: Hermetic consumption with deterministic reads - Consumption holons operate without discretionary context discovery.
       measurable_outcomes:
         - Consumption holons can complete tasks using only preauthorized stable-ID fetches plus actuation tools.
-        - "Discretionary context discovery uses graduated enforcement: defect-emitting initially (weeks 1-3), soft-fail (weeks 4-6), then denied (week 7+) per TRADEOFF-0001. Acceleration clause: if MET-0002 >85% at week 5, advance to denied at week 6."
+        - Discretionary context discovery during consumption is denied and/or defect-emitting by policy.
         - ContextPack manifests include transitive dependency closure (deep pinning).
         - Run receipts capture context_pack_miss and context_pack_sufficiency; misses gate consumption unless explicitly escalated.
-    - id: G-0004
+    - id: CAC-G-0004
       statement: Bounded context production with replayable evidence - Production holons operate under explicit budgets with replayable outputs.
       measurable_outcomes:
         - Production holons operate under explicit leases/budgets and publish replayable evidence (snapshots, extraction logs, diffs).
         - Tool calls are classified as planned/unplanned and feed defect signals into pack compiler improvement.
         - Admissions include a ChangeSet report to summarize semantic deltas and enable compaction.
-    - id: G-0005
+    - id: CAC-G-0005
       statement: Target interoperability without drift - Target profiles govern compilation to vendor payloads without making those payloads normative.
       measurable_outcomes:
         - Target profiles define rendering, retrieval, and delivery constraints independent of model intelligence.
         - Target payloads (vendor layouts, model IRs) are compiled deterministically from CAC sources and never treated as normative.
         - Export manifests provide provenance and are verified by conformance tests.
-    - id: G-0006
+    - id: CAC-G-0006
       statement: Messaging-native control plane compatibility - CAC actions are reflected in kernel messages with hash references.
       measurable_outcomes:
         - CAC actions (admission, compilation, export, selftest) are reflected in kernel messages (ledger events) with hash references.
         - Holons can negotiate capabilities and retrieve required context via stable IDs referenced in messages.
-    - id: G-0007
+    - id: CAC-G-0007
       statement: Measurable throughput and quality gains - System improvements are tracked via leading and lagging metrics.
       measurable_outcomes:
-        - "Unplanned tool calls in consumption mode trend toward zero during graduated enforcement (per G-0003), reaching zero upon full enforcement (week 5+)."
-        - PR cycle time and defect recurrence improve after adoption (per EVID-0013/EVID-0014 methodology).
+        - Unplanned tool calls in consumption mode trend toward zero.
+        - PR cycle time and defect recurrence improve after adoption.
         - AAT receipts gate critical operations with high pass rates.
-    - id: G-0008
+    - id: CAC-G-0008
       statement: Typed quantities and context budgets - All budgets, timeouts, and costs use typed quantities with explicit units.
       measurable_outcomes:
         - Budgets, timeouts, costs, and probabilities are expressed as typed quantities with explicit units.
         - ContextPack compilation and validation reject packs exceeding token/artifact/byte budgets.
-    - id: G-0009
+    - id: CAC-G-0009
       statement: Canonicalizer governance - Canonicalization is versioned, tested, and recorded in all normative artifacts.
       measurable_outcomes:
         - Canonicalizer id/version are recorded in envelopes and receipts for all normative artifacts.
