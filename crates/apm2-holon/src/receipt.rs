@@ -1,12 +1,13 @@
 //! `RunReceipt` types for episode completion tracking.
 //!
-//! This module provides the [`RunReceipt`] struct for capturing episode completion
-//! metadata including context pack sufficiency and budget consumption.
+//! This module provides the [`RunReceipt`] struct for capturing episode
+//! completion metadata including context pack sufficiency and budget
+//! consumption.
 //!
 //! # Design Principles
 //!
-//! - **Hermetic Consumption Feedback**: Pack misses are tracked to feed back into
-//!   pack completeness improvements (per DD-0003)
+//! - **Hermetic Consumption Feedback**: Pack misses are tracked to feed back
+//!   into pack completeness improvements (per DD-0003)
 //! - **Typed Quantities**: Budget deltas use explicit types for safety
 //! - **Strict Serde**: All types use `#[serde(deny_unknown_fields)]` (CTR-1604)
 //!
@@ -156,7 +157,11 @@ impl PackMiss {
     /// * `fetch_attempt_ns` - When the fetch was attempted (Unix nanoseconds)
     /// * `reason` - Human-readable reason for the miss
     #[must_use]
-    pub fn new(stable_id: impl Into<String>, fetch_attempt_ns: u64, reason: impl Into<String>) -> Self {
+    pub fn new(
+        stable_id: impl Into<String>,
+        fetch_attempt_ns: u64,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
             stable_id: stable_id.into(),
             fetch_attempt_ns,
@@ -725,13 +730,22 @@ mod tests {
         builder.record_miss("org:doc:missing", 1_000_000, "not in pack");
         builder.record_miss("org:lib:utils", 2_000_000, "dependency not resolved");
 
-        let receipt = builder.with_budget_delta(BudgetDelta::new(200, 1000, 5)).build().unwrap();
+        let receipt = builder
+            .with_budget_delta(BudgetDelta::new(200, 1000, 5))
+            .build()
+            .unwrap();
 
         assert!(!receipt.context_pack_sufficiency());
         assert!(receipt.has_misses());
         assert_eq!(receipt.miss_count(), 2);
-        assert_eq!(receipt.context_pack_misses()[0].stable_id(), "org:doc:missing");
-        assert_eq!(receipt.context_pack_misses()[1].stable_id(), "org:lib:utils");
+        assert_eq!(
+            receipt.context_pack_misses()[0].stable_id(),
+            "org:doc:missing"
+        );
+        assert_eq!(
+            receipt.context_pack_misses()[1].stable_id(),
+            "org:lib:utils"
+        );
     }
 
     #[test]
@@ -756,7 +770,10 @@ mod tests {
         let deserialized: RunReceipt = serde_json::from_str(&json).unwrap();
 
         assert_eq!(deserialized.episode_id(), receipt.episode_id());
-        assert_eq!(deserialized.context_pack_sufficiency(), receipt.context_pack_sufficiency());
+        assert_eq!(
+            deserialized.context_pack_sufficiency(),
+            receipt.context_pack_sufficiency()
+        );
     }
 
     #[test]
@@ -896,7 +913,10 @@ mod tests {
         assert!(err.to_string().contains("256"));
         assert!(err.to_string().contains("300"));
 
-        let err = ReceiptError::TooManyMisses { count: 1001, max: 1000 };
+        let err = ReceiptError::TooManyMisses {
+            count: 1001,
+            max: 1000,
+        };
         assert!(err.to_string().contains("1001"));
         assert!(err.to_string().contains("1000"));
     }
