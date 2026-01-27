@@ -362,23 +362,32 @@ impl CoordinationAborted {
 ///
 /// Contains all coordination event variants as a tagged union for
 /// convenient pattern matching.
+///
+/// The `#[serde(rename = "...")]` attributes ensure that the JSON `type` tag
+/// matches the `EVENT_TYPE_*` constants used by
+/// [`CoordinationEvent::event_type`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 #[non_exhaustive]
 pub enum CoordinationEvent {
     /// Coordination started processing work queue.
+    #[serde(rename = "coordination.started")]
     Started(CoordinationStarted),
 
     /// Session bound to work item.
+    #[serde(rename = "coordination.session_bound")]
     SessionBound(CoordinationSessionBound),
 
     /// Session unbound from work item.
+    #[serde(rename = "coordination.session_unbound")]
     SessionUnbound(CoordinationSessionUnbound),
 
     /// Coordination completed.
+    #[serde(rename = "coordination.completed")]
     Completed(CoordinationCompleted),
 
     /// Coordination aborted.
+    #[serde(rename = "coordination.aborted")]
     Aborted(CoordinationAborted),
 }
 
@@ -983,5 +992,80 @@ mod tests {
             err.contains("work_ids exceeds maximum size"),
             "Expected error about work_ids size limit, got: {err}"
         );
+    }
+
+    /// TCK-00148: Test that the JSON `type` tag matches the `event_type()`
+    /// return value for all coordination event variants.
+    ///
+    /// This ensures protocol consistency between the serialized wire format
+    /// and the programmatic event type constants.
+    #[test]
+    fn test_event_type_matches_json_tag() {
+        // Build all event variants
+        let events = vec![
+            CoordinationEvent::Started(
+                CoordinationStarted::new(
+                    "c".to_string(),
+                    vec!["w1".to_string()],
+                    CoordinationBudget::new(10, 60_000, None).unwrap(),
+                    3,
+                    1000,
+                )
+                .unwrap(),
+            ),
+            CoordinationEvent::SessionBound(CoordinationSessionBound::new(
+                "c".to_string(),
+                "s".to_string(),
+                "w1".to_string(),
+                1,
+                10,
+                2000,
+            )),
+            CoordinationEvent::SessionUnbound(CoordinationSessionUnbound::new(
+                "c".to_string(),
+                "s".to_string(),
+                "w1".to_string(),
+                SessionOutcome::Success,
+                500,
+                3000,
+            )),
+            CoordinationEvent::Completed(CoordinationCompleted::new(
+                "c".to_string(),
+                StopCondition::WorkCompleted,
+                BudgetUsage::new(),
+                1,
+                1,
+                0,
+                [0u8; BLAKE3_HASH_SIZE],
+                4000,
+            )),
+            CoordinationEvent::Aborted(CoordinationAborted::new(
+                "c".to_string(),
+                AbortReason::NoEligibleWork,
+                BudgetUsage::new(),
+                5000,
+            )),
+        ];
+
+        for event in events {
+            let json_bytes = event.to_json_bytes().unwrap();
+            let json_value: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+
+            // Extract the "type" field from the serialized JSON
+            let json_type = json_value
+                .get("type")
+                .expect("JSON should have a 'type' field")
+                .as_str()
+                .expect("'type' field should be a string");
+
+            // Verify it matches the event_type() method
+            assert_eq!(
+                json_type,
+                event.event_type(),
+                "JSON type tag '{}' does not match event_type() '{}'",
+                json_type,
+                event.event_type()
+            );
+        }
     }
 }

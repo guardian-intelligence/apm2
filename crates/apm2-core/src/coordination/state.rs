@@ -31,6 +31,13 @@ pub const MAX_WORK_QUEUE_SIZE: usize = 1000;
 /// when deserializing coordination state from untrusted JSON.
 pub const MAX_HASHMAP_SIZE: usize = 10_000;
 
+/// Maximum number of session IDs allowed per work item.
+///
+/// This limit prevents denial-of-service attacks through unbounded allocation
+/// when deserializing `WorkItemTracking` from untrusted JSON. The limit is
+/// set conservatively since each session generates at most one entry.
+pub const MAX_SESSION_IDS_PER_WORK: usize = 100;
+
 /// Custom deserializer for `work_queue` that enforces [`MAX_WORK_QUEUE_SIZE`].
 ///
 /// This uses a streaming visitor pattern that enforces limits DURING
@@ -67,6 +74,54 @@ where
                         "work_queue exceeds maximum size: {} > {}",
                         items.len() + 1,
                         MAX_WORK_QUEUE_SIZE
+                    )));
+                }
+                items.push(item);
+            }
+            Ok(items)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor)
+}
+
+/// Custom deserializer for `session_ids` that enforces
+/// [`MAX_SESSION_IDS_PER_WORK`].
+///
+/// This uses a streaming visitor pattern that enforces limits DURING
+/// deserialization, preventing OOM attacks by rejecting oversized arrays
+/// before full allocation occurs.
+fn deserialize_bounded_session_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedVecVisitor;
+
+    impl<'de> Visitor<'de> for BoundedVecVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                formatter,
+                "a sequence of at most {MAX_SESSION_IDS_PER_WORK} strings"
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            // Use size hint but cap at MAX_SESSION_IDS_PER_WORK to prevent pre-allocation
+            // attacks
+            let capacity = seq.size_hint().unwrap_or(0).min(MAX_SESSION_IDS_PER_WORK);
+            let mut items = Vec::with_capacity(capacity);
+
+            while let Some(item) = seq.next_element()? {
+                if items.len() >= MAX_SESSION_IDS_PER_WORK {
+                    return Err(de::Error::custom(format!(
+                        "session_ids exceeds maximum size: {} > {}",
+                        items.len() + 1,
+                        MAX_SESSION_IDS_PER_WORK
                     )));
                 }
                 items.push(item);
@@ -573,6 +628,9 @@ pub struct WorkItemTracking {
     pub attempt_count: u32,
 
     /// Session IDs used for this work item.
+    ///
+    /// Limited to [`MAX_SESSION_IDS_PER_WORK`] entries during deserialization.
+    #[serde(deserialize_with = "deserialize_bounded_session_ids")]
     pub session_ids: Vec<String>,
 
     /// Final outcome (set when work item processing is complete).
@@ -1572,6 +1630,52 @@ mod tests {
             )),
             "Expected error at boundary {}, got: {err}",
             MAX_WORK_QUEUE_SIZE + 1
+        );
+    }
+
+    /// TCK-00148: Test that `session_ids` size limit is enforced during
+    /// deserialization, preventing denial-of-service via oversized JSON
+    /// payloads in `WorkItemTracking`.
+    #[test]
+    fn test_work_tracking_session_ids_limit_serde() {
+        // Build a session_ids array that exceeds the limit
+        let oversized_session_ids: Vec<String> = (0..=MAX_SESSION_IDS_PER_WORK)
+            .map(|i| format!("session-{i}"))
+            .collect();
+        assert_eq!(oversized_session_ids.len(), MAX_SESSION_IDS_PER_WORK + 1);
+
+        let json = serde_json::json!({
+            "work_id": "work-123",
+            "attempt_count": 0,
+            "session_ids": oversized_session_ids,
+            "final_outcome": null
+        });
+
+        let result: Result<WorkItemTracking, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("session_ids exceeds maximum size"),
+            "Expected error about session_ids size limit, got: {err}"
+        );
+
+        // Verify exact limit works
+        let exact_session_ids: Vec<String> = (0..MAX_SESSION_IDS_PER_WORK)
+            .map(|i| format!("session-{i}"))
+            .collect();
+        assert_eq!(exact_session_ids.len(), MAX_SESSION_IDS_PER_WORK);
+
+        let json = serde_json::json!({
+            "work_id": "work-123",
+            "attempt_count": 0,
+            "session_ids": exact_session_ids,
+            "final_outcome": null
+        });
+
+        let result: Result<WorkItemTracking, _> = serde_json::from_value(json);
+        assert!(
+            result.is_ok(),
+            "Expected exact limit to work, got: {result:?}"
         );
     }
 }
