@@ -1,0 +1,260 @@
+rfc_design_decisions:
+  schema_version: "2026-01-27"
+  template_version: "2026-01-27"
+  rfc_id: RFC-0011
+
+  architectural_overview: |
+    CAC v1 introduces a closed-loop context pipeline with these core components:
+
+    1. CAC-JSON Canonicalizer: Parses and emits deterministic canonical bytes (JCS-like)
+    2. CAC Validator: Validates against JSON Schemas with strict unknown field rejection
+    3. Bootstrap Schema Bundle: Immutable trust root embedded in binary
+    4. Patch Engine: Applies JSON Patch/Merge Patch with replay protection
+    5. DCP Index/Resolver: Resolves stable_id to content_hash for deterministic reads
+    6. Context Compiler: Compiles ContextPackSpec to deep-pinned manifests
+    7. Target Delivery: Deterministic rendering to vendor layouts with provenance
+    8. AAT Harness: Generates CapabilityManifest and verifies via selftests
+
+    All state transitions are recorded as signed kernel messages referencing immutable hashes.
+
+  design_decisions:
+    - id: DD-0001
+      title: CAC-JSON as sole normative format
+      decision: |
+        Use a strict JSON profile (CAC-JSON) as the sole normative representation for all
+        control artifacts. No floats (integers only within signed 64-bit range), duplicate
+        keys forbidden, maximum depth 128, UTF-8 NFC normalized strings.
+      alternatives:
+        - id: ALT-0001-A
+          description: Use YAML as normative format
+          rejected_reason: YAML parsing is complex with multiple implementations producing different results. No canonical form standard.
+        - id: ALT-0001-B
+          description: Use Protocol Buffers for normative storage
+          rejected_reason: Binary format reduces human reviewability. Schema evolution more complex. Existing ecosystem expects JSON.
+      rationale: |
+        JSON with strict constraints (JCS-like canonicalization) provides deterministic
+        parsing across all platforms, human reviewability, and compatibility with existing
+        tooling. Integer-only numbers eliminate float ambiguity.
+      evidence_ids:
+        - EVID-0001
+      requirement_ids:
+        - CAC-REQ-0001
+      status: HYPOTHESIS
+      discovery_question: |
+        Q-0001: Exact canonicalization spec - strict RFC 8785 JCS vs a stricter CAC profile?
+        How to publish, pin, and version test vectors and canonicalizer IDs?
+
+    - id: DD-0002
+      title: Patch-first authoring with replay protection
+      decision: |
+        Machines produce typed patch streams (JSON Patch RFC 6902 / Merge Patch RFC 7396)
+        rather than whole-document rewrites. All patches require expected_base_hash matching
+        current artifact state. Patches produce AdmissionReceipt and emit ledger provenance.
+      alternatives:
+        - id: ALT-0002-A
+          description: Allow whole-document writes without replay protection
+          rejected_reason: No provenance, no replay protection, no audit trail. Violates security properties.
+        - id: ALT-0002-B
+          description: Use git-like version control for artifacts
+          rejected_reason: Git is too heavyweight for individual artifact versioning. Patches are more atomic.
+      rationale: |
+        Patch-first authoring enables fine-grained provenance, prevents stale overwrites,
+        and supports compaction without losing history. Replay protection ensures concurrent
+        modifications are detected.
+      evidence_ids:
+        - EVID-0003
+      requirement_ids:
+        - CAC-REQ-0002
+      status: HYPOTHESIS
+      discovery_question: |
+        Q-0007: Compaction policy - when does patch depth require snapshotting, and how
+        are ChangeSet summaries preserved across compaction?
+
+    - id: DD-0003
+      title: Hermetic consumption via ContextPacks
+      decision: |
+        Consumption holons receive ContextPack manifests with deep-pinned dependencies.
+        All fetches use stable-ID deterministic reads via ArtifactFetch tool. Discretionary
+        context discovery is policy-denied and emits DefectRecord.
+      alternatives:
+        - id: ALT-0003-A
+          description: Allow limited discovery with budget constraints
+          rejected_reason: Introduces non-determinism and potential policy leaks. Harder to audit.
+        - id: ALT-0003-B
+          description: Pre-load all artifacts at session start
+          rejected_reason: Memory-prohibitive for large packs. Lazy loading with stable IDs is more efficient.
+      rationale: |
+        Hermetic consumption ensures deterministic execution. Pack misses are treated as
+        compiler defects, not execution necessities. This creates a feedback loop that
+        improves pack completeness over time.
+      evidence_ids:
+        - EVID-0005
+        - EVID-0010
+      requirement_ids:
+        - CAC-REQ-0003
+        - CAC-REQ-0011
+      status: HYPOTHESIS
+      discovery_question: |
+        Q-0004: How to represent large binary artifacts within CAC-JSON (likely via CAS
+        refs only) and enforce policies consistently?
+
+    - id: DD-0004
+      title: Bootstrap trust root with binary embedding
+      decision: |
+        Embed a minimal schema bundle pinned by hash in the apm2 binary. Bootstrap verification
+        at startup; refuse to operate if verification fails. Admission rejects patches
+        targeting bootstrap stable IDs.
+      alternatives:
+        - id: ALT-0004-A
+          description: Load bootstrap from filesystem at startup
+          rejected_reason: Filesystem could be tampered with. No cryptographic binding to binary version.
+        - id: ALT-0004-B
+          description: Fetch bootstrap from trusted server
+          rejected_reason: Introduces network dependency and additional attack surface. Offline operation compromised.
+      rationale: |
+        Binary embedding ensures the trust root cannot be modified without a new binary
+        release. Provides strong cryptographic binding between binary version and schema
+        expectations. Supports air-gapped deployments.
+      evidence_ids:
+        - EVID-0008
+      requirement_ids:
+        - CAC-REQ-0010
+      status: HYPOTHESIS
+      discovery_question: |
+        Recovery procedures: What happens when ledger state is incompatible with new bootstrap?
+        CNS-0006 defines emergency override and tiered recovery protocol.
+
+    - id: DD-0005
+      title: Target profiles for vendor compilation
+      decision: |
+        Target profiles define rendering, retrieval, and delivery constraints independent
+        of model intelligence. CAC-JSON is always source of truth; vendor layouts (Markdown,
+        directories) are derived outputs with embedded provenance.
+      alternatives:
+        - id: ALT-0005-A
+          description: Treat vendor layouts as source of truth with CAC as derived
+          rejected_reason: Loses canonical representation benefits. Drift between representations.
+        - id: ALT-0005-B
+          description: Maintain bidirectional sync between CAC and vendor formats
+          rejected_reason: Complex, error-prone, and hard to audit. One direction (CAC -> vendor) is simpler.
+      rationale: |
+        Target profiles decouple internal IR from vendor ABIs. Model capability is a
+        compile-time contract, not a runtime assumption. Export determinism is verifiable
+        via conformance tests.
+      evidence_ids:
+        - EVID-0006
+        - EVID-0009
+      requirement_ids:
+        - CAC-REQ-0005
+        - CAC-REQ-0013
+      status: HYPOTHESIS
+      discovery_question: |
+        Q-0006: TargetProfile schema - what is the minimal stage taxonomy (plan/implement/
+        review/ops) and which policies must be mandatory vs optional?
+
+    - id: DD-0006
+      title: CapabilityManifest generated from binary selftests
+      decision: |
+        Generate CapabilityManifest from the apm2 binary via hermetic selftests (AAT).
+        AATReceipt is cryptographically bound to binary hash. Receipts gate critical
+        cutovers and agent planning.
+      alternatives:
+        - id: ALT-0006-A
+          description: Handwritten capability declarations
+          rejected_reason: Can drift from actual behavior. No verification of claims.
+        - id: ALT-0006-B
+          description: Generate capabilities from code analysis only
+          rejected_reason: Static analysis misses runtime behavior. Tests are more reliable truth.
+      rationale: |
+        Selftests prove capabilities exist, not just that code paths exist. Binary binding
+        prevents receipt reuse across versions. Agents can trust capabilities are verified.
+      evidence_ids:
+        - EVID-0007
+      requirement_ids:
+        - CAC-REQ-0014
+      status: HYPOTHESIS
+      discovery_question: |
+        Binary hash verification: AATReceipt MUST include binary_hash (BLAKE3-256).
+        How to handle binary variants (debug/release, platform-specific)?
+
+    - id: DD-0007
+      title: Typed quantities with explicit units
+      decision: |
+        All budgets, timeouts, costs, and probabilities are expressed as typed quantities
+        with explicit units (ms, bytes, tokens, count, percent, usd). Unit mismatches
+        are rejected at validation. Cross-unit arithmetic fails at compile time.
+      alternatives:
+        - id: ALT-0007-A
+          description: Use implicit units with naming conventions (e.g., timeout_ms)
+          rejected_reason: Error-prone. No compile-time enforcement. Easy to mix units.
+        - id: ALT-0007-B
+          description: Use floating-point numbers for quantities
+          rejected_reason: Float representation issues. CAC-JSON prohibits floats for determinism.
+      rationale: |
+        Typed quantities prevent unit mismatch errors that could cause silent failures
+        in budget enforcement. Scaled integers preserve precision. Schema validation
+        enforces correctness.
+      evidence_ids:
+        - EVID-0012
+      requirement_ids:
+        - CAC-REQ-0008
+      status: DECIDED
+
+    - id: DD-0008
+      title: DCP as projection over ledger events
+      decision: |
+        Deterministic Content Plane (DCP) is implemented as an index/projection over
+        immutable artifacts and ledger events, not an independent mutable source of truth.
+        Stable-ID resolution reconstructs from ledger events.
+      alternatives:
+        - id: ALT-0008-A
+          description: DCP as independent database with sync to ledger
+          rejected_reason: Creates dual source of truth. Sync failures cause inconsistency.
+        - id: ALT-0008-B
+          description: Store stable-ID mappings in separate file system
+          rejected_reason: Not hash-chained. Loses provenance and audit properties.
+      rationale: |
+        Projection-based DCP ensures consistency with ledger as the authoritative log.
+        Index can be rebuilt from ledger at any time. Supports compaction checkpoints.
+      evidence_ids:
+        - EVID-0004
+      requirement_ids:
+        - CAC-REQ-0001
+      status: HYPOTHESIS
+      discovery_question: |
+        Q-0002: Stable ID namespace governance - who can mint namespaces, and how are
+        collisions prevented across org/projects?
+
+  component_mapping:
+    # Known Unknowns: Impact map shows 15 unresolved requirements
+    # All requirements have no component matches (Jaccard similarity below threshold)
+    # This section documents hypothesized component locations for v2 exploration
+    hypothesis:
+      - requirement_id: CAC-REQ-0001
+        candidate_components:
+          - crates/apm2-core/src/determinism/canonicalize.rs
+          - crates/apm2-core/src/evidence/cas.rs
+        confidence: LOW
+        discovery_needed: true
+
+      - requirement_id: CAC-REQ-0002
+        candidate_components:
+          - crates/apm2-core/src/ledger/storage.rs
+          - crates/apm2-core/src/events/
+        confidence: LOW
+        discovery_needed: true
+
+      - requirement_id: CAC-REQ-0003
+        candidate_components:
+          - crates/apm2-holon/src/episode/controller.rs
+          - crates/apm2-core/src/policy/engine.rs
+        confidence: LOW
+        discovery_needed: true
+
+      - requirement_id: CAC-REQ-0010
+        candidate_components:
+          - crates/apm2-cli/src/main.rs
+          - crates/apm2-core/build.rs
+        confidence: LOW
+        discovery_needed: true
+        note: Bootstrap embedding requires build.rs integration
