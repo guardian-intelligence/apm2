@@ -911,7 +911,7 @@ mod tests {
     // Error Handling Tests - HIGH: DoS Vector Prevention (TCK-00138)
     // =========================================================================
 
-    /// Test that build() returns error when work_id is missing.
+    /// Test that `build()` returns error when `work_id` is missing.
     #[test]
     fn test_build_error_missing_work_id() {
         let result = DefectRecord::builder("DEF-001", "TEST")
@@ -927,7 +927,7 @@ mod tests {
         assert!(err.to_string().contains("work_id"));
     }
 
-    /// Test that build() returns error when signal is missing.
+    /// Test that `build()` returns error when signal is missing.
     #[test]
     fn test_build_error_missing_signal() {
         let result = DefectRecord::builder("DEF-001", "TEST")
@@ -940,7 +940,7 @@ mod tests {
         assert!(err.to_string().contains("signal"));
     }
 
-    /// Test that build() returns error when both required fields are missing.
+    /// Test that `build()` returns error when both required fields are missing.
     #[test]
     fn test_build_error_missing_both_required_fields() {
         let result = DefectRecord::builder("DEF-001", "TEST").build();
@@ -958,11 +958,11 @@ mod tests {
     // Input Validation Tests - MEDIUM: Unbounded Memory Prevention (TCK-00138)
     // =========================================================================
 
-    /// Test that defect_id exceeding MAX_DEFECT_ID_LENGTH is rejected.
+    /// Test that `defect_id` exceeding `MAX_DEFECT_ID_LENGTH` is rejected.
     #[test]
     fn test_validation_defect_id_too_long() {
         let long_id = "x".repeat(MAX_DEFECT_ID_LENGTH + 1);
-        let result = DefectRecord::builder(long_id.clone(), "TEST")
+        let result = DefectRecord::builder(long_id, "TEST")
             .work_id("work-123")
             .signal(DefectSignal::new(SignalType::AatFail, "test"))
             .build();
@@ -979,7 +979,7 @@ mod tests {
         ));
     }
 
-    /// Test that defect_class exceeding MAX_DEFECT_CLASS_LENGTH is rejected.
+    /// Test that `defect_class` exceeding `MAX_DEFECT_CLASS_LENGTH` is rejected.
     #[test]
     fn test_validation_defect_class_too_long() {
         let long_class = "x".repeat(MAX_DEFECT_CLASS_LENGTH + 1);
@@ -1000,7 +1000,7 @@ mod tests {
         ));
     }
 
-    /// Test that work_id exceeding MAX_WORK_ID_LENGTH is rejected.
+    /// Test that `work_id` exceeding `MAX_WORK_ID_LENGTH` is rejected.
     #[test]
     fn test_validation_work_id_too_long() {
         let long_work_id = "x".repeat(MAX_WORK_ID_LENGTH + 1);
@@ -1021,7 +1021,7 @@ mod tests {
         ));
     }
 
-    /// Test that signal details exceeding MAX_SIGNAL_DETAILS_LENGTH is
+    /// Test that signal details exceeding `MAX_SIGNAL_DETAILS_LENGTH` is
     /// rejected.
     #[test]
     fn test_validation_signal_details_too_long() {
@@ -1043,7 +1043,7 @@ mod tests {
         ));
     }
 
-    /// Test that too many remediations is rejected.
+    /// Test that too many remediations are rejected.
     #[test]
     fn test_validation_too_many_remediations() {
         let mut builder = DefectRecord::builder("DEF-001", "TEST")
@@ -1069,7 +1069,7 @@ mod tests {
         ));
     }
 
-    /// Test that individual remediation exceeding MAX_REMEDIATION_LENGTH is
+    /// Test that individual remediation exceeding `MAX_REMEDIATION_LENGTH` is
     /// rejected.
     #[test]
     fn test_validation_remediation_too_long() {
@@ -1092,7 +1092,7 @@ mod tests {
         ));
     }
 
-    /// Test that context.actor_id exceeding MAX_ACTOR_ID_LENGTH is rejected.
+    /// Test that `context.actor_id` exceeding `MAX_ACTOR_ID_LENGTH` is rejected.
     #[test]
     fn test_validation_actor_id_too_long() {
         let long_actor_id = "x".repeat(MAX_ACTOR_ID_LENGTH + 1);
@@ -1114,7 +1114,7 @@ mod tests {
         ));
     }
 
-    /// Test that context.session_id exceeding MAX_SESSION_ID_LENGTH is
+    /// Test that `context.session_id` exceeding `MAX_SESSION_ID_LENGTH` is
     /// rejected.
     #[test]
     fn test_validation_session_id_too_long() {
@@ -1137,7 +1137,7 @@ mod tests {
         ));
     }
 
-    /// Test that context.requested_stable_id exceeding MAX_STABLE_ID_LENGTH is
+    /// Test that `context.requested_stable_id` exceeding `MAX_STABLE_ID_LENGTH` is
     /// rejected.
     #[test]
     fn test_validation_stable_id_too_long() {
@@ -1160,7 +1160,7 @@ mod tests {
         ));
     }
 
-    /// Test that valid inputs at exactly the maximum length are accepted.
+    /// Test that valid inputs at exactly the max length are accepted.
     #[test]
     fn test_validation_accepts_max_length_inputs() {
         let max_id = "x".repeat(MAX_DEFECT_ID_LENGTH);
@@ -1178,7 +1178,7 @@ mod tests {
         assert!(result.is_ok(), "Should accept inputs at max length");
     }
 
-    /// Test that DefectError Display trait works correctly.
+    /// Test that `DefectError` Display trait works correctly.
     #[test]
     fn test_defect_error_display() {
         let missing = DefectError::missing_field("work_id");
@@ -1196,7 +1196,7 @@ mod tests {
         assert!(too_many.to_string().contains("15"));
     }
 
-    /// Test that DefectError implements std::error::Error.
+    /// Test that `DefectError` implements `std::error::Error`.
     #[test]
     fn test_defect_error_is_std_error() {
         let err: Box<dyn std::error::Error> = Box::new(DefectError::missing_field("test"));
