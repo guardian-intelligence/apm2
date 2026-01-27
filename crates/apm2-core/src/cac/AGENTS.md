@@ -34,6 +34,42 @@ A compiled JSON Schema validator with CAC-specific configuration.
 - [CTR-0021] `validate()` returns first error encountered (fail-fast)
 - [CTR-0022] All errors include JSON path to the violation
 
+### `DcpIndex`
+
+```rust
+pub struct DcpIndex { /* fields private */ }
+```
+
+A stable-ID resolution index projected from ledger events.
+
+**Invariants:**
+- [INV-0023] Stable IDs must be unique (collision detection)
+- [INV-0024] Stable IDs must follow `namespace:kind:identifier[@version]` format
+- [INV-0025] Reserved prefixes (`cac:`, `bootstrap:`, `internal:`) require authorization
+- [INV-0026] Dependencies must exist and not be deprecated (DAG enforcement)
+
+**Contracts:**
+- [CTR-0023] `register()` is idempotent for identical entries
+- [CTR-0024] `resolve()` returns `None` for deprecated entries
+
+### `DcpEntry`
+
+```rust
+pub struct DcpEntry {
+    pub stable_id: String,
+    pub content_hash: String,
+    pub schema_id: String,
+    pub dependencies: Vec<String>,
+    // ...
+}
+```
+
+A registered artifact entry.
+
+**Invariants:**
+- [INV-0027] `content_hash` must be a valid 64-char hex BLAKE3 hash
+- [INV-0028] `dependencies` list cannot exceed `MAX_DEPENDENCIES` (128)
+
 ### `ValidationError`
 
 ```rust
@@ -63,6 +99,9 @@ Comprehensive error types with JSON path locations.
 | `MAX_ARRAY_MEMBERS` | 100,000 | Maximum array size |
 | `MAX_OBJECT_PROPERTIES` | 100,000 | Maximum object size |
 | `MAX_DEPTH` | 128 | Maximum nesting depth |
+| `MAX_STABLE_ID_LENGTH` | 1024 | Maximum stable ID length |
+| `MAX_CONTENT_HASH_LENGTH` | 64 | Hex-encoded BLAKE3 hash length |
+| `MAX_DEPENDENCIES` | 128 | Maximum dependencies per artifact |
 
 ## Public API
 
@@ -71,6 +110,10 @@ Comprehensive error types with JSON path locations.
 | `CacValidator::new(schema)` | Create validator from JSON Schema |
 | `CacValidator::validate(value)` | Validate value with size limits and schema |
 | `validate_cac_artifact(schema, artifact)` | One-shot validation for admission pipeline |
+| `DcpIndex::register(entry)` | Register an artifact (idempotent) |
+| `DcpIndex::resolve(id)` | Resolve stable ID to content hash |
+| `DcpIndex::deprecate(id)` | Mark artifact as deprecated |
+| `DcpIndex::apply_event(evt)` | Update index from ledger event |
 
 ## Examples
 
@@ -128,6 +171,27 @@ let value: serde_json::Value = serde_json::from_str(&canonical)?;
 validate_cac_artifact(&schema, &value)?;
 
 // Step 3: Store in CAS (not shown)
+```
+
+### DCP Index Resolution
+
+```rust
+use apm2_core::cac::{DcpIndex, DcpEntry};
+
+let mut index = DcpIndex::new();
+
+// Register artifact
+let entry = DcpEntry::new(
+    "org:ticket:TCK-00134",
+    "a".repeat(64), // Valid hash
+    "cac:schema:ticket-v1"
+);
+index.register(entry)?;
+
+// Resolve
+if let Some(hash) = index.resolve("org:ticket:TCK-00134") {
+    println!("Artifact hash: {}", hash);
+}
 ```
 
 ### Handling Size Limit Errors
