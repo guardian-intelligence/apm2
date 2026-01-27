@@ -144,6 +144,15 @@ pub enum CapabilityError {
         /// The maximum allowed.
         max: usize,
     },
+
+    /// Too many capabilities in a receipt.
+    #[error("too many capabilities in receipt: {count} exceeds maximum of {max}")]
+    TooManyCapabilities {
+        /// The number of capabilities in the receipt.
+        count: usize,
+        /// The maximum allowed.
+        max: usize,
+    },
 }
 
 impl From<AATReceiptError> for CapabilityError {
@@ -392,6 +401,15 @@ impl CapabilityGate {
     ///   malformed
     #[must_use = "verification result must be checked"]
     pub fn verify_receipt(&self, receipt: &AATReceipt) -> Result<(), CapabilityError> {
+        // SECURITY: Limit capabilities count to prevent DoS via unbounded allocation
+        // during canonicalization (which clones, sorts, and joins the vector).
+        if receipt.capabilities_tested.len() > crate::cac::manifest::MAX_CAPABILITIES {
+            return Err(CapabilityError::TooManyCapabilities {
+                count: receipt.capabilities_tested.len(),
+                max: crate::cac::manifest::MAX_CAPABILITIES,
+            });
+        }
+
         // Fast check: binary hash match
         if !receipt.verify_binary_hash(&self.binary_hash) {
             return Err(CapabilityError::BinaryHashMismatch {
@@ -407,7 +425,9 @@ impl CapabilityGate {
             }
         })?;
 
-        let canonical = receipt_canonical_bytes(receipt);
+        // Use AATReceipt::canonical_bytes to ensure consistency between signer and
+        // verifier
+        let canonical = receipt.canonical_bytes();
         let signature = parse_signature(receipt.signature()).map_err(|e| {
             CapabilityError::InvalidReceiptFormat {
                 reason: e.to_string(),
@@ -565,28 +585,6 @@ impl CapabilityGate {
             .cloned()
             .collect()
     }
-}
-
-/// Computes the canonical bytes for an AAT receipt (for signature
-/// verification).
-///
-/// The canonical format matches [`AATReceipt::canonical_bytes()`]:
-/// `receipt_id|binary_hash|passed|failed|skipped|capabilities_sorted|timestamp`
-fn receipt_canonical_bytes(receipt: &AATReceipt) -> Vec<u8> {
-    let mut sorted_caps = receipt.capabilities_tested.clone();
-    sorted_caps.sort();
-
-    format!(
-        "{}|{}|{}|{}|{}|{}|{}",
-        receipt.receipt_id,
-        receipt.binary_hash,
-        receipt.test_summary.tests_passed,
-        receipt.test_summary.tests_failed,
-        receipt.test_summary.tests_skipped,
-        sorted_caps.join(","),
-        receipt.generated_at
-    )
-    .into_bytes()
 }
 
 // ============================================================================
@@ -1100,6 +1098,61 @@ mod tests {
         assert!(
             matches!(result, Err(CapabilityError::BinaryHashMismatch { .. })),
             "Old receipt should be rejected by new binary version"
+        );
+    }
+
+    /// SECURITY TEST: Verify receipt with too many capabilities is rejected.
+    ///
+    /// This test proves that receipts with unbounded `capabilities_tested`
+    /// vectors are rejected before canonicalization to prevent DoS attacks
+    /// via OOM or CPU exhaustion.
+    #[test]
+    fn test_verify_receipt_too_many_capabilities() {
+        let (gate, generator) = make_gate_and_generator();
+
+        // Create a valid receipt first, then modify capabilities_tested
+        // (the signature will be invalid, but the capabilities check happens first)
+        let summary = TestSummary::new(10, 0, 0);
+        let mut receipt = generator
+            .generate("rcpt-dos", summary, 1_000_000_000)
+            .unwrap();
+
+        // Replace capabilities_tested with too many items
+        receipt.capabilities_tested = (0..=crate::cac::manifest::MAX_CAPABILITIES)
+            .map(|i| format!("cap:{i}"))
+            .collect();
+
+        // The receipt has MAX_CAPABILITIES + 1 items
+        assert_eq!(
+            receipt.capabilities_tested.len(),
+            crate::cac::manifest::MAX_CAPABILITIES + 1
+        );
+
+        // Verification should fail with TooManyCapabilities error
+        let result = gate.verify_receipt(&receipt);
+        assert!(
+            matches!(
+                result,
+                Err(CapabilityError::TooManyCapabilities { count, max })
+                if count == crate::cac::manifest::MAX_CAPABILITIES + 1
+                    && max == crate::cac::manifest::MAX_CAPABILITIES
+            ),
+            "Receipt with too many capabilities should be rejected: {result:?}"
+        );
+
+        // Also test that exactly MAX_CAPABILITIES is allowed
+        receipt.capabilities_tested.pop();
+        assert_eq!(
+            receipt.capabilities_tested.len(),
+            crate::cac::manifest::MAX_CAPABILITIES
+        );
+
+        // This should pass the capabilities count check (but may fail signature
+        // because we modified the receipt after signing)
+        let result = gate.verify_receipt(&receipt);
+        assert!(
+            !matches!(result, Err(CapabilityError::TooManyCapabilities { .. })),
+            "Receipt with exactly MAX_CAPABILITIES should not be rejected for count"
         );
     }
 
