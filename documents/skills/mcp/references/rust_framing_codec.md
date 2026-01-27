@@ -17,15 +17,14 @@ Implementation options:
 
 ## streamable HTTP (SSE) 
 - For server->client messages: SSE event stream:
-  - `event: message`
-  - `data: <json>`
+  - `data: <json>` (JSON-RPC message)
+  - `event:` is optional (default SSE event type is `message`)
   - optional `id: <event-id>`
   - optional `retry: <ms>`
 - Implement reconnect:
   - client reconnects with `Last-Event-ID`
-  - server may replay only messages from the originating stream cursor
+  - server may replay only messages from the originating stream cursor (MUST NOT replay messages from a different stream)
 
 ## Canonicalization for signing (optional)
 - If message digests are required (e.g., internal receipts), canonicalize JSON before hashing (e.g., JCS).
 - Do NOT replace MCP wire encoding; canonicalization is for internal integrity only.
-

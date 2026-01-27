@@ -28,7 +28,7 @@ state_machine:
 init_gating_rules:
   - "client MUST send initialize as first message"
   - "client SHOULD NOT send requests other than ping before initialize response"
-  - "INITIALIZED BARRIER: server MUST NOT process standard requests (tools/list, resources/list, etc.) until notifications/initialized is received. Early requests SHOULD be rejected with -32600 (Invalid Request) or buffered until the barrier is cleared."
+  - "INITIALIZED BARRIER: notifications/initialized marks the client as ready to begin normal operations. Servers SHOULD gate non-trivial operations until this notification is received."
   - "server SHOULD NOT send requests other than ping and logging before receiving notifications/initialized"
 
 experimental_features:

@@ -18,7 +18,16 @@
         "listChanged": true
       },
       "logging": {},
-      "completions": {}
+      "completions": {},
+      "tasks": {
+        "list": {},
+        "cancel": {},
+        "requests": {
+          "tools": {
+            "call": {}
+          }
+        }
+      }
     },
     "serverInfo": {
       "name": "apm2-mcp-server",

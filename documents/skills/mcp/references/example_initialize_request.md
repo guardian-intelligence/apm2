@@ -12,12 +12,21 @@
         "listChanged": true
       },
       "sampling": {},
-      "elicitation": {},
+      "elicitation": {
+        "form": {},
+        "url": {}
+      },
       "tasks": {
         "requests": {
-          "sampling/createMessage": {},
-          "elicitation/create": {}
-        }
+          "sampling": {
+            "createMessage": {}
+          },
+          "elicitation": {
+            "create": {}
+          }
+        },
+        "list": {},
+        "cancel": {}
       }
     },
     "clientInfo": {

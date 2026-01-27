@@ -71,8 +71,9 @@ clients:
 
 schema_sanitization_quirks:
   gemini:
-    - "Often rejects 'additionalProperties: true' or '$ref' in tool input schemas."
-    - "Prefers explicit property types; 'anyOf' / 'oneOf' may cause degradation."
+    - "Gemini CLI sanitizes schemas during discovery (notably strips `$schema` and `additionalProperties`)."
+    - "Removes defaults in certain `anyOf` shapes (Vertex AI compatibility)."
+    - "Complex schemas (`$ref`, deep `anyOf`/`oneOf`) may be rejected or degrade; prefer simple object schemas."
   codex:
     - "May truncate long 'description' fields in tool definitions."
     - "Requires 'type: object' for inputSchema even if no properties are defined."

@@ -2,7 +2,7 @@
 
 ```json
 {
-  "generated_at": "2026-01-27T06:00:00Z",
+  "generated_at": "2026-01-27T07:19:08Z",
   "kind": "apm2.skill.index",
   "references": {
     "examples": [
@@ -10,6 +10,9 @@
       "references/example_initialize_response.md",
       "references/example_tools_list_response.md",
       "references/example_streamable_http_sequence.md"
+    ],
+    "patterns": [
+      "references/patterns_agent_to_agent.md"
     ],
     "performance": [
       "references/perf_overhead.md",

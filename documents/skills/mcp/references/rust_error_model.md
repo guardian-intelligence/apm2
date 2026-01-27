@@ -2,9 +2,11 @@
 
 ## JSON-RPC layer
 - Parse errors, invalid requests, method not found, invalid params, internal errors.
-- **Null ID Enforcement**: 
-  - **Requests**: MCP strictly forbids `id: null` for client-initiated requests.
-  - **Responses**: If a request is malformed such that an `id` cannot be extracted (Parse Error -32700 or Invalid Request -32600), the response **MUST** use `id: null` to comply with JSON-RPC 2.0. Standard protocol logic should treat these as terminal transport or framing failures.
+- **ID rules**:
+  - **Requests**: MCP requires `id` to be a string or integer; `id` MUST NOT be `null`.
+  - **Responses**:
+    - Result responses MUST include the request `id`.
+    - Error responses MUST include the request `id`, except when the `id` could not be read due to a malformed request (then the `id` field MAY be omitted).
 - Use `serde_json::value::RawValue` for params to allow identifying the `id` and `method` without failing the entire parse if `params` are malformed.
 
 ## MCP layer

@@ -44,5 +44,6 @@ suites:
     cases:
       - "task augmented tools/call yields CreateTaskResult"
       - "tasks/result returns ToolResult for that task"
-      - "tasks/cancel transitions to cancelled and returns empty result"
+      - "tasks/get returns Task with status + pollInterval"
+      - "tasks/cancel transitions to cancelled and returns Task"
 ```

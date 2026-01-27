@@ -60,6 +60,7 @@ See `references/provider_compatibility.md`.
 ## Files
 - `references/references_index.md`: machine-readable index + provenance.
 - `references/spec_tasks_state_machine.md`: lifecycle and notifications for long-running tasks.
+- `references/patterns_agent_to_agent.md`: patterns for agent-to-agent messaging over MCP (APM2 hub/federation).
 - `references/rust_*`: crate layout, APIs, parsing, testing.
 - `references/provider_*`: integration notes for major clients.
 - `references/test_*`: conformance + fuzz + golden vectors.

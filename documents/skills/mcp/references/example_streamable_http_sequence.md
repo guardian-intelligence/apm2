@@ -1,12 +1,15 @@
 # Streamable HTTP message flow (sequence)
 
-1. Client opens a session by POSTing the `initialize` JSON-RPC request to the MCP endpoint.
-2. Server returns JSON-RPC response (optionally includes `Mcp-Session-Id` header).
-3. Client opens an SSE stream:
+1. Client opens a session by POSTing the `initialize` JSON-RPC request to the MCP endpoint (`Content-Type: application/json`).
+2. Server returns the JSON-RPC response (either `Content-Type: application/json` or `Content-Type: text/event-stream`).
+   - If session management is used, the server may include `MCP-Session-Id` on the HTTP response containing the `InitializeResult`.
+3. Client may open an SSE stream via GET to receive server→client JSON-RPC messages:
    - GET MCP endpoint
-   - includes `Mcp-Session-Id` (if present)
-4. Client sends further JSON-RPC requests via POST:
-   - includes `Mcp-Session-Id`
-   - includes `MCP-Protocol-Version`
-5. Server sends async requests/notifications over the SSE stream (`event: message`, `data: <json>`).
-6. Client reconnects SSE with `Last-Event-ID` where supported; server may replay prior stream messages per spec.
+   - includes `MCP-Session-Id` (if present)
+4. Client sends subsequent JSON-RPC messages via POST:
+   - includes `MCP-Session-Id` (if present/required)
+   - includes `MCP-Protocol-Version` (post-init)
+   - notifications/responses get HTTP `202 Accepted` when accepted
+5. Server sends server→client requests/notifications/responses over SSE streams (event type may be omitted; JSON lives in `data:`).
+   - If multiple SSE streams are open, each JSON-RPC message is delivered on exactly one stream (no broadcast).
+6. On disconnect, client reconnects SSE with `Last-Event-ID` (via GET); server may replay messages from the originating stream cursor per spec.

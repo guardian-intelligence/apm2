@@ -1,48 +1,55 @@
-# MCP Tasks: Status State Machine (Experimental)
+# MCP Tasks (Experimental): States, Polling, Notifications
 
 ## Purpose
-The `tasks` utility (revision 2025-11-25) introduces asynchronous, long-running operations. This document clarifies the lifecycle of a task and its associated notifications.
+The `tasks` utility (revision 2025-11-25) enables task-augmented requests: the receiver returns a `CreateTaskResult` immediately, and the requestor later retrieves the operation result via `tasks/result`.
 
-## Task Lifecycle States
-A task MUST transition through the following states:
+## Task Object (shape highlights)
+A `Task` includes (at minimum):
+- `taskId` (string)
+- `status` (string enum)
+- `createdAt` (RFC3339 timestamp)
+- `lastUpdatedAt` (RFC3339 timestamp)
+- optional: `statusMessage`, `ttl` (ms), `pollInterval` (ms)
 
-1.  **CREATED**: The task has been initialized and assigned a `taskId`. 
-    *   Trigger: `tools/call` with `task` params returns a `TaskDescriptor`.
-2.  **RUNNING**: The operation is currently in progress.
-    *   Notification: `notifications/tasks/status` with `status: "running"`.
-3.  **COMPLETED**: The operation finished successfully.
-    *   Notification: `notifications/tasks/status` with `status: "completed"`.
-    *   Next Step: Requestor calls `tasks/result` to fetch the domain-specific result (e.g., `ToolResult`).
-4.  **FAILED**: The operation encountered an error.
-    *   Notification: `notifications/tasks/status` with `status: "failed"`.
-    *   Result: `tasks/result` will return an error object or `isError: true` in the domain result.
-5.  **CANCELLED**: The operation was explicitly terminated by the requestor or receiver.
-    *   Trigger: `tasks/cancel` request.
-    *   Notification: `notifications/tasks/status` with `status: "cancelled"`.
+## Status Values (2025-11-25)
+The spec uses these task statuses:
+- `working`: non-terminal; operation is in progress
+- `input_required`: non-terminal; operation needs additional input before it can continue
+- `completed`: terminal; result is available via `tasks/result`
+- `failed`: terminal; operation failed (details may appear in `statusMessage`)
+- `cancelled`: terminal; operation was cancelled
 
-## Interaction Diagram (tools/call Example)
+## Polling vs Push
+- **Polling (`tasks/get`) is the reliability baseline.** Requestors SHOULD respect `pollInterval` when choosing polling frequency, and SHOULD continue polling until the task reaches a terminal status or `input_required`.
+- **Push (`notifications/tasks/status`) is optional.** Receivers MAY send it when status changes; requestors MUST NOT rely on receiving it.
+
+## Result Retrieval
+- `tasks/result` blocks until the task reaches a terminal status, then returns the **domain result** matching the original request type (e.g., `CallToolResult` for a task-augmented `tools/call`).
+- Invoking `tasks/result` does **not** replace polling: requestors MAY continue polling `tasks/get` in parallel (e.g., to drive UI updates or recover from a cancelled/failed `tasks/result` attempt).
+
+## Interaction Diagram (task-augmented `tools/call`)
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant Server
-    
+
     Client->>Server: tools/call (task: {ttl: 60000})
-    Server-->>Client: {task: {taskId: "T1", status: "created"}}
-    
-    Note over Server: Async Execution Begins
-    
-    Server->>Client: notifications/tasks/status (taskId: "T1", status: "running")
-    
-    Note over Server: Work Completes
-    
-    Server->>Client: notifications/tasks/status (taskId: "T1", status: "completed")
-    
-    Client->>Server: tasks/result (taskId: "T1")
-    Server-->>Client: {content: [...], isError: false}
+    Server-->>Client: CreateTaskResult { taskId, status: "working", pollInterval: 5000, ... }
+
+    loop Poll until terminal / input_required
+        Client->>Server: tasks/get (taskId)
+        Server-->>Client: Task { status: "working", ... }
+        opt Optional push
+            Server->>Client: notifications/tasks/status (Task { ... })
+        end
+    end
+
+    Client->>Server: tasks/result (taskId)
+    Server-->>Client: CallToolResult { content: [...], isError: false, _meta: { related-task: { taskId } } }
 ```
 
-## Implementation Notes
-- **Persistence**: Task state should be stored in a bounded-size TTL cache. Tasks exceeding their TTL MUST be transitioned to `FAILED` or purged.
-- **Polling vs Push**: Clients SHOULD NOT poll `tasks/get` aggressively. They MUST rely on `notifications/tasks/status` where the `tasks` capability is negotiated.
-- **Race Conditions**: A `tasks/cancel` request might arrive after the task has already entered the `COMPLETED` state. In this case, the server SHOULD return the existing result or a "too late to cancel" error.
+## Implementation Notes (APM2-oriented)
+- **Task storage**: keep task state in a bounded, session-aware TTL cache keyed by `taskId` to prevent cross-session leakage.
+- **`pollInterval`**: treat as a load-shedding hint; pick a sane default and allow method-specific overrides for expensive work.
+- **Streamable HTTP**: the spec allows clients to disconnect from an SSE stream opened in response to `tasks/get` or `tasks/result`; implementations still MUST comply with Streamable HTTP transport rules.

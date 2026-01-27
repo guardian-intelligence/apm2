@@ -37,6 +37,7 @@ progress:
     progressToken: "token associated with the operation"
     progress: "number"
     total: "optional number"
+    message: "optional string"
   association:
     - "progressToken is typically provided by requestor via params._meta.progressToken"
 
@@ -56,5 +57,5 @@ completion:
   note: "argument auto-completion for prompts/tools/resource templates"
 
 tasks:
-  note: "tasks are experimental in 2025-11-25; see spec + references/spec/methods_registry.yaml"
+  note: "tasks are experimental in 2025-11-25; see spec + references/spec_methods_registry.md"
 ```

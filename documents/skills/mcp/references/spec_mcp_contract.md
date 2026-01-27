@@ -20,7 +20,10 @@ protocol:
           - "id MUST NOT be null"
           - "id MUST be unique among outstanding requests within a session"
       response:
-        required_fields: ["jsonrpc", "id"]
+        required_fields: ["jsonrpc"]
+        id_rules:
+          - "Result responses MUST include id (string|number) matching the request"
+          - "Error responses MUST include id matching the request, except when the id could not be read due to a malformed request (then id MAY be omitted)"
         one_of:
           - result: { required: true }
           - error: { required: true }
@@ -68,13 +71,14 @@ capabilities:
     roots: { listChanged: "bool (emit notifications/roots/list_changed)" }
     sampling: { supported: "object (empty) means supported" }
     elicitation:
-      modes: ["form", "url"]
-      compatibility:
-        - "empty object == form-only for backwards compatibility"
+      form: "object (if present: form mode supported)"
+      url: "object (if present: URL mode supported)"
     tasks:
+      list: "object (if present: tasks/list supported)"
+      cancel: "object (if present: tasks/cancel supported)"
       requests:
-        sampling.createMessage: {}
-        elicitation.create: {}
+        sampling: { createMessage: "object (task-augmented sampling/createMessage supported)" }
+        elicitation: { create: "object (task-augmented elicitation/create supported)" }
   common_server_capabilities:
     prompts: { listChanged: "bool" }
     resources: { subscribe: "bool", listChanged: "bool" }
@@ -82,10 +86,10 @@ capabilities:
     logging: {}
     completions: {}
     tasks:
-      list: {}
-      cancel: {}
+      list: "object (if present: tasks/list supported)"
+      cancel: "object (if present: tasks/cancel supported)"
       requests:
-        tools.call: {}
+        tools: { call: "object (task-augmented tools/call supported)" }
 
 transports:
   stdio:
@@ -95,19 +99,20 @@ transports:
     streams:
       - "client writes to server stdin; server writes to stdout"
       - "protocol data MUST NOT be interleaved with logs on stdout"
+      - "server MAY write logs to stderr; client MAY capture/ignore stderr"
   streamable_http:
     session:
-      header: "Mcp-Session-Id"
+      header: "MCP-Session-Id"
       rules:
-        - "server MAY assign Mcp-Session-Id on initialize response"
-        - "client MUST send Mcp-Session-Id on subsequent HTTP requests"
+        - "server MAY assign MCP-Session-Id on the HTTP response containing InitializeResult"
+        - "client MUST send MCP-Session-Id on subsequent HTTP requests"
     protocol_version_header:
       header: "MCP-Protocol-Version"
     methods:
-      post: "client->server JSON-RPC messages"
-      get_sse: "server->client event stream (SSE) for async messages"
+      post: "client->server JSON-RPC message per HTTP POST; requests get either application/json or text/event-stream response; notifications/responses get HTTP 202"
+      get_sse: "client->server HTTP GET opens SSE stream; server delivers JSON-RPC messages"
     sse:
-      - "server should emit messages as SSE 'event: message' with JSON in 'data:'"
+      - "server emits JSON-RPC messages in SSE events (event type MAY be omitted; data contains JSON)"
       - "client should reconnect with Last-Event-ID where supported"
       - "disconnecting SSE stream does not imply request cancellation"
 ```
