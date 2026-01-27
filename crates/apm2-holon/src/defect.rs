@@ -72,7 +72,8 @@ pub const MAX_REMEDIATION_LENGTH: usize = 1024;
 /// Errors that can occur when building or validating defect records.
 ///
 /// This error type is returned by [`DefectRecordBuilder::build`] instead of
-/// panicking, avoiding denial-of-service vectors in SCP code where panics are problematic.
+/// panicking, avoiding denial-of-service vectors in SCP code where panics are
+/// problematic.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DefectError {
     /// A required field was not set.
@@ -623,16 +624,13 @@ impl DefectRecordBuilder {
     /// # Errors
     ///
     /// Returns `DefectError::MissingField` if `work_id` or `signal` is not set.
-    /// Returns `DefectError::FieldTooLong` if any field exceeds its maximum length.
-    /// Returns `DefectError::TooManyItems` if `suggested_remediations` exceeds `MAX_REMEDIATIONS`.
+    /// Returns `DefectError::FieldTooLong` if any field exceeds its maximum
+    /// length. Returns `DefectError::TooManyItems` if
+    /// `suggested_remediations` exceeds `MAX_REMEDIATIONS`.
     pub fn build(self) -> Result<DefectRecord, DefectError> {
         // Validate required fields
-        let work_id = self
-            .work_id
-            .ok_or(DefectError::missing_field("work_id"))?;
-        let signal = self
-            .signal
-            .ok_or(DefectError::missing_field("signal"))?;
+        let work_id = self.work_id.ok_or(DefectError::missing_field("work_id"))?;
+        let signal = self.signal.ok_or(DefectError::missing_field("signal"))?;
 
         // Validate length constraints
         if self.defect_id.len() > MAX_DEFECT_ID_LENGTH {
@@ -922,7 +920,10 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, DefectError::MissingField { field: "work_id" }));
+        assert!(matches!(
+            err,
+            DefectError::MissingField { field: "work_id" }
+        ));
         assert!(err.to_string().contains("work_id"));
     }
 
@@ -947,7 +948,10 @@ mod tests {
         // Should fail on the first missing field (work_id)
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, DefectError::MissingField { field: "work_id" }));
+        assert!(matches!(
+            err,
+            DefectError::MissingField { field: "work_id" }
+        ));
     }
 
     // =========================================================================
@@ -1017,7 +1021,8 @@ mod tests {
         ));
     }
 
-    /// Test that signal details exceeding MAX_SIGNAL_DETAILS_LENGTH is rejected.
+    /// Test that signal details exceeding MAX_SIGNAL_DETAILS_LENGTH is
+    /// rejected.
     #[test]
     fn test_validation_signal_details_too_long() {
         let long_details = "x".repeat(MAX_SIGNAL_DETAILS_LENGTH + 1);
@@ -1064,7 +1069,8 @@ mod tests {
         ));
     }
 
-    /// Test that individual remediation exceeding MAX_REMEDIATION_LENGTH is rejected.
+    /// Test that individual remediation exceeding MAX_REMEDIATION_LENGTH is
+    /// rejected.
     #[test]
     fn test_validation_remediation_too_long() {
         let long_remediation = "x".repeat(MAX_REMEDIATION_LENGTH + 1);
@@ -1108,7 +1114,8 @@ mod tests {
         ));
     }
 
-    /// Test that context.session_id exceeding MAX_SESSION_ID_LENGTH is rejected.
+    /// Test that context.session_id exceeding MAX_SESSION_ID_LENGTH is
+    /// rejected.
     #[test]
     fn test_validation_session_id_too_long() {
         let long_session_id = "x".repeat(MAX_SESSION_ID_LENGTH + 1);
@@ -1130,7 +1137,8 @@ mod tests {
         ));
     }
 
-    /// Test that context.requested_stable_id exceeding MAX_STABLE_ID_LENGTH is rejected.
+    /// Test that context.requested_stable_id exceeding MAX_STABLE_ID_LENGTH is
+    /// rejected.
     #[test]
     fn test_validation_stable_id_too_long() {
         let long_stable_id = "x".repeat(MAX_STABLE_ID_LENGTH + 1);
@@ -1191,8 +1199,7 @@ mod tests {
     /// Test that DefectError implements std::error::Error.
     #[test]
     fn test_defect_error_is_std_error() {
-        let err: Box<dyn std::error::Error> =
-            Box::new(DefectError::missing_field("test"));
+        let err: Box<dyn std::error::Error> = Box::new(DefectError::missing_field("test"));
         assert!(!err.to_string().is_empty());
     }
 }

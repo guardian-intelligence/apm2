@@ -446,9 +446,10 @@ impl EpisodeController {
     /// This helper is foundational plumbing for context pack miss tracking.
     /// It is not currently invoked during episode execution because pack misses
     /// occur within the `Holon::execute_episode` implementation, which returns
-    /// an opaque `EpisodeResult`. Integration will happen when artifact fetching
-    /// is implemented in a future ticket, at which point the execution context
-    /// will need to propagate pack miss information back to the controller.
+    /// an opaque `EpisodeResult`. Integration will happen when artifact
+    /// fetching is implemented in a future ticket, at which point the
+    /// execution context will need to propagate pack miss information back
+    /// to the controller.
     ///
     /// See TCK-00138 for the foundational receipt/defect infrastructure.
     #[allow(dead_code)] // Foundational plumbing - integration pending artifact fetch impl
