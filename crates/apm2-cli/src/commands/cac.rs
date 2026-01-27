@@ -3,8 +3,15 @@
 //! This module provides CLI commands for CAC operations including
 //! patch application with replay protection via the admission pipeline.
 
+use std::fs;
 use std::io::{self, Read as IoRead};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Maximum file size for input files (10MB).
+///
+/// This limit prevents denial-of-service attacks via memory exhaustion from
+/// large file inputs.
+const MAX_INPUT_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 use anyhow::{Context, Result, bail};
 use apm2_core::cac::admission::{
@@ -185,25 +192,17 @@ fn run_apply_patch_inner(args: &ApplyPatchArgs) -> Result<AdmissionReceipt, CacC
     let patch: Value = serde_json::from_str(&patch_content)
         .map_err(|e| CacCliError::ValidationError(format!("invalid patch JSON: {e}")))?;
 
-    // Read the base document
-    let base_content = std::fs::read_to_string(&args.base).map_err(|e| {
-        CacCliError::Other(format!(
-            "failed to read base document '{}': {e}",
-            args.base.display()
-        ))
-    })?;
+    // Read the base document with size limit
+    let base_content = read_bounded_file(&args.base)
+        .map_err(|e| CacCliError::Other(format!("failed to read base document: {e}")))?;
 
     // Parse base document as JSON
     let base: Value = serde_json::from_str(&base_content)
         .map_err(|e| CacCliError::ValidationError(format!("invalid base document JSON: {e}")))?;
 
-    // Read the schema
-    let schema_content = std::fs::read_to_string(&args.schema).map_err(|e| {
-        CacCliError::Other(format!(
-            "failed to read schema '{}': {e}",
-            args.schema.display()
-        ))
-    })?;
+    // Read the schema with size limit
+    let schema_content = read_bounded_file(&args.schema)
+        .map_err(|e| CacCliError::Other(format!("failed to read schema: {e}")))?;
 
     // Parse schema as JSON
     let schema: Value = serde_json::from_str(&schema_content)
@@ -268,19 +267,59 @@ fn run_apply_patch_inner(args: &ApplyPatchArgs) -> Result<AdmissionReceipt, CacC
     Ok(result.receipt)
 }
 
+/// Reads a file with size limit to prevent denial-of-service via memory
+/// exhaustion.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The file cannot be read
+/// - The file size exceeds `MAX_INPUT_FILE_SIZE` (10MB)
+fn read_bounded_file(path: &Path) -> Result<String> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to read file metadata: {}", path.display()))?;
+
+    let file_size = metadata.len();
+    if file_size > MAX_INPUT_FILE_SIZE {
+        bail!(
+            "file '{}' exceeds maximum size limit of {} bytes (file size: {} bytes)",
+            path.display(),
+            MAX_INPUT_FILE_SIZE,
+            file_size
+        );
+    }
+
+    fs::read_to_string(path).with_context(|| format!("failed to read file: {}", path.display()))
+}
+
+/// Reads from stdin with size limit to prevent denial-of-service via memory
+/// exhaustion.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Reading from stdin fails
+/// - The input exceeds `MAX_INPUT_FILE_SIZE` (10MB)
+fn read_bounded_stdin() -> Result<String> {
+    let mut content = String::new();
+    let mut handle = io::stdin().take(MAX_INPUT_FILE_SIZE + 1);
+
+    handle
+        .read_to_string(&mut content)
+        .context("failed to read from stdin")?;
+
+    if content.len() as u64 > MAX_INPUT_FILE_SIZE {
+        bail!("stdin input exceeds maximum size limit of {MAX_INPUT_FILE_SIZE} bytes");
+    }
+
+    Ok(content)
+}
+
 /// Reads patch input from file or stdin.
 fn read_patch_input(patch_path: Option<&PathBuf>) -> Result<String> {
     match patch_path {
-        Some(path) if path.as_os_str() != "-" => std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read patch file: {}", path.display())),
-        _ => {
-            // Read from stdin
-            let mut content = String::new();
-            io::stdin()
-                .read_to_string(&mut content)
-                .context("failed to read patch from stdin")?;
-            Ok(content)
-        },
+        Some(path) if path.as_os_str() != "-" => read_bounded_file(path),
+        _ => read_bounded_stdin(),
     }
 }
 
@@ -716,6 +755,105 @@ mod tests {
         assert!(
             matches!(result, Err(CacCliError::Other(_))),
             "Expected Other error for missing file, got: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // File Size Limit Tests
+    // =========================================================================
+
+    #[test]
+    fn test_apply_patch_file_too_large() {
+        use std::io::Write;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().join("base.json");
+        let schema_path = temp_dir.path().join("schema.json");
+
+        // Create base document
+        let base = serde_json::json!({"id": "TCK-00133", "version": 1});
+        let base_hash = compute_base_hash(&base);
+        std::fs::write(&base_path, serde_json::to_string(&base).unwrap()).unwrap();
+
+        // Create a patch file that exceeds MAX_INPUT_FILE_SIZE (10MB)
+        // We create a file slightly larger than 10MB
+        let oversized_path = temp_dir.path().join("oversized_patch.json");
+        {
+            let mut file = std::fs::File::create(&oversized_path).unwrap();
+            // Write opening bracket for JSON array
+            file.write_all(b"[").unwrap();
+            // Write enough data to exceed 10MB
+            let chunk = r#"{"op":"test","path":"/id","value":"TCK-00133"},"#;
+            #[allow(clippy::cast_possible_truncation)]
+            let chunk_count = (super::MAX_INPUT_FILE_SIZE as usize / chunk.len()) + 100;
+            for _ in 0..chunk_count {
+                file.write_all(chunk.as_bytes()).unwrap();
+            }
+            // Write closing operation and bracket
+            file.write_all(b"{\"op\":\"test\",\"path\":\"/id\",\"value\":\"TCK-00133\"}]")
+                .unwrap();
+        }
+
+        // Verify the file is actually larger than the limit
+        let metadata = std::fs::metadata(&oversized_path).unwrap();
+        assert!(
+            metadata.len() > super::MAX_INPUT_FILE_SIZE,
+            "Test file should exceed MAX_INPUT_FILE_SIZE"
+        );
+
+        // Create schema
+        std::fs::write(
+            &schema_path,
+            serde_json::to_string(&sample_schema()).unwrap(),
+        )
+        .unwrap();
+
+        let args = ApplyPatchArgs {
+            expected_base: base_hash,
+            patch: Some(oversized_path),
+            base: base_path,
+            schema: schema_path,
+            dcp_id: "dcp://test/ticket/TCK-00133".to_string(),
+            artifact_kind: "ticket".to_string(),
+            patch_type: PatchTypeArg::JsonPatch,
+            dry_run: false,
+            format: OutputFormat::Json,
+        };
+
+        let result = run_apply_patch_inner(&args);
+        assert!(
+            matches!(result, Err(CacCliError::Other(ref msg)) if msg.contains("exceeds maximum size limit")),
+            "Expected error about file size limit, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_bounded_file_rejects_oversized() {
+        use std::io::Write;
+
+        let temp_dir = TempDir::new().unwrap();
+        let oversized_path = temp_dir.path().join("oversized.txt");
+
+        // Create a file that exceeds MAX_INPUT_FILE_SIZE
+        {
+            let mut file = std::fs::File::create(&oversized_path).unwrap();
+            let chunk = vec![b'x'; 1024 * 1024]; // 1MB chunk
+            for _ in 0..11 {
+                // Write 11MB total
+                file.write_all(&chunk).unwrap();
+            }
+        }
+
+        let result = super::read_bounded_file(&oversized_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("exceeds maximum size limit"),
+            "Error message should mention size limit: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("10485760"),
+            "Error message should include the limit in bytes: {err_msg}"
         );
     }
 }
