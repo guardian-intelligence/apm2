@@ -906,3 +906,111 @@ mod validation_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod artifact_fetch_tests {
+    use super::*;
+
+    #[test]
+    fn test_artifact_fetch_valid_stable_id() {
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
+                stable_id: "org:ticket:TCK-001".to_string(),
+                content_hash: String::new(),
+                expected_hash: String::new(),
+                max_bytes: 1024,
+                format: "json".to_string(),
+            })),
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_artifact_fetch_valid_content_hash() {
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
+                stable_id: String::new(),
+                content_hash: "a".repeat(64),
+                expected_hash: String::new(),
+                max_bytes: 1024,
+                format: String::new(),
+            })),
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_artifact_fetch_missing_identifiers() {
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
+                stable_id: String::new(),
+                content_hash: String::new(),
+                expected_hash: String::new(),
+                max_bytes: 1024,
+                format: String::new(),
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "artifact_fetch"));
+    }
+
+    #[test]
+    fn test_artifact_fetch_invalid_content_hash() {
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
+                stable_id: String::new(),
+                content_hash: "invalid-hash".to_string(),
+                expected_hash: String::new(),
+                max_bytes: 1024,
+                format: String::new(),
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "artifact_fetch.content_hash")
+        );
+    }
+
+    #[test]
+    fn test_artifact_fetch_max_bytes_exceeded() {
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
+                stable_id: "org:test".to_string(),
+                content_hash: String::new(),
+                expected_hash: String::new(),
+                max_bytes: (MAX_WRITE_SIZE + 1) as u64,
+                format: String::new(),
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "artifact_fetch.max_bytes"));
+    }
+}

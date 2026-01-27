@@ -106,7 +106,7 @@
 //! let schema = DcpEntry::new(
 //!     "org:schema:ticket-v1",
 //!     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-//!     "org:schema:ticket-v1",  // Self-referential is allowed
+//!     "org:schema:ticket-v1", // Self-referential is allowed
 //! );
 //! index.register(schema).unwrap();
 //!
