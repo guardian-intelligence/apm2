@@ -14,7 +14,9 @@
 //! # Example
 //!
 //! ```rust
-//! use apm2_holon::defect::{DefectRecord, DefectSeverity, DefectSignal, SignalType};
+//! use apm2_holon::defect::{
+//!     DefectRecord, DefectSeverity, DefectSignal, SignalType,
+//! };
 //!
 //! let defect = DefectRecord::builder("DEF-001", "UNPLANNED_CONTEXT")
 //!     .severity(DefectSeverity::S2)
@@ -314,7 +316,9 @@ impl DefectContext {
 /// # Example
 ///
 /// ```rust
-/// use apm2_holon::defect::{DefectRecord, DefectSeverity, DefectSignal, SignalType};
+/// use apm2_holon::defect::{
+///     DefectRecord, DefectSeverity, DefectSignal, SignalType,
+/// };
 ///
 /// let defect = DefectRecord::builder("DEF-001", "PACK_MISS")
 ///     .severity(DefectSeverity::S2)
@@ -605,7 +609,10 @@ mod tests {
             SignalType::UnplannedContextRead.as_str(),
             "UNPLANNED_CONTEXT_READ"
         );
-        assert_eq!(SignalType::UnplannedToolCall.as_str(), "UNPLANNED_TOOL_CALL");
+        assert_eq!(
+            SignalType::UnplannedToolCall.as_str(),
+            "UNPLANNED_TOOL_CALL"
+        );
     }
 
     #[test]
@@ -667,8 +674,13 @@ mod tests {
 
     #[test]
     fn test_defect_record_pack_miss() {
-        let defect =
-            DefectRecord::pack_miss("DEF-001", "work-123", "org:doc:missing", [0u8; 32], 1_000_000);
+        let defect = DefectRecord::pack_miss(
+            "DEF-001",
+            "work-123",
+            "org:doc:missing",
+            [0u8; 32],
+            1_000_000,
+        );
 
         assert_eq!(defect.defect_id(), "DEF-001");
         assert_eq!(defect.defect_class(), "UNPLANNED_CONTEXT_READ");

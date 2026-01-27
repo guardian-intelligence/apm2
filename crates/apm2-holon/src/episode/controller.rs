@@ -420,7 +420,8 @@ impl EpisodeController {
         &self.config
     }
 
-    /// Records a context pack miss and emits a `DefectRecord` if this is the first miss.
+    /// Records a context pack miss and emits a `DefectRecord` if this is the
+    /// first miss.
     ///
     /// This method should be called when an artifact fetch fails due to the
     /// artifact not being present in the context pack.
@@ -437,8 +438,8 @@ impl EpisodeController {
     ///
     /// # Returns
     ///
-    /// Returns `true` if this was the first miss (and a `DefectRecord` was emitted),
-    /// `false` otherwise.
+    /// Returns `true` if this was the first miss (and a `DefectRecord` was
+    /// emitted), `false` otherwise.
     pub fn record_pack_miss(
         builder: &mut RunReceiptBuilder,
         defect_records: &mut Vec<DefectRecord>,
@@ -1562,10 +1563,12 @@ mod tests {
         assert_eq!(defect_records.len(), 1);
         assert_eq!(defect_records[0].defect_class(), "UNPLANNED_CONTEXT_READ");
         assert_eq!(defect_records[0].work_id(), "work-123");
-        assert!(defect_records[0]
-            .signal()
-            .details()
-            .contains("org:doc:missing"));
+        assert!(
+            defect_records[0]
+                .signal()
+                .details()
+                .contains("org:doc:missing")
+        );
     }
 
     #[test]
