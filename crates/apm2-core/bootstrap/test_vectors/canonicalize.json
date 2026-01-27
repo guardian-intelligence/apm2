@@ -292,10 +292,11 @@
   "depth_limit_vectors": [
     {
       "id": "depth-001",
-      "description": "Nesting at exactly MAX_DEPTH=128 levels (may hit serde limit first)",
+      "description": "Nesting at exactly MAX_DEPTH=128 levels (hits serde_json recursion limit)",
       "depth": 128,
       "generator": "nested_object",
-      "notes": "Generate {\"n\":{\"n\":...}} nested 128 times. May succeed or fail depending on serde_json recursion limit."
+      "expected_error_pattern": "recursion",
+      "notes": "Generate {\"n\":{\"n\":...}} nested 128 times. serde_json's default recursion limit (128) is hit before our depth check."
     },
     {
       "id": "depth-002",

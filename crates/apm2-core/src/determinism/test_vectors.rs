@@ -290,28 +290,39 @@ mod canonicalization {
 
             let result = canonicalize_json(&input);
 
-            if let Some(pattern) = &vector.expected_error_pattern {
-                // Expect failure
-                match result {
-                    Ok(canonical) => {
-                        panic!(
-                            "Vector {}: expected error matching '{}' but got success.\nDepth: {}\nGenerator: {}\nCanonical: {}",
-                            vector.id, pattern, vector.depth, vector.generator, canonical
-                        );
-                    },
-                    Err(e) => {
-                        let err_str = format!("{e:?}");
-                        let patterns: Vec<&str> = pattern.split('|').collect();
-                        let matches = patterns
-                            .iter()
-                            .any(|p| err_str.to_lowercase().contains(&p.to_lowercase()));
-                        assert!(
-                            matches,
-                            "Vector {}: error message should contain one of {:?}, got: {:?}",
-                            vector.id, patterns, e
-                        );
-                    },
-                }
+            match (&vector.expected_error_pattern, result) {
+                // Expected failure, got failure - verify error pattern matches
+                (Some(pattern), Err(e)) => {
+                    let err_str = format!("{e:?}");
+                    let patterns: Vec<&str> = pattern.split('|').collect();
+                    let matches = patterns
+                        .iter()
+                        .any(|p| err_str.to_lowercase().contains(&p.to_lowercase()));
+                    assert!(
+                        matches,
+                        "Vector {}: error message should contain one of {:?}, got: {:?}",
+                        vector.id, patterns, e
+                    );
+                },
+                // Expected failure, got success - panic (DoS protection regression)
+                (Some(pattern), Ok(canonical)) => {
+                    panic!(
+                        "Vector {}: expected error matching '{}' but got success.\nDepth: {}\nGenerator: {}\nCanonical: {}",
+                        vector.id, pattern, vector.depth, vector.generator, canonical
+                    );
+                },
+                // Expected success (no error pattern), got success - OK
+                (None, Ok(_)) => {
+                    // Depth vector with no expected_error_pattern should
+                    // succeed
+                },
+                // Expected success (no error pattern), got failure - panic
+                (None, Err(e)) => {
+                    panic!(
+                        "Vector {}: expected success but got error.\nDepth: {}\nGenerator: {}\nError: {:?}",
+                        vector.id, vector.depth, vector.generator, e
+                    );
+                },
             }
         }
     }
