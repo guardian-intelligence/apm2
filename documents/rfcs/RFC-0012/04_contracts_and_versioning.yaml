@@ -96,7 +96,7 @@ rfc_contracts_and_versioning:
                 session_id: SessionId,
                 attempt_number: u32,
                 /// Atomic check: binding only succeeds if work is still at this count.
-                expected_transition_count: u32,
+                expected_transition_count: u64,
             },
             SessionUnbound {
                 coordination_id: CoordinationId,
@@ -157,7 +157,7 @@ rfc_contracts_and_versioning:
             pub async fn start(&self, config: CoordinationConfig) -> Result<CoordinationId, Error>;
             pub async fn run_loop(&self, coordination_id: CoordinationId) -> Result<CoordinationReceipt, Error>;
             fn check_stop_condition(&self, state: &CoordinationState) -> Option<StopCondition>;
-            fn check_work_freshness(&self, work_id: WorkId, expected_seq: u32) -> Result<(), Error>;
+            fn check_work_freshness(&self, work_id: WorkId, expected_transition_count: u64) -> Result<(), Error>;
         }
 
         pub struct CoordinationConfig {

@@ -135,18 +135,19 @@ rfc_design_decisions:
         Atomicity is achieved via a Compare-And-Swap (CAS) check at the ledger
         admission boundary.
 
-        NORMATIVE ORDERING:
+        NORMATIVE ORDERING (MANDATORY):
         1. Controller reads `WorkState` and `transition_count` (K).
         2. Controller emits `coordination.session_bound(expected_transition_count=K)`.
         3. Ledger admission gate MUST verify `work.transition_count == K`.
-        4. IF AND ONLY IF the event is successfully committed to the ledger,
+        4. IF AND ONLY IF the event is successfully committed to the ledger (authoritative record),
            the controller proceeds to spawn the session via the `SessionSpawner`.
 
         This ensures that no session is spawned unless the binding is
         authoritatively recorded and validated against the pinned state.
+        Spawning BEFORE commit is a correctness defect.
       rationale: |
         "Check-then-spawn" is vulnerable to TOCTOU races. Placing the
-        binding commit *before* the side effect (spawning) and making it
+        binding commit *before* side effects (spawning) and making it
         conditional on state freshness ensures deterministic coordination.
       constraint_ref: "documents/prds/PRD-0008/06_constraints_invariants.yaml#CNS-COORD-0005"
 
@@ -203,7 +204,7 @@ rfc_design_decisions:
         - `canonicalizer_version`: "1.0"
         - Every structure used in coordination MUST provide a `canonical_bytes()`
           method that invokes the specified versioned canonicalizer.
-        - `mcp-testkit` MUST include golden test vectors (raw bytes + expected hashes)
+        - `kernel-testkit` MUST include golden test vectors (raw bytes + expected hashes)
           for all coordination structures.
         - SIGNING/HASHING POLICY: Always sign/hash the output of `canonical_bytes()`,
           never the standard `serde` serialization or memory representation.
