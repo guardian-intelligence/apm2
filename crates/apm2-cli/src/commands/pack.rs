@@ -24,7 +24,8 @@ pub mod exit_codes {
     pub const SUCCESS: u8 = 0;
     /// Budget exceeded exit code.
     pub const BUDGET_EXCEEDED: u8 = 1;
-    /// Validation error exit code (schema validation failed, invalid input, etc.).
+    /// Validation error exit code (schema validation failed, invalid input,
+    /// etc.).
     pub const VALIDATION_ERROR: u8 = 2;
 }
 
@@ -115,7 +116,11 @@ pub fn run_pack(cmd: &PackCommand) -> u8 {
 fn run_compile(args: &CompileArgs) -> u8 {
     match run_compile_inner(args) {
         Ok(()) => exit_codes::SUCCESS,
-        Err(PackCliError::BudgetExceeded { dimension, limit, actual }) => {
+        Err(PackCliError::BudgetExceeded {
+            dimension,
+            limit,
+            actual,
+        }) => {
             eprintln!(
                 "Error: Budget exceeded - {dimension} limit is {limit}, but pack requires {actual}"
             );
@@ -183,7 +188,8 @@ fn run_compile_inner(args: &CompileArgs) -> Result<(), PackCliError> {
     if let Some(ref profile) = args.profile {
         spec.target_profile.clone_from(profile);
         // Re-validate after modification
-        spec.validate().map_err(|e| PackCliError::ValidationError(e.to_string()))?;
+        spec.validate()
+            .map_err(|e| PackCliError::ValidationError(e.to_string()))?;
     }
 
     // Create DCP index (empty for now - in production this would be populated)
@@ -232,7 +238,10 @@ fn run_compile_inner(args: &CompileArgs) -> Result<(), PackCliError> {
     match &args.output {
         Some(path) => {
             let mut file = File::create(path).map_err(|e| {
-                PackCliError::IoError(format!("failed to create output file '{}': {e}", path.display()))
+                PackCliError::IoError(format!(
+                    "failed to create output file '{}': {e}",
+                    path.display()
+                ))
             })?;
             file.write_all(manifest_output.as_bytes()).map_err(|e| {
                 PackCliError::IoError(format!("failed to write to '{}': {e}", path.display()))
@@ -247,7 +256,8 @@ fn run_compile_inner(args: &CompileArgs) -> Result<(), PackCliError> {
     Ok(())
 }
 
-/// Reads a file with size limit to prevent denial-of-service via memory exhaustion.
+/// Reads a file with size limit to prevent denial-of-service via memory
+/// exhaustion.
 ///
 /// Uses a bounded reader to avoid TOCTOU (time-of-check to time-of-use) race
 /// conditions. Instead of checking file size then reading, we read up to
@@ -427,7 +437,9 @@ target_profile: "org:profile:test"
         }
 
         let result = read_bounded_file(&oversized_path);
-        assert!(matches!(result, Err(PackCliError::ValidationError(msg)) if msg.contains("exceeds maximum size limit")));
+        assert!(
+            matches!(result, Err(PackCliError::ValidationError(msg)) if msg.contains("exceeds maximum size limit"))
+        );
     }
 
     #[test]
@@ -476,7 +488,8 @@ target_profile: "org:profile:test"
             format: OutputFormat::Json,
         };
 
-        // The compile should fail because the root artifact doesn't exist in the empty index
+        // The compile should fail because the root artifact doesn't exist in the empty
+        // index
         let result = run_compile(&args);
         assert_eq!(result, exit_codes::VALIDATION_ERROR);
     }
@@ -651,7 +664,8 @@ target_profile: "org:profile:test"
             format: OutputFormat::Json,
         };
 
-        // Should still fail due to missing artifact, but would pass budget check if artifact existed
+        // Should still fail due to missing artifact, but would pass budget check if
+        // artifact existed
         let result = run_compile(&args);
         assert_eq!(result, exit_codes::VALIDATION_ERROR);
     }
