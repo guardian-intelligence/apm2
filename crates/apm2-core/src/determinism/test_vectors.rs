@@ -293,10 +293,11 @@ mod canonicalization {
             if let Some(pattern) = &vector.expected_error_pattern {
                 // Expect failure
                 match result {
-                    Ok(_) => {
-                        // Some depth tests might succeed depending on
-                        // serde_json limits Just warn
-                        // but don't fail
+                    Ok(canonical) => {
+                        panic!(
+                            "Vector {}: expected error matching '{}' but got success.\nDepth: {}\nGenerator: {}\nCanonical: {}",
+                            vector.id, pattern, vector.depth, vector.generator, canonical
+                        );
                     },
                     Err(e) => {
                         let err_str = format!("{e:?}");
