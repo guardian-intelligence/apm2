@@ -85,6 +85,11 @@ fn generate_bootstrap_manifest() -> Result<(), Box<dyn std::error::Error>> {
             let filename = entry.file_name().to_string_lossy().to_string();
             let content = fs::read_to_string(&path)?;
 
+            // Validate JSON at build time to fail early on malformed schemas
+            serde_json::from_str::<serde_json::Value>(&content).map_err(|e| {
+                format!("Invalid JSON in bootstrap schema {}: {}", path.display(), e)
+            })?;
+
             // Compute BLAKE3 hash
             let hash = blake3::hash(content.as_bytes());
             let hash_bytes: [u8; 32] = *hash.as_bytes();
