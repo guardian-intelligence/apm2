@@ -1,0 +1,215 @@
+rfc_ticket_decomposition:
+  schema_version: "2026-01-27"
+  template_version: "2026-01-27"
+
+  status: PENDING
+  v0_note: |
+    Ticket decomposition pending RFC advancement to v4 (Standard phase).
+    The following is a preliminary structure based on rollout phases.
+    Detailed tickets will be generated during DECOMPOSE mode.
+
+  preliminary_tickets:
+    # Phase 1A: Protocol Foundation
+    - ticket_id: TCK-PEND-001
+      title: "Implement UDS protocol server with length-prefixed framing"
+      phase: PHASE-1A
+      requirement_ids: [REQ-PROTOCOL-001]
+      depends_on: []
+      summary: |
+        UDS server listening on XDG_RUNTIME_DIR/apm2/apm2d.sock.
+        Length-prefixed binary framing with max 16MB frames.
+        Protocol version negotiation in handshake.
+
+    - ticket_id: TCK-PEND-002
+      title: "Implement protobuf message definitions"
+      phase: PHASE-1A
+      requirement_ids: [REQ-PROTOCOL-001]
+      depends_on: [TCK-PEND-001]
+      summary: |
+        Define proto/daemon_protocol.proto with all message types.
+        Generate Rust code via prost. Include golden vectors.
+
+    # Phase 1B: Episode Envelope and Lifecycle
+    - ticket_id: TCK-PEND-003
+      title: "Implement EpisodeEnvelope type with canonicalization"
+      phase: PHASE-1B
+      requirement_ids: [REQ-EPISODE-001]
+      depends_on: [TCK-PEND-002]
+      summary: |
+        EpisodeEnvelope struct with all fields per AD-EPISODE-001.
+        canonical_bytes() with deterministic serialization.
+        Golden vectors for envelope hashing.
+
+    - ticket_id: TCK-PEND-004
+      title: "Implement EpisodeRuntime with state machine"
+      phase: PHASE-1B
+      requirement_ids: [REQ-EPISODE-001, REQ-DAEMON-001]
+      depends_on: [TCK-PEND-003]
+      summary: |
+        EpisodeRuntime struct with create/start/stop/signal methods.
+        State machine: CREATED -> RUNNING -> (TERMINATED | QUARANTINED).
+        Event emission for all transitions.
+
+    # Phase 1C: PTY Runner and Basic Adapter
+    - ticket_id: TCK-PEND-005
+      title: "Implement PTY spawning and output capture"
+      phase: PHASE-1C
+      requirement_ids: [REQ-ADAPTER-001]
+      depends_on: [TCK-PEND-004]
+      summary: |
+        PTY allocation and child process spawning via nix.
+        Output capture with sequence numbers and timestamps.
+        Ring buffer for flight recorder.
+
+    - ticket_id: TCK-PEND-006
+      title: "Implement basic HarnessAdapter trait and registry"
+      phase: PHASE-1C
+      requirement_ids: [REQ-ADAPTER-001]
+      depends_on: [TCK-PEND-005]
+      summary: |
+        HarnessAdapter trait definition per CTR-DAEMON-003.
+        AdapterRegistry for adapter lookup by type.
+        RawAdapter emitting unstructured output events.
+
+    # Phase 2A: Tool Broker Foundation
+    - ticket_id: TCK-PEND-007
+      title: "Implement capability manifest and validation"
+      phase: PHASE-2A
+      requirement_ids: [REQ-TOOL-001]
+      depends_on: [TCK-PEND-004]
+      summary: |
+        CapabilityManifest type with sealed references.
+        Capability validation against tool requests.
+        Policy integration for OCAP enforcement.
+
+    - ticket_id: TCK-PEND-008
+      title: "Implement ToolBroker with dedupe cache"
+      phase: PHASE-2A
+      requirement_ids: [REQ-TOOL-001]
+      depends_on: [TCK-PEND-007]
+      summary: |
+        ToolBroker struct per CTR-DAEMON-004.
+        DedupeCache for idempotent tool replay.
+        Policy evaluation for allow/deny decisions.
+
+    # Phase 2B: Tool Execution and Receipts
+    - ticket_id: TCK-PEND-009
+      title: "Implement tool execution with receipt generation"
+      phase: PHASE-2B
+      requirement_ids: [REQ-TOOL-001, REQ-RECEIPT-001]
+      depends_on: [TCK-PEND-008]
+      summary: |
+        Tool executor with budget charging.
+        Receipt generation per AD-RECEIPT-001.
+        CAS storage for tool results.
+
+    - ticket_id: TCK-PEND-010
+      title: "Implement receipt signing and verification"
+      phase: PHASE-2B
+      requirement_ids: [REQ-RECEIPT-001]
+      depends_on: [TCK-PEND-009]
+      summary: |
+        Ed25519 signing of receipt canonical bytes.
+        Verification predicate implementation.
+        Signing key management in OS keychain.
+
+    # Phase 2C: Telemetry Collection
+    - ticket_id: TCK-PEND-011
+      title: "Implement cgroups v2 reader for resource metrics"
+      phase: PHASE-2C
+      requirement_ids: [REQ-TEL-001]
+      depends_on: [TCK-PEND-004]
+      summary: |
+        CgroupReader for cpu, memory, io stats.
+        Per-episode cgroup placement.
+        Fallback to /proc for non-cgroup metrics.
+
+    - ticket_id: TCK-PEND-012
+      title: "Implement TelemetryCollector and frame streaming"
+      phase: PHASE-2C
+      requirement_ids: [REQ-TEL-001]
+      depends_on: [TCK-PEND-011]
+      summary: |
+        TelemetryCollector per CTR-DAEMON-005.
+        Configurable sample interval.
+        Integration with budget accounting.
+
+    # Phase 3A: Evidence Economics
+    - ticket_id: TCK-PEND-013
+      title: "Implement flight recorder with ring buffers"
+      phase: PHASE-3A
+      requirement_ids: [REQ-EVID-001]
+      depends_on: [TCK-PEND-005, TCK-PEND-012]
+      summary: |
+        Per-episode ring buffers for PTY, tool I/O, telemetry.
+        Configurable buffer sizes per risk tier.
+        Persistence on trigger events.
+
+    - ticket_id: TCK-PEND-014
+      title: "Implement evidence TTL and pinning"
+      phase: PHASE-3A
+      requirement_ids: [REQ-EVID-001]
+      depends_on: [TCK-PEND-013]
+      summary: |
+        Evidence artifact with ttl, class, pin_state.
+        TTL enforcement timer.
+        Pin API for incident binding.
+
+    - ticket_id: TCK-PEND-015
+      title: "Implement evidence compaction"
+      phase: PHASE-3A
+      requirement_ids: [REQ-EVID-001]
+      depends_on: [TCK-PEND-014]
+      summary: |
+        Compaction job producing summary receipts.
+        Tombstoned pointers for dropped artifacts.
+        Compaction receipts for audit trail.
+
+    # Phase 3B: Vendor Adapter
+    - ticket_id: TCK-PEND-016
+      title: "Implement Claude Code harness adapter"
+      phase: PHASE-3B
+      requirement_ids: [REQ-ADAPTER-001]
+      depends_on: [TCK-PEND-006, TCK-PEND-008]
+      summary: |
+        PTY output parser for Claude Code CLI.
+        Tool call detection and extraction.
+        Test fixtures from real Claude Code sessions.
+
+    # Phase 4: Integration and CLI
+    - ticket_id: TCK-PEND-017
+      title: "Implement apm2 episode CLI commands"
+      phase: PHASE-4
+      requirement_ids: []
+      depends_on: [TCK-PEND-016, TCK-PEND-015]
+      summary: |
+        apm2 episode create/start/stop/status commands.
+        JSON output for machine readability.
+        Integration with daemon via UDS.
+
+    - ticket_id: TCK-PEND-018
+      title: "Implement end-to-end integration tests"
+      phase: PHASE-4
+      requirement_ids: []
+      depends_on: [TCK-PEND-017]
+      summary: |
+        E2E test suite covering episode lifecycle.
+        Receipt and evidence verification.
+        Budget exhaustion scenarios.
+
+  decomposition_gates:
+    - gate: GATE-TCK-ATOMICITY
+      status: PENDING
+      notes: "Will be evaluated during DECOMPOSE mode"
+
+    - gate: GATE-TCK-IMPLEMENTABILITY
+      status: PENDING
+      notes: "Will be evaluated during DECOMPOSE mode"
+
+    - gate: GATE-TCK-ANTI-COUSIN
+      status: PENDING
+      notes: "Will be evaluated during DECOMPOSE mode"
+
+  ticket_numbering_note: |
+    Final ticket IDs (TCK-XXXXX format) will be assigned during DECOMPOSE mode
+    based on next available ticket number in work substrate.
