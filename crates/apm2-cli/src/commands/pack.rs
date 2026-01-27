@@ -81,8 +81,9 @@ pub struct CompileArgs {
 
     /// Path to a DCP index file (JSON).
     ///
-    /// The index file should contain artifact metadata in the `DcpIndex` format.
-    /// Each entry maps a stable ID to its content hash and schema reference.
+    /// The index file should contain artifact metadata in the `DcpIndex`
+    /// format. Each entry maps a stable ID to its content hash and schema
+    /// reference.
     ///
     /// Example index file:
     /// ```json
@@ -882,7 +883,9 @@ target_profile: "org:profile:test"
     #[test]
     fn test_load_dcp_index_none_returns_error() {
         let result = load_dcp_index(None);
-        assert!(matches!(result, Err(PackCliError::ValidationError(msg)) if msg.contains("No DCP index provided")));
+        assert!(
+            matches!(result, Err(PackCliError::ValidationError(msg)) if msg.contains("No DCP index provided"))
+        );
     }
 
     #[test]
@@ -903,7 +906,9 @@ target_profile: "org:profile:test"
         std::fs::write(&index_path, "{ invalid json }").unwrap();
 
         let result = load_dcp_index(Some(&index_path));
-        assert!(matches!(result, Err(PackCliError::ValidationError(msg)) if msg.contains("failed to parse index file")));
+        assert!(
+            matches!(result, Err(PackCliError::ValidationError(msg)) if msg.contains("failed to parse index file"))
+        );
     }
 
     #[test]
