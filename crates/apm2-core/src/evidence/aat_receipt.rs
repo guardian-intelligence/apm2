@@ -682,6 +682,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_test_summary_pass_rate() {
         let summary = TestSummary::new(8, 2, 0);
         assert_eq!(summary.pass_rate(), 80.0);

@@ -1225,7 +1225,10 @@ mod tests {
         };
 
         assert!(result.all_passed());
-        assert_eq!(result.pass_rate(), 100.0);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(result.pass_rate(), 100.0);
+        }
     }
 
     #[test]
@@ -1255,7 +1258,10 @@ mod tests {
         };
 
         assert!(!result.all_passed());
-        assert_eq!(result.pass_rate(), 60.0);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(result.pass_rate(), 60.0);
+        }
         assert_eq!(result.failed_tests(), vec!["test1"]);
     }
 
@@ -1271,7 +1277,10 @@ mod tests {
         };
 
         assert!(!result.all_passed()); // No tests passed means not "all passed"
-        assert_eq!(result.pass_rate(), 0.0);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(result.pass_rate(), 0.0);
+        }
     }
 
     // =========================================================================
