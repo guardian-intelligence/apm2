@@ -73,6 +73,10 @@ pub const MAX_CAPABILITY_ID_LENGTH: usize = 256;
 /// Maximum length for test names.
 pub const MAX_TEST_NAME_LENGTH: usize = 256;
 
+/// Characters that are forbidden in capability IDs and test names because they
+/// break canonical serialization in AAT receipts.
+const FORBIDDEN_ID_CHARS: &[char] = &['|', ',', '/', '\\', '\n', '\r', '\0'];
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -121,6 +125,13 @@ pub enum CacHarnessError {
         /// The reason it's invalid.
         reason: String,
     },
+    /// Execution failed with a non-timeout error.
+    ExecutionFailed {
+        /// The test that failed.
+        test_name: String,
+        /// The error message.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for CacHarnessError {
@@ -160,6 +171,9 @@ impl std::fmt::Display for CacHarnessError {
             },
             Self::InvalidTestName { name, reason } => {
                 write!(f, "Invalid test name '{name}': {reason}")
+            },
+            Self::ExecutionFailed { test_name, message } => {
+                write!(f, "Test '{test_name}' execution failed: {message}")
             },
         }
     }
@@ -436,6 +450,8 @@ impl CacSchemaTest {
     /// # Errors
     ///
     /// Returns an error if the capability ID or test name is invalid.
+    /// IDs containing forbidden characters (`|`, `,`) are rejected to prevent
+    /// canonicalization ambiguity in AAT receipts.
     pub fn new(
         capability_id: impl Into<String>,
         test_name: impl Into<String>,
@@ -459,6 +475,15 @@ impl CacSchemaTest {
                 ),
             });
         }
+        // Check for forbidden characters in capability ID
+        for forbidden in FORBIDDEN_ID_CHARS {
+            if capability_id.contains(*forbidden) {
+                return Err(CacHarnessError::InvalidCapabilityId {
+                    id: capability_id.chars().take(50).collect(),
+                    reason: format!("contains forbidden character: {forbidden:?}"),
+                });
+            }
+        }
 
         // Validate test name
         if test_name.is_empty() {
@@ -472,6 +497,15 @@ impl CacSchemaTest {
                 name: test_name.chars().take(50).collect(),
                 reason: format!("test name exceeds maximum length of {MAX_TEST_NAME_LENGTH}"),
             });
+        }
+        // Check for forbidden characters in test name
+        for forbidden in FORBIDDEN_ID_CHARS {
+            if test_name.contains(*forbidden) {
+                return Err(CacHarnessError::InvalidTestName {
+                    name: test_name.chars().take(50).collect(),
+                    reason: format!("contains forbidden character: {forbidden:?}"),
+                });
+            }
         }
 
         Ok(Self {
@@ -887,13 +921,15 @@ impl CacSelftestSuite {
                 },
                 Err(e) => {
                     total_failed += 1;
+                    // Use ExecutionFailed for non-timeout errors to provide
+                    // accurate error reporting
                     results.push(TestExecutionResult {
                         test_id: test.full_test_id(),
                         passed: false,
                         evidence: None,
-                        error: Some(CacHarnessError::Timeout {
+                        error: Some(CacHarnessError::ExecutionFailed {
                             test_name: test.test_name.clone(),
-                            timeout_secs: self.budget.max_duration.as_secs(),
+                            message: e.to_string(),
                         }),
                         budget_consumed: BudgetConsumed::new(test_duration, 1, 0),
                     });
@@ -1114,6 +1150,80 @@ mod tests {
             result,
             Err(CacHarnessError::InvalidCapabilityId { .. })
         ));
+    }
+
+    // =========================================================================
+    // Security: Forbidden Character Validation Tests
+    // =========================================================================
+
+    /// SECURITY PROOF TEST: Capability ID containing pipe character is
+    /// rejected.
+    ///
+    /// This test proves that capability IDs containing `|` are rejected to
+    /// prevent canonicalization ambiguity in AAT receipts where `|` is a
+    /// field separator.
+    #[test]
+    fn test_capability_id_with_pipe_rejected() {
+        let result = CacSchemaTest::new("cac:patch|inject", "test_valid", "echo");
+        assert!(
+            matches!(result, Err(CacHarnessError::InvalidCapabilityId { .. })),
+            "Capability ID with pipe should be rejected"
+        );
+    }
+
+    /// SECURITY PROOF TEST: Capability ID containing comma is rejected.
+    ///
+    /// This test proves that capability IDs containing `,` are rejected to
+    /// prevent canonicalization ambiguity in AAT receipts where `,` is a
+    /// list separator.
+    #[test]
+    fn test_capability_id_with_comma_rejected() {
+        let result = CacSchemaTest::new("cac:a,cac:b", "test_valid", "echo");
+        assert!(
+            matches!(result, Err(CacHarnessError::InvalidCapabilityId { .. })),
+            "Capability ID with comma should be rejected"
+        );
+    }
+
+    /// SECURITY PROOF TEST: Test name containing pipe character is rejected.
+    ///
+    /// This test proves that test names containing `|` are rejected to prevent
+    /// canonicalization ambiguity in AAT receipts.
+    #[test]
+    fn test_test_name_with_pipe_rejected() {
+        let result = CacSchemaTest::new("cac:valid", "test|inject", "echo");
+        assert!(
+            matches!(result, Err(CacHarnessError::InvalidTestName { .. })),
+            "Test name with pipe should be rejected"
+        );
+    }
+
+    /// SECURITY PROOF TEST: Test name containing comma is rejected.
+    ///
+    /// This test proves that test names containing `,` are rejected to prevent
+    /// canonicalization ambiguity in AAT receipts.
+    #[test]
+    fn test_test_name_with_comma_rejected() {
+        let result = CacSchemaTest::new("cac:valid", "test_a,test_b", "echo");
+        assert!(
+            matches!(result, Err(CacHarnessError::InvalidTestName { .. })),
+            "Test name with comma should be rejected"
+        );
+    }
+
+    /// SECURITY PROOF TEST: Valid IDs without forbidden characters are
+    /// accepted.
+    #[test]
+    fn test_valid_ids_accepted() {
+        // Test various valid patterns
+        let result = CacSchemaTest::new("cac:patch:apply", "test_valid_patch", "echo");
+        assert!(result.is_ok(), "Valid IDs should be accepted");
+
+        let result = CacSchemaTest::new("cap-test_v2.3", "test-name_123", "echo");
+        assert!(
+            result.is_ok(),
+            "IDs with hyphens and underscores should be accepted"
+        );
     }
 
     #[test]

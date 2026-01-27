@@ -106,6 +106,13 @@ pub enum AATReceiptError {
         /// The reason the signature is malformed.
         reason: String,
     },
+    /// A capability ID is invalid.
+    InvalidCapabilityId {
+        /// The invalid capability ID.
+        id: String,
+        /// The reason it's invalid.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for AATReceiptError {
@@ -126,6 +133,9 @@ impl std::fmt::Display for AATReceiptError {
             Self::MalformedSignature { reason } => {
                 write!(f, "malformed signature: {reason}")
             },
+            Self::InvalidCapabilityId { id, reason } => {
+                write!(f, "invalid capability ID '{id}': {reason}")
+            },
         }
     }
 }
@@ -136,45 +146,82 @@ impl std::error::Error for AATReceiptError {}
 // Validation Helpers
 // ============================================================================
 
-/// Validates a receipt ID.
-fn validate_receipt_id(id: &str) -> Result<(), AATReceiptError> {
+/// Validates a "safe ID" that can be used in canonical serialization.
+///
+/// Safe IDs must:
+/// - Be non-empty
+/// - Not exceed the maximum length
+/// - Not contain forbidden characters (`|`, `,`, `/`, `\`, `\n`, `\r`, `\0`)
+/// - Not contain path traversal sequences (`..`)
+/// - Contain only ASCII printable characters
+///
+/// This function is shared between receipt IDs and capability IDs to ensure
+/// consistent canonicalization safety.
+///
+/// # Arguments
+///
+/// * `id` - The ID to validate
+/// * `max_length` - Maximum allowed length
+///
+/// # Returns
+///
+/// `Ok(())` if valid, or a reason string describing the validation failure.
+///
+/// # Errors
+///
+/// Returns `Err(String)` with a description of why the ID is invalid if:
+/// - The ID is empty
+/// - The ID exceeds the maximum length
+/// - The ID contains forbidden characters
+/// - The ID contains path traversal sequences
+/// - The ID contains non-ASCII or control characters
+pub fn validate_safe_id(id: &str, max_length: usize) -> Result<(), String> {
     if id.is_empty() {
-        return Err(AATReceiptError::InvalidReceiptId {
-            reason: "receipt ID cannot be empty".to_string(),
-        });
+        return Err("cannot be empty".to_string());
     }
 
-    if id.len() > MAX_RECEIPT_ID_LENGTH {
-        return Err(AATReceiptError::InvalidReceiptId {
-            reason: format!("receipt ID exceeds maximum length of {MAX_RECEIPT_ID_LENGTH}"),
-        });
+    if id.len() > max_length {
+        return Err(format!("exceeds maximum length of {max_length}"));
     }
 
     for forbidden in FORBIDDEN_ID_CHARS {
         if id.contains(*forbidden) {
-            return Err(AATReceiptError::InvalidReceiptId {
-                reason: format!("receipt ID contains forbidden character: {forbidden:?}"),
-            });
+            return Err(format!("contains forbidden character: {forbidden:?}"));
         }
     }
 
     // Check for path traversal
     if id.contains("..") {
-        return Err(AATReceiptError::InvalidReceiptId {
-            reason: "receipt ID contains path traversal sequence: ..".to_string(),
-        });
+        return Err("contains path traversal sequence: ..".to_string());
     }
 
     // Check for non-ASCII printable characters
     for (i, c) in id.chars().enumerate() {
         if !c.is_ascii() || c.is_ascii_control() {
-            return Err(AATReceiptError::InvalidReceiptId {
-                reason: format!("receipt ID contains invalid character at position {i}: {c:?}"),
-            });
+            return Err(format!("contains invalid character at position {i}: {c:?}"));
         }
     }
 
     Ok(())
+}
+
+/// Validates a receipt ID.
+fn validate_receipt_id(id: &str) -> Result<(), AATReceiptError> {
+    validate_safe_id(id, MAX_RECEIPT_ID_LENGTH).map_err(|reason| {
+        AATReceiptError::InvalidReceiptId {
+            reason: format!("receipt ID {reason}"),
+        }
+    })
+}
+
+/// Validates a capability ID for use in AAT receipts.
+fn validate_capability_id(id: &str) -> Result<(), AATReceiptError> {
+    validate_safe_id(id, MAX_RECEIPT_ID_LENGTH).map_err(|reason| {
+        AATReceiptError::InvalidCapabilityId {
+            id: id.chars().take(50).collect(),
+            reason,
+        }
+    })
 }
 
 /// Validates a binary hash.
@@ -520,7 +567,9 @@ impl AATReceiptGenerator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the receipt ID or binary hash is invalid.
+    /// Returns an error if the receipt ID, binary hash, or any capability ID is
+    /// invalid. Capability IDs must not contain forbidden characters (`|`, `,`)
+    /// that would break the canonical serialization format.
     pub fn generate_with_budget(
         &self,
         receipt_id: &str,
@@ -532,6 +581,13 @@ impl AATReceiptGenerator {
         // Validate inputs
         validate_receipt_id(receipt_id)?;
         validate_binary_hash(&self.binary_hash)?;
+
+        // Validate all capability IDs to prevent canonicalization ambiguity
+        // (capability IDs containing `|` or `,` could spoof the list or break
+        // out of the canonical field structure)
+        for cap_id in &capabilities_tested {
+            validate_capability_id(cap_id)?;
+        }
 
         // Create the receipt (unsigned)
         let mut receipt = AATReceipt {
@@ -977,6 +1033,100 @@ mod tests {
             result,
             Err(AATReceiptError::InvalidBinaryHash { .. })
         ));
+    }
+
+    // =========================================================================
+    // Capability ID Validation Tests (Security: Canonicalization Ambiguity)
+    // =========================================================================
+
+    /// SECURITY PROOF TEST: Capability IDs containing pipe character are
+    /// rejected.
+    ///
+    /// This test proves that an attacker cannot craft a capability ID
+    /// containing `|` to break out of the canonical field structure. The
+    /// `|` character is the field separator in `canonical_bytes()`, so
+    /// allowing it in capability IDs would enable field injection attacks.
+    #[test]
+    fn test_capability_id_with_pipe_rejected() {
+        let signer = Signer::generate();
+        let binary_hash = make_test_binary_hash();
+        let generator = AATReceiptGenerator::new(signer, binary_hash);
+
+        let summary = TestSummary::new(10, 0, 0);
+        let caps = vec!["cap:valid".to_string(), "cap|injected".to_string()];
+
+        let result = generator.generate_with_budget(
+            "rcpt-001",
+            summary,
+            BudgetConsumed::default(),
+            caps,
+            1_000_000_000,
+        );
+
+        assert!(
+            matches!(result, Err(AATReceiptError::InvalidCapabilityId { .. })),
+            "Capability ID with pipe character should be rejected"
+        );
+    }
+
+    /// SECURITY PROOF TEST: Capability IDs containing comma are rejected.
+    ///
+    /// This test proves that an attacker cannot craft a capability ID
+    /// containing `,` to spoof the list of tested capabilities. The `,`
+    /// character is the list separator in `canonical_bytes()` for
+    /// `capabilities_tested`, so allowing it in capability IDs would enable
+    /// list spoofing attacks.
+    #[test]
+    fn test_capability_id_with_comma_rejected() {
+        let signer = Signer::generate();
+        let binary_hash = make_test_binary_hash();
+        let generator = AATReceiptGenerator::new(signer, binary_hash);
+
+        let summary = TestSummary::new(10, 0, 0);
+        let caps = vec!["cap:a,cap:b".to_string()]; // Single cap pretending to be two
+
+        let result = generator.generate_with_budget(
+            "rcpt-001",
+            summary,
+            BudgetConsumed::default(),
+            caps,
+            1_000_000_000,
+        );
+
+        assert!(
+            matches!(result, Err(AATReceiptError::InvalidCapabilityId { .. })),
+            "Capability ID with comma should be rejected"
+        );
+    }
+
+    /// SECURITY PROOF TEST: Valid capability IDs are accepted.
+    ///
+    /// This test verifies that normal capability IDs without forbidden
+    /// characters are still accepted after adding the validation.
+    #[test]
+    fn test_valid_capability_ids_accepted() {
+        let signer = Signer::generate();
+        let binary_hash = make_test_binary_hash();
+        let generator = AATReceiptGenerator::new(signer, binary_hash);
+
+        let summary = TestSummary::new(10, 0, 0);
+        let caps = vec![
+            "cac:patch:apply".to_string(),
+            "cac:admission:validate".to_string(),
+            "test-capability_v2.3".to_string(),
+        ];
+
+        let result = generator.generate_with_budget(
+            "rcpt-001",
+            summary,
+            BudgetConsumed::default(),
+            caps.clone(),
+            1_000_000_000,
+        );
+
+        assert!(result.is_ok(), "Valid capability IDs should be accepted");
+        let receipt = result.unwrap();
+        assert_eq!(receipt.capabilities_tested, caps);
     }
 
     // =========================================================================
