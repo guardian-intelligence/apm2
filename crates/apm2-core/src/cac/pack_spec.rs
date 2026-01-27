@@ -614,7 +614,8 @@ impl DependencyReview {
     /// # Errors
     ///
     /// - [`PackSpecError::FieldTooLong`] if `stable_id` exceeds max length
-    /// - [`PackSpecError::InvalidQuantity`] if `content_hash` is not 64 hex chars
+    /// - [`PackSpecError::InvalidQuantity`] if `content_hash` is not 64 hex
+    ///   chars
     pub fn validate(&self) -> Result<(), PackSpecError> {
         if self.stable_id.len() > MAX_STABLE_ID_LENGTH {
             return Err(PackSpecError::FieldTooLong {
@@ -776,7 +777,8 @@ pub const CONTEXT_PACK_SPEC_VERSION: &str = "v1";
 /// Specification for a `ContextPack` that defines artifacts and budget
 /// constraints.
 ///
-/// A `ContextPackSpec` is the input to the pack compiler (DD-0003). It specifies:
+/// A `ContextPackSpec` is the input to the pack compiler (DD-0003). It
+/// specifies:
 /// - Root artifacts to include (ordered for dependency resolution)
 /// - Budget constraints for resource limits
 /// - Target profile for compilation
