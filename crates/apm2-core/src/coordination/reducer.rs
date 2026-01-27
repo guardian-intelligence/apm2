@@ -106,6 +106,15 @@ impl CoordinationReducer {
             return;
         }
 
+        // Enforce MAX_HASHMAP_SIZE limit to match deserialization bounds (CTR-1303)
+        // This prevents unbounded growth that would cause checkpoint deserialization
+        // failure
+        if self.state.coordinations.len() >= super::state::MAX_HASHMAP_SIZE {
+            // State at capacity - skip this event
+            // In production, this would be logged as a warning
+            return;
+        }
+
         // Create the coordination session
         let Ok(session) = CoordinationSession::new(
             event.coordination_id.clone(),
@@ -143,7 +152,19 @@ impl CoordinationReducer {
         // Update work tracking
         if let Some(tracking) = coordination.work_tracking.get_mut(&event.work_id) {
             tracking.attempt_count = event.attempt_number;
-            tracking.session_ids.push(event.session_id.clone());
+            // Only add session_id if within bounds (MAX_SESSION_IDS_PER_WORK)
+            if tracking.session_ids.len() < super::state::MAX_SESSION_IDS_PER_WORK {
+                tracking.session_ids.push(event.session_id.clone());
+            }
+        }
+
+        // Enforce MAX_HASHMAP_SIZE limit for bindings to match deserialization bounds
+        // (CTR-1303) Skip if at capacity, but allow update of existing binding
+        if self.state.bindings.len() >= super::state::MAX_HASHMAP_SIZE
+            && !self.state.bindings.contains_key(&event.session_id)
+        {
+            // Bindings at capacity - skip this event
+            return;
         }
 
         // Create binding info
