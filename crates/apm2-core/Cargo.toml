@@ -97,6 +97,7 @@ criterion.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
+blake3.workspace = true
 
 [features]
 default = []
