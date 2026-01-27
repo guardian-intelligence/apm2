@@ -3,7 +3,6 @@
 //! This module provides CLI commands for CAC operations including
 //! patch application with replay protection via the admission pipeline.
 
-use std::fs;
 use std::io::{self, Read as IoRead};
 use std::path::{Path, PathBuf};
 
@@ -48,6 +47,16 @@ pub enum CacSubcommand {
     /// Reads a patch document (JSON Patch RFC 6902 or Merge Patch RFC 7396)
     /// and applies it to a base document. Requires --expected-base for replay
     /// protection to prevent stale overwrites.
+    ///
+    /// NOTE: This command validates the patch and computes an admission receipt
+    /// but does NOT persist the resulting artifact. The in-memory CAS is used
+    /// for validation only - artifacts are discarded when the command exits.
+    /// This is useful for:
+    ///   - Verifying patches are valid before committing to a workflow
+    ///   - Testing schema compliance of patched documents
+    ///   - Computing artifact hashes for planning purposes
+    ///
+    /// Future versions will support persistence options via --store flags.
     ApplyPatch(ApplyPatchArgs),
 }
 
@@ -270,26 +279,38 @@ fn run_apply_patch_inner(args: &ApplyPatchArgs) -> Result<AdmissionReceipt, CacC
 /// Reads a file with size limit to prevent denial-of-service via memory
 /// exhaustion.
 ///
+/// Uses a bounded reader to avoid TOCTOU (time-of-check to time-of-use) race
+/// conditions. Instead of checking file size then reading, we read up to
+/// `MAX_INPUT_FILE_SIZE + 1` bytes and reject if we hit the limit.
+///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The file cannot be read
-/// - The file size exceeds `MAX_INPUT_FILE_SIZE` (10MB)
+/// - The file content exceeds `MAX_INPUT_FILE_SIZE` (10MB)
 fn read_bounded_file(path: &Path) -> Result<String> {
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("failed to read file metadata: {}", path.display()))?;
+    use std::fs::File;
+    use std::io::Read;
 
-    let file_size = metadata.len();
-    if file_size > MAX_INPUT_FILE_SIZE {
+    let file =
+        File::open(path).with_context(|| format!("failed to open file: {}", path.display()))?;
+
+    let mut content = String::new();
+    let mut bounded_reader = file.take(MAX_INPUT_FILE_SIZE + 1);
+
+    bounded_reader
+        .read_to_string(&mut content)
+        .with_context(|| format!("failed to read file: {}", path.display()))?;
+
+    if content.len() as u64 > MAX_INPUT_FILE_SIZE {
         bail!(
-            "file '{}' exceeds maximum size limit of {} bytes (file size: {} bytes)",
+            "file '{}' exceeds maximum size limit of {} bytes",
             path.display(),
-            MAX_INPUT_FILE_SIZE,
-            file_size
+            MAX_INPUT_FILE_SIZE
         );
     }
 
-    fs::read_to_string(path).with_context(|| format!("failed to read file: {}", path.display()))
+    Ok(content)
 }
 
 /// Reads from stdin with size limit to prevent denial-of-service via memory
