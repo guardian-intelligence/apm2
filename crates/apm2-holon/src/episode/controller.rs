@@ -440,6 +440,18 @@ impl EpisodeController {
     ///
     /// Returns `true` if this was the first miss (and a `DefectRecord` was
     /// emitted), `false` otherwise.
+    ///
+    /// # Integration Note
+    ///
+    /// This helper is foundational plumbing for context pack miss tracking.
+    /// It is not currently invoked during episode execution because pack misses
+    /// occur within the `Holon::execute_episode` implementation, which returns
+    /// an opaque `EpisodeResult`. Integration will happen when artifact fetching
+    /// is implemented in a future ticket, at which point the execution context
+    /// will need to propagate pack miss information back to the controller.
+    ///
+    /// See TCK-00138 for the foundational receipt/defect infrastructure.
+    #[allow(dead_code)] // Foundational plumbing - integration pending artifact fetch impl
     pub fn record_pack_miss(
         builder: &mut RunReceiptBuilder,
         defect_records: &mut Vec<DefectRecord>,
@@ -454,9 +466,14 @@ impl EpisodeController {
         // Emit DefectRecord only on first pack miss
         if is_first {
             let defect_id = format!("{work_id}-defect-pack-miss-{timestamp_ns}");
-            let defect =
-                DefectRecord::pack_miss(defect_id, work_id, stable_id, pack_hash, timestamp_ns);
-            defect_records.push(defect);
+            // Note: pack_miss returns Result to avoid panics (DoS vector).
+            // Here we use ok() because failure to create a defect record should not
+            // prevent the rest of execution. The miss is still tracked in the receipt.
+            if let Ok(defect) =
+                DefectRecord::pack_miss(defect_id, work_id, stable_id, pack_hash, timestamp_ns)
+            {
+                defect_records.push(defect);
+            }
         }
 
         is_first
@@ -1685,7 +1702,8 @@ mod tests {
         assert!(result.defect_records().is_empty());
 
         // Add a defect
-        let defect = DefectRecord::pack_miss("DEF-001", "work-123", "org:doc:x", [0u8; 32], 1000);
+        let defect =
+            DefectRecord::pack_miss("DEF-001", "work-123", "org:doc:x", [0u8; 32], 1000).unwrap();
         result.defect_records.push(defect);
 
         assert!(result.has_defects());

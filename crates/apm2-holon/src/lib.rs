@@ -119,7 +119,8 @@ mod tests;
 pub use artifact::Artifact;
 pub use context::EpisodeContext;
 pub use defect::{
-    DefectContext, DefectRecord, DefectRecordBuilder, DefectSeverity, DefectSignal, SignalType,
+    DefectContext, DefectError, DefectRecord, DefectRecordBuilder, DefectSeverity, DefectSignal,
+    SignalType,
 };
 pub use episode::{
     ContextPackConfig, EpisodeController, EpisodeControllerConfig, EpisodeLoopOutcome,
@@ -146,7 +147,8 @@ pub mod prelude {
     pub use crate::artifact::Artifact;
     pub use crate::context::EpisodeContext;
     pub use crate::defect::{
-        DefectContext, DefectRecord, DefectRecordBuilder, DefectSeverity, DefectSignal, SignalType,
+        DefectContext, DefectError, DefectRecord, DefectRecordBuilder, DefectSeverity,
+        DefectSignal, SignalType,
     };
     pub use crate::episode::{
         ContextPackConfig, EpisodeController, EpisodeControllerConfig, EpisodeLoopOutcome,

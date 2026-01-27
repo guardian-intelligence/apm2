@@ -25,12 +25,14 @@
 //!         SignalType::UnplannedContextRead,
 //!         "artifact org:doc:missing not in pack",
 //!     ))
-//!     .build();
+//!     .build()
+//!     .expect("valid defect record");
 //!
 //! assert_eq!(defect.defect_id(), "DEF-001");
 //! ```
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 // ============================================================================
 // Constants
@@ -62,6 +64,66 @@ pub const MAX_REMEDIATIONS: usize = 10;
 
 /// Maximum length for remediation strings.
 pub const MAX_REMEDIATION_LENGTH: usize = 1024;
+
+// ============================================================================
+// DefectError
+// ============================================================================
+
+/// Errors that can occur when building or validating defect records.
+///
+/// This error type is returned by [`DefectRecordBuilder::build`] instead of
+/// panicking, avoiding denial-of-service vectors in SCP code where panics are problematic.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DefectError {
+    /// A required field was not set.
+    #[error("missing required field: {field}")]
+    MissingField {
+        /// The name of the missing field.
+        field: &'static str,
+    },
+
+    /// A field value exceeds its maximum length.
+    #[error("{field} exceeds maximum length ({max}): got {actual}")]
+    FieldTooLong {
+        /// The name of the field.
+        field: &'static str,
+        /// The maximum allowed length.
+        max: usize,
+        /// The actual length.
+        actual: usize,
+    },
+
+    /// Too many items in a collection field.
+    #[error("{field} exceeds maximum count ({max}): got {actual}")]
+    TooManyItems {
+        /// The name of the field.
+        field: &'static str,
+        /// The maximum allowed count.
+        max: usize,
+        /// The actual count.
+        actual: usize,
+    },
+}
+
+impl DefectError {
+    /// Creates a missing field error.
+    #[must_use]
+    pub const fn missing_field(field: &'static str) -> Self {
+        Self::MissingField { field }
+    }
+
+    /// Creates a field too long error.
+    #[must_use]
+    pub const fn field_too_long(field: &'static str, max: usize, actual: usize) -> Self {
+        Self::FieldTooLong { field, max, actual }
+    }
+
+    /// Creates a too many items error.
+    #[must_use]
+    pub const fn too_many_items(field: &'static str, max: usize, actual: usize) -> Self {
+        Self::TooManyItems { field, max, actual }
+    }
+}
 
 // ============================================================================
 // DefectSeverity
@@ -327,7 +389,8 @@ impl DefectContext {
 ///         SignalType::UnplannedContextRead,
 ///         "artifact org:doc:missing not found in pack",
 ///     ))
-///     .build();
+///     .build()
+///     .expect("valid defect record");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -386,13 +449,17 @@ impl DefectRecord {
     /// * `stable_id` - The stable ID of the missing artifact
     /// * `pack_hash` - The hash of the context pack
     /// * `timestamp_ns` - When the miss was detected (Unix nanoseconds)
+    ///
+    /// # Errors
+    ///
+    /// Returns `DefectError` if any input exceeds validation limits.
     pub fn pack_miss(
         defect_id: impl Into<String>,
         work_id: impl Into<String>,
         stable_id: impl Into<String>,
         pack_hash: Hash,
         timestamp_ns: u64,
-    ) -> Self {
+    ) -> Result<Self, DefectError> {
         let stable_id_str = stable_id.into();
         Self::builder(defect_id, "UNPLANNED_CONTEXT_READ")
             .severity(DefectSeverity::S2)
@@ -553,21 +620,111 @@ impl DefectRecordBuilder {
 
     /// Builds the `DefectRecord`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `work_id` or `signal` is not set.
-    pub fn build(self) -> DefectRecord {
-        DefectRecord {
+    /// Returns `DefectError::MissingField` if `work_id` or `signal` is not set.
+    /// Returns `DefectError::FieldTooLong` if any field exceeds its maximum length.
+    /// Returns `DefectError::TooManyItems` if `suggested_remediations` exceeds `MAX_REMEDIATIONS`.
+    pub fn build(self) -> Result<DefectRecord, DefectError> {
+        // Validate required fields
+        let work_id = self
+            .work_id
+            .ok_or(DefectError::missing_field("work_id"))?;
+        let signal = self
+            .signal
+            .ok_or(DefectError::missing_field("signal"))?;
+
+        // Validate length constraints
+        if self.defect_id.len() > MAX_DEFECT_ID_LENGTH {
+            return Err(DefectError::field_too_long(
+                "defect_id",
+                MAX_DEFECT_ID_LENGTH,
+                self.defect_id.len(),
+            ));
+        }
+        if self.defect_class.len() > MAX_DEFECT_CLASS_LENGTH {
+            return Err(DefectError::field_too_long(
+                "defect_class",
+                MAX_DEFECT_CLASS_LENGTH,
+                self.defect_class.len(),
+            ));
+        }
+        if work_id.len() > MAX_WORK_ID_LENGTH {
+            return Err(DefectError::field_too_long(
+                "work_id",
+                MAX_WORK_ID_LENGTH,
+                work_id.len(),
+            ));
+        }
+        if signal.details.len() > MAX_SIGNAL_DETAILS_LENGTH {
+            return Err(DefectError::field_too_long(
+                "signal.details",
+                MAX_SIGNAL_DETAILS_LENGTH,
+                signal.details.len(),
+            ));
+        }
+
+        // Validate collection constraints
+        if self.suggested_remediations.len() > MAX_REMEDIATIONS {
+            return Err(DefectError::too_many_items(
+                "suggested_remediations",
+                MAX_REMEDIATIONS,
+                self.suggested_remediations.len(),
+            ));
+        }
+
+        // Validate individual remediation lengths
+        for remediation in &self.suggested_remediations {
+            if remediation.len() > MAX_REMEDIATION_LENGTH {
+                // Use a static field name since we can't format at const time
+                return Err(DefectError::FieldTooLong {
+                    field: "suggested_remediations[item]",
+                    max: MAX_REMEDIATION_LENGTH,
+                    actual: remediation.len(),
+                });
+            }
+        }
+
+        // Validate context field lengths if present
+        if let Some(ref actor_id) = self.context.actor_id {
+            if actor_id.len() > MAX_ACTOR_ID_LENGTH {
+                return Err(DefectError::field_too_long(
+                    "context.actor_id",
+                    MAX_ACTOR_ID_LENGTH,
+                    actor_id.len(),
+                ));
+            }
+        }
+        if let Some(ref session_id) = self.context.session_id {
+            if session_id.len() > MAX_SESSION_ID_LENGTH {
+                return Err(DefectError::field_too_long(
+                    "context.session_id",
+                    MAX_SESSION_ID_LENGTH,
+                    session_id.len(),
+                ));
+            }
+        }
+        if let Some(ref stable_id) = self.context.requested_stable_id {
+            if stable_id.len() > MAX_STABLE_ID_LENGTH {
+                return Err(DefectError::field_too_long(
+                    "context.requested_stable_id",
+                    MAX_STABLE_ID_LENGTH,
+                    stable_id.len(),
+                ));
+            }
+        }
+
+        Ok(DefectRecord {
             defect_id: self.defect_id,
             defect_class: self.defect_class,
             severity: self.severity,
-            work_id: self.work_id.expect("work_id is required"),
+            work_id,
             detected_at: self.detected_at.unwrap_or_else(current_timestamp_ns),
-            signal: self.signal.expect("signal is required"),
+            signal,
             context: self.context,
             evidence: self.evidence,
             suggested_remediations: self.suggested_remediations,
-        }
+        })
     }
 }
 
@@ -656,7 +813,8 @@ mod tests {
             .context(DefectContext::new().with_actor_id("agent-1"))
             .add_evidence([2u8; 32])
             .add_remediation("Add to pack")
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(defect.defect_id(), "DEF-001");
         assert_eq!(defect.defect_class(), "PACK_MISS");
@@ -680,7 +838,8 @@ mod tests {
             "org:doc:missing",
             [0u8; 32],
             1_000_000,
-        );
+        )
+        .unwrap();
 
         assert_eq!(defect.defect_id(), "DEF-001");
         assert_eq!(defect.defect_class(), "UNPLANNED_CONTEXT_READ");
@@ -705,7 +864,8 @@ mod tests {
             .severity(DefectSeverity::S1)
             .work_id("work-123")
             .signal(DefectSignal::new(SignalType::AatFail, "test failed"))
-            .build();
+            .build()
+            .unwrap();
 
         let json = serde_json::to_string(&defect).unwrap();
         assert!(json.contains("\"defect_id\":\"DEF-001\""));
@@ -747,5 +907,292 @@ mod tests {
 
         let deserialized: SignalType = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, SignalType::UnplannedContextRead);
+    }
+
+    // =========================================================================
+    // Error Handling Tests - HIGH: DoS Vector Prevention (TCK-00138)
+    // =========================================================================
+
+    /// Test that build() returns error when work_id is missing.
+    #[test]
+    fn test_build_error_missing_work_id() {
+        let result = DefectRecord::builder("DEF-001", "TEST")
+            .signal(DefectSignal::new(SignalType::AatFail, "test"))
+            .build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, DefectError::MissingField { field: "work_id" }));
+        assert!(err.to_string().contains("work_id"));
+    }
+
+    /// Test that build() returns error when signal is missing.
+    #[test]
+    fn test_build_error_missing_signal() {
+        let result = DefectRecord::builder("DEF-001", "TEST")
+            .work_id("work-123")
+            .build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, DefectError::MissingField { field: "signal" }));
+        assert!(err.to_string().contains("signal"));
+    }
+
+    /// Test that build() returns error when both required fields are missing.
+    #[test]
+    fn test_build_error_missing_both_required_fields() {
+        let result = DefectRecord::builder("DEF-001", "TEST").build();
+
+        // Should fail on the first missing field (work_id)
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, DefectError::MissingField { field: "work_id" }));
+    }
+
+    // =========================================================================
+    // Input Validation Tests - MEDIUM: Unbounded Memory Prevention (TCK-00138)
+    // =========================================================================
+
+    /// Test that defect_id exceeding MAX_DEFECT_ID_LENGTH is rejected.
+    #[test]
+    fn test_validation_defect_id_too_long() {
+        let long_id = "x".repeat(MAX_DEFECT_ID_LENGTH + 1);
+        let result = DefectRecord::builder(long_id.clone(), "TEST")
+            .work_id("work-123")
+            .signal(DefectSignal::new(SignalType::AatFail, "test"))
+            .build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            DefectError::FieldTooLong {
+                field: "defect_id",
+                max: MAX_DEFECT_ID_LENGTH,
+                ..
+            }
+        ));
+    }
+
+    /// Test that defect_class exceeding MAX_DEFECT_CLASS_LENGTH is rejected.
+    #[test]
+    fn test_validation_defect_class_too_long() {
+        let long_class = "x".repeat(MAX_DEFECT_CLASS_LENGTH + 1);
+        let result = DefectRecord::builder("DEF-001", long_class)
+            .work_id("work-123")
+            .signal(DefectSignal::new(SignalType::AatFail, "test"))
+            .build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            DefectError::FieldTooLong {
+                field: "defect_class",
+                max: MAX_DEFECT_CLASS_LENGTH,
+                ..
+            }
+        ));
+    }
+
+    /// Test that work_id exceeding MAX_WORK_ID_LENGTH is rejected.
+    #[test]
+    fn test_validation_work_id_too_long() {
+        let long_work_id = "x".repeat(MAX_WORK_ID_LENGTH + 1);
+        let result = DefectRecord::builder("DEF-001", "TEST")
+            .work_id(long_work_id)
+            .signal(DefectSignal::new(SignalType::AatFail, "test"))
+            .build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            DefectError::FieldTooLong {
+                field: "work_id",
+                max: MAX_WORK_ID_LENGTH,
+                ..
+            }
+        ));
+    }
+
+    /// Test that signal details exceeding MAX_SIGNAL_DETAILS_LENGTH is rejected.
+    #[test]
+    fn test_validation_signal_details_too_long() {
+        let long_details = "x".repeat(MAX_SIGNAL_DETAILS_LENGTH + 1);
+        let result = DefectRecord::builder("DEF-001", "TEST")
+            .work_id("work-123")
+            .signal(DefectSignal::new(SignalType::AatFail, long_details))
+            .build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            DefectError::FieldTooLong {
+                field: "signal.details",
+                max: MAX_SIGNAL_DETAILS_LENGTH,
+                ..
+            }
+        ));
+    }
+
+    /// Test that too many remediations is rejected.
+    #[test]
+    fn test_validation_too_many_remediations() {
+        let mut builder = DefectRecord::builder("DEF-001", "TEST")
+            .work_id("work-123")
+            .signal(DefectSignal::new(SignalType::AatFail, "test"));
+
+        // Add MAX_REMEDIATIONS + 1 remediations
+        for i in 0..=MAX_REMEDIATIONS {
+            builder = builder.add_remediation(format!("remediation {i}"));
+        }
+
+        let result = builder.build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            DefectError::TooManyItems {
+                field: "suggested_remediations",
+                max: MAX_REMEDIATIONS,
+                ..
+            }
+        ));
+    }
+
+    /// Test that individual remediation exceeding MAX_REMEDIATION_LENGTH is rejected.
+    #[test]
+    fn test_validation_remediation_too_long() {
+        let long_remediation = "x".repeat(MAX_REMEDIATION_LENGTH + 1);
+        let result = DefectRecord::builder("DEF-001", "TEST")
+            .work_id("work-123")
+            .signal(DefectSignal::new(SignalType::AatFail, "test"))
+            .add_remediation(long_remediation)
+            .build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            DefectError::FieldTooLong {
+                field: "suggested_remediations[item]",
+                max: MAX_REMEDIATION_LENGTH,
+                ..
+            }
+        ));
+    }
+
+    /// Test that context.actor_id exceeding MAX_ACTOR_ID_LENGTH is rejected.
+    #[test]
+    fn test_validation_actor_id_too_long() {
+        let long_actor_id = "x".repeat(MAX_ACTOR_ID_LENGTH + 1);
+        let result = DefectRecord::builder("DEF-001", "TEST")
+            .work_id("work-123")
+            .signal(DefectSignal::new(SignalType::AatFail, "test"))
+            .context(DefectContext::new().with_actor_id(long_actor_id))
+            .build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            DefectError::FieldTooLong {
+                field: "context.actor_id",
+                max: MAX_ACTOR_ID_LENGTH,
+                ..
+            }
+        ));
+    }
+
+    /// Test that context.session_id exceeding MAX_SESSION_ID_LENGTH is rejected.
+    #[test]
+    fn test_validation_session_id_too_long() {
+        let long_session_id = "x".repeat(MAX_SESSION_ID_LENGTH + 1);
+        let result = DefectRecord::builder("DEF-001", "TEST")
+            .work_id("work-123")
+            .signal(DefectSignal::new(SignalType::AatFail, "test"))
+            .context(DefectContext::new().with_session_id(long_session_id))
+            .build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            DefectError::FieldTooLong {
+                field: "context.session_id",
+                max: MAX_SESSION_ID_LENGTH,
+                ..
+            }
+        ));
+    }
+
+    /// Test that context.requested_stable_id exceeding MAX_STABLE_ID_LENGTH is rejected.
+    #[test]
+    fn test_validation_stable_id_too_long() {
+        let long_stable_id = "x".repeat(MAX_STABLE_ID_LENGTH + 1);
+        let result = DefectRecord::builder("DEF-001", "TEST")
+            .work_id("work-123")
+            .signal(DefectSignal::new(SignalType::AatFail, "test"))
+            .context(DefectContext::new().with_requested_stable_id(long_stable_id))
+            .build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            DefectError::FieldTooLong {
+                field: "context.requested_stable_id",
+                max: MAX_STABLE_ID_LENGTH,
+                ..
+            }
+        ));
+    }
+
+    /// Test that valid inputs at exactly the maximum length are accepted.
+    #[test]
+    fn test_validation_accepts_max_length_inputs() {
+        let max_id = "x".repeat(MAX_DEFECT_ID_LENGTH);
+        let max_class = "y".repeat(MAX_DEFECT_CLASS_LENGTH);
+        let max_work_id = "z".repeat(MAX_WORK_ID_LENGTH);
+        let max_details = "a".repeat(MAX_SIGNAL_DETAILS_LENGTH);
+        let max_remediation = "b".repeat(MAX_REMEDIATION_LENGTH);
+
+        let result = DefectRecord::builder(max_id, max_class)
+            .work_id(max_work_id)
+            .signal(DefectSignal::new(SignalType::AatFail, max_details))
+            .add_remediation(max_remediation)
+            .build();
+
+        assert!(result.is_ok(), "Should accept inputs at max length");
+    }
+
+    /// Test that DefectError Display trait works correctly.
+    #[test]
+    fn test_defect_error_display() {
+        let missing = DefectError::missing_field("work_id");
+        assert!(missing.to_string().contains("work_id"));
+        assert!(missing.to_string().contains("missing"));
+
+        let too_long = DefectError::field_too_long("defect_id", 256, 300);
+        assert!(too_long.to_string().contains("defect_id"));
+        assert!(too_long.to_string().contains("256"));
+        assert!(too_long.to_string().contains("300"));
+
+        let too_many = DefectError::too_many_items("remediations", 10, 15);
+        assert!(too_many.to_string().contains("remediations"));
+        assert!(too_many.to_string().contains("10"));
+        assert!(too_many.to_string().contains("15"));
+    }
+
+    /// Test that DefectError implements std::error::Error.
+    #[test]
+    fn test_defect_error_is_std_error() {
+        let err: Box<dyn std::error::Error> =
+            Box::new(DefectError::missing_field("test"));
+        assert!(!err.to_string().is_empty());
     }
 }
