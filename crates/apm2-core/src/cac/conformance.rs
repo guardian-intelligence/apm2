@@ -1503,8 +1503,8 @@ provenance:
         let pack = test_pack();
         let resolver = MemoryContentResolver::new();
 
-        let tests: Vec<ConformanceTest> = (0..MAX_CONFORMANCE_TESTS + 1)
-            .map(|i| ConformanceTest::determinism(format!("test-{}", i), "pack"))
+        let tests: Vec<ConformanceTest> = (0..=MAX_CONFORMANCE_TESTS)
+            .map(|i| ConformanceTest::determinism(format!("test-{i}"), "pack"))
             .collect();
 
         let config = ConformanceSuiteConfig::default();
