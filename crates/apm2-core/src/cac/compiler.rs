@@ -568,7 +568,11 @@ impl<'a> ContextPackCompiler<'a> {
     /// # Errors
     ///
     /// Returns [`CompilationError::CycleDetected`] with the cycle path.
-    #[allow(clippy::items_after_statements, clippy::too_many_arguments)]
+    #[allow(
+        clippy::items_after_statements,
+        clippy::too_many_arguments,
+        clippy::too_many_lines
+    )]
     fn detect_cycles(&self, stable_ids: &BTreeSet<String>) -> Result<(), CompilationError> {
         // Build adjacency list for the subgraph
         let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -623,12 +627,26 @@ impl<'a> ContextPackCompiler<'a> {
                         lowlinks,
                         sccs,
                     );
-                    let w_lowlink = *lowlinks.get(w).unwrap();
-                    let v_lowlink = lowlinks.get_mut(v).unwrap();
+                    // INVARIANT: w was just visited by recursive strongconnect, which always
+                    // inserts into lowlinks before returning. This lookup cannot fail.
+                    let w_lowlink = *lowlinks.get(w).expect(
+                        "Tarjan invariant violated: w must have lowlink after strongconnect returns",
+                    );
+                    // INVARIANT: v was inserted into lowlinks at the start of this function call.
+                    let v_lowlink = lowlinks.get_mut(v).expect(
+                        "Tarjan invariant violated: v must have lowlink (inserted at function entry)",
+                    );
                     *v_lowlink = (*v_lowlink).min(w_lowlink);
                 } else if on_stack.contains(w) {
-                    let w_index = *indices.get(w).unwrap();
-                    let v_lowlink = lowlinks.get_mut(v).unwrap();
+                    // INVARIANT: w is on the stack, meaning it was previously visited and had its
+                    // index assigned. Nodes are only added to on_stack after indices.insert().
+                    let w_index = *indices
+                        .get(w)
+                        .expect("Tarjan invariant violated: w on stack must have index");
+                    // INVARIANT: v was inserted into lowlinks at the start of this function call.
+                    let v_lowlink = lowlinks.get_mut(v).expect(
+                        "Tarjan invariant violated: v must have lowlink (inserted at function entry)",
+                    );
                     *v_lowlink = (*v_lowlink).min(w_index);
                 }
             }
@@ -636,7 +654,13 @@ impl<'a> ContextPackCompiler<'a> {
             if lowlinks.get(v) == indices.get(v) {
                 let mut scc: Vec<&str> = Vec::new();
                 loop {
-                    let w = stack.pop().unwrap();
+                    // INVARIANT: When lowlink[v] == index[v], v is the root of an SCC.
+                    // All nodes in this SCC are on the stack above (and including) v.
+                    // The loop terminates when we pop v itself, which is guaranteed to be
+                    // on the stack because we pushed it at the start of this function.
+                    let w = stack.pop().expect(
+                        "Tarjan invariant violated: stack must contain SCC members up to and including root v",
+                    );
                     on_stack.remove(w);
                     scc.push(w);
                     if w == v {
@@ -714,10 +738,26 @@ impl<'a> ContextPackCompiler<'a> {
 
     /// Enforces budget constraints against the resolved artifacts.
     ///
+    /// # Enforced Dimensions
+    ///
+    /// - **`max_artifacts`**: Checked at compile time. Returns an error if the
+    ///   artifact count exceeds the limit.
+    ///
+    /// # NOT Enforced at Compile Time
+    ///
+    /// The following dimensions are **NOT** enforced by this method and must be
+    /// checked at consumption time:
+    ///
+    /// - **`max_tokens`**: Requires content analysis/tokenization which is
+    ///   beyond the scope of the compiler. The consumer must verify token
+    ///   counts when loading artifact content.
+    /// - **`max_bytes`**: Requires fetching artifact content to compute actual
+    ///   byte sizes. The consumer must verify total bytes when loading content.
+    ///
     /// # Errors
     ///
-    /// Returns [`CompilationError::BudgetExceeded`] if any constraint is
-    /// violated.
+    /// Returns [`CompilationError::BudgetExceeded`] if `max_artifacts`
+    /// constraint is violated.
     #[allow(clippy::cast_possible_truncation)]
     fn enforce_budget(
         spec: &ContextPackSpec,
