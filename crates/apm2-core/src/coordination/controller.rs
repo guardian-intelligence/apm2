@@ -1,56 +1,59 @@
 //! Coordination controller for autonomous work loop execution.
 //!
-//! This module implements [`CoordinationController`] which orchestrates the
-//! serial execution of work items with budget enforcement and circuit breaker
-//! protection.
+//! This module implements [`CoordinationController`] which provides the state
+//! machine and event generation logic for serial execution of work items with
+//! budget enforcement and circuit breaker protection.
 //!
 //! # Architecture
 //!
-//! The controller operates as a coordination loop:
+//! The controller provides building blocks for an execution loop. The caller is
+//! responsible for integrating with the ledger, session spawning, and async
+//! orchestration. A typical execution loop follows this pattern:
 //!
 //! ```text
-//! start() --> emit coordination.started
+//! Caller's run_loop:
 //!     |
-//!     v
-//! run_loop() --> for each work_id in work_queue:
+//!     +-- controller.start() --> emit coordination.started
 //!     |
-//!     +-- check_stop_condition()
-//!     |
-//!     +-- check_work_freshness()
-//!     |
-//!     +-- spawn_session_for_work()
+//!     +-- loop:
 //!     |       |
-//!     |       +-- generate session_id (UUID)
-//!     |       +-- emit coordination.session_bound
-//!     |       +-- spawn holon session
-//!     |
-//!     +-- observe_session_termination()
+//!     |       +-- check controller.check_stop_condition()
+//!     |       |       --> if Some(stop), break
 //!     |       |
-//!     |       +-- poll SessionReducer until terminal
-//!     |       +-- emit coordination.session_unbound
+//!     |       +-- controller.check_work_freshness(work_id, seq_id, is_claimable)
+//!     |       |       --> if not eligible, controller.skip_work_item()
+//!     |       |
+//!     |       +-- controller.prepare_session_spawn(work_id, ...) --> session_id, binding_event
+//!     |       |       --> caller writes binding_event to ledger
+//!     |       |       --> caller spawns holon session with session_id
+//!     |       |
+//!     |       +-- caller observes session termination
+//!     |       |       --> poll SessionReducer until terminal
+//!     |       |
+//!     |       +-- controller.record_session_termination(...) --> unbound_event
+//!     |               --> caller writes unbound_event to ledger
 //!     |
-//!     +-- handle_outcome() --> retry or advance
-//!     |
-//!     v
-//! emit coordination.completed or coordination.aborted
+//!     +-- controller.complete(stop_condition) or controller.abort(reason)
+//!             --> caller writes completed/aborted event to ledger
 //! ```
 //!
 //! # Key Design Decisions
 //!
 //! - **Serial execution (AD-COORD-002)**: One session at a time. The controller
-//!   waits for each session to complete before starting the next.
+//!   tracks state to ensure sessions are processed sequentially.
 //!
 //! - **Session ID generation (AD-COORD-007)**: Session ID is generated BEFORE
-//!   the binding event is emitted, ensuring the UUID in the binding matches the
-//!   spawned session.
+//!   the binding event via `prepare_session_spawn()`, ensuring the UUID in the
+//!   binding matches the session the caller will spawn.
 //!
-//! - **Binding bracket (AD-COORD-003)**: `session_bound` is emitted BEFORE
-//!   `session.started`, and `session_unbound` is emitted AFTER
-//!   `session.terminated`.
+//! - **Binding bracket (AD-COORD-003)**: `prepare_session_spawn()` generates
+//!   `session_bound` BEFORE the caller spawns the session.
+//!   `record_session_termination()` generates `session_unbound` AFTER the
+//!   session terminates.
 //!
-//! - **Work freshness (AD-COORD-006)**: Before spawning a session, the
-//!   controller checks that the work item's state has not changed since it was
-//!   queued.
+//! - **Work freshness (AD-COORD-006)**: `check_work_freshness()` validates work
+//!   state at a known ledger sequence. The caller should call this before
+//!   spawn.
 //!
 //! # Example
 //!
@@ -67,13 +70,34 @@
 //! ).unwrap();
 //!
 //! // Create controller
-//! let controller = CoordinationController::new(config, deps);
+//! let mut controller = CoordinationController::new(config);
 //!
 //! // Start coordination
-//! let coordination_id = controller.start().await?;
+//! let coordination_id = controller.start(timestamp_ns)?;
 //!
-//! // Run the execution loop
-//! let receipt = controller.run_loop().await?;
+//! // Execution loop (caller implements async orchestration)
+//! loop {
+//!     if let Some(stop) = controller.check_stop_condition() {
+//!         controller.complete(stop, timestamp_ns)?;
+//!         break;
+//!     }
+//!
+//!     let work_id = controller.current_work_id().unwrap();
+//!     let freshness = controller.check_work_freshness(work_id, seq_id, is_claimable);
+//!
+//!     if !freshness.is_eligible {
+//!         controller.skip_work_item(work_id);
+//!         continue;
+//!     }
+//!
+//!     let spawn_result = controller.prepare_session_spawn(work_id, seq_id, timestamp_ns)?;
+//!     // ... write binding_event to ledger ...
+//!     // ... spawn session with spawn_result.session_id ...
+//!     // ... observe session termination ...
+//!
+//!     controller.record_session_termination(&spawn_result.session_id, work_id, outcome, tokens, timestamp_ns)?;
+//!     // ... write unbound_event to ledger ...
+//! }
 //! ```
 //!
 //! # References
@@ -868,56 +892,12 @@ impl CoordinationController {
     }
 }
 
-/// Generates a UUID v4 string.
+/// Generates a cryptographically secure UUID v4 string.
 ///
+/// Uses the `uuid` crate with random number generation for secure session IDs.
 /// Format: `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`
-/// where `x` is a random hex digit and `y` is one of 8, 9, a, or b.
-#[allow(clippy::cast_possible_truncation)]
 fn generate_uuid() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Simple UUID v4 generation using timestamps and a counter
-    // For production, consider using the `uuid` crate
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-
-    // Mix timestamp with some pseudo-random source
-    // Note: truncation from u128 to u64 is intentional for hashing
-    let hash = {
-        #[allow(clippy::cast_possible_truncation)]
-        let mut h = timestamp as u64;
-        h = h.wrapping_mul(0x517c_c1b7_2722_0a95);
-        h ^= h >> 32;
-        h = h.wrapping_mul(0x0_dead_beef_cafe_babe);
-        h ^= h >> 32;
-        h
-    };
-
-    // Add process ID for additional entropy
-    let pid = u64::from(std::process::id());
-    let combined = hash.wrapping_add(pid);
-
-    // Generate UUID format with version 4 and variant bits
-    // Note: truncation is intentional - we extract specific bit ranges
-    #[allow(clippy::cast_possible_truncation)]
-    let time_low = (combined & 0xFFFF_FFFF) as u32;
-    #[allow(clippy::cast_possible_truncation)]
-    let time_mid = ((combined >> 32) & 0xFFFF) as u16;
-    #[allow(clippy::cast_possible_truncation)]
-    let time_hi = ((combined >> 48) & 0x0FFF) as u16 | 0x4000; // Version 4
-
-    // Use timestamp high bits for the remaining parts
-    // Note: truncation is intentional for UUID generation
-    #[allow(clippy::cast_possible_truncation)]
-    let high_timestamp = (timestamp >> 64) as u64;
-    #[allow(clippy::cast_possible_truncation)]
-    let clock_seq = ((high_timestamp & 0x3FFF) | 0x8000) as u16; // Variant bits
-    #[allow(clippy::cast_possible_truncation)]
-    let node = timestamp & 0xFFFF_FFFF_FFFF;
-
-    format!("{time_low:08x}-{time_mid:04x}-{time_hi:04x}-{clock_seq:04x}-{node:012x}")
+    uuid::Uuid::new_v4().to_string()
 }
 
 #[cfg(test)]
