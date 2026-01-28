@@ -3,7 +3,7 @@ rfc_ticket_decomposition:
 
   decomposition_strategy:
     overview: |
-      The implementation is decomposed into 11 tickets across 4 phases. Each ticket
+      The implementation is decomposed into 16 tickets across 4 phases. Each ticket
       is scoped to be completable in 1-3 days by a single engineer. Dependencies
       are explicit and form a partial order that maximizes parallelism.
 
@@ -11,20 +11,20 @@ rfc_ticket_decomposition:
       - id: P0
         name: "Foundation"
         description: "Abstractions and schema extensions without behavioral change"
-        tickets: [DCS-001, DCS-002, DCS-003]
+        tickets: [DCS-001, DCS-002, DCS-012, DCS-003]
         estimated_duration: "2 weeks"
 
       - id: P1
         name: "Replication"
         description: "Multi-node communication and leader-based replication"
-        tickets: [DCS-004, DCS-005, DCS-006]
+        tickets: [DCS-004, DCS-005, DCS-006, DCS-013]
         estimated_duration: "3 weeks"
         depends_on: [P0]
 
       - id: P2
         name: "Consensus"
         description: "Full BFT consensus and anti-entropy with CRDT merge"
-        tickets: [DCS-007, DCS-008, DCS-009]
+        tickets: [DCS-007, DCS-008, DCS-016, DCS-014, DCS-009, DCS-015]
         estimated_duration: "4 weeks"
         depends_on: [P1]
 
@@ -112,6 +112,8 @@ rfc_ticket_decomposition:
         EventRecord struct with new optional fields.
       acceptance_criteria:
         - "New columns: consensus_epoch, consensus_round, quorum_cert, schema_digest"
+        - "New columns: canonicalizer_id, canonicalizer_version"
+        - "New columns: hlc_wall_time, hlc_counter"
         - "Migration script runs on existing databases"
         - "Existing events remain readable"
         - "New fields default to NULL/None"
@@ -157,6 +159,7 @@ rfc_ticket_decomposition:
       estimated_effort: "3 days"
       requirements_covered:
         - TB-0006
+        - DCS-REQ-0011
       description: |
         Implement the Relay Holon worker and the reverse-TLS management tunnel
         protocol. Allow workers behind NAT to maintain persistent outbound
@@ -168,6 +171,29 @@ rfc_ticket_decomposition:
       files_to_create:
         - path: "crates/apm2-core/src/consensus/relay.rs"
         - path: "crates/apm2-core/src/consensus/tunnel.rs"
+      dependencies:
+        - DCS-004
+
+    - id: DCS-006
+      phase: P1
+      title: "Genesis Adoption and Validation"
+      complexity: MEDIUM
+      estimated_effort: "2 days"
+      requirements_covered:
+        - DCS-REQ-0002
+        - DCS-REQ-0006
+      description: |
+        Implement consensus genesis creation that adopts the existing ledger head
+        hash as the epoch-0 prev_hash. Validate genesis signatures and block
+        join on mismatch.
+      acceptance_criteria:
+        - "Genesis adopts existing ledger head hash without rehashing history"
+        - "Genesis signature verified against T0 key"
+        - "Node rejects join on genesis mismatch"
+      files_to_create:
+        - path: "crates/apm2-core/src/consensus/genesis.rs"
+      dependencies:
+        - DCS-001
 
     - id: DCS-013
       phase: P1
@@ -203,6 +229,42 @@ rfc_ticket_decomposition:
       files_to_create:
         - path: "crates/apm2-core/src/consensus/bft_machine.rs"
 
+    - id: DCS-008
+      phase: P2
+      title: "Quorum Certificate Generation and Verification"
+      complexity: MEDIUM
+      estimated_effort: "2 days"
+      requirements_covered:
+        - DCS-REQ-0001
+        - DCS-REQ-0007
+      description: |
+        Aggregate 2f+1 validator signatures into a QuorumCertificate and attach
+        it to finalized authority events. Provide offline verification utilities.
+      acceptance_criteria:
+        - "QC generated after 2f+1 votes"
+        - "QC verification validates signer membership and signatures"
+        - "Authority events include QC in ledger record"
+      dependencies:
+        - DCS-007
+
+    - id: DCS-016
+      phase: P2
+      title: "StrictlyOrderedEvidence and Gate Predicates"
+      complexity: MEDIUM
+      estimated_effort: "2 days"
+      requirements_covered:
+        - DCS-REQ-0009
+      description: |
+        Enforce StrictlyOrderedEvidence for Admission-critical artifacts and
+        extend GateReceipt generation to include evidence predicates.
+      acceptance_criteria:
+        - "Admission-critical evidence rejected unless TotalOrder finalized"
+        - "GateReceipt includes evidence_predicates metadata"
+        - "Evidence predicates are auditable and replayable"
+      dependencies:
+        - DCS-007
+        - DCS-008
+
     - id: DCS-014
       phase: P2
       title: "Byzantine Equivocation Detection"
@@ -235,6 +297,9 @@ rfc_ticket_decomposition:
       files_to_create:
         - path: "crates/apm2-core/src/consensus/anti_entropy.rs"
         - path: "crates/apm2-core/src/consensus/merkle.rs"
+      dependencies:
+        - DCS-004
+        - DCS-012
 
     - id: DCS-015
       phase: P2
@@ -243,9 +308,10 @@ rfc_ticket_decomposition:
       estimated_effort: "2 days"
       requirements_covered:
         - DCS-REQ-0004
+        - DCS-REQ-0010
       description: |
         Implement CRDT merge operators using Hybrid Logical Clocks (HLC) for
-        LWW determinism. Record conflicts as MergeConflict events.
+        LWW determinism. Record conflicts as DefectRecorded events.
       acceptance_criteria:
         - "HLC-based LWW merge produces deterministic result"
         - "Conflicts recorded correctly"
@@ -256,7 +322,7 @@ rfc_ticket_decomposition:
       phase: P3
       title: "HSM Integration for T1 Validator Keys"
       complexity: MEDIUM
-      estimated_effort: "4 days"
+      estimated_effort: "3 days"
       requirements_covered:
         - TB-0002
       description: |
@@ -283,7 +349,7 @@ rfc_ticket_decomposition:
       phase: P3
       title: "Operational Monitoring and Alerting"
       complexity: MEDIUM
-      estimated_effort: "4 days"
+      estimated_effort: "3 days"
       requirements_covered: []
       description: |
         Implement Prometheus metrics export for consensus health. Create Grafana
@@ -312,16 +378,21 @@ rfc_ticket_decomposition:
 
   dependency_graph: |
     Phase 0 (Foundation):
-      DCS-001 ─┬─> DCS-004 ─┬─> DCS-005 ─┬─> DCS-007 ─┬─> DCS-008
-               │            │            │            │
-               └─> DCS-006 ─┘            │            ├─> DCS-010
-                                         │            │
-      DCS-002 ────────────────────────> DCS-009 ──────┘
-                                         │
-      DCS-003 ───────────────────────────┘            └─> DCS-011
+      DCS-001 ─┬─> DCS-006 ─┬─> DCS-007 ─┬─> DCS-008 ─┬─> DCS-016
+               │            │            │
+               └─> DCS-004 ─┬─> DCS-005 ─┼─> DCS-013 ─┼─> DCS-014
+                             │            │            │
+      DCS-002 ─> DCS-012 ────┼─> DCS-009 ─┘            │
+      DCS-003 ───────────────┘                         │
+                                                     └─> DCS-015
+
+      DCS-007 ─┬─> DCS-010
+               └─> DCS-011
 
     Parallel Opportunities:
       - DCS-001, DCS-002, DCS-003 can be done in parallel
-      - DCS-006 can proceed after DCS-001 (parallel with DCS-004, DCS-005)
-      - DCS-009 can proceed after DCS-002 and DCS-004 (parallel with DCS-007)
+      - DCS-004 can proceed after DCS-001; DCS-005 follows DCS-004
+      - DCS-006 can proceed after DCS-001 (parallel with DCS-004/DCS-005)
+      - DCS-009 can proceed after DCS-004 and DCS-012
+      - DCS-016 can proceed after DCS-008 (parallel with DCS-014/DCS-015)
       - DCS-010, DCS-011 can be done in parallel after DCS-007

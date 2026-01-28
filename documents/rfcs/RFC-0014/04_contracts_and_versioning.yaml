@@ -36,21 +36,22 @@ rfc_contracts_and_versioning:
               pub seq_id: SeqId,
               /// Event hash (prev_hash || content)
               pub event_hash: Hash,
-              /// For consensus backends: Raft term/index
+              /// For consensus backends: BFT term/round/index
               pub consensus_index: Option<ConsensusIndex>,
           }
 
           /// Consensus-specific metadata
           #[derive(Debug, Clone, Copy)]
           pub struct ConsensusIndex {
-              pub term: u64,
+              pub epoch: u64,
+              pub round: u64,
               pub index: u64,
           }
 
           /// Ordering guarantee for the operation
           #[derive(Debug, Clone, Copy, PartialEq, Eq)]
           pub enum OrderingGuarantee {
-              /// Requires total ordering (Raft consensus for control plane)
+              /// Requires total ordering (BFT consensus for control plane)
               TotalOrder,
               /// Eventual consistency acceptable (anti-entropy for data plane)
               Eventual,
@@ -74,12 +75,14 @@ rfc_contracts_and_versioning:
           /// Event metadata for routing and merge
           #[derive(Debug, Clone)]
           pub struct EventMetadata {
-              /// Namespace for Raft group routing
+              /// Namespace for quorum routing
               pub namespace: String,
               /// Required ordering guarantee
               pub ordering: OrderingGuarantee,
               /// Merge operator for conflict resolution
               pub merge_op: MergeOperator,
+              /// Admission-critical evidence flag (requires TotalOrder)
+              pub strict_evidence: bool,
               /// Actor ID (signer)
               pub actor_id: String,
               /// Dedupe key for idempotency
@@ -134,7 +137,7 @@ rfc_contracts_and_versioning:
           pub trait LedgerBackend: Send + Sync {
               /// Appends an event with the specified ordering guarantee.
               ///
-              /// For `TotalOrder`: Routes to Raft leader, waits for commit.
+              /// For `TotalOrder`: Routes to BFT leader, waits for commit.
               /// For `Eventual`: Appends locally, triggers anti-entropy sync.
               fn append<'a>(
                   &'a self,
@@ -582,6 +585,34 @@ rfc_contracts_and_versioning:
           }
       evidence_ids:
         - EVID-0012
+
+    - id: CTR-0005
+      name: "Gate Receipt Evidence Predicates"
+      type: EVENT_SCHEMA
+      versioning:
+        scheme: SEMVER
+        current_version: "0.2.0"
+        compatibility_rules:
+          - "New fields are optional with zero-value defaults"
+          - "Existing field numbers unchanged"
+      schema:
+        format: PROTOBUF
+        path: "proto/kernel_events.proto"
+        changes: |
+          // GateReceiptGenerated extended with evidence predicates
+          message GateReceiptGenerated {
+            // ... existing fields 1-6 unchanged ...
+            repeated EvidencePredicate evidence_predicates = 7;
+          }
+
+          message EvidencePredicate {
+            string predicate_id = 1;
+            string command_id = 2;
+            int32 exit_code = 3;
+            bytes artifact_hash = 4;
+          }
+      evidence_ids:
+        - EVID-0014
 
   outputs:
     artifacts_produced:

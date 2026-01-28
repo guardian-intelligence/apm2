@@ -1515,6 +1515,142 @@
           "LAW-07",
           "LAW-15"
         ]
+      },
+      "MECH-SUBTASK-ISOLATION": {
+        "node_class": "NORMATIVE",
+        "name": "Subtask context isolation",
+        "role": "Enforces scoped ContextPacks per subtask; prevents cross-coupling via monolithic trace injection.",
+        "properties": [
+          "subtasks receive scoped ContextPacks, not full history",
+          "inter-subtask state flows via typed summaries/receipts (LAW-07)",
+          "monolithic trace injection across subtask boundaries is a CONTEXT_BLEED defect"
+        ],
+        "law_refs": [
+          "LAW-02",
+          "LAW-07"
+        ],
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "DefectRecorded": true
+            },
+            "requires": {
+              "WorkOpened": true
+            }
+          },
+          "receipt_kinds": {}
+        }
+      },
+      "MECH-MONITOR-ISOLATION": {
+        "node_class": "NORMATIVE",
+        "name": "Monitorability conservation",
+        "role": "Protects oversight/interpretability channels from optimization pressure. Monitors used for accountability/safety MUST NOT be incorporated into training rewards.",
+        "properties": [
+          "oversight signals structurally isolated from reward signals",
+          "audit channel features excluded from gradient updates",
+          "violation produces MONITOR_GAMING defect"
+        ],
+        "rationale": "Monitoring channels are themselves optimization targets. Training that rewards monitor evasion destroys the very interpretability needed for oversight.",
+        "law_refs": [
+          "LAW-08"
+        ],
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "DefectRecorded": true,
+              "PolicyViolation": true
+            },
+            "requires": {
+              "PolicyLoaded": true
+            }
+          },
+          "receipt_kinds": {}
+        }
+      },
+      "MECH-EVALUATOR-AUDIT": {
+        "node_class": "NORMATIVE",
+        "name": "Evaluator validity auditing",
+        "role": "Gate evaluators MUST be periodically audited for false negatives and instruction-checker alignment. Non-deterministic or misaligned evaluators produce EVALUATOR_DRIFT defects.",
+        "properties": [
+          "false-negative audit: correct work rejected",
+          "instruction-checker alignment validation",
+          "non-deterministic evaluators require statistical characterization",
+          "measured performance deltas must account for evaluator uncertainty"
+        ],
+        "rationale": "Evaluator fixes can materially swing measured success. Many 'agent gains' are within evaluator error bars.",
+        "law_refs": [
+          "LAW-15"
+        ],
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "DefectRecorded": true
+            },
+            "requires": {
+              "GateRunCompleted": true
+            }
+          },
+          "receipt_kinds": {}
+        }
+      },
+      "MECH-REPETITION-DETECTION": {
+        "node_class": "NORMATIVE",
+        "name": "Echo trap / repetition detection",
+        "role": "Detects template-like repetitive reasoning patterns (entropy collapse, reward variance flatlining) as a termination trigger and defect signal.",
+        "properties": [
+          "monitors reasoning entropy over sliding window",
+          "detects reward variance collapse",
+          "triggers termination on echo-trap detection",
+          "emits REASONING_DEGENERATION DefectRecord"
+        ],
+        "rationale": "Reasoning can collapse into repetitive locally-rewarded patterns ('Echo Trap'). This is a distinct failure mode from unbounded search.",
+        "law_refs": [
+          "LAW-12"
+        ],
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "DefectRecorded": true,
+              "SessionTerminated": true
+            },
+            "requires": {
+              "SessionProgress": true
+            }
+          },
+          "receipt_kinds": {}
+        }
+      },
+      "MECH-MEMORY-GOVERNANCE": {
+        "node_class": "NORMATIVE",
+        "name": "Memory evolution governance",
+        "role": "Agent-controlled memory updates (linking, evolution, decay) MUST be recorded as ledger events. Memory retrieval operations are auditable tool invocations.",
+        "properties": [
+          "memory mutations logged as ledger events",
+          "silent memory updates produce SILENT_MEMORY_MUTATION defect",
+          "retrieval operations subject to capability policy (LAW-05)",
+          "memory linking/evolution operations have explicit contracts"
+        ],
+        "rationale": "Memory is becoming a 'programmable substrate' with operations/mutation, not passive retrieval. Treating memory as a learned data structure requires governance.",
+        "law_refs": [
+          "LAW-03",
+          "LAW-05"
+        ],
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "DefectRecorded": true,
+              "ToolExecuted": true
+            },
+            "requires": {
+              "LeaseIssued": true
+            }
+          },
+          "receipt_kinds": {
+            "emits": {
+              "tool_execution.receipt": true
+            }
+          }
+        }
       }
     },
     "invariants": {
@@ -2745,32 +2881,39 @@
         "LAW-01": {
           "name": "Loop Closure & Gated Promotion",
           "reference_path": "references/law_01.md",
-          "role": "Defines authoritative promotion: no shared truth transition without verification receipts.",
-          "node_class": "NORMATIVE"
+          "role": "Defines authoritative promotion: no shared truth transition without verification receipts. Includes hierarchical gate separation for Planner/Executor layers with layer-specific budgets.",
+          "node_class": "NORMATIVE",
+          "amendments": ["Hierarchical Gate Separation", "Layer-Specific Budgets"]
         },
         "LAW-02": {
           "name": "Observable Context Sufficiency",
           "reference_path": "references/law_02.md",
-          "role": "Defines measurable surrogates for context sufficiency; drives context compiler optimization.",
-          "node_class": "NORMATIVE"
+          "role": "Defines measurable surrogates for context sufficiency; drives context compiler optimization. Mandates subtask isolation with scoped ContextPacks and typed inter-subtask interfaces.",
+          "node_class": "NORMATIVE",
+          "amendments": ["Subtask Isolation", "Inter-Subtask Interface"],
+          "defect_classes": ["CONTEXT_BLEED"]
         },
         "LAW-03": {
           "name": "Monotone Ledger vs. Overwritable Projection",
           "reference_path": "references/law_03.md",
-          "role": "Separates truth substrate from mutable projections; requires merge algebra and compaction discipline.",
-          "node_class": "NORMATIVE"
+          "role": "Separates truth substrate from mutable projections; requires merge algebra and compaction discipline. Memory mutations are ledger events; retrieval is auditable tool invocation. Shared authority facts MUST be quorum-attested via BFT consensus.",
+          "node_class": "NORMATIVE",
+          "amendments": ["Memory Mutation as Ledger Events", "Retrieval as Tool Call", "BFT Consensus Quorum"],
+          "defect_classes": ["SILENT_MEMORY_MUTATION"]
         },
         "LAW-04": {
           "name": "Stochastic Stability",
           "reference_path": "references/law_04.md",
-          "role": "Binds stability to contract+receipt+evidence; flakiness is a first-class defect.",
-          "node_class": "NORMATIVE"
+          "role": "Since both transducers (agents) and verifiers (tests) are stochastic, stability is achieved only through the binding of Stability = (Contract + Receipt + Evidence). Event ordering MUST rely on Hybrid Logical Clocks (HLC) to preserve causal determinism.",
+          "node_class": "NORMATIVE",
+          "amendments": ["Causal Determinism (HLC)"]
         },
         "LAW-05": {
           "name": "Dual-Axis Containment",
           "reference_path": "references/law_05.md",
-          "role": "Authority confinement + identity/audit; context read firewalls and confused deputy prevention.",
-          "node_class": "NORMATIVE"
+          "role": "Containment requires both Authority (Capabilities) and Accountability (Identity/Audit). Connectivity for contained agents MUST use Relay Holons to preserve outbound-only security boundary.",
+          "node_class": "NORMATIVE",
+          "amendments": ["Relay-Mediated Connectivity"]
         },
         "LAW-06": {
           "name": "MDL as a Gated Budget",
@@ -2787,8 +2930,10 @@
         "LAW-08": {
           "name": "Verifier Economics (Goodhart Resistance)",
           "reference_path": "references/law_08.md",
-          "role": "Only gate what you can defend; holdouts/adversarial suites; safety constraints separated from performance targets.",
-          "node_class": "NORMATIVE"
+          "role": "Only gate what you can defend; holdouts/adversarial suites; safety constraints separated from performance targets. Includes monitorability conservation: oversight channels isolated from optimization objectives.",
+          "node_class": "NORMATIVE",
+          "amendments": ["Monitorability Conservation", "Audit Channel Integrity"],
+          "defect_classes": ["MONITOR_GAMING"]
         },
         "LAW-09": {
           "name": "Temporal Pinning & Freshness",
@@ -2811,8 +2956,10 @@
         "LAW-12": {
           "name": "Bounded Search and Termination Discipline",
           "reference_path": "references/law_12.md",
-          "role": "Exploration runs under leases and stop conditions; non-convergence is a defect.",
-          "node_class": "NORMATIVE"
+          "role": "Exploration runs under leases and stop conditions; non-convergence is a defect. Includes repetition/echo-trap detection as termination trigger and defect signal.",
+          "node_class": "NORMATIVE",
+          "amendments": ["Repetition Detection", "Degeneration as Defect"],
+          "defect_classes": ["REASONING_DEGENERATION"]
         },
         "LAW-13": {
           "name": "Semantic Contracting",
@@ -2829,8 +2976,10 @@
         "LAW-15": {
           "name": "Measurement Integrity",
           "reference_path": "references/law_15.md",
-          "role": "Receipts are tamper-evident; omission of required evidence is a defect; fail-closed in high-risk transitions.",
-          "node_class": "NORMATIVE"
+          "role": "Receipts are tamper-evident; omission of required evidence is a defect; fail-closed in high-risk transitions. Includes evaluator validity auditing for false negatives and instruction-checker alignment.",
+          "node_class": "NORMATIVE",
+          "amendments": ["Evaluator Validity", "Evaluator Brittleness as Defect"],
+          "defect_classes": ["EVALUATOR_DRIFT"]
         }
       },
       "law_order": [

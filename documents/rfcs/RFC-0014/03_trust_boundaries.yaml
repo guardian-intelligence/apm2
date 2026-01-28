@@ -7,6 +7,7 @@ rfc_trust_boundaries:
       up to f of 3f+1 nodes may be Byzantine (arbitrarily malicious). Trust is established
       through cryptographic attestation at four hierarchical tiers, with each tier able
       to delegate only to lower tiers.
+      This model applies to local quorums (4-7 nodes); planetary-scale federation is deferred.
 
     adversary_model:
       assumptions:
@@ -43,6 +44,11 @@ rfc_trust_boundaries:
         - id: INV-0003
           statement: "Genesis hash refers to pre-existing ledger head"
           verification: "consensus_epoch_0.prev_hash == ledger_head.hash"
+      threats:
+        - threat: "Malicious genesis with attacker-controlled validators"
+          mitigation: "T0 key ceremony with multi-party verification; genesis hash published out-of-band"
+        - threat: "Genesis key compromise"
+          mitigation: "Air-gapped storage; multi-sig ceremony; key never exposed to network"
 
     - id: TB-0006
       name: "Relay Holon Boundary"
@@ -63,11 +69,6 @@ rfc_trust_boundaries:
           mitigation: "mTLS ensures relay cannot spoof messages; worker signs all events; multiple relays"
         - threat: "Man-in-the-middle on tunnel"
           mitigation: "Certificate pinning; end-to-end encryption of consensus payloads"
-      threats:
-        - threat: "Malicious genesis with attacker-controlled validators"
-          mitigation: "T0 key ceremony with multi-party verification; genesis hash published out-of-band"
-        - threat: "Genesis key compromise"
-          mitigation: "Air-gapped storage; multi-sig ceremony; key never exposed to network"
 
     - id: TB-0002
       name: "Validator Quorum Boundary"
@@ -178,7 +179,7 @@ rfc_trust_boundaries:
       statement: |
         If the network is synchronous and fewer than f nodes are Byzantine,
         proposed events eventually finalize.
-      verification: "Proven via Raft/PBFT liveness under synchrony"
+      verification: "Proven via HotStuff/PBFT liveness under synchrony"
       evidence_ids:
         - EVID-0008
 
@@ -200,10 +201,10 @@ rfc_trust_boundaries:
         - EVID-0010
 
     - id: SEC-PROP-0005
-      name: "Forward Secrecy of Keys"
+      name: "Key Compromise Containment"
       statement: |
-        Key rotation via KeyRotated events ensures that compromise of a current key
-        does not compromise historical signatures.
+        Key rotation via KeyRotated events limits future exposure after compromise while
+        preserving historical verification. This is not forward secrecy for signatures.
       verification: "Historical events remain verifiable with old key recorded in KeyRotated"
       evidence_ids:
         - EVID-0011

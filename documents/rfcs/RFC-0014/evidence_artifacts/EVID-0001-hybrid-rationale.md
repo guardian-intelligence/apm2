@@ -14,8 +14,8 @@ consensus approach for APM2's distributed truth substrate.
 | Option | Description | Pros | Cons |
 |--------|-------------|------|------|
 | OPT-SEQ | Single-writer sequencer | Simple, low latency | SPOF, no fault tolerance |
-| OPT-RAFT | Raft for all events | Strong ordering | High overhead for observations |
-| OPT-HYBRID | Raft control + CRDT data | Best of both worlds | More complex implementation |
+| OPT-RAFT | Raft for all events | Strong ordering | CFT only; not BFT |
+| OPT-HYBRID | BFT control + CRDT data | Best of both worlds | More complex implementation |
 | OPT-FED | Federated signed chains | High availability | Weak ordering, complex merge |
 
 ### Decision Criteria
@@ -32,12 +32,12 @@ consensus approach for APM2's distributed truth substrate.
 OPT-HYBRID was selected because:
 
 1. Control plane events (authority operations) are low-volume and require
-   strict total ordering - perfect fit for Raft consensus
+   strict total ordering - fit for BFT consensus (HotStuff/PBFT)
 
 2. Data plane events (observations, telemetry) are high-volume and naturally
    commutative - CRDT/anti-entropy is more efficient than consensus
 
-3. The existing LeaseScope namespace model maps naturally to Raft group
+3. The existing LeaseScope namespace model maps naturally to quorum
    partitioning for future sharding
 
 4. Aligns with holonic laws and unified theory principles

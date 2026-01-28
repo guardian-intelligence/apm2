@@ -13,7 +13,7 @@ rfc_governance_and_gates:
           - "Component design and interfaces"
           - "LedgerBackend trait design"
           - "Consensus library selection"
-          - "Namespace-to-group mapping"
+          - "Namespace-to-quorum mapping"
         signoff_criteria:
           - "Interfaces are minimal and composable"
           - "Abstractions enable future extension"
@@ -154,7 +154,7 @@ rfc_governance_and_gates:
       pass_criteria:
         - "All TEST-AE-* tests pass"
         - "CRDT properties verified (commutativity, associativity)"
-        - "MergeConflict events recorded correctly"
+        - "DefectRecorded events recorded correctly"
         - "Sync completes within SLO"
       evidence_required:
         - "Test results"

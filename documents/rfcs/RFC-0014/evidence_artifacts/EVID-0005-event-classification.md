@@ -8,7 +8,7 @@ Complete classification of all kernel events by ordering guarantee and merge ope
 
 ## Classification
 
-### Total Order Events (Raft Consensus Required)
+### Total Order Events (BFT Consensus Required)
 
 These events change authority state and must be totally ordered:
 
@@ -32,7 +32,10 @@ These events change authority state and must be totally ordered:
 | AdjudicationVote | Adjudication | Governance action |
 | AdjudicationResolved | Adjudication | Governance action |
 | AdjudicationTimeout | Adjudication | Governance action |
+| ToolRequested | Tool | Authority decision request |
+| ToolDecided | Tool | Policy decision |
 | GateReceiptGenerated | Evidence | Authoritative receipt |
+| MergeReceiptGenerated | Evidence | Authoritative merge receipt |
 | SessionStarted | Session | Creates actor context |
 | SessionTerminated | Session | Ends actor context |
 | SessionQuarantined | Session | Security action |
@@ -46,7 +49,7 @@ These events are observations and can use CRDT merge:
 | SessionProgress | LastWriterWins | Latest progress wins |
 | ToolExecuted | LastWriterWins | Latest result wins |
 | BudgetExceeded | LastWriterWins | Latest reading wins |
-| EvidencePublished | SetUnion | Accumulate evidence |
+| EvidencePublished | SetUnion | Accumulate evidence (StrictlyOrderedEvidence may require TotalOrder) |
 | SessionCrashDetected | SetUnion | Record all crashes |
 | SessionRestartScheduled | SetUnion | Record all restarts |
 
@@ -54,7 +57,7 @@ These events are observations and can use CRDT merge:
 
 ### LastWriterWins (LWW)
 ```
-merge(a, b) = if a.timestamp_ns >= b.timestamp_ns then a else b
+merge(a, b) = if HLC(a) >= HLC(b) then a else b
 ```
 
 ### SetUnion
@@ -66,6 +69,7 @@ merge(a, b) = a ∪ b (deduplicated by content hash)
 ```
 merge(a, b) = ERROR if a.hash != b.hash (conflict = defect)
 ```
+Conflicts emit DefectRecorded events for auditability.
 
 ## References
 - proto/kernel_events.proto

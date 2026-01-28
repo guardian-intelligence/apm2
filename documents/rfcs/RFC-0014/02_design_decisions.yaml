@@ -27,7 +27,7 @@ rfc_design_decisions:
           - "head() for current sequence position"
 
       - name: "ConsensusLayer"
-        role: "Raft-based total ordering for control plane"
+        role: "BFT-based total ordering for control plane"
         responsibilities:
           - "Proposal submission and quorum collection"
           - "Leader election and view changes"
@@ -63,12 +63,12 @@ rfc_design_decisions:
       |                          APM2 HYBRID CONSENSUS LAYER                         |
       +==============================================================================+
 
-                             CONTROL PLANE (Raft Consensus)
+                             CONTROL PLANE (BFT Consensus)
       +------------------------------------------------------------------------------+
       |  +------------------+     +------------------+     +------------------+       |
       |  | Namespace        |     | Namespace        |     | Namespace        |       |
-      |  | Authority Raft   |     | Authority Raft   |     | Authority Raft   |       |
-      |  | Group (kernel)   |     | Group (holon-A)  |     | Group (holon-B)  |       |
+      |  | Authority BFT    |     | Authority BFT    |     | Authority BFT    |       |
+      |  | Quorum (kernel)  |     | Quorum (holon-A) |     | Quorum (holon-B) |       |
       |  +--------+---------+     +--------+---------+     +--------+---------+       |
       |           |                        |                        |                |
       |           v                        v                        v                |
@@ -80,7 +80,7 @@ rfc_design_decisions:
       |  +------------------+     +------------------+     +------------------+       |
       +------------------------------------------------------------------------------+
                                         |
-                                        | Raft Group Registry
+                                        | Quorum Registry
                                         v
       +------------------------------------------------------------------------------+
       |                         SCHEMA REGISTRY (Consensus)                          |
@@ -133,6 +133,11 @@ rfc_design_decisions:
           rejected_reason: |
             Standard Raft is only CFT, not BFT. Fails security requirements for
             federated authority. Consensus overhead for observations is prohibitive.
+        - id: ALT-0001-D
+          name: "OPT-SIGNED-RAFT: Signed-Proof Raft (CFT + detection)"
+          rejected_reason: |
+            Detection-only byzantine logic is insufficient for Admission integrity.
+            The system must remain safe under malicious validators, not merely detect them.
         - id: ALT-0001-C
           name: "OPT-FED: Federated signed chains with merge receipts"
           rejected_reason: |
@@ -303,7 +308,7 @@ rfc_design_decisions:
           - SessionCrashDetected
           - SessionRestartScheduled
         conflict_recording:
-          - MergeConflict
+          - DefectRecorded
       rationale:
         - "Authority events must be totally ordered for deterministic state"
         - "Admission-critical evidence requires TotalOrder to prevent stale evidence attacks"
@@ -375,9 +380,9 @@ rfc_design_decisions:
           status: EXTEND
           changes: "Add consensus_epoch, consensus_round, quorum_cert fields to EventRecord"
       new_components:
-        - path: "crates/apm2-core/src/consensus/raft.rs"
+        - path: "crates/apm2-core/src/consensus/bft.rs"
           status: NEW
-          purpose: "Raft consensus implementation"
+          purpose: "BFT consensus implementation (HotStuff/PBFT variant)"
       confidence: HIGH
 
     - requirement_id: DCS-REQ-0003

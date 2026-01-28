@@ -6,7 +6,8 @@ requirement:
 
   statement: |
     All authority operations (promotions, capability grants, policy changes) MUST be
-    reflected as signed kernel messages with total ordering guarantees.
+    reflected as signed kernel messages with total ordering guarantees provided by
+    a BFT quorum (HotStuff/PBFT) at local-quorum scale.
 
   rationale: |
     Authority operations change the security posture of the system. They must be

@@ -7,11 +7,11 @@ rfc_risks_and_open_questions:
       likelihood: MEDIUM
       impact: HIGH
       description: |
-        The choice of consensus implementation (custom Raft, off-the-shelf library,
-        PBFT variant) significantly affects development time, security, and
+        The choice of BFT consensus implementation (custom HotStuff/PBFT variant or
+        off-the-shelf library) significantly affects development time, security, and
         maintainability. Wrong choice may require rewrite.
       mitigation:
-        - "Evaluate existing Rust consensus libraries (raft-rs, tendermint-rs)"
+        - "Evaluate existing Rust BFT consensus libraries or frameworks"
         - "Prototype with abstraction layer to enable swap"
         - "Prioritize libraries with formal verification or extensive production use"
         - "Plan for at least 2 weeks of library evaluation before commitment"
@@ -103,7 +103,7 @@ rfc_risks_and_open_questions:
       mitigation:
         - "Tune sync frequency based on event rate"
         - "Monitor conflict rate; alert on high divergence"
-        - "Record all conflicts as MergeConflict events for analysis"
+        - "Record all conflicts as DefectRecorded events for analysis"
         - "Prioritize CRDT-friendly event designs"
       residual_risk: "Temporary inconsistency in non-authority data"
       owner: "Engineer"
@@ -129,39 +129,43 @@ rfc_risks_and_open_questions:
       status: OPEN
       context: |
         Options include:
-        - raft-rs (TiKV's Raft implementation)
-        - tendermint-rs (Cosmos ecosystem)
+        - BFT libraries or frameworks with HotStuff/PBFT semantics
         - Custom implementation
         Each has different trade-offs in maturity, features, and maintenance.
       proposed_resolution: |
         Conduct 2-week evaluation with prototype of each option. Criteria:
         - API compatibility with LedgerBackend
         - Testing infrastructure quality
-        - Byzantine fault tolerance (if required)
+        - Byzantine fault tolerance (required)
         - Maintenance and community activity
       decision_owner: "Architect"
       decision_deadline: "Before DCS-007 implementation"
 
     - id: Q-0002
-      question: "Should we use Raft or BFT for Byzantine tolerance?"
-      status: RESOLVED
-      resolution: |
-        Commit to BFT at the local quorum boundary (HotStuff/PBFT variant).
-        Admission integrity requirements (PRD-0007) mandate protection
-        against malicious authority nodes.
-      decision_date: "2026-01-28"
+      question: "Which BFT protocol variant should we use (HotStuff vs PBFT)?"
+      status: OPEN
+      context: |
+        Both HotStuff and PBFT satisfy BFT safety/liveness at local quorum scale,
+        but differ in message complexity, implementation complexity, and available
+        Rust libraries.
+      proposed_resolution: |
+        Evaluate HotStuff and PBFT variants during DCS-007 spike. Select based on:
+        - Message complexity vs latency at 4-7 nodes
+        - Availability of reference implementations or libraries
+        - Ease of QC integration and evidence export
       decision_owner: "Security + Architect"
+      decision_deadline: "Before DCS-007 implementation"
 
     - id: Q-0003
-      question: "How should namespace-to-Raft-group mapping work?"
+      question: "How should namespace-to-quorum mapping work?"
       status: OPEN
       context: |
         Options:
-        - One Raft group per namespace (fine-grained but many groups)
-        - One Raft group for all control plane (simple but potential bottleneck)
+        - One BFT quorum per namespace (fine-grained but many groups)
+        - One BFT quorum for all control plane (simple but potential bottleneck)
         - Hierarchical grouping (complex)
       proposed_resolution: |
-        Start with single Raft group for all control plane. Add namespace
+        Start with single BFT quorum for all control plane. Add namespace
         sharding only if performance requires. Monitor proposal rate to
         determine if sharding is needed.
       decision_owner: "Architect"

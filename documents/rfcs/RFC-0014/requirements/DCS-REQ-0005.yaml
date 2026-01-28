@@ -22,7 +22,7 @@ requirement:
       verification: "Implementation delegates to existing methods"
 
     - id: AC-003
-      description: "ConsensusLedgerBackend routes to Raft group"
+      description: "ConsensusLedgerBackend routes to BFT quorum"
       verification: "Implementation uses consensus protocol"
 
     - id: AC-004

@@ -11,8 +11,8 @@ rfc_meta:
     abstract: |
       This RFC specifies a distributed consensus and replication layer that extends APM2's
       append-only ledger and content-addressed storage (CAS) to multi-node operation. The
-      design employs a hybrid approach: Raft-based consensus for control plane operations
-      requiring total ordering (promotions, capability grants, policy changes) and
+      design employs a hybrid approach: HotStuff/PBFT-based BFT consensus for control plane
+      operations requiring total ordering (promotions, capability grants, policy changes) and
       CRDT/anti-entropy replication for data plane observations. The architecture preserves
       holonic authority constraints, maintains hash-chain integrity across nodes, and enables
       migration from the current single-node SQLite WAL implementation.

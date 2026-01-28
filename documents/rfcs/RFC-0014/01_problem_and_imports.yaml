@@ -97,8 +97,8 @@ rfc_problem_and_imports:
       rfc_local_id: DCS-REQ-0003
       title: "Canonicalizer Governance"
       statement: |
-        Every event envelope MUST include schema_version, schema_digest, and canonicalizer_id
-        to enable fail-closed validation and cross-version verification.
+        Every event envelope MUST include schema_version, schema_digest, canonicalizer_id, and
+        canonicalizer_version to enable fail-closed validation and cross-version verification.
       acceptance_criteria:
         - "Schema registry tracks all known schema digests"
         - "Unknown schema_digest triggers event rejection"
@@ -108,7 +108,7 @@ rfc_problem_and_imports:
     - id: DCS-REQ-0004
       title: "Hybrid Ordering Model"
       statement: |
-        The system MUST support two ordering guarantees: TotalOrder (Raft consensus) for
+        The system MUST support two ordering guarantees: TotalOrder (BFT consensus) for
         control plane operations and Eventual (anti-entropy) for data plane observations.
       acceptance_criteria:
         - "Event metadata includes OrderingGuarantee enum"
@@ -126,7 +126,7 @@ rfc_problem_and_imports:
       acceptance_criteria:
         - "LedgerBackend trait with append/read_from/verify_chain methods"
         - "SqliteLedgerBackend wraps existing Ledger implementation"
-        - "ConsensusLedgerBackend routes to Raft group"
+        - "ConsensusLedgerBackend routes to BFT quorum"
         - "Trait is async-compatible (Pin<Box<Future>>)"
 
     - id: DCS-REQ-0006
@@ -160,6 +160,37 @@ rfc_problem_and_imports:
         - "Merge conflicts recorded as DefectRecorded events"
       law_refs:
         - LAW-10
+
+    - id: DCS-REQ-0009
+      title: "Strictly Ordered Evidence"
+      statement: |
+        EvidencePublished events that gate Admission MUST be totally ordered and finalized
+        by the control-plane BFT quorum before GateReceipt generation.
+      acceptance_criteria:
+        - "Admission-critical EvidencePublished events carry TotalOrder metadata"
+        - "GateReceipt generation rejects evidence without TotalOrder finalization"
+        - "Strictly ordered evidence is auditable in the ledger"
+
+    - id: DCS-REQ-0010
+      title: "Hybrid Logical Clocks for LWW"
+      statement: |
+        All LWW merge operators MUST use Hybrid Logical Clocks (HLC) instead of wall time
+        to preserve causality and determinism under partition.
+      acceptance_criteria:
+        - "EventMetadata includes HLC timestamp"
+        - "LWW merge uses HLC ordering"
+        - "Determinism tests validate HLC ordering across nodes"
+
+    - id: DCS-REQ-0011
+      title: "Outbound-Only Networking via Relay Holons"
+      statement: |
+        Nodes behind NAT/firewall MUST participate via outbound-only reverse-TLS tunnels
+        terminated at Relay Holons. Relay Holons are availability infrastructure and do not
+        participate in consensus.
+      acceptance_criteria:
+        - "Outbound-only nodes can join quorum via relay tunnel"
+        - "Relay compromise does not allow consensus forgery"
+        - "Relay downtime degrades availability but not safety"
 
   non_goals:
     - id: NG-0001

@@ -194,6 +194,9 @@ rfc_test_and_evidence:
       description: "Tests for TotalOrder, HLC, and StrictlyOrderedEvidence"
       requirements_covered:
         - DCS-REQ-0004
+        - DCS-REQ-0009
+        - DCS-REQ-0010
+        - DCS-REQ-0011
       tests:
         - id: TEST-ORD-001
           type: UNIT
@@ -209,6 +212,16 @@ rfc_test_and_evidence:
           type: INTEGRATION
           description: "Relay Holon tunnel maintains message order"
           verification: "Stream events through Relay; assert arrival matches departure order"
+
+    - category: "Gate Evidence Predicates"
+      description: "Tests for evidence predicates on gate receipts"
+      requirements_covered:
+        - DCS-REQ-0009
+      tests:
+        - id: TEST-GE-001
+          type: UNIT
+          description: "GateReceipt includes evidence_predicates"
+          verification: "Generate GateReceipt; assert evidence_predicates populated"
 
     - category: "Anti-Entropy Sync"
       description: "Tests for CRDT merge and data plane convergence"
@@ -244,11 +257,11 @@ rfc_test_and_evidence:
 
         - id: TEST-AE-007
           type: INTEGRATION
-          description: "Merge conflict recorded as MergeConflict event"
+          description: "Merge conflict recorded as DefectRecorded event"
           verification: |
             1. Node A and B have conflicting events (NoMerge operator)
             2. Anti-entropy sync detects conflict
-            3. Assert: MergeConflict event emitted to local log
+            3. Assert: DefectRecorded event emitted to local log
 
     - category: "Migration"
       description: "Tests for single-node to distributed migration"
@@ -347,19 +360,19 @@ rfc_test_and_evidence:
       name: "LedgerBackend Trait Extraction"
       description: |
         Evidence that SqliteLedgerBackend passes all existing ledger tests.
-      path: "evidence_artifacts/EVID-0002-ledger-backend-tests.md"
+      path: "evidence_artifacts/EVID-0002-ledgerbackend-trait-extraction.md"
 
     - id: EVID-0003
       name: "Trust Tier Analysis"
       description: |
         Analysis of signer tiers and key management requirements.
-      path: "evidence_artifacts/EVID-0003-trust-tiers.md"
+      path: "evidence_artifacts/EVID-0003-trust-tier-analysis.md"
 
     - id: EVID-0004
       name: "Schema Registry Design"
       description: |
         Design document for fail-closed schema validation.
-      path: "evidence_artifacts/EVID-0004-schema-registry.md"
+      path: "evidence_artifacts/EVID-0004-schema-registry-design.md"
 
     - id: EVID-0005
       name: "Event Classification Matrix"
@@ -371,40 +384,58 @@ rfc_test_and_evidence:
       name: "Merkle Tree Performance Analysis"
       description: |
         Benchmark results for Merkle tree operations at various scales.
-      path: "evidence_artifacts/EVID-0006-merkle-performance.md"
+      path: "evidence_artifacts/EVID-0006-merkle-tree-performance-analysis.md"
 
     - id: EVID-0007
       name: "Consensus Protocol Specification"
       description: |
         Formal specification of consensus messages and state machine.
-      path: "evidence_artifacts/EVID-0007-consensus-spec.md"
+      path: "evidence_artifacts/EVID-0007-consensus-protocol-specification.md"
 
     - id: EVID-0008
       name: "BFT Safety Proof"
       description: |
         Reference to BFT safety and liveness proofs (e.g., PBFT paper).
-      path: "evidence_artifacts/EVID-0008-bft-proofs.md"
+      path: "evidence_artifacts/EVID-0008-bft-safety-proof.md"
 
     - id: EVID-0009
       name: "Equivocation Detection Test Results"
       description: |
         Test results demonstrating Byzantine fault detection.
-      path: "evidence_artifacts/EVID-0009-equivocation-tests.md"
+      path: "evidence_artifacts/EVID-0009-equivocation-detection-test-results.md"
 
     - id: EVID-0010
       name: "Hash Chain Integrity Test Results"
       description: |
         Test results for hash chain verification across scenarios.
-      path: "evidence_artifacts/EVID-0010-hash-chain-tests.md"
+      path: "evidence_artifacts/EVID-0010-hash-chain-integrity-test-results.md"
 
     - id: EVID-0011
       name: "Key Rotation Security Analysis"
       description: |
         Analysis of key rotation protocol security properties.
-      path: "evidence_artifacts/EVID-0011-key-rotation.md"
+      path: "evidence_artifacts/EVID-0011-key-rotation-security-analysis.md"
 
     - id: EVID-0012
       name: "Schema Backward Compatibility"
       description: |
         Evidence that extended KernelEvent is backward compatible.
-      path: "evidence_artifacts/EVID-0012-schema-compat.md"
+      path: "evidence_artifacts/EVID-0012-schema-backward-compatibility.md"
+
+    - id: EVID-0013
+      name: "HLC Determinism Analysis"
+      description: |
+        Evidence that Hybrid Logical Clocks preserve causality and deterministic merge.
+      path: "evidence_artifacts/EVID-0013-hlc-determinism.md"
+
+    - id: EVID-0014
+      name: "Strictly Ordered Evidence Policy"
+      description: |
+        Admission policy describing when EvidencePublished must be TotalOrder.
+      path: "evidence_artifacts/EVID-0014-strict-evidence.md"
+
+    - id: EVID-0015
+      name: "Relay Holon Security Review"
+      description: |
+        Threat analysis and mitigations for Relay Holon tunnels.
+      path: "evidence_artifacts/EVID-0015-relay-security.md"

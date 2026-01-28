@@ -43,6 +43,7 @@ rfc_rollout_and_ops:
           - "Events replicate from leader to followers"
           - "Genesis block hash matches pre-existing ledger head"
           - "Follower can sync from leader after restart"
+          - "Admission-critical authority operations remain disabled until PHASE-2"
         rollback: "Disable replication; fall back to single-node"
 
       - id: PHASE-2
@@ -54,8 +55,9 @@ rfc_rollout_and_ops:
           - "HotStuff/PBFT BFT consensus implementation"
           - "Quorum certificate generation and verification"
           - "Leader election and view changes"
+          - "StrictlyOrderedEvidence enforcement for Admission"
           - "HLC-based CRDT merge operators (LWW, GCounter, SetUnion)"
-          - "Conflict recording via MergeConflict events"
+          - "Conflict recording via DefectRecorded events"
           - "Byzantine fault detection (equivocation)"
         validation:
           - "Control plane events finalized with 2f+1 signatures"
@@ -223,7 +225,7 @@ rfc_rollout_and_ops:
         description: "Insufficient validators for quorum"
 
       - name: "HighFinalizationLatency"
-        condition: "histogram_quantile(0.99, apm2_consensus_finalization_latency_seconds) > 5"
+        condition: "histogram_quantile(0.99, apm2_consensus_finalization_latency_seconds) > 0.5"
         severity: warning
         description: "Consensus finalization taking too long"
 
