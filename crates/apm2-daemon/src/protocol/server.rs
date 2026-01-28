@@ -391,16 +391,25 @@ impl Connection {
     /// Initializes with [`MAX_HANDSHAKE_FRAME_SIZE`] limit.
     fn new(stream: UnixStream) -> Self {
         Self {
-            framed: Framed::new(stream, FrameCodec::with_max_size(MAX_HANDSHAKE_FRAME_SIZE)),
+            framed: Framed::new(
+                stream,
+                FrameCodec::with_max_size(MAX_HANDSHAKE_FRAME_SIZE)
+                    .expect("MAX_HANDSHAKE_FRAME_SIZE must be within protocol limits"),
+            ),
         }
     }
 
-    /// Upgrade the connection to support full-sized frames.
+    /// Upgrades the connection to the full protocol frame size.
     ///
     /// Should be called after a successful handshake to allow messages
     /// up to [`MAX_FRAME_SIZE`].
-    pub fn upgrade_to_full_frame_size(&mut self) {
-        self.framed.codec_mut().set_max_frame_size(MAX_FRAME_SIZE);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::FrameTooLarge`] if [`MAX_FRAME_SIZE`]
+    /// exceeds the codec's limits.
+    pub fn upgrade_to_full_frame_size(&mut self) -> ProtocolResult<()> {
+        self.framed.codec_mut().set_max_frame_size(MAX_FRAME_SIZE)
     }
 
     /// Get a reference to the underlying framed stream.

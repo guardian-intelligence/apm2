@@ -123,7 +123,10 @@ pub fn build_script_command(
     model: Option<&str>,
 ) -> String {
     let quoted_prompt = quote_path(prompt_path);
-    let model_flag = model.map_or_else(String::new, |m| format!("--model {m} "));
+    let model_flag = model.map_or_else(String::new, |m| {
+        let escaped_m = escape_for_single_quote(m);
+        format!("--model {escaped_m} ")
+    });
     let inner_cmd = format!("gemini {model_flag}--yolo < {quoted_prompt}");
     let escaped_inner = escape_for_single_quote(&inner_cmd);
 

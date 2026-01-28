@@ -79,7 +79,7 @@ async fn test_full_handshake_protocol() {
         assert!(handshake.is_completed());
 
         // Upgrade to full frame size after successful handshake
-        conn.upgrade_to_full_frame_size();
+        conn.upgrade_to_full_frame_size().unwrap();
 
         handshake.negotiated_version()
     });
@@ -103,7 +103,7 @@ async fn test_full_handshake_protocol() {
     assert_eq!(client_handshake.server_info(), Some("test-daemon/1.0"));
 
     // Upgrade to full frame size after successful handshake
-    client_conn.upgrade_to_full_frame_size();
+    client_conn.upgrade_to_full_frame_size().unwrap();
 
     // Verify server completed handshake
     let server_version = timeout(Duration::from_secs(1), server_handle)
@@ -180,7 +180,7 @@ async fn test_large_frame_transmission() {
     let server_handle = tokio::spawn(async move {
         let (mut conn, _permit) = server.accept().await.unwrap();
         // Upgrade connection to allow large frames
-        conn.upgrade_to_full_frame_size();
+        conn.upgrade_to_full_frame_size().unwrap();
         let frame = conn.framed().next().await.unwrap().unwrap();
         conn.framed().send(frame).await.unwrap();
     });
@@ -188,7 +188,7 @@ async fn test_large_frame_transmission() {
     // Client sends and receives
     let mut client_conn = connect(&socket_path).await.unwrap();
     // Upgrade client connection as well
-    client_conn.upgrade_to_full_frame_size();
+    client_conn.upgrade_to_full_frame_size().unwrap();
     client_conn.framed().send(payload_bytes).await.unwrap();
 
     let response = client_conn.framed().next().await.unwrap().unwrap();
