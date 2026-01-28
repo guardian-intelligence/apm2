@@ -27,8 +27,8 @@
 //! - [`golden_vectors`]: Golden test vectors for determinism verification
 //! - [`handshake`]: Version negotiation ([`Hello`], [`HelloAck`],
 //!   [`ServerHandshake`])
-//! - [`messages`]: Protocol buffer message types ([`Receipt`],
-//!   [`TelemetryFrame`], etc.)
+//! - [`messages`]: Protocol buffer message types ([`messages::Receipt`],
+//!   [`messages::TelemetryFrame`], etc.)
 //! - [`server`]: UDS server ([`ProtocolServer`], [`Connection`])
 //!
 //! # Wire Format
