@@ -445,7 +445,7 @@ impl CoordinationReceipt {
     ///
     /// The receipt is stored as JSON. The returned hash is the CAS content
     /// hash (computed over JSON bytes), which differs from the canonical
-    /// hash returned by [`compute_hash`].
+    /// hash returned by [`Self::compute_hash`].
     ///
     /// Use `compute_hash()` for tamper-evidence verification.
     /// Use this method for CAS storage/retrieval operations.
