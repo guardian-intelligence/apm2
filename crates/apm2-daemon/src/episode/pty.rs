@@ -54,13 +54,15 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{CString, OsStr};
+use std::io::{self, Read};
 use std::mem::ManuallyDrop;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use bytes::Bytes;
 use nix::errno::Errno;
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::libc;
 use nix::pty::{Winsize, openpty};
 use nix::sys::signal::{self, Signal};
@@ -68,6 +70,7 @@ use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, close, execvp, fork, setsid};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
+use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -659,13 +662,72 @@ fn path_to_cstring(path: &Path) -> Result<CString, PtyError> {
     CString::new(bytes).map_err(|_| PtyError::InvalidPath)
 }
 
+/// Sets a file descriptor to non-blocking mode.
+///
+/// This is required for using `AsyncFd` with the PTY master.
+///
+/// # Errors
+///
+/// Returns `PtyError::NonBlocking` if the fcntl call fails.
+fn set_nonblocking(fd: BorrowedFd<'_>) -> Result<(), PtyError> {
+    // Get current flags
+    let flags = fcntl(fd, FcntlArg::F_GETFL)
+        .map_err(|e| PtyError::NonBlocking(io::Error::from_raw_os_error(e as i32)))?;
+
+    // Add O_NONBLOCK
+    let new_flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+    fcntl(fd, FcntlArg::F_SETFL(new_flags))
+        .map_err(|e| PtyError::NonBlocking(io::Error::from_raw_os_error(e as i32)))?;
+
+    Ok(())
+}
+
+/// Wrapper around `OwnedFd` that implements `Read` and `AsRawFd` for use with
+/// `AsyncFd`.
+///
+/// `AsyncFd` requires `AsRawFd` for registration with the reactor.
+/// The `Read` implementation is provided for convenience but the async
+/// read loop uses `libc::read` directly for non-blocking I/O.
+struct ReadableFd(OwnedFd);
+
+impl AsFd for ReadableFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+impl AsRawFd for ReadableFd {
+    fn as_raw_fd(&self) -> i32 {
+        self.0.as_raw_fd()
+    }
+}
+
+impl Read for ReadableFd {
+    #[allow(clippy::cast_sign_loss)] // n is checked to be >= 0 before cast
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // SAFETY: We're reading into a valid buffer from a valid fd
+        let n = unsafe {
+            libc::read(
+                self.0.as_raw_fd(),
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+}
+
 /// Spawns the async output capture task.
 ///
 /// This task reads from the master PTY fd and sends output chunks through the
-/// channel. It uses `spawn_blocking` with synchronous I/O to avoid FD ownership
-/// conflicts with `send_input`. This approach prevents resource exhaustion at
-/// scale (`MAX_CONCURRENT_EPISODES` = 10,000) by not creating a new tokio
-/// runtime per PTY.
+/// channel. It uses `AsyncFd` with non-blocking I/O for efficient async reads
+/// without blocking a thread per episode. This approach supports scaling to
+/// `MAX_CONCURRENT_EPISODES` = 10,000 without exhausting the tokio blocking
+/// thread pool (INV-PTY003).
 ///
 /// # FD Ownership
 ///
@@ -685,9 +747,10 @@ fn path_to_cstring(path: &Path) -> Result<CString, PtyError> {
 ///
 /// The monotonic clock is acceptable here because:
 /// 1. Output timestamps are for ordering within a single episode, not
-///    cross-episode
+///    cross-episode correlation. This is a documented exception to HARD-TIME.
 /// 2. Sequence numbers provide the primary ordering guarantee (INV-OUT001)
 /// 3. The monotonic clock provides relative ordering without wall-clock issues
+/// 4. `CLOCK_MONOTONIC` is not affected by NTP adjustments or timezone changes
 ///
 /// For replay/simulation scenarios where deterministic timestamps are required,
 /// the flight recorder should be fed pre-timestamped data rather than capturing
@@ -712,32 +775,66 @@ fn spawn_capture_task(
         return tokio::spawn(async {});
     }
 
-    // Use spawn_blocking with synchronous I/O. This is simpler than async I/O
-    // and avoids the need for a nested runtime while still running on the
-    // existing thread pool.
-    tokio::task::spawn_blocking(move || {
-        // SAFETY: capture_fd is a valid FD from dup(). We take ownership via
-        // OwnedFd, which will close it when dropped.
-        let owned_fd = unsafe { OwnedFd::from_raw_fd(capture_fd) };
+    // SAFETY: capture_fd is a valid FD from dup(). We take ownership via
+    // OwnedFd, which will close it when dropped.
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(capture_fd) };
 
-        // Use std::fs::File for synchronous reads
-        let file = std::fs::File::from(owned_fd);
-        let mut reader = std::io::BufReader::with_capacity(buffer_size, file);
+    // Set to non-blocking mode for use with AsyncFd
+    if let Err(e) = set_nonblocking(owned_fd.as_fd()) {
+        error!("failed to set non-blocking mode: {}", e);
+        return tokio::spawn(async {});
+    }
 
+    // Wrap in ReadableFd for AsyncFd
+    let readable_fd = ReadableFd(owned_fd);
+
+    // Create AsyncFd for event-driven I/O
+    let async_fd = match AsyncFd::new(readable_fd) {
+        Ok(fd) => fd,
+        Err(e) => {
+            error!("failed to create AsyncFd: {}", e);
+            return tokio::spawn(async {});
+        },
+    };
+
+    // Use tokio::spawn (not spawn_blocking) for async I/O.
+    // This does not block a thread per PTY, enabling scale to 10,000+ episodes.
+    tokio::spawn(async move {
         let mut seq_gen = SequenceGenerator::new();
         let mut buf = vec![0u8; buffer_size];
 
-        // We need to send through the channel, which is async. Use a simple
-        // blocking approach with try_send and a small sleep on backpressure.
         loop {
-            use std::io::Read;
-            match reader.read(&mut buf) {
-                Ok(0) => {
+            // Wait for the FD to be readable
+            let mut guard = match async_fd.readable().await {
+                Ok(guard) => guard,
+                Err(e) => {
+                    error!("AsyncFd readable error: {}", e);
+                    break;
+                },
+            };
+
+            // Attempt to read using try_io.
+            // The closure performs a non-blocking read; if it would block,
+            // try_io returns Err(_would_block) and we loop back to wait.
+            #[allow(clippy::cast_sign_loss)] // n is checked to be >= 0 before cast
+            match guard.try_io(|inner| {
+                let fd = inner.get_ref().0.as_raw_fd();
+                // SAFETY: Reading into a valid buffer from a valid fd.
+                // The fd is non-blocking, so this won't block.
+                let n =
+                    unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+                if n < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }) {
+                Ok(Ok(0)) => {
                     // EOF - PTY closed
                     debug!("PTY EOF reached");
                     break;
                 },
-                Ok(n) => {
+                Ok(Ok(n)) => {
                     // Get monotonic timestamp using clock_gettime.
                     // See function-level documentation for HARD-TIME rationale.
                     let ts_mono = get_monotonic_ns();
@@ -746,34 +843,29 @@ fn spawn_capture_task(
                     let output =
                         PtyOutput::combined(Bytes::copy_from_slice(&buf[..n]), seq, ts_mono);
 
-                    // Use blocking_send since we're in spawn_blocking
-                    if output_tx.blocking_send(output).is_err() {
+                    // Use send().await since we're in an async context
+                    if output_tx.send(output).await.is_err() {
                         // Receiver dropped
                         debug!("output channel closed");
                         break;
                     }
                 },
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::Interrupted
-                    {
-                        // Transient error - retry after short sleep
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        continue;
-                    }
+                Ok(Err(e)) => {
                     // Check if it's an I/O error due to child exit
-                    if e.kind() == std::io::ErrorKind::Other || e.raw_os_error() == Some(libc::EIO)
-                    {
+                    if e.kind() == io::ErrorKind::Other || e.raw_os_error() == Some(libc::EIO) {
                         debug!("PTY read error (child likely exited): {}", e);
                         break;
                     }
                     error!("PTY read error: {}", e);
                     break;
                 },
+                Err(_would_block) => {
+                    // Not actually ready, clear readiness and loop back to wait
+                },
             }
         }
 
-        // OwnedFd will close capture_fd when dropped here
+        // OwnedFd will close capture_fd when async_fd is dropped here
     })
 }
 
