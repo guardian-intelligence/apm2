@@ -17,6 +17,8 @@ APM2 is a process supervision framework for orchestrating heterogeneous AI agent
 - [Architectural Overview](#architectural-overview)
 - [Technology Stack](#technology-stack)
 - [Documentation Convention](#documentation-convention)
+- [Fast Onboarding (CAC)](#fast-onboarding-cac)
+- [Working Tree Assumptions](#working-tree-assumptions)
 - [Module Index](#module-index)
 - [Type Glossary](#type-glossary)
 - [Security](#security)
@@ -126,6 +128,24 @@ Each module contains an `AGENTS.md` file providing AI-agent-optimized documentat
 - **References**: Links to external specifications
 
 See individual `AGENTS.md` files linked in the Module Index below for detailed documentation.
+
+---
+
+## Fast Onboarding (CAC)
+
+If you have a constrained context window, prefer `ROOT_ONBOARDING.cac.md` first.
+It is a machine-readable, token-efficient index of **root** Markdown docs with audit hashes and explicit exclusions.
+
+---
+
+## Working Tree Assumptions
+
+This repo is frequently in a **dirty worktree** due to concurrent work, generated artifacts, and multi-agent workflows.
+
+- Do **not** treat `git status` cleanliness as a precondition for work.
+- Do **not** attempt to clean up, revert, or “fix” unrelated changes unless explicitly requested.
+- Keep edits narrowly scoped to the task. If you must edit a file that already has unrelated changes, preserve them and minimize incidental reformatting.
+- Mention unrelated changes only if they **block** the requested task (e.g., merge conflicts in the same file you must edit) or create a correctness/safety hazard.
 
 ---
 

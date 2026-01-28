@@ -260,8 +260,9 @@ See `documents/skills/glossary/` and `AGENTS.md` for deeper definitions and modu
 
 ## Documentation
 
+- [ROOT_ONBOARDING.cac.md](ROOT_ONBOARDING.cac.md): token-efficient, machine-readable onboarding index for agents
 - [AGENTS.md](AGENTS.md): architecture + module index
-- [CONTRIBUTING.md](CONTRIBUTING.md): development workflow and tooling
+- [CONTRIBUTING.md](CONTRIBUTING.md): human contributor workflow and tooling notes
 - [SECURITY.md](SECURITY.md): vulnerability reporting and security docs pointers
 - [documents/](documents/): PRDs, RFCs, security docs, and specs
 
@@ -278,6 +279,8 @@ This project is pre-1.0; the roadmap is directional and may change.
 ## Contributing
 
 Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and open an issue/PR.
+
+If you are an **AI implementation / ticket-queue agent**, treat `CONTRIBUTING.md` as non-authoritative and follow `AGENTS.md` and the relevant `documents/skills/**/SKILL.md` instead.
 
 ## Security
 

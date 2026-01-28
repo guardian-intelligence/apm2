@@ -11,39 +11,39 @@ rfc_ticket_decomposition:
       - id: P0
         name: "Foundation"
         description: "Abstractions and schema extensions without behavioral change"
-        tickets: [DCS-001, DCS-002, DCS-012, DCS-003]
+        tickets: [TCK-00180, TCK-00181, TCK-00194, TCK-00182]
         estimated_duration: "2 weeks"
 
       - id: P1
         name: "Replication"
         description: "Multi-node communication and leader-based replication"
-        tickets: [DCS-004, DCS-005, DCS-006, DCS-013]
+        tickets: [TCK-00183, TCK-00184, TCK-00185, TCK-00195]
         estimated_duration: "3 weeks"
         depends_on: [P0]
 
       - id: P1.5
         name: "Consensus Spike"
         description: "BFT protocol/library evaluation and capability proof model"
-        tickets: [DCS-007a, DCS-018a]
+        tickets: [TCK-00186, TCK-00199]
         estimated_duration: "2 weeks"
         depends_on: [P1]
 
       - id: P2
         name: "Consensus"
         description: "Full BFT consensus and anti-entropy with CRDT merge"
-        tickets: [DCS-007b, DCS-007c, DCS-007d, DCS-008, DCS-016, DCS-014, DCS-009, DCS-015, DCS-018b]
+        tickets: [TCK-00187, TCK-00188, TCK-00189, TCK-00190, TCK-00198, TCK-00196, TCK-00191, TCK-00197, TCK-00200]
         estimated_duration: "6-8 weeks"
         depends_on: [P1.5]
 
       - id: P3
         name: "Production"
         description: "HSM integration and operational tooling"
-        tickets: [DCS-010, DCS-011]
+        tickets: [TCK-00192, TCK-00193]
         estimated_duration: "2 weeks"
         depends_on: [P2]
 
   tickets:
-    - id: DCS-001
+    - ticket_id: TCK-00180
       phase: P0
       title: "Extract LedgerBackend Trait from Existing Ledger"
       complexity: MEDIUM
@@ -70,7 +70,7 @@ rfc_ticket_decomposition:
       dependencies: []
       blocked_by: []
 
-    - id: DCS-002
+    - ticket_id: TCK-00181
       phase: P0
       title: "Define SchemaRegistry Trait and InMemory Implementation"
       complexity: MEDIUM
@@ -89,7 +89,7 @@ rfc_ticket_decomposition:
         - path: "crates/apm2-core/src/schema_registry/traits.rs"
         - path: "crates/apm2-core/src/schema_registry/memory.rs"
 
-    - id: DCS-012
+    - ticket_id: TCK-00194
       phase: P0
       title: "Integrate Schema Validation into Append Path"
       complexity: MEDIUM
@@ -103,9 +103,9 @@ rfc_ticket_decomposition:
         - "Event append validates schema_digest"
         - "Unknown digest returns SchemaMismatch error"
       dependencies:
-        - DCS-002
+        - TCK-00181
 
-    - id: DCS-003
+    - ticket_id: TCK-00182
       phase: P0
       title: "Schema Extension for Consensus Columns"
       complexity: LOW
@@ -132,7 +132,7 @@ rfc_ticket_decomposition:
       dependencies: []
       blocked_by: []
 
-    - id: DCS-004
+    - ticket_id: TCK-00183
       phase: P1
       title: "Peer Discovery and Mutual TLS"
       complexity: MEDIUM
@@ -157,11 +157,11 @@ rfc_ticket_decomposition:
         - path: "crates/apm2-core/src/consensus/discovery.rs"
           purpose: "Peer discovery protocol"
       dependencies:
-        - DCS-001
+        - TCK-00180
       blocked_by:
-        - DCS-001
+        - TCK-00180
 
-    - id: DCS-005
+    - ticket_id: TCK-00184
       phase: P1
       title: "Relay Holon and Reverse-TLS Tunneling"
       complexity: HIGH
@@ -181,9 +181,9 @@ rfc_ticket_decomposition:
         - path: "crates/apm2-core/src/consensus/relay.rs"
         - path: "crates/apm2-core/src/consensus/tunnel.rs"
       dependencies:
-        - DCS-004
+        - TCK-00183
 
-    - id: DCS-006
+    - ticket_id: TCK-00185
       phase: P1
       title: "Genesis Adoption and Validation"
       complexity: MEDIUM
@@ -205,9 +205,9 @@ rfc_ticket_decomposition:
       files_to_create:
         - path: "crates/apm2-core/src/consensus/genesis.rs"
       dependencies:
-        - DCS-001
+        - TCK-00180
 
-    - id: DCS-013
+    - ticket_id: TCK-00195
       phase: P1
       title: "Leader-Based Replication (Basic)"
       complexity: MEDIUM
@@ -221,10 +221,10 @@ rfc_ticket_decomposition:
         - "Proposals replicated to followers"
         - "Followers append replicated events to local log"
       dependencies:
-        - DCS-004
-        - DCS-005
+        - TCK-00183
+        - TCK-00184
 
-    - id: DCS-007a
+    - ticket_id: TCK-00186
       phase: P1.5
       title: "BFT Library Evaluation Spike"
       complexity: HIGH
@@ -239,9 +239,9 @@ rfc_ticket_decomposition:
         - "EVID-0007 populated with message types + state machine"
         - "EVID-0008 populated with safety/liveness proof references"
       dependencies:
-        - DCS-004
+        - TCK-00183
 
-    - id: DCS-007b
+    - ticket_id: TCK-00187
       phase: P2
       title: "BFT State Machine Core"
       complexity: HIGH
@@ -258,9 +258,9 @@ rfc_ticket_decomposition:
       files_to_create:
         - path: "crates/apm2-core/src/consensus/bft_machine.rs"
       dependencies:
-        - DCS-007a
+        - TCK-00186
 
-    - id: DCS-007c
+    - ticket_id: TCK-00188
       phase: P2
       title: "BFT Network Message Handlers"
       complexity: MEDIUM
@@ -275,10 +275,10 @@ rfc_ticket_decomposition:
         - "Handlers reject invalid or replayed messages"
         - "Transport integrates padding + jitter requirements"
       dependencies:
-        - DCS-004
-        - DCS-007b
+        - TCK-00183
+        - TCK-00187
 
-    - id: DCS-007d
+    - ticket_id: TCK-00189
       phase: P2
       title: "BFT LedgerBackend Integration"
       complexity: MEDIUM
@@ -294,11 +294,11 @@ rfc_ticket_decomposition:
         - "Quorum certificates stored with authority events"
         - "Consensus metadata persisted and replayable"
       dependencies:
-        - DCS-007b
-        - DCS-007c
-        - DCS-008
+        - TCK-00187
+        - TCK-00188
+        - TCK-00190
 
-    - id: DCS-008
+    - ticket_id: TCK-00190
       phase: P2
       title: "Quorum Certificate Generation and Verification"
       complexity: MEDIUM
@@ -314,9 +314,9 @@ rfc_ticket_decomposition:
         - "QC verification validates signer membership and signatures"
         - "Authority events include QC in ledger record"
       dependencies:
-        - DCS-007b
+        - TCK-00187
 
-    - id: DCS-016
+    - ticket_id: TCK-00198
       phase: P2
       title: "StrictlyOrderedEvidence and Gate Predicates"
       complexity: MEDIUM
@@ -331,10 +331,10 @@ rfc_ticket_decomposition:
         - "GateReceipt includes evidence_predicates metadata"
         - "Evidence predicates are auditable and replayable"
       dependencies:
-        - DCS-007d
-        - DCS-008
+        - TCK-00189
+        - TCK-00190
 
-    - id: DCS-018a
+    - ticket_id: TCK-00199
       phase: P1.5
       title: "Capability Proof Model and Event Definitions"
       complexity: MEDIUM
@@ -349,7 +349,7 @@ rfc_ticket_decomposition:
         - "Proof format includes namespace binding"
         - "Relationship to lease system documented"
 
-    - id: DCS-018b
+    - ticket_id: TCK-00200
       phase: P2
       title: "Cross-Node Capability Verification Integration"
       complexity: MEDIUM
@@ -365,10 +365,10 @@ rfc_ticket_decomposition:
         - "Verification uses ledger state + signature chain"
         - "Invalid proofs are rejected deterministically"
       dependencies:
-        - DCS-018a
-        - DCS-007d
+        - TCK-00199
+        - TCK-00189
 
-    - id: DCS-014
+    - ticket_id: TCK-00196
       phase: P2
       title: "Byzantine Equivocation Detection"
       complexity: MEDIUM
@@ -382,10 +382,10 @@ rfc_ticket_decomposition:
         - "Equivocation detected and evidence generated"
         - "Byzantine node identity included in evidence"
       dependencies:
-        - DCS-007b
-        - DCS-007c
+        - TCK-00187
+        - TCK-00188
 
-    - id: DCS-009
+    - ticket_id: TCK-00191
       phase: P2
       title: "Anti-Entropy Gossip with Merkle Trees"
       complexity: MEDIUM
@@ -402,10 +402,10 @@ rfc_ticket_decomposition:
         - path: "crates/apm2-core/src/consensus/anti_entropy.rs"
         - path: "crates/apm2-core/src/consensus/merkle.rs"
       dependencies:
-        - DCS-004
-        - DCS-012
+        - TCK-00183
+        - TCK-00194
 
-    - id: DCS-015
+    - ticket_id: TCK-00197
       phase: P2
       title: "HLC-Based CRDT Merge Operators"
       complexity: MEDIUM
@@ -420,9 +420,9 @@ rfc_ticket_decomposition:
         - "HLC-based LWW merge produces deterministic result"
         - "Conflicts recorded correctly"
       dependencies:
-        - DCS-009
+        - TCK-00191
 
-    - id: DCS-010
+    - ticket_id: TCK-00192
       phase: P3
       title: "HSM Integration for T1 Validator Keys"
       complexity: MEDIUM
@@ -445,11 +445,11 @@ rfc_ticket_decomposition:
         - path: "crates/apm2-core/src/crypto/yubihsm.rs"
           purpose: "YubiHSM implementation"
       dependencies:
-        - DCS-007d
+        - TCK-00189
       blocked_by:
-        - DCS-007d
+        - TCK-00189
 
-    - id: DCS-011
+    - ticket_id: TCK-00193
       phase: P3
       title: "Operational Monitoring and Alerting"
       complexity: MEDIUM
@@ -478,40 +478,40 @@ rfc_ticket_decomposition:
         - path: "crates/apm2-cli/src/commands/mod.rs"
           changes: "Export consensus commands module"
       dependencies:
-        - DCS-007d
+        - TCK-00189
       blocked_by:
-        - DCS-007d
+        - TCK-00189
 
   dependency_graph: |
     Phase 0 (Foundation):
-      DCS-001 ─┬─> DCS-006
-               └─> DCS-004
-      DCS-002 ─┬─> DCS-012 ─┬─> DCS-009 ─┬─> DCS-015
-      DCS-003 ─┘            └─> (joins Phase 1.5)
+      TCK-00180 ─┬─> TCK-00185
+               └─> TCK-00183
+      TCK-00181 ─┬─> TCK-00194 ─┬─> TCK-00191 ─┬─> TCK-00197
+      TCK-00182 ─┘            └─> (joins Phase 1.5)
 
     Phase 1 (Replication):
-      DCS-004 ─> DCS-005 ─> DCS-013
+      TCK-00183 ─> TCK-00184 ─> TCK-00195
 
     Phase 1.5 (Spike):
-      DCS-007a (BFT evaluation)
-      DCS-018a (capability proof model)
+      TCK-00186 (BFT evaluation)
+      TCK-00199 (capability proof model)
 
     Phase 2 (Consensus):
-      DCS-007a ─> DCS-007b ─┬─> DCS-007c ─> DCS-007d ─┬─> DCS-016
-                            ├─> DCS-008 ──────────────┘
-                            └─> DCS-014
-      DCS-018a ─> DCS-018b ─┘
+      TCK-00186 ─> TCK-00187 ─┬─> TCK-00188 ─> TCK-00189 ─┬─> TCK-00198
+                            ├─> TCK-00190 ──────────────┘
+                            └─> TCK-00196
+      TCK-00199 ─> TCK-00200 ─┘
 
     Phase 3 (Production):
-      DCS-007d ─┬─> DCS-010
-                └─> DCS-011
+      TCK-00189 ─┬─> TCK-00192
+                └─> TCK-00193
 
     Parallel Opportunities:
-      - DCS-001, DCS-002, DCS-003 can be done in parallel
-      - DCS-004 can proceed after DCS-001; DCS-005 follows DCS-004
-      - DCS-006 can proceed after DCS-001 (parallel with DCS-004/DCS-005)
-      - DCS-009 can proceed after DCS-004 and DCS-012
-      - DCS-007a and DCS-018a can proceed after P1 completes
-      - DCS-008 can proceed after DCS-007b (parallel with DCS-007c)
-      - DCS-016 can proceed after DCS-007d and DCS-008
-      - DCS-010, DCS-011 can be done in parallel after DCS-007d
+      - TCK-00180, TCK-00181, TCK-00182 can be done in parallel
+      - TCK-00183 can proceed after TCK-00180; TCK-00184 follows TCK-00183
+      - TCK-00185 can proceed after TCK-00180 (parallel with TCK-00183/TCK-00184)
+      - TCK-00191 can proceed after TCK-00183 and TCK-00194
+      - TCK-00186 and TCK-00199 can proceed after P1 completes
+      - TCK-00190 can proceed after TCK-00187 (parallel with TCK-00188)
+      - TCK-00198 can proceed after TCK-00189 and TCK-00190
+      - TCK-00192, TCK-00193 can be done in parallel after TCK-00189

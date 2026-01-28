@@ -1,5 +1,16 @@
 # Contributing to APM2
 
+> IMPORTANT (AI implementation / ticket-queue agents)
+>
+> This file is **human-oriented** and can be misleading for constrained agents.
+> For agent execution, prefer:
+>
+> - `ROOT_ONBOARDING.cac.md` (token-efficient onboarding index)
+> - `AGENTS.md` (authoritative agent-facing architecture + invariants)
+> - `documents/skills/**/SKILL.md` (role-specific operating procedures)
+>
+> If this file conflicts with `AGENTS.md` or a relevant `SKILL.md`, treat this file as **non-authoritative**.
+
 Development workflow for AI agents using **trunk-based development** with **worktree isolation**. Ideally you should not run git commands yourself, instead run `cargo xtask <command>` to accomplish every phase of the development loop.
 
 See @documents/skills/dev-eng-ticket/SKILL.md for general instructions on how to develop within this code base.

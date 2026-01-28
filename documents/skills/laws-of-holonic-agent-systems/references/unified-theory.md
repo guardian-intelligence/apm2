@@ -2054,6 +2054,88 @@
           "LAW-07",
           "LAW-15"
         ]
+      },
+      "git_object_ref": {
+        "node_class": "NORMATIVE",
+        "schema_id": "apm2.git_object_ref.v1",
+        "json_schema_path": "schemas/apm2/git_object_ref.schema.json",
+        "fields": {
+          "algo": "enum{sha1,sha256}",
+          "object_kind": "enum{commit,tree,blob,tag}",
+          "object_id": "hex string (length depends on algo)"
+        },
+        "notes": [
+          "Never commit to symbolic refs like HEAD/branch names; always record resolved object ids.",
+          "Receipts should record (algo, object_id) to support SHA-1 and SHA-256 repos."
+        ],
+        "law_refs": [
+          "LAW-09",
+          "LAW-13",
+          "LAW-15"
+        ]
+      },
+      "selector": {
+        "node_class": "NORMATIVE",
+        "schema_id": "apm2.selector.v1",
+        "json_schema_path": "schemas/apm2/selector.schema.json",
+        "kinds": [
+          "ledger_event",
+          "ledger_range",
+          "cas",
+          "dcp",
+          "git_object"
+        ],
+        "law_refs": [
+          "LAW-03",
+          "LAW-07",
+          "LAW-15"
+        ]
+      },
+      "view_commitment": {
+        "node_class": "NORMATIVE",
+        "schema_id": "apm2.view_commitment.v1",
+        "json_schema_path": "schemas/apm2/view_commitment.schema.json",
+        "fields": {
+          "ledger_anchor": "object{ledger_event|snapshot anchor}",
+          "pins": "object{git_commit?,git_tree?,policy_digest?,toolchain_digest?,workspace_delta?}",
+          "selectors": "array<Selector>"
+        },
+        "law_refs": [
+          "LAW-03",
+          "LAW-06",
+          "LAW-07",
+          "LAW-15"
+        ]
+      },
+      "attestation": {
+        "node_class": "NORMATIVE",
+        "schema_id": "apm2.attestation.v1",
+        "json_schema_path": "schemas/apm2/attestation.schema.json",
+        "law_refs": [
+          "LAW-01",
+          "LAW-14",
+          "LAW-15"
+        ]
+      },
+      "workspace_delta": {
+        "node_class": "NORMATIVE",
+        "schema_id": "apm2.workspace_delta.v1",
+        "json_schema_path": "schemas/apm2/workspace_delta.schema.json",
+        "law_refs": [
+          "LAW-03",
+          "LAW-09",
+          "LAW-11",
+          "LAW-15"
+        ]
+      },
+      "summary_receipt": {
+        "node_class": "NORMATIVE",
+        "schema_id": "apm2.summary_receipt.v1",
+        "json_schema_path": "schemas/apm2/summary_receipt.schema.json",
+        "law_refs": [
+          "LAW-07",
+          "LAW-15"
+        ]
       }
     },
     "risk_model": {
@@ -3093,8 +3175,16 @@
           "ref": "documents/skills/glossary/references/gate.md",
           "node_class": "BACKGROUND"
         },
+        "Terminal Verifier": {
+          "ref": "documents/skills/glossary/references/terminal_verifier.md",
+          "node_class": "BACKGROUND"
+        },
         "Evidence": {
           "ref": "documents/skills/glossary/references/evidence.md",
+          "node_class": "BACKGROUND"
+        },
+        "Attestation": {
+          "ref": "documents/skills/glossary/references/attestation.md",
           "node_class": "BACKGROUND"
         },
         "Finding": {
@@ -3123,6 +3213,30 @@
         },
         "ContextPack": {
           "ref": "documents/skills/glossary/references/context_pack.md",
+          "node_class": "BACKGROUND"
+        },
+        "Content Resolver": {
+          "ref": "documents/skills/glossary/references/content_resolver.md",
+          "node_class": "BACKGROUND"
+        },
+        "View Commitment": {
+          "ref": "documents/skills/glossary/references/view_commitment.md",
+          "node_class": "BACKGROUND"
+        },
+        "Git Digest Conventions": {
+          "ref": "documents/skills/glossary/references/git_digest_conventions.md",
+          "node_class": "BACKGROUND"
+        },
+        "Workspace Delta": {
+          "ref": "documents/skills/glossary/references/workspace_delta.md",
+          "node_class": "BACKGROUND"
+        },
+        "Selector": {
+          "ref": "documents/skills/glossary/references/selector.md",
+          "node_class": "BACKGROUND"
+        },
+        "Summary Receipt": {
+          "ref": "documents/skills/glossary/references/summary_receipt.md",
           "node_class": "BACKGROUND"
         },
         "Commitment Filter": {

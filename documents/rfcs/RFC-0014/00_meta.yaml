@@ -4,10 +4,10 @@ rfc_meta:
   rfc:
     id: RFC-0014
     title: "Distributed Consensus and Replication Layer for APM2 Ledger+CAS Truth Substrate"
-    status: DRAFT
+    status: APPROVED
     created_date: "2026-01-28"
     last_updated_date: "2026-01-28"
-    version: "2.0.0"
+    version: "4.0.0"
     version_history:
       - version: "0.1.0"
         date: "2026-01-28"
@@ -17,6 +17,10 @@ rfc_meta:
         date: "2026-01-28"
         phase: "v2 (Grounded)"
         notes: "EXPLORE mode complete - design decisions grounded in codebase evidence"
+      - version: "4.0.0"
+        date: "2026-01-28"
+        phase: "v4 (Standard)"
+        notes: "FINALIZE mode complete - all gates passed, ready for ticket decomposition"
     abstract: |
       This RFC specifies a distributed consensus and replication layer that extends APM2's
       append-only ledger and content-addressed storage (CAS) to multi-node operation. The
