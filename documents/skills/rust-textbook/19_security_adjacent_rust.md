@@ -43,7 +43,11 @@
 [PROVENANCE] Unicode security issues exist independent of memory safety.
 
 [HAZARD: RSK-1906] Nondeterminism as Integrity Failure.
-[...]
+- TRIGGER: wall-clock time in core logic, RNG without explicit seeding, hash iteration order, `cfg`-dependent behavior drift.
+- FAILURE MODE: divergent outputs across nodes; reproducibility failure; consensus drift.
+- REJECT IF: nondeterminism enters a domain that requires deterministic outputs (signatures, hashing, consensus state machines).
+- ENFORCE BY: deterministic time sources (see Chapter 25); explicit seeding; sort before hashing; build-matrix coverage for cfg.
+[PROVENANCE] Determinism is a system contract; Rust does not enforce determinism.
 [VERIFICATION] Deterministic test harnesses; CI build matrix; property tests for determinism.
 
 [HAZARD: RSK-1909] Timing Attacks and Side Channels.
