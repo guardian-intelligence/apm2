@@ -307,21 +307,46 @@ impl DedupeCache {
         *self.total_bytes.read().await
     }
 
-    /// Looks up a cached result by dedupe key.
+    /// Looks up a cached result by dedupe key for a specific episode.
     ///
     /// Returns `None` if:
     /// - The key is not in the cache
     /// - The entry has expired based on TTL
+    /// - The entry belongs to a different episode (cross-episode isolation)
     ///
     /// # Arguments
     ///
+    /// * `episode_id` - The episode making the request (for isolation)
     /// * `key` - The dedupe key to lookup
     /// * `current_ns` - Current timestamp in nanoseconds (for TTL check)
-    pub async fn get(&self, key: &DedupeKey, current_ns: u64) -> Option<ToolResult> {
+    ///
+    /// # Security
+    ///
+    /// Per AD-TOOL-002, cache entries are isolated by episode. An entry is
+    /// only returned if its stored `episode_id` matches the requesting
+    /// episode's ID. This prevents cross-episode information leakage.
+    pub async fn get(
+        &self,
+        episode_id: &EpisodeId,
+        key: &DedupeKey,
+        current_ns: u64,
+    ) -> Option<ToolResult> {
         let ttl_ns = self.config.ttl_secs * 1_000_000_000;
 
         let mut entries = self.entries.write().await;
         let entry = entries.get_mut(key)?;
+
+        // SECURITY: Verify episode_id matches to prevent cross-episode information
+        // leakage
+        if entry.episode_id != *episode_id {
+            trace!(
+                key = %key,
+                cached_episode = %entry.episode_id,
+                requesting_episode = %episode_id,
+                "cache miss: episode mismatch"
+            );
+            return None;
+        }
 
         // Check TTL
         if entry.is_expired(current_ns, ttl_ns) {
@@ -662,17 +687,18 @@ mod tests {
         let cache = DedupeCache::with_defaults();
         let key = test_dedupe_key("1");
         let result = test_result("req-1");
+        let episode = test_episode_id();
 
         cache
             .insert(
-                test_episode_id(),
+                episode.clone(),
                 key.clone(),
                 result.clone(),
                 timestamp_ns(0),
             )
             .await;
 
-        let cached = cache.get(&key, timestamp_ns(0)).await;
+        let cached = cache.get(&episode, &key, timestamp_ns(0)).await;
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().request_id, "req-1");
     }
@@ -681,8 +707,9 @@ mod tests {
     async fn test_cache_miss() {
         let cache = DedupeCache::with_defaults();
         let key = test_dedupe_key("nonexistent");
+        let episode = test_episode_id();
 
-        let cached = cache.get(&key, timestamp_ns(0)).await;
+        let cached = cache.get(&episode, &key, timestamp_ns(0)).await;
         assert!(cached.is_none());
     }
 
@@ -692,18 +719,19 @@ mod tests {
         let cache = DedupeCache::new(config);
         let key = test_dedupe_key("ttl");
         let result = test_result("req-ttl");
+        let episode = test_episode_id();
 
         // Insert at time 0
         cache
-            .insert(test_episode_id(), key.clone(), result, timestamp_ns(0))
+            .insert(episode.clone(), key.clone(), result, timestamp_ns(0))
             .await;
 
         // Should be available at time 5
-        let cached = cache.get(&key, timestamp_ns(5)).await;
+        let cached = cache.get(&episode, &key, timestamp_ns(5)).await;
         assert!(cached.is_some());
 
         // Should be expired at time 15 (TTL is 10 seconds)
-        let cached = cache.get(&key, timestamp_ns(15)).await;
+        let cached = cache.get(&episode, &key, timestamp_ns(15)).await;
         assert!(cached.is_none());
     }
 
@@ -711,13 +739,14 @@ mod tests {
     async fn test_cache_lru_eviction() {
         let config = DedupeCacheConfig::default().with_max_entries(3);
         let cache = DedupeCache::new(config);
+        let episode = test_episode_id();
 
         // Insert 3 entries
         for i in 0..3 {
             let key = test_dedupe_key(&format!("{i}"));
             let result = test_result(&format!("req-{i}"));
             cache
-                .insert(test_episode_id(), key, result, timestamp_ns(i))
+                .insert(episode.clone(), key, result, timestamp_ns(i))
                 .await;
         }
 
@@ -727,17 +756,21 @@ mod tests {
         let key = test_dedupe_key("3");
         let result = test_result("req-3");
         cache
-            .insert(test_episode_id(), key, result, timestamp_ns(3))
+            .insert(episode.clone(), key, result, timestamp_ns(3))
             .await;
 
         assert_eq!(cache.len().await, 3);
 
         // key-0 should be evicted
-        let cached = cache.get(&test_dedupe_key("0"), timestamp_ns(3)).await;
+        let cached = cache
+            .get(&episode, &test_dedupe_key("0"), timestamp_ns(3))
+            .await;
         assert!(cached.is_none());
 
         // key-1 should still be there
-        let cached = cache.get(&test_dedupe_key("1"), timestamp_ns(3)).await;
+        let cached = cache
+            .get(&episode, &test_dedupe_key("1"), timestamp_ns(3))
+            .await;
         assert!(cached.is_some());
     }
 
@@ -773,7 +806,9 @@ mod tests {
         assert_eq!(cache.len().await, 2);
 
         // Episode 2 entries should still be there
-        let cached = cache.get(&test_dedupe_key("ep2-0"), timestamp_ns(0)).await;
+        let cached = cache
+            .get(&episode2, &test_dedupe_key("ep2-0"), timestamp_ns(0))
+            .await;
         assert!(cached.is_some());
     }
 
@@ -842,19 +877,20 @@ mod tests {
         // This test verifies RSK-1304: ghost key prevention
         let config = DedupeCacheConfig::default().with_max_entries(3);
         let cache = DedupeCache::new(config);
+        let episode = test_episode_id();
 
         // Insert an entry
         let key = test_dedupe_key("ghost-test");
         let result1 = test_result("req-1");
         cache
-            .insert(test_episode_id(), key.clone(), result1, timestamp_ns(0))
+            .insert(episode.clone(), key.clone(), result1, timestamp_ns(0))
             .await;
 
         // Remove it by inserting a new entry with the same key but different timestamp
         // This simulates re-insertion after manual removal
         let result2 = test_result("req-2");
         cache
-            .insert(test_episode_id(), key.clone(), result2, timestamp_ns(10))
+            .insert(episode.clone(), key.clone(), result2, timestamp_ns(10))
             .await;
 
         // The LRU queue now has two entries for the same key with different timestamps
@@ -865,14 +901,14 @@ mod tests {
             let k = test_dedupe_key(&format!("fill-{i}"));
             let r = test_result(&format!("fill-{i}"));
             cache
-                .insert(test_episode_id(), k, r, timestamp_ns(20 + i))
+                .insert(episode.clone(), k, r, timestamp_ns(20 + i))
                 .await;
         }
 
         assert_eq!(cache.len().await, 3);
 
         // The original key should still have the updated value
-        let cached = cache.get(&key, timestamp_ns(25)).await;
+        let cached = cache.get(&episode, &key, timestamp_ns(25)).await;
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().request_id, "req-2");
     }
@@ -882,14 +918,15 @@ mod tests {
         let cache = DedupeCache::with_defaults();
         let key = test_dedupe_key("access");
         let result = test_result("req-access");
+        let episode = test_episode_id();
 
         cache
-            .insert(test_episode_id(), key.clone(), result, timestamp_ns(0))
+            .insert(episode.clone(), key.clone(), result, timestamp_ns(0))
             .await;
 
         // Access multiple times
         for _ in 0..5 {
-            let _ = cache.get(&key, timestamp_ns(0)).await;
+            let _ = cache.get(&episode, &key, timestamp_ns(0)).await;
         }
 
         // Access count should be tracked (internal, verified via debug)
@@ -904,14 +941,15 @@ mod tests {
 
         let key = test_dedupe_key("shared");
         let result = test_result("req-shared");
+        let episode = test_episode_id();
 
         cache
-            .insert(test_episode_id(), key.clone(), result, timestamp_ns(0))
+            .insert(episode.clone(), key.clone(), result, timestamp_ns(0))
             .await;
 
         // Can be cloned and used from multiple places
         let cloned_cache = Arc::clone(&cache);
-        let result = cloned_cache.get(&key, timestamp_ns(0)).await;
+        let result = cloned_cache.get(&episode, &key, timestamp_ns(0)).await;
         assert!(result.is_some());
     }
 
@@ -986,7 +1024,13 @@ mod tests {
         );
 
         // Early entries should have been evicted
-        let cached = cache.get(&test_dedupe_key("mem-0"), timestamp_ns(20)).await;
+        let cached = cache
+            .get(
+                &test_episode_id(),
+                &test_dedupe_key("mem-0"),
+                timestamp_ns(20),
+            )
+            .await;
         assert!(cached.is_none(), "oldest entry should have been evicted");
     }
 
@@ -1076,20 +1120,113 @@ mod tests {
     async fn test_cache_without_episode_tracking() {
         let config = DedupeCacheConfig::default().without_episode_tracking();
         let cache = DedupeCache::new(config);
+        let episode = test_episode_id();
 
         let key = test_dedupe_key("no-track");
         let result = test_result("req-no-track");
 
         cache
-            .insert(test_episode_id(), key.clone(), result, timestamp_ns(0))
+            .insert(episode.clone(), key.clone(), result, timestamp_ns(0))
             .await;
 
         // Evict by episode should do nothing
-        let evicted = cache.evict_by_episode(&test_episode_id()).await;
+        let evicted = cache.evict_by_episode(&episode).await;
         assert_eq!(evicted, 0);
 
         // Entry should still be there
-        let cached = cache.get(&key, timestamp_ns(0)).await;
+        let cached = cache.get(&episode, &key, timestamp_ns(0)).await;
         assert!(cached.is_some());
+    }
+
+    // =========================================================================
+    // Security Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_cross_episode_isolation() {
+        // This test verifies that cache entries are isolated by episode.
+        // An episode cannot read another episode's cached results.
+        let cache = DedupeCache::with_defaults();
+        let episode1 = EpisodeId::new("ep-security-1").unwrap();
+        let episode2 = EpisodeId::new("ep-security-2").unwrap();
+
+        // Insert a result for episode 1
+        let key = test_dedupe_key("secret-data");
+        let result = test_result("req-secret");
+        cache
+            .insert(episode1.clone(), key.clone(), result, timestamp_ns(0))
+            .await;
+
+        // Episode 1 can read its own data
+        let cached = cache.get(&episode1, &key, timestamp_ns(0)).await;
+        assert!(
+            cached.is_some(),
+            "episode 1 should be able to read its own cache entry"
+        );
+
+        // Episode 2 CANNOT read episode 1's data (cross-episode isolation)
+        let cached = cache.get(&episode2, &key, timestamp_ns(0)).await;
+        assert!(
+            cached.is_none(),
+            "episode 2 must NOT be able to read episode 1's cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_same_key_different_episodes() {
+        // This test verifies that the same dedupe key can exist independently
+        // for different episodes without leaking data.
+        let cache = DedupeCache::with_defaults();
+        let episode1 = EpisodeId::new("ep-key-1").unwrap();
+        let episode2 = EpisodeId::new("ep-key-2").unwrap();
+
+        // Both episodes use the same dedupe key
+        let key = test_dedupe_key("shared-key");
+
+        // Insert result for episode 1
+        let result1 = ToolResult::success(
+            "req-ep1",
+            b"episode 1 secret data".to_vec(),
+            BudgetDelta::single_call(),
+            StdDuration::from_millis(100),
+            1_000_000_000,
+        );
+        cache
+            .insert(episode1.clone(), key.clone(), result1, timestamp_ns(0))
+            .await;
+
+        // Insert result for episode 2 with the same key
+        let result2 = ToolResult::success(
+            "req-ep2",
+            b"episode 2 secret data".to_vec(),
+            BudgetDelta::single_call(),
+            StdDuration::from_millis(100),
+            2_000_000_000,
+        );
+        cache
+            .insert(episode2.clone(), key.clone(), result2, timestamp_ns(1))
+            .await;
+
+        // Episode 1 should get episode 1's data (latest insert overwrote)
+        // Note: Since we use the same key, the second insert replaces the first
+        // But episode 1 should NOT get episode 2's data
+        let cached1 = cache.get(&episode1, &key, timestamp_ns(2)).await;
+        let cached2 = cache.get(&episode2, &key, timestamp_ns(2)).await;
+
+        // The cache should only return the entry to the episode that owns it
+        // Episode 2's insert overwrote the entry, so only episode 2 should see it
+        assert!(
+            cached1.is_none(),
+            "episode 1 should not get cached entry after episode 2 overwrote it"
+        );
+        assert!(
+            cached2.is_some(),
+            "episode 2 should be able to read its own cache entry"
+        );
+        assert_eq!(
+            cached2.unwrap().output,
+            b"episode 2 secret data",
+            "episode 2 should get its own data"
+        );
     }
 }

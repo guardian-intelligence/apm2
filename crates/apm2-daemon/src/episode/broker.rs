@@ -429,9 +429,15 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     ///
     /// This is the main entry point for tool request validation. It:
     /// 1. Validates the request structure
-    /// 2. Checks the dedupe cache for cached results
-    /// 3. Validates against capability manifests
-    /// 4. Evaluates policy rules
+    /// 2. Validates against capability manifests (OCAP check)
+    /// 3. Evaluates policy rules
+    /// 4. Checks dedupe cache (only for authorized requests)
+    ///
+    /// # Security
+    ///
+    /// Per AD-TOOL-002, the cache lookup MUST occur AFTER capability validation
+    /// to prevent authorization bypass. An attacker cannot use cache hits to
+    /// circumvent capability checks.
     ///
     /// # Arguments
     ///
@@ -456,18 +462,9 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         // Step 1: Validate request structure
         request.validate()?;
 
-        // Step 2: Check dedupe cache
-        if self.config.use_dedupe_cache {
-            if let Some(cached) = self.lookup_dedupe(&request.dedupe_key, timestamp_ns).await {
-                debug!(dedupe_key = %request.dedupe_key, "dedupe cache hit");
-                return Ok(ToolDecision::DedupeCacheHit {
-                    request_id: request.request_id.clone(),
-                    result: Box::new(cached),
-                });
-            }
-        }
-
-        // Step 3: Validate against capability manifest
+        // Step 2: Validate against capability manifest (OCAP check)
+        // SECURITY: This MUST happen before cache lookup to prevent authorization
+        // bypass
         let validator = self.validator.read().await;
         let validator = validator.as_ref().ok_or(BrokerError::NotInitialized)?;
 
@@ -487,42 +484,54 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             },
         };
 
-        // Step 4: Evaluate policy (if enabled)
+        // Step 3: Evaluate policy (if enabled)
+        // SECURITY: Policy evaluation must also happen before cache lookup
         if self.config.check_policy {
-            match self.policy.evaluate(request) {
-                PolicyDecision::Allow { rule_id } => {
-                    debug!(capability_id = %capability_id, "request allowed");
-                    Ok(ToolDecision::Allow {
-                        request_id: request.request_id.clone(),
-                        capability_id,
-                        rule_id,
-                        policy_hash: self.policy.policy_hash(),
-                        budget_delta: BudgetDelta::single_call(),
-                    })
-                },
-                PolicyDecision::Deny { rule_id, reason } => {
-                    warn!(rule_id = %rule_id, reason = %reason, "policy denied");
-                    Ok(ToolDecision::Deny {
-                        request_id: request.request_id.clone(),
-                        reason: DenyReason::NoMatchingCapability {
-                            tool_class: request.tool_class,
-                        },
-                        rule_id: Some(rule_id),
-                        policy_hash: self.policy.policy_hash(),
-                    })
-                },
+            if let PolicyDecision::Deny { rule_id, reason } = self.policy.evaluate(request) {
+                warn!(rule_id = %rule_id, reason = %reason, "policy denied");
+                return Ok(ToolDecision::Deny {
+                    request_id: request.request_id.clone(),
+                    reason: DenyReason::NoMatchingCapability {
+                        tool_class: request.tool_class,
+                    },
+                    rule_id: Some(rule_id),
+                    policy_hash: self.policy.policy_hash(),
+                });
             }
-        } else {
-            // Policy check disabled
-            debug!(capability_id = %capability_id, "request allowed (no policy check)");
-            Ok(ToolDecision::Allow {
-                request_id: request.request_id.clone(),
-                capability_id,
-                rule_id: None,
-                policy_hash: self.policy.policy_hash(),
-                budget_delta: BudgetDelta::single_call(),
-            })
         }
+
+        // Step 4: Check dedupe cache (only for authorized requests)
+        // SECURITY: Cache lookup occurs AFTER authorization to prevent bypass attacks
+        if self.config.use_dedupe_cache {
+            if let Some(cached) = self
+                .lookup_dedupe(&request.episode_id, &request.dedupe_key, timestamp_ns)
+                .await
+            {
+                debug!(dedupe_key = %request.dedupe_key, "dedupe cache hit");
+                return Ok(ToolDecision::DedupeCacheHit {
+                    request_id: request.request_id.clone(),
+                    result: Box::new(cached),
+                });
+            }
+        }
+
+        // Request is authorized - return Allow decision
+        debug!(capability_id = %capability_id, "request allowed");
+        Ok(ToolDecision::Allow {
+            request_id: request.request_id.clone(),
+            capability_id,
+            rule_id: if self.config.check_policy {
+                // Extract rule_id from policy decision if available
+                match self.policy.evaluate(request) {
+                    PolicyDecision::Allow { rule_id } => rule_id,
+                    PolicyDecision::Deny { .. } => None, // Already handled above
+                }
+            } else {
+                None
+            },
+            policy_hash: self.policy.policy_hash(),
+            budget_delta: BudgetDelta::single_call(),
+        })
     }
 
     /// Executes a tool and returns the result.
@@ -573,21 +582,34 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         Ok(())
     }
 
-    /// Looks up a cached result by dedupe key.
+    /// Looks up a cached result by dedupe key for a specific episode.
     ///
     /// # Arguments
     ///
+    /// * `episode_id` - The episode making the request (for isolation)
     /// * `key` - The dedupe key to lookup
     /// * `timestamp_ns` - Current timestamp (for TTL check)
     ///
+    /// # Security
+    ///
+    /// The `episode_id` MUST be verified to prevent cross-episode information
+    /// leakage. A cached result is only returned if it belongs to the
+    /// requesting episode.
+    ///
     /// # Returns
     ///
-    /// The cached result if found and not expired.
-    pub async fn lookup_dedupe(&self, key: &DedupeKey, timestamp_ns: u64) -> Option<ToolResult> {
+    /// The cached result if found, not expired, and belongs to the same
+    /// episode.
+    pub async fn lookup_dedupe(
+        &self,
+        episode_id: &EpisodeId,
+        key: &DedupeKey,
+        timestamp_ns: u64,
+    ) -> Option<ToolResult> {
         if !self.config.use_dedupe_cache {
             return None;
         }
-        self.dedupe_cache.get(key, timestamp_ns).await
+        self.dedupe_cache.get(episode_id, key, timestamp_ns).await
     }
 
     /// Evicts all cached results for an episode.
@@ -1035,5 +1057,200 @@ mod tests {
         let content = b"test content";
         let stored_hash = cas.store(content);
         assert_eq!(stored_hash.len(), 32);
+    }
+
+    // =========================================================================
+    // Security Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_security_authorization_before_cache() {
+        // This test verifies the CRITICAL security fix: cache lookup occurs
+        // AFTER capability validation. An unauthorized request must NOT
+        // receive a cache hit even if a valid cached result exists.
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        // Initialize with Read capability only (no Write)
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-read",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Create a valid Read request and execute it to populate the cache
+        let read_request = make_request("req-read-1", ToolClass::Read, Some("/workspace/file.rs"));
+        let decision = broker
+            .request(&read_request, timestamp_ns(0))
+            .await
+            .unwrap();
+        assert!(decision.is_allowed(), "read request should be allowed");
+
+        // Record a result to populate the cache
+        let result = ToolResult::success(
+            "req-read-1",
+            b"cached file contents".to_vec(),
+            BudgetDelta::single_call(),
+            Duration::from_millis(100),
+            timestamp_ns(0),
+        );
+        broker
+            .record_result(
+                test_episode_id(),
+                &decision,
+                read_request.dedupe_key.clone(),
+                result,
+                timestamp_ns(0),
+            )
+            .await
+            .unwrap();
+
+        // Now create a Write request with the SAME dedupe key
+        // This simulates an attacker trying to use cache hits to bypass authorization
+        let mut write_request =
+            make_request("req-write-1", ToolClass::Write, Some("/workspace/file.rs"));
+        write_request.dedupe_key = read_request.dedupe_key.clone(); // Same dedupe key!
+
+        // The Write request should be DENIED (not a cache hit)
+        // Authorization check must happen before cache lookup
+        let write_decision = broker
+            .request(&write_request, timestamp_ns(1))
+            .await
+            .unwrap();
+        assert!(
+            write_decision.is_denied(),
+            "write request must be denied, not served from cache"
+        );
+        assert!(
+            !write_decision.is_cache_hit(),
+            "unauthorized request must not receive cache hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_security_cross_episode_cache_isolation() {
+        // This test verifies the HIGH security fix: cache entries are isolated
+        // by episode. One episode cannot read another episode's cached data.
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-read",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        let episode1 = EpisodeId::new("ep-security-1").unwrap();
+        let episode2 = EpisodeId::new("ep-security-2").unwrap();
+
+        // Create a request for episode 1
+        let request1 = BrokerToolRequest::new(
+            "req-ep1",
+            episode1.clone(),
+            ToolClass::Read,
+            test_dedupe_key("shared-key"),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path("/workspace/secret.txt");
+
+        let decision1 = broker.request(&request1, timestamp_ns(0)).await.unwrap();
+        assert!(decision1.is_allowed());
+
+        // Record result for episode 1
+        let result = ToolResult::success(
+            "req-ep1",
+            b"episode 1 secret data".to_vec(),
+            BudgetDelta::single_call(),
+            Duration::from_millis(100),
+            timestamp_ns(0),
+        );
+        broker
+            .record_result(
+                episode1.clone(),
+                &decision1,
+                request1.dedupe_key.clone(),
+                result,
+                timestamp_ns(0),
+            )
+            .await
+            .unwrap();
+
+        // Episode 1 should get a cache hit
+        let decision1_again = broker.request(&request1, timestamp_ns(1)).await.unwrap();
+        assert!(
+            decision1_again.is_cache_hit(),
+            "episode 1 should get cache hit for its own data"
+        );
+
+        // Create a request for episode 2 with the SAME dedupe key
+        let request2 = BrokerToolRequest::new(
+            "req-ep2",
+            episode2.clone(),
+            ToolClass::Read,
+            test_dedupe_key("shared-key"), // Same key as episode 1!
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path("/workspace/secret.txt");
+
+        // Episode 2 must NOT get a cache hit from episode 1's data
+        let decision2 = broker.request(&request2, timestamp_ns(2)).await.unwrap();
+        assert!(
+            !decision2.is_cache_hit(),
+            "episode 2 must not receive cache hit from episode 1's data"
+        );
+        assert!(
+            decision2.is_allowed(),
+            "episode 2's request should be allowed (but not cached)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_security_cache_hit_after_authorization() {
+        // This test verifies that authorized requests DO get cache hits
+        // after authorization passes.
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-read",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
+
+        // First request - should be allowed
+        let decision1 = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        assert!(decision1.is_allowed());
+
+        // Record result
+        let result = ToolResult::success(
+            "req-1",
+            b"file contents".to_vec(),
+            BudgetDelta::single_call(),
+            Duration::from_millis(100),
+            timestamp_ns(0),
+        );
+        broker
+            .record_result(
+                test_episode_id(),
+                &decision1,
+                request.dedupe_key.clone(),
+                result,
+                timestamp_ns(0),
+            )
+            .await
+            .unwrap();
+
+        // Second request with same dedupe key - should get cache hit
+        // (after authorization passes)
+        let decision2 = broker.request(&request, timestamp_ns(1)).await.unwrap();
+        assert!(
+            decision2.is_cache_hit(),
+            "authorized request should get cache hit"
+        );
+
+        if let ToolDecision::DedupeCacheHit { result, .. } = decision2 {
+            assert_eq!(result.output, b"file contents");
+        }
     }
 }

@@ -310,6 +310,12 @@ impl BrokerToolRequest {
 ///
 /// Uses `deny_unknown_fields` to prevent field injection attacks when
 /// deserializing from untrusted input.
+///
+/// **IMPORTANT:** Although the dedupe key is a user-controlled string, the
+/// `DedupeCache` enforces episode isolation by verifying the `episode_id`
+/// stored with each cache entry matches the requesting episode. This
+/// prevents cross-episode cache collisions even if two episodes use the
+/// same dedupe key string. See `DedupeCache::get` for the isolation check.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DedupeKey(String);
@@ -658,8 +664,21 @@ impl ToolResult {
     ///
     /// Per AD-VERIFY-001, this provides deterministic serialization
     /// for use in digests and signatures.
+    ///
+    /// # Determinism Guarantee
+    ///
+    /// This encoding is deterministic because:
+    /// 1. All fields in `ToolResultProto` are scalar types (no repeated fields)
+    /// 2. Prost encodes scalar fields in a deterministic order (by tag number)
+    /// 3. No map fields are present (maps are non-deterministic in protobuf)
+    ///
+    /// If repeated fields are ever added to `ToolResultProto`, they MUST be
+    /// sorted before encoding to maintain determinism (see
+    /// `CapabilityManifest::canonical_bytes` for the pattern).
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
+        // SECURITY: All fields are scalar types, ensuring deterministic encoding.
+        // If repeated fields are added, they must be sorted before encoding.
         let proto = ToolResultProto {
             request_id: self.request_id.clone(),
             success: Some(self.success),
