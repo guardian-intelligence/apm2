@@ -458,4 +458,51 @@ mod tests {
 
         assert_eq!(bytes1, bytes2, "Roundtrip should preserve bytes");
     }
+
+    /// Golden test: verify that canonical_bytes produces sorted output even
+    /// when evidence_refs are added in reverse order.
+    ///
+    /// This test constructs a Receipt with evidence refs [0xff..., 0x00...]
+    /// and verifies canonical_bytes produces the SORTED byte sequence.
+    #[test]
+    fn test_golden_receipt_unsorted_produces_sorted_canonical() {
+        use crate::protocol::messages::CanonicalBytes;
+
+        // Construct receipt with evidence refs in REVERSE order (unsorted)
+        let receipt_unsorted = Receipt::new(ReceiptKind::EpisodeStart)
+            .with_envelope_hash(vec![0xab; 32])
+            .with_policy_hash(vec![0xcd; 32])
+            .with_evidence_ref(vec![0xff; 32]) // Larger value first
+            .with_evidence_ref(vec![0x00; 32]); // Smaller value second
+
+        // Construct receipt with evidence refs in SORTED order
+        let receipt_sorted = Receipt::new(ReceiptKind::EpisodeStart)
+            .with_envelope_hash(vec![0xab; 32])
+            .with_policy_hash(vec![0xcd; 32])
+            .with_evidence_ref(vec![0x00; 32]) // Smaller value first
+            .with_evidence_ref(vec![0xff; 32]); // Larger value second
+
+        // Both should produce identical canonical bytes
+        let canonical_unsorted = receipt_unsorted.canonical_bytes();
+        let canonical_sorted = receipt_sorted.canonical_bytes();
+
+        assert_eq!(
+            canonical_unsorted, canonical_sorted,
+            "canonical_bytes must sort repeated fields regardless of insertion order"
+        );
+
+        // Verify the actual sorted order in the canonical bytes by checking
+        // that 0x00 appears before 0xff in the serialized evidence_refs
+        let hex = hex::encode(&canonical_sorted);
+        let pos_00 = hex.find("00".repeat(32).as_str());
+        let pos_ff = hex.find("ff".repeat(32).as_str());
+        assert!(
+            pos_00.is_some() && pos_ff.is_some(),
+            "Both evidence refs should be in the output"
+        );
+        assert!(
+            pos_00.unwrap() < pos_ff.unwrap(),
+            "0x00... should appear before 0xff... in canonical bytes"
+        );
+    }
 }

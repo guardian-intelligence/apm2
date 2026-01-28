@@ -320,6 +320,63 @@ fn test_receipt_canonical_bytes_deterministic() {
     assert_eq!(bytes2, bytes3);
 }
 
+/// Per AD-VERIFY-001: canonical_bytes must produce identical output regardless
+/// of the order in which repeated fields were added.
+#[test]
+fn test_receipt_canonical_bytes_sorts_unsorted_evidence_refs() {
+    // Create two receipts with evidence_refs added in different orders
+    let receipt_ab = Receipt::new(ReceiptKind::EpisodeStop)
+        .with_envelope_hash(vec![0xab; 32])
+        .with_policy_hash(vec![0xcd; 32])
+        .with_evidence_ref(vec![0x00; 32]) // A first
+        .with_evidence_ref(vec![0xff; 32]); // B second
+
+    let receipt_ba = Receipt::new(ReceiptKind::EpisodeStop)
+        .with_envelope_hash(vec![0xab; 32])
+        .with_policy_hash(vec![0xcd; 32])
+        .with_evidence_ref(vec![0xff; 32]) // B first
+        .with_evidence_ref(vec![0x00; 32]); // A second
+
+    // canonical_bytes must be identical because it sorts evidence_refs
+    assert_eq!(
+        receipt_ab.canonical_bytes(),
+        receipt_ba.canonical_bytes(),
+        "canonical_bytes must produce identical output regardless of insertion order"
+    );
+}
+
+/// Test that TelemetryPolicy sorts triggers by (metric, threshold) for total
+/// ordering
+#[test]
+fn test_telemetry_policy_canonicalize_total_ordering() {
+    // Same metric but different thresholds - should have stable ordering
+    let mut policy = TelemetryPolicy {
+        sample_period_ms: 1000,
+        promote_triggers: vec![
+            PromoteTrigger {
+                metric: "cpu.percent".to_string(),
+                threshold: 90.0,
+            },
+            PromoteTrigger {
+                metric: "cpu.percent".to_string(),
+                threshold: 80.0,
+            },
+            PromoteTrigger {
+                metric: "cpu.percent".to_string(),
+                threshold: 95.0,
+            },
+        ],
+        ring_buffer_limits: None,
+    };
+
+    policy.canonicalize();
+
+    // Should be sorted by threshold ascending (80, 90, 95)
+    assert_eq!(policy.promote_triggers[0].threshold, 80.0);
+    assert_eq!(policy.promote_triggers[1].threshold, 90.0);
+    assert_eq!(policy.promote_triggers[2].threshold, 95.0);
+}
+
 #[test]
 fn test_receipt_compute_unsigned_bytes_hash() {
     let receipt = Receipt::new(ReceiptKind::Gate)

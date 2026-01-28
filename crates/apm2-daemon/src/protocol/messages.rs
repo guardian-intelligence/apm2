@@ -133,9 +133,13 @@ impl Canonicalize for CompactionCompleted {
 
 impl Canonicalize for TelemetryPolicy {
     fn canonicalize(&mut self) {
-        // Sort promote_triggers by metric name for determinism
-        self.promote_triggers
-            .sort_by(|a, b| a.metric.cmp(&b.metric));
+        // Sort promote_triggers by (metric, threshold) for total ordering.
+        // Uses f64::total_cmp for threshold to handle NaN and -0.0 consistently.
+        self.promote_triggers.sort_by(|a, b| {
+            a.metric
+                .cmp(&b.metric)
+                .then_with(|| a.threshold.total_cmp(&b.threshold))
+        });
     }
 }
 
@@ -149,19 +153,27 @@ impl CanonicalBytes for Receipt {
         let mut unsigned = self.clone();
         unsigned.signature.clear();
         unsigned.issuer_signature = None;
+        // Per AD-VERIFY-001: canonical bytes require sorted repeated fields
+        unsigned.canonicalize();
         unsigned.encode_to_vec()
     }
 }
 
 impl CanonicalBytes for Hello {
     fn canonical_bytes(&self) -> Vec<u8> {
-        self.encode_to_vec()
+        // Per AD-VERIFY-001: canonical bytes require sorted repeated fields
+        let mut copy = self.clone();
+        copy.canonicalize();
+        copy.encode_to_vec()
     }
 }
 
 impl CanonicalBytes for HelloAck {
     fn canonical_bytes(&self) -> Vec<u8> {
-        self.encode_to_vec()
+        // Per AD-VERIFY-001: canonical bytes require sorted repeated fields
+        let mut copy = self.clone();
+        copy.canonicalize();
+        copy.encode_to_vec()
     }
 }
 
