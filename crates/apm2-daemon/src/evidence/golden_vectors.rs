@@ -33,6 +33,7 @@
 //! 4. Update expected bytes and hashes
 
 use super::receipt::{CanonicalizerId, ReceiptKind, ToolExecutionDetails, ToolReceipt};
+use crate::episode::EpisodeId;
 
 /// A golden test vector for receipt types.
 pub struct GoldenVector {
@@ -146,7 +147,7 @@ pub fn construct_receipt_tool_execution() -> ToolReceipt {
 
     ToolReceipt {
         kind: ReceiptKind::ToolExecution,
-        episode_id: "ep00001".to_string(),
+        episode_id: EpisodeId::new("ep00001").unwrap(),
         envelope_hash: [0xaa; 32],
         policy_hash: [0xbb; 32],
         canonicalizer_id: CanonicalizerId::apm2_proto_v1(),
@@ -165,7 +166,7 @@ pub fn construct_receipt_tool_execution() -> ToolReceipt {
 pub fn construct_receipt_episode_start() -> ToolReceipt {
     ToolReceipt {
         kind: ReceiptKind::EpisodeStart,
-        episode_id: "ep00002".to_string(),
+        episode_id: EpisodeId::new("ep00002").unwrap(),
         envelope_hash: [0xaa; 32],
         policy_hash: [0xbb; 32],
         canonicalizer_id: CanonicalizerId::apm2_proto_v1(),
@@ -186,7 +187,7 @@ pub fn construct_receipt_episode_start() -> ToolReceipt {
 pub fn construct_receipt_sorted_evidence_refs() -> ToolReceipt {
     ToolReceipt {
         kind: ReceiptKind::EpisodeStart,
-        episode_id: "ep00003".to_string(),
+        episode_id: EpisodeId::new("ep00003").unwrap(),
         envelope_hash: [0xaa; 32],
         policy_hash: [0xbb; 32],
         canonicalizer_id: CanonicalizerId::apm2_proto_v1(),
@@ -301,7 +302,7 @@ mod tests {
         // Create receipt with unsorted evidence refs
         let receipt_unsorted = ToolReceipt {
             kind: ReceiptKind::EpisodeStart,
-            episode_id: "ep".to_string(),
+            episode_id: EpisodeId::new("ep").unwrap(),
             envelope_hash: [0xab; 32],
             policy_hash: [0xcd; 32],
             canonicalizer_id: CanonicalizerId::apm2_proto_v1(),
@@ -317,7 +318,7 @@ mod tests {
         // Create receipt with sorted evidence refs
         let receipt_sorted = ToolReceipt {
             kind: ReceiptKind::EpisodeStart,
-            episode_id: "ep".to_string(),
+            episode_id: EpisodeId::new("ep").unwrap(),
             envelope_hash: [0xab; 32],
             policy_hash: [0xcd; 32],
             canonicalizer_id: CanonicalizerId::apm2_proto_v1(),
@@ -348,7 +349,7 @@ mod tests {
         // Change episode_id
         {
             let mut modified = construct_receipt_episode_start();
-            modified.episode_id = "ep00099".to_string();
+            modified.episode_id = EpisodeId::new("ep00099").unwrap();
             assert_ne!(
                 blake3::hash(&modified.canonical_bytes()),
                 base_hash,
@@ -379,29 +380,42 @@ mod tests {
         }
     }
 
-    /// Verify signature is excluded from canonical bytes.
+    /// Verify signature is excluded but `signer_identity` is included in
+    /// canonical bytes.
     #[test]
-    fn test_signature_excluded_from_canonical_bytes() {
+    fn test_signature_excluded_but_signer_identity_included() {
         let receipt_unsigned = construct_receipt_episode_start();
-        let mut receipt_signed = construct_receipt_episode_start();
 
-        receipt_signed.signature = Some([0xab; 64]);
-        receipt_signed.signer_identity = Some(SignerIdentity {
+        // Only add signature (not signer_identity)
+        let mut receipt_with_sig_only = construct_receipt_episode_start();
+        receipt_with_sig_only.signature = Some([0xab; 64]);
+
+        // Signature alone should not change canonical bytes
+        assert_eq!(
+            receipt_unsigned.canonical_bytes(),
+            receipt_with_sig_only.canonical_bytes(),
+            "signature must be excluded from canonical bytes"
+        );
+
+        // Add signer_identity - this SHOULD change canonical bytes (for cryptographic
+        // binding)
+        let mut receipt_with_signer = construct_receipt_episode_start();
+        receipt_with_signer.signer_identity = Some(SignerIdentity {
             public_key: [0x12; 32],
             identity: "test-signer".to_string(),
         });
 
-        assert_eq!(
+        assert_ne!(
             receipt_unsigned.canonical_bytes(),
-            receipt_signed.canonical_bytes(),
-            "signature and signer_identity must be excluded from canonical bytes"
+            receipt_with_signer.canonical_bytes(),
+            "signer_identity must be INCLUDED in canonical bytes for cryptographic binding"
         );
     }
 
     /// Verify that builder produces correct receipts.
     #[test]
     fn test_builder_produces_valid_receipt() {
-        let receipt = ReceiptBuilder::for_episode_start("ep-test")
+        let receipt = ReceiptBuilder::for_episode_start(EpisodeId::new("ep-test").unwrap())
             .with_envelope([0xaa; 32])
             .with_policy([0xbb; 32])
             .with_timestamp(1_000_000_000)

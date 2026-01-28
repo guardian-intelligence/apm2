@@ -38,9 +38,10 @@ pub mod receipt_builder;
 // Re-export binding types
 pub use binding::{EvidenceBinding, ToolEvidenceCollector};
 pub use receipt::{
-    CanonicalizerId, Hash, MAX_CANONICALIZER_ID_LEN, MAX_CAPABILITY_ID_LEN, MAX_EPISODE_ID_LEN,
-    MAX_EVIDENCE_REFS, MAX_REQUEST_ID_LEN, MAX_RESULT_MESSAGE_LEN, MAX_SIGNER_IDENTITY_LEN,
-    ReceiptError, ReceiptKind, Signature, SignerIdentity, ToolExecutionDetails, ToolReceipt,
+    CanonicalizerId, EpisodeId, Hash, MAX_CANONICALIZER_ID_LEN, MAX_CAPABILITY_ID_LEN,
+    MAX_EPISODE_ID_LEN, MAX_EVIDENCE_REFS, MAX_REQUEST_ID_LEN, MAX_RESULT_MESSAGE_LEN,
+    MAX_SIGNER_IDENTITY_LEN, ReceiptError, ReceiptKind, Signature, SignerIdentity,
+    ToolExecutionDetails, ToolReceipt,
 };
 // Re-export builder
 pub use receipt_builder::{ReceiptBuilder, ReceiptSigning};

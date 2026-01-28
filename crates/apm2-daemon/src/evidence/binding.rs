@@ -144,8 +144,11 @@ impl EvidenceBinding {
     /// Returns an error if adding the reference would exceed
     /// `MAX_EVIDENCE_REFS`.
     pub fn add_evidence_ref(&mut self, hash: Hash) -> Result<(), ReceiptError> {
-        // Count total refs (args + result + additional)
-        let total = self.evidence_refs().len() + 1;
+        // Count total refs (args + result + additional) without allocation
+        // Using O(1) computation instead of calling evidence_refs() which is O(n)
+        let args_count = usize::from(self.args_hash.is_some());
+        let result_count = usize::from(self.result_hash.is_some());
+        let total = args_count + result_count + self.additional_refs.len() + 1;
         if total > MAX_EVIDENCE_REFS {
             return Err(ReceiptError::TooManyEvidenceRefs {
                 count: total,

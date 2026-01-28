@@ -31,9 +31,10 @@
 //! - CTR-2603: Builder completeness
 
 use super::receipt::{
-    CanonicalizerId, Hash, MAX_EPISODE_ID_LEN, MAX_EVIDENCE_REFS, ReceiptError, ReceiptKind,
-    Signature, SignerIdentity, ToolExecutionDetails, ToolReceipt,
+    CanonicalizerId, Hash, MAX_EVIDENCE_REFS, ReceiptError, ReceiptKind, Signature, SignerIdentity,
+    ToolExecutionDetails, ToolReceipt,
 };
+use crate::episode::EpisodeId;
 
 /// Builder for constructing unsigned tool receipts.
 ///
@@ -44,8 +45,9 @@ use super::receipt::{
 ///
 /// ```rust,ignore
 /// use apm2_daemon::evidence::{ReceiptBuilder, ToolExecutionDetails};
+/// use apm2_daemon::episode::EpisodeId;
 ///
-/// let receipt = ReceiptBuilder::for_tool_execution("ep-001")
+/// let receipt = ReceiptBuilder::for_tool_execution(EpisodeId::new("ep-001")?)
 ///     .with_envelope([0xaa; 32])
 ///     .with_policy([0xbb; 32])
 ///     .with_evidence(vec![[0xcc; 32]])
@@ -64,7 +66,7 @@ use super::receipt::{
 #[derive(Debug, Clone)]
 pub struct ReceiptBuilder {
     kind: ReceiptKind,
-    episode_id: String,
+    episode_id: EpisodeId,
     envelope_hash: Option<Hash>,
     policy_hash: Option<Hash>,
     canonicalizer_id: CanonicalizerId,
@@ -76,10 +78,10 @@ pub struct ReceiptBuilder {
 
 impl ReceiptBuilder {
     /// Creates a new builder with the specified kind and episode ID.
-    fn new(kind: ReceiptKind, episode_id: impl Into<String>) -> Self {
+    fn new(kind: ReceiptKind, episode_id: EpisodeId) -> Self {
         Self {
             kind,
-            episode_id: episode_id.into(),
+            episode_id,
             envelope_hash: None,
             policy_hash: None,
             canonicalizer_id: CanonicalizerId::apm2_proto_v1(),
@@ -94,9 +96,9 @@ impl ReceiptBuilder {
     ///
     /// # Arguments
     ///
-    /// * `episode_id` - Episode this receipt belongs to
+    /// * `episode_id` - Episode this receipt belongs to (validated `EpisodeId`)
     #[must_use]
-    pub fn for_tool_execution(episode_id: impl Into<String>) -> Self {
+    pub fn for_tool_execution(episode_id: EpisodeId) -> Self {
         Self::new(ReceiptKind::ToolExecution, episode_id)
     }
 
@@ -104,9 +106,9 @@ impl ReceiptBuilder {
     ///
     /// # Arguments
     ///
-    /// * `episode_id` - Episode this receipt belongs to
+    /// * `episode_id` - Episode this receipt belongs to (validated `EpisodeId`)
     #[must_use]
-    pub fn for_episode_start(episode_id: impl Into<String>) -> Self {
+    pub fn for_episode_start(episode_id: EpisodeId) -> Self {
         Self::new(ReceiptKind::EpisodeStart, episode_id)
     }
 
@@ -114,9 +116,9 @@ impl ReceiptBuilder {
     ///
     /// # Arguments
     ///
-    /// * `episode_id` - Episode this receipt belongs to
+    /// * `episode_id` - Episode this receipt belongs to (validated `EpisodeId`)
     #[must_use]
-    pub fn for_episode_stop(episode_id: impl Into<String>) -> Self {
+    pub fn for_episode_stop(episode_id: EpisodeId) -> Self {
         Self::new(ReceiptKind::EpisodeStop, episode_id)
     }
 
@@ -124,9 +126,9 @@ impl ReceiptBuilder {
     ///
     /// # Arguments
     ///
-    /// * `episode_id` - Episode this receipt belongs to
+    /// * `episode_id` - Episode this receipt belongs to (validated `EpisodeId`)
     #[must_use]
-    pub fn for_episode_quarantine(episode_id: impl Into<String>) -> Self {
+    pub fn for_episode_quarantine(episode_id: EpisodeId) -> Self {
         Self::new(ReceiptKind::EpisodeQuarantine, episode_id)
     }
 
@@ -134,9 +136,9 @@ impl ReceiptBuilder {
     ///
     /// # Arguments
     ///
-    /// * `episode_id` - Episode this receipt belongs to
+    /// * `episode_id` - Episode this receipt belongs to (validated `EpisodeId`)
     #[must_use]
-    pub fn for_budget_checkpoint(episode_id: impl Into<String>) -> Self {
+    pub fn for_budget_checkpoint(episode_id: EpisodeId) -> Self {
         Self::new(ReceiptKind::BudgetCheckpoint, episode_id)
     }
 
@@ -144,9 +146,9 @@ impl ReceiptBuilder {
     ///
     /// # Arguments
     ///
-    /// * `episode_id` - Episode this receipt belongs to
+    /// * `episode_id` - Episode this receipt belongs to (validated `EpisodeId`)
     #[must_use]
-    pub fn for_policy_evaluation(episode_id: impl Into<String>) -> Self {
+    pub fn for_policy_evaluation(episode_id: EpisodeId) -> Self {
         Self::new(ReceiptKind::PolicyEvaluation, episode_id)
     }
 
@@ -241,18 +243,7 @@ impl ReceiptBuilder {
     /// - Any field exceeds its maximum length
     /// - `ToolExecution` kind is missing `tool_execution_details`
     pub fn build(self) -> Result<ToolReceipt, ReceiptError> {
-        // Validate episode_id
-        if self.episode_id.is_empty() {
-            return Err(ReceiptError::EmptyField {
-                field: "episode_id",
-            });
-        }
-        if self.episode_id.len() > MAX_EPISODE_ID_LEN {
-            return Err(ReceiptError::EpisodeIdTooLong {
-                len: self.episode_id.len(),
-                max: MAX_EPISODE_ID_LEN,
-            });
-        }
+        // Note: episode_id is already validated by the EpisodeId type
 
         // Validate required fields
         let envelope_hash = self.envelope_hash.ok_or(ReceiptError::EmptyField {
@@ -349,6 +340,11 @@ impl ReceiptSigning for ToolReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::episode::EpisodeError;
+
+    fn test_episode_id(id: &str) -> EpisodeId {
+        EpisodeId::new(id).unwrap()
+    }
 
     fn test_details() -> ToolExecutionDetails {
         ToolExecutionDetails {
@@ -364,7 +360,7 @@ mod tests {
 
     #[test]
     fn test_builder_for_tool_execution() {
-        let receipt = ReceiptBuilder::for_tool_execution("ep-001")
+        let receipt = ReceiptBuilder::for_tool_execution(test_episode_id("ep-001"))
             .with_envelope([0xaa; 32])
             .with_policy([0xbb; 32])
             .with_evidence(vec![[0xcc; 32]])
@@ -374,7 +370,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(receipt.kind, ReceiptKind::ToolExecution);
-        assert_eq!(receipt.episode_id, "ep-001");
+        assert_eq!(receipt.episode_id.as_str(), "ep-001");
         assert_eq!(receipt.envelope_hash, [0xaa; 32]);
         assert_eq!(receipt.policy_hash, [0xbb; 32]);
         assert_eq!(receipt.evidence_refs.len(), 1);
@@ -384,7 +380,7 @@ mod tests {
 
     #[test]
     fn test_builder_for_episode_start() {
-        let receipt = ReceiptBuilder::for_episode_start("ep-002")
+        let receipt = ReceiptBuilder::for_episode_start(test_episode_id("ep-002"))
             .with_envelope([0xaa; 32])
             .with_policy([0xbb; 32])
             .with_timestamp(1_000_000)
@@ -392,12 +388,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(receipt.kind, ReceiptKind::EpisodeStart);
-        assert_eq!(receipt.episode_id, "ep-002");
+        assert_eq!(receipt.episode_id.as_str(), "ep-002");
     }
 
     #[test]
     fn test_builder_for_episode_stop() {
-        let receipt = ReceiptBuilder::for_episode_stop("ep-003")
+        let receipt = ReceiptBuilder::for_episode_stop(test_episode_id("ep-003"))
             .with_envelope([0xaa; 32])
             .with_policy([0xbb; 32])
             .with_timestamp(2_000_000)
@@ -409,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_builder_for_episode_quarantine() {
-        let receipt = ReceiptBuilder::for_episode_quarantine("ep-004")
+        let receipt = ReceiptBuilder::for_episode_quarantine(test_episode_id("ep-004"))
             .with_envelope([0xaa; 32])
             .with_policy([0xbb; 32])
             .with_timestamp(3_000_000)
@@ -421,7 +417,7 @@ mod tests {
 
     #[test]
     fn test_builder_for_budget_checkpoint() {
-        let receipt = ReceiptBuilder::for_budget_checkpoint("ep-005")
+        let receipt = ReceiptBuilder::for_budget_checkpoint(test_episode_id("ep-005"))
             .with_envelope([0xaa; 32])
             .with_policy([0xbb; 32])
             .with_timestamp(4_000_000)
@@ -433,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_builder_for_policy_evaluation() {
-        let receipt = ReceiptBuilder::for_policy_evaluation("ep-006")
+        let receipt = ReceiptBuilder::for_policy_evaluation(test_episode_id("ep-006"))
             .with_envelope([0xaa; 32])
             .with_policy([0xbb; 32])
             .with_timestamp(5_000_000)
@@ -445,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_builder_missing_envelope() {
-        let result = ReceiptBuilder::for_episode_start("ep-001")
+        let result = ReceiptBuilder::for_episode_start(test_episode_id("ep-001"))
             .with_policy([0xbb; 32])
             .with_timestamp(1_000_000)
             .build();
@@ -460,7 +456,7 @@ mod tests {
 
     #[test]
     fn test_builder_missing_policy() {
-        let result = ReceiptBuilder::for_episode_start("ep-001")
+        let result = ReceiptBuilder::for_episode_start(test_episode_id("ep-001"))
             .with_envelope([0xaa; 32])
             .with_timestamp(1_000_000)
             .build();
@@ -475,7 +471,7 @@ mod tests {
 
     #[test]
     fn test_builder_missing_timestamp() {
-        let result = ReceiptBuilder::for_episode_start("ep-001")
+        let result = ReceiptBuilder::for_episode_start(test_episode_id("ep-001"))
             .with_envelope([0xaa; 32])
             .with_policy([0xbb; 32])
             .build();
@@ -490,7 +486,7 @@ mod tests {
 
     #[test]
     fn test_builder_tool_execution_missing_details() {
-        let result = ReceiptBuilder::for_tool_execution("ep-001")
+        let result = ReceiptBuilder::for_tool_execution(test_episode_id("ep-001"))
             .with_envelope([0xaa; 32])
             .with_policy([0xbb; 32])
             .with_timestamp(1_000_000)
@@ -504,38 +500,21 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_builder_empty_episode_id() {
-        let result = ReceiptBuilder::for_episode_start("")
-            .with_envelope([0xaa; 32])
-            .with_policy([0xbb; 32])
-            .with_timestamp(1_000_000)
-            .build();
-
-        assert!(matches!(
-            result,
-            Err(ReceiptError::EmptyField {
-                field: "episode_id"
-            })
-        ));
-    }
+    // Note: Episode ID validation (empty, too long) is now handled by
+    // EpisodeId::new() and will panic or return Err(EpisodeError) at
+    // construction time.
 
     #[test]
-    fn test_builder_episode_id_too_long() {
-        let long_id = "x".repeat(MAX_EPISODE_ID_LEN + 1);
-        let result = ReceiptBuilder::for_episode_start(long_id)
-            .with_envelope([0xaa; 32])
-            .with_policy([0xbb; 32])
-            .with_timestamp(1_000_000)
-            .build();
-
-        assert!(matches!(result, Err(ReceiptError::EpisodeIdTooLong { .. })));
+    fn test_episode_id_empty_rejected() {
+        // EpisodeId validation happens at construction time, not at build time
+        let result = EpisodeId::new("");
+        assert!(matches!(result, Err(EpisodeError::InvalidId { .. })));
     }
 
     #[test]
     fn test_builder_too_many_evidence_refs() {
         let refs = vec![[0; 32]; MAX_EVIDENCE_REFS + 1];
-        let result = ReceiptBuilder::for_episode_start("ep-001")
+        let result = ReceiptBuilder::for_episode_start(test_episode_id("ep-001"))
             .with_envelope([0xaa; 32])
             .with_policy([0xbb; 32])
             .with_evidence(refs)
@@ -550,7 +529,7 @@ mod tests {
 
     #[test]
     fn test_builder_add_evidence() {
-        let receipt = ReceiptBuilder::for_episode_start("ep-001")
+        let receipt = ReceiptBuilder::for_episode_start(test_episode_id("ep-001"))
             .with_envelope([0xaa; 32])
             .with_policy([0xbb; 32])
             .add_evidence([0x11; 32])
@@ -566,7 +545,7 @@ mod tests {
     #[test]
     fn test_builder_with_canonicalizer() {
         let custom_id = CanonicalizerId::new("custom-v2").unwrap();
-        let receipt = ReceiptBuilder::for_episode_start("ep-001")
+        let receipt = ReceiptBuilder::for_episode_start(test_episode_id("ep-001"))
             .with_envelope([0xaa; 32])
             .with_policy([0xbb; 32])
             .with_canonicalizer(custom_id, 2)
@@ -580,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_builder_computes_unsigned_bytes_hash() {
-        let receipt = ReceiptBuilder::for_episode_start("ep-001")
+        let receipt = ReceiptBuilder::for_episode_start(test_episode_id("ep-001"))
             .with_envelope([0xaa; 32])
             .with_policy([0xbb; 32])
             .with_timestamp(1_000_000)
@@ -594,7 +573,7 @@ mod tests {
 
     #[test]
     fn test_receipt_signing() {
-        let receipt = ReceiptBuilder::for_episode_start("ep-001")
+        let receipt = ReceiptBuilder::for_episode_start(test_episode_id("ep-001"))
             .with_envelope([0xaa; 32])
             .with_policy([0xbb; 32])
             .with_timestamp(1_000_000)
@@ -615,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_receipt_signing_already_signed() {
-        let receipt = ReceiptBuilder::for_episode_start("ep-001")
+        let receipt = ReceiptBuilder::for_episode_start(test_episode_id("ep-001"))
             .with_envelope([0xaa; 32])
             .with_policy([0xbb; 32])
             .with_timestamp(1_000_000)
@@ -643,7 +622,7 @@ mod tests {
             duration_ns: 100,
         };
 
-        let result = ReceiptBuilder::for_tool_execution("ep-001")
+        let result = ReceiptBuilder::for_tool_execution(test_episode_id("ep-001"))
             .with_envelope([0xaa; 32])
             .with_policy([0xbb; 32])
             .with_timestamp(1_000_000)

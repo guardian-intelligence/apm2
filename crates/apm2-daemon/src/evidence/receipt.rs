@@ -41,6 +41,9 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+// Import EpisodeId and its validation constants from the episode module
+pub use crate::episode::{EpisodeId, MAX_EPISODE_ID_LEN};
+
 /// BLAKE3-256 hash type.
 pub type Hash = [u8; 32];
 
@@ -99,8 +102,8 @@ pub const MAX_SIGNER_IDENTITY_LEN: usize = 256;
 /// Maximum length for request ID.
 pub const MAX_REQUEST_ID_LEN: usize = 256;
 
-/// Maximum length for episode ID.
-pub const MAX_EPISODE_ID_LEN: usize = 256;
+// Note: Episode ID length is validated by the EpisodeId type from the episode
+// module. We re-export the constant from there for compatibility.
 
 /// Maximum length for capability ID.
 pub const MAX_CAPABILITY_ID_LEN: usize = 256;
@@ -492,6 +495,15 @@ pub enum ReceiptError {
         /// The receipt kind requiring details.
         kind: ReceiptKind,
     },
+
+    /// Hash mismatch between stored and computed digest.
+    #[error("hash mismatch: expected {expected:?}, got {actual:?}")]
+    HashMismatch {
+        /// Expected hash (computed digest).
+        expected: Hash,
+        /// Actual hash (stored value).
+        actual: Hash,
+    },
 }
 
 // =============================================================================
@@ -505,12 +517,16 @@ pub enum ReceiptError {
 /// - Policy version (via `policy_hash`)
 /// - Evidence artifacts (via `evidence_refs`)
 /// - Execution details (via `tool_execution_details`)
+/// - Signer identity (via `signer_identity` in canonical bytes)
 ///
 /// # Security
 ///
 /// - Uses `deny_unknown_fields` to prevent field injection
-/// - `canonical_bytes()` excludes signature for signing
+/// - `canonical_bytes()` excludes signature for signing but INCLUDES
+///   `signer_identity`
 /// - Evidence refs are sorted for determinism per AD-VERIFY-001
+/// - `signer_identity` is cryptographically bound to the receipt via canonical
+///   bytes
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolReceipt {
@@ -518,7 +534,7 @@ pub struct ToolReceipt {
     pub kind: ReceiptKind,
 
     /// Episode ID this receipt belongs to.
-    pub episode_id: String,
+    pub episode_id: EpisodeId,
 
     /// Hash of the episode envelope.
     pub envelope_hash: Hash,
@@ -560,20 +576,10 @@ impl ToolReceipt {
     /// # Errors
     ///
     /// Returns an error if any field exceeds its limits or required fields
-    /// are missing.
+    /// are missing. Also verifies that `unsigned_bytes_hash` matches the
+    /// computed digest.
     pub fn validate(&self) -> Result<(), ReceiptError> {
-        // Check episode ID
-        if self.episode_id.is_empty() {
-            return Err(ReceiptError::EmptyField {
-                field: "episode_id",
-            });
-        }
-        if self.episode_id.len() > MAX_EPISODE_ID_LEN {
-            return Err(ReceiptError::EpisodeIdTooLong {
-                len: self.episode_id.len(),
-                max: MAX_EPISODE_ID_LEN,
-            });
-        }
+        // Note: episode_id is validated by the EpisodeId type at construction time
 
         // Check evidence refs count (CTR-1303)
         if self.evidence_refs.len() > MAX_EVIDENCE_REFS {
@@ -605,6 +611,15 @@ impl ToolReceipt {
             }
         }
 
+        // Verify unsigned_bytes_hash matches computed digest
+        let computed_digest = self.digest();
+        if self.unsigned_bytes_hash != computed_digest {
+            return Err(ReceiptError::HashMismatch {
+                expected: computed_digest,
+                actual: self.unsigned_bytes_hash,
+            });
+        }
+
         Ok(())
     }
 
@@ -619,7 +634,8 @@ impl ToolReceipt {
     /// Per AD-VERIFY-001:
     /// - Fields are serialized in tag order
     /// - Evidence refs are sorted by hash value
-    /// - Signature, `signer_identity`, and `unsigned_bytes_hash` are excluded
+    /// - Signature and `unsigned_bytes_hash` are excluded
+    /// - `signer_identity` IS included to cryptographically bind the signer
     ///
     /// # Design Note
     ///
@@ -628,6 +644,10 @@ impl ToolReceipt {
     /// The signature is computed over these canonical bytes, and the
     /// `unsigned_bytes_hash` is stored for convenience (to verify without
     /// re-computing).
+    ///
+    /// The `signer_identity` is INCLUDED because it must be cryptographically
+    /// bound to the receipt. Without this, an attacker could replace the
+    /// signer identity without invalidating the signature.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         // Sort evidence refs for determinism
@@ -636,7 +656,7 @@ impl ToolReceipt {
 
         let proto = ToolReceiptProto {
             kind: Some(self.kind.value()),
-            episode_id: self.episode_id.clone(),
+            episode_id: self.episode_id.as_str().to_string(),
             envelope_hash: self.envelope_hash.to_vec(),
             policy_hash: self.policy_hash.to_vec(),
             canonicalizer_id: self.canonicalizer_id.as_str().to_string(),
@@ -647,8 +667,13 @@ impl ToolReceipt {
                 .tool_execution_details
                 .as_ref()
                 .map(ToolExecutionDetails::canonical_bytes),
-            // NOTE: signature, signer_identity, and unsigned_bytes_hash are EXCLUDED
-            // per AD-VERIFY-001 (unsigned_bytes_hash would create circular dependency)
+            // signer_identity IS included for cryptographic binding
+            signer_identity: self
+                .signer_identity
+                .as_ref()
+                .map(SignerIdentity::canonical_bytes),
+            // NOTE: signature and unsigned_bytes_hash are EXCLUDED
+            // (unsigned_bytes_hash would create circular dependency)
         };
         proto.encode_to_vec()
     }
@@ -669,11 +694,33 @@ impl ToolReceipt {
     }
 }
 
+/// Internal protobuf representation for `SignerIdentity`.
+#[derive(Clone, PartialEq, Message)]
+struct SignerIdentityProto {
+    #[prost(bytes = "vec", tag = "1")]
+    public_key: Vec<u8>,
+    #[prost(string, tag = "2")]
+    identity: String,
+}
+
+impl SignerIdentity {
+    /// Returns the canonical bytes for this signer identity.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let proto = SignerIdentityProto {
+            public_key: self.public_key.to_vec(),
+            identity: self.identity.clone(),
+        };
+        proto.encode_to_vec()
+    }
+}
+
 /// Internal protobuf representation for `ToolReceipt`.
 ///
-/// Note: This excludes signature, `signer_identity`, and `unsigned_bytes_hash`
-/// for canonical encoding. The `unsigned_bytes_hash` would create a circular
-/// dependency if included.
+/// Note: This excludes signature and `unsigned_bytes_hash` for canonical
+/// encoding. The `unsigned_bytes_hash` would create a circular dependency if
+/// included. The `signer_identity` IS included to cryptographically bind the
+/// signer to the receipt.
 #[derive(Clone, PartialEq, Message)]
 struct ToolReceiptProto {
     #[prost(uint32, optional, tag = "1")]
@@ -695,6 +742,9 @@ struct ToolReceiptProto {
     // Tag 9 reserved for unsigned_bytes_hash (not included in canonical encoding)
     #[prost(bytes = "vec", optional, tag = "10")]
     tool_execution_details: Option<Vec<u8>>,
+    // Tag 11: signer_identity - INCLUDED for cryptographic binding
+    #[prost(bytes = "vec", optional, tag = "11")]
+    signer_identity: Option<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -702,16 +752,16 @@ mod tests {
     use super::*;
 
     fn make_test_receipt() -> ToolReceipt {
-        ToolReceipt {
+        let mut receipt = ToolReceipt {
             kind: ReceiptKind::ToolExecution,
-            episode_id: "ep-test-001".to_string(),
+            episode_id: EpisodeId::new("ep-test-001").unwrap(),
             envelope_hash: [0xaa; 32],
             policy_hash: [0xbb; 32],
             canonicalizer_id: CanonicalizerId::apm2_proto_v1(),
             canonicalizer_version: 1,
             evidence_refs: vec![[0xcc; 32], [0xdd; 32]],
             timestamp_ns: 1_704_067_200_000_000_000,
-            unsigned_bytes_hash: [0xee; 32],
+            unsigned_bytes_hash: [0; 32], // Will be computed below
             tool_execution_details: Some(ToolExecutionDetails {
                 request_id: "req-001".to_string(),
                 capability_id: "cap-read".to_string(),
@@ -723,7 +773,10 @@ mod tests {
             }),
             signature: None,
             signer_identity: None,
-        }
+        };
+        // Compute the correct unsigned_bytes_hash
+        receipt.unsigned_bytes_hash = receipt.digest();
+        receipt
     }
 
     #[test]
@@ -846,17 +899,8 @@ mod tests {
         assert!(receipt.validate().is_ok());
     }
 
-    #[test]
-    fn test_receipt_validation_empty_episode_id() {
-        let mut receipt = make_test_receipt();
-        receipt.episode_id = String::new();
-        assert!(matches!(
-            receipt.validate(),
-            Err(ReceiptError::EmptyField {
-                field: "episode_id"
-            })
-        ));
-    }
+    // Note: Episode ID validation is handled by the EpisodeId newtype at
+    // construction time, so we don't need a test for empty episode_id here.
 
     #[test]
     fn test_receipt_validation_too_many_evidence_refs() {
@@ -922,19 +966,30 @@ mod tests {
     }
 
     #[test]
-    fn test_canonical_bytes_excludes_signature() {
+    fn test_canonical_bytes_excludes_signature_but_includes_signer_identity() {
         let receipt_unsigned = make_test_receipt();
-        let mut receipt_signed = make_test_receipt();
-        receipt_signed.signature = Some([0xab; 64]);
-        receipt_signed.signer_identity = Some(SignerIdentity {
+
+        // Add only signature (not signer_identity) - canonical bytes should be same
+        let mut receipt_with_sig_only = make_test_receipt();
+        receipt_with_sig_only.signature = Some([0xab; 64]);
+
+        assert_eq!(
+            receipt_unsigned.canonical_bytes(),
+            receipt_with_sig_only.canonical_bytes(),
+            "signature must be excluded from canonical bytes"
+        );
+
+        // Add signer_identity - canonical bytes should be DIFFERENT (signer is bound)
+        let mut receipt_with_signer = make_test_receipt();
+        receipt_with_signer.signer_identity = Some(SignerIdentity {
             public_key: [0x12; 32],
             identity: "test-signer".to_string(),
         });
 
-        assert_eq!(
+        assert_ne!(
             receipt_unsigned.canonical_bytes(),
-            receipt_signed.canonical_bytes(),
-            "signature must be excluded from canonical bytes"
+            receipt_with_signer.canonical_bytes(),
+            "signer_identity must be INCLUDED in canonical bytes for cryptographic binding"
         );
     }
 
@@ -1003,5 +1058,32 @@ mod tests {
 
         let result: Result<ToolReceipt, _> = serde_json::from_str(json);
         assert!(result.is_err(), "should reject unknown fields");
+    }
+
+    #[test]
+    fn test_receipt_validation_verifies_unsigned_bytes_hash() {
+        let mut receipt = make_test_receipt();
+        // Corrupt the hash
+        receipt.unsigned_bytes_hash = [0xff; 32];
+
+        assert!(matches!(
+            receipt.validate(),
+            Err(ReceiptError::HashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_signer_identity_canonical_bytes() {
+        let identity = SignerIdentity {
+            public_key: [0x12; 32],
+            identity: "test-signer".to_string(),
+        };
+
+        let bytes = identity.canonical_bytes();
+        assert!(!bytes.is_empty());
+
+        // Verify determinism
+        let bytes2 = identity.canonical_bytes();
+        assert_eq!(bytes, bytes2);
     }
 }
