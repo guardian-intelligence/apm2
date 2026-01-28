@@ -101,7 +101,10 @@ pub use handshake::{
     ClientHandshake, HandshakeErrorCode, HandshakeMessage, HandshakeState, Hello, HelloAck,
     HelloNack, ServerHandshake, parse_handshake_message, parse_hello, serialize_handshake_message,
 };
-pub use messages::{CanonicalBytes, Canonicalize};
+pub use messages::{
+    BoundedDecode, CanonicalBytes, Canonicalize, DEFAULT_MAX_MESSAGE_SIZE,
+    DEFAULT_MAX_REPEATED_FIELD_COUNT, DecodeConfig, DecodeError,
+};
 pub use server::{
     Connection, ConnectionPermit, ProtocolServer, ServerConfig, connect, default_socket_path,
 };

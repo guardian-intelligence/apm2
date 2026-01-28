@@ -69,6 +69,256 @@ mod generated {
 pub use generated::*;
 use prost::Message;
 
+// ============================================================================
+// Bounded Decoding (CTR-1603, RSK-1601)
+// ============================================================================
+
+/// Default maximum message size for bounded decoding (64 MiB).
+///
+/// Per security review findings, this limit prevents denial-of-service attacks
+/// where a malicious peer sends oversized messages to exhaust memory. The limit
+/// is intentionally larger than `MAX_FRAME_SIZE` (16 MiB) to allow for future
+/// protocol extensions while still providing protection.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
+/// Default maximum count for repeated fields.
+///
+/// Per security review findings, this limit prevents denial-of-service attacks
+/// where a malicious peer sends messages with millions of repeated field
+/// entries.
+pub const DEFAULT_MAX_REPEATED_FIELD_COUNT: usize = 100_000;
+
+/// Configuration for bounded message decoding.
+///
+/// # Security Considerations
+///
+/// Per CTR-1603 and RSK-1601, all untrusted message decoding must enforce
+/// explicit bounds to prevent denial-of-service attacks:
+///
+/// - `max_message_size`: Limits total message bytes
+/// - `max_repeated_field_count`: Limits repeated field element counts
+///
+/// These limits are validated during decoding to prevent memory exhaustion
+/// before allocations occur.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeConfig {
+    /// Maximum allowed message size in bytes.
+    pub max_message_size: usize,
+    /// Maximum allowed count for any repeated field.
+    pub max_repeated_field_count: usize,
+}
+
+impl Default for DecodeConfig {
+    fn default() -> Self {
+        Self {
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_repeated_field_count: DEFAULT_MAX_REPEATED_FIELD_COUNT,
+        }
+    }
+}
+
+impl DecodeConfig {
+    /// Creates a new decode configuration with custom limits.
+    #[must_use]
+    pub const fn new(max_message_size: usize, max_repeated_field_count: usize) -> Self {
+        Self {
+            max_message_size,
+            max_repeated_field_count,
+        }
+    }
+
+    /// Creates a strict configuration for handshake messages.
+    ///
+    /// Uses tighter limits appropriate for the unauthenticated handshake phase.
+    #[must_use]
+    pub const fn handshake() -> Self {
+        Self {
+            max_message_size: 64 * 1024, // 64 KiB
+            max_repeated_field_count: 1_000,
+        }
+    }
+}
+
+/// Error returned when bounded decoding fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeError {
+    /// Message size exceeds the configured limit.
+    MessageTooLarge {
+        /// Actual size of the message in bytes.
+        size: usize,
+        /// Maximum allowed size.
+        max: usize,
+    },
+    /// A repeated field exceeds the configured count limit.
+    RepeatedFieldTooLarge {
+        /// Name of the field that exceeded the limit.
+        field: &'static str,
+        /// Actual count of elements.
+        count: usize,
+        /// Maximum allowed count.
+        max: usize,
+    },
+    /// Underlying prost decode error.
+    Prost(String),
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MessageTooLarge { size, max } => {
+                write!(
+                    f,
+                    "message too large: {size} bytes exceeds maximum {max} bytes"
+                )
+            },
+            Self::RepeatedFieldTooLarge { field, count, max } => {
+                write!(
+                    f,
+                    "repeated field '{field}' too large: {count} elements exceeds maximum {max}"
+                )
+            },
+            Self::Prost(msg) => write!(f, "protobuf decode error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+impl From<prost::DecodeError> for DecodeError {
+    fn from(err: prost::DecodeError) -> Self {
+        Self::Prost(err.to_string())
+    }
+}
+
+/// Trait for bounded message decoding.
+///
+/// This trait extends prost's `Message` trait to provide size-validated
+/// decoding that prevents denial-of-service attacks from oversized messages.
+///
+/// # Security Contract: CTR-1603
+///
+/// All implementations MUST:
+/// 1. Validate message size BEFORE decoding
+/// 2. Validate repeated field counts AFTER decoding
+/// 3. Return appropriate `DecodeError` variants for violations
+pub trait BoundedDecode: Message + Default + Sized {
+    /// Decodes a message from bytes with size validation.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The bytes to decode from
+    /// * `config` - Configuration specifying size and count limits
+    ///
+    /// # Errors
+    ///
+    /// Returns `DecodeError::MessageTooLarge` if the buffer exceeds the
+    /// configured `max_message_size`.
+    ///
+    /// Returns `DecodeError::RepeatedFieldTooLarge` if any repeated field
+    /// exceeds the configured `max_repeated_field_count`.
+    ///
+    /// Returns `DecodeError::Prost` for underlying protobuf decode errors.
+    fn decode_bounded(buf: &[u8], config: &DecodeConfig) -> Result<Self, DecodeError>;
+
+    /// Decodes a message from bytes with default configuration.
+    ///
+    /// Convenience method that uses [`DecodeConfig::default()`].
+    fn decode_bounded_default(buf: &[u8]) -> Result<Self, DecodeError> {
+        Self::decode_bounded(buf, &DecodeConfig::default())
+    }
+}
+
+/// Macro to implement `BoundedDecode` for messages without repeated fields.
+macro_rules! impl_bounded_decode_simple {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl BoundedDecode for $ty {
+                fn decode_bounded(buf: &[u8], config: &DecodeConfig) -> Result<Self, DecodeError> {
+                    // CTR-1603: Validate size BEFORE decoding
+                    if buf.len() > config.max_message_size {
+                        return Err(DecodeError::MessageTooLarge {
+                            size: buf.len(),
+                            max: config.max_message_size,
+                        });
+                    }
+
+                    // Decode using prost
+                    let msg = Self::decode(buf)?;
+                    Ok(msg)
+                }
+            }
+        )*
+    };
+}
+
+/// Macro to implement `BoundedDecode` for messages with repeated fields.
+macro_rules! impl_bounded_decode_with_repeated {
+    ($ty:ty, $($field:ident),* $(,)?) => {
+        impl BoundedDecode for $ty {
+            fn decode_bounded(buf: &[u8], config: &DecodeConfig) -> Result<Self, DecodeError> {
+                // CTR-1603: Validate size BEFORE decoding
+                if buf.len() > config.max_message_size {
+                    return Err(DecodeError::MessageTooLarge {
+                        size: buf.len(),
+                        max: config.max_message_size,
+                    });
+                }
+
+                // Decode using prost
+                let msg = Self::decode(buf)?;
+
+                // Validate repeated field counts AFTER decoding
+                $(
+                    if msg.$field.len() > config.max_repeated_field_count {
+                        return Err(DecodeError::RepeatedFieldTooLarge {
+                            field: stringify!($field),
+                            count: msg.$field.len(),
+                            max: config.max_repeated_field_count,
+                        });
+                    }
+                )*
+
+                Ok(msg)
+            }
+        }
+    };
+}
+
+// Implement BoundedDecode for messages without repeated fields
+impl_bounded_decode_simple!(
+    ClientInfo,
+    ServerInfo,
+    CreateEpisode,
+    EpisodeCreated,
+    StartEpisode,
+    EpisodeStarted,
+    StopEpisode,
+    EpisodeStopped,
+    SignalEpisode,
+    ResizePty,
+    SendInput,
+    StreamOutput,
+    ToolRequest,
+    ToolDecision,
+    ToolResult,
+    BudgetDelta,
+    TelemetryFrame,
+    CgroupStats,
+    RingBufferLimits,
+    PublishEvidence,
+    EvidencePinned,
+    EvidenceTtlExpired,
+    PromoteTrigger,
+);
+
+// Implement BoundedDecode for messages with repeated fields
+impl_bounded_decode_with_repeated!(Hello, requested_caps);
+impl_bounded_decode_with_repeated!(HelloAck, granted_caps);
+impl_bounded_decode_with_repeated!(EpisodeQuarantined, evidence_pinned);
+impl_bounded_decode_with_repeated!(Receipt, evidence_refs);
+impl_bounded_decode_with_repeated!(CompactionCompleted, tombstoned_hashes);
+impl_bounded_decode_with_repeated!(TelemetryPolicy, promote_triggers);
+
 /// Trait for canonicalizing messages before signing.
 ///
 /// Types implementing this trait have repeated fields that must be sorted

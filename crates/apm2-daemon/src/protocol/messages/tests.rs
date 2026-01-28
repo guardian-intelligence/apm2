@@ -554,3 +554,221 @@ fn test_stream_kind_conversion() {
     );
     assert_eq!(StreamKind::Stdout.as_str_name(), "STDOUT");
 }
+
+// ============================================================================
+// Bounded decoding tests (CTR-1603, RSK-1601)
+// ============================================================================
+
+#[test]
+fn test_bounded_decode_within_limits() {
+    let hello = Hello::new(1)
+        .with_client_info("test", "1.0")
+        .with_capability("cap1");
+
+    let bytes = hello.encode_to_vec();
+    let config = DecodeConfig::default();
+
+    let decoded = Hello::decode_bounded(&bytes, &config).expect("decode should succeed");
+    assert_eq!(decoded.protocol_version, 1);
+    assert_eq!(decoded.requested_caps.len(), 1);
+}
+
+#[test]
+fn test_bounded_decode_rejects_oversized_message() {
+    // Create a message that exceeds our configured limit
+    let config = DecodeConfig::new(100, 1000); // Only allow 100 bytes
+
+    // Create a message larger than 100 bytes
+    let mut hello = Hello::new(1).with_client_info("test-client-with-a-long-name", "1.0.0");
+    for i in 0..10 {
+        hello = hello.with_capability(format!("capability-{i}"));
+    }
+
+    let bytes = hello.encode_to_vec();
+    assert!(bytes.len() > 100, "message should be larger than limit");
+
+    let result = Hello::decode_bounded(&bytes, &config);
+    assert!(
+        matches!(
+            result,
+            Err(DecodeError::MessageTooLarge { size, max })
+            if size == bytes.len() && max == 100
+        ),
+        "should reject oversized message: {result:?}"
+    );
+}
+
+#[test]
+#[allow(clippy::cast_possible_truncation)]
+fn test_bounded_decode_rejects_too_many_repeated_elements() {
+    // Create a Receipt with many evidence_refs
+    let mut receipt = Receipt::new(ReceiptKind::ToolExecution)
+        .with_envelope_hash(vec![0xab; 32])
+        .with_policy_hash(vec![0xcd; 32]);
+
+    // Add more evidence_refs than allowed
+    for i in 0u8..100 {
+        receipt = receipt.with_evidence_ref(vec![i; 32]);
+    }
+
+    let bytes = receipt.encode_to_vec();
+
+    // Configure to only allow 50 repeated elements
+    let config = DecodeConfig::new(64 * 1024 * 1024, 50);
+
+    let result = Receipt::decode_bounded(&bytes, &config);
+    assert!(
+        matches!(
+            result,
+            Err(DecodeError::RepeatedFieldTooLarge { field, count, max })
+            if field == "evidence_refs" && count == 100 && max == 50
+        ),
+        "should reject message with too many repeated elements: {result:?}"
+    );
+}
+
+#[test]
+fn test_bounded_decode_default_config() {
+    let frame = TelemetryFrame::new("ep-123", 1, 1000).with_cpu_ns(500);
+
+    let bytes = frame.encode_to_vec();
+    let decoded = TelemetryFrame::decode_bounded_default(&bytes).expect("decode should succeed");
+
+    assert_eq!(decoded.episode_id, "ep-123");
+    assert_eq!(decoded.cpu_ns, 500);
+}
+
+#[test]
+fn test_bounded_decode_handshake_config() {
+    let hello = Hello::new(1).with_client_info("test", "1.0");
+
+    let bytes = hello.encode_to_vec();
+    let config = DecodeConfig::handshake();
+
+    let decoded = Hello::decode_bounded(&bytes, &config).expect("decode should succeed");
+    assert_eq!(decoded.protocol_version, 1);
+}
+
+#[test]
+fn test_bounded_decode_handshake_rejects_large_message() {
+    // Create a message larger than handshake limit (64 KiB)
+    let config = DecodeConfig::handshake();
+
+    // Create a very large fake "message" buffer
+    let large_buffer = vec![0u8; 65 * 1024]; // 65 KiB, exceeds 64 KiB limit
+
+    let result = Hello::decode_bounded(&large_buffer, &config);
+    assert!(
+        matches!(
+            result,
+            Err(DecodeError::MessageTooLarge { size, max })
+            if size == 65 * 1024 && max == 64 * 1024
+        ),
+        "handshake config should reject 65KiB message: {result:?}"
+    );
+}
+
+#[test]
+fn test_bounded_decode_hello_ack_repeated_field() {
+    let mut ack = HelloAck::new();
+    for i in 0..100 {
+        ack = ack.with_granted_cap(format!("cap-{i}"));
+    }
+
+    let bytes = ack.encode_to_vec();
+
+    // Allow message size but limit repeated fields to 50
+    let config = DecodeConfig::new(64 * 1024 * 1024, 50);
+
+    let result = HelloAck::decode_bounded(&bytes, &config);
+    assert!(
+        matches!(
+            result,
+            Err(DecodeError::RepeatedFieldTooLarge { field, count, max })
+            if field == "granted_caps" && count == 100 && max == 50
+        ),
+        "should reject HelloAck with too many granted_caps: {result:?}"
+    );
+}
+
+#[test]
+fn test_bounded_decode_telemetry_policy_repeated_field() {
+    let mut policy = TelemetryPolicy {
+        sample_period_ms: 1000,
+        promote_triggers: Vec::new(),
+        ring_buffer_limits: None,
+    };
+
+    // Add many triggers
+    for i in 0i32..100 {
+        policy.promote_triggers.push(PromoteTrigger {
+            metric: format!("metric-{i}"),
+            threshold: f64::from(i),
+        });
+    }
+
+    let bytes = policy.encode_to_vec();
+
+    // Allow message size but limit repeated fields to 50
+    let config = DecodeConfig::new(64 * 1024 * 1024, 50);
+
+    let result = TelemetryPolicy::decode_bounded(&bytes, &config);
+    assert!(
+        matches!(
+            result,
+            Err(DecodeError::RepeatedFieldTooLarge { field, count, max })
+            if field == "promote_triggers" && count == 100 && max == 50
+        ),
+        "should reject TelemetryPolicy with too many triggers: {result:?}"
+    );
+}
+
+#[test]
+fn test_bounded_decode_simple_message_no_repeated() {
+    // Test that simple messages (no repeated fields) work correctly
+    let frame = TelemetryFrame::new("ep-test", 42, 1000)
+        .with_cpu_ns(100)
+        .with_mem_rss_bytes(1024);
+
+    let bytes = frame.encode_to_vec();
+    let config = DecodeConfig::new(1024, 10); // Reasonable limits
+
+    let decoded = TelemetryFrame::decode_bounded(&bytes, &config).expect("decode should succeed");
+    assert_eq!(decoded.episode_id, "ep-test");
+    assert_eq!(decoded.seq, 42);
+    assert_eq!(decoded.cpu_ns, 100);
+}
+
+#[test]
+fn test_decode_error_display() {
+    let err = DecodeError::MessageTooLarge { size: 100, max: 50 };
+    assert!(err.to_string().contains("100"));
+    assert!(err.to_string().contains("50"));
+
+    let err = DecodeError::RepeatedFieldTooLarge {
+        field: "evidence_refs",
+        count: 200,
+        max: 100,
+    };
+    assert!(err.to_string().contains("evidence_refs"));
+    assert!(err.to_string().contains("200"));
+    assert!(err.to_string().contains("100"));
+
+    let err = DecodeError::Prost("invalid wire type".to_string());
+    assert!(err.to_string().contains("invalid wire type"));
+}
+
+#[test]
+fn test_decode_config_constants() {
+    // Verify the default constants are reasonable
+    assert_eq!(super::DEFAULT_MAX_MESSAGE_SIZE, 64 * 1024 * 1024);
+    assert_eq!(super::DEFAULT_MAX_REPEATED_FIELD_COUNT, 100_000);
+
+    let config = DecodeConfig::default();
+    assert_eq!(config.max_message_size, 64 * 1024 * 1024);
+    assert_eq!(config.max_repeated_field_count, 100_000);
+
+    let handshake = DecodeConfig::handshake();
+    assert_eq!(handshake.max_message_size, 64 * 1024);
+    assert_eq!(handshake.max_repeated_field_count, 1_000);
+}
