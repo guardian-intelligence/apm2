@@ -3,6 +3,32 @@
 //! The [`RawAdapter`] is a baseline adapter that spawns processes and emits
 //! all PTY output as raw [`HarnessEvent::Output`] events without any parsing.
 //!
+//! # Runtime Requirements
+//!
+//! **IMPORTANT**: The [`RawAdapterHolon`] implementation requires a
+//! **multi-threaded tokio runtime**. The [`Holon::execute_episode`] method
+//! uses `tokio::task::block_in_place` to bridge synchronous holon execution
+//! with async process spawning. This will **panic** if called from a
+//! single-threaded runtime.
+//!
+//! When using `RawAdapterHolon`, ensure your tokio runtime is configured with
+//! multiple worker threads:
+//!
+//! ```rust,ignore
+//! #[tokio::main(flavor = "multi_thread")]
+//! async fn main() {
+//!     // Safe to use RawAdapterHolon here
+//! }
+//!
+//! // Or explicitly:
+//! let rt = tokio::runtime::Builder::new_multi_thread()
+//!     .worker_threads(4)
+//!     .build()
+//!     .unwrap();
+//! ```
+//!
+//! The `apm2-daemon` binary uses a multi-threaded runtime by default.
+//!
 //! # Behavior
 //!
 //! - Spawns processes using PTY (pseudo-terminal) for proper terminal emulation
@@ -573,6 +599,20 @@ impl Holon for RawAdapterHolon {
         Ok(())
     }
 
+    /// Executes an episode step, driving the process lifecycle.
+    ///
+    /// # Runtime Requirements
+    ///
+    /// **IMPORTANT**: This method requires a **multi-threaded tokio runtime**.
+    /// It uses `tokio::task::block_in_place` to bridge the synchronous `Holon`
+    /// trait with async process spawning. Calling this method from a
+    /// single-threaded runtime will **panic**.
+    ///
+    /// # Lifecycle
+    ///
+    /// 1. First call: Spawns the process (returns `NeedsContinuation`)
+    /// 2. Subsequent calls: Polls for termination and collects output events
+    /// 3. Final call: Returns `Completed` when process terminates
     fn execute_episode(
         &mut self,
         _ctx: &EpisodeContext,

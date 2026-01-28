@@ -418,8 +418,16 @@ impl HarnessConfig {
     /// - Command: non-empty, max 4096 chars, no null bytes or control chars
     /// - Args: max 1000 args, each max 4096 chars, no null bytes or control
     ///   chars
-    /// - cwd: must be canonicalizable (if present)
+    /// - cwd: syntactic validation only (no path traversal, no null bytes).
+    ///   Filesystem existence is checked at spawn time.
     /// - env: max 500 vars, keys max 256 chars, values max 32768 chars
+    ///
+    /// # Design Note
+    ///
+    /// Validation is intentionally deterministic and does not perform blocking
+    /// I/O. Path canonicalization and existence checks for `cwd` are deferred
+    /// to process spawn time to ensure validation can be performed
+    /// synchronously without side effects.
     ///
     /// # Errors
     ///
@@ -493,12 +501,41 @@ impl HarnessConfig {
     }
 
     /// Validate the cwd field.
+    ///
+    /// # Design Note
+    ///
+    /// Validation is intentionally limited to syntactic checks (non-empty, no
+    /// path traversal). Filesystem existence and canonicalization are deferred
+    /// to process spawn time to keep validation deterministic and avoid
+    /// blocking I/O in the validation path. This follows the principle that
+    /// validation should be pure and not depend on external state.
     fn validate_cwd(&self) -> Result<(), ValidationError> {
         if let Some(ref cwd) = self.cwd {
-            // Check that the path can be canonicalized (exists and is accessible)
-            std::fs::canonicalize(cwd).map_err(|e| ValidationError::InvalidCwd {
-                reason: format!("cannot canonicalize '{}': {}", cwd.display(), e),
-            })?;
+            // Convert to string for validation checks
+            let path_str = cwd.to_string_lossy();
+
+            // Reject empty paths
+            if path_str.is_empty() {
+                return Err(ValidationError::InvalidCwd {
+                    reason: "working directory path cannot be empty".to_string(),
+                });
+            }
+
+            // Reject path traversal attempts (parent directory references)
+            // This is a security check per CTR-1503 (Path Safety)
+            if path_str.contains("..") {
+                return Err(ValidationError::InvalidCwd {
+                    reason: "working directory cannot contain parent directory references (..)"
+                        .to_string(),
+                });
+            }
+
+            // Reject paths with null bytes
+            if path_str.contains('\0') {
+                return Err(ValidationError::InvalidCwd {
+                    reason: "working directory cannot contain null bytes".to_string(),
+                });
+            }
         }
         Ok(())
     }
@@ -1100,17 +1137,35 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_invalid_cwd() {
-        let config =
-            HarnessConfig::new("echo", "ep-1").with_cwd("/nonexistent/path/that/does/not/exist");
+    fn test_validate_cwd_with_path_traversal() {
+        // Path traversal attempts should fail validation (per CTR-1503)
+        let config = HarnessConfig::new("echo", "ep-1").with_cwd("/tmp/../etc/passwd");
         let result = config.validate();
         assert!(matches!(result, Err(ValidationError::InvalidCwd { .. })));
+        if let Err(ValidationError::InvalidCwd { reason }) = result {
+            assert!(reason.contains("parent directory"));
+        }
+    }
+
+    #[test]
+    fn test_validate_cwd_with_null_byte() {
+        let config = HarnessConfig::new("echo", "ep-1").with_cwd("/tmp/test\0path");
+        let result = config.validate();
+        assert!(matches!(result, Err(ValidationError::InvalidCwd { .. })));
+        if let Err(ValidationError::InvalidCwd { reason }) = result {
+            assert!(reason.contains("null bytes"));
+        }
     }
 
     #[test]
     fn test_validate_valid_cwd() {
+        // Valid paths should pass validation regardless of filesystem existence
+        // Existence check is deferred to spawn time
         let config = HarnessConfig::new("echo", "ep-1").with_cwd("/tmp");
-        // /tmp should exist on all Unix systems
+        assert!(config.validate().is_ok());
+
+        // Non-existent paths should also pass syntactic validation
+        let config = HarnessConfig::new("echo", "ep-1").with_cwd("/nonexistent/path");
         assert!(config.validate().is_ok());
     }
 
