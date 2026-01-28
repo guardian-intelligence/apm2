@@ -14,7 +14,8 @@
 //!     `-- key_exists(key_id) -> bool
 //!
 //! OsKeychain (impl SigningKeyStore)
-//!     `-- Uses `keyring` crate for Secret Service (Linux) / Keychain (macOS)
+//!     |-- Uses `keyring` crate for Secret Service (Linux) / Keychain (macOS)
+//!     `-- Persists key metadata to ~/.apm2/keychain_manifest.json
 //!
 //! InMemoryKeyStore (impl SigningKeyStore)
 //!     `-- For testing without OS keychain
@@ -28,6 +29,15 @@
 //! - 90-day rotation schedule (enforced by caller)
 //! - Old keys preserved for verification (1 year)
 //!
+//! # Persistence
+//!
+//! The `OsKeychain` implementation maintains a manifest file at
+//! `~/.apm2/keychain_manifest.json` that tracks key metadata (IDs, versions,
+//! timestamps). This ensures:
+//! - `list_keys()` returns all keys even after daemon restart
+//! - `MAX_STORED_KEYS` limit is enforced across restarts
+//! - The manifest only contains metadata, never secret key material
+//!
 //! # Contract References
 //!
 //! - AD-KEY-001: Key lifecycle management
@@ -35,9 +45,13 @@
 //! - CTR-2003: Fail-closed security defaults
 
 use std::collections::HashMap;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::sync::RwLock;
 
 use secrecy::zeroize::Zeroizing;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::signer::{KeyId, ReceiptSigner, SignerError};
@@ -54,6 +68,28 @@ pub const MAX_STORED_KEYS: usize = 100;
 
 /// Key data version for serialization compatibility.
 const KEY_DATA_VERSION: u8 = 1;
+
+/// Manifest file name for persistent key tracking.
+const MANIFEST_FILE_NAME: &str = "keychain_manifest.json";
+
+/// Directory name under home for apm2 state.
+const APM2_DIR_NAME: &str = ".apm2";
+
+// =============================================================================
+// Helper Functions (internal)
+// =============================================================================
+
+/// Gets the current Unix timestamp, failing closed on system time errors.
+///
+/// Per CTR-2003, if the system time is before the Unix epoch (which should
+/// never happen in practice on modern systems), we return an error rather
+/// than silently using a fallback value.
+fn current_timestamp() -> Result<u64, KeychainError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|e| KeychainError::Manifest(format!("system time is before Unix epoch: {e}")))
+}
 
 // =============================================================================
 // KeychainError
@@ -99,6 +135,14 @@ pub enum KeychainError {
     /// Lock poisoned.
     #[error("internal lock poisoned")]
     LockPoisoned,
+
+    /// Manifest file operation failed.
+    #[error("manifest error: {0}")]
+    Manifest(String),
+
+    /// Home directory not found.
+    #[error("could not determine home directory")]
+    NoHomeDirectory,
 }
 
 // =============================================================================
@@ -106,7 +150,7 @@ pub enum KeychainError {
 // =============================================================================
 
 /// Metadata about a stored key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyInfo {
     /// Unique identifier for the key.
     pub key_id: KeyId,
@@ -204,6 +248,74 @@ pub trait SigningKeyStore: Send + Sync {
 }
 
 // =============================================================================
+// KeyManifest
+// =============================================================================
+
+/// Persistent manifest tracking all stored keys.
+///
+/// This manifest is stored at `~/.apm2/keychain_manifest.json` and contains
+/// only metadata (no secret key material). It ensures `list_keys()` and
+/// `MAX_STORED_KEYS` enforcement work correctly across daemon restarts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct KeyManifest {
+    /// Map from key ID string to metadata.
+    keys: HashMap<String, KeyInfo>,
+}
+
+impl KeyManifest {
+    /// Gets the path to the manifest file.
+    ///
+    /// Returns `~/.apm2/keychain_manifest.json` or `None` if the home
+    /// directory cannot be determined.
+    fn path() -> Option<PathBuf> {
+        directories::BaseDirs::new()
+            .map(|dirs| dirs.home_dir().join(APM2_DIR_NAME).join(MANIFEST_FILE_NAME))
+    }
+
+    /// Loads the manifest from disk.
+    ///
+    /// Returns an empty manifest if the file doesn't exist. Fails closed
+    /// on parse errors per CTR-2003.
+    fn load() -> Result<Self, KeychainError> {
+        let path = Self::path().ok_or(KeychainError::NoHomeDirectory)?;
+
+        match fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str(&content)
+                .map_err(|e| KeychainError::Manifest(format!("failed to parse manifest: {e}"))),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                // File doesn't exist yet - return empty manifest
+                Ok(Self::default())
+            },
+            Err(e) => Err(KeychainError::Manifest(format!(
+                "failed to read manifest: {e}"
+            ))),
+        }
+    }
+
+    /// Saves the manifest to disk.
+    ///
+    /// Creates the parent directory if it doesn't exist.
+    fn save(&self) -> Result<(), KeychainError> {
+        let path = Self::path().ok_or(KeychainError::NoHomeDirectory)?;
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                KeychainError::Manifest(format!("failed to create manifest directory: {e}"))
+            })?;
+        }
+
+        let content = serde_json::to_string_pretty(&self)
+            .map_err(|e| KeychainError::Manifest(format!("failed to serialize manifest: {e}")))?;
+
+        fs::write(&path, content)
+            .map_err(|e| KeychainError::Manifest(format!("failed to write manifest: {e}")))?;
+
+        Ok(())
+    }
+}
+
+// =============================================================================
 // OsKeychain
 // =============================================================================
 
@@ -213,33 +325,113 @@ pub trait SigningKeyStore: Send + Sync {
 /// - Linux: Secret Service API (GNOME Keyring, KDE Wallet)
 /// - macOS: Keychain
 /// - Windows: Credential Manager
+///
+/// Key metadata is persisted to `~/.apm2/keychain_manifest.json` to ensure
+/// `list_keys()` returns all keys and `MAX_STORED_KEYS` is enforced across
+/// daemon restarts.
 pub struct OsKeychain {
     /// Service name for keychain entries.
     service_name: String,
     /// Cache of key metadata (key IDs and versions only, not secrets).
+    /// This cache is populated from the manifest on initialization.
     metadata_cache: RwLock<HashMap<String, KeyInfo>>,
+    /// Path to manifest file (None to use default path).
+    manifest_path: Option<PathBuf>,
 }
 
 impl OsKeychain {
     /// Creates a new OS keychain store.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            service_name: KEYCHAIN_SERVICE_NAME.to_string(),
-            metadata_cache: RwLock::new(HashMap::new()),
-        }
+    ///
+    /// Loads existing key metadata from the manifest file if it exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest exists but cannot be read or parsed.
+    pub fn new() -> Result<Self, KeychainError> {
+        Self::with_service_name(KEYCHAIN_SERVICE_NAME)
     }
 
     /// Creates a new OS keychain store with a custom service name.
     ///
+    /// Loads existing key metadata from the manifest file if it exists.
+    ///
     /// # Arguments
     ///
     /// * `service_name` - Custom service name for keychain entries
-    #[must_use]
-    pub fn with_service_name(service_name: impl Into<String>) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest exists but cannot be read or parsed.
+    pub fn with_service_name(service_name: impl Into<String>) -> Result<Self, KeychainError> {
+        let manifest = KeyManifest::load()?;
+        Ok(Self {
             service_name: service_name.into(),
-            metadata_cache: RwLock::new(HashMap::new()),
+            metadata_cache: RwLock::new(manifest.keys),
+            manifest_path: None,
+        })
+    }
+
+    /// Creates a new OS keychain store with a custom manifest path.
+    ///
+    /// This is primarily for testing to avoid using the global manifest file.
+    ///
+    /// # Arguments
+    ///
+    /// * `service_name` - Custom service name for keychain entries
+    /// * `manifest_path` - Path to the manifest file
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest exists but cannot be read or parsed.
+    pub fn with_manifest_path(
+        service_name: impl Into<String>,
+        manifest_path: PathBuf,
+    ) -> Result<Self, KeychainError> {
+        let manifest = Self::load_manifest_from_path(&manifest_path)?;
+        Ok(Self {
+            service_name: service_name.into(),
+            metadata_cache: RwLock::new(manifest.keys),
+            manifest_path: Some(manifest_path),
+        })
+    }
+
+    /// Loads manifest from a specific path.
+    fn load_manifest_from_path(path: &PathBuf) -> Result<KeyManifest, KeychainError> {
+        match fs::read_to_string(path) {
+            Ok(content) => serde_json::from_str(&content)
+                .map_err(|e| KeychainError::Manifest(format!("failed to parse manifest: {e}"))),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(KeyManifest::default()),
+            Err(e) => Err(KeychainError::Manifest(format!(
+                "failed to read manifest: {e}"
+            ))),
+        }
+    }
+
+    /// Saves the current cache to the manifest file.
+    fn save_manifest(&self, cache: &HashMap<String, KeyInfo>) -> Result<(), KeychainError> {
+        let manifest = KeyManifest {
+            keys: cache.clone(),
+        };
+
+        if let Some(ref path) = self.manifest_path {
+            // Use custom path
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    KeychainError::Manifest(format!("failed to create manifest directory: {e}"))
+                })?;
+            }
+
+            let content = serde_json::to_string_pretty(&manifest).map_err(|e| {
+                KeychainError::Manifest(format!("failed to serialize manifest: {e}"))
+            })?;
+
+            fs::write(path, content)
+                .map_err(|e| KeychainError::Manifest(format!("failed to write manifest: {e}")))?;
+
+            Ok(())
+        } else {
+            // Use default path
+            manifest.save()
         }
     }
 
@@ -304,12 +496,6 @@ impl OsKeychain {
     }
 }
 
-impl Default for OsKeychain {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl SigningKeyStore for OsKeychain {
     fn store_key(
         &self,
@@ -324,7 +510,8 @@ impl SigningKeyStore for OsKeychain {
             });
         }
 
-        // Check limit (CTR-1303)
+        // Check limit (CTR-1303) - this now works across restarts because
+        // the cache is populated from the manifest on initialization
         {
             let cache = self
                 .metadata_cache
@@ -337,20 +524,17 @@ impl SigningKeyStore for OsKeychain {
             }
         }
 
-        // Get current timestamp
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // Get current timestamp (fail closed per CTR-2003)
+        let created_at = current_timestamp()?;
 
-        // Serialize and store
+        // Serialize and store in OS keychain
         let data = Self::serialize_key_data(key_bytes, version, created_at);
         let entry = self.entry(key_id)?;
         entry
             .set_password(&data)
             .map_err(|e| KeychainError::Keychain(e.to_string()))?;
 
-        // Update cache
+        // Update cache and persist manifest
         let mut cache = self
             .metadata_cache
             .write()
@@ -363,6 +547,9 @@ impl SigningKeyStore for OsKeychain {
                 created_at,
             },
         );
+
+        // Persist manifest to ensure keys survive restart
+        self.save_manifest(&cache)?;
 
         Ok(())
     }
@@ -382,7 +569,8 @@ impl SigningKeyStore for OsKeychain {
         let signer = ReceiptSigner::from_bytes(&*key_bytes, key_id.clone(), version)
             .map_err(KeychainError::KeyId)?;
 
-        // Update cache
+        // Update cache (no need to persist manifest on load - it's already there
+        // or will be persisted on next mutation)
         let mut cache = self
             .metadata_cache
             .write()
@@ -402,23 +590,28 @@ impl SigningKeyStore for OsKeychain {
     fn delete_key(&self, key_id: &KeyId) -> Result<(), KeychainError> {
         let entry = self.entry(key_id)?;
 
-        // Attempt to delete, ignore NotFound (idempotent)
+        // Attempt to delete from OS keychain, ignore NotFound (idempotent)
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => {},
             Err(e) => return Err(KeychainError::Keychain(e.to_string())),
         }
 
-        // Remove from cache
+        // Remove from cache and persist manifest
         let mut cache = self
             .metadata_cache
             .write()
             .map_err(|_| KeychainError::LockPoisoned)?;
         cache.remove(key_id.as_str());
 
+        // Persist manifest to ensure deletion survives restart
+        self.save_manifest(&cache)?;
+
         Ok(())
     }
 
     fn list_keys(&self) -> Result<Vec<KeyInfo>, KeychainError> {
+        // Because the cache is loaded from the manifest on initialization,
+        // this now returns all keys even after daemon restart
         let cache = self
             .metadata_cache
             .read()
@@ -448,7 +641,7 @@ impl SigningKeyStore for OsKeychain {
     }
 
     fn update_version(&self, key_id: &KeyId, new_version: u32) -> Result<(), KeychainError> {
-        // Load existing key
+        // Load existing key from OS keychain
         let entry = self.entry(key_id)?;
         let data = entry.get_password().map_err(|e| match e {
             keyring::Error::NoEntry => KeychainError::NotFound {
@@ -459,13 +652,13 @@ impl SigningKeyStore for OsKeychain {
 
         let (key_bytes, _old_version, created_at) = Self::deserialize_key_data(&data)?;
 
-        // Store with new version
+        // Store with new version in OS keychain
         let new_data = Self::serialize_key_data(&key_bytes, new_version, created_at);
         entry
             .set_password(&new_data)
             .map_err(|e| KeychainError::Keychain(e.to_string()))?;
 
-        // Update cache
+        // Update cache and persist manifest
         let mut cache = self
             .metadata_cache
             .write()
@@ -473,6 +666,9 @@ impl SigningKeyStore for OsKeychain {
         if let Some(info) = cache.get_mut(key_id.as_str()) {
             info.version = new_version;
         }
+
+        // Persist manifest to ensure version update survives restart
+        self.save_manifest(&cache)?;
 
         Ok(())
     }
@@ -531,10 +727,9 @@ impl SigningKeyStore for InMemoryKeyStore {
             });
         }
 
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // For testing, use current_timestamp helper which fails closed per CTR-2003.
+        // In practice, system time before Unix epoch is impossible on modern systems.
+        let created_at = current_timestamp()?;
 
         let info = KeyInfo {
             key_id: key_id.clone(),
@@ -783,5 +978,104 @@ mod tests {
         let key_id = KeyId::new("key-overflow").unwrap();
         let result = store.store_key(&key_id, &[0xff; 32], 1);
         assert!(matches!(result, Err(KeychainError::LimitExceeded { .. })));
+    }
+
+    // =========================================================================
+    // Manifest Persistence Tests
+    // =========================================================================
+
+    #[test]
+    fn test_manifest_roundtrip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("test_manifest.json");
+
+        // Create a keychain with custom manifest path
+        let keychain = OsKeychain::with_manifest_path("test-service", manifest_path).unwrap();
+
+        // Initially empty
+        assert!(keychain.list_keys().unwrap().is_empty());
+
+        // Note: We can't actually test store_key without a real keyring
+        // backend, but we can test manifest serialization directly
+    }
+
+    #[test]
+    fn test_manifest_serialization() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("manifest.json");
+
+        // Create and save a manifest with test data
+        let mut manifest = KeyManifest::default();
+        let key_id = KeyId::new("test-key").unwrap();
+        manifest.keys.insert(
+            "test-key".to_string(),
+            KeyInfo {
+                key_id,
+                version: 1,
+                created_at: 1_704_067_200,
+            },
+        );
+
+        // Write manifest to file
+        let content = serde_json::to_string_pretty(&manifest).unwrap();
+        fs::write(&manifest_path, &content).unwrap();
+
+        // Load it back
+        let loaded = OsKeychain::load_manifest_from_path(&manifest_path).unwrap();
+
+        assert_eq!(loaded.keys.len(), 1);
+        let loaded_info = loaded.keys.get("test-key").unwrap();
+        assert_eq!(loaded_info.key_id.as_str(), "test-key");
+        assert_eq!(loaded_info.version, 1);
+        assert_eq!(loaded_info.created_at, 1_704_067_200);
+    }
+
+    #[test]
+    fn test_manifest_missing_file_returns_empty() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("nonexistent.json");
+
+        // Loading a non-existent manifest should return empty, not error
+        let manifest = OsKeychain::load_manifest_from_path(&manifest_path).unwrap();
+        assert!(manifest.keys.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_corrupt_file_returns_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("corrupt.json");
+
+        // Write invalid JSON
+        fs::write(&manifest_path, "not valid json {{{").unwrap();
+
+        // Loading corrupt manifest should fail closed (CTR-2003)
+        let result = OsKeychain::load_manifest_from_path(&manifest_path);
+        assert!(matches!(result, Err(KeychainError::Manifest(_))));
+    }
+
+    #[test]
+    fn test_key_info_serialization() {
+        // Test that KeyInfo round-trips through JSON correctly
+        let key_id = KeyId::new("test-key-123").unwrap();
+        let info = KeyInfo {
+            key_id,
+            version: 42,
+            created_at: 1_700_000_000,
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        let loaded: KeyInfo = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.key_id.as_str(), "test-key-123");
+        assert_eq!(loaded.version, 42);
+        assert_eq!(loaded.created_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn test_current_timestamp_succeeds() {
+        // Should succeed on any modern system
+        let ts = current_timestamp().unwrap();
+        // Timestamp should be after 2024-01-01 (1704067200)
+        assert!(ts > 1_704_067_200);
     }
 }

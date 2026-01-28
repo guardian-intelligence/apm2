@@ -30,6 +30,7 @@
 use std::fmt;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -56,7 +57,8 @@ pub const INITIAL_KEY_VERSION: u32 = 1;
 ///
 /// Key IDs are used to look up keys in the keychain and must be
 /// validated to prevent injection attacks.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct KeyId(String);
 
 impl KeyId {
@@ -96,6 +98,20 @@ impl KeyId {
 impl fmt::Display for KeyId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl TryFrom<String> for KeyId {
+    type Error = SignerError;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::new(s)
+    }
+}
+
+impl From<KeyId> for String {
+    fn from(key_id: KeyId) -> Self {
+        key_id.0
     }
 }
 
@@ -230,9 +246,12 @@ impl ReceiptSigner {
                 len: key_bytes.len(),
             });
         }
+        // SAFETY: The length check above guarantees key_bytes.len() == 32,
+        // so try_into() for [u8; 32] will always succeed. The expect is
+        // unreachable but provides defense-in-depth documentation.
         let bytes: [u8; 32] = key_bytes
             .try_into()
-            .expect("length already validated as 32");
+            .expect("unreachable: length validated as 32 above");
         let signing_key = SigningKey::from_bytes(&bytes);
         Ok(Self::new(signing_key, key_id, key_version))
     }
