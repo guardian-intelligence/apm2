@@ -27,6 +27,23 @@
 //!     +-- emit completion event with receipt_hash
 //! ```
 //!
+//! # Hashing Strategy
+//!
+//! This module uses two distinct hashing approaches:
+//!
+//! 1. **Canonical Hash** ([`CoordinationReceipt::compute_hash`]): Used for
+//!    tamper-evidence verification. Computed over length-prefixed binary
+//!    encoding that is immune to delimiter injection attacks. This is the hash
+//!    included in completion events and used for `verify()`.
+//!
+//! 2. **CAS Hash** ([`CoordinationReceipt::store`]): Used by
+//!    [`ContentAddressedStore`] for content deduplication. Computed over JSON
+//!    serialization. Different from canonical hash but provides
+//!    content-addressable storage guarantees.
+//!
+//! Clients should use `compute_hash()` and `verify()` for tamper-evidence
+//! checks, and CAS hash for storage/retrieval operations.
+//!
 //! # Contract: CTR-COORD-006
 //!
 //! The `CoordinationReceipt` must include:
@@ -49,6 +66,8 @@ use std::fmt;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, de};
 
+#[cfg(test)]
+use super::state::BudgetType;
 use super::state::{BudgetUsage, CoordinationBudget, SessionOutcome, StopCondition};
 use crate::crypto::{EventHasher, Hash};
 use crate::evidence::{CasError, ContentAddressedStore};
@@ -63,6 +82,35 @@ pub const MAX_WORK_OUTCOMES: usize = 1000;
 ///
 /// Matches [`super::state::MAX_SESSION_IDS_PER_WORK`].
 pub const MAX_SESSION_IDS_PER_OUTCOME: usize = 100;
+
+// ============================================================================
+// Length-Prefixed Encoding Helpers
+// ============================================================================
+
+/// Writes a length-prefixed string to the buffer.
+///
+/// Format: 4-byte u32 LE length + UTF-8 bytes
+///
+/// This prevents delimiter injection attacks by unambiguously encoding
+/// string boundaries.
+fn write_length_prefixed_string(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    // Truncate to u32::MAX if needed (should never happen in practice)
+    #[allow(clippy::cast_possible_truncation)]
+    let len = bytes.len().min(u32::MAX as usize) as u32;
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(&bytes[..len as usize]);
+}
+
+/// Writes a u32 to the buffer in little-endian format.
+fn write_u32(buf: &mut Vec<u8>, value: u32) {
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Writes a u64 to the buffer in little-endian format.
+fn write_u64(buf: &mut Vec<u8>, value: u64) {
+    buf.extend_from_slice(&value.to_le_bytes());
+}
 
 // ============================================================================
 // Bounded Deserializers (DoS/OOM Protection)
@@ -219,6 +267,24 @@ impl WorkOutcome {
             session_ids,
         })
     }
+
+    /// Writes this work outcome to a buffer using length-prefixed encoding.
+    fn write_canonical(&self, buf: &mut Vec<u8>) {
+        write_length_prefixed_string(buf, &self.work_id);
+        write_u32(buf, self.attempts);
+        // Use stable string representation for outcome
+        buf.push(match self.final_outcome {
+            SessionOutcome::Success => b'S',
+            SessionOutcome::Failure => b'F',
+        });
+        // Write session IDs count and each ID
+        #[allow(clippy::cast_possible_truncation)]
+        let session_count = self.session_ids.len().min(u32::MAX as usize) as u32;
+        write_u32(buf, session_count);
+        for session_id in &self.session_ids {
+            write_length_prefixed_string(buf, session_id);
+        }
+    }
 }
 
 // ============================================================================
@@ -280,87 +346,109 @@ pub struct CoordinationReceipt {
 impl CoordinationReceipt {
     /// Computes the canonical bytes for hashing.
     ///
-    /// The canonical format is a deterministic pipe-delimited string that
-    /// ensures consistent hashing across different JSON serialization
-    /// implementations.
+    /// Uses length-prefixed binary encoding to prevent delimiter injection
+    /// attacks. Each string is prefixed with its length as a 4-byte u32 LE,
+    /// ensuring unambiguous parsing regardless of string content.
     ///
-    /// Format:
-    /// `coordination_id|work_outcomes_canonical|budget_usage|budget_ceiling|
-    /// stop_condition|started_at|completed_at|total|successful|failed`
+    /// This encoding is:
+    /// - **Collision-resistant**: Different receipts always produce different
+    ///   bytes
+    /// - **Deterministic**: Same receipt always produces same bytes
+    /// - **Stable**: Not dependent on Debug trait or compiler versions
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        // Canonicalize work outcomes
-        let work_outcomes_str: String = self
-            .work_outcomes
-            .iter()
-            .map(|wo| {
-                let sessions = wo.session_ids.join(",");
-                format!(
-                    "{}:{}:{}:{}",
-                    wo.work_id,
-                    wo.attempts,
-                    match wo.final_outcome {
-                        SessionOutcome::Success => "S",
-                        SessionOutcome::Failure => "F",
-                    },
-                    sessions
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(";");
+        // Pre-allocate reasonable buffer size
+        let mut buf = Vec::with_capacity(1024);
 
-        // Canonicalize stop condition
-        let stop_condition_str = match &self.stop_condition {
-            StopCondition::WorkCompleted => "WorkCompleted".to_string(),
-            StopCondition::BudgetExhausted(bt) => format!("BudgetExhausted:{bt:?}"),
+        // Magic bytes for versioning (allows future format changes)
+        buf.extend_from_slice(b"CRv1");
+
+        // Coordination ID
+        write_length_prefixed_string(&mut buf, &self.coordination_id);
+
+        // Work outcomes
+        #[allow(clippy::cast_possible_truncation)]
+        let work_count = self.work_outcomes.len().min(u32::MAX as usize) as u32;
+        write_u32(&mut buf, work_count);
+        for wo in &self.work_outcomes {
+            wo.write_canonical(&mut buf);
+        }
+
+        // Budget usage
+        write_u32(&mut buf, self.budget_usage.consumed_episodes);
+        write_u64(&mut buf, self.budget_usage.elapsed_ms);
+        write_u64(&mut buf, self.budget_usage.consumed_tokens);
+
+        // Budget ceiling
+        write_u32(&mut buf, self.budget_ceiling.max_episodes);
+        write_u64(&mut buf, self.budget_ceiling.max_duration_ms);
+        // Optional max_tokens: write 0 for None, otherwise write the value
+        write_u64(&mut buf, self.budget_ceiling.max_tokens.unwrap_or(0));
+        // Discriminator for Option
+        buf.push(u8::from(self.budget_ceiling.max_tokens.is_some()));
+
+        // Stop condition - use stable string representation
+        let stop_condition_tag = match &self.stop_condition {
+            StopCondition::WorkCompleted => 0u8,
+            StopCondition::BudgetExhausted(_) => 1u8,
+            StopCondition::MaxAttemptsExceeded { .. } => 2u8,
+            StopCondition::CircuitBreakerTriggered { .. } => 3u8,
+        };
+        buf.push(stop_condition_tag);
+
+        // Stop condition payload
+        match &self.stop_condition {
+            StopCondition::WorkCompleted => {
+                // No payload
+            },
+            StopCondition::BudgetExhausted(bt) => {
+                // Use stable as_str() method instead of Debug
+                write_length_prefixed_string(&mut buf, bt.as_str());
+            },
             StopCondition::MaxAttemptsExceeded { work_id } => {
-                format!("MaxAttemptsExceeded:{work_id}")
+                write_length_prefixed_string(&mut buf, work_id);
             },
             StopCondition::CircuitBreakerTriggered {
                 consecutive_failures,
             } => {
-                format!("CircuitBreakerTriggered:{consecutive_failures}")
+                write_u32(&mut buf, *consecutive_failures);
             },
-        };
+        }
 
-        format!(
-            "{}|{}|{}:{}:{}|{}:{}:{}|{}|{}|{}|{}|{}|{}",
-            self.coordination_id,
-            work_outcomes_str,
-            self.budget_usage.consumed_episodes,
-            self.budget_usage.elapsed_ms,
-            self.budget_usage.consumed_tokens,
-            self.budget_ceiling.max_episodes,
-            self.budget_ceiling.max_duration_ms,
-            self.budget_ceiling.max_tokens.unwrap_or(0),
-            stop_condition_str,
-            self.started_at,
-            self.completed_at,
-            self.total_sessions,
-            self.successful_sessions,
-            self.failed_sessions,
-        )
-        .into_bytes()
+        // Timestamps
+        write_u64(&mut buf, self.started_at);
+        write_u64(&mut buf, self.completed_at);
+
+        // Session counts
+        write_u32(&mut buf, self.total_sessions);
+        write_u32(&mut buf, self.successful_sessions);
+        write_u32(&mut buf, self.failed_sessions);
+
+        buf
     }
 
     /// Computes the BLAKE3 hash of this receipt.
     ///
     /// The hash is computed over the canonical bytes representation of the
-    /// receipt. This ensures deterministic hashing across different runs.
+    /// receipt. This ensures deterministic hashing across different runs
+    /// and is immune to delimiter injection attacks.
     ///
-    /// # Errors
-    ///
-    /// This function is infallible for valid receipts.
+    /// This is the **tamper-evidence hash** that should be included in
+    /// completion events and used for verification.
     #[must_use]
     pub fn compute_hash(&self) -> Hash {
         let canonical = self.canonical_bytes();
         EventHasher::hash_content(&canonical)
     }
 
-    /// Stores this receipt in the given CAS and returns its hash.
+    /// Stores this receipt in the given CAS and returns the CAS content hash.
     ///
-    /// The receipt is stored as JSON but the hash is computed from the
-    /// canonical bytes representation to ensure deterministic hashing.
+    /// The receipt is stored as JSON. The returned hash is the CAS content
+    /// hash (computed over JSON bytes), which differs from the canonical
+    /// hash returned by [`compute_hash`].
+    ///
+    /// Use `compute_hash()` for tamper-evidence verification.
+    /// Use this method for CAS storage/retrieval operations.
     ///
     /// # Errors
     ///
@@ -374,7 +462,7 @@ impl CoordinationReceipt {
         Ok(result.hash)
     }
 
-    /// Loads a receipt from CAS by its hash.
+    /// Loads a receipt from CAS by its CAS content hash.
     ///
     /// # Errors
     ///
@@ -388,14 +476,16 @@ impl CoordinationReceipt {
             })?;
 
         // CAS already verified the hash matches the stored content.
-        // We don't re-verify against canonical hash here because the CAS
-        // hash is over the JSON bytes, not the canonical bytes.
-        // Use verify() with compute_hash() for canonical verification.
+        // The CAS hash is over JSON bytes, distinct from canonical hash.
+        // Use verify() with compute_hash() for tamper-evidence verification.
 
         Ok(receipt)
     }
 
-    /// Verifies that this receipt's hash matches the expected hash.
+    /// Verifies that this receipt's canonical hash matches the expected hash.
+    ///
+    /// Use this method to verify tamper-evidence. The expected hash should
+    /// come from a trusted source (e.g., completion event, signed manifest).
     ///
     /// # Errors
     ///
@@ -649,9 +739,10 @@ impl ReceiptBuilder {
         }
     }
 
-    /// Builds the receipt and stores it in CAS, returning the hash.
+    /// Builds the receipt and stores it in CAS, returning both hashes.
     ///
-    /// This is a convenience method that combines `build()` and `store()`.
+    /// This is a convenience method that combines `build()`, `store()`, and
+    /// `compute_hash()`.
     ///
     /// # Arguments
     ///
@@ -662,7 +753,10 @@ impl ReceiptBuilder {
     ///
     /// # Returns
     ///
-    /// A tuple of (receipt, hash).
+    /// A tuple of (receipt, `canonical_hash`, `cas_hash`).
+    /// - `canonical_hash`: Use for tamper-evidence (include in completion
+    ///   events)
+    /// - `cas_hash`: Use for CAS retrieval operations
     ///
     /// # Errors
     ///
@@ -673,10 +767,11 @@ impl ReceiptBuilder {
         stop_condition: StopCondition,
         budget_usage: BudgetUsage,
         completed_at: u64,
-    ) -> Result<(CoordinationReceipt, Hash), ReceiptError> {
+    ) -> Result<(CoordinationReceipt, Hash, Hash), ReceiptError> {
         let receipt = self.build(stop_condition, budget_usage, completed_at);
-        let hash = receipt.store(cas)?;
-        Ok((receipt, hash))
+        let canonical_hash = receipt.compute_hash();
+        let cas_hash = receipt.store(cas)?;
+        Ok((receipt, canonical_hash, cas_hash))
     }
 }
 
@@ -850,6 +945,56 @@ mod tests {
     }
 
     #[test]
+    fn tck_00154_receipt_delimiter_injection_produces_different_hash() {
+        // CRITICAL TEST: Ensure delimiter injection doesn't cause hash collisions
+        //
+        // With naive delimiter-based encoding (e.g., "a|b" + "c" vs "a" + "b|c"),
+        // different logical data could produce same bytes.
+        //
+        // Length-prefixed encoding prevents this.
+
+        // Receipt 1: coordination_id = "a|b", work with id "c"
+        let receipt1 = CoordinationReceipt {
+            coordination_id: "a|b".to_string(),
+            work_outcomes: vec![
+                WorkOutcome::new("c".to_string(), 1, SessionOutcome::Success, vec![]).unwrap(),
+            ],
+            budget_usage: BudgetUsage::new(),
+            budget_ceiling: CoordinationBudget::new(10, 60_000, None).unwrap(),
+            stop_condition: StopCondition::WorkCompleted,
+            started_at: 0,
+            completed_at: 0,
+            total_sessions: 0,
+            successful_sessions: 0,
+            failed_sessions: 0,
+        };
+
+        // Receipt 2: coordination_id = "a", work with id "b|c"
+        let receipt2 = CoordinationReceipt {
+            coordination_id: "a".to_string(),
+            work_outcomes: vec![
+                WorkOutcome::new("b|c".to_string(), 1, SessionOutcome::Success, vec![]).unwrap(),
+            ],
+            budget_usage: BudgetUsage::new(),
+            budget_ceiling: CoordinationBudget::new(10, 60_000, None).unwrap(),
+            stop_condition: StopCondition::WorkCompleted,
+            started_at: 0,
+            completed_at: 0,
+            total_sessions: 0,
+            successful_sessions: 0,
+            failed_sessions: 0,
+        };
+
+        let hash1 = receipt1.compute_hash();
+        let hash2 = receipt2.compute_hash();
+
+        assert_ne!(
+            hash1, hash2,
+            "Delimiter injection must produce different hashes"
+        );
+    }
+
+    #[test]
     fn tck_00154_receipt_serde_roundtrip() {
         let receipt = create_test_receipt();
 
@@ -865,33 +1010,36 @@ mod tests {
         let receipt = create_test_receipt();
 
         // Store
-        let hash = receipt.store(&cas).unwrap();
+        let cas_hash = receipt.store(&cas).unwrap();
 
         // Load
-        let loaded = CoordinationReceipt::load(&cas, &hash).unwrap();
+        let loaded = CoordinationReceipt::load(&cas, &cas_hash).unwrap();
 
         assert_eq!(receipt, loaded);
     }
 
     #[test]
-    fn tck_00154_receipt_hash_matches_cas_content() {
+    fn tck_00154_receipt_canonical_hash_differs_from_cas_hash() {
         let cas = MemoryCas::new();
         let receipt = create_test_receipt();
 
-        // Store and get hash
-        let stored_hash = receipt.store(&cas).unwrap();
+        // Get both hashes
+        let canonical_hash = receipt.compute_hash();
+        let cas_hash = receipt.store(&cas).unwrap();
 
-        // Compute hash directly
-        let computed_hash = receipt.compute_hash();
+        // They should be different (canonical is length-prefixed, CAS is JSON)
+        assert_ne!(
+            canonical_hash, cas_hash,
+            "Canonical and CAS hashes should differ"
+        );
 
-        // Note: stored_hash is from JSON bytes, computed_hash is from canonical bytes
-        // They will be different, but both are valid content-addressed hashes
-        // The important thing is that load() verifies consistency
-        let loaded = CoordinationReceipt::load(&cas, &stored_hash).unwrap();
-        assert_eq!(receipt, loaded);
+        // But canonical hash should be stable
+        let canonical_hash2 = receipt.compute_hash();
+        assert_eq!(canonical_hash, canonical_hash2);
 
-        // And verify() uses canonical hash
-        assert!(receipt.verify(&computed_hash).is_ok());
+        // And both should work for their intended purposes
+        assert!(receipt.verify(&canonical_hash).is_ok());
+        let _loaded = CoordinationReceipt::load(&cas, &cas_hash).unwrap();
     }
 
     #[test]
@@ -1011,13 +1159,11 @@ mod tests {
         let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
         let mut builder = ReceiptBuilder::new("coord-123".to_string(), budget, 1_000_000_000);
 
-        // Create outcome with too many session IDs by bypassing WorkOutcome::new()
-        // We directly construct to test the builder's validation
+        // Create outcome with too many session IDs by direct construction
         let session_ids: Vec<String> = (0..=MAX_SESSION_IDS_PER_OUTCOME)
             .map(|i| format!("session-{i}"))
             .collect();
 
-        // Construct directly to bypass WorkOutcome::new() validation
         let outcome = WorkOutcome {
             work_id: "work-1".to_string(),
             attempts: 1,
@@ -1111,13 +1257,16 @@ mod tests {
         builder.record_session(SessionOutcome::Success);
 
         let usage = BudgetUsage::new();
-        let (receipt, hash) = builder
+        let (receipt, canonical_hash, cas_hash) = builder
             .build_and_store(&cas, StopCondition::WorkCompleted, usage, 1_001_000_000)
             .unwrap();
 
         // Verify stored correctly
-        let loaded = CoordinationReceipt::load(&cas, &hash).unwrap();
+        let loaded = CoordinationReceipt::load(&cas, &cas_hash).unwrap();
         assert_eq!(receipt, loaded);
+
+        // Verify canonical hash works
+        assert!(receipt.verify(&canonical_hash).is_ok());
     }
 
     #[test]
@@ -1203,7 +1352,7 @@ mod tests {
             consumed_tokens: 15000,
         };
 
-        let (receipt, hash) = builder
+        let (receipt, canonical_hash, cas_hash) = builder
             .build_and_store(&cas, StopCondition::WorkCompleted, usage, 1_005_000_000)
             .unwrap();
 
@@ -1215,17 +1364,18 @@ mod tests {
         assert_eq!(receipt.failed_sessions, 1);
 
         // Verify can load from CAS
-        let loaded = CoordinationReceipt::load(&cas, &hash).unwrap();
+        let loaded = CoordinationReceipt::load(&cas, &cas_hash).unwrap();
         assert_eq!(receipt, loaded);
+
+        // Verify tamper-evidence hash
+        assert!(receipt.verify(&canonical_hash).is_ok());
     }
 
     #[test]
     fn tck_00154_receipt_tamper_detection() {
-        let cas = MemoryCas::new();
         let receipt = create_test_receipt();
 
-        // Store original and get canonical hash
-        let _stored_hash = receipt.store(&cas).unwrap();
+        // Get canonical hash
         let original_hash = receipt.compute_hash();
 
         // Create tampered receipt
@@ -1265,9 +1415,9 @@ mod tests {
 
         let stop_conditions = vec![
             StopCondition::WorkCompleted,
-            StopCondition::BudgetExhausted(super::super::state::BudgetType::Episodes),
-            StopCondition::BudgetExhausted(super::super::state::BudgetType::Duration),
-            StopCondition::BudgetExhausted(super::super::state::BudgetType::Tokens),
+            StopCondition::BudgetExhausted(BudgetType::Episodes),
+            StopCondition::BudgetExhausted(BudgetType::Duration),
+            StopCondition::BudgetExhausted(BudgetType::Tokens),
             StopCondition::MaxAttemptsExceeded {
                 work_id: "work-1".to_string(),
             },
@@ -1280,23 +1430,59 @@ mod tests {
             let builder = ReceiptBuilder::new("coord-test".to_string(), budget.clone(), 1_000);
             let receipt = builder.build(stop_condition.clone(), BudgetUsage::new(), 2_000);
 
+            // Verify hash is deterministic
+            let hash1 = receipt.compute_hash();
+            let hash2 = receipt.compute_hash();
+            assert_eq!(hash1, hash2);
+
             // Verify serde roundtrip
             let json = serde_json::to_string(&receipt).unwrap();
             let restored: CoordinationReceipt = serde_json::from_str(&json).unwrap();
             assert_eq!(receipt.stop_condition, restored.stop_condition);
-
-            // Verify canonical bytes include stop condition
-            let canonical = String::from_utf8(receipt.canonical_bytes()).unwrap();
-            match &receipt.stop_condition {
-                StopCondition::WorkCompleted => assert!(canonical.contains("WorkCompleted")),
-                StopCondition::BudgetExhausted(_) => assert!(canonical.contains("BudgetExhausted")),
-                StopCondition::MaxAttemptsExceeded { .. } => {
-                    assert!(canonical.contains("MaxAttemptsExceeded"));
-                },
-                StopCondition::CircuitBreakerTriggered { .. } => {
-                    assert!(canonical.contains("CircuitBreakerTriggered"));
-                },
-            }
         }
+    }
+
+    #[test]
+    fn tck_00154_stop_condition_uses_stable_encoding() {
+        // Verify that BudgetType uses as_str() for stable encoding
+        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+
+        let receipt_duration = {
+            let builder = ReceiptBuilder::new("coord-1".to_string(), budget.clone(), 1_000);
+            builder.build(
+                StopCondition::BudgetExhausted(BudgetType::Duration),
+                BudgetUsage::new(),
+                2_000,
+            )
+        };
+
+        let receipt_tokens = {
+            let builder = ReceiptBuilder::new("coord-1".to_string(), budget.clone(), 1_000);
+            builder.build(
+                StopCondition::BudgetExhausted(BudgetType::Tokens),
+                BudgetUsage::new(),
+                2_000,
+            )
+        };
+
+        // Different budget types should produce different hashes
+        assert_ne!(
+            receipt_duration.compute_hash(),
+            receipt_tokens.compute_hash()
+        );
+
+        // Same budget type should produce same hash
+        let receipt_duration2 = {
+            let builder = ReceiptBuilder::new("coord-1".to_string(), budget, 1_000);
+            builder.build(
+                StopCondition::BudgetExhausted(BudgetType::Duration),
+                BudgetUsage::new(),
+                2_000,
+            )
+        };
+        assert_eq!(
+            receipt_duration.compute_hash(),
+            receipt_duration2.compute_hash()
+        );
     }
 }
