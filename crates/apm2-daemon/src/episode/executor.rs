@@ -377,7 +377,8 @@ impl ToolExecutor {
             Ok(data) => data,
             Err(err) => {
                 warn!(error = %err, "handler execution failed");
-                // Return failure result with consumed budget
+                // Return failure result with consumed budget (no reconciliation needed
+                // since we charged the estimate and execution failed)
                 return Ok(self.build_failure_result(
                     ctx,
                     err.to_string(),
@@ -387,11 +388,36 @@ impl ToolExecutor {
             },
         };
 
-        // Step 5: Store result in CAS
+        // Step 5: Reconcile budget - adjust for actual vs estimated usage
+        // This is critical for security: prevents fail-open if actual > estimate
+        if let Err(reconcile_err) = self
+            .budget_tracker
+            .reconcile(&estimated_delta, &result_data.budget_consumed)
+        {
+            warn!(
+                error = %reconcile_err,
+                estimated_tokens = estimated_delta.tokens,
+                actual_tokens = result_data.budget_consumed.tokens,
+                "budget reconciliation failed: actual exceeded estimate"
+            );
+            // Fail-closed: return error result, budget remains at charged amount
+            return Err(ExecutorError::BudgetExceeded(reconcile_err));
+        }
+
+        debug!(
+            estimated_tokens = estimated_delta.tokens,
+            actual_tokens = result_data.budget_consumed.tokens,
+            refund_tokens = estimated_delta
+                .tokens
+                .saturating_sub(result_data.budget_consumed.tokens),
+            "budget reconciled"
+        );
+
+        // Step 6: Store result in CAS
         let result_hash = self.store_result_data(&result_data)?;
         debug!(result_hash = %hex::encode(&result_hash[..8]), "result stored in CAS");
 
-        // Step 6: Build and return result
+        // Step 7: Build and return result
         let duration = start_time.elapsed();
         // Safe truncation: durations > 585 years would overflow, which is impractical
         #[allow(clippy::cast_possible_truncation)]
@@ -594,6 +620,12 @@ mod tests {
         fn name(&self) -> &'static str {
             "MockReadHandler"
         }
+
+        fn estimate_budget(&self, _args: &ToolArgs) -> BudgetDelta {
+            // Estimate should be >= actual to pass reconciliation
+            // Actual returns bytes_io=13, so estimate at least that much
+            BudgetDelta::single_call().with_bytes_io(100)
+        }
     }
 
     #[test]
@@ -647,7 +679,7 @@ mod tests {
             .unwrap();
 
         let args = ToolArgs::Read(ReadArgs {
-            path: PathBuf::from("/workspace/file.rs"),
+            path: PathBuf::from("workspace/file.rs"),
             offset: None,
             limit: None,
         });
@@ -664,7 +696,7 @@ mod tests {
         let executor = test_executor();
 
         let args = ToolArgs::Read(ReadArgs {
-            path: PathBuf::from("/workspace/file.rs"),
+            path: PathBuf::from("workspace/file.rs"),
             offset: None,
             limit: None,
         });
@@ -703,7 +735,7 @@ mod tests {
             .unwrap();
 
         let args = ToolArgs::Read(ReadArgs {
-            path: PathBuf::from("/nonexistent"),
+            path: PathBuf::from("nonexistent"),
             offset: None,
             limit: None,
         });
@@ -723,7 +755,7 @@ mod tests {
             .unwrap();
 
         let args = ToolArgs::Read(ReadArgs {
-            path: PathBuf::from("/workspace/file.rs"),
+            path: PathBuf::from("workspace/file.rs"),
             offset: None,
             limit: None,
         });
@@ -746,7 +778,7 @@ mod tests {
             .unwrap();
 
         let args = ToolArgs::Read(ReadArgs {
-            path: PathBuf::from("/workspace/file.rs"),
+            path: PathBuf::from("workspace/file.rs"),
             offset: None,
             limit: None,
         });
@@ -767,7 +799,7 @@ mod tests {
             .unwrap();
 
         let args = ToolArgs::Read(ReadArgs {
-            path: PathBuf::from("/workspace/file.rs"),
+            path: PathBuf::from("workspace/file.rs"),
             offset: None,
             limit: None,
         });
@@ -776,7 +808,7 @@ mod tests {
 
         // No handler for Write
         let write_args = ToolArgs::Write(crate::episode::tool_handler::WriteArgs {
-            path: PathBuf::from("/workspace/file.rs"),
+            path: PathBuf::from("workspace/file.rs"),
             content: Some(b"content".to_vec()),
             content_hash: None,
             create_parents: false,
@@ -821,7 +853,7 @@ mod tests {
             .unwrap();
 
         let args = ToolArgs::Read(ReadArgs {
-            path: PathBuf::from("/workspace/file.rs"),
+            path: PathBuf::from("workspace/file.rs"),
             offset: None,
             limit: None,
         });
@@ -834,5 +866,33 @@ mod tests {
         // The result data was stored in CAS (we can't retrieve from stub,
         // but we verify the store operation completes)
         // In a real implementation, we'd verify the hash matches
+    }
+
+    // =========================================================================
+    // Budget reconciliation tests (TCK-00165 Security Fix)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_executor_reconciles_budget() {
+        let mut executor = test_executor();
+        executor
+            .register_handler(Box::new(MockReadHandler::new()))
+            .unwrap();
+
+        let args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("workspace/file.rs"),
+            offset: None,
+            limit: None,
+        });
+
+        // Execute tool - MockReadHandler returns budget with bytes_io=13
+        // but the estimate is based on limit (4096 default)
+        executor.execute(&test_context(), &args).await.unwrap();
+
+        // Budget should be reconciled to actual consumption
+        let consumed = executor.budget_tracker().consumed();
+        // The actual bytes_io from MockReadHandler is 13, not the estimate
+        assert_eq!(consumed.bytes_io, 13);
+        assert_eq!(consumed.tool_calls, 1);
     }
 }

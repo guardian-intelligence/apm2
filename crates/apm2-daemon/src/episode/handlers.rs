@@ -40,10 +40,36 @@ use super::tool_handler::{ToolArgs, ToolHandler, ToolHandlerError, ToolResultDat
 ///
 /// # Security
 ///
-/// Per CTR-1503, rejects paths containing `..` components to prevent
-/// directory traversal attacks.
+/// Per CTR-1503, rejects:
+/// - Paths containing `..` components (directory traversal)
+/// - Absolute paths (paths starting with `/` on Unix or drive letters on
+///   Windows)
+/// - Paths containing null bytes
+///
+/// All paths must be relative to the workspace root.
 fn validate_path(path: &Path) -> Result<(), ToolHandlerError> {
     let path_str = path.to_string_lossy();
+
+    // Reject absolute paths (CTR-1503 security fix)
+    // This prevents access to system files like /etc/shadow
+    if path.is_absolute() {
+        return Err(ToolHandlerError::PathValidation {
+            path: path_str.to_string(),
+            reason: "absolute paths not allowed; use paths relative to workspace".to_string(),
+        });
+    }
+
+    // Additional check for Windows-style absolute paths (C:\, D:\, etc.)
+    // even on Unix systems (defense in depth)
+    if path_str.len() >= 2 {
+        let bytes = path_str.as_bytes();
+        if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return Err(ToolHandlerError::PathValidation {
+                path: path_str.to_string(),
+                reason: "absolute paths not allowed; use paths relative to workspace".to_string(),
+            });
+        }
+    }
 
     // Reject parent directory traversal (CTR-1503)
     if path.components().any(|c| c.as_os_str() == "..") {
@@ -410,14 +436,95 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_validate_path_ok() {
-        let path = Path::new("/workspace/src/main.rs");
+    fn test_validate_path_relative_ok() {
+        let path = Path::new("workspace/src/main.rs");
         assert!(validate_path(path).is_ok());
     }
 
     #[test]
+    fn test_validate_path_relative_nested_ok() {
+        let path = Path::new("src/lib/module/file.rs");
+        assert!(validate_path(path).is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_absolute_unix_rejected() {
+        let path = Path::new("/etc/passwd");
+        let result = validate_path(path);
+        assert!(
+            matches!(result, Err(ToolHandlerError::PathValidation { .. })),
+            "Expected path validation error for absolute path"
+        );
+        if let Err(ToolHandlerError::PathValidation { reason, .. }) = result {
+            assert!(
+                reason.contains("absolute"),
+                "Error should mention 'absolute': {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_path_absolute_shadow_rejected() {
+        // Specific test for /etc/shadow (CTR-1503 bypass test)
+        let path = Path::new("/etc/shadow");
+        let result = validate_path(path);
+        assert!(
+            matches!(result, Err(ToolHandlerError::PathValidation { .. })),
+            "Expected path validation error for /etc/shadow"
+        );
+    }
+
+    #[test]
+    fn test_validate_path_absolute_workspace_rejected() {
+        // Even paths that look like workspace paths should be rejected if absolute
+        let path = Path::new("/workspace/src/main.rs");
+        let result = validate_path(path);
+        assert!(
+            matches!(result, Err(ToolHandlerError::PathValidation { .. })),
+            "Expected path validation error for absolute workspace path"
+        );
+    }
+
+    #[test]
+    fn test_validate_path_windows_drive_rejected() {
+        // Windows-style absolute paths should be rejected even on Unix
+        let path = Path::new("C:\\Windows\\System32\\config\\SAM");
+        let result = validate_path(path);
+        assert!(
+            matches!(result, Err(ToolHandlerError::PathValidation { .. })),
+            "Expected path validation error for Windows drive path"
+        );
+    }
+
+    #[test]
+    fn test_validate_path_windows_drive_lowercase_rejected() {
+        let path = Path::new("c:\\Users\\Admin\\secrets.txt");
+        let result = validate_path(path);
+        assert!(
+            matches!(result, Err(ToolHandlerError::PathValidation { .. })),
+            "Expected path validation error for lowercase Windows drive path"
+        );
+    }
+
+    #[test]
     fn test_validate_path_traversal_rejected() {
-        let path = Path::new("/workspace/../etc/passwd");
+        let path = Path::new("workspace/../etc/passwd");
+        let result = validate_path(path);
+        assert!(matches!(
+            result,
+            Err(ToolHandlerError::PathValidation { .. })
+        ));
+        if let Err(ToolHandlerError::PathValidation { reason, .. }) = result {
+            assert!(
+                reason.contains("traversal"),
+                "Error should mention 'traversal': {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_path_null_byte_rejected() {
+        let path = Path::new("workspace/file\0.txt");
         let result = validate_path(path);
         assert!(matches!(
             result,
@@ -426,13 +533,16 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_path_null_byte_rejected() {
-        let path = Path::new("/workspace/file\0.txt");
-        let result = validate_path(path);
-        assert!(matches!(
-            result,
-            Err(ToolHandlerError::PathValidation { .. })
-        ));
+    fn test_validate_path_current_dir_ok() {
+        // Current directory reference is fine
+        let path = Path::new("./src/main.rs");
+        assert!(validate_path(path).is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_single_file_ok() {
+        let path = Path::new("Cargo.toml");
+        assert!(validate_path(path).is_ok());
     }
 
     // =========================================================================
@@ -443,7 +553,7 @@ mod tests {
     async fn test_read_handler_execute() {
         let handler = ReadFileHandler::new();
         let args = ToolArgs::Read(ReadArgs {
-            path: PathBuf::from("/workspace/file.rs"),
+            path: PathBuf::from("workspace/file.rs"),
             offset: None,
             limit: None,
         });
@@ -457,7 +567,7 @@ mod tests {
     fn test_read_handler_validate_ok() {
         let handler = ReadFileHandler::new();
         let args = ToolArgs::Read(ReadArgs {
-            path: PathBuf::from("/workspace/file.rs"),
+            path: PathBuf::from("workspace/file.rs"),
             offset: None,
             limit: Some(1024),
         });
@@ -466,10 +576,23 @@ mod tests {
     }
 
     #[test]
+    fn test_read_handler_validate_absolute_rejected() {
+        let handler = ReadFileHandler::new();
+        let args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("/etc/passwd"),
+            offset: None,
+            limit: None,
+        });
+
+        let result = handler.validate(&args);
+        assert!(result.is_err(), "Absolute paths should be rejected");
+    }
+
+    #[test]
     fn test_read_handler_validate_traversal() {
         let handler = ReadFileHandler::new();
         let args = ToolArgs::Read(ReadArgs {
-            path: PathBuf::from("/workspace/../etc/passwd"),
+            path: PathBuf::from("workspace/../etc/passwd"),
             offset: None,
             limit: None,
         });
@@ -481,7 +604,7 @@ mod tests {
     fn test_read_handler_validate_limit_too_large() {
         let handler = ReadFileHandler::new();
         let args = ToolArgs::Read(ReadArgs {
-            path: PathBuf::from("/workspace/file.rs"),
+            path: PathBuf::from("workspace/file.rs"),
             offset: None,
             limit: Some(200 * 1024 * 1024), // 200 MiB
         });
@@ -511,7 +634,7 @@ mod tests {
     async fn test_write_handler_execute() {
         let handler = WriteFileHandler::new();
         let args = ToolArgs::Write(WriteArgs {
-            path: PathBuf::from("/workspace/output.txt"),
+            path: PathBuf::from("workspace/output.txt"),
             content: Some(b"hello world".to_vec()),
             content_hash: None,
             create_parents: false,
@@ -527,7 +650,7 @@ mod tests {
     fn test_write_handler_validate_ok() {
         let handler = WriteFileHandler::new();
         let args = ToolArgs::Write(WriteArgs {
-            path: PathBuf::from("/workspace/output.txt"),
+            path: PathBuf::from("workspace/output.txt"),
             content: Some(b"content".to_vec()),
             content_hash: None,
             create_parents: true,
@@ -538,10 +661,25 @@ mod tests {
     }
 
     #[test]
+    fn test_write_handler_validate_absolute_rejected() {
+        let handler = WriteFileHandler::new();
+        let args = ToolArgs::Write(WriteArgs {
+            path: PathBuf::from("/etc/crontab"),
+            content: Some(b"malicious".to_vec()),
+            content_hash: None,
+            create_parents: false,
+            append: false,
+        });
+
+        let result = handler.validate(&args);
+        assert!(result.is_err(), "Absolute paths should be rejected");
+    }
+
+    #[test]
     fn test_write_handler_validate_no_content() {
         let handler = WriteFileHandler::new();
         let args = ToolArgs::Write(WriteArgs {
-            path: PathBuf::from("/workspace/output.txt"),
+            path: PathBuf::from("workspace/output.txt"),
             content: None,
             content_hash: None,
             create_parents: false,
@@ -555,7 +693,7 @@ mod tests {
     fn test_write_handler_validate_content_too_large() {
         let handler = WriteFileHandler::new();
         let args = ToolArgs::Write(WriteArgs {
-            path: PathBuf::from("/workspace/output.txt"),
+            path: PathBuf::from("workspace/output.txt"),
             content: Some(vec![0u8; 200 * 1024 * 1024]), // 200 MiB
             content_hash: None,
             create_parents: false,
@@ -591,12 +729,27 @@ mod tests {
         let args = ToolArgs::Execute(ExecuteArgs {
             command: "ls".to_string(),
             args: vec!["-la".to_string()],
-            cwd: Some(PathBuf::from("/workspace")),
+            cwd: Some(PathBuf::from("workspace")),
             stdin: None,
             timeout_ms: Some(30_000),
         });
 
         assert!(handler.validate(&args).is_ok());
+    }
+
+    #[test]
+    fn test_execute_handler_validate_cwd_absolute_rejected() {
+        let handler = ExecuteHandler::new();
+        let args = ToolArgs::Execute(ExecuteArgs {
+            command: "ls".to_string(),
+            args: vec![],
+            cwd: Some(PathBuf::from("/etc")),
+            stdin: None,
+            timeout_ms: None,
+        });
+
+        let result = handler.validate(&args);
+        assert!(result.is_err(), "Absolute cwd paths should be rejected");
     }
 
     #[test]
@@ -633,7 +786,7 @@ mod tests {
         let args = ToolArgs::Execute(ExecuteArgs {
             command: "ls".to_string(),
             args: vec![],
-            cwd: Some(PathBuf::from("/workspace/../etc")),
+            cwd: Some(PathBuf::from("workspace/../etc")),
             stdin: None,
             timeout_ms: None,
         });
@@ -662,7 +815,7 @@ mod tests {
     #[test]
     fn test_handler_budget_estimates() {
         let read_args = ToolArgs::Read(ReadArgs {
-            path: PathBuf::from("/file"),
+            path: PathBuf::from("file"),
             offset: None,
             limit: Some(8192),
         });
@@ -671,7 +824,7 @@ mod tests {
         assert_eq!(estimate.bytes_io, 8192);
 
         let write_args = ToolArgs::Write(WriteArgs {
-            path: PathBuf::from("/file"),
+            path: PathBuf::from("file"),
             content: Some(vec![0u8; 1000]),
             content_hash: None,
             create_parents: false,
