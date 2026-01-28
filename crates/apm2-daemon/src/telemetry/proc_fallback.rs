@@ -29,25 +29,86 @@
 //!
 //! - AD-CGROUP-001: Degraded mode fallback to /proc
 
-use std::fs;
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
+use nix::libc;
 use nix::unistd::Pid;
 use thiserror::Error;
 use tracing::debug;
 
 use super::stats::{CpuStats, IoStats, MemoryStats, MetricSource};
 
-/// System page size (typically 4096 bytes).
-/// Used to convert page counts to bytes.
-const PAGE_SIZE: u64 = 4096;
+/// Maximum size for proc file reads (64 KiB).
+///
+/// This prevents denial-of-service via unbounded file reads. Proc files are
+/// typically small, but we use a generous limit for safety.
+pub const MAX_PROC_FILE_SIZE: u64 = 64 * 1024;
 
-/// Clock ticks per second (typically 100 on Linux).
-/// Used to convert jiffies to nanoseconds.
-const CLK_TCK: u64 = 100;
+/// Fallback page size if sysconf fails (4096 bytes).
+const FALLBACK_PAGE_SIZE: u64 = 4096;
 
-/// Nanoseconds per jiffy (10,000,000 ns for 100 Hz).
-const NS_PER_JIFFY: u64 = 1_000_000_000 / CLK_TCK;
+/// Fallback clock ticks per second if sysconf fails (100 Hz).
+const FALLBACK_CLK_TCK: u64 = 100;
+
+/// Runtime-queried system page size.
+///
+/// Uses libc `sysconf(_SC_PAGESIZE)` for accurate system-specific value.
+#[allow(unsafe_code)]
+fn page_size() -> u64 {
+    static PAGE_SIZE: OnceLock<u64> = OnceLock::new();
+    *PAGE_SIZE.get_or_init(|| {
+        // SAFETY: sysconf is a thread-safe libc function that reads system
+        // configuration without modifying any state. _SC_PAGESIZE is a valid
+        // sysconf parameter on all POSIX systems.
+        let result = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if result > 0 {
+            // SAFETY: We verified result > 0, so the cast is safe
+            #[allow(clippy::cast_sign_loss)]
+            let value = result as u64;
+            value
+        } else {
+            debug!(
+                "sysconf(_SC_PAGESIZE) failed, using fallback {}",
+                FALLBACK_PAGE_SIZE
+            );
+            FALLBACK_PAGE_SIZE
+        }
+    })
+}
+
+/// Runtime-queried clock ticks per second.
+///
+/// Uses libc `sysconf(_SC_CLK_TCK)` for accurate system-specific value.
+#[allow(unsafe_code)]
+fn clk_tck() -> u64 {
+    static CLK_TCK: OnceLock<u64> = OnceLock::new();
+    *CLK_TCK.get_or_init(|| {
+        // SAFETY: sysconf is a thread-safe libc function that reads system
+        // configuration without modifying any state. _SC_CLK_TCK is a valid
+        // sysconf parameter on all POSIX systems.
+        let result = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if result > 0 {
+            // SAFETY: We verified result > 0, so the cast is safe
+            #[allow(clippy::cast_sign_loss)]
+            let value = result as u64;
+            value
+        } else {
+            debug!(
+                "sysconf(_SC_CLK_TCK) failed, using fallback {}",
+                FALLBACK_CLK_TCK
+            );
+            FALLBACK_CLK_TCK
+        }
+    })
+}
+
+/// Calculates nanoseconds per jiffy based on runtime `CLK_TCK`.
+fn ns_per_jiffy() -> u64 {
+    1_000_000_000 / clk_tck()
+}
 
 /// Proc reader errors.
 #[derive(Debug, Error)]
@@ -140,15 +201,32 @@ impl ProcReader {
         PathBuf::from(format!("/proc/{}/{}", self.pid.as_raw(), file))
     }
 
-    /// Reads a proc file as a string.
+    /// Reads a proc file as a string with bounded size.
+    ///
+    /// Uses `Read::take()` to limit reads to `MAX_PROC_FILE_SIZE` bytes,
+    /// preventing denial-of-service via unbounded file reads.
     fn read_file(self, file: &str) -> ProcResult<String> {
         self.validate_pid()?;
         let path = self.proc_path(file);
-        fs::read_to_string(&path).map_err(|e| ProcError::ReadFailed {
+
+        let f = File::open(&path).map_err(|e| ProcError::ReadFailed {
             pid: self.pid.as_raw(),
             file: file.to_string(),
             source: e,
-        })
+        })?;
+
+        let mut reader = BufReader::new(f).take(MAX_PROC_FILE_SIZE);
+        let mut content = String::new();
+
+        reader
+            .read_to_string(&mut content)
+            .map_err(|e| ProcError::ReadFailed {
+                pid: self.pid.as_raw(),
+                file: file.to_string(),
+                source: e,
+            })?;
+
+        Ok(content)
     }
 
     /// Reads CPU statistics from `/proc/{pid}/stat`.
@@ -204,9 +282,10 @@ impl ProcReader {
             reason: format!("invalid stime value: '{}'", fields[12]),
         })?;
 
-        // Convert jiffies to nanoseconds
-        let user_ns = utime_jiffies.saturating_mul(NS_PER_JIFFY);
-        let system_ns = stime_jiffies.saturating_mul(NS_PER_JIFFY);
+        // Convert jiffies to nanoseconds using runtime CLK_TCK
+        let ns_per_jiff = ns_per_jiffy();
+        let user_ns = utime_jiffies.saturating_mul(ns_per_jiff);
+        let system_ns = stime_jiffies.saturating_mul(ns_per_jiff);
         let usage_ns = user_ns.saturating_add(system_ns);
 
         debug!(
@@ -256,7 +335,7 @@ impl ProcReader {
                 reason: format!("invalid resident value: '{}'", statm_fields[1]),
             })?;
 
-        let rss_bytes = resident_pages.saturating_mul(PAGE_SIZE);
+        let rss_bytes = resident_pages.saturating_mul(page_size());
 
         // Read stat for page faults
         let proc_stat = self.read_file("stat")?;
@@ -448,8 +527,27 @@ mod tests {
 
     #[test]
     fn test_ns_per_jiffy_calculation() {
-        // Verify the constant is correct for 100 Hz
-        assert_eq!(NS_PER_JIFFY, 10_000_000);
+        // Verify ns_per_jiffy returns a sensible value
+        // On most Linux systems, CLK_TCK is 100, so ns_per_jiffy should be 10,000,000
+        let ns = ns_per_jiffy();
+        assert!(ns > 0, "ns_per_jiffy should be positive");
+        assert!(
+            ns <= 1_000_000_000,
+            "ns_per_jiffy should be at most 1 second"
+        );
+    }
+
+    #[test]
+    fn test_page_size_is_positive() {
+        let size = page_size();
+        assert!(size > 0, "page_size should be positive");
+        assert!(size.is_power_of_two(), "page_size should be a power of two");
+    }
+
+    #[test]
+    fn test_clk_tck_is_positive() {
+        let ticks = clk_tck();
+        assert!(ticks > 0, "clk_tck should be positive");
     }
 
     // Integration test that reads from actual /proc

@@ -117,6 +117,11 @@ impl CpuStats {
     /// Creates new CPU statistics.
     ///
     /// Values are clamped to `MAX_NS` to prevent overflow.
+    ///
+    /// # Note
+    ///
+    /// This constructor does not enforce the invariant `usage >= user +
+    /// system`. Use [`try_new`](Self::try_new) for strict validation.
     #[must_use]
     pub const fn new(usage_ns: u64, user_ns: u64, system_ns: u64, source: MetricSource) -> Self {
         Self {
@@ -129,6 +134,42 @@ impl CpuStats {
             },
             source,
         }
+    }
+
+    /// Creates new CPU statistics with invariant validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if `usage_ns < user_ns + system_ns`.
+    pub fn try_new(
+        usage_ns: u64,
+        user_ns: u64,
+        system_ns: u64,
+        source: MetricSource,
+    ) -> Result<Self, String> {
+        let stats = Self::new(usage_ns, user_ns, system_ns, source);
+        stats.validate()?;
+        Ok(stats)
+    }
+
+    /// Validates the CPU stats invariants.
+    ///
+    /// # Invariants
+    ///
+    /// - [INV-CPU001] `usage_ns >= user_ns + system_ns` (may include wait time)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string describing the violated invariant.
+    pub fn validate(&self) -> Result<(), String> {
+        let user_plus_system = self.user_ns.saturating_add(self.system_ns);
+        if self.usage_ns < user_plus_system {
+            return Err(format!(
+                "INV-CPU001 violated: usage_ns ({}) < user_ns ({}) + system_ns ({})",
+                self.usage_ns, self.user_ns, self.system_ns
+            ));
+        }
+        Ok(())
     }
 
     /// Creates CPU statistics indicating unavailable metrics.
@@ -237,6 +278,11 @@ impl MemoryStats {
     /// Creates new memory statistics.
     ///
     /// Values are clamped to their respective maximums to prevent overflow.
+    ///
+    /// # Note
+    ///
+    /// This constructor does not enforce the invariant `peak >= rss`.
+    /// Use [`try_new`](Self::try_new) for strict validation.
     #[must_use]
     pub const fn new(
         rss_bytes: u64,
@@ -268,6 +314,48 @@ impl MemoryStats {
             },
             source,
         }
+    }
+
+    /// Creates new memory statistics with invariant validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if `peak_bytes < rss_bytes`.
+    pub fn try_new(
+        rss_bytes: u64,
+        peak_bytes: u64,
+        page_faults_major: u64,
+        page_faults_minor: u64,
+        source: MetricSource,
+    ) -> Result<Self, String> {
+        let stats = Self::new(
+            rss_bytes,
+            peak_bytes,
+            page_faults_major,
+            page_faults_minor,
+            source,
+        );
+        stats.validate()?;
+        Ok(stats)
+    }
+
+    /// Validates the memory stats invariants.
+    ///
+    /// # Invariants
+    ///
+    /// - [INV-MEM001] `peak_bytes >= rss_bytes` at collection time
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string describing the violated invariant.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.peak_bytes < self.rss_bytes {
+            return Err(format!(
+                "INV-MEM001 violated: peak_bytes ({}) < rss_bytes ({})",
+                self.peak_bytes, self.rss_bytes
+            ));
+        }
+        Ok(())
     }
 
     /// Creates memory statistics indicating unavailable metrics.
@@ -614,6 +702,44 @@ mod tests {
     }
 
     #[test]
+    fn test_cpu_stats_validate_ok() {
+        // usage >= user + system
+        let stats = CpuStats::new(
+            1_000_000_000,
+            600_000_000,
+            400_000_000,
+            MetricSource::Cgroup,
+        );
+        assert!(stats.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cpu_stats_validate_fail() {
+        // usage < user + system violates invariant
+        let stats = CpuStats::new(500_000_000, 600_000_000, 400_000_000, MetricSource::Cgroup);
+        let result = stats.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("INV-CPU001"));
+    }
+
+    #[test]
+    fn test_cpu_stats_try_new_ok() {
+        let result = CpuStats::try_new(
+            1_000_000_000,
+            600_000_000,
+            400_000_000,
+            MetricSource::Cgroup,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_cpu_stats_try_new_fail() {
+        let result = CpuStats::try_new(500_000_000, 600_000_000, 400_000_000, MetricSource::Cgroup);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_cpu_stats_serialize() {
         let stats = CpuStats::new(
             1_000_000_000,
@@ -659,8 +785,36 @@ mod tests {
 
     #[test]
     fn test_memory_stats_rss_mib() {
-        let stats = MemoryStats::new(104_857_600, 0, 0, 0, MetricSource::Cgroup);
+        let stats = MemoryStats::new(104_857_600, 104_857_600, 0, 0, MetricSource::Cgroup);
         assert_eq!(stats.rss_mib(), 100);
+    }
+
+    #[test]
+    fn test_memory_stats_validate_ok() {
+        // peak >= rss
+        let stats = MemoryStats::new(104_857_600, 157_286_400, 10, 1000, MetricSource::Cgroup);
+        assert!(stats.validate().is_ok());
+    }
+
+    #[test]
+    fn test_memory_stats_validate_fail() {
+        // peak < rss violates invariant
+        let stats = MemoryStats::new(157_286_400, 104_857_600, 10, 1000, MetricSource::Cgroup);
+        let result = stats.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("INV-MEM001"));
+    }
+
+    #[test]
+    fn test_memory_stats_try_new_ok() {
+        let result = MemoryStats::try_new(104_857_600, 157_286_400, 10, 1000, MetricSource::Cgroup);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_memory_stats_try_new_fail() {
+        let result = MemoryStats::try_new(157_286_400, 104_857_600, 10, 1000, MetricSource::Cgroup);
+        assert!(result.is_err());
     }
 
     // ========================================================================

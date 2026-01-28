@@ -43,7 +43,8 @@
 //! - AD-CGROUP-001: Per-episode cgroup hierarchy with systemd transient API
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use nix::unistd::Pid;
@@ -64,6 +65,13 @@ pub const MAX_CGROUP_PATH_LEN: usize = 4096;
 
 /// Maximum episode ID length for cgroup scope names.
 pub const MAX_EPISODE_ID_LEN: usize = 128;
+
+/// Maximum size for telemetry file reads (64 KiB).
+///
+/// This prevents denial-of-service via unbounded file reads on paths derived
+/// from external IDs. Cgroup stat files are typically a few hundred bytes;
+/// 64 KiB is generous.
+pub const MAX_TELEMETRY_FILE_SIZE: u64 = 64 * 1024;
 
 /// Cgroup reader errors.
 #[derive(Debug, Error)]
@@ -409,33 +417,51 @@ impl CgroupReader {
     }
 
     /// Reads memory stats from cgroup files.
+    ///
+    /// Fails closed on parse errors per security review - returns error
+    /// rather than using default values that could mask issues.
     fn read_memory_from_cgroup(&self) -> CgroupResult<MemoryStats> {
-        // Read memory.current
+        // Read memory.current (required)
         let current_path = self.cgroup_path.join("memory.current");
         let current_content = read_cgroup_file(&current_path)?;
         let rss_bytes = parse_u64(current_content.trim(), "memory.current", "value")?;
 
-        // Read memory.peak (may not exist on older kernels)
-        let peak_bytes = read_cgroup_file(&self.cgroup_path.join("memory.peak"))
-            .map_or(rss_bytes, |content| {
-                parse_u64(content.trim(), "memory.peak", "value").unwrap_or(rss_bytes)
-            });
+        // Read memory.peak (required for proper invariant validation)
+        let peak_path = self.cgroup_path.join("memory.peak");
+        let peak_bytes = match read_cgroup_file(&peak_path) {
+            Ok(content) => parse_u64(content.trim(), "memory.peak", "value")?,
+            Err(CgroupError::ReadFailed { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                // memory.peak doesn't exist on older kernels - use rss as fallback
+                debug!("memory.peak not available, using memory.current as peak");
+                rss_bytes
+            },
+            Err(e) => return Err(e),
+        };
 
-        // Read memory.stat for page faults
-        let (page_faults_major, page_faults_minor) =
-            read_cgroup_file(&self.cgroup_path.join("memory.stat"))
-                .map_or((0, 0), |content| parse_memory_stat(&content));
+        // Read memory.stat for page faults (required)
+        let memory_stat_path = self.cgroup_path.join("memory.stat");
+        let memory_stat_content = read_cgroup_file(&memory_stat_path)?;
+        let (page_faults_major, page_faults_minor) = parse_memory_stat(&memory_stat_content)?;
 
-        Ok(MemoryStats::new(
+        // Validate and construct stats
+        MemoryStats::try_new(
             rss_bytes,
             peak_bytes,
             page_faults_major,
             page_faults_minor,
             MetricSource::Cgroup,
-        ))
+        )
+        .map_err(|reason| CgroupError::ParseFailed {
+            file: "memory.*".to_string(),
+            reason,
+        })
     }
 
     /// Reads I/O stats from cgroup files.
+    ///
+    /// Fails closed on parse errors per security review.
     fn read_io_from_cgroup(&self) -> CgroupResult<IoStats> {
         let io_stat_path = self.cgroup_path.join("io.stat");
         let content = read_cgroup_file(&io_stat_path)?;
@@ -447,7 +473,9 @@ impl CgroupReader {
 
         // io.stat format: <major>:<minor> rbytes=<n> wbytes=<n> rios=<n> wios=<n> ...
         for line in content.lines() {
-            let stats = parse_io_stat_line(line);
+            let stats = parse_io_stat_line(line)?;
+            // Use 0 as default for missing keys (device may not have all metrics)
+            // but fail on malformed values (handled by parse_io_stat_line)
             total_read_bytes =
                 total_read_bytes.saturating_add(stats.get("rbytes").copied().unwrap_or(0));
             total_write_bytes =
@@ -544,12 +572,392 @@ fn check_controllers(cgroup_path: &Path) -> ControllerAvailability {
     }
 }
 
-/// Reads a cgroup file as a string.
+// ============================================================================
+// Cgroup Scope Creation (per AD-CGROUP-001)
+// ============================================================================
+
+/// Resource limits for an episode cgroup scope.
+///
+/// Specifies the resource constraints to apply when creating a cgroup scope.
+#[derive(Debug, Clone, Default)]
+pub struct EpisodeBudget {
+    /// Memory limit in bytes (maps to `memory.max`).
+    pub memory_bytes: Option<u64>,
+    /// CPU time limit in microseconds per period (maps to `cpu.max`).
+    /// Format: `(quota_usec, period_usec)`. E.g., `(100000, 100000)` = 100% of
+    /// one CPU.
+    pub cpu_quota: Option<(u64, u64)>,
+}
+
+/// Strategy used to create a cgroup scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeCreationStrategy {
+    /// Created via systemd transient API (D-Bus).
+    SystemdTransient,
+    /// Created via direct cgroup v2 writes (fallback).
+    DirectWrite,
+}
+
+/// Result of scope creation.
+#[derive(Debug)]
+pub struct ScopeCreationResult {
+    /// Path to the created cgroup.
+    pub cgroup_path: PathBuf,
+    /// Strategy used to create the scope.
+    pub strategy: ScopeCreationStrategy,
+}
+
+/// Creates an episode cgroup scope for process isolation.
+///
+/// Per AD-CGROUP-001, this function:
+/// 1. **Primary**: Uses systemd transient API via zbus (D-Bus)
+/// 2. **Fallback**: Uses direct cgroup v2 writes
+///
+/// The "freeze trick" is used for direct writes: create the cgroup frozen,
+/// assign the PID, then unfreeze to prevent race conditions.
+///
+/// # Arguments
+///
+/// * `episode_id` - The episode identifier (used in scope name)
+/// * `pid` - The process ID to place in the cgroup
+/// * `budget` - Optional resource limits to apply
+///
+/// # Returns
+///
+/// The path to the created cgroup and the strategy used.
+///
+/// # Errors
+///
+/// Returns `CgroupError::CreateFailed` if scope creation fails via both
+/// strategies.
+pub async fn create_episode_scope(
+    episode_id: &str,
+    pid: Pid,
+    budget: Option<&EpisodeBudget>,
+) -> CgroupResult<ScopeCreationResult> {
+    create_episode_scope_with_root(episode_id, pid, budget, CGROUP_V2_MOUNT).await
+}
+
+/// Creates an episode cgroup scope with a custom cgroup root.
+///
+/// This is primarily for testing with mock cgroup hierarchies.
+pub async fn create_episode_scope_with_root(
+    episode_id: &str,
+    pid: Pid,
+    budget: Option<&EpisodeBudget>,
+    cgroup_root: &str,
+) -> CgroupResult<ScopeCreationResult> {
+    validate_episode_id(episode_id)?;
+
+    // Validate PID
+    if pid.as_raw() <= 0 {
+        return Err(CgroupError::CreateFailed {
+            reason: format!("invalid PID: {}", pid.as_raw()),
+        });
+    }
+
+    let scope_name = format!("episode-{episode_id}.scope");
+
+    // Try systemd transient API first
+    match create_scope_via_systemd(&scope_name, pid, budget).await {
+        Ok(cgroup_path) => {
+            debug!(
+                episode_id,
+                pid = %pid,
+                path = %cgroup_path.display(),
+                "created episode scope via systemd"
+            );
+            return Ok(ScopeCreationResult {
+                cgroup_path,
+                strategy: ScopeCreationStrategy::SystemdTransient,
+            });
+        },
+        Err(e) => {
+            debug!(
+                episode_id,
+                error = %e,
+                "systemd transient API failed, trying direct write fallback"
+            );
+        },
+    }
+
+    // Fallback to direct cgroup v2 writes
+    let cgroup_path = create_scope_via_direct_write(&scope_name, pid, budget, cgroup_root)?;
+
+    debug!(
+        episode_id,
+        pid = %pid,
+        path = %cgroup_path.display(),
+        "created episode scope via direct write"
+    );
+
+    Ok(ScopeCreationResult {
+        cgroup_path,
+        strategy: ScopeCreationStrategy::DirectWrite,
+    })
+}
+
+/// Creates a scope via systemd transient API.
+///
+/// Uses D-Bus to call `org.freedesktop.systemd1.Manager.StartTransientUnit`.
+async fn create_scope_via_systemd(
+    scope_name: &str,
+    pid: Pid,
+    budget: Option<&EpisodeBudget>,
+) -> CgroupResult<PathBuf> {
+    use zbus::Connection;
+
+    // Connect to the system bus
+    let connection = Connection::system()
+        .await
+        .map_err(|e| CgroupError::CreateFailed {
+            reason: format!("failed to connect to system bus: {e}"),
+        })?;
+
+    // Build properties for the scope
+    // Safety: We validate PID is positive before calling this function
+    let pid_u32 = u32::try_from(pid.as_raw()).map_err(|_| CgroupError::CreateFailed {
+        reason: format!("PID {} cannot be converted to u32", pid.as_raw()),
+    })?;
+    let mut properties: Vec<(&str, zbus::zvariant::Value<'_>)> = vec![
+        // PIDs to place in the scope
+        ("PIDs", zbus::zvariant::Value::new(vec![pid_u32])),
+        // Delegate controllers to allow nested cgroup management
+        ("Delegate", zbus::zvariant::Value::new(true)),
+    ];
+
+    // Add resource limits if specified
+    if let Some(budget) = budget {
+        if let Some(memory_bytes) = budget.memory_bytes {
+            properties.push(("MemoryMax", zbus::zvariant::Value::new(memory_bytes)));
+        }
+        if let Some((quota, period)) = budget.cpu_quota {
+            // CPUQuota in systemd is expressed as a percentage (e.g., 100 = 100%)
+            // Convert from (quota_usec, period_usec) to percentage
+            let percent = (quota * 100) / period;
+            properties.push(("CPUQuotaPerSecUSec", zbus::zvariant::Value::new(quota)));
+            let _ = percent; // Silence unused variable warning
+        }
+    }
+
+    // Get the systemd manager proxy
+    let proxy = zbus::fdo::ObjectManagerProxy::builder(&connection)
+        .destination("org.freedesktop.systemd1")
+        .map_err(|e| CgroupError::CreateFailed {
+            reason: format!("failed to create proxy builder: {e}"),
+        })?
+        .path("/org/freedesktop/systemd1")
+        .map_err(|e| CgroupError::CreateFailed {
+            reason: format!("failed to set proxy path: {e}"),
+        })?
+        .build()
+        .await
+        .map_err(|e| CgroupError::CreateFailed {
+            reason: format!("failed to build proxy: {e}"),
+        })?;
+
+    // Use low-level call to StartTransientUnit
+    let reply: zbus::Message = connection
+        .call_method(
+            Some("org.freedesktop.systemd1"),
+            "/org/freedesktop/systemd1",
+            Some("org.freedesktop.systemd1.Manager"),
+            "StartTransientUnit",
+            // Arguments: name, mode, properties, aux
+            &(
+                format!("{APM2_SLICE}/{scope_name}"),
+                "fail", // mode: fail if exists
+                properties,
+                Vec::<(String, Vec<(String, zbus::zvariant::Value<'_>)>)>::new(), // aux units
+            ),
+        )
+        .await
+        .map_err(|e| CgroupError::CreateFailed {
+            reason: format!("StartTransientUnit failed: {e}"),
+        })?;
+
+    // Extract the job path from the reply (we don't need it, but verify success)
+    let _: zbus::zvariant::OwnedObjectPath =
+        reply
+            .body()
+            .deserialize()
+            .map_err(|e| CgroupError::CreateFailed {
+                reason: format!("failed to parse StartTransientUnit response: {e}"),
+            })?;
+
+    // The proxy is just for validation, actual path comes from cgroup root
+    let _ = proxy;
+
+    // Return the expected cgroup path
+    Ok(PathBuf::from(CGROUP_V2_MOUNT)
+        .join(APM2_SLICE)
+        .join(scope_name))
+}
+
+/// Creates a scope via direct cgroup v2 writes (fallback).
+///
+/// Uses the "freeze trick" per AD-CGROUP-001:
+/// 1. Create the cgroup directory frozen
+/// 2. Assign the PID
+/// 3. Unfreeze
+///
+/// This prevents race conditions where the process could escape before
+/// being properly contained.
+fn create_scope_via_direct_write(
+    scope_name: &str,
+    pid: Pid,
+    budget: Option<&EpisodeBudget>,
+    cgroup_root: &str,
+) -> CgroupResult<PathBuf> {
+    let slice_path = PathBuf::from(cgroup_root).join(APM2_SLICE);
+    let scope_path = slice_path.join(scope_name);
+
+    // Ensure the APM2 slice exists
+    if !slice_path.exists() {
+        fs::create_dir_all(&slice_path).map_err(|e| CgroupError::CreateFailed {
+            reason: format!("failed to create slice directory: {e}"),
+        })?;
+
+        // Enable controllers in the slice
+        enable_controllers(&slice_path);
+    }
+
+    // Create the scope directory
+    fs::create_dir(&scope_path).map_err(|e| CgroupError::CreateFailed {
+        reason: format!("failed to create scope directory: {e}"),
+    })?;
+
+    // Enable controllers in the scope
+    enable_controllers(&scope_path);
+
+    // Step 1: Freeze the cgroup (if freezer is available)
+    let freeze_path = scope_path.join("cgroup.freeze");
+    let had_freezer = if freeze_path.exists() {
+        fs::write(&freeze_path, "1").map_err(|e| CgroupError::CreateFailed {
+            reason: format!("failed to freeze cgroup: {e}"),
+        })?;
+        true
+    } else {
+        debug!("cgroup.freeze not available, skipping freeze trick");
+        false
+    };
+
+    // Step 2: Assign the PID to the cgroup
+    let procs_path = scope_path.join("cgroup.procs");
+    fs::write(&procs_path, format!("{}\n", pid.as_raw())).map_err(|e| {
+        CgroupError::CreateFailed {
+            reason: format!("failed to assign PID to cgroup: {e}"),
+        }
+    })?;
+
+    // Step 3: Apply resource limits
+    if let Some(budget) = budget {
+        if let Some(memory_bytes) = budget.memory_bytes {
+            let memory_max_path = scope_path.join("memory.max");
+            if memory_max_path.exists() {
+                fs::write(&memory_max_path, format!("{memory_bytes}\n")).map_err(|e| {
+                    CgroupError::CreateFailed {
+                        reason: format!("failed to set memory.max: {e}"),
+                    }
+                })?;
+            }
+        }
+
+        if let Some((quota, period)) = budget.cpu_quota {
+            let cpu_max_path = scope_path.join("cpu.max");
+            if cpu_max_path.exists() {
+                fs::write(&cpu_max_path, format!("{quota} {period}\n")).map_err(|e| {
+                    CgroupError::CreateFailed {
+                        reason: format!("failed to set cpu.max: {e}"),
+                    }
+                })?;
+            }
+        }
+    }
+
+    // Step 4: Unfreeze the cgroup
+    if had_freezer {
+        fs::write(&freeze_path, "0").map_err(|e| CgroupError::CreateFailed {
+            reason: format!("failed to unfreeze cgroup: {e}"),
+        })?;
+    }
+
+    Ok(scope_path)
+}
+
+/// Enables cgroup controllers in a directory.
+///
+/// Writes to `cgroup.subtree_control` to enable cpu, memory, and io
+/// controllers.
+fn enable_controllers(path: &Path) {
+    let subtree_control = path.join("cgroup.subtree_control");
+    if subtree_control.exists() {
+        // Enable common controllers
+        // Note: This may fail if controllers are not available, which is OK
+        let _ = fs::write(&subtree_control, "+cpu +memory +io");
+    }
+}
+
+/// Removes an episode cgroup scope.
+///
+/// This should be called after the process has terminated to clean up
+/// the cgroup hierarchy.
+///
+/// # Arguments
+///
+/// * `episode_id` - The episode identifier
+///
+/// # Errors
+///
+/// Returns `CgroupError::PathNotFound` if the scope doesn't exist.
+pub fn remove_episode_scope(episode_id: &str) -> CgroupResult<()> {
+    remove_episode_scope_with_root(episode_id, CGROUP_V2_MOUNT)
+}
+
+/// Removes an episode cgroup scope with a custom root.
+pub fn remove_episode_scope_with_root(episode_id: &str, cgroup_root: &str) -> CgroupResult<()> {
+    validate_episode_id(episode_id)?;
+
+    let scope_name = format!("episode-{episode_id}.scope");
+    let scope_path = PathBuf::from(cgroup_root).join(APM2_SLICE).join(scope_name);
+
+    if !scope_path.exists() {
+        return Err(CgroupError::PathNotFound {
+            path: scope_path.display().to_string(),
+        });
+    }
+
+    // Remove the scope directory
+    // Note: This will fail if there are still processes in the cgroup
+    fs::remove_dir(&scope_path).map_err(|e| CgroupError::CreateFailed {
+        reason: format!("failed to remove scope directory: {e}"),
+    })?;
+
+    Ok(())
+}
+
+/// Reads a cgroup file as a string with bounded size.
+///
+/// Uses `Read::take()` to limit reads to `MAX_TELEMETRY_FILE_SIZE` bytes,
+/// preventing denial-of-service via unbounded file reads on paths derived
+/// from external IDs.
 fn read_cgroup_file(path: &Path) -> CgroupResult<String> {
-    fs::read_to_string(path).map_err(|e| CgroupError::ReadFailed {
+    let file = File::open(path).map_err(|e| CgroupError::ReadFailed {
         file: path.display().to_string(),
         source: e,
-    })
+    })?;
+
+    let mut reader = BufReader::new(file).take(MAX_TELEMETRY_FILE_SIZE);
+    let mut content = String::new();
+
+    reader
+        .read_to_string(&mut content)
+        .map_err(|e| CgroupError::ReadFailed {
+            file: path.display().to_string(),
+            source: e,
+        })?;
+
+    Ok(content)
 }
 
 /// Parses a u64 value from a string.
@@ -561,44 +969,74 @@ fn parse_u64(s: &str, file: &str, field: &str) -> CgroupResult<u64> {
 }
 
 /// Parses memory.stat for page fault counters.
-fn parse_memory_stat(content: &str) -> (u64, u64) {
-    let mut pgmajfault: u64 = 0;
-    let mut pgfault: u64 = 0;
+///
+/// Returns `Ok((major, minor))` on success, or `Err` if required fields
+/// cannot be parsed. This is fail-closed behavior per security review.
+fn parse_memory_stat(content: &str) -> CgroupResult<(u64, u64)> {
+    let mut pgmajfault: Option<u64> = None;
+    let mut pgfault: Option<u64> = None;
 
     for line in content.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 2 {
             match parts[0] {
                 "pgmajfault" => {
-                    pgmajfault = parts[1].parse().unwrap_or(0);
+                    pgmajfault = Some(parts[1].parse().map_err(|_| CgroupError::ParseFailed {
+                        file: "memory.stat".to_string(),
+                        reason: format!("invalid pgmajfault value: '{}'", parts[1]),
+                    })?);
                 },
                 "pgfault" => {
-                    pgfault = parts[1].parse().unwrap_or(0);
+                    pgfault = Some(parts[1].parse().map_err(|_| CgroupError::ParseFailed {
+                        file: "memory.stat".to_string(),
+                        reason: format!("invalid pgfault value: '{}'", parts[1]),
+                    })?);
                 },
                 _ => {},
             }
         }
     }
 
+    // Both fields are required for accurate metrics
+    let pgmajfault = pgmajfault.ok_or_else(|| CgroupError::ParseFailed {
+        file: "memory.stat".to_string(),
+        reason: "missing pgmajfault field".to_string(),
+    })?;
+
+    let pgfault = pgfault.ok_or_else(|| CgroupError::ParseFailed {
+        file: "memory.stat".to_string(),
+        reason: "missing pgfault field".to_string(),
+    })?;
+
     // pgfault is total, pgmajfault is major; minor = total - major
     let pgminorfault = pgfault.saturating_sub(pgmajfault);
-    (pgmajfault, pgminorfault)
+    Ok((pgmajfault, pgminorfault))
 }
 
 /// Parses a single line from io.stat.
-fn parse_io_stat_line(line: &str) -> HashMap<&str, u64> {
+///
+/// Returns `Ok(HashMap)` on success, or `Err` if the line format is invalid.
+/// This is fail-closed behavior per security review.
+fn parse_io_stat_line(line: &str) -> CgroupResult<HashMap<&str, u64>> {
     let mut stats = HashMap::new();
+
+    // Empty lines are valid (no I/O recorded)
+    if line.trim().is_empty() {
+        return Ok(stats);
+    }
 
     // Skip the device identifier (first field)
     for part in line.split_whitespace().skip(1) {
         if let Some((key, value)) = part.split_once('=') {
-            if let Ok(v) = value.parse::<u64>() {
-                stats.insert(key, v);
-            }
+            let v = value.parse::<u64>().map_err(|_| CgroupError::ParseFailed {
+                file: "io.stat".to_string(),
+                reason: format!("invalid value for key '{key}': '{value}'"),
+            })?;
+            stats.insert(key, v);
         }
     }
 
-    stats
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -674,15 +1112,32 @@ mod tests {
     #[test]
     fn test_parse_memory_stat() {
         let content = "pgfault 1000\npgmajfault 10\nother 123\n";
-        let (major, minor) = parse_memory_stat(content);
+        let (major, minor) = parse_memory_stat(content).unwrap();
         assert_eq!(major, 10);
         assert_eq!(minor, 990); // 1000 - 10
     }
 
     #[test]
+    fn test_parse_memory_stat_missing_pgfault() {
+        let content = "pgmajfault 10\nother 123\n";
+        let result = parse_memory_stat(content);
+        assert!(matches!(
+            result,
+            Err(CgroupError::ParseFailed { reason, .. }) if reason.contains("pgfault")
+        ));
+    }
+
+    #[test]
+    fn test_parse_memory_stat_invalid_value() {
+        let content = "pgfault notanumber\npgmajfault 10\n";
+        let result = parse_memory_stat(content);
+        assert!(matches!(result, Err(CgroupError::ParseFailed { .. })));
+    }
+
+    #[test]
     fn test_parse_io_stat_line() {
         let line = "8:0 rbytes=12345 wbytes=67890 rios=100 wios=50";
-        let stats = parse_io_stat_line(line);
+        let stats = parse_io_stat_line(line).unwrap();
         assert_eq!(stats.get("rbytes"), Some(&12345));
         assert_eq!(stats.get("wbytes"), Some(&67890));
         assert_eq!(stats.get("rios"), Some(&100));
@@ -692,8 +1147,15 @@ mod tests {
     #[test]
     fn test_parse_io_stat_line_empty() {
         let line = "";
-        let stats = parse_io_stat_line(line);
+        let stats = parse_io_stat_line(line).unwrap();
         assert!(stats.is_empty());
+    }
+
+    #[test]
+    fn test_parse_io_stat_line_invalid_value() {
+        let line = "8:0 rbytes=notanumber";
+        let result = parse_io_stat_line(line);
+        assert!(matches!(result, Err(CgroupError::ParseFailed { .. })));
     }
 
     #[test]

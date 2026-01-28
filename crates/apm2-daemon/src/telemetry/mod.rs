@@ -63,11 +63,13 @@ pub mod stats;
 
 // Re-export primary types
 pub use cgroup::{
-    APM2_SLICE, CGROUP_V2_MOUNT, CgroupError, CgroupReader, CgroupResult, MAX_CGROUP_PATH_LEN,
-    MAX_EPISODE_ID_LEN, episode_cgroup_path, episode_cgroup_path_with_root, is_cgroup_v2_available,
-    is_cgroup_v2_available_at,
+    APM2_SLICE, CGROUP_V2_MOUNT, CgroupError, CgroupReader, CgroupResult, EpisodeBudget,
+    MAX_CGROUP_PATH_LEN, MAX_EPISODE_ID_LEN, MAX_TELEMETRY_FILE_SIZE, ScopeCreationResult,
+    ScopeCreationStrategy, create_episode_scope, create_episode_scope_with_root,
+    episode_cgroup_path, episode_cgroup_path_with_root, is_cgroup_v2_available,
+    is_cgroup_v2_available_at, remove_episode_scope, remove_episode_scope_with_root,
 };
-pub use proc_fallback::{ProcError, ProcReader, ProcResult};
+pub use proc_fallback::{MAX_PROC_FILE_SIZE, ProcError, ProcReader, ProcResult};
 pub use stats::{
     CpuStats, IoStats, MAX_BYTES, MAX_NS, MAX_OPS, MAX_PAGE_FAULTS, MemoryStats, MetricSource,
     ResourceStats,
