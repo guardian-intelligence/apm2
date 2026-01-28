@@ -555,7 +555,7 @@ impl CapabilityManifest {
 
     /// Returns `true` if this manifest has expired using the system clock.
     ///
-    /// For deterministic testing, use [`is_expired_with_clock`] instead.
+    /// For deterministic testing, use [`Self::is_expired_with_clock`] instead.
     #[must_use]
     pub fn is_expired(&self) -> bool {
         self.is_expired_with_clock(&SystemClock)
@@ -1040,7 +1040,7 @@ pub struct CapabilityValidator {
 impl CapabilityValidator {
     /// Creates a new validator with the given manifest using the system clock.
     ///
-    /// For deterministic testing, use [`new_with_clock`] instead.
+    /// For deterministic testing, use [`Self::new_with_clock`] instead.
     ///
     /// # Errors
     ///
