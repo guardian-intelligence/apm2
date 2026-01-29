@@ -7,7 +7,7 @@
 //! # Security Properties
 //!
 //! - **Bounded size**: Registry has a maximum capacity to prevent memory
-//!   exhaustion, with O(1) FIFO eviction when full ([CTR-1303])
+//!   exhaustion, with FIFO eviction when full ([CTR-1303])
 //! - **Bounded handshake**: Handshake requests limited to
 //!   `MAX_HANDSHAKE_DIGESTS` to prevent memory denial-of-service attacks
 //! - **Content verification**: Schema digests are verified on registration
@@ -19,17 +19,16 @@
 //!
 //! # Thread Safety
 //!
-//! The implementation uses `RwLock` for thread-safe concurrent access.
-//! Clone shares the underlying storage via `Arc`.
+//! The implementation uses a single `RwLock` protecting an inner struct for
+//! thread-safe concurrent access. Clone shares the underlying storage via
+//! `Arc`.
 //!
-//! # Lock Ordering
+//! # Eviction Complexity
 //!
-//! To prevent deadlocks, all methods MUST acquire locks in this order:
-//! 1. `insertion_order` (if needed)
-//! 2. `by_digest` (if needed)
-//! 3. `by_stable_id` (if needed)
-//!
-//! Never acquire locks in a different order.
+//! Eviction is typically O(1) via `VecDeque` FIFO ordering, but can degrade to
+//! O(N) in the worst case when all entries are protected (kernel schemas).
+//! Protected schemas are moved to the back of the queue and skipped during
+//! eviction attempts.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
@@ -40,6 +39,27 @@ use super::traits::{
     SchemaDigest, SchemaEntry, SchemaRegistry, SchemaRegistryError,
 };
 use crate::crypto::EventHasher;
+
+/// Inner state protected by a single `RwLock`.
+///
+/// Consolidating all maps into a single lock reduces overhead and simplifies
+/// reasoning about thread safety. The staging pattern (hash verification
+/// outside the lock) is still maintained for denial-of-service prevention.
+#[derive(Debug, Default)]
+struct RegistryInner {
+    /// Insertion order tracking for FIFO eviction.
+    insertion_order: VecDeque<SchemaDigest>,
+    /// Schema storage, keyed by digest.
+    /// Uses `Arc<SchemaEntry>` for zero-copy returns from lookup methods.
+    by_digest: HashMap<SchemaDigest, Arc<SchemaEntry>>,
+    /// Index from stable ID to digest for fast lookup.
+    /// Note: One `stable_id` per digest ([INV-0014]).
+    by_stable_id: HashMap<String, SchemaDigest>,
+    /// Protected digests that cannot be evicted ([INV-0016]).
+    /// Kernel schemas (`stable_id` starting with "kernel:") are automatically
+    /// protected.
+    protected_digests: HashSet<SchemaDigest>,
+}
 
 /// In-memory schema registry for testing and single-node deployments.
 ///
@@ -52,11 +72,11 @@ use crate::crypto::EventHasher;
 /// - [INV-0010] Schema count cannot exceed `max_schemas` (eviction when full)
 /// - [INV-0011] Clone shares storage via `Arc` (not deep copy)
 /// - [INV-0012] Digests are computed from content using BLAKE3
-/// - [INV-0013] Eviction is O(1) via `VecDeque` insertion order tracking
+/// - [INV-0013] Eviction uses FIFO ordering via `VecDeque`; typically O(1) but
+///   can be O(N) when skipping protected schemas
 /// - [INV-0014] One `stable_id` per digest (no aliases) - prevents ghost
 ///   entries
-/// - [INV-0015] Lock ordering: `insertion_order` -> `by_digest` ->
-///   `by_stable_id`
+/// - [INV-0015] Single `RwLock` protects all internal state
 /// - [INV-0016] Protected schemas (kernel:) are never evicted
 ///
 /// # Example
@@ -66,6 +86,7 @@ use crate::crypto::EventHasher;
 /// use apm2_core::schema_registry::{
 ///     InMemorySchemaRegistry, SchemaDigest, SchemaEntry,
 /// };
+/// use bytes::Bytes;
 ///
 /// let registry = InMemorySchemaRegistry::new();
 ///
@@ -76,7 +97,7 @@ use crate::crypto::EventHasher;
 /// let entry = SchemaEntry {
 ///     stable_id: "test:schema.v1".to_string(),
 ///     digest,
-///     content: content.to_vec(),
+///     content: Bytes::from_static(content),
 ///     canonicalizer_version: "cac-json-v1".to_string(),
 ///     registered_at: 0,
 ///     registered_by: "test-actor".to_string(),
@@ -86,18 +107,8 @@ use crate::crypto::EventHasher;
 /// ```
 #[derive(Debug)]
 pub struct InMemorySchemaRegistry {
-    /// Insertion order tracking for O(1) FIFO eviction ([INV-0013]).
-    /// Listed first to document lock ordering ([INV-0015]).
-    insertion_order: Arc<RwLock<VecDeque<SchemaDigest>>>,
-    /// Schema storage, keyed by digest.
-    by_digest: Arc<RwLock<HashMap<SchemaDigest, SchemaEntry>>>,
-    /// Index from stable ID to digest for fast lookup.
-    /// Note: One `stable_id` per digest ([INV-0014]).
-    by_stable_id: Arc<RwLock<HashMap<String, SchemaDigest>>>,
-    /// Protected digests that cannot be evicted ([INV-0016]).
-    /// Kernel schemas (`stable_id` starting with "kernel:") are automatically
-    /// protected.
-    protected_digests: Arc<RwLock<HashSet<SchemaDigest>>>,
+    /// All internal state protected by a single `RwLock` ([INV-0015]).
+    inner: Arc<RwLock<RegistryInner>>,
     /// Maximum number of schemas allowed.
     max_schemas: usize,
 }
@@ -122,13 +133,8 @@ impl InMemorySchemaRegistry {
     /// * `max_schemas` - Maximum number of schemas that can be stored
     #[must_use]
     pub fn with_capacity(max_schemas: usize) -> Self {
-        // Fields ordered to match lock ordering: insertion_order -> by_digest ->
-        // by_stable_id
         Self {
-            insertion_order: Arc::new(RwLock::new(VecDeque::new())),
-            by_digest: Arc::new(RwLock::new(HashMap::new())),
-            by_stable_id: Arc::new(RwLock::new(HashMap::new())),
-            protected_digests: Arc::new(RwLock::new(HashSet::new())),
+            inner: Arc::new(RwLock::new(RegistryInner::default())),
             max_schemas,
         }
     }
@@ -140,7 +146,7 @@ impl InMemorySchemaRegistry {
     /// Panics if the internal lock is poisoned (indicates a thread panic).
     #[must_use]
     pub fn count(&self) -> usize {
-        self.by_digest.read().expect("lock poisoned").len()
+        self.inner.read().expect("lock poisoned").by_digest.len()
     }
 
     /// Returns true if the registry is empty.
@@ -150,7 +156,11 @@ impl InMemorySchemaRegistry {
     /// Panics if the internal lock is poisoned (indicates a thread panic).
     #[must_use]
     pub fn is_empty_sync(&self) -> bool {
-        self.by_digest.read().expect("lock poisoned").is_empty()
+        self.inner
+            .read()
+            .expect("lock poisoned")
+            .by_digest
+            .is_empty()
     }
 
     /// Clears all registered schemas, including protected ones.
@@ -158,22 +168,12 @@ impl InMemorySchemaRegistry {
     /// # Panics
     ///
     /// Panics if the internal lock is poisoned (indicates a thread panic).
-    ///
-    /// # Lock Ordering
-    ///
-    /// Acquires locks in order: `insertion_order` -> `by_digest` ->
-    /// `by_stable_id`
     pub fn clear(&self) {
-        // Lock ordering: insertion_order -> by_digest -> by_stable_id ([INV-0015])
-        let mut insertion_order = self.insertion_order.write().expect("lock poisoned");
-        let mut by_digest = self.by_digest.write().expect("lock poisoned");
-        let mut by_stable_id = self.by_stable_id.write().expect("lock poisoned");
-        let mut protected = self.protected_digests.write().expect("lock poisoned");
-
-        insertion_order.clear();
-        by_digest.clear();
-        by_stable_id.clear();
-        protected.clear();
+        let mut inner = self.inner.write().expect("lock poisoned");
+        inner.insertion_order.clear();
+        inner.by_digest.clear();
+        inner.by_stable_id.clear();
+        inner.protected_digests.clear();
     }
 
     /// Performs cheap validation of a schema entry (without hash verification).
@@ -230,13 +230,8 @@ impl InMemorySchemaRegistry {
 
 impl Clone for InMemorySchemaRegistry {
     fn clone(&self) -> Self {
-        // Fields ordered to match lock ordering: insertion_order -> by_digest ->
-        // by_stable_id
         Self {
-            insertion_order: Arc::clone(&self.insertion_order),
-            by_digest: Arc::clone(&self.by_digest),
-            by_stable_id: Arc::clone(&self.by_stable_id),
-            protected_digests: Arc::clone(&self.protected_digests),
+            inner: Arc::clone(&self.inner),
             max_schemas: self.max_schemas,
         }
     }
@@ -254,15 +249,15 @@ impl SchemaRegistry for InMemorySchemaRegistry {
             //   - Cheap validation (size limits, format)
             //   - Expensive hash verification (BLAKE3 of up to 1MB content)
             //
-            // Phase 2 (READ LOCKS): Quick existence check
+            // Phase 2 (READ LOCK): Quick existence check
             //   - Check if already registered (idempotent no-op)
             //
-            // Phase 3 (WRITE LOCKS): Commit the registration
+            // Phase 3 (WRITE LOCK): Commit the registration
             //   - Re-check under write lock (double-checked locking)
             //   - Evict if needed, then insert
             //
             // This prevents blocking read operations during hash verification.
-            // [INV-0015]: Lock ordering: insertion_order -> by_digest -> by_stable_id
+            // [INV-0015]: Single RwLock protects all internal state.
 
             // ===== PHASE 1: Pre-validation WITHOUT locks =====
             // Cheap validation (O(1) checks, no hashing)
@@ -273,14 +268,13 @@ impl SchemaRegistry for InMemorySchemaRegistry {
             // and blocks all registry operations during hash computation.
             Self::verify_hash(entry)?;
 
-            // ===== PHASE 2: Quick existence check with READ locks =====
-            // Use read locks for fast-path duplicate detection
+            // ===== PHASE 2: Quick existence check with READ lock =====
+            // Use read lock for fast-path duplicate detection
             {
-                let by_digest = self.by_digest.read().expect("lock poisoned");
-                let by_stable_id = self.by_stable_id.read().expect("lock poisoned");
+                let inner = self.inner.read().expect("lock poisoned");
 
                 // Check for stable ID conflict
-                if let Some(existing_digest) = by_stable_id.get(&entry.stable_id) {
+                if let Some(existing_digest) = inner.by_stable_id.get(&entry.stable_id) {
                     if *existing_digest != entry.digest {
                         return Err(SchemaRegistryError::Conflict {
                             stable_id: entry.stable_id.clone(),
@@ -293,23 +287,18 @@ impl SchemaRegistry for InMemorySchemaRegistry {
                 // Check if digest already exists.
                 // SECURITY [INV-0014]: First stable_id wins - subsequent registrations
                 // with same digest are true no-ops. This prevents alias hijacking.
-                if by_digest.contains_key(&entry.digest) {
+                if inner.by_digest.contains_key(&entry.digest) {
                     return Ok(());
                 }
             }
-            // Read locks released here
+            // Read lock released here
 
-            // ===== PHASE 3: Commit with WRITE locks =====
-            // Acquire write locks in consistent order: insertion_order -> by_digest ->
-            // by_stable_id
-            let mut insertion_order = self.insertion_order.write().expect("lock poisoned");
-            let mut by_digest = self.by_digest.write().expect("lock poisoned");
-            let mut by_stable_id = self.by_stable_id.write().expect("lock poisoned");
-            let mut protected = self.protected_digests.write().expect("lock poisoned");
+            // ===== PHASE 3: Commit with WRITE lock =====
+            let mut inner = self.inner.write().expect("lock poisoned");
 
             // Double-checked locking: Re-verify under write lock since another
             // thread may have registered between our read check and write lock
-            if let Some(existing_digest) = by_stable_id.get(&entry.stable_id) {
+            if let Some(existing_digest) = inner.by_stable_id.get(&entry.stable_id) {
                 if *existing_digest != entry.digest {
                     return Err(SchemaRegistryError::Conflict {
                         stable_id: entry.stable_id.clone(),
@@ -317,35 +306,36 @@ impl SchemaRegistry for InMemorySchemaRegistry {
                 }
                 return Ok(());
             }
-            if by_digest.contains_key(&entry.digest) {
+            if inner.by_digest.contains_key(&entry.digest) {
                 return Ok(());
             }
 
             // Evict oldest entries if at capacity ([CTR-1303])
-            // O(1) eviction via insertion_order VecDeque ([INV-0013])
+            // FIFO eviction via insertion_order VecDeque ([INV-0013])
+            // Note: Typically O(1), but can be O(N) when skipping protected schemas.
             // SECURITY [INV-0016]: Skip protected digests (kernel schemas)
             let mut eviction_attempts = 0;
-            let max_eviction_attempts = insertion_order.len();
-            while by_digest.len() >= self.max_schemas {
-                if let Some(oldest_digest) = insertion_order.pop_front() {
+            let max_eviction_attempts = inner.insertion_order.len();
+            while inner.by_digest.len() >= self.max_schemas {
+                if let Some(oldest_digest) = inner.insertion_order.pop_front() {
                     eviction_attempts += 1;
 
                     // Skip protected digests - put them back at the end
-                    if protected.contains(&oldest_digest) {
-                        insertion_order.push_back(oldest_digest);
+                    if inner.protected_digests.contains(&oldest_digest) {
+                        inner.insertion_order.push_back(oldest_digest);
                         // Safety: If we've tried all entries and none can be evicted,
                         // the registry is full of protected schemas.
                         if eviction_attempts > max_eviction_attempts {
                             return Err(SchemaRegistryError::RegistryFull {
-                                current: by_digest.len(),
+                                current: inner.by_digest.len(),
                                 max: self.max_schemas,
                             });
                         }
                         continue;
                     }
                     // Remove the oldest non-protected entry and its stable_id mapping
-                    if let Some(evicted) = by_digest.remove(&oldest_digest) {
-                        by_stable_id.remove(&evicted.stable_id);
+                    if let Some(evicted) = inner.by_digest.remove(&oldest_digest) {
+                        inner.by_stable_id.remove(&evicted.stable_id);
                     }
                     // Note: If digest not found (shouldn't happen with
                     // [INV-0014]), continue evicting
@@ -357,13 +347,16 @@ impl SchemaRegistry for InMemorySchemaRegistry {
             }
 
             // Register the new schema
-            by_digest.insert(entry.digest, entry.clone());
-            by_stable_id.insert(entry.stable_id.clone(), entry.digest);
-            insertion_order.push_back(entry.digest);
+            let arc_entry = Arc::new(entry.clone());
+            inner.by_digest.insert(entry.digest, arc_entry);
+            inner
+                .by_stable_id
+                .insert(entry.stable_id.clone(), entry.digest);
+            inner.insertion_order.push_back(entry.digest);
 
             // SECURITY [INV-0016]: Protect kernel schemas from eviction
             if entry.stable_id.starts_with(KERNEL_SCHEMA_PREFIX) {
-                protected.insert(entry.digest);
+                inner.protected_digests.insert(entry.digest);
             }
 
             Ok(())
@@ -373,26 +366,23 @@ impl SchemaRegistry for InMemorySchemaRegistry {
     fn lookup_by_digest<'a>(
         &'a self,
         digest: &'a SchemaDigest,
-    ) -> BoxFuture<'a, Result<Option<SchemaEntry>, SchemaRegistryError>> {
+    ) -> BoxFuture<'a, Result<Option<Arc<SchemaEntry>>, SchemaRegistryError>> {
         Box::pin(async move {
-            let by_digest = self.by_digest.read().expect("lock poisoned");
-            Ok(by_digest.get(digest).cloned())
+            let inner = self.inner.read().expect("lock poisoned");
+            Ok(inner.by_digest.get(digest).cloned())
         })
     }
 
     fn lookup_by_stable_id<'a>(
         &'a self,
         stable_id: &'a str,
-    ) -> BoxFuture<'a, Result<Option<SchemaEntry>, SchemaRegistryError>> {
+    ) -> BoxFuture<'a, Result<Option<Arc<SchemaEntry>>, SchemaRegistryError>> {
         Box::pin(async move {
-            // LOCK ORDERING ([INV-0015]): by_digest -> by_stable_id
-            // Note: insertion_order not needed for read-only lookup
-            let by_digest = self.by_digest.read().expect("lock poisoned");
-            let by_stable_id = self.by_stable_id.read().expect("lock poisoned");
-
-            Ok(by_stable_id
+            let inner = self.inner.read().expect("lock poisoned");
+            Ok(inner
+                .by_stable_id
                 .get(stable_id)
-                .and_then(|digest| by_digest.get(digest).cloned()))
+                .and_then(|digest| inner.by_digest.get(digest).cloned()))
         })
     }
 
@@ -409,9 +399,10 @@ impl SchemaRegistry for InMemorySchemaRegistry {
                 });
             }
 
-            let by_digest = self.by_digest.read().expect("lock poisoned");
+            let inner = self.inner.read().expect("lock poisoned");
 
-            let local_digests: std::collections::HashSet<_> = by_digest.keys().copied().collect();
+            let local_digests: std::collections::HashSet<_> =
+                inner.by_digest.keys().copied().collect();
             let peer_digest_set: std::collections::HashSet<_> =
                 peer_digests.iter().copied().collect();
 
@@ -440,15 +431,15 @@ impl SchemaRegistry for InMemorySchemaRegistry {
 
     fn all_digests(&self) -> BoxFuture<'_, Result<Vec<SchemaDigest>, SchemaRegistryError>> {
         Box::pin(async move {
-            let by_digest = self.by_digest.read().expect("lock poisoned");
-            Ok(by_digest.keys().copied().collect())
+            let inner = self.inner.read().expect("lock poisoned");
+            Ok(inner.by_digest.keys().copied().collect())
         })
     }
 
     fn len(&self) -> BoxFuture<'_, Result<usize, SchemaRegistryError>> {
         Box::pin(async move {
-            let by_digest = self.by_digest.read().expect("lock poisoned");
-            Ok(by_digest.len())
+            let inner = self.inner.read().expect("lock poisoned");
+            Ok(inner.by_digest.len())
         })
     }
 }
@@ -468,6 +459,8 @@ fn hex_encode(hash: &[u8; 32]) -> String {
 #[cfg(test)]
 #[allow(clippy::large_stack_arrays)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
 
     /// Helper to create a test schema entry with computed digest.
@@ -476,7 +469,7 @@ mod tests {
         SchemaEntry {
             stable_id: stable_id.to_string(),
             digest,
-            content: content.to_vec(),
+            content: Bytes::copy_from_slice(content),
             canonicalizer_version: "cac-json-v1".to_string(),
             registered_at: 0,
             registered_by: "test-actor".to_string(),
@@ -560,7 +553,7 @@ mod tests {
         let entry = SchemaEntry {
             stable_id: "test:empty.v1".to_string(),
             digest: SchemaDigest::new([0u8; 32]),
-            content: vec![],
+            content: Bytes::new(),
             canonicalizer_version: "cac-json-v1".to_string(),
             registered_at: 0,
             registered_by: "test".to_string(),
@@ -577,7 +570,7 @@ mod tests {
         let entry = SchemaEntry {
             stable_id: "test:large.v1".to_string(),
             digest: SchemaDigest::new(EventHasher::hash_content(&large_content)),
-            content: large_content,
+            content: Bytes::from(large_content),
             canonicalizer_version: "cac-json-v1".to_string(),
             registered_at: 0,
             registered_by: "test".to_string(),
@@ -599,7 +592,7 @@ mod tests {
         let entry = SchemaEntry {
             stable_id: String::new(),
             digest: SchemaDigest::new(EventHasher::hash_content(content)),
-            content: content.to_vec(),
+            content: Bytes::copy_from_slice(content),
             canonicalizer_version: "cac-json-v1".to_string(),
             registered_at: 0,
             registered_by: "test".to_string(),
@@ -615,7 +608,7 @@ mod tests {
         let entry = SchemaEntry {
             stable_id: long_id,
             digest: SchemaDigest::new(EventHasher::hash_content(content)),
-            content: content.to_vec(),
+            content: Bytes::copy_from_slice(content),
             canonicalizer_version: "cac-json-v1".to_string(),
             registered_at: 0,
             registered_by: "test".to_string(),
@@ -636,7 +629,7 @@ mod tests {
         let entry = SchemaEntry {
             stable_id: "test:mismatch.v1".to_string(),
             digest: SchemaDigest::new([42u8; 32]), // Wrong hash
-            content: content.to_vec(),
+            content: Bytes::copy_from_slice(content),
             canonicalizer_version: "cac-json-v1".to_string(),
             registered_at: 0,
             registered_by: "test".to_string(),
@@ -903,7 +896,7 @@ mod tests {
         let entry = SchemaEntry {
             stable_id: "test:empty.v1".to_string(),
             digest: SchemaDigest::new([42u8; 32]), // Wrong hash, but irrelevant
-            content: vec![],                       // Empty content - cheap check fails first
+            content: Bytes::new(),                 // Empty content - cheap check fails first
             canonicalizer_version: "cac-json-v1".to_string(),
             registered_at: 0,
             registered_by: "test".to_string(),
@@ -956,7 +949,7 @@ mod tests {
         let entry2 = SchemaEntry {
             stable_id: "test:schema.v1".to_string(),
             digest: SchemaDigest::new([42u8; 32]), // Wrong hash
-            content: br#"{"id": 2}"#.to_vec(),     // Different content
+            content: Bytes::from_static(br#"{"id": 2}"#), // Different content
             canonicalizer_version: "cac-json-v1".to_string(),
             registered_at: 0,
             registered_by: "test".to_string(),

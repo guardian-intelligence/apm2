@@ -80,6 +80,7 @@
 mod memory;
 mod traits;
 
+use bytes::Bytes;
 pub use memory::InMemorySchemaRegistry;
 pub use traits::{
     BoxFuture, DEFAULT_MAX_SCHEMAS, HandshakeResult, MAX_SCHEMA_SIZE, SchemaDigest, SchemaEntry,
@@ -108,6 +109,8 @@ pub const KERNEL_SCHEMA_PREFIX: &str = "kernel:";
 /// # Returns
 ///
 /// A `SchemaEntry` with computed digest and kernel metadata.
+/// Note: `registered_at` is set to 0; callers should update this if timestamp
+/// tracking is needed.
 ///
 /// # Example
 ///
@@ -126,9 +129,9 @@ pub fn create_kernel_schema(type_name: &str, content: &[u8]) -> SchemaEntry {
     SchemaEntry {
         stable_id: format!("{KERNEL_SCHEMA_PREFIX}{type_name}"),
         digest,
-        content: content.to_vec(),
+        content: Bytes::copy_from_slice(content),
         canonicalizer_version: KERNEL_CANONICALIZER_VERSION.to_string(),
-        registered_at: 0, // Set during actual registration
+        registered_at: 0,
         registered_by: "kernel".to_string(),
     }
 }

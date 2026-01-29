@@ -19,7 +19,9 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
+use bytes::Bytes;
 use thiserror::Error;
 
 use crate::crypto::Hash;
@@ -179,6 +181,13 @@ impl AsRef<[u8]> for SchemaDigest {
 ///
 /// Each entry contains the schema's stable ID, content digest, and metadata
 /// about when and by whom it was registered.
+///
+/// # Performance
+///
+/// The `content` field uses `bytes::Bytes` for zero-copy cloning. This avoids
+/// expensive deep copies of schema content (up to 1MB) when entries are
+/// returned from lookup methods. Cloning a `SchemaEntry` only increments a
+/// reference count for the content, making it O(1) regardless of content size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaEntry {
     /// The stable ID for this schema (e.g., `"dcp://org/schema@v1"`).
@@ -188,7 +197,10 @@ pub struct SchemaEntry {
     pub digest: SchemaDigest,
 
     /// The raw schema content (JSON).
-    pub content: Vec<u8>,
+    ///
+    /// Uses `bytes::Bytes` for zero-copy cloning to avoid expensive deep
+    /// copies when returning entries from lookup methods.
+    pub content: Bytes,
 
     /// The canonicalizer version used to compute the digest.
     ///
@@ -206,6 +218,7 @@ pub struct SchemaEntry {
 impl SchemaEntry {
     /// Returns the content size in bytes.
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // Bytes::len() is not const
     pub fn content_size(&self) -> usize {
         self.content.len()
     }
@@ -312,11 +325,12 @@ pub trait SchemaRegistry: Send + Sync {
     ///
     /// # Returns
     ///
-    /// The schema entry if found, or `None` if not registered.
+    /// An `Arc<SchemaEntry>` if found, or `None` if not registered.
+    /// Using `Arc` avoids cloning the entry, especially the content bytes.
     fn lookup_by_digest<'a>(
         &'a self,
         digest: &'a SchemaDigest,
-    ) -> BoxFuture<'a, Result<Option<SchemaEntry>, SchemaRegistryError>>;
+    ) -> BoxFuture<'a, Result<Option<Arc<SchemaEntry>>, SchemaRegistryError>>;
 
     /// Looks up a schema entry by its stable ID.
     ///
@@ -328,11 +342,12 @@ pub trait SchemaRegistry: Send + Sync {
     ///
     /// # Returns
     ///
-    /// The schema entry if found, or `None` if not registered.
+    /// An `Arc<SchemaEntry>` if found, or `None` if not registered.
+    /// Using `Arc` avoids cloning the entry, especially the content bytes.
     fn lookup_by_stable_id<'a>(
         &'a self,
         stable_id: &'a str,
-    ) -> BoxFuture<'a, Result<Option<SchemaEntry>, SchemaRegistryError>>;
+    ) -> BoxFuture<'a, Result<Option<Arc<SchemaEntry>>, SchemaRegistryError>>;
 
     /// Performs a peer handshake to compare schema registries.
     ///
@@ -427,7 +442,7 @@ mod tests {
         let entry = SchemaEntry {
             stable_id: "test:schema.v1".to_string(),
             digest: SchemaDigest::new([0u8; 32]),
-            content: vec![1, 2, 3, 4, 5],
+            content: Bytes::from_static(&[1, 2, 3, 4, 5]),
             canonicalizer_version: "cac-json-v1".to_string(),
             registered_at: 0,
             registered_by: "test".to_string(),
