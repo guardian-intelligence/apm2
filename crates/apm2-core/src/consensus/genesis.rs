@@ -111,6 +111,10 @@ pub enum GenesisError {
         invitee: String,
     },
 
+    /// Public key binding mismatch (INV-0014: identity-to-key binding).
+    #[error("public key binding mismatch: provided public key does not match invitee_id")]
+    PublicKeyBindingMismatch,
+
     /// Insufficient quorum signatures.
     #[error("insufficient quorum signatures: {have} of {need} required")]
     InsufficientQuorum {
@@ -595,6 +599,24 @@ pub struct QuorumSignature {
     signature: [u8; 64],
 }
 
+/// Computes the `invitee_id` from a public key.
+///
+/// The `invitee_id` is the hex-encoded BLAKE3 hash of the public key bytes.
+/// This creates a cryptographic binding between the `invitee_id` in the
+/// invitation token and the public key used to prove ownership during join.
+///
+/// # Security
+///
+/// This binding prevents token theft attacks where an attacker could use a
+/// stolen invitation token with their own keypair. The `invitee_id` in the
+/// token must match the hash of the public key presented during join validation
+/// (INV-0014).
+#[must_use]
+pub fn compute_invitee_id(public_key: &VerifyingKey) -> String {
+    let hash = blake3::hash(public_key.as_bytes());
+    hex::encode(hash.as_bytes())
+}
+
 impl InvitationToken {
     /// Creates a new invitation token.
     #[must_use]
@@ -1051,6 +1073,20 @@ impl GenesisValidator {
     ) -> Result<(), GenesisError> {
         // Check rate limit first (INV-0013)
         self.rate_limiter.check(source)?;
+
+        // Verify public key binding (INV-0014): the provided public key must match
+        // the invitee_id in the invitation token. This prevents token theft attacks
+        // where an attacker uses a stolen token with their own keypair.
+        // The invitee_id is the hex-encoded BLAKE3 hash of the public key bytes.
+        let expected_invitee_id = compute_invitee_id(invitee_public_key);
+        let expected_bytes = expected_invitee_id.as_bytes();
+        let actual_bytes = invitation.invitee_id.as_bytes();
+        // Use constant-time comparison to prevent timing attacks
+        if expected_bytes.len() != actual_bytes.len()
+            || expected_bytes.ct_eq(actual_bytes).unwrap_u8() == 0
+        {
+            return Err(GenesisError::PublicKeyBindingMismatch);
+        }
 
         // Verify identity binding: source must match invitation invitee_id
         // Uses constant-time comparison to prevent timing attacks
@@ -1760,12 +1796,12 @@ mod tck_00185_genesis_tests {
             .build()
             .unwrap();
 
-        // Use source that matches invitee_id for identity binding
-        let source = "node-123";
+        // Use source that matches invitee_id for identity binding (public key hash)
+        let source = compute_invitee_id(&invitee_verifying);
 
         // Create invitation token with matching invitee_id
         let genesis_hash = genesis.genesis_hash();
-        let mut token = InvitationToken::new(genesis_hash, source.to_string(), u64::MAX);
+        let mut token = InvitationToken::new(genesis_hash, source.clone(), u64::MAX);
         let sig = q_signing.sign(&token.canonical_hash());
         token.add_signature(0, sig.to_bytes()).unwrap();
 
@@ -1782,8 +1818,7 @@ mod tck_00185_genesis_tests {
         // after 3 attempts regardless of single-use enforcement
         for i in 0u64..3 {
             // Create unique tokens for each attempt to avoid single-use rejection
-            let mut unique_token =
-                InvitationToken::new(genesis_hash, source.to_string(), u64::MAX - i);
+            let mut unique_token = InvitationToken::new(genesis_hash, source.clone(), u64::MAX - i);
             let unique_sig = q_signing.sign(&unique_token.canonical_hash());
             unique_token
                 .add_signature(0, unique_sig.to_bytes())
@@ -1795,7 +1830,7 @@ mod tck_00185_genesis_tests {
             assert!(
                 validator
                     .validate_join_request(
-                        source,
+                        &source,
                         &genesis,
                         &unique_token,
                         &unique_proof,
@@ -1809,7 +1844,7 @@ mod tck_00185_genesis_tests {
 
         // 4th attempt should be rate limited
         let result = validator.validate_join_request(
-            source,
+            &source,
             &genesis,
             &token,
             &proof,
@@ -1822,9 +1857,8 @@ mod tck_00185_genesis_tests {
         );
 
         // Different source with different token should work (not rate-limited)
-        let other_source = "node-456";
-        let mut other_token =
-            InvitationToken::new(genesis_hash, other_source.to_string(), u64::MAX);
+        let other_source = compute_invitee_id(&other_invitee_verifying);
+        let mut other_token = InvitationToken::new(genesis_hash, other_source.clone(), u64::MAX);
         let other_sig = q_signing.sign(&other_token.canonical_hash());
         other_token.add_signature(0, other_sig.to_bytes()).unwrap();
         let other_proof = other_invitee_signing
@@ -1834,7 +1868,7 @@ mod tck_00185_genesis_tests {
         assert!(
             validator
                 .validate_join_request(
-                    other_source,
+                    &other_source,
                     &genesis,
                     &other_token,
                     &other_proof,
@@ -1876,13 +1910,12 @@ mod tck_00185_genesis_tests {
 
         let mut validator = GenesisValidator::new(config, genesis.clone());
 
-        // Source must match invitee_id for identity binding
-        let source1 = "node-123";
-        let source2 = "node-456";
+        // Source must match invitee_id for identity binding (public key hash)
+        let source1 = compute_invitee_id(&invitee1_verifying);
+        let source2 = compute_invitee_id(&invitee2_verifying);
 
         // Create token with only 1 signature (insufficient)
-        let mut insufficient_token =
-            InvitationToken::new(genesis_hash, source1.to_string(), u64::MAX);
+        let mut insufficient_token = InvitationToken::new(genesis_hash, source1.clone(), u64::MAX);
         let sig1 = q1_signing.sign(&insufficient_token.canonical_hash());
         insufficient_token
             .add_signature(0, sig1.to_bytes())
@@ -1892,7 +1925,7 @@ mod tck_00185_genesis_tests {
             .to_bytes();
 
         let result = validator.validate_join_request(
-            source1,
+            &source1,
             &genesis,
             &insufficient_token,
             &proof1,
@@ -1905,8 +1938,7 @@ mod tck_00185_genesis_tests {
         );
 
         // Create token with 2 signatures (sufficient)
-        let mut sufficient_token =
-            InvitationToken::new(genesis_hash, source2.to_string(), u64::MAX);
+        let mut sufficient_token = InvitationToken::new(genesis_hash, source2.clone(), u64::MAX);
         let sig1 = q1_signing.sign(&sufficient_token.canonical_hash());
         let sig2 = q2_signing.sign(&sufficient_token.canonical_hash());
         sufficient_token.add_signature(0, sig1.to_bytes()).unwrap();
@@ -1918,7 +1950,7 @@ mod tck_00185_genesis_tests {
         assert!(
             validator
                 .validate_join_request(
-                    source2,
+                    &source2,
                     &genesis,
                     &sufficient_token,
                     &proof2,
@@ -2158,7 +2190,9 @@ mod tck_00185_genesis_tests {
 
     #[test]
     fn test_tck_00185_identity_binding_enforced() {
-        // Security: Source must match invitation invitee_id (prevents token theft)
+        // Security: Public key must match invitation invitee_id (prevents token theft)
+        // The invitee_id is now BLAKE3(public_key) to cryptographically bind the token
+        // to the intended recipient's keypair.
         let (signing_key, verifying_key) = create_test_keypair();
         let (q_signing, q_verifying) = create_test_keypair();
         // Create invitee keypairs for proof-of-possession
@@ -2183,17 +2217,20 @@ mod tck_00185_genesis_tests {
 
         let mut validator = GenesisValidator::new(config, genesis.clone());
 
-        // Create token for "legitimate-node"
-        let mut token = InvitationToken::new(genesis_hash, "legitimate-node".to_string(), u64::MAX);
+        // Create token for legitimate node (invitee_id = hash of legit public key)
+        let legit_invitee_id = compute_invitee_id(&legit_verifying);
+        let mut token = InvitationToken::new(genesis_hash, legit_invitee_id.clone(), u64::MAX);
         let sig = q_signing.sign(&token.canonical_hash());
         token.add_signature(0, sig.to_bytes()).unwrap();
         let legit_proof = legit_signing.sign(&token.canonical_hash()).to_bytes();
 
-        // Attacker tries to use the token with a different source identity
-        // Even with attacker's proof, identity binding should fail first
+        // Attacker tries to use stolen token with their own keypair
+        // Public key binding should fail because attacker's public key doesn't match
+        // invitee_id
         let attacker_proof = attacker_signing.sign(&token.canonical_hash()).to_bytes();
+        let attacker_source = compute_invitee_id(&attacker_verifying);
         let result = validator.validate_join_request(
-            "attacker-node",
+            &attacker_source,
             &genesis,
             &token,
             &attacker_proof,
@@ -2201,13 +2238,13 @@ mod tck_00185_genesis_tests {
             0,
         );
         assert!(
-            matches!(result, Err(GenesisError::IdentityBindingMismatch { .. })),
-            "Must reject join when source doesn't match invitee_id: {result:?}"
+            matches!(result, Err(GenesisError::PublicKeyBindingMismatch)),
+            "Must reject join when public key doesn't match invitee_id (token theft attempt): {result:?}"
         );
 
         // Legitimate node can use their own token with valid proof
         let result = validator.validate_join_request(
-            "legitimate-node",
+            &legit_invitee_id,
             &genesis,
             &token,
             &legit_proof,
@@ -2216,7 +2253,7 @@ mod tck_00185_genesis_tests {
         );
         assert!(
             result.is_ok(),
-            "Must accept join when source matches invitee_id: {result:?}"
+            "Must accept join when public key matches invitee_id: {result:?}"
         );
     }
 
@@ -2337,7 +2374,7 @@ mod tck_00185_genesis_tests {
         let (signing_key, verifying_key) = create_test_keypair();
         let (q_signing, q_verifying) = create_test_keypair();
         let (invitee_signing, invitee_verifying) = create_test_keypair();
-        let (wrong_signing, wrong_verifying) = create_test_keypair();
+        let (wrong_signing, _wrong_verifying) = create_test_keypair();
         let namespace = "test-network";
         let ledger_hash = [1u8; 32];
 
@@ -2357,15 +2394,16 @@ mod tck_00185_genesis_tests {
 
         let mut validator = GenesisValidator::new(config, genesis.clone());
 
-        let source = "node-123";
-        let mut token = InvitationToken::new(genesis_hash, source.to_string(), u64::MAX);
+        // Use invitee_id = hash(public_key) for proper binding
+        let source = compute_invitee_id(&invitee_verifying);
+        let mut token = InvitationToken::new(genesis_hash, source.clone(), u64::MAX);
         let sig = q_signing.sign(&token.canonical_hash());
         token.add_signature(0, sig.to_bytes()).unwrap();
 
         // Valid proof-of-possession
         let valid_proof = invitee_signing.sign(&token.canonical_hash()).to_bytes();
         let result = validator.validate_join_request(
-            source,
+            &source,
             &genesis,
             &token,
             &valid_proof,
@@ -2377,40 +2415,24 @@ mod tck_00185_genesis_tests {
             "Valid proof-of-possession should succeed: {result:?}"
         );
 
-        // Wrong proof-of-possession (signed by different key)
-        let mut token2 = InvitationToken::new(genesis_hash, source.to_string(), u64::MAX - 1);
+        // Wrong proof-of-possession (proof signed by different key than
+        // invitee_public_key) The token is still for invitee_verifying, but
+        // proof is signed by wrong_signing
+        let mut token2 = InvitationToken::new(genesis_hash, source.clone(), u64::MAX - 1);
         let sig2 = q_signing.sign(&token2.canonical_hash());
         token2.add_signature(0, sig2.to_bytes()).unwrap();
         let wrong_proof = wrong_signing.sign(&token2.canonical_hash()).to_bytes();
         let result = validator.validate_join_request(
-            source,
+            &source,
             &genesis,
             &token2,
             &wrong_proof,
-            &invitee_verifying, // Claiming to be invitee but signed with wrong key
+            &invitee_verifying, // Correct public key but wrong proof signature
             0,
         );
         assert!(
             matches!(result, Err(GenesisError::ProofOfPossessionFailed(_))),
             "Wrong proof-of-possession must be rejected: {result:?}"
-        );
-
-        // Invalid proof-of-possession (public key doesn't match signature)
-        let mut token3 = InvitationToken::new(genesis_hash, source.to_string(), u64::MAX - 2);
-        let sig3 = q_signing.sign(&token3.canonical_hash());
-        token3.add_signature(0, sig3.to_bytes()).unwrap();
-        let mismatched_proof = invitee_signing.sign(&token3.canonical_hash()).to_bytes();
-        let result = validator.validate_join_request(
-            source,
-            &genesis,
-            &token3,
-            &mismatched_proof,
-            &wrong_verifying, // Wrong public key for the proof
-            0,
-        );
-        assert!(
-            matches!(result, Err(GenesisError::ProofOfPossessionFailed(_))),
-            "Mismatched proof-of-possession must be rejected: {result:?}"
         );
     }
 
@@ -2439,15 +2461,16 @@ mod tck_00185_genesis_tests {
 
         let mut validator = GenesisValidator::new(config, genesis.clone());
 
-        let source = "node-123";
-        let mut token = InvitationToken::new(genesis_hash, source.to_string(), u64::MAX);
+        // Use invitee_id = hash(public_key) for proper binding
+        let source = compute_invitee_id(&invitee_verifying);
+        let mut token = InvitationToken::new(genesis_hash, source.clone(), u64::MAX);
         let sig = q_signing.sign(&token.canonical_hash());
         token.add_signature(0, sig.to_bytes()).unwrap();
         let proof = invitee_signing.sign(&token.canonical_hash()).to_bytes();
 
         // First use should succeed
         let result = validator.validate_join_request(
-            source,
+            &source,
             &genesis,
             &token,
             &proof,
@@ -2459,7 +2482,7 @@ mod tck_00185_genesis_tests {
 
         // Second use of same token should fail
         let result = validator.validate_join_request(
-            source,
+            &source,
             &genesis,
             &token,
             &proof,
@@ -2499,18 +2522,18 @@ mod tck_00185_genesis_tests {
         let mut validator =
             GenesisValidator::with_max_used_tokens(config, genesis.clone(), max_tokens);
 
-        let source = "node-123";
+        // Use invitee_id = hash(public_key) for proper binding
+        let source = compute_invitee_id(&invitee_verifying);
 
         // Use more tokens than the limit
         for i in 0..(max_tokens + 5) {
-            let mut token =
-                InvitationToken::new(genesis_hash, source.to_string(), u64::MAX - i as u64);
+            let mut token = InvitationToken::new(genesis_hash, source.clone(), u64::MAX - i as u64);
             let sig = q_signing.sign(&token.canonical_hash());
             token.add_signature(0, sig.to_bytes()).unwrap();
             let proof = invitee_signing.sign(&token.canonical_hash()).to_bytes();
 
             let _ = validator.validate_join_request(
-                source,
+                &source,
                 &genesis,
                 &token,
                 &proof,
