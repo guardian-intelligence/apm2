@@ -498,6 +498,16 @@ impl TunnelInfo {
         self.last_heartbeat.elapsed() > HEARTBEAT_TIMEOUT
     }
 
+    /// Checks if the tunnel has exceeded the given maximum age (for forced
+    /// rotation).
+    ///
+    /// RFC-0014 (INV-0023) requires tunnels to be rotated after a maximum
+    /// duration to prevent connection squatting attacks.
+    #[must_use]
+    pub fn exceeds_max_age(&self, max_age: Duration) -> bool {
+        self.established_at.elapsed() > max_age
+    }
+
     /// Updates the last heartbeat time.
     pub fn touch(&mut self) {
         self.last_heartbeat = Instant::now();

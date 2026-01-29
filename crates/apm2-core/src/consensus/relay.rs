@@ -40,7 +40,7 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, Semaphore, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_rustls::TlsStream;
 
@@ -73,6 +73,21 @@ pub const MAX_RELAY_ID_LEN: usize = 128;
 
 /// Tunnel cleanup interval.
 pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Maximum concurrent TLS handshakes (denial-of-service protection).
+///
+/// Limits the number of simultaneous TLS handshakes to prevent resource
+/// exhaustion attacks. Connections exceeding this limit will wait for
+/// a permit before proceeding with the handshake.
+pub const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 64;
+
+/// Maximum relay assignment duration before forced rotation (RFC-0014,
+/// INV-0023).
+///
+/// Tunnels must be rotated after this duration to prevent connection squatting
+/// attacks where a malicious actor holds connections indefinitely to exhaust
+/// relay resources.
+pub const MAX_RELAY_ASSIGNMENT_DURATION: Duration = Duration::from_secs(3600); // 1 hour
 
 // =============================================================================
 // Error Types
@@ -451,20 +466,33 @@ impl TunnelRegistry {
         result
     }
 
-    /// Removes stale tunnels (no recent heartbeat).
+    /// Removes stale tunnels (no recent heartbeat) and expired tunnels (max age
+    /// exceeded).
+    ///
+    /// RFC-0014 (INV-0023): Tunnels are rotated after
+    /// `MAX_RELAY_ASSIGNMENT_DURATION` to prevent connection squatting
+    /// attacks.
     pub async fn cleanup_stale(&self) -> Vec<String> {
         let by_id = self.tunnels_by_id.read().await;
         let mut stale = Vec::new();
 
         for (tunnel_id, entry) in by_id.iter() {
             let guard = entry.read().await;
-            if guard.info.is_stale() {
+            // Check for heartbeat staleness OR maximum age exceeded (forced rotation)
+            if guard.info.is_stale() || guard.info.exceeds_max_age(MAX_RELAY_ASSIGNMENT_DURATION) {
                 stale.push(tunnel_id.clone());
+                if guard.info.exceeds_max_age(MAX_RELAY_ASSIGNMENT_DURATION) {
+                    tracing::info!(
+                        tunnel_id = %tunnel_id,
+                        worker_id = %guard.info.worker_id,
+                        "Tunnel exceeded max assignment duration, forcing rotation (INV-0023)"
+                    );
+                }
             }
         }
         drop(by_id);
 
-        // Remove stale tunnels
+        // Remove stale/expired tunnels
         for tunnel_id in &stale {
             self.unregister(tunnel_id).await;
         }
@@ -524,6 +552,12 @@ impl RelayHolon {
     /// for each incoming connection. It processes tunnel registrations and
     /// maintains the tunnel registry.
     ///
+    /// # Security
+    ///
+    /// TLS handshakes are rate-limited via semaphore to prevent
+    /// denial-of-service attacks that could exhaust CPU/FD resources
+    /// through unbounded concurrent handshakes.
+    ///
     /// # Errors
     ///
     /// Returns an error if the listener cannot be started.
@@ -544,6 +578,9 @@ impl RelayHolon {
 
         let tls_acceptor = self.config.tls_config.acceptor();
 
+        // SECURITY: Semaphore to limit concurrent TLS handshakes (DoS protection)
+        let handshake_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TLS_HANDSHAKES));
+
         loop {
             tokio::select! {
                 accept_result = listener.accept() => {
@@ -552,9 +589,19 @@ impl RelayHolon {
                             let acceptor = tls_acceptor.clone();
                             let relay_config = self.config.clone();
                             let registry = Arc::clone(&self.registry);
+                            let semaphore = Arc::clone(&handshake_semaphore);
 
-                            // Spawn connection handler
+                            // Spawn connection handler with semaphore-limited TLS handshake
                             tokio::spawn(async move {
+                                // Acquire permit before TLS handshake (denial-of-service protection)
+                                let Ok(_permit) = semaphore.acquire().await else {
+                                    tracing::debug!(
+                                        peer_addr = %peer_addr,
+                                        "TLS handshake semaphore closed"
+                                    );
+                                    return;
+                                };
+
                                 if let Err(e) = handle_incoming_connection(
                                     tcp_stream,
                                     peer_addr,
@@ -568,6 +615,7 @@ impl RelayHolon {
                                         "Failed to handle incoming connection"
                                     );
                                 }
+                                // Permit automatically released when _permit drops
                             });
                         }
                         Err(e) => {
@@ -927,6 +975,8 @@ async fn handle_incoming_connection(
 /// 2. Writes outgoing frames from the channel to the connection
 /// 3. Validates that all incoming frames match the expected tunnel ID
 /// 4. Updates heartbeat timestamps in the registry
+/// 5. Sends ACK frames back to the worker (CRITICAL: heartbeat ACKs must be
+///    transmitted)
 ///
 /// # Security
 ///
@@ -943,12 +993,21 @@ fn spawn_tunnel_handler(
         // Split the connection into read and write halves for concurrent I/O
         let (read_half, write_half) = connection.into_split();
 
-        // Spawn writer task
-        let writer_handle = tokio::spawn(tunnel_writer_loop(write_half, receiver));
+        // Create channel for ACK frames from reader to writer (CRITICAL: fixes
+        // heartbeat ACK transmission)
+        let (ack_tx, ack_rx) = mpsc::channel::<ControlFrame>(MAX_PENDING_MESSAGES);
 
-        // Run reader loop in this task
-        let read_result =
-            tunnel_reader_loop(read_half, Arc::clone(&registry), expected_tunnel_id.clone()).await;
+        // Spawn writer task with both outbound message channel and ACK channel
+        let writer_handle = tokio::spawn(tunnel_writer_loop(write_half, receiver, ack_rx));
+
+        // Run reader loop in this task, passing ACK sender
+        let read_result = tunnel_reader_loop(
+            read_half,
+            Arc::clone(&registry),
+            expected_tunnel_id.clone(),
+            ack_tx,
+        )
+        .await;
 
         // Clean up on exit
         writer_handle.abort();
@@ -968,18 +1027,41 @@ fn spawn_tunnel_handler(
 }
 
 /// Writer loop that sends frames from the channel to the connection.
+///
+/// Handles both outbound messages from the relay and ACK frames from the
+/// reader. CRITICAL: ACK frames (especially heartbeat ACKs) must be transmitted
+/// to prevent tunnel timeouts on low-traffic connections.
 async fn tunnel_writer_loop(
     mut write_half: WriteHalf<TlsStream<TcpStream>>,
     mut receiver: mpsc::Receiver<ControlFrame>,
+    mut ack_receiver: mpsc::Receiver<ControlFrame>,
 ) {
-    while let Some(frame) = receiver.recv().await {
-        if let Err(e) = write_half.write_all(frame.as_bytes()).await {
-            tracing::debug!(error = %e, "Failed to write frame to tunnel");
-            break;
-        }
-        if let Err(e) = write_half.flush().await {
-            tracing::debug!(error = %e, "Failed to flush tunnel write");
-            break;
+    loop {
+        tokio::select! {
+            // Handle outbound messages from relay
+            Some(frame) = receiver.recv() => {
+                if let Err(e) = write_half.write_all(frame.as_bytes()).await {
+                    tracing::debug!(error = %e, "Failed to write frame to tunnel");
+                    break;
+                }
+                if let Err(e) = write_half.flush().await {
+                    tracing::debug!(error = %e, "Failed to flush tunnel write");
+                    break;
+                }
+            }
+            // Handle ACK frames from reader (CRITICAL: heartbeat ACKs must be sent)
+            Some(ack_frame) = ack_receiver.recv() => {
+                if let Err(e) = write_half.write_all(ack_frame.as_bytes()).await {
+                    tracing::debug!(error = %e, "Failed to write ACK frame to tunnel");
+                    break;
+                }
+                if let Err(e) = write_half.flush().await {
+                    tracing::debug!(error = %e, "Failed to flush ACK frame");
+                    break;
+                }
+            }
+            // Both channels closed
+            else => break,
         }
     }
 }
@@ -991,10 +1073,13 @@ async fn tunnel_writer_loop(
 /// All incoming frames are validated to ensure their `tunnel_id` matches the
 /// `expected_tunnel_id` that was bound during registration. This prevents
 /// cross-tunnel identity spoofing.
+///
+/// Protocol errors result in connection termination (fail-closed).
 async fn tunnel_reader_loop(
     mut read_half: ReadHalf<TlsStream<TcpStream>>,
     registry: Arc<TunnelRegistry>,
     expected_tunnel_id: String,
+    ack_sender: mpsc::Sender<ControlFrame>,
 ) -> Result<(), RelayError> {
     let mut buf = [0u8; CONTROL_FRAME_SIZE];
 
@@ -1008,18 +1093,33 @@ async fn tunnel_reader_loop(
                 let frame = ControlFrame::parse(&buf)?;
 
                 // Process the frame with identity binding
-                if let Err(e) =
-                    process_tunnel_frame_with_identity(&registry, &frame, &expected_tunnel_id).await
+                match process_tunnel_frame_with_identity(&registry, &frame, &expected_tunnel_id)
+                    .await
                 {
-                    tracing::warn!(
-                        tunnel_id = %expected_tunnel_id,
-                        error = %e,
-                        "Error processing tunnel frame"
-                    );
-                    // On identity mismatch, close the connection
-                    if matches!(e, RelayError::TunnelIdentityMismatch { .. }) {
+                    Ok(Some(ack_frame)) => {
+                        // CRITICAL: Send ACK frame back to worker (fixes heartbeat ACK
+                        // transmission)
+                        if ack_sender.send(ack_frame).await.is_err() {
+                            tracing::debug!(
+                                tunnel_id = %expected_tunnel_id,
+                                "ACK channel closed, exiting reader loop"
+                            );
+                            return Err(RelayError::Shutdown);
+                        }
+                    },
+                    Ok(None) => {
+                        // Frame processed, no response needed
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            tunnel_id = %expected_tunnel_id,
+                            error = %e,
+                            "Error processing tunnel frame"
+                        );
+                        // SECURITY: Fail-closed on all protocol errors (not just identity mismatch)
+                        // Protocol violations should terminate the connection
                         return Err(e);
-                    }
+                    },
                 }
             },
             Ok(Err(e)) => {
