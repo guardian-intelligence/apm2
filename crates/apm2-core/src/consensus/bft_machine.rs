@@ -653,23 +653,29 @@ impl BftMachine {
     /// Checks for newly committed blocks.
     ///
     /// Detects new commits from the underlying state machine and emits
-    /// `BftAction::Commit` for the coordinator to apply to the ledger.
+    /// `BftAction::Commit` for EVERY newly committed block, not just the
+    /// latest.
     ///
     /// # 3-Chain Commit Rule
     ///
     /// A block is only committed when it becomes the head of a proper 3-chain
     /// (three consecutive certified rounds). This is verified by the underlying
-    /// `HotStuffState::try_commit()` method. We extract the committed block
-    /// hash from `last_committed_hash()`, NOT from `locked_qc` (which is
-    /// set at 2-chain).
+    /// `HotStuffState::try_commit()` method.
+    ///
+    /// # Multiple Commits
+    ///
+    /// When a round jump occurs, `try_commit` may commit multiple blocks in a
+    /// single call (the grandparent plus its uncommitted ancestors). This
+    /// method drains ALL newly committed blocks and emits a `Commit` action
+    /// for each one, ensuring the coordinator doesn't miss ledger updates.
     fn check_commits(&mut self) {
-        // Get the last committed block hash from state (proper 3-chain commit)
-        if let Some(committed_hash) = self.state.last_committed_hash() {
-            // Only emit Commit action if this is a new commit
-            if self.last_committed != Some(committed_hash) {
-                self.last_committed = Some(committed_hash);
-                self.push_action(BftAction::Commit(committed_hash));
-            }
+        // Drain all newly committed blocks from state
+        let newly_committed = self.state.drain_newly_committed();
+
+        // Emit a Commit action for each newly committed block
+        for committed_hash in newly_committed {
+            self.last_committed = Some(committed_hash);
+            self.push_action(BftAction::Commit(committed_hash));
         }
     }
 

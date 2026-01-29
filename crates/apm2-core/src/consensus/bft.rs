@@ -47,7 +47,7 @@
 //! }
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -89,11 +89,19 @@ pub const MAX_ROUND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Timeout multiplier for exponential backoff on view change.
 pub const TIMEOUT_MULTIPLIER: f64 = 1.5;
 
-/// Maximum allowed round jump in proposals.
+/// Maximum allowed round jump in proposals and `NewView` messages.
 ///
-/// Proposals that skip more than this many rounds are rejected to prevent
-/// round-skipping attacks that could disrupt consensus progress.
+/// Proposals and `NewView` messages that skip more than this many rounds are
+/// rejected to prevent round-skipping attacks that could disrupt consensus
+/// progress or cause memory exhaustion via unbounded future round tracking.
 pub const MAX_ROUND_JUMP: u64 = 10;
+
+/// Maximum number of future rounds to track for `NewView` messages.
+///
+/// Bounds the `new_view_messages` map to prevent denial-of-service via memory
+/// exhaustion from malicious validators sending `NewView` messages for many
+/// different future rounds.
+pub const MAX_NEW_VIEW_ROUNDS: usize = 16;
 
 /// Maximum number of pending blocks to track.
 ///
@@ -703,6 +711,14 @@ impl NewView {
 // ============================================================================
 
 /// The current phase of the consensus state machine.
+///
+/// # Note on Committed Phase
+///
+/// The `Committed` variant exists for completeness and external observability
+/// (e.g., metrics, debugging). However, commits are primarily communicated
+/// through `HotStuffState::drain_newly_committed()` and `BftAction::Commit`
+/// actions rather than through the phase field, since `advance_round()` resets
+/// the phase to `Idle` after each round.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     /// Waiting for a proposal from the leader.
@@ -713,6 +729,10 @@ pub enum Phase {
     /// Formed a QC, waiting for next round or commit.
     Certified,
     /// Block committed to ledger.
+    ///
+    /// Note: This phase may not be directly observable during normal operation
+    /// since `advance_round()` resets to `Idle`. Commits are reported via
+    /// `drain_newly_committed()` and `BftAction::Commit` actions.
     Committed,
     /// View change in progress.
     ViewChange,
@@ -936,8 +956,14 @@ pub struct HotStuffState {
     /// Uses `HashSet` for O(1) lookup (denial-of-service mitigation) with
     /// bounded size.
     committed: HashSet<BlockHash>,
-    /// Oldest committed round (for eviction tracking).
-    oldest_committed_round: u64,
+    /// Committed blocks in order for FIFO eviction.
+    /// Stores (round, `BlockHash`) pairs in insertion order for correct
+    /// eviction when `MAX_COMMITTED_BLOCKS` is reached.
+    committed_order: VecDeque<(u64, BlockHash)>,
+    /// Newly committed block hashes since last `drain_newly_committed()` call.
+    /// Used by `BftMachine` to emit Commit actions for all newly committed
+    /// blocks, not just the latest one.
+    newly_committed: Vec<BlockHash>,
     /// Last committed block hash (for reporting).
     last_committed_hash: Option<BlockHash>,
 }
@@ -960,7 +986,8 @@ impl HotStuffState {
             pending_blocks: HashMap::new(),
             certified_blocks: HashMap::new(),
             committed: HashSet::new(),
-            oldest_committed_round: 0,
+            committed_order: VecDeque::new(),
+            newly_committed: Vec::new(),
             last_committed_hash: None,
         }
     }
@@ -1019,6 +1046,18 @@ impl HotStuffState {
     #[must_use]
     pub const fn last_committed_hash(&self) -> Option<BlockHash> {
         self.last_committed_hash
+    }
+
+    /// Drains and returns all newly committed block hashes since the last call.
+    ///
+    /// This is used by `BftMachine` to emit `Commit` actions for ALL newly
+    /// committed blocks, not just the latest one. This is important when
+    /// `try_commit` commits multiple ancestors in a single call (e.g., after
+    /// a round jump).
+    ///
+    /// The blocks are returned in commit order (oldest first).
+    pub fn drain_newly_committed(&mut self) -> Vec<BlockHash> {
+        std::mem::take(&mut self.newly_committed)
     }
 
     /// Returns a reference to the certified blocks map.
@@ -1310,13 +1349,32 @@ impl HotStuffState {
     /// `NewView` messages are received for that round (prevents
     /// denial-of-service via single high-round `NewView` message).
     ///
+    /// # Security
+    ///
+    /// `NewView` messages for rounds too far in the future are rejected to
+    /// prevent memory exhaustion attacks (bounded by `MAX_ROUND_JUMP`).
+    /// Additionally, the total number of tracked future rounds is bounded
+    /// by `MAX_NEW_VIEW_ROUNDS`.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the message is invalid.
+    /// Returns an error if the message is invalid or for a round too far in
+    /// the future.
     pub fn on_new_view(&mut self, new_view: &NewView) -> Result<(), BftError> {
         // Validate round is advancement
         if new_view.round <= self.round {
             return Ok(()); // Ignore stale new-view
+        }
+
+        // Reject NewView for rounds too far in the future (DoS mitigation)
+        let round_jump = new_view.round - self.round;
+        if round_jump > MAX_ROUND_JUMP {
+            return Err(BftError::RoundJumpTooLarge {
+                proposed: new_view.round,
+                current: self.round,
+                jump: round_jump,
+                max: MAX_ROUND_JUMP,
+            });
         }
 
         // Validate sender is in validator set and verify signature
@@ -1334,6 +1392,24 @@ impl HotStuffState {
         // Update high_qc if theirs is higher
         if new_view.high_qc.round > self.high_qc.round {
             self.high_qc = new_view.high_qc.clone();
+        }
+
+        // Enforce bounded storage for new_view_messages (DoS mitigation)
+        // If at capacity, remove the oldest (lowest) tracked round before adding
+        while self.new_view_messages.len() >= MAX_NEW_VIEW_ROUNDS
+            && !self.new_view_messages.contains_key(&new_view.round)
+        {
+            if let Some(&oldest_round) = self.new_view_messages.keys().min() {
+                // Only evict if the new round is higher than the oldest
+                if new_view.round > oldest_round {
+                    self.new_view_messages.remove(&oldest_round);
+                } else {
+                    // New round is not higher than any tracked round, reject silently
+                    return Ok(());
+                }
+            } else {
+                break;
+            }
         }
 
         // Track this NewView message (prevents DoS via single unauthenticated round
@@ -1426,10 +1502,18 @@ impl HotStuffState {
     /// QC's block extends the previous (verified via `pending_blocks`
     /// parent tracking).
     ///
+    /// # Recursive Ancestor Commit
+    ///
+    /// When a 3-chain is formed, this method also commits all uncommitted
+    /// ancestors of the grandparent block. This handles the case where a round
+    /// jump occurred and some ancestors were never explicitly committed.
+    ///
     /// # Note
     ///
     /// This method is called internally and should also be callable from
     /// `BftMachine` after updating certified blocks from any source.
+    /// Newly committed blocks are accumulated in `newly_committed` and can be
+    /// retrieved via `drain_newly_committed()`.
     pub fn try_commit(&mut self) {
         let current_round = self.high_qc.round;
 
@@ -1444,7 +1528,7 @@ impl HotStuffState {
         let parent_round = current_round - 1;
 
         // Get QCs for all three rounds
-        let Some(grandparent_qc) = self.certified_blocks.get(&grandparent_round) else {
+        let Some(grandparent_qc) = self.certified_blocks.get(&grandparent_round).cloned() else {
             return;
         };
         let Some(parent_qc) = self.certified_blocks.get(&parent_round) else {
@@ -1473,58 +1557,88 @@ impl HotStuffState {
         };
 
         if chain_valid {
-            // Commit the grandparent block (head of the 3-chain)
-            // O(1) HashSet lookup instead of O(N) Vec scan (DoS mitigation)
-            if !self.committed.contains(&grandparent_qc.block_hash) {
-                self.add_committed_block(grandparent_qc.block_hash, grandparent_round);
-                self.phase = Phase::Committed;
-            }
+            // Recursively commit all uncommitted ancestors of the grandparent block
+            // This handles the case where a round jump occurred and some ancestors
+            // were never explicitly committed.
+            self.commit_block_and_ancestors(grandparent_qc.block_hash, grandparent_round);
         }
     }
 
-    /// Adds a committed block with bounded storage.
+    /// Commits a block and all its uncommitted ancestors.
     ///
-    /// If the storage exceeds `MAX_COMMITTED_BLOCKS`, oldest entries are
-    /// evicted.
-    fn add_committed_block(&mut self, block_hash: BlockHash, round: u64) {
-        // Evict oldest entries if at capacity
-        while self.committed.len() >= MAX_COMMITTED_BLOCKS {
-            // We track oldest_committed_round for efficient eviction
-            // Find and remove blocks at or below oldest_committed_round
-            let to_remove: Vec<BlockHash> = self
-                .committed
-                .iter()
-                .filter(|hash| {
-                    // Check if this block is at a round <= oldest_committed_round
-                    // by looking up in pending_blocks
-                    self.pending_blocks
-                        .get(*hash)
-                        .is_some_and(|(r, _)| *r <= self.oldest_committed_round)
-                })
-                .copied()
-                .collect();
+    /// This method traverses the `pending_blocks` chain from the given block
+    /// back to either a committed block or genesis, collecting all uncommitted
+    /// blocks along the way. It then commits them in order from oldest to
+    /// newest.
+    fn commit_block_and_ancestors(&mut self, block_hash: BlockHash, round: u64) {
+        /// Maximum depth for ancestor traversal (denial-of-service mitigation).
+        const MAX_ANCESTOR_DEPTH: usize = 64;
 
-            if to_remove.is_empty() {
-                // No blocks to remove based on round, just remove any one block
-                if let Some(hash) = self.committed.iter().next().copied() {
-                    self.committed.remove(&hash);
-                }
+        // If already committed, nothing to do
+        if self.committed.contains(&block_hash) {
+            return;
+        }
+
+        // Collect uncommitted ancestors by walking the parent chain
+        // We limit the depth to prevent DoS via deep chains
+        let mut to_commit: Vec<(BlockHash, u64)> = Vec::new();
+        let mut current_hash = block_hash;
+        let mut current_round = round;
+
+        for _ in 0..MAX_ANCESTOR_DEPTH {
+            if self.committed.contains(&current_hash) {
                 break;
             }
 
-            for hash in to_remove {
-                self.committed.remove(&hash);
+            to_commit.push((current_hash, current_round));
+
+            // Get parent from pending_blocks
+            if let Some((parent_round, parent_hash)) = self.pending_blocks.get(&current_hash) {
+                current_hash = *parent_hash;
+                current_round = *parent_round;
+            } else {
+                // No parent found - either genesis or missing block
+                break;
             }
-            self.oldest_committed_round += 1;
         }
 
+        // Commit in reverse order (oldest to newest) for correct ordering
+        for (hash, rnd) in to_commit.into_iter().rev() {
+            self.add_committed_block(hash, rnd);
+        }
+    }
+
+    /// Adds a committed block with bounded storage and FIFO eviction.
+    ///
+    /// If the storage exceeds `MAX_COMMITTED_BLOCKS`, the oldest entries are
+    /// evicted using the `committed_order` queue for correct FIFO behavior.
+    fn add_committed_block(&mut self, block_hash: BlockHash, round: u64) {
+        // Don't add if already committed
+        if self.committed.contains(&block_hash) {
+            return;
+        }
+
+        // Evict oldest entries if at capacity using FIFO order
+        while self.committed.len() >= MAX_COMMITTED_BLOCKS {
+            if let Some((_, oldest_hash)) = self.committed_order.pop_front() {
+                self.committed.remove(&oldest_hash);
+            } else {
+                // Queue empty but set not empty - shouldn't happen, clear set
+                self.committed.clear();
+                break;
+            }
+        }
+
+        // Add to both the hash set (for O(1) lookup) and the order queue (for FIFO
+        // eviction)
         self.committed.insert(block_hash);
-        self.last_committed_hash = Some(block_hash);
+        self.committed_order.push_back((round, block_hash));
 
-        // Update oldest_committed_round if needed
-        if self.oldest_committed_round == 0 || round < self.oldest_committed_round {
-            self.oldest_committed_round = round;
-        }
+        // Track newly committed blocks for BftMachine to emit Commit actions
+        self.newly_committed.push(block_hash);
+
+        // Update last committed hash
+        self.last_committed_hash = Some(block_hash);
     }
 
     /// Advances to the next round (called after QC is formed and broadcast).
