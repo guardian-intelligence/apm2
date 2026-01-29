@@ -59,6 +59,7 @@ use tokio::sync::RwLock;
 
 use super::bft::ValidatorId;
 use super::handlers::PeerManager;
+use crate::determinism::{CacJsonError, canonicalize_json};
 use crate::ledger::{EventRecord, LedgerBackend, LedgerError};
 
 // =============================================================================
@@ -174,6 +175,10 @@ pub enum ReplicationError {
     /// Serialization error.
     #[error("serialization error: {0}")]
     Serialization(String),
+
+    /// Canonicalization error.
+    #[error("canonicalization error: {0}")]
+    Canonicalization(#[from] CacJsonError),
 
     /// Ledger error during append.
     #[error("ledger error: {0}")]
@@ -458,8 +463,9 @@ pub struct ReplicationProposal {
 impl ReplicationProposal {
     /// Creates the message to sign for this proposal.
     ///
-    /// The message includes a domain separation prefix and the namespace to
-    /// prevent cross-protocol and cross-namespace replay attacks.
+    /// The message includes a domain separation prefix, the namespace, and the
+    /// leader identity to prevent cross-protocol, cross-namespace, and identity
+    /// spoofing replay attacks.
     ///
     /// # Errors
     ///
@@ -472,10 +478,11 @@ impl ReplicationProposal {
                 max: u32::MAX as usize,
             })?;
         let mut msg =
-            Vec::with_capacity(DOMAIN_PREFIX_PROPOSAL.len() + 4 + ns_bytes.len() + 8 + 8 + 32);
+            Vec::with_capacity(DOMAIN_PREFIX_PROPOSAL.len() + 4 + ns_bytes.len() + 32 + 8 + 8 + 32);
         msg.extend_from_slice(DOMAIN_PREFIX_PROPOSAL);
         msg.extend_from_slice(&ns_len.to_le_bytes());
         msg.extend_from_slice(ns_bytes);
+        msg.extend_from_slice(&self.leader_id);
         msg.extend_from_slice(&self.epoch.to_le_bytes());
         msg.extend_from_slice(&self.sequence_id.to_le_bytes());
         msg.extend_from_slice(&self.event_hash);
@@ -550,7 +557,9 @@ pub struct ReplicationAck {
 impl ReplicationAck {
     /// Creates the message to sign for this acknowledgment.
     ///
-    /// The message includes a domain separation prefix and the namespace.
+    /// The message includes a domain separation prefix, the namespace, and the
+    /// follower identity to prevent cross-protocol, cross-namespace, and
+    /// identity spoofing replay attacks.
     ///
     /// # Errors
     ///
@@ -562,10 +571,12 @@ impl ReplicationAck {
                 size: ns_bytes.len(),
                 max: u32::MAX as usize,
             })?;
-        let mut msg = Vec::with_capacity(DOMAIN_PREFIX_ACK.len() + 4 + ns_bytes.len() + 8 + 8 + 8);
+        let mut msg =
+            Vec::with_capacity(DOMAIN_PREFIX_ACK.len() + 4 + ns_bytes.len() + 32 + 8 + 8 + 8);
         msg.extend_from_slice(DOMAIN_PREFIX_ACK);
         msg.extend_from_slice(&ns_len.to_le_bytes());
         msg.extend_from_slice(ns_bytes);
+        msg.extend_from_slice(&self.follower_id);
         msg.extend_from_slice(&self.epoch.to_le_bytes());
         msg.extend_from_slice(&self.sequence_id.to_le_bytes());
         msg.extend_from_slice(&self.local_seq_id.to_le_bytes());
@@ -668,7 +679,9 @@ impl NackReason {
 impl ReplicationNack {
     /// Creates the message to sign for this nack.
     ///
-    /// The message includes a domain separation prefix and the namespace.
+    /// The message includes a domain separation prefix, the namespace, and the
+    /// follower identity to prevent cross-protocol, cross-namespace, and
+    /// identity spoofing replay attacks.
     ///
     /// # Errors
     ///
@@ -680,10 +693,12 @@ impl ReplicationNack {
                 size: ns_bytes.len(),
                 max: u32::MAX as usize,
             })?;
-        let mut msg = Vec::with_capacity(DOMAIN_PREFIX_NACK.len() + 4 + ns_bytes.len() + 8 + 8 + 1);
+        let mut msg =
+            Vec::with_capacity(DOMAIN_PREFIX_NACK.len() + 4 + ns_bytes.len() + 32 + 8 + 8 + 1);
         msg.extend_from_slice(DOMAIN_PREFIX_NACK);
         msg.extend_from_slice(&ns_len.to_le_bytes());
         msg.extend_from_slice(ns_bytes);
+        msg.extend_from_slice(&self.follower_id);
         msg.extend_from_slice(&self.epoch.to_le_bytes());
         msg.extend_from_slice(&self.sequence_id.to_le_bytes());
         msg.push(self.reason.code());
@@ -830,6 +845,19 @@ mod base64_arr_64 {
 // Acknowledgment Tracking
 // =============================================================================
 
+/// Result of attempting to record an acknowledgment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecordAckResult {
+    /// Ack was successfully recorded.
+    Recorded,
+    /// Ack was rejected due to epoch mismatch.
+    EpochMismatch,
+    /// Ack was rejected due to namespace mismatch.
+    NamespaceMismatch,
+    /// Ack was rejected because capacity limit was reached.
+    CapacityLimitReached,
+}
+
 /// Tracks acknowledgments for a single proposal.
 ///
 /// Note: We only store metadata (epoch, namespace) needed for validation,
@@ -859,22 +887,22 @@ impl ProposalAckState {
 
     /// Records an acknowledgment, validating epoch and namespace match.
     ///
-    /// Returns true if the ack was recorded, false if validation failed or
-    /// limit reached.
-    fn record_ack(&mut self, ack: ReplicationAck) -> bool {
+    /// Returns a detailed result indicating success or the specific reason for
+    /// rejection (epoch mismatch, namespace mismatch, or capacity limit).
+    fn record_ack(&mut self, ack: ReplicationAck) -> RecordAckResult {
         // Validate epoch matches to prevent stale acks from old epochs
         if ack.epoch != self.epoch {
-            return false;
+            return RecordAckResult::EpochMismatch;
         }
         // Validate namespace matches to prevent cross-namespace confusion
         if ack.namespace != self.namespace {
-            return false;
+            return RecordAckResult::NamespaceMismatch;
         }
         if self.acks.len() < MAX_ACKS_PER_PROPOSAL {
             self.acks.insert(ack.follower_id, ack);
-            true
+            RecordAckResult::Recorded
         } else {
-            false
+            RecordAckResult::CapacityLimitReached
         }
     }
 
@@ -1050,10 +1078,12 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
             });
         }
 
-        // Convert to ReplicatedEvent and serialize
+        // Convert to ReplicatedEvent and serialize using JCS canonicalization
+        // for deterministic output across all nodes (RFC 8785)
         let replicated_event = ReplicatedEvent::from_event_record(event);
-        let event_data = serde_json::to_vec(&replicated_event)
+        let json_string = serde_json::to_string(&replicated_event)
             .map_err(|e| ReplicationError::Serialization(e.to_string()))?;
+        let event_data = canonicalize_json(&json_string)?.into_bytes();
 
         // Check payload size
         if event_data.len() > MAX_REPLICATION_PAYLOAD_SIZE {
@@ -1125,6 +1155,97 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
         Ok(sequence_id)
     }
 
+    /// Validates the basic proposal structure (payload size, leader, epoch,
+    /// hash).
+    ///
+    /// Returns `None` if validation passes, or `Some(NackReason)` on failure.
+    fn validate_proposal_structure(
+        proposal: &ReplicationProposal,
+        config: &ReplicationConfig,
+    ) -> Option<NackReason> {
+        // Validate payload size to prevent DoS (CTR-1303)
+        if proposal.event_data.len() > MAX_REPLICATION_PAYLOAD_SIZE {
+            return Some(NackReason::PayloadTooLarge);
+        }
+
+        // Verify the proposal is from the current leader
+        if !bool::from(proposal.leader_id.ct_eq(&config.leader_id)) {
+            return Some(NackReason::NotLeader);
+        }
+
+        // Verify epoch matches
+        if proposal.epoch != config.epoch {
+            return Some(NackReason::Stale);
+        }
+
+        // Validate the event hash
+        if !proposal.validate_hash() {
+            return Some(NackReason::InvalidHash);
+        }
+
+        None
+    }
+
+    /// Validates the proposal signature against the leader's public key.
+    ///
+    /// Returns `None` if validation passes, or `Some(NackReason)` on failure.
+    fn validate_proposal_signature(
+        proposal: &ReplicationProposal,
+        validator_keys: &HashMap<ValidatorId, VerifyingKey>,
+    ) -> Option<NackReason> {
+        if let Some(leader_key) = validator_keys.get(&proposal.leader_id) {
+            if proposal.verify_signature(leader_key).is_err() {
+                return Some(NackReason::InvalidSignature);
+            }
+        } else {
+            // Unknown leader key - reject
+            return Some(NackReason::InvalidSignature);
+        }
+        None
+    }
+
+    /// Validates the proposal sequence ID against the last appended sequence.
+    ///
+    /// Returns `None` if validation passes, or `Some(NackReason)` on failure.
+    const fn validate_proposal_sequence(
+        proposal: &ReplicationProposal,
+        last_appended_seq: u64,
+    ) -> Option<NackReason> {
+        let expected_seq = last_appended_seq + 1;
+
+        if proposal.sequence_id < expected_seq {
+            return Some(NackReason::Duplicate);
+        }
+
+        if proposal.sequence_id > expected_seq {
+            // Gap detected - we're missing proposals
+            return Some(NackReason::Gap);
+        }
+
+        None
+    }
+
+    /// Deserializes and validates the replicated event from proposal data.
+    ///
+    /// Returns the validated `ReplicatedEvent` or `Some(NackReason)` on
+    /// failure.
+    fn deserialize_and_validate_event(event_data: &[u8]) -> Result<ReplicatedEvent, NackReason> {
+        // Deserialize the replicated event and convert to EventRecord
+        // Note: We use serde_json which has some depth limits by default, but for
+        // additional DoS protection, the payload size is already validated above.
+        let replicated_event: ReplicatedEvent =
+            serde_json::from_slice(event_data).map_err(|_| NackReason::LedgerError)?;
+
+        // Validate the inner event's hash for integrity (defense-in-depth)
+        // This catches corrupted or tampered events even if the leader's
+        // proposal signature is valid.
+        if !replicated_event.validate_hash() {
+            return Err(NackReason::InvalidEventSignature);
+        }
+
+        Ok(replicated_event)
+    }
+
     /// Handles an incoming replication proposal (follower role).
     ///
     /// # Arguments
@@ -1147,7 +1268,7 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
         let config = self.config.read().await;
         let my_id = config.validator_id;
 
-        // Clone namespace for use in the closure
+        // Clone namespace for use in the nack helper
         let proposal_namespace = proposal.namespace.clone();
 
         // Create a nack helper
@@ -1166,65 +1287,31 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
             nack
         };
 
-        // Validate payload size to prevent DoS (CTR-1303)
-        if proposal.event_data.len() > MAX_REPLICATION_PAYLOAD_SIZE {
-            return Err(make_nack(NackReason::PayloadTooLarge));
+        // Validate proposal structure (payload size, leader, epoch, hash)
+        if let Some(reason) = Self::validate_proposal_structure(&proposal, &config) {
+            return Err(make_nack(reason));
         }
 
-        // Verify the proposal is from the current leader
-        if !bool::from(proposal.leader_id.ct_eq(&config.leader_id)) {
-            return Err(make_nack(NackReason::NotLeader));
-        }
-
-        // Verify epoch matches
-        if proposal.epoch != config.epoch {
-            return Err(make_nack(NackReason::Stale));
-        }
-
-        // Validate the event hash
-        if !proposal.validate_hash() {
-            return Err(make_nack(NackReason::InvalidHash));
-        }
-
-        // Verify signature
+        // Validate proposal signature
         let keys = self.validator_keys.read().await;
-        if let Some(leader_key) = keys.get(&proposal.leader_id) {
-            if proposal.verify_signature(leader_key).is_err() {
-                return Err(make_nack(NackReason::InvalidSignature));
-            }
-        } else {
-            // Unknown leader key - reject
-            return Err(make_nack(NackReason::InvalidSignature));
+        if let Some(reason) = Self::validate_proposal_signature(&proposal, &keys) {
+            return Err(make_nack(reason));
         }
+        drop(keys);
 
-        // Check sequence ID
+        // Validate sequence ID
         let last_seq = *self.last_appended_seq.read().await;
-        let expected_seq = last_seq + 1;
-
-        if proposal.sequence_id < expected_seq {
-            return Err(make_nack(NackReason::Duplicate));
+        if let Some(reason) = Self::validate_proposal_sequence(&proposal, last_seq) {
+            return Err(make_nack(reason));
         }
 
-        if proposal.sequence_id > expected_seq {
-            // Gap detected - we're missing proposals
-            return Err(make_nack(NackReason::Gap));
-        }
-
-        // Deserialize the replicated event and convert to EventRecord
-        // Note: We use serde_json which has some depth limits by default, but for
-        // additional DoS protection, the payload size is already validated above.
-        let replicated_event: ReplicatedEvent = serde_json::from_slice(&proposal.event_data)
-            .map_err(|_| make_nack(NackReason::LedgerError))?;
-
-        // Validate the inner event's hash for integrity (defense-in-depth)
-        // This catches corrupted or tampered events even if the leader's
-        // proposal signature is valid.
-        if !replicated_event.validate_hash() {
-            return Err(make_nack(NackReason::InvalidEventSignature));
-        }
+        // Deserialize and validate the replicated event
+        let replicated_event =
+            Self::deserialize_and_validate_event(&proposal.event_data).map_err(&make_nack)?;
 
         let event = replicated_event.to_event_record();
 
+        // Append to ledger
         let local_seq_id = self
             .backend
             .append(&proposal.namespace, &event)
@@ -1281,14 +1368,25 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
         // Record the ack (with epoch validation)
         let mut tracker = self.ack_tracker.write().await;
         if let Some(state) = tracker.get_mut(&ack.sequence_id) {
-            // record_ack validates epoch internally and returns false if mismatched
-            if state.record_ack(ack.clone()) {
-                Ok(state.ack_count())
-            } else {
-                Err(ReplicationError::StaleEpoch {
+            match state.record_ack(ack.clone()) {
+                RecordAckResult::Recorded => Ok(state.ack_count()),
+                RecordAckResult::EpochMismatch => Err(ReplicationError::StaleEpoch {
                     ack_epoch: ack.epoch,
                     proposal_epoch: state.epoch,
-                })
+                }),
+                RecordAckResult::NamespaceMismatch => {
+                    // Namespace mismatch is a stale epoch error variant - the ack
+                    // doesn't match the proposal we're tracking
+                    Err(ReplicationError::StaleEpoch {
+                        ack_epoch: ack.epoch,
+                        proposal_epoch: state.epoch,
+                    })
+                },
+                RecordAckResult::CapacityLimitReached => {
+                    // Capacity limit reached - ack is valid but cannot be stored
+                    // Return current count without error since this is a resource limit
+                    Ok(state.ack_count())
+                },
             }
         } else {
             // Proposal not being tracked (already evicted or unknown)
@@ -1620,14 +1718,17 @@ mod tests {
         for i in 0u8..3 {
             let mut follower_id = [0u8; 32];
             follower_id[0] = i;
-            assert!(state.record_ack(ReplicationAck {
-                epoch: 1,
-                sequence_id: 42,
-                namespace: "test".to_string(),
-                follower_id,
-                local_seq_id: 100 + u64::from(i),
-                signature: [0u8; 64],
-            }));
+            assert_eq!(
+                state.record_ack(ReplicationAck {
+                    epoch: 1,
+                    sequence_id: 42,
+                    namespace: "test".to_string(),
+                    follower_id,
+                    local_seq_id: 100 + u64::from(i),
+                    signature: [0u8; 64],
+                }),
+                RecordAckResult::Recorded
+            );
         }
 
         assert_eq!(state.ack_count(), 3);
@@ -1635,14 +1736,33 @@ mod tests {
         // Ack with mismatched epoch should be rejected
         let mut follower_id = [0u8; 32];
         follower_id[0] = 99;
-        assert!(!state.record_ack(ReplicationAck {
-            epoch: 2, // Wrong epoch
-            sequence_id: 42,
-            namespace: "test".to_string(),
-            follower_id,
-            local_seq_id: 200,
-            signature: [0u8; 64],
-        }));
+        assert_eq!(
+            state.record_ack(ReplicationAck {
+                epoch: 2, // Wrong epoch
+                sequence_id: 42,
+                namespace: "test".to_string(),
+                follower_id,
+                local_seq_id: 200,
+                signature: [0u8; 64],
+            }),
+            RecordAckResult::EpochMismatch
+        );
+        assert_eq!(state.ack_count(), 3); // Count unchanged
+
+        // Ack with mismatched namespace should be rejected
+        let mut follower_id2 = [0u8; 32];
+        follower_id2[0] = 100;
+        assert_eq!(
+            state.record_ack(ReplicationAck {
+                epoch: 1,
+                sequence_id: 42,
+                namespace: "wrong_namespace".to_string(),
+                follower_id: follower_id2,
+                local_seq_id: 201,
+                signature: [0u8; 64],
+            }),
+            RecordAckResult::NamespaceMismatch
+        );
         assert_eq!(state.ack_count(), 3); // Count unchanged
 
         // Add nack
@@ -1760,7 +1880,7 @@ mod tck_00195_tests {
     #[test]
     fn tck_00195_error_variants() {
         // Verify all error variants exist and can be displayed
-        let errors: [ReplicationError; 12] = [
+        let errors: [ReplicationError; 13] = [
             ReplicationError::NotLeader {
                 expected: String::new(),
                 actual: String::new(),
@@ -1782,6 +1902,7 @@ mod tck_00195_tests {
             },
             ReplicationError::PayloadTooLarge { size: 0, max: 0 },
             ReplicationError::Serialization(String::new()),
+            ReplicationError::Canonicalization(CacJsonError::FloatNotAllowed),
             ReplicationError::QueueFull { size: 0, max: 0 },
             ReplicationError::UnknownPeer {
                 peer_id: String::new(),
@@ -1792,7 +1913,7 @@ mod tck_00195_tests {
             },
             ReplicationError::Shutdown,
         ];
-        assert_eq!(errors.len(), 12);
+        assert_eq!(errors.len(), 13);
     }
 
     #[test]
