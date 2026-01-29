@@ -105,8 +105,9 @@ pub use bft_machine::{
 // HLC-based CRDT merge operators (TCK-00197)
 pub use crdt::{
     ConflictRecord, CrdtMergeError, GCounter, Hlc, HlcWithNodeId, LwwRegister,
-    MAX_CONFLICT_PAYLOAD_SIZE, MAX_CONFLICTS_PER_BATCH, MAX_KEY_LEN, MAX_NODE_ID_LEN, MergeEngine,
-    MergeOperator, MergeResult, MergeWinner, NodeId, hash_value, validate_key, validate_node_id,
+    MAX_CONFLICTS_PER_BATCH, MAX_KEY_LEN, MAX_NODE_ID_LEN, MAX_SET_ELEMENTS, MergeEngine,
+    MergeOperator, MergeResult, MergeWinner, NodeId, SetUnion, hash_value, validate_key,
+    validate_node_id,
 };
 pub use discovery::{
     DiscoveryConfig, DiscoveryError, PeerDiscovery, PeerInfo, PeerList, PeerStatus,

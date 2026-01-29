@@ -71,9 +71,6 @@ pub const MAX_NODE_ID_LEN: usize = 64;
 /// Maximum length of key for LWW registers.
 pub const MAX_KEY_LEN: usize = 256;
 
-/// Maximum payload size for conflict recording.
-pub const MAX_CONFLICT_PAYLOAD_SIZE: usize = 64 * 1024; // 64 KiB
-
 /// Maximum number of nodes in a `GCounter`.
 ///
 /// Bounded to prevent denial-of-service via memory exhaustion (CTR-1303).
@@ -88,6 +85,12 @@ pub const MAX_FUTURE_SKEW_NS: u64 = 60 * 1_000_000_000; // 60 seconds
 
 /// Maximum length of reason string for conflict records.
 pub const MAX_REASON_LEN: usize = 1024;
+
+/// Maximum number of elements in a `SetUnion`.
+///
+/// Bounded to prevent denial-of-service via memory exhaustion (CTR-1303).
+/// An attacker could inject arbitrary elements to cause OOM.
+pub const MAX_SET_ELEMENTS: usize = 1024;
 
 // =============================================================================
 // Errors
@@ -165,6 +168,15 @@ pub enum CrdtMergeError {
         /// Maximum allowed length.
         max: usize,
     },
+
+    /// `SetUnion` has too many elements.
+    #[error("SetUnion element limit exceeded: {count} > {max}")]
+    SetUnionElementLimitExceeded {
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed count.
+        max: usize,
+    },
 }
 
 // =============================================================================
@@ -185,9 +197,9 @@ pub enum CrdtMergeError {
 #[serde(deny_unknown_fields)]
 pub struct Hlc {
     /// Wall clock time in nanoseconds since Unix epoch.
-    pub wall_time_ns: u64,
+    wall_time_ns: u64,
     /// Logical counter for ordering within same wall time.
-    pub logical_counter: u32,
+    logical_counter: u32,
 }
 
 impl Hlc {
@@ -198,6 +210,18 @@ impl Hlc {
             wall_time_ns,
             logical_counter,
         }
+    }
+
+    /// Returns the wall clock time in nanoseconds since Unix epoch.
+    #[must_use]
+    pub const fn wall_time_ns(&self) -> u64 {
+        self.wall_time_ns
+    }
+
+    /// Returns the logical counter for ordering within the same wall time.
+    #[must_use]
+    pub const fn logical_counter(&self) -> u32 {
+        self.logical_counter
     }
 
     /// Creates an HLC from the current system time.
@@ -262,7 +286,7 @@ impl Hlc {
     /// use apm2_core::consensus::crdt::{CrdtMergeError, Hlc, MAX_FUTURE_SKEW_NS};
     ///
     /// let local = Hlc::now();
-    /// let remote = Hlc::new(local.wall_time_ns + 1000, 0); // 1 microsecond ahead
+    /// let remote = Hlc::new(local.wall_time_ns() + 1000, 0); // 1 microsecond ahead
     ///
     /// // Normal update succeeds
     /// let updated = local.update_with_remote(&remote).unwrap();
@@ -542,7 +566,8 @@ impl ConflictRecord {
     /// could cause memory exhaustion. For secure operation, use
     /// [`Self::try_lww`] which validates all inputs.
     #[must_use]
-    pub const fn lww_unchecked(
+    #[allow(clippy::missing_const_for_fn)] // String parameters are not const-compatible
+    pub fn lww_unchecked(
         local_hlc: Hlc,
         local_node_id: NodeId,
         remote_hlc: Hlc,
@@ -667,11 +692,11 @@ pub enum MergeWinner {
 #[serde(deny_unknown_fields)]
 pub struct LwwRegister<T> {
     /// The stored value.
-    pub value: T,
+    value: T,
     /// Timestamp of the last write.
-    pub hlc: Hlc,
+    hlc: Hlc,
     /// Node that performed the last write.
-    pub node_id: NodeId,
+    node_id: NodeId,
 }
 
 impl<T: Clone + PartialEq> LwwRegister<T> {
@@ -684,6 +709,25 @@ impl<T: Clone + PartialEq> LwwRegister<T> {
             hlc,
             node_id,
         }
+    }
+
+    /// Returns a reference to the stored value.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // Generic type may not be const-compatible
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    /// Returns the HLC timestamp of the last write.
+    #[must_use]
+    pub const fn hlc(&self) -> Hlc {
+        self.hlc
+    }
+
+    /// Returns the node ID that performed the last write.
+    #[must_use]
+    pub const fn node_id(&self) -> NodeId {
+        self.node_id
     }
 
     /// Returns the HLC with node ID for comparison.
@@ -715,30 +759,17 @@ impl<T: Clone + PartialEq> LwwRegister<T> {
         let self_ts = self.timestamp();
         let other_ts = other.timestamp();
 
+        // HlcWithNodeId::cmp provides total ordering: HLC first, then node_id
+        // So Ordering::Equal only occurs when both HLC and node_id match exactly
         let (winner, resolution, reason) = match self_ts.cmp(&other_ts) {
-            Ordering::Greater => (self.clone(), MergeWinner::LocalWins, "local HLC is higher"),
+            Ordering::Greater | Ordering::Equal => {
+                (self.clone(), MergeWinner::LocalWins, "local timestamp wins")
+            },
             Ordering::Less => (
                 other.clone(),
                 MergeWinner::RemoteWins,
-                "remote HLC is higher",
+                "remote timestamp wins",
             ),
-            Ordering::Equal => {
-                // HLCs are exactly equal - this shouldn't happen in practice
-                // but we handle it by comparing node IDs
-                if self.node_id >= other.node_id {
-                    (
-                        self.clone(),
-                        MergeWinner::LocalWins,
-                        "HLC tie, local node_id is higher",
-                    )
-                } else {
-                    (
-                        other.clone(),
-                        MergeWinner::RemoteWins,
-                        "HLC tie, remote node_id is higher",
-                    )
-                }
-            },
         };
 
         let conflict = ConflictRecord::lww_unchecked(
@@ -925,6 +956,172 @@ impl GCounter {
     #[must_use]
     pub fn node_count_len(&self) -> usize {
         self.counts.len()
+    }
+}
+
+// =============================================================================
+// Set Union (Add-only Set)
+// =============================================================================
+
+/// A Set Union CRDT (also known as G-Set or Add-only Set).
+///
+/// Elements can only be added, never removed. The merge operation is set union.
+/// This satisfies all CRDT properties:
+/// - **Commutativity**: `a.merge(b) = b.merge(a)`
+/// - **Associativity**: `merge(merge(a, b), c) = merge(a, merge(b, c))`
+/// - **Idempotence**: `a.merge(a) = a`
+///
+/// Used for `EvidencePublished` events per RFC-0014 (DD-0005).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetUnion<T: Ord + Clone> {
+    /// The set of elements. Using `BTreeSet` for deterministic iteration order.
+    elements: std::collections::BTreeSet<T>,
+}
+
+impl<T: Ord + Clone> Default for SetUnion<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Ord + Clone> SetUnion<T> {
+    /// Creates a new empty set.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            elements: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Creates a set from an iterator without capacity checking.
+    ///
+    /// # Safety
+    ///
+    /// This method does not enforce the element limit. An attacker could inject
+    /// many elements to cause memory exhaustion (OOM). For secure operation,
+    /// use [`Self::try_from_iter`] which enforces the limit.
+    #[must_use]
+    pub fn from_iter_unchecked(iter: impl IntoIterator<Item = T>) -> Self {
+        Self {
+            elements: iter.into_iter().collect(),
+        }
+    }
+
+    /// Creates a set from an iterator with capacity checking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtMergeError::SetUnionElementLimitExceeded`] if the iterator
+    /// contains more than [`MAX_SET_ELEMENTS`] elements.
+    pub fn try_from_iter(iter: impl IntoIterator<Item = T>) -> Result<Self, CrdtMergeError> {
+        let elements: std::collections::BTreeSet<T> = iter.into_iter().collect();
+        if elements.len() > MAX_SET_ELEMENTS {
+            return Err(CrdtMergeError::SetUnionElementLimitExceeded {
+                count: elements.len(),
+                max: MAX_SET_ELEMENTS,
+            });
+        }
+        Ok(Self { elements })
+    }
+
+    /// Inserts an element into the set without capacity checking.
+    ///
+    /// Returns `true` if the element was newly inserted, `false` if it already
+    /// existed.
+    ///
+    /// # Safety
+    ///
+    /// This method does not enforce the element limit. For secure operation,
+    /// use [`Self::try_insert`] which enforces the limit.
+    pub fn insert_unchecked(&mut self, element: T) -> bool {
+        self.elements.insert(element)
+    }
+
+    /// Inserts an element into the set with capacity checking.
+    ///
+    /// Returns `true` if the element was newly inserted, `false` if it already
+    /// existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtMergeError::SetUnionElementLimitExceeded`] if inserting a
+    /// new element would exceed [`MAX_SET_ELEMENTS`].
+    pub fn try_insert(&mut self, element: T) -> Result<bool, CrdtMergeError> {
+        // Check if this is a new element and we're at capacity
+        if !self.elements.contains(&element) && self.elements.len() >= MAX_SET_ELEMENTS {
+            return Err(CrdtMergeError::SetUnionElementLimitExceeded {
+                count: self.elements.len() + 1,
+                max: MAX_SET_ELEMENTS,
+            });
+        }
+        Ok(self.elements.insert(element))
+    }
+
+    /// Returns true if the set contains the element.
+    #[must_use]
+    pub fn contains(&self, element: &T) -> bool {
+        self.elements.contains(element)
+    }
+
+    /// Returns the number of elements in the set.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.elements.len()
+    }
+
+    /// Returns true if the set is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.elements.is_empty()
+    }
+
+    /// Returns an iterator over the elements in the set.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.elements.iter()
+    }
+
+    /// Merges this set with another without capacity checking.
+    ///
+    /// The result is the union of both sets.
+    ///
+    /// # Safety
+    ///
+    /// This method does not enforce the element limit. An attacker could inject
+    /// sets with many elements to cause memory exhaustion (OOM). For secure
+    /// operation, use [`Self::try_merge`] which enforces the limit.
+    #[must_use]
+    pub fn merge_unchecked(&self, other: &Self) -> Self {
+        Self {
+            elements: self.elements.union(&other.elements).cloned().collect(),
+        }
+    }
+
+    /// Merges this set with another with capacity checking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtMergeError::SetUnionElementLimitExceeded`] if the merged
+    /// set would exceed [`MAX_SET_ELEMENTS`].
+    pub fn try_merge(&self, other: &Self) -> Result<Self, CrdtMergeError> {
+        let merged: std::collections::BTreeSet<T> =
+            self.elements.union(&other.elements).cloned().collect();
+
+        if merged.len() > MAX_SET_ELEMENTS {
+            return Err(CrdtMergeError::SetUnionElementLimitExceeded {
+                count: merged.len(),
+                max: MAX_SET_ELEMENTS,
+            });
+        }
+
+        Ok(Self { elements: merged })
+    }
+
+    /// Returns a reference to the underlying `BTreeSet`.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // Generic type may not be const-compatible
+    pub fn as_set(&self) -> &std::collections::BTreeSet<T> {
+        &self.elements
     }
 }
 
@@ -1117,8 +1314,8 @@ mod tests {
         let winner_ab = result_ab.winner().unwrap();
         let winner_ba = result_ba.winner().unwrap();
 
-        assert_eq!(winner_ab.value, winner_ba.value);
-        assert_eq!(winner_ab.value, "value_b"); // Higher HLC wins
+        assert_eq!(winner_ab.value(), winner_ba.value());
+        assert_eq!(winner_ab.value(), "value_b"); // Higher HLC wins
     }
 
     /// AC1: LWW merge is associative.
@@ -1140,8 +1337,8 @@ mod tests {
         let bc = reg_b.merge(&reg_c).winner().unwrap();
         let abc_right = reg_a.merge(&bc).winner().unwrap();
 
-        assert_eq!(abc_left.value, abc_right.value);
-        assert_eq!(abc_left.value, "c"); // Highest HLC wins
+        assert_eq!(abc_left.value(), abc_right.value());
+        assert_eq!(abc_left.value(), "c"); // Highest HLC wins
     }
 
     /// AC1: LWW merge is idempotent.
@@ -1154,7 +1351,7 @@ mod tests {
 
         assert!(!result.had_conflict());
         let winner = result.winner().unwrap();
-        assert_eq!(winner.value, reg_a.value);
+        assert_eq!(winner.value(), reg_a.value());
     }
 
     /// AC1: LWW merge uses `node_id` as tie-breaker when HLCs are equal.
@@ -1172,7 +1369,7 @@ mod tests {
         // node_b > node_a, so value_b wins
         assert!(result.had_conflict());
         let winner = result.winner().unwrap();
-        assert_eq!(winner.value, "value_b");
+        assert_eq!(winner.value(), "value_b");
     }
 
     /// AC1: Concurrent updates resolve deterministically.
@@ -1191,8 +1388,8 @@ mod tests {
             let result_ab = reg_a.merge(&reg_b).winner().unwrap();
             let result_ba = reg_b.merge(&reg_a).winner().unwrap();
 
-            assert_eq!(result_ab.value, result_ba.value);
-            assert_eq!(result_ab.value, "from_a"); // Higher counter wins
+            assert_eq!(result_ab.value(), result_ba.value());
+            assert_eq!(result_ab.value(), "from_a"); // Higher counter wins
         }
     }
 
@@ -1322,9 +1519,9 @@ mod tests {
         let updated = local.receive_unchecked(&remote);
 
         // Should have the same or higher wall time
-        assert!(updated.wall_time_ns >= 1000);
+        assert!(updated.wall_time_ns() >= 1000);
         // Counter should be at least max + 1
-        assert!(updated.logical_counter > 10 || updated.wall_time_ns > 1000);
+        assert!(updated.logical_counter() > 10 || updated.wall_time_ns() > 1000);
     }
 
     /// Test HLC tick algorithm.
@@ -1334,11 +1531,11 @@ mod tests {
         let ticked = hlc.tick();
 
         // Wall time should be same or higher
-        assert!(ticked.wall_time_ns >= hlc.wall_time_ns);
+        assert!(ticked.wall_time_ns() >= hlc.wall_time_ns());
 
         // If wall time stayed the same, counter should increment
-        if ticked.wall_time_ns == hlc.wall_time_ns {
-            assert!(ticked.logical_counter > hlc.logical_counter);
+        if ticked.wall_time_ns() == hlc.wall_time_ns() {
+            assert!(ticked.logical_counter() > hlc.logical_counter());
         }
     }
 
@@ -1624,8 +1821,8 @@ mod tests {
 
         let updated = result.unwrap();
         // Should have advanced beyond both inputs
-        assert!(updated.wall_time_ns >= local.wall_time_ns);
-        assert!(updated.wall_time_ns >= remote.wall_time_ns);
+        assert!(updated.wall_time_ns() >= local.wall_time_ns());
+        assert!(updated.wall_time_ns() >= remote.wall_time_ns());
     }
 
     /// Test `ConflictRecord` validation via `try_lww`.
@@ -1731,5 +1928,244 @@ mod tests {
         assert_eq!(MAX_GCOUNTER_NODES, 1024);
         assert_eq!(MAX_FUTURE_SKEW_NS, 60 * 1_000_000_000); // 60 seconds
         assert_eq!(MAX_REASON_LEN, 1024);
+        assert_eq!(MAX_SET_ELEMENTS, 1024);
+    }
+
+    // =========================================================================
+    // TCK-00197: SetUnion CRDT Tests
+    // =========================================================================
+
+    /// `SetUnion`: basic insertion and containment.
+    #[test]
+    fn tck_00197_set_union_basic() {
+        let mut set: SetUnion<String> = SetUnion::new();
+        assert!(set.is_empty());
+        assert_eq!(set.len(), 0);
+
+        // Insert element
+        assert!(set.insert_unchecked("a".to_string()));
+        assert!(!set.is_empty());
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&"a".to_string()));
+
+        // Duplicate insert returns false
+        assert!(!set.insert_unchecked("a".to_string()));
+        assert_eq!(set.len(), 1);
+    }
+
+    /// `SetUnion`: merge is commutative (a.merge(b) = b.merge(a)).
+    #[test]
+    fn tck_00197_set_union_merge_commutativity() {
+        let mut set_a: SetUnion<i32> = SetUnion::new();
+        set_a.insert_unchecked(1);
+        set_a.insert_unchecked(2);
+
+        let mut set_b: SetUnion<i32> = SetUnion::new();
+        set_b.insert_unchecked(2);
+        set_b.insert_unchecked(3);
+
+        let merged_ab = set_a.merge_unchecked(&set_b);
+        let merged_ba = set_b.merge_unchecked(&set_a);
+
+        // Merged sets should be equal
+        assert_eq!(merged_ab, merged_ba);
+
+        // Should contain union of both sets
+        assert!(merged_ab.contains(&1));
+        assert!(merged_ab.contains(&2));
+        assert!(merged_ab.contains(&3));
+        assert_eq!(merged_ab.len(), 3);
+    }
+
+    /// `SetUnion`: merge is associative (merge(merge(a, b), c) = merge(a,
+    /// merge(b, c))).
+    #[test]
+    fn tck_00197_set_union_merge_associativity() {
+        let mut set_a: SetUnion<i32> = SetUnion::new();
+        set_a.insert_unchecked(1);
+
+        let mut set_b: SetUnion<i32> = SetUnion::new();
+        set_b.insert_unchecked(2);
+
+        let mut set_c: SetUnion<i32> = SetUnion::new();
+        set_c.insert_unchecked(3);
+
+        // (a merge b) merge c
+        let ab = set_a.merge_unchecked(&set_b);
+        let abc_left = ab.merge_unchecked(&set_c);
+
+        // a merge (b merge c)
+        let bc = set_b.merge_unchecked(&set_c);
+        let abc_right = set_a.merge_unchecked(&bc);
+
+        assert_eq!(abc_left, abc_right);
+        assert_eq!(abc_left.len(), 3);
+    }
+
+    /// `SetUnion`: merge is idempotent (a.merge(a) = a).
+    #[test]
+    fn tck_00197_set_union_merge_idempotent() {
+        let mut set: SetUnion<i32> = SetUnion::new();
+        set.insert_unchecked(1);
+        set.insert_unchecked(2);
+        set.insert_unchecked(3);
+
+        let merged = set.merge_unchecked(&set);
+
+        assert_eq!(merged, set);
+        assert_eq!(merged.len(), 3);
+    }
+
+    /// `SetUnion`: empty sets merge correctly.
+    #[test]
+    fn tck_00197_set_union_empty_merge() {
+        let empty: SetUnion<i32> = SetUnion::new();
+        let mut non_empty: SetUnion<i32> = SetUnion::new();
+        non_empty.insert_unchecked(1);
+
+        // Empty merged with non-empty
+        let merged = empty.merge_unchecked(&non_empty);
+        assert_eq!(merged.len(), 1);
+        assert!(merged.contains(&1));
+
+        // Non-empty merged with empty
+        let merged2 = non_empty.merge_unchecked(&empty);
+        assert_eq!(merged2.len(), 1);
+        assert!(merged2.contains(&1));
+    }
+
+    /// `SetUnion`: `try_insert` enforces capacity limit.
+    #[test]
+    fn tck_00197_set_union_capacity_try_insert() {
+        let mut set: SetUnion<usize> = SetUnion::new();
+
+        // Fill up to the limit
+        for i in 0..MAX_SET_ELEMENTS {
+            set.try_insert(i).unwrap();
+        }
+        assert_eq!(set.len(), MAX_SET_ELEMENTS);
+
+        // Next new element should fail
+        let result = set.try_insert(MAX_SET_ELEMENTS);
+        assert!(matches!(
+            result,
+            Err(CrdtMergeError::SetUnionElementLimitExceeded { .. })
+        ));
+
+        // But existing element can still be "inserted" (no-op)
+        let result = set.try_insert(0);
+        assert!(result.is_ok());
+        assert!(!result.unwrap()); // Returns false because element existed
+    }
+
+    /// `SetUnion`: `try_merge` enforces capacity limit.
+    #[test]
+    fn tck_00197_set_union_capacity_try_merge() {
+        let mut set_a: SetUnion<usize> = SetUnion::new();
+        let mut set_b: SetUnion<usize> = SetUnion::new();
+
+        // Fill set_a with half the limit
+        for i in 0..(MAX_SET_ELEMENTS / 2) {
+            set_a.try_insert(i).unwrap();
+        }
+
+        // Fill set_b with different elements, also half the limit
+        for i in (MAX_SET_ELEMENTS / 2)..MAX_SET_ELEMENTS {
+            set_b.try_insert(i).unwrap();
+        }
+
+        // Merge should succeed (exactly at limit)
+        let merged = set_a.try_merge(&set_b).unwrap();
+        assert_eq!(merged.len(), MAX_SET_ELEMENTS);
+
+        // Add one more element to set_b
+        set_b.insert_unchecked(MAX_SET_ELEMENTS);
+
+        // Now merge should fail
+        let result = merged.try_merge(&set_b);
+        assert!(matches!(
+            result,
+            Err(CrdtMergeError::SetUnionElementLimitExceeded { .. })
+        ));
+    }
+
+    /// `SetUnion`: `try_from_iter` enforces capacity limit.
+    #[test]
+    fn tck_00197_set_union_capacity_try_from_iter() {
+        // Valid: exactly at limit
+        let elements: Vec<usize> = (0..MAX_SET_ELEMENTS).collect();
+        let set = SetUnion::try_from_iter(elements).unwrap();
+        assert_eq!(set.len(), MAX_SET_ELEMENTS);
+
+        // Invalid: over limit
+        let elements: Vec<usize> = (0..=MAX_SET_ELEMENTS).collect();
+        let result = SetUnion::try_from_iter(elements);
+        assert!(matches!(
+            result,
+            Err(CrdtMergeError::SetUnionElementLimitExceeded { .. })
+        ));
+    }
+
+    /// `SetUnion`: iterator and `as_set` work correctly.
+    #[test]
+    fn tck_00197_set_union_iteration() {
+        let mut set: SetUnion<i32> = SetUnion::new();
+        set.insert_unchecked(3);
+        set.insert_unchecked(1);
+        set.insert_unchecked(2);
+
+        // Iterator should yield elements in order (BTreeSet)
+        let elements: Vec<_> = set.iter().copied().collect();
+        assert_eq!(elements, vec![1, 2, 3]);
+
+        // as_set should return the underlying BTreeSet
+        assert_eq!(set.as_set().len(), 3);
+    }
+
+    /// `SetUnion`: `from_iter_unchecked` works.
+    #[test]
+    fn tck_00197_set_union_from_iter() {
+        let set = SetUnion::from_iter_unchecked(vec![1, 2, 3, 2, 1]);
+
+        // Duplicates should be removed
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&1));
+        assert!(set.contains(&2));
+        assert!(set.contains(&3));
+    }
+
+    /// `SetUnion`: default creates empty set.
+    #[test]
+    fn tck_00197_set_union_default() {
+        let set: SetUnion<i32> = SetUnion::default();
+        assert!(set.is_empty());
+    }
+
+    /// `SetUnion`: error display for `SetUnionElementLimitExceeded`.
+    #[test]
+    fn tck_00197_set_union_error_display() {
+        let err = CrdtMergeError::SetUnionElementLimitExceeded {
+            count: 1025,
+            max: 1024,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("1025"));
+        assert!(msg.contains("1024"));
+        assert!(msg.contains("SetUnion"));
+    }
+
+    /// `SetUnion`: serialization round-trip.
+    #[test]
+    fn tck_00197_set_union_serialization() {
+        let mut set: SetUnion<String> = SetUnion::new();
+        set.insert_unchecked("hello".to_string());
+        set.insert_unchecked("world".to_string());
+
+        let json = serde_json::to_string(&set).unwrap();
+        let parsed: SetUnion<String> = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed, set);
+        assert!(parsed.contains(&"hello".to_string()));
+        assert!(parsed.contains(&"world".to_string()));
     }
 }
