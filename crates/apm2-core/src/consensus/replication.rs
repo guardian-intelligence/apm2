@@ -1191,6 +1191,11 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
             return Some(NackReason::Stale);
         }
 
+        // Verify namespace matches (prevent cross-namespace pollution)
+        if proposal.namespace != config.namespace {
+            return Some(NackReason::Stale);
+        }
+
         // Validate the event hash
         if !proposal.validate_hash() {
             return Some(NackReason::InvalidHash);
