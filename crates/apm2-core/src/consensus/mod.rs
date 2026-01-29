@@ -75,9 +75,13 @@ pub use network::{
     CONTROL_FRAME_SIZE, Connection, ConnectionPool, ControlFrame, Network, NetworkConfig,
     NetworkError, PooledConnection, TlsConfig, TlsConfigBuilder, apply_dispatch_jitter,
 };
+// Note: process_tunnel_frame is deprecated, use the internal identity-bound
+// version instead
+#[allow(deprecated)]
+pub use relay::process_tunnel_frame;
 pub use relay::{
     CLEANUP_INTERVAL, MAX_PENDING_MESSAGES, MAX_RELAY_ID_LEN, ROUTE_TIMEOUT, RelayConfig,
-    RelayConfigBuilder, RelayError, RelayHolon, RelayStats, TunnelRegistry, process_tunnel_frame,
+    RelayConfigBuilder, RelayError, RelayHolon, RelayStats, TunnelRegistry,
 };
 pub use tunnel::{
     HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, MAX_TUNNEL_ID_LEN, MAX_TUNNELS, MAX_WORKER_ID_LEN,

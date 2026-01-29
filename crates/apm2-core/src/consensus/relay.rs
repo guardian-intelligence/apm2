@@ -38,13 +38,18 @@ use std::time::Duration;
 
 use subtle::ConstantTimeEq;
 use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::time::timeout;
+use tokio_rustls::TlsStream;
 
-use super::network::{Connection, ControlFrame, NetworkError, TlsConfig};
+use super::network::{CONTROL_FRAME_SIZE, Connection, ControlFrame, NetworkError, TlsConfig};
 use super::tunnel::{
-    HEARTBEAT_INTERVAL, MAX_TUNNELS, MSG_TUNNEL_CLOSE, MSG_TUNNEL_DATA, MSG_TUNNEL_HEARTBEAT,
-    MSG_TUNNEL_HEARTBEAT_ACK, TunnelAcceptResponse, TunnelData, TunnelError, TunnelHeartbeat,
-    TunnelInfo, TunnelRegisterRequest, TunnelRejectResponse, TunnelState,
+    HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, MAX_TUNNELS, MSG_TUNNEL_CLOSE, MSG_TUNNEL_DATA,
+    MSG_TUNNEL_HEARTBEAT, MSG_TUNNEL_HEARTBEAT_ACK, MSG_TUNNEL_REGISTER, TunnelAcceptResponse,
+    TunnelData, TunnelError, TunnelHeartbeat, TunnelInfo, TunnelRegisterRequest,
+    TunnelRejectResponse, TunnelState,
 };
 
 // =============================================================================
@@ -154,6 +159,15 @@ pub enum RelayError {
     /// Relay shutdown.
     #[error("relay is shutting down")]
     Shutdown,
+
+    /// Tunnel identity mismatch (cross-tunnel spoofing attempt).
+    #[error("tunnel identity mismatch: expected {expected}, received {received}")]
+    TunnelIdentityMismatch {
+        /// Expected tunnel ID bound to the connection.
+        expected: String,
+        /// Tunnel ID received in the message.
+        received: String,
+    },
 }
 
 // =============================================================================
@@ -164,25 +178,32 @@ pub enum RelayError {
 struct TunnelEntry {
     /// Tunnel metadata.
     info: TunnelInfo,
-    /// The underlying connection (reserved for future bidirectional messaging).
-    #[allow(dead_code)]
-    connection: Connection,
-    /// Channel for sending messages to the tunnel handler.
+    /// Channel for sending messages to the tunnel handler task.
     sender: mpsc::Sender<ControlFrame>,
+    /// Handle to the tunnel handler task (for cleanup).
+    task_handle: tokio::task::JoinHandle<()>,
 }
 
 impl TunnelEntry {
     /// Creates a new tunnel entry.
-    const fn new(
+    #[allow(clippy::missing_const_for_fn)] // JoinHandle is not const-compatible
+    fn new(
         info: TunnelInfo,
-        connection: Connection,
         sender: mpsc::Sender<ControlFrame>,
+        task_handle: tokio::task::JoinHandle<()>,
     ) -> Self {
         Self {
             info,
-            connection,
             sender,
+            task_handle,
         }
+    }
+}
+
+impl Drop for TunnelEntry {
+    fn drop(&mut self) {
+        // Abort the handler task when the entry is dropped
+        self.task_handle.abort();
     }
 }
 
@@ -333,8 +354,8 @@ impl TunnelRegistry {
     pub async fn register(
         &self,
         info: TunnelInfo,
-        connection: Connection,
         sender: mpsc::Sender<ControlFrame>,
+        task_handle: tokio::task::JoinHandle<()>,
     ) -> Result<(), RelayError> {
         let mut by_id = self.tunnels_by_id.write().await;
         let mut by_worker = self.tunnels_by_worker.write().await;
@@ -367,7 +388,7 @@ impl TunnelRegistry {
         let worker_id = info.worker_id.clone();
 
         // Create entry
-        let entry = Arc::new(RwLock::new(TunnelEntry::new(info, connection, sender)));
+        let entry = Arc::new(RwLock::new(TunnelEntry::new(info, sender, task_handle)));
         by_id.insert(tunnel_id.clone(), entry);
 
         // Add to worker index
@@ -480,8 +501,7 @@ pub struct RelayHolon {
     config: RelayConfig,
     /// Tunnel registry.
     registry: Arc<TunnelRegistry>,
-    /// Shutdown signal sender (reserved for graceful shutdown implementation).
-    #[allow(dead_code)]
+    /// Shutdown signal sender for graceful shutdown.
     shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -495,6 +515,80 @@ impl RelayHolon {
             config,
             registry,
             shutdown_tx: None,
+        }
+    }
+
+    /// Runs the relay listener, accepting incoming tunnel connections.
+    ///
+    /// This method binds to the configured address and spawns handler tasks
+    /// for each incoming connection. It processes tunnel registrations and
+    /// maintains the tunnel registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the listener cannot be started.
+    pub async fn run(&mut self) -> Result<(), RelayError> {
+        let listener = TcpListener::bind(self.config.bind_addr)
+            .await
+            .map_err(|e| RelayError::Listener(format!("failed to bind: {e}")))?;
+
+        tracing::info!(
+            bind_addr = %self.config.bind_addr,
+            relay_id = %self.config.relay_id,
+            "Relay listener started"
+        );
+
+        // Create shutdown channel
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        self.shutdown_tx = Some(shutdown_tx);
+
+        let tls_acceptor = self.config.tls_config.acceptor();
+
+        loop {
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok((tcp_stream, peer_addr)) => {
+                            let acceptor = tls_acceptor.clone();
+                            let relay_config = self.config.clone();
+                            let registry = Arc::clone(&self.registry);
+
+                            // Spawn connection handler
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_incoming_connection(
+                                    tcp_stream,
+                                    peer_addr,
+                                    acceptor,
+                                    relay_config,
+                                    registry,
+                                ).await {
+                                    tracing::debug!(
+                                        peer_addr = %peer_addr,
+                                        error = %e,
+                                        "Failed to handle incoming connection"
+                                    );
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to accept connection");
+                        }
+                    }
+                }
+                _ = &mut shutdown_rx => {
+                    tracing::info!("Relay received shutdown signal");
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Triggers graceful shutdown of the relay.
+    pub fn shutdown(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
         }
     }
 
@@ -520,6 +614,9 @@ impl RelayHolon {
     ///
     /// Identity comparison uses constant-time equality to prevent timing
     /// attacks.
+    ///
+    /// The spawned handler task binds the `tunnel_id` to this connection,
+    /// preventing cross-tunnel identity spoofing (CRITICAL security fix).
     ///
     /// # Errors
     ///
@@ -559,11 +656,20 @@ impl RelayHolon {
             connection.peer_addr(),
         );
 
-        // Create message channel
-        let (sender, _receiver) = mpsc::channel(MAX_PENDING_MESSAGES);
+        // Create message channel for outbound messages to the tunnel
+        let (sender, receiver) = mpsc::channel(MAX_PENDING_MESSAGES);
 
-        // Register tunnel
-        self.registry.register(info, connection, sender).await?;
+        // Spawn the tunnel handler task that:
+        // 1. Reads incoming frames from the connection
+        // 2. Writes outgoing frames from the channel to the connection
+        // 3. Binds the expected tunnel_id to prevent cross-tunnel spoofing
+        let registry = Arc::clone(&self.registry);
+        let expected_tunnel_id = request.tunnel_id.clone();
+        let task_handle =
+            spawn_tunnel_handler(connection, receiver, registry, expected_tunnel_id.clone());
+
+        // Register tunnel with the handler task
+        self.registry.register(info, sender, task_handle).await?;
 
         // Create accept response
         let accept = TunnelAcceptResponse::new(
@@ -679,22 +785,294 @@ pub struct RelayStats {
 }
 
 // =============================================================================
+// Connection Handler
+// =============================================================================
+
+/// Handles an incoming connection from a worker.
+///
+/// This function:
+/// 1. Performs TLS handshake with client certificate verification
+/// 2. Reads the registration request
+/// 3. Validates identity against the mTLS certificate
+/// 4. Sends accept/reject response
+/// 5. On accept, the connection is handed off to the tunnel handler task
+async fn handle_incoming_connection(
+    tcp_stream: TcpStream,
+    peer_addr: SocketAddr,
+    acceptor: tokio_rustls::TlsAcceptor,
+    config: RelayConfig,
+    registry: Arc<TunnelRegistry>,
+) -> Result<(), RelayError> {
+    // Perform TLS handshake with timeout
+    let tls_stream = timeout(
+        super::network::TLS_HANDSHAKE_TIMEOUT,
+        acceptor.accept(tcp_stream),
+    )
+    .await
+    .map_err(|_| NetworkError::Timeout {
+        operation: "TLS handshake".into(),
+    })?
+    .map_err(|e| NetworkError::Handshake(format!("TLS handshake failed: {e}")))?;
+
+    let mut connection = Connection::new(TlsStream::Server(tls_stream), peer_addr);
+
+    // Read registration request with timeout
+    let frame = connection
+        .recv_frame_with_timeout(super::tunnel::REGISTRATION_TIMEOUT)
+        .await?;
+
+    // Verify it's a registration request
+    if frame.message_type() != MSG_TUNNEL_REGISTER {
+        return Err(RelayError::InvalidMessage(format!(
+            "expected TUNNEL_REGISTER ({}), got {}",
+            MSG_TUNNEL_REGISTER,
+            frame.message_type()
+        )));
+    }
+
+    // Parse the registration request
+    let request = TunnelRegisterRequest::from_bytes(frame.payload())?;
+    request.validate()?;
+
+    // Validate identity if configured (INV-0023)
+    if config.validate_identity {
+        let cert_cn = connection.peer_common_name().ok_or_else(|| {
+            RelayError::InvalidMessage("certificate CN required for identity validation".into())
+        })?;
+
+        let cn_bytes = cert_cn.as_bytes();
+        let worker_id_bytes = request.worker_id.as_bytes();
+        let is_equal: bool = cn_bytes.ct_eq(worker_id_bytes).into();
+
+        if !is_equal {
+            // Send rejection
+            let reject = TunnelRejectResponse::new(
+                request.tunnel_id.clone(),
+                format!("identity mismatch: certificate CN '{cert_cn}' does not match worker ID"),
+            );
+            let payload = reject.to_bytes()?;
+            let frame = ControlFrame::new(super::tunnel::MSG_TUNNEL_REJECT, &payload)?;
+            let _ = connection.send_frame(&frame).await;
+
+            return Err(RelayError::IdentityMismatch {
+                cert_cn,
+                worker_id: request.worker_id,
+            });
+        }
+    }
+
+    // Check registry limits
+    let current_count = registry.len().await;
+    if current_count >= config.max_tunnels {
+        let reject = TunnelRejectResponse::new(
+            request.tunnel_id.clone(),
+            "maximum tunnels reached".to_string(),
+        );
+        let payload = reject.to_bytes()?;
+        let frame = ControlFrame::new(super::tunnel::MSG_TUNNEL_REJECT, &payload)?;
+        let _ = connection.send_frame(&frame).await;
+
+        return Err(RelayError::MaxTunnelsReached {
+            max: config.max_tunnels,
+        });
+    }
+
+    // Create tunnel info
+    let info = TunnelInfo::new(
+        request.tunnel_id.clone(),
+        request.worker_id.clone(),
+        peer_addr,
+    );
+
+    // Send accept response
+    let accept = TunnelAcceptResponse::new(
+        request.tunnel_id.clone(),
+        config.relay_id.clone(),
+        config.heartbeat_interval.as_secs(),
+    );
+    let payload = accept.to_bytes()?;
+    let frame = ControlFrame::new(super::tunnel::MSG_TUNNEL_ACCEPT, &payload)?;
+    connection.send_frame(&frame).await?;
+
+    // Create message channel
+    let (sender, receiver) = mpsc::channel(MAX_PENDING_MESSAGES);
+
+    // Spawn tunnel handler task
+    let expected_tunnel_id = request.tunnel_id.clone();
+    let registry_clone = Arc::clone(&registry);
+    let task_handle =
+        spawn_tunnel_handler(connection, receiver, registry_clone, expected_tunnel_id);
+
+    // Register tunnel
+    registry.register(info, sender, task_handle).await?;
+
+    tracing::info!(
+        tunnel_id = %request.tunnel_id,
+        worker_id = %request.worker_id,
+        peer_addr = %peer_addr,
+        "Tunnel registered"
+    );
+
+    Ok(())
+}
+
+// =============================================================================
+// Tunnel Handler Task
+// =============================================================================
+
+/// Spawns a background task to handle a tunnel connection.
+///
+/// This task:
+/// 1. Reads incoming frames from the TLS connection
+/// 2. Writes outgoing frames from the channel to the connection
+/// 3. Validates that all incoming frames match the expected tunnel ID
+/// 4. Updates heartbeat timestamps in the registry
+///
+/// # Security
+///
+/// The `expected_tunnel_id` is bound to this connection during registration.
+/// All incoming frames are validated to ensure they match this ID, preventing
+/// cross-tunnel identity spoofing attacks.
+fn spawn_tunnel_handler(
+    connection: Connection,
+    receiver: mpsc::Receiver<ControlFrame>,
+    registry: Arc<TunnelRegistry>,
+    expected_tunnel_id: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Split the connection into read and write halves for concurrent I/O
+        let (read_half, write_half) = connection.into_split();
+
+        // Spawn writer task
+        let writer_handle = tokio::spawn(tunnel_writer_loop(write_half, receiver));
+
+        // Run reader loop in this task
+        let read_result =
+            tunnel_reader_loop(read_half, Arc::clone(&registry), expected_tunnel_id.clone()).await;
+
+        // Clean up on exit
+        writer_handle.abort();
+
+        if let Err(e) = read_result {
+            tracing::debug!(
+                tunnel_id = %expected_tunnel_id,
+                error = %e,
+                "Tunnel reader loop exited"
+            );
+        }
+
+        // Unregister the tunnel
+        registry.unregister(&expected_tunnel_id).await;
+        tracing::info!(tunnel_id = %expected_tunnel_id, "Tunnel handler task completed");
+    })
+}
+
+/// Writer loop that sends frames from the channel to the connection.
+async fn tunnel_writer_loop(
+    mut write_half: WriteHalf<TlsStream<TcpStream>>,
+    mut receiver: mpsc::Receiver<ControlFrame>,
+) {
+    while let Some(frame) = receiver.recv().await {
+        if let Err(e) = write_half.write_all(frame.as_bytes()).await {
+            tracing::debug!(error = %e, "Failed to write frame to tunnel");
+            break;
+        }
+        if let Err(e) = write_half.flush().await {
+            tracing::debug!(error = %e, "Failed to flush tunnel write");
+            break;
+        }
+    }
+}
+
+/// Reader loop that reads frames from the connection and processes them.
+///
+/// # Security
+///
+/// All incoming frames are validated to ensure their `tunnel_id` matches the
+/// `expected_tunnel_id` that was bound during registration. This prevents
+/// cross-tunnel identity spoofing.
+async fn tunnel_reader_loop(
+    mut read_half: ReadHalf<TlsStream<TcpStream>>,
+    registry: Arc<TunnelRegistry>,
+    expected_tunnel_id: String,
+) -> Result<(), RelayError> {
+    let mut buf = [0u8; CONTROL_FRAME_SIZE];
+
+    loop {
+        // Read with heartbeat timeout
+        let read_result = timeout(HEARTBEAT_TIMEOUT, read_half.read_exact(&mut buf)).await;
+
+        match read_result {
+            Ok(Ok(_)) => {
+                // Parse the frame
+                let frame = ControlFrame::parse(&buf)?;
+
+                // Process the frame with identity binding
+                if let Err(e) =
+                    process_tunnel_frame_with_identity(&registry, &frame, &expected_tunnel_id).await
+                {
+                    tracing::warn!(
+                        tunnel_id = %expected_tunnel_id,
+                        error = %e,
+                        "Error processing tunnel frame"
+                    );
+                    // On identity mismatch, close the connection
+                    if matches!(e, RelayError::TunnelIdentityMismatch { .. }) {
+                        return Err(e);
+                    }
+                }
+            },
+            Ok(Err(e)) => {
+                // Read error
+                return Err(RelayError::Network(e.into()));
+            },
+            Err(_) => {
+                // Timeout - tunnel is stale
+                tracing::info!(
+                    tunnel_id = %expected_tunnel_id,
+                    "Tunnel read timeout, marking as stale"
+                );
+                return Err(RelayError::Tunnel(TunnelError::HeartbeatTimeout {
+                    tunnel_id: expected_tunnel_id,
+                }));
+            },
+        }
+    }
+}
+
+// =============================================================================
 // Protocol Handlers
 // =============================================================================
 
-/// Processes an incoming control frame from a tunnel.
+/// Processes an incoming control frame from a tunnel with identity validation.
+///
+/// # Security
+///
+/// This function validates that the `tunnel_id` in the frame payload matches
+/// the `expected_tunnel_id` that was bound to this connection during
+/// registration. This prevents cross-tunnel identity spoofing attacks where
+/// a malicious peer with a valid mTLS certificate could send messages for
+/// other active tunnels.
 ///
 /// # Errors
 ///
-/// Returns an error if the frame cannot be processed.
-pub async fn process_tunnel_frame(
-    relay: &RelayHolon,
+/// Returns an error if:
+/// - The frame cannot be processed
+/// - The `tunnel_id` in the frame doesn't match the expected identity
+async fn process_tunnel_frame_with_identity(
+    registry: &TunnelRegistry,
     frame: &ControlFrame,
+    expected_tunnel_id: &str,
 ) -> Result<Option<ControlFrame>, RelayError> {
     match frame.message_type() {
         MSG_TUNNEL_HEARTBEAT => {
             let heartbeat = TunnelHeartbeat::from_bytes(frame.payload())?;
-            relay.handle_heartbeat(heartbeat.clone()).await?;
+
+            // CRITICAL: Validate tunnel_id matches the expected identity
+            validate_tunnel_identity(&heartbeat.tunnel_id, expected_tunnel_id)?;
+
+            // Update heartbeat in registry
+            registry.touch(&heartbeat.tunnel_id).await?;
 
             // Send heartbeat ack
             let ack = TunnelHeartbeat::new(
@@ -712,7 +1090,97 @@ pub async fn process_tunnel_frame(
         MSG_TUNNEL_CLOSE => {
             let tunnel_id = std::str::from_utf8(frame.payload())
                 .map_err(|e| RelayError::InvalidMessage(format!("invalid tunnel_id: {e}")))?;
-            relay.handle_close(tunnel_id).await;
+
+            // CRITICAL: Validate tunnel_id matches the expected identity
+            validate_tunnel_identity(tunnel_id, expected_tunnel_id)?;
+
+            registry.unregister(tunnel_id).await;
+            tracing::info!(tunnel_id = %tunnel_id, "Tunnel closed by worker");
+            Ok(None)
+        },
+        MSG_TUNNEL_DATA => {
+            let data = TunnelData::from_bytes(frame.payload())?;
+
+            // CRITICAL: Validate tunnel_id matches the expected identity
+            validate_tunnel_identity(&data.tunnel_id, expected_tunnel_id)?;
+
+            // Data from worker - would be routed to appropriate client
+            // This is typically handled by application-level routing
+            Ok(None)
+        },
+        msg_type => Err(RelayError::InvalidMessage(format!(
+            "unexpected message type on tunnel: {msg_type}"
+        ))),
+    }
+}
+
+/// Validates that a `tunnel_id` from a message matches the expected identity.
+///
+/// # Security
+///
+/// Uses constant-time comparison to prevent timing attacks that could leak
+/// information about valid tunnel IDs.
+///
+/// # Errors
+///
+/// Returns `TunnelIdentityMismatch` if the IDs don't match.
+fn validate_tunnel_identity(
+    message_tunnel_id: &str,
+    expected_tunnel_id: &str,
+) -> Result<(), RelayError> {
+    let msg_bytes = message_tunnel_id.as_bytes();
+    let expected_bytes = expected_tunnel_id.as_bytes();
+    let is_equal: bool = msg_bytes.ct_eq(expected_bytes).into();
+
+    if !is_equal {
+        return Err(RelayError::TunnelIdentityMismatch {
+            expected: expected_tunnel_id.to_string(),
+            received: message_tunnel_id.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Processes an incoming control frame from a tunnel (legacy API).
+///
+/// **Deprecated**: Use `process_tunnel_frame_with_identity` instead for
+/// proper identity binding.
+///
+/// # Errors
+///
+/// Returns an error if the frame cannot be processed.
+#[deprecated(
+    since = "0.1.0",
+    note = "Use process_tunnel_frame_with_identity for proper identity binding"
+)]
+pub async fn process_tunnel_frame(
+    registry: &TunnelRegistry,
+    frame: &ControlFrame,
+) -> Result<Option<ControlFrame>, RelayError> {
+    match frame.message_type() {
+        MSG_TUNNEL_HEARTBEAT => {
+            let heartbeat = TunnelHeartbeat::from_bytes(frame.payload())?;
+            registry.touch(&heartbeat.tunnel_id).await?;
+
+            // Send heartbeat ack
+            let ack = TunnelHeartbeat::new(
+                heartbeat.tunnel_id,
+                heartbeat.sequence,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
+            let payload = ack.to_bytes()?;
+            let ack_frame = ControlFrame::new(MSG_TUNNEL_HEARTBEAT_ACK, &payload)?;
+            Ok(Some(ack_frame))
+        },
+        MSG_TUNNEL_CLOSE => {
+            let tunnel_id = std::str::from_utf8(frame.payload())
+                .map_err(|e| RelayError::InvalidMessage(format!("invalid tunnel_id: {e}")))?;
+            registry.unregister(tunnel_id).await;
+            tracing::info!(tunnel_id = %tunnel_id, "Tunnel closed by worker");
             Ok(None)
         },
         MSG_TUNNEL_DATA => {
@@ -897,6 +1365,66 @@ mod tck_00184_relay_tests {
             current: 0,
             max: MAX_TUNNELS_PER_WORKER,
         };
+        // Verify tunnel identity mismatch error variant exists (CRITICAL security fix)
+        let _: RelayError = RelayError::TunnelIdentityMismatch {
+            expected: String::new(),
+            received: String::new(),
+        };
+    }
+
+    #[test]
+    fn test_tck_00184_validate_tunnel_identity_match() {
+        // Matching identities should succeed
+        let result = validate_tunnel_identity("tunnel-123", "tunnel-123");
+        assert!(result.is_ok(), "Matching tunnel IDs should pass validation");
+    }
+
+    #[test]
+    fn test_tck_00184_validate_tunnel_identity_mismatch() {
+        // Mismatched identities should fail with TunnelIdentityMismatch
+        let result = validate_tunnel_identity("tunnel-123", "tunnel-456");
+        assert!(
+            matches!(result, Err(RelayError::TunnelIdentityMismatch { .. })),
+            "Mismatched tunnel IDs should fail validation"
+        );
+
+        if let Err(RelayError::TunnelIdentityMismatch { expected, received }) = result {
+            assert_eq!(expected, "tunnel-456");
+            assert_eq!(received, "tunnel-123");
+        }
+    }
+
+    #[test]
+    fn test_tck_00184_validate_tunnel_identity_empty() {
+        // Empty string comparisons should work correctly
+        let result = validate_tunnel_identity("", "");
+        assert!(result.is_ok(), "Empty strings should match");
+
+        let result = validate_tunnel_identity("tunnel", "");
+        assert!(matches!(
+            result,
+            Err(RelayError::TunnelIdentityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_tck_00184_identity_spoofing_prevention() {
+        // This test verifies that the identity validation prevents cross-tunnel
+        // spoofing A malicious peer cannot send messages for a different tunnel
+        // ID
+
+        // Simulate a legitimate tunnel registration
+        let registered_tunnel = "legit-tunnel-abc123";
+
+        // Attacker tries to send a message claiming to be from a different tunnel
+        let attacker_claimed_tunnel = "victim-tunnel-xyz789";
+
+        // The validation should reject the spoofed identity
+        let result = validate_tunnel_identity(attacker_claimed_tunnel, registered_tunnel);
+        assert!(
+            matches!(result, Err(RelayError::TunnelIdentityMismatch { .. })),
+            "Cross-tunnel spoofing attempt should be rejected"
+        );
     }
 
     #[test]

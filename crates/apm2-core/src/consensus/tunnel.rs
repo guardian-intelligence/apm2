@@ -20,17 +20,20 @@
 //! - INV-0023: Relay validates worker identity matches certificate CN
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_rustls::TlsStream;
 
 use super::network::{
-    Connection, ControlFrame, NetworkError, TCP_CONNECT_TIMEOUT, TLS_HANDSHAKE_TIMEOUT, TlsConfig,
+    CONTROL_FRAME_SIZE, ControlFrame, NetworkError, TCP_CONNECT_TIMEOUT, TLS_HANDSHAKE_TIMEOUT,
+    TlsConfig,
 };
 
 // =============================================================================
@@ -510,8 +513,16 @@ impl TunnelInfo {
 /// This struct manages the worker-side of a reverse-TLS tunnel, handling:
 /// - Connection establishment
 /// - Registration with relay
-/// - Heartbeat maintenance
-/// - Message sending/receiving
+/// - Automatic heartbeat maintenance (via background task)
+/// - Concurrent message sending/receiving (via split streams)
+///
+/// # Concurrency
+///
+/// The tunnel uses `tokio::io::split` to separate the TLS stream into
+/// independent read and write halves. This allows:
+/// - Sending heartbeats without blocking frame reception
+/// - Receiving frames without blocking heartbeat transmission
+/// - Concurrent send/receive operations
 pub struct ManagedTunnel {
     /// Tunnel identifier.
     tunnel_id: String,
@@ -519,28 +530,46 @@ pub struct ManagedTunnel {
     worker_id: String,
     /// Current state.
     state: RwLock<TunnelState>,
-    /// Underlying connection (when established).
-    connection: RwLock<Option<Connection>>,
-    /// Heartbeat sequence number.
-    heartbeat_seq: RwLock<u64>,
-    /// Last heartbeat time.
+    /// Write half of the connection (protected for concurrent sends).
+    write_half: Mutex<Option<WriteHalf<TlsStream<TcpStream>>>>,
+    /// Read half of the connection (protected for concurrent reads).
+    read_half: Mutex<Option<ReadHalf<TlsStream<TcpStream>>>>,
+    /// Heartbeat sequence number (atomic for lock-free updates).
+    heartbeat_seq: AtomicU64,
+    /// Last heartbeat time (protected by `RwLock` for accurate reads).
     last_heartbeat: RwLock<Instant>,
     /// TLS configuration.
     tls_config: TlsConfig,
+    /// Channel for sending outbound frames.
+    outbound_tx: mpsc::Sender<ControlFrame>,
+    /// Channel receiver for outbound frames (used by writer task).
+    outbound_rx: Mutex<Option<mpsc::Receiver<ControlFrame>>>,
+    /// Shutdown signal sender.
+    shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
+    /// Flag indicating if the tunnel is running.
+    running: AtomicBool,
 }
 
 impl ManagedTunnel {
     /// Creates a new managed tunnel.
     #[must_use]
     pub fn new(tunnel_id: String, worker_id: String, tls_config: TlsConfig) -> Self {
+        // Create channel for outbound frames (bounded for backpressure)
+        let (outbound_tx, outbound_rx) = mpsc::channel(100);
+
         Self {
             tunnel_id,
             worker_id,
             state: RwLock::new(TunnelState::Connecting),
-            connection: RwLock::new(None),
-            heartbeat_seq: RwLock::new(0),
+            write_half: Mutex::new(None),
+            read_half: Mutex::new(None),
+            heartbeat_seq: AtomicU64::new(0),
             last_heartbeat: RwLock::new(Instant::now()),
             tls_config,
+            outbound_tx,
+            outbound_rx: Mutex::new(Some(outbound_rx)),
+            shutdown_tx: Mutex::new(None),
+            running: AtomicBool::new(false),
         }
     }
 
@@ -600,14 +629,9 @@ impl ManagedTunnel {
         })?
         .map_err(|e| NetworkError::Handshake(format!("TLS handshake failed: {e}")))?;
 
-        let peer_addr = relay_addr;
-        let conn = Connection::new(TlsStream::Client(tls_stream), peer_addr);
-
-        // Store connection
-        {
-            let mut connection = self.connection.write().await;
-            *connection = Some(conn);
-        }
+        // Create TlsStream and split for concurrent I/O
+        let tls_stream = TlsStream::Client(tls_stream);
+        let (read_half, mut write_half) = tokio::io::split(tls_stream);
 
         // Update state to registering
         {
@@ -628,32 +652,29 @@ impl ManagedTunnel {
         let payload = register.to_bytes()?;
         let frame = ControlFrame::new(MSG_TUNNEL_REGISTER, &payload)?;
 
-        // Send registration
-        {
-            let mut conn_guard = self.connection.write().await;
-            if let Some(conn) = conn_guard.as_mut() {
-                conn.send_frame_with_timeout(&frame, REGISTRATION_TIMEOUT)
-                    .await?;
-            } else {
-                return Err(TunnelError::InvalidState {
-                    expected: "connected".into(),
-                    actual: "disconnected".into(),
-                });
-            }
-        }
+        // Send registration with timeout
+        timeout(REGISTRATION_TIMEOUT, async {
+            write_half.write_all(frame.as_bytes()).await?;
+            write_half.flush().await?;
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+        .map_err(|_| NetworkError::Timeout {
+            operation: "send registration".into(),
+        })??;
 
-        // Wait for response
-        let response = {
-            let mut conn_guard = self.connection.write().await;
-            if let Some(conn) = conn_guard.as_mut() {
-                conn.recv_frame_with_timeout(REGISTRATION_TIMEOUT).await?
-            } else {
-                return Err(TunnelError::InvalidState {
-                    expected: "connected".into(),
-                    actual: "disconnected".into(),
-                });
-            }
-        };
+        // Temporarily store read_half for receiving response
+        let mut temp_read_half = read_half;
+
+        // Wait for response with timeout
+        let mut buf = [0u8; CONTROL_FRAME_SIZE];
+        timeout(REGISTRATION_TIMEOUT, temp_read_half.read_exact(&mut buf))
+            .await
+            .map_err(|_| NetworkError::Timeout {
+                operation: "receive registration response".into(),
+            })??;
+
+        let response = ControlFrame::parse(&buf)?;
 
         match response.message_type() {
             MSG_TUNNEL_ACCEPT => {
@@ -663,6 +684,16 @@ impl ManagedTunnel {
                         "tunnel_id mismatch: expected {}, got {}",
                         self.tunnel_id, accept.tunnel_id
                     )));
+                }
+
+                // Store split streams for concurrent I/O
+                {
+                    let mut wh = self.write_half.lock().await;
+                    *wh = Some(write_half);
+                }
+                {
+                    let mut rh = self.read_half.lock().await;
+                    *rh = Some(temp_read_half);
                 }
 
                 // Update state to active
@@ -704,6 +735,88 @@ impl ManagedTunnel {
         }
     }
 
+    /// Starts the automatic maintenance loop for heartbeats and stale
+    /// detection.
+    ///
+    /// This spawns a background task that:
+    /// 1. Sends heartbeats at the configured interval
+    /// 2. Monitors for stale connections
+    /// 3. Processes outbound frames from the send channel
+    ///
+    /// Call `stop()` to gracefully shutdown the maintenance loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tunnel is not in the Active state.
+    pub async fn start(&self) -> Result<(), TunnelError> {
+        let state = self.state.read().await;
+        if *state != TunnelState::Active {
+            return Err(TunnelError::InvalidState {
+                expected: "active".into(),
+                actual: state.to_string(),
+            });
+        }
+        drop(state);
+
+        if self.running.swap(true, Ordering::SeqCst) {
+            // Already running
+            return Ok(());
+        }
+
+        // Take the outbound receiver (can only start once)
+        let outbound_rx = {
+            let mut rx_guard = self.outbound_rx.lock().await;
+            rx_guard.take()
+        };
+
+        let Some(outbound_rx) = outbound_rx else {
+            return Err(TunnelError::InvalidState {
+                expected: "not started".into(),
+                actual: "already started".into(),
+            });
+        };
+
+        // Create shutdown channel
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        {
+            let mut tx_guard = self.shutdown_tx.lock().await;
+            *tx_guard = Some(shutdown_tx);
+        }
+
+        // Take the write half for the maintenance task
+        let write_half = {
+            let mut wh = self.write_half.lock().await;
+            wh.take()
+        };
+
+        let Some(write_half) = write_half else {
+            return Err(TunnelError::InvalidState {
+                expected: "connected".into(),
+                actual: "disconnected".into(),
+            });
+        };
+
+        // Spawn the maintenance task
+        let tunnel_id = self.tunnel_id.clone();
+        tokio::spawn(maintenance_loop(
+            tunnel_id,
+            write_half,
+            outbound_rx,
+            shutdown_rx,
+        ));
+
+        Ok(())
+    }
+
+    /// Stops the automatic maintenance loop.
+    pub async fn stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        let mut tx_guard = self.shutdown_tx.lock().await;
+        if let Some(tx) = tx_guard.take() {
+            let _ = tx.send(());
+        }
+    }
+
     /// Sends a heartbeat to the relay.
     ///
     /// # Errors
@@ -719,12 +832,8 @@ impl ManagedTunnel {
         }
         drop(state);
 
-        // Increment sequence
-        let sequence = {
-            let mut seq = self.heartbeat_seq.write().await;
-            *seq += 1;
-            *seq
-        };
+        // Increment sequence atomically
+        let sequence = self.heartbeat_seq.fetch_add(1, Ordering::SeqCst) + 1;
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -735,17 +844,53 @@ impl ManagedTunnel {
         let payload = heartbeat.to_bytes()?;
         let frame = ControlFrame::new(MSG_TUNNEL_HEARTBEAT, &payload)?;
 
-        let mut conn_guard = self.connection.write().await;
-        if let Some(conn) = conn_guard.as_mut() {
-            conn.send_frame(&frame).await?;
-        } else {
-            return Err(TunnelError::InvalidState {
-                expected: "connected".into(),
-                actual: "disconnected".into(),
-            });
-        }
+        // Send via outbound channel (non-blocking)
+        self.outbound_tx
+            .try_send(frame)
+            .map_err(|e| TunnelError::Channel(format!("failed to queue heartbeat: {e}")))?;
 
         Ok(())
+    }
+
+    /// Sends a heartbeat directly to the write half (bypasses channel).
+    ///
+    /// This is used when the maintenance loop is not running.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the heartbeat cannot be sent.
+    pub async fn send_heartbeat_direct(&self) -> Result<(), TunnelError> {
+        let state = self.state.read().await;
+        if *state != TunnelState::Active {
+            return Err(TunnelError::InvalidState {
+                expected: "active".into(),
+                actual: state.to_string(),
+            });
+        }
+        drop(state);
+
+        let sequence = self.heartbeat_seq.fetch_add(1, Ordering::SeqCst) + 1;
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let heartbeat = TunnelHeartbeat::new(self.tunnel_id.clone(), sequence, timestamp);
+        let payload = heartbeat.to_bytes()?;
+        let frame = ControlFrame::new(MSG_TUNNEL_HEARTBEAT, &payload)?;
+
+        let mut wh = self.write_half.lock().await;
+        if let Some(ref mut write_half) = *wh {
+            write_half.write_all(frame.as_bytes()).await?;
+            write_half.flush().await?;
+            Ok(())
+        } else {
+            Err(TunnelError::InvalidState {
+                expected: "connected".into(),
+                actual: "disconnected".into(),
+            })
+        }
     }
 
     /// Sends data through the tunnel.
@@ -767,28 +912,62 @@ impl ManagedTunnel {
         let payload = tunnel_data.to_bytes()?;
         let frame = ControlFrame::new(MSG_TUNNEL_DATA, &payload)?;
 
-        let mut conn_guard = self.connection.write().await;
-        if let Some(conn) = conn_guard.as_mut() {
-            conn.send_frame(&frame).await?;
-        } else {
-            return Err(TunnelError::InvalidState {
-                expected: "connected".into(),
-                actual: "disconnected".into(),
-            });
-        }
+        // Send via outbound channel
+        self.outbound_tx
+            .send(frame)
+            .await
+            .map_err(|e| TunnelError::Channel(format!("failed to queue data: {e}")))?;
 
         Ok(())
     }
 
+    /// Sends data directly to the write half (bypasses channel).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data cannot be sent.
+    pub async fn send_data_direct(&self, data: Vec<u8>) -> Result<(), TunnelError> {
+        let state = self.state.read().await;
+        if *state != TunnelState::Active {
+            return Err(TunnelError::InvalidState {
+                expected: "active".into(),
+                actual: state.to_string(),
+            });
+        }
+        drop(state);
+
+        let tunnel_data = TunnelData::new(self.tunnel_id.clone(), data);
+        let payload = tunnel_data.to_bytes()?;
+        let frame = ControlFrame::new(MSG_TUNNEL_DATA, &payload)?;
+
+        let mut wh = self.write_half.lock().await;
+        if let Some(ref mut write_half) = *wh {
+            write_half.write_all(frame.as_bytes()).await?;
+            write_half.flush().await?;
+            Ok(())
+        } else {
+            Err(TunnelError::InvalidState {
+                expected: "connected".into(),
+                actual: "disconnected".into(),
+            })
+        }
+    }
+
     /// Receives a frame from the tunnel.
+    ///
+    /// This method uses the read half of the split connection, allowing
+    /// concurrent send operations without blocking.
     ///
     /// # Errors
     ///
     /// Returns an error if reading fails.
     pub async fn recv_frame(&self) -> Result<ControlFrame, TunnelError> {
-        let mut conn_guard = self.connection.write().await;
-        if let Some(conn) = conn_guard.as_mut() {
-            let frame = conn.recv_frame().await?;
+        let mut rh = self.read_half.lock().await;
+        if let Some(ref mut read_half) = *rh {
+            let mut buf = [0u8; CONTROL_FRAME_SIZE];
+            read_half.read_exact(&mut buf).await?;
+
+            let frame = ControlFrame::parse(&buf)?;
 
             // Update heartbeat time on any message received
             {
@@ -805,6 +984,22 @@ impl ManagedTunnel {
         }
     }
 
+    /// Receives a frame with timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading fails or times out.
+    pub async fn recv_frame_with_timeout(
+        &self,
+        duration: Duration,
+    ) -> Result<ControlFrame, TunnelError> {
+        timeout(duration, self.recv_frame())
+            .await
+            .map_err(|_| TunnelError::HeartbeatTimeout {
+                tunnel_id: self.tunnel_id.clone(),
+            })?
+    }
+
     /// Closes the tunnel gracefully.
     ///
     /// # Errors
@@ -819,13 +1014,17 @@ impl ManagedTunnel {
             *state = TunnelState::Closing;
         }
 
+        // Stop maintenance loop
+        self.stop().await;
+
         // Send close message
         let frame = ControlFrame::new(MSG_TUNNEL_CLOSE, self.tunnel_id.as_bytes())?;
 
         let result = {
-            let mut conn_guard = self.connection.write().await;
-            if let Some(conn) = conn_guard.as_mut() {
-                conn.send_frame(&frame).await
+            let mut wh = self.write_half.lock().await;
+            if let Some(ref mut write_half) = *wh {
+                write_half.write_all(frame.as_bytes()).await.ok();
+                write_half.flush().await
             } else {
                 Ok(())
             }
@@ -837,10 +1036,14 @@ impl ManagedTunnel {
             *state = TunnelState::Closed;
         }
 
-        // Clear connection
+        // Clear connection halves
         {
-            let mut conn_guard = self.connection.write().await;
-            *conn_guard = None;
+            let mut wh = self.write_half.lock().await;
+            *wh = None;
+        }
+        {
+            let mut rh = self.read_half.lock().await;
+            *rh = None;
         }
 
         result.map_err(Into::into)
@@ -857,6 +1060,80 @@ impl ManagedTunnel {
         let last_hb = self.last_heartbeat.read().await;
         last_hb.elapsed() < HEARTBEAT_TIMEOUT
     }
+}
+
+/// Background maintenance loop for automatic heartbeats.
+async fn maintenance_loop(
+    tunnel_id: String,
+    mut write_half: WriteHalf<TlsStream<TcpStream>>,
+    mut outbound_rx: mpsc::Receiver<ControlFrame>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
+    let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut heartbeat_seq: u64 = 0;
+
+    loop {
+        tokio::select! {
+            // Heartbeat timer
+            _ = heartbeat_interval.tick() => {
+                heartbeat_seq += 1;
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                let heartbeat = TunnelHeartbeat::new(tunnel_id.clone(), heartbeat_seq, timestamp);
+                if let Ok(payload) = heartbeat.to_bytes() {
+                    if let Ok(frame) = ControlFrame::new(MSG_TUNNEL_HEARTBEAT, &payload) {
+                        if let Err(e) = write_half.write_all(frame.as_bytes()).await {
+                            tracing::debug!(
+                                tunnel_id = %tunnel_id,
+                                error = %e,
+                                "Failed to send heartbeat"
+                            );
+                            break;
+                        }
+                        if let Err(e) = write_half.flush().await {
+                            tracing::debug!(
+                                tunnel_id = %tunnel_id,
+                                error = %e,
+                                "Failed to flush heartbeat"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Outbound frames from channel
+            Some(frame) = outbound_rx.recv() => {
+                if let Err(e) = write_half.write_all(frame.as_bytes()).await {
+                    tracing::debug!(
+                        tunnel_id = %tunnel_id,
+                        error = %e,
+                        "Failed to send outbound frame"
+                    );
+                    break;
+                }
+                if let Err(e) = write_half.flush().await {
+                    tracing::debug!(
+                        tunnel_id = %tunnel_id,
+                        error = %e,
+                        "Failed to flush outbound frame"
+                    );
+                    break;
+                }
+            }
+
+            // Shutdown signal
+            _ = &mut shutdown_rx => {
+                tracing::debug!(tunnel_id = %tunnel_id, "Maintenance loop received shutdown");
+                break;
+            }
+        }
+    }
+
+    tracing::debug!(tunnel_id = %tunnel_id, "Maintenance loop exited");
 }
 
 #[cfg(test)]

@@ -532,6 +532,20 @@ impl Connection {
     pub fn is_idle(&self) -> bool {
         self.last_used.elapsed() > CONNECTION_IDLE_TIMEOUT
     }
+
+    /// Splits the connection into read and write halves for concurrent I/O.
+    ///
+    /// This enables sending heartbeats and receiving frames concurrently
+    /// without blocking each other.
+    #[must_use]
+    pub fn into_split(
+        self,
+    ) -> (
+        tokio::io::ReadHalf<TlsStream<TcpStream>>,
+        tokio::io::WriteHalf<TlsStream<TcpStream>>,
+    ) {
+        tokio::io::split(self.stream)
+    }
 }
 
 /// RAII guard for a pooled connection.
