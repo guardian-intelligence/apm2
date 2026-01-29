@@ -1,0 +1,187 @@
+rfc_ticket_decomposition:
+  schema_version: "2026-01-29"
+
+  status: PLACEHOLDER
+  # Populated during DECOMPOSE phase after RFC reaches v4
+
+  description: |
+    This file will contain the ticket decomposition for RFC-0015 once the RFC reaches
+    version v4 (Standard phase) and DECOMPOSE mode is executed. The DECOMPOSE phase
+    transforms the planned_ticket_structure into full tickets with implementation details.
+
+  planned_ticket_structure:
+    # High-level ticket grouping identified during v0 (Discovery)
+    # Will be refined during EXPLORE (v2) and FINALIZE (v4) phases
+
+    ticket_groups:
+      - group_id: TG-FAC-001
+        name: "Gate Event Infrastructure"
+        requirements:
+          - FAC-REQ-0017
+          - FAC-REQ-0018
+        estimated_tickets: 3-5
+        dependencies: []
+        description: |
+          Implement GateLeaseIssued, GateRunStarted, GateRunCompleted events with
+          Ed25519 signature verification and domain separation.
+
+      - group_id: TG-FAC-002
+        name: "OCAP Context Firewall"
+        requirements:
+          - FAC-REQ-0001
+        estimated_tickets: 2-4
+        dependencies:
+          - TG-FAC-001
+        description: |
+          Implement mechanical context firewall for CONSUME-mode holons with
+          manifest allowlist enforcement and context miss handling.
+
+      - group_id: TG-FAC-003
+        name: "Projection and Divergence Watchdog"
+        requirements:
+          - FAC-REQ-0002
+          - FAC-REQ-0019
+        estimated_tickets: 2-4
+        dependencies:
+          - TG-FAC-001
+        description: |
+          Implement projection-only GitHub integration with divergence watchdog
+          and InterventionFreeze handling.
+
+      - group_id: TG-FAC-004
+        name: "CI Evidence Import"
+        requirements:
+          - FAC-REQ-0003
+        estimated_tickets: 2-3
+        dependencies:
+          - TG-FAC-001
+        description: |
+          Implement CI evidence import with attestation and fail-closed validation.
+
+      - group_id: TG-FAC-005
+        name: "Typed AAT GateReceipt"
+        requirements:
+          - FAC-REQ-0004
+          - FAC-REQ-0006
+          - FAC-REQ-0007
+        estimated_tickets: 3-5
+        dependencies:
+          - TG-FAC-001
+        description: |
+          Implement typed AAT GateReceipt payloads with evidence binding,
+          transcript chains, and terminal verifier enforcement.
+
+      - group_id: TG-FAC-006
+        name: "Risk-Tiered AAT Selection"
+        requirements:
+          - FAC-REQ-0009
+          - FAC-REQ-0010
+          - FAC-REQ-0012
+        estimated_tickets: 2-4
+        dependencies:
+          - TG-FAC-005
+        description: |
+          Implement risk-tiered AAT selection policy with anti-downgrade enforcement
+          and AAT lease binding.
+
+      - group_id: TG-FAC-007
+        name: "Determinism Envelope (Phase 2)"
+        requirements:
+          - FAC-REQ-0005
+          - FAC-REQ-0008
+        estimated_tickets: 2-4
+        dependencies:
+          - TG-FAC-005
+        phase: PHASE-2
+        description: |
+          Implement determinism envelope with N-run stability validation and
+          flake classification policy routing.
+
+      - group_id: TG-FAC-008
+        name: "AAT Reuse and Evidence Hygiene"
+        requirements:
+          - FAC-REQ-0013
+          - FAC-REQ-0014
+        estimated_tickets: 2-3
+        dependencies:
+          - TG-FAC-005
+        description: |
+          Implement AAT reuse safety with provenance validation and evidence
+          hygiene enforcement.
+
+      - group_id: TG-FAC-009
+        name: "AAT Quorum and Harness Sandboxing"
+        requirements:
+          - FAC-REQ-0015
+          - FAC-REQ-0016
+        estimated_tickets: 2-4
+        dependencies:
+          - TG-FAC-006
+        phase: PHASE-2
+        description: |
+          Implement quorum/audit enforcement by risk tier and AAT harness
+          sandboxing with egress control.
+
+      - group_id: TG-FAC-010
+        name: "Invariant-First AAT Specs"
+        requirements:
+          - FAC-REQ-0011
+        estimated_tickets: 1-2
+        dependencies:
+          - TG-FAC-005
+        description: |
+          Implement AAT spec validation requiring invariant declarations.
+
+      - group_id: TG-FAC-011
+        name: "Atomic Merge Receipt"
+        requirements:
+          - FAC-REQ-0020
+        estimated_tickets: 2-3
+        dependencies:
+          - TG-FAC-001
+        description: |
+          Implement MergeReceipt with atomic binding of inputs to result after
+          trunk observation.
+
+      - group_id: TG-FAC-012
+        name: "Bounded Retries and Echo-Trap"
+        requirements:
+          - FAC-REQ-0021
+        estimated_tickets: 1-2
+        dependencies:
+          - TG-FAC-001
+        description: |
+          Implement bounded retry management and echo-trap detection with
+          escalation.
+
+  tickets: []
+    # Will be populated during DECOMPOSE phase
+    # Each ticket will include:
+    # - ticket_id: TCK-XXXXX
+    # - title
+    # - requirement_ids
+    # - depends_on
+    # - files_to_create
+    # - files_to_modify
+    # - implementation_steps
+    # - acceptance_criteria
+    # - test_requirements
+
+  open_questions_for_decomposition:
+    - id: Q-DECOMP-0001
+      question: |
+        Proto placement for FAC events: extend kernel_events.proto or create fac_events.proto?
+      impact: "Affects TG-FAC-001 ticket structure"
+      resolution_needed_by: "v2 (EXPLORE phase)"
+
+    - id: Q-DECOMP-0002
+      question: |
+        Context firewall integration point: daemon protocol layer or core library?
+      impact: "Affects TG-FAC-002 file paths"
+      resolution_needed_by: "v2 (EXPLORE phase)"
+
+    - id: Q-DECOMP-0003
+      question: |
+        AAT transcript schema: existing TranscriptChunk or new FAC-specific type?
+      impact: "Affects TG-FAC-005 implementation"
+      resolution_needed_by: "v2 (EXPLORE phase)"

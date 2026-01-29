@@ -1,0 +1,527 @@
+rfc_design_decisions:
+  schema_version: "2026-01-29"
+
+  version_transition:
+    from_version: null
+    to_version: "v0"
+    transition_date: "2026-01-29"
+    mode: CREATE
+    summary: |
+      Initial RFC v0 (Discovery) creation. Design decisions are hypotheses pending
+      codebase exploration in EXPLORE phase. Component mapping confidence is LOW
+      until grounded in existing patterns.
+
+  exploration_findings: []
+    # To be populated during EXPLORE phase
+
+  architectural_overview:
+    summary: |
+      FAC implements a hardened admission protocol with seven protocol stages:
+      (1) Changeset ingestion with view commitment and policy pinning,
+      (2) CI evidence import as observations,
+      (3) Review Context Pack compilation,
+      (4) Gate-scoped authority minting via leases,
+      (5) Gate execution under OCAP context firewall,
+      (6) Admission decision with atomic merge receipt,
+      (7) Projection sync with divergence watchdog.
+
+      The design ensures cryptographic signing of all gate outcomes, lease-bounded
+      executor authority, mechanical context containment, and projection-only GitHub
+      integration. AAT gates have enhanced requirements including typed payloads,
+      evidence binding, terminal verifier enforcement, and risk-tiered selection.
+
+    constraints:
+      - id: CON-FAC-001
+        name: "Fail-Closed Admission"
+        description: "Uncertain truth implies deny admission or escalate to adjudication/oracle"
+      - id: CON-FAC-002
+        name: "GitHub is Projection"
+        description: "GitHub is never a source of truth; all admission authority flows from internal ledger"
+      - id: CON-FAC-003
+        name: "CAS-at-Commit Ordering"
+        description: "Changeset and lease bound to ledger before any gate execution"
+      - id: CON-FAC-004
+        name: "Domain-Separated Signatures"
+        description: "All critical events signed with domain-specific prefixes to prevent cross-context replay"
+
+    components:
+      - name: "Coordinator"
+        holon_id: HOLON-COORDINATOR
+        role: "FAC orchestration"
+        responsibilities:
+          - "CAS-at-commit binding of changeset to work_id"
+          - "Bounded retry management per gate"
+          - "Echo-trap detection and termination"
+          - "Gate execution scheduling"
+
+      - name: "Kernel Governance"
+        holon_id: HOLON-KERNEL-GOVERNANCE
+        role: "Authority minting"
+        responsibilities:
+          - "GateLease issuance with scope validation"
+          - "Key rotation via KeyRotated events"
+          - "COI grouping policy enforcement"
+          - "Critical event signing"
+
+      - name: "Kernel Gate"
+        holon_id: HOLON-KERNEL-GATE
+        role: "Admission decision"
+        responsibilities:
+          - "GateRunCompleted signature verification"
+          - "Lease validity and expiry checking"
+          - "MergeReceipt emission after trunk observation"
+          - "Intervention freeze management"
+
+      - name: "Context Compiler"
+        holon_id: HOLON-CONTEXT-COMPILER
+        role: "RCP compilation"
+        responsibilities:
+          - "Impact expansion with deterministic tools"
+          - "View commitment generation"
+          - "ZTI scoring and pack optimization"
+          - "Stable-ID to content hash deep-pinning"
+
+      - name: "GitHub Adapter"
+        holon_id: HOLON-GITHUB-ADAPTER
+        role: "Projection and CI import"
+        responsibilities:
+          - "Ledger -> GitHub state projection"
+          - "Divergence watchdog polling"
+          - "CI evidence import with attestation"
+          - "Tamper detection and overwrite"
+
+      - name: "Gate Executors"
+        holon_ids:
+          - HOLON-REVIEWER-QUALITY
+          - HOLON-REVIEWER-SECURITY
+          - HOLON-AAT
+        role: "Gate execution"
+        responsibilities:
+          - "Execute under OCAP context firewall"
+          - "Produce evidence bundles"
+          - "Sign GateRunCompleted under valid lease"
+          - "Respect RCP manifest allowlist"
+
+    protocol_stages:
+      - stage_id: FAC-00-INGEST_CHANGESET
+        name: "Ingest ChangeSet + View Commitment"
+        actor: HOLON-COORDINATOR
+        inputs:
+          - work_id
+          - plan_snapshot_hash
+          - base_selector
+          - workspace_delta_or_commit_range
+        outputs:
+          - changeset_digest
+          - pr_bundle_hash
+          - view_commitment_hash
+          - resolved_policy_hash
+          - resolved_risk_tier
+
+      - stage_id: FAC-01-CI_EVIDENCE_IMPORT
+        name: "Import CI evidence"
+        actor: HOLON-GITHUB-ADAPTER
+        inputs:
+          - pr_number
+          - ci_provider_observations
+        outputs:
+          - ci_evidence_bundle_hash
+          - ci_import_attestation_hash
+
+      - stage_id: FAC-02-RCP_COMPILE
+        name: "Compile Review Context Packs"
+        actor: HOLON-CONTEXT-COMPILER
+        inputs:
+          - changeset_digest
+          - ccp_atlas_hash
+        outputs:
+          - rcp_quality_manifest_hash
+          - rcp_security_manifest_hash
+          - rcp_aat_manifest_hash
+
+      - stage_id: FAC-03-MINT_AUTHORITY
+        name: "Mint gate-scoped authority"
+        actor: HOLON-KERNEL-GOVERNANCE
+        inputs:
+          - work_id
+          - changeset_digest
+          - gate_set
+        outputs:
+          - gate_lease_issued_events
+
+      - stage_id: FAC-04-RUN_GATES
+        name: "Run gates under OCAP firewall"
+        actors:
+          - HOLON-REVIEWER-QUALITY
+          - HOLON-REVIEWER-SECURITY
+          - HOLON-AAT
+        inputs:
+          - gate_lease
+          - rcp_manifest_hash
+        outputs:
+          - evidence_bundle_hash
+          - gate_receipt_id
+          - gate_run_completed_event_signed
+
+      - stage_id: FAC-05-ADMISSION_DECISION
+        name: "Admission decision + atomic merge"
+        actor: HOLON-KERNEL-GATE
+        inputs:
+          - gate_run_completed_events
+          - gate_receipts
+        outputs:
+          - admission_decision
+          - merge_receipt_hash
+
+      - stage_id: FAC-06-PROJECTION_SYNC
+        name: "Projection sync + watchdog"
+        actor: HOLON-GITHUB-ADAPTER
+        inputs:
+          - ledger_head
+          - latest_merge_receipt
+        outputs:
+          - projection_receipt_hash
+          - projection_health
+
+  design_decisions:
+    - id: DD-FAC-0001
+      title: "Ed25519 Domain-Separated Signatures for Critical Events"
+      status: HYPOTHESIS
+      decision: |
+        All critical events (GateLeaseIssued, GateRunCompleted, MergeReceipt) MUST be signed
+        with Ed25519 using domain-separated prefixes. Signature covers canonical bytes with
+        prefix to prevent cross-context replay.
+      domain_separators:
+        - event: GateLeaseIssued
+          prefix: "GATE_LEASE_ISSUED:"
+        - event: GateRunCompleted
+          prefix: "GATE_RUN_COMPLETED:"
+        - event: MergeReceipt
+          prefix: "MERGE_RECEIPT:"
+        - event: CIImportAttestation
+          prefix: "CI_IMPORT_ATTESTATION:"
+        - event: ProjectionReceipt
+          prefix: "PROJECTION_RECEIPT:"
+        - event: AATResultReused
+          prefix: "AAT_RESULT_REUSED:"
+      alternatives:
+        - id: ALT-0001-A
+          name: "HMAC-based event integrity"
+          rejected_reason: "Symmetric keys cannot provide non-repudiation; verification requires shared secret"
+        - id: ALT-0001-B
+          name: "No domain separation (single signature scheme)"
+          rejected_reason: "Enables cross-context signature replay attacks"
+      rationale:
+        - "Non-repudiation requires asymmetric signatures"
+        - "Domain separation prevents signing a lease from being replayed as gate completion"
+        - "Ed25519 is already used in the codebase (via ed25519-dalek)"
+        - "Canonical serialization required before signing (JCS or sorted protobuf)"
+      requirement_ids:
+        - FAC-REQ-0017
+      confidence: MEDIUM
+
+    - id: DD-FAC-0002
+      title: "Lease-Scoped Gate Authority with Strict Scope Fields"
+      status: HYPOTHESIS
+      decision: |
+        GateLease binds (work_id, gate_id, changeset_digest, executor_actor_id, expiry, policy_hash).
+        Leases are single-use with enforced expiry. Child leases can only narrow scope (subset rule).
+      lease_structure:
+        fields:
+          - lease_id
+          - work_id
+          - gate_id
+          - changeset_digest
+          - executor_actor_id
+          - issued_at
+          - expires_at
+          - policy_hash
+          - issuer_actor_id
+          - issuer_signature
+        aat_extensions:
+          - view_commitment_hash
+          - rcp_manifest_hash
+          - rcp_profile_id
+          - selection_policy_id
+      alternatives:
+        - id: ALT-0002-A
+          name: "Ambient authority with post-hoc audit"
+          rejected_reason: "Cannot prevent unauthorized execution; audit is detective not preventative"
+      rationale:
+        - "Explicit lease scoping prevents privilege escalation"
+        - "Single-use prevents replay"
+        - "Expiry bounds temporal authority"
+        - "AAT-specific extensions bind to view commitment"
+      requirement_ids:
+        - FAC-REQ-0018
+        - FAC-REQ-0010
+      confidence: MEDIUM
+
+    - id: DD-FAC-0003
+      title: "OCAP Context Firewall with Manifest Allowlist"
+      status: HYPOTHESIS
+      decision: |
+        CONSUME-mode holons operate under mechanical context firewall. All repo.read and file.read
+        operations must reference a manifest entry in the RCP allowlist. Denials are hard failures
+        with ToolDecided=DENY. Context misses terminate the session and trigger refinement.
+      firewall_rules:
+        - rule_id: CTX-ALLOWLIST-001
+          statement: "Reads must reference manifest entry (stable_id or path+hash)"
+          enforcement: "ToolDecided=DENY if not allowlisted"
+          severity: S1
+        - rule_id: CTX-SUFFICIENCY-001
+          statement: "RunReceipt records context sufficiency metrics"
+          enforcement: "RunReceipt required for GateRunCompleted acceptance"
+          severity: S2
+        - rule_id: CTX-ZOOM-001
+          statement: "Additional context only via ContextRefinementRequest"
+          enforcement: "SessionTerminated rationale=CONTEXT_MISS; coordinator reissues after refined pack"
+          severity: S1
+        - rule_id: CTX-CONSUME-FATAL-001
+          statement: "In CONSUME mode, reads outside pack are blocked (session-fatal)"
+          enforcement: "SessionTerminated rationale=CONTEXT_MISS"
+          severity: S1
+      alternatives:
+        - id: ALT-0003-A
+          name: "Soft warnings with audit log"
+          rejected_reason: "Does not prevent information leakage; warnings can be ignored"
+      rationale:
+        - "Prevents non-deterministic gate outcomes from context discovery"
+        - "Forces systematic improvement of pack compilation"
+        - "Aligns with LAW-02 (context sufficiency) and LAW-05 (OCAP)"
+      requirement_ids:
+        - FAC-REQ-0001
+      confidence: MEDIUM
+
+    - id: DD-FAC-0004
+      title: "Projection-Only GitHub with Divergence Watchdog"
+      status: HYPOTHESIS
+      decision: |
+        GitHub is a projection target, never a source of truth. Only HOLON-GITHUB-ADAPTER may
+        write to GitHub. A divergence watchdog continuously compares external trunk HEAD to
+        latest MergeReceipt result_selector, triggering InterventionFreeze on mismatch.
+      projection_model:
+        write_identity: HOLON-GITHUB-ADAPTER
+        idempotence_key: "(work_id, changeset_digest, ledger_head)"
+        poll_interval_seconds: 30
+        on_divergence:
+          - "Emit DefectRecord(PROJECTION_DIVERGENCE)"
+          - "Emit InterventionFreeze(scope=repo)"
+          - "Halt new FAC admissions for repo"
+          - "Open AdjudicationRequested(EMERGENCY_RECOVERY)"
+        on_tamper:
+          - "Emit DefectRecord(PROJECTION_TAMPER)"
+          - "Overwrite projection to match ledger truth"
+      alternatives:
+        - id: ALT-0004-A
+          name: "GitHub status as admission input"
+          rejected_reason: "Creates adversarial surface; external status can be spoofed"
+      rationale:
+        - "Single source of truth (ledger) prevents split-brain"
+        - "Projection-only ensures external manipulation cannot affect admission"
+        - "Divergence detection enables security response"
+      requirement_ids:
+        - FAC-REQ-0002
+        - FAC-REQ-0019
+      confidence: MEDIUM
+
+    - id: DD-FAC-0005
+      title: "Evidence-Backed CI Import with Attestation"
+      status: HYPOTHESIS
+      decision: |
+        CI conclusions are observations, not truth. READY_FOR_REVIEW transition requires:
+        (1) webhook signature verified, (2) raw log/artifact digests imported into CAS,
+        (3) adapter attestation signed and committed. Plain 'success' conclusion without
+        evidence import is ignored (fail-closed).
+      attestation_fields:
+        - workflow_run_id
+        - downloaded_artifact_hashes
+        - runner_image_digest (optional, L1+)
+        - toolchain (optional, L1+)
+        - command_transcript_hash (optional, L1+)
+      feature_flags:
+        - CI_EVENTS_ENABLED: "false by default (fail-closed)"
+        - CI_GATED_QUEUE_ENABLED: "false by default"
+      alternatives:
+        - id: ALT-0005-A
+          name: "CI status as authoritative signal"
+          rejected_reason: "CI can be spoofed; no evidence backing"
+      rationale:
+        - "Treats CI as external observation requiring internal verification"
+        - "Fail-closed prevents bypass via missing evidence"
+        - "Attestation provides evidence chain for audit"
+      requirement_ids:
+        - FAC-REQ-0003
+      confidence: MEDIUM
+
+    - id: DD-FAC-0006
+      title: "Typed AAT GateReceipt Payloads"
+      status: HYPOTHESIS
+      decision: |
+        AAT outcomes use typed GateReceipt payloads (gate_id=aat) with required fields for
+        view commitment binding, determinism tracking, evidence binding, and attestation.
+        No standalone AATReceipt event; all AAT-specific data in GateReceipt payload.
+      required_fields:
+        - view_commitment_hash
+        - rcp_manifest_hash
+        - rcp_profile_id
+        - policy_hash
+        - determinism_class
+        - flake_class
+        - run_count
+        - run_receipt_hashes
+        - stability_digest
+        - verdict
+        - transcript_chain_root_hash
+        - transcript_bundle_hash
+        - artifact_digests
+        - terminal_verifier_outputs
+        - verifier_policy_hash
+        - selection_policy_id
+        - risk_tier
+        - attestation
+      alternatives:
+        - id: ALT-0006-A
+          name: "Separate AATReceipt event type"
+          rejected_reason: "Creates parallel receipt paths; complicates admission logic"
+      rationale:
+        - "Single GateReceipt with typed payload keeps admission logic unified"
+        - "Required fields prevent spoofed PASS"
+        - "Evidence binding enables independent verification"
+      requirement_ids:
+        - FAC-REQ-0004
+        - FAC-REQ-0006
+      confidence: MEDIUM
+
+    - id: DD-FAC-0007
+      title: "Terminal Verifier Binding for AAT"
+      status: HYPOTHESIS
+      decision: |
+        AAT PASS requires terminal verifier outputs satisfying machine-defined predicates.
+        Policy defines scenario_type -> allowed_verifier_kinds + required_outputs + machine_predicate.
+        Narrative is non-authoritative.
+      allowed_verifier_kinds:
+        - exit_code
+        - snapshot_diff
+        - structured_test_report
+        - invariant_check
+      enforcement: "PASS requires predicate satisfied; missing outputs => FAIL or NEEDS_INPUT"
+      alternatives:
+        - id: ALT-0007-A
+          name: "Narrative-based acceptance"
+          rejected_reason: "LLM narratives can be manipulated; no machine verification"
+      rationale:
+        - "Terminal verifiers provide ground truth"
+        - "Prevents Goodhart drift toward non-terminal signals"
+        - "Machine predicates are deterministic"
+      requirement_ids:
+        - FAC-REQ-0007
+      confidence: MEDIUM
+
+    - id: DD-FAC-0008
+      title: "Risk-Tiered AAT Selection Policy"
+      status: HYPOTHESIS
+      decision: |
+        AAT selection is risk-tiered: HIGH always requires AAT, MED requires AAT for sensitive
+        domains, LOW is sampled with nightly full AAT. Risk tier and selection_policy_id
+        recorded in GateReceipt.
+      tiers:
+        HIGH:
+          aat_required: always
+          selection: "All AAT scenarios for impacted modules"
+        MED:
+          aat_required: conditional
+          selection: "Required for auth/crypto/ledger/tool mediation; sampled otherwise"
+        LOW:
+          aat_required: sampled
+          selection: "1 in N sampling + nightly full AAT on main"
+      alternatives:
+        - id: ALT-0008-A
+          name: "AAT required for all changes"
+          rejected_reason: "Throughput collapse; merge cadence unacceptable"
+        - id: ALT-0008-B
+          name: "AAT optional everywhere"
+          rejected_reason: "High-risk changes escape verification"
+      rationale:
+        - "Preserves merge cadence while protecting high-risk changes"
+        - "Risk tier based on diff impact and module criticality"
+        - "Nightly full AAT catches sampling gaps"
+      requirement_ids:
+        - FAC-REQ-0009
+      confidence: MEDIUM
+
+    - id: DD-FAC-0009
+      title: "AAT Anti-Downgrade Enforcement"
+      status: HYPOTHESIS
+      decision: |
+        Policy resolution is pinned at FAC-00 ingestion. Admission rejects AAT receipts
+        where risk_tier, determinism_class, verifier_policy_hash, or rcp_profile_id are
+        lower than resolved values. Downgrades require explicit waiver.
+      pinned_at_ingest:
+        - resolved_policy_hash
+        - resolved_risk_tier
+        - resolved_determinism_class
+        - resolved_verifier_policy_hash
+        - resolved_rcp_profile_id
+      enforcement:
+        - "policy_hash MUST equal resolved_policy_hash"
+        - "risk_tier MUST NOT be lower than resolved_risk_tier"
+        - "verifier_policy_hash MUST be allowed for resolved_risk_tier"
+        - "Downgrades require AdjudicationRequested(WAIVER)"
+      alternatives:
+        - id: ALT-0009-A
+          name: "Dynamic policy selection"
+          rejected_reason: "Enables 'easier exam' attacks via policy substitution"
+      rationale:
+        - "Prevents silent policy weakening"
+        - "Waiver provides auditable override path"
+        - "Pinning at ingest creates immutable baseline"
+      requirement_ids:
+        - FAC-REQ-0012
+      confidence: MEDIUM
+
+  component_mapping:
+    # Confidence: LOW until grounded during EXPLORE phase
+
+    - requirement_id: FAC-REQ-0001
+      verified_components: []
+      new_components:
+        - path: "crates/apm2-daemon/src/context_firewall/"
+          status: NEW
+          purpose: "OCAP context firewall implementation"
+      confidence: LOW
+
+    - requirement_id: FAC-REQ-0002
+      verified_components: []
+      new_components:
+        - path: "crates/apm2-daemon/src/projection/watchdog.rs"
+          status: NEW
+          purpose: "Divergence watchdog implementation"
+      confidence: LOW
+
+    - requirement_id: FAC-REQ-0017
+      verified_components:
+        - path: "crates/apm2-core/src/crypto/sign.rs"
+          status: REUSE
+          changes: "Use existing Ed25519 Signer for gate outcome signing"
+      new_components:
+        - path: "crates/apm2-core/src/gate/receipt.rs"
+          status: NEW
+          purpose: "GateReceipt with typed payloads and evidence binding"
+      confidence: LOW
+
+    - requirement_id: FAC-REQ-0018
+      verified_components: []
+      new_components:
+        - path: "crates/apm2-core/src/lease/gate_lease.rs"
+          status: NEW
+          purpose: "GateLease with strict scope fields and AAT extensions"
+      confidence: LOW
+
+    - requirement_id: FAC-REQ-0019
+      verified_components: []
+      new_components:
+        - path: "crates/apm2-daemon/src/projection/"
+          status: NEW
+          purpose: "Projection-only GitHub integration"
+      confidence: LOW

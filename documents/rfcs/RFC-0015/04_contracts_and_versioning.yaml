@@ -1,0 +1,260 @@
+rfc_contracts_and_versioning:
+  schema_version: "2026-01-29"
+
+  protocol_contracts:
+    - contract_id: FAC-CONTRACT-001
+      name: "GateLeaseIssued Contract"
+      description: |
+        Defines the structure and invariants for gate lease issuance.
+      schema: |
+        message GateLease {
+          string lease_id = 1;
+          string work_id = 2;
+          string gate_id = 3;
+          bytes changeset_digest = 4;
+          string executor_actor_id = 5;
+          google.protobuf.Timestamp issued_at = 6;
+          google.protobuf.Timestamp expires_at = 7;
+          bytes policy_hash = 8;
+          string issuer_actor_id = 9;
+          bytes issuer_signature = 10;
+
+          // AAT-specific extensions (when gate_id = "aat")
+          AatLeaseExtension aat_extension = 11;
+        }
+
+        message AatLeaseExtension {
+          bytes view_commitment_hash = 1;
+          bytes rcp_manifest_hash = 2;
+          string rcp_profile_id = 3;
+          string selection_policy_id = 4;
+        }
+      invariants:
+        - "lease_id is globally unique"
+        - "expires_at > issued_at"
+        - "issuer_signature covers canonical bytes with GATE_LEASE_ISSUED: prefix"
+        - "Child leases can only narrow scope (subset rule)"
+      domain_separator: "GATE_LEASE_ISSUED:"
+
+    - contract_id: FAC-CONTRACT-002
+      name: "GateRunCompleted Contract"
+      description: |
+        Defines the structure and invariants for gate completion events.
+      schema: |
+        message GateRunCompleted {
+          string gate_id = 1;
+          string lease_id = 2;
+          bytes changeset_digest = 3;
+          string executor_actor_id = 4;
+          bytes evidence_bundle_hash = 5;
+          string gate_receipt_id = 6;
+          google.protobuf.Timestamp completed_at = 7;
+          bytes executor_signature = 8;
+
+          // Typed payload (discriminated by gate_id)
+          oneof payload {
+            AatGateReceipt aat_receipt = 10;
+            GenericGateReceipt generic_receipt = 11;
+          }
+        }
+      invariants:
+        - "lease_id references valid GateLease"
+        - "changeset_digest matches lease"
+        - "executor_actor_id matches lease"
+        - "executor_signature covers canonical bytes with GATE_RUN_COMPLETED: prefix"
+        - "completed_at <= lease.expires_at"
+      domain_separator: "GATE_RUN_COMPLETED:"
+
+    - contract_id: FAC-CONTRACT-003
+      name: "AatGateReceipt Contract"
+      description: |
+        Typed payload for AAT gate receipts with evidence binding.
+      schema: |
+        message AatGateReceipt {
+          // View commitment binding
+          bytes view_commitment_hash = 1;
+          bytes rcp_manifest_hash = 2;
+          string rcp_profile_id = 3;
+          bytes policy_hash = 4;
+
+          // Determinism tracking
+          uint32 determinism_class = 5;
+          string flake_class = 6;
+          uint32 run_count = 7;
+          repeated bytes run_receipt_hashes = 8;
+          bytes stability_digest = 9;
+
+          // Verdict
+          string verdict = 10;  // PASS, FAIL, NEEDS_INPUT
+
+          // Evidence binding
+          bytes transcript_chain_root_hash = 11;
+          bytes transcript_bundle_hash = 12;
+          repeated ArtifactDigest artifact_digests = 13;
+          repeated TerminalVerifierOutput terminal_verifier_outputs = 14;
+          bytes verifier_policy_hash = 15;
+
+          // Risk tier
+          string selection_policy_id = 16;
+          string risk_tier = 17;  // HIGH, MED, LOW
+
+          // Attestation
+          AatAttestation attestation = 18;
+        }
+
+        message ArtifactDigest {
+          string artifact_type = 1;  // log, junit, coverage, snapshot, binary
+          bytes digest = 2;
+          string data_classification = 3;
+          bool redaction_applied = 4;
+          bytes redaction_profile_hash = 5;
+          uint64 retention_ttl_seconds = 6;
+        }
+
+        message TerminalVerifierOutput {
+          string verifier_kind = 1;  // exit_code, snapshot_diff, structured_test_report, invariant_check
+          bytes output_digest = 2;
+          bool predicate_satisfied = 3;
+        }
+
+        message AatAttestation {
+          bytes container_image_digest = 1;
+          repeated bytes toolchain_digests = 2;
+          string runner_identity_key_id = 3;
+          bytes network_policy_profile_hash = 4;
+        }
+      invariants:
+        - "view_commitment_hash matches FAC-00 output"
+        - "rcp_manifest_hash matches FAC-02 output for profile"
+        - "run_receipt_hashes.len() == run_count"
+        - "transcript_chain_root_hash derivable from transcript_bundle_hash"
+        - "All artifact_digests include data_classification"
+        - "At least one terminal_verifier_output present for PASS"
+        - "predicate_satisfied == true for all verifier outputs when verdict == PASS"
+
+    - contract_id: FAC-CONTRACT-004
+      name: "MergeReceipt Contract"
+      description: |
+        Defines the atomic merge receipt binding inputs to result.
+      schema: |
+        message MergeReceipt {
+          bytes base_selector = 1;
+          bytes changeset_digest = 2;
+          repeated string gate_receipt_ids = 3;
+          bytes policy_hash = 4;
+          bytes result_selector = 5;
+          google.protobuf.Timestamp merged_at = 6;
+          string gate_actor_id = 7;
+          bytes gate_signature = 8;
+        }
+      invariants:
+        - "result_selector is observed trunk HEAD after merge"
+        - "All gate_receipt_ids reference valid GateRunCompleted events"
+        - "gate_signature covers canonical bytes with MERGE_RECEIPT: prefix"
+        - "merged_at reflects actual merge time (not future)"
+      domain_separator: "MERGE_RECEIPT:"
+
+    - contract_id: FAC-CONTRACT-005
+      name: "AATResultReused Contract"
+      description: |
+        Defines the provenance-bound AAT result reuse event.
+      schema: |
+        message AATResultReused {
+          bytes from_receipt_hash = 1;
+          AatProvenanceTuple provenance = 2;
+          bytes policy_hash = 3;
+          string justification = 4;
+          bytes gate_signature = 5;
+        }
+
+        message AatProvenanceTuple {
+          bytes changeset_digest = 1;
+          bytes pinned_snapshot_digest = 2;
+          bytes verifier_policy_hash = 3;
+          bytes toolchain_digest = 4;
+          bytes env_attestation_digest = 5;
+          bytes rcp_aat_manifest_hash = 6;
+        }
+      invariants:
+        - "from_receipt_hash references valid AatGateReceipt"
+        - "All provenance fields must match exactly"
+        - "gate_signature covers canonical bytes with AAT_RESULT_REUSED: prefix"
+      domain_separator: "AAT_RESULT_REUSED:"
+
+    - contract_id: FAC-CONTRACT-006
+      name: "InterventionFreeze Contract"
+      description: |
+        Defines the freeze/unfreeze protocol for divergence handling.
+      schema: |
+        message InterventionFreeze {
+          string scope = 1;  // repo, work_id
+          string scope_value = 2;
+          string trigger_defect_id = 3;
+          google.protobuf.Timestamp frozen_at = 4;
+          string gate_actor_id = 5;
+          bytes gate_signature = 6;
+        }
+
+        message InterventionUnfreeze {
+          string freeze_id = 1;
+          string resolution_type = 2;  // ADJUDICATION, EMERGENCY_OVERRIDE
+          string adjudication_id = 3;
+          google.protobuf.Timestamp unfrozen_at = 4;
+          string gate_actor_id = 5;
+          bytes gate_signature = 6;
+        }
+      invariants:
+        - "Unfreeze requires valid adjudication or emergency override ceremony"
+        - "No admissions proceed while freeze is active for scope"
+
+  versioning_strategy:
+    schema_versioning:
+      approach: "Schema digest with fail-closed validation"
+      details: |
+        All event envelopes include schema_version and schema_digest. Unknown schemas
+        trigger event rejection. Canonicalizer version tracked for cross-version verification.
+
+    api_versioning:
+      approach: "Semantic versioning with additive-only extensions"
+      details: |
+        FAC protocol version follows semver. New fields are additive with default handling.
+        Breaking changes require new major version and migration path.
+
+    policy_versioning:
+      approach: "Content-addressed policy profiles"
+      details: |
+        Policy profiles are identified by policy_hash (BLAKE3 digest of canonical form).
+        Policy resolution pinned at FAC-00 ingestion. Changes require new changeset.
+
+  migration_considerations:
+    - id: MIG-FAC-0001
+      name: "Gate Event Payload Extension"
+      description: |
+        Existing kernel_events.proto may need extension for GateLeaseIssued, GateRunStarted,
+        GateRunCompleted payloads. Alternative: new fac_events.proto with import.
+      open_question: "Q-FAC-0001: Canonical proto placement for new payloads"
+
+    - id: MIG-FAC-0002
+      name: "Gradual OCAP Rollout"
+      description: |
+        Context firewall enforcement should be graduated (warn -> soft-fail -> hard-fail)
+        to allow pack completeness improvements during transition.
+      phases:
+        - phase: FAC-R-01
+          mode: WARN
+          duration_days: 14
+        - phase: FAC-R-02
+          mode: SOFT_FAIL
+          duration_days: 14
+        - phase: FAC-R-03
+          mode: HARD_FAIL
+          duration_days: 14
+        - phase: FAC-R-04
+          mode: PRODUCTION
+          duration: ongoing
+
+    - id: MIG-FAC-0003
+      name: "CI Evidence Feature Flag"
+      description: |
+        CI evidence import is disabled by default (CI_EVENTS_ENABLED=false).
+        Fail-closed when disabled; evidence-backed import required when enabled.

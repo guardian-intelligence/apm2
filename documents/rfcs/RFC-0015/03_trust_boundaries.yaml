@@ -1,0 +1,330 @@
+rfc_trust_boundaries:
+  schema_version: "2026-01-29"
+
+  trust_model:
+    summary: |
+      FAC establishes trust boundaries around gate execution, GitHub projection, and CI evidence
+      import. The core principle is that internal cryptographically-signed events are authoritative,
+      while external signals (GitHub status, CI conclusions) are observations requiring verification.
+      OCAP context firewall ensures consumption holons cannot escape their assigned context.
+
+    trust_domains:
+      - domain_id: TD-KERNEL
+        name: "Kernel Authority"
+        holons:
+          - HOLON-KERNEL-GOVERNANCE
+          - HOLON-KERNEL-GATE
+        trust_level: CRITICAL
+        description: |
+          Kernel authority controls lease issuance, admission decisions, and merge receipts.
+          Compromise of kernel holons would allow unauthorized admissions.
+        key_tier: T1
+
+      - domain_id: TD-COORDINATOR
+        name: "Coordination"
+        holons:
+          - HOLON-COORDINATOR
+        trust_level: HIGH
+        description: |
+          Coordinator orchestrates FAC workflow but cannot directly emit gate outcomes or merge
+          receipts. Can spawn sessions and issue retry decisions.
+        key_tier: T2
+
+      - domain_id: TD-COMPILER
+        name: "Context Compilation"
+        holons:
+          - HOLON-CONTEXT-COMPILER
+        trust_level: HIGH
+        description: |
+          Context compiler produces RCP manifests that determine what gate executors can read.
+          Compromise could allow overly permissive context packs.
+        key_tier: T2
+
+      - domain_id: TD-PROJECTION
+        name: "External Projection"
+        holons:
+          - HOLON-GITHUB-ADAPTER
+        trust_level: MEDIUM
+        description: |
+          Adapter writes to GitHub but cannot influence admission decisions. Has access to
+          projection credentials. Compromise allows projection tampering but not admission bypass.
+        key_tier: T2
+
+      - domain_id: TD-GATE-EXECUTION
+        name: "Gate Execution"
+        holons:
+          - HOLON-REVIEWER-QUALITY
+          - HOLON-REVIEWER-SECURITY
+          - HOLON-AAT
+        trust_level: MEDIUM
+        description: |
+          Gate executors operate under lease-scoped authority and OCAP context firewall.
+          Can only produce gate outcomes for their assigned lease. Cannot escalate authority.
+        key_tier: T2
+
+      - domain_id: TD-SESSION
+        name: "Session Execution"
+        trust_level: LOW
+        description: |
+          Ephemeral session keys (T3) for tool requests and session events.
+          Compromise affects only the current session.
+        key_tier: T3
+
+  trust_boundaries:
+    - boundary_id: TB-0001
+      name: "Admission Authority Boundary"
+      description: |
+        Only signed GateRunCompleted events from leased executors can satisfy gate requirements.
+        MergeReceipt can only be emitted by HOLON-KERNEL-GATE after verifying all required gates.
+      crossing_rules:
+        - rule: "GateRunCompleted must be signed by leased executor"
+          enforcement: "Signature verification on ingestion; INVALID_SIGNATURE rejects"
+        - rule: "Lease must be valid and unexpired"
+          enforcement: "Lease validation; UNAUTHORIZED_EXECUTOR rejects"
+        - rule: "MergeReceipt emitted only after result_selector observed"
+          enforcement: "Atomic merge semantics; MERGE_NONATOMIC defect on failure"
+      law_refs:
+        - LAW-01
+
+    - boundary_id: TB-0002
+      name: "Context Firewall Boundary"
+      description: |
+        CONSUME-mode holons cannot read outside their RCP manifest allowlist. Context misses
+        terminate the session rather than allowing discovery.
+      crossing_rules:
+        - rule: "All reads must reference manifest entry"
+          enforcement: "ToolDecided=DENY; rule_id CTX-ALLOWLIST-001"
+        - rule: "Context miss terminates session"
+          enforcement: "SessionTerminated rationale=CONTEXT_MISS"
+        - rule: "Refinement via ContextRefinementRequest only"
+          enforcement: "No in-session discovery; coordinator reissues after refined pack"
+      law_refs:
+        - LAW-02
+        - LAW-05
+
+    - boundary_id: TB-0003
+      name: "Projection Isolation Boundary"
+      description: |
+        GitHub is a projection target, not a source of truth. Admission never reads GitHub status.
+        Only HOLON-GITHUB-ADAPTER may write to GitHub.
+      crossing_rules:
+        - rule: "Admission reads internal projections only"
+          enforcement: "Code architecture; no GitHub reads in admission path"
+        - rule: "Only adapter writes to GitHub"
+          enforcement: "Policy enforcement; PROJECTION_WRITE_UNAUTHORIZED on violation"
+        - rule: "Divergence triggers freeze"
+          enforcement: "Watchdog poll; InterventionFreeze on mismatch"
+      law_refs:
+        - LAW-03
+
+    - boundary_id: TB-0004
+      name: "CI Evidence Import Boundary"
+      description: |
+        CI conclusions are observations requiring evidence import. READY_FOR_REVIEW requires
+        attested evidence, not just status success.
+      crossing_rules:
+        - rule: "Webhook signature must be verified"
+          enforcement: "CI_ATTESTATION_INVALID on failure"
+        - rule: "Raw artifacts must be imported to CAS"
+          enforcement: "CI_EVIDENCE_MISSING if bypassed"
+        - rule: "Adapter attestation must be signed"
+          enforcement: "Required for READY_FOR_REVIEW transition"
+      law_refs:
+        - LAW-04
+        - LAW-15
+
+    - boundary_id: TB-0005
+      name: "AAT Evidence Boundary"
+      description: |
+        AAT PASS requires evidence-bound receipts with transcript chains, terminal verifiers,
+        and attestation. Narrative is non-authoritative.
+      crossing_rules:
+        - rule: "Transcript chain must be complete"
+          enforcement: "AAT_TRANSCRIPT_CHAIN_INVALID on incompleteness"
+        - rule: "Terminal verifier outputs required"
+          enforcement: "AAT_TERMINAL_VERIFIER_MISSING on absence"
+        - rule: "Machine predicate must be satisfied"
+          enforcement: "AAT_TERMINAL_VERIFIER_MISMATCH on failure"
+      law_refs:
+        - LAW-04
+        - LAW-15
+
+    - boundary_id: TB-0006
+      name: "Credential Isolation Boundary"
+      description: |
+        Agent processes do not inherit GitHub tokens or SSH keys. Only HOLON-GITHUB-ADAPTER
+        has projection credentials.
+      crossing_rules:
+        - rule: "No ambient credential access"
+          enforcement: "PolicyViolation and session quarantine on access attempt"
+        - rule: "Adapter-only projection credentials"
+          enforcement: "Tool policy allowlist; github.write only for adapter"
+      law_refs:
+        - LAW-05
+
+    - boundary_id: TB-0007
+      name: "AAT Executor Custody Boundary"
+      description: |
+        AAT executor keys must be in a distinct custody domain from coordinator and implementer
+        roles. Prevents orchestrator from spoofing AAT outcomes.
+      crossing_rules:
+        - rule: "AAT executor keys in separate custody domain"
+          enforcement: "KeyPolicy validation on lease issuance"
+        - rule: "Custody group prevents self-AAT"
+          enforcement: "UNAUTHORIZED_EXECUTOR on custody violation"
+      law_refs:
+        - LAW-05
+
+  security_controls:
+    - id: SEC-CTRL-FAC-0001
+      name: "Ed25519 Signature Verification"
+      type: PREVENTATIVE
+      boundary: TB-0001
+      details: |
+        All critical events require Ed25519 signature verification on ingestion with
+        domain-separated prefixes. Unsigned or invalid signatures rejected immediately.
+
+    - id: SEC-CTRL-FAC-0002
+      name: "OCAP Manifest Allowlist Enforcement"
+      type: PREVENTATIVE
+      boundary: TB-0002
+      details: |
+        Context firewall mediates all read operations through RCP manifest allowlist.
+        Denials emit ToolDecided=DENY with rule_id. No fallback reads permitted.
+
+    - id: SEC-CTRL-FAC-0003
+      name: "Divergence Watchdog"
+      type: DETECTIVE
+      boundary: TB-0003
+      details: |
+        Continuous polling (30s) of external trunk HEAD vs MergeReceipt result_selector.
+        Divergence triggers InterventionFreeze with AdjudicationRequested.
+
+    - id: SEC-CTRL-FAC-0004
+      name: "Lease Expiry Enforcement"
+      type: PREVENTATIVE
+      boundary: TB-0001
+      details: |
+        All leases have mandatory expires_at. GateRunCompleted verification rejects if
+        timestamp exceeds lease expiry.
+
+    - id: SEC-CTRL-FAC-0005
+      name: "CI Evidence Attestation"
+      type: PREVENTATIVE
+      boundary: TB-0004
+      details: |
+        READY_FOR_REVIEW requires signed adapter attestation with artifact hashes.
+        Fail-closed on missing evidence.
+
+    - id: SEC-CTRL-FAC-0006
+      name: "Terminal Verifier Binding"
+      type: PREVENTATIVE
+      boundary: TB-0005
+      details: |
+        AAT PASS requires terminal verifier outputs satisfying machine predicate.
+        Narrative cannot substitute for verifier evidence.
+
+    - id: SEC-CTRL-FAC-0007
+      name: "Echo-Trap Detection"
+      type: DETECTIVE
+      boundary: TB-0001
+      details: |
+        Monitor FindingSignature repetition within GateRun window. Threshold=3
+        triggers SessionTerminated with escalation.
+
+    - id: SEC-CTRL-FAC-0008
+      name: "AAT Harness Sandboxing"
+      type: PREVENTATIVE
+      boundary: TB-0005
+      details: |
+        AAT harnesses run in strict namespaces/containers. No host mounts beyond
+        pinned snapshot. Egress deny by default.
+
+  threat_model:
+    adversaries:
+      - id: ADV-0001
+        name: "Malicious Agent"
+        capabilities:
+          - "Can manipulate external GitHub status"
+          - "Can attempt to produce forged gate outcomes"
+          - "Can attempt to access resources outside context pack"
+        mitigations:
+          - TB-0001
+          - TB-0002
+          - TB-0003
+
+      - id: ADV-0002
+        name: "Compromised CI Environment"
+        capabilities:
+          - "Can produce false success signals"
+          - "Can attempt to inject false evidence"
+        mitigations:
+          - TB-0004
+
+      - id: ADV-0003
+        name: "External Attacker"
+        capabilities:
+          - "Can force-push to trunk (if branch protection bypassed)"
+          - "Can manipulate GitHub state"
+        mitigations:
+          - TB-0003
+
+      - id: ADV-0004
+        name: "Compromised AAT Harness"
+        capabilities:
+          - "Can attempt evidence forgery"
+          - "Can attempt data exfiltration"
+        mitigations:
+          - TB-0005
+          - SEC-CTRL-FAC-0008
+
+    attack_vectors:
+      - id: AV-0001
+        name: "Status Spoofing"
+        adversary: ADV-0001
+        description: "Agent manipulates GitHub status to bypass gate requirements"
+        mitigation: "TB-0003: GitHub is projection-only; admission ignores GitHub status"
+
+      - id: AV-0002
+        name: "Gate Outcome Forgery"
+        adversary: ADV-0001
+        description: "Agent produces fake GateRunCompleted without valid lease"
+        mitigation: "TB-0001: Signature verification and lease validation"
+
+      - id: AV-0003
+        name: "Context Escape"
+        adversary: ADV-0001
+        description: "Agent attempts to read files outside assigned context pack"
+        mitigation: "TB-0002: OCAP firewall with hard deny"
+
+      - id: AV-0004
+        name: "CI Evidence Bypass"
+        adversary: ADV-0002
+        description: "CI reports success without actual test execution"
+        mitigation: "TB-0004: Evidence import required; attestation signed"
+
+      - id: AV-0005
+        name: "Projection Divergence"
+        adversary: ADV-0003
+        description: "External trunk modified without FAC admission"
+        mitigation: "TB-0003: Divergence watchdog triggers freeze"
+
+      - id: AV-0006
+        name: "AAT Narrative Manipulation"
+        adversary: ADV-0001
+        description: "Agent produces convincing narrative without actual test PASS"
+        mitigation: "TB-0005: Terminal verifier binding; narrative non-authoritative"
+
+  coi_policy:
+    description: |
+      Conflict of Interest (COI) enforcement ensures that changeset authors cannot review
+      their own changes for required gates. COI is enforced at key custody group level.
+    rules:
+      - rule: "Executor of required gate must not be author of ChangeSet"
+        enforcement: "COI check at lease issuance"
+      - rule: "Keys in same COI group are treated as same actor"
+        enforcement: "COI grouping policy under CAC governance"
+      - rule: "Waiver requires explicit adjudication"
+        enforcement: "AdjudicationRequested(WAIVER) with bounded scope and TTL"
+    open_question: |
+      Q-FAC-0003: Formal COI grouping policy and KeyPolicy artifact definition
