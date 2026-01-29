@@ -169,7 +169,7 @@ rfc_test_and_evidence:
         Test that HARNESS_FLAKE triggers runner pool quarantine.
         Test that TEST_NONSEMANTIC triggers test spec quarantine.
         Test that ENVIRONMENT_DRIFT invalidates attestation and blocks admission.
-        Test that deterministic FAIL uses outcome_class=DETERMINISTIC_FAIL.
+        Test that deterministic FAIL uses flake_class=DETERMINISTIC_FAIL.
 
     - evidence_id: EVID-FAC-0012
       requirement_ids:

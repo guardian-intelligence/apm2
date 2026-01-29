@@ -314,7 +314,7 @@ prd_solution_overview:
           - Admission reads only internal projections; never reads GitHub status as truth.
           - Required gates must be satisfied by valid GateRunCompleted signatures + matching unexpired leases + matching ChangeSetDigest.
           - "Admission verifies PolicyResolvedForChangeSet exists and matches resolved policy tuple for this changeset."
-          - AAT admission validates typed GateReceipt payload (view_commitment_hash, rcp_manifest_hash, determinism_class, determinism_status, outcome_class/flake_class, run_receipt_hashes, run_count, stability_digest).
+          - AAT admission validates typed GateReceipt payload (view_commitment_hash, rcp_manifest_hash, determinism_class, determinism_status, flake_class, run_receipt_hashes, run_count, stability_digest).
           - "AAT admission validates transcript chain completeness, artifact_manifest_hash, terminal verifier outputs, terminal_evidence_digest, observational_evidence_digest, terminal_verifier_outputs_digest, verifier_policy_hash, selection_policy_id, risk_tier, and attestation fields."
           - "AAT admission enforces anti-downgrade: policy_hash matches resolved_policy_hash; risk_tier/determinism_class not lowered; verifier_policy_hash allowed for resolved tier; rcp_profile_id and manifest match resolved profile."
           - "AAT reuse is allowed only via AATResultReused with exact provenance tuple match; otherwise reuse is forbidden."
@@ -434,7 +434,7 @@ prd_solution_overview:
           - policy_hash
           - determinism_class
           - determinism_status
-          - outcome_class (flake_class field)
+          - flake_class
           - run_count
           - run_receipt_hashes
           - stability_digest
@@ -525,20 +525,20 @@ prd_solution_overview:
       determinism_status:
         - "STABLE"
         - "MISMATCH"
-      outcome_class:
-        field_name: "flake_class (legacy field name; semantics are outcome_class)"
+      flake_class:
+        field_name: "flake_class"
         canonical_values:
           - "DETERMINISTIC_FAIL"
           - "HARNESS_FLAKE"
           - "ENVIRONMENT_DRIFT"
           - "TEST_NONSEMANTIC"
-          - "UNKNOWN"
-        optional_values:
           - "CODE_NONSEMANTIC"
+          - "UNKNOWN"
       rules:
-        - "determinism_status=MISMATCH requires outcome_class in {HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN}."
-        - "determinism_status=STABLE and verdict=FAIL => outcome_class=DETERMINISTIC_FAIL."
-        - "determinism_status=STABLE and verdict=PASS may omit outcome_class."
+        - "flake_class is the canonical field name; synonyms are forbidden."
+        - "determinism_status=MISMATCH requires flake_class in {HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN}."
+        - "determinism_status=STABLE and verdict=FAIL => flake_class=DETERMINISTIC_FAIL."
+        - "determinism_status=STABLE and verdict=PASS may omit flake_class."
       handling:
         DETERMINISTIC_FAIL: "Deterministic FAIL; no mismatch; handled by verdict with no retries."
         HARNESS_FLAKE: "Quarantine runner pool; reroute to clean pool with attestation check."
@@ -601,7 +601,7 @@ prd_solution_overview:
     default_run_count: 3
     stability_rule: "All N runs must produce identical terminal_evidence_digest and terminal_verifier_outputs_digest (and verdict)."
     proof: "GateReceipt payload includes run_receipt_hashes, run_count, terminal_evidence_digest, terminal_verifier_outputs_digest, and stability_digest."
-    classification: "Coordinator assigns determinism_status (STABLE|MISMATCH) and outcome_class (flake_class field); GateReceipt records determinism_class + determinism_status + outcome_class for failures/mismatches."
+    classification: "Coordinator assigns determinism_status (STABLE|MISMATCH) and flake_class; GateReceipt records determinism_class + determinism_status + flake_class for failures/mismatches."
     failure_actions:
       - "Emit DefectRecord(GATE_NONDETERMINISTIC)."
       - "RunnerPoolQuarantined event emitted on HARNESS_FLAKE; selection excludes quarantined pools."

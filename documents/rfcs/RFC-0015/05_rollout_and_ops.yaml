@@ -149,7 +149,7 @@ rfc_rollout_and_ops:
       - metric: aat_flake_classification
         type: histogram
         labels: [flake_class]
-        description: "Distribution of AAT outcome_class (flake_class field) classifications"
+        description: "Distribution of AAT flake_class classifications"
 
     incident_response:
       - scenario: "Projection Divergence Detected"

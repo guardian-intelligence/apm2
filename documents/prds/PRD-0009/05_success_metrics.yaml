@@ -186,8 +186,8 @@ prd_success_metrics:
     - id: MET-0016
       name: Flake attribution distribution
       description: |
-        Distribution of AAT mismatches by outcome_class (flake_class field) values:
-        HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, UNKNOWN (CODE_NONSEMANTIC optional).
+        Distribution of AAT mismatches by flake_class values:
+        HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN.
       baseline: "Baseline established after flake classification rollout."
       target: "UNKNOWN <5%; HARNESS_FLAKE + ENVIRONMENT_DRIFT trending down"
       measurement_method: |

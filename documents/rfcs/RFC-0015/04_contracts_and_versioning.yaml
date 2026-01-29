@@ -153,7 +153,7 @@ rfc_contracts_and_versioning:
           // Determinism tracking
           uint32 determinism_class = 5;
           string determinism_status = 6; // STABLE, MISMATCH
-          string flake_class = 7;        // outcome_class (legacy field name); DETERMINISTIC_FAIL, HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC(optional), UNKNOWN
+          string flake_class = 7;        // canonical enum: DETERMINISTIC_FAIL, HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN
           uint32 run_count = 8;
           repeated bytes run_receipt_hashes = 9;
           bytes terminal_evidence_digest = 10;
@@ -200,6 +200,7 @@ rfc_contracts_and_versioning:
         - "observational_evidence_digest excluded from determinism equality"
         - "At least one terminal_verifier_output present for PASS"
         - "predicate_satisfied == true for all verifier outputs when verdict == PASS"
+        - "flake_class is the canonical field name; alternate field names are rejected"
         - "determinism_status == MISMATCH implies flake_class in {HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN}"
         - "verdict == FAIL AND determinism_status == STABLE implies flake_class == DETERMINISTIC_FAIL"
         - "stability_digest == hash(verdict, terminal_evidence_digest, terminal_verifier_outputs_digest)"

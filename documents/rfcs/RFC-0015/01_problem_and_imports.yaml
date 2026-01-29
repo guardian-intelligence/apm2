@@ -181,7 +181,7 @@ rfc_problem_and_imports:
         Failures are classified and routed by policy to prevent throughput collapse; UNKNOWN
         failures never PASS via retries.
       acceptance_criteria:
-        - "GateReceipt payload records determinism_class, determinism_status, and outcome_class (flake_class field) for AAT failures/mismatches"
+        - "GateReceipt payload records determinism_class, determinism_status, and flake_class for AAT failures/mismatches"
         - "UNKNOWN failures never PASS via retries; NEEDS_INPUT required"
         - "HARNESS_FLAKE quarantines runner pool; TEST_NONSEMANTIC quarantines test spec"
 

@@ -675,7 +675,7 @@ rfc_design_decisions:
         - policy_hash
         - determinism_class
         - determinism_status
-        - outcome_class (flake_class field)
+        - flake_class
         - run_count
         - run_receipt_hashes
         - terminal_evidence_digest
@@ -874,17 +874,19 @@ rfc_design_decisions:
       title: "AAT Flake Classification and Policy Routing"
       status: VALIDATED
       validation_evidence: |
-        PRD-0009 FAC-REQ-0008 defines determinism_class, determinism_status, and outcome_class routing.
+        PRD-0009 FAC-REQ-0008 defines determinism_class, determinism_status, and flake_class routing.
         Q-RFC-FAC-0006 defines classification for mismatch scenarios.
       decision: |
         AAT GateReceipts MUST record determinism_class, determinism_status (STABLE|MISMATCH),
-        and outcome_class (flake_class field). outcome_class routing:
+        and flake_class. flake_class is the canonical field name with fixed enum values:
+        DETERMINISTIC_FAIL, HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN.
+        No alternate field names or aliases are permitted. flake_class routing:
         HARNESS_FLAKE -> runner pool quarantine, ENVIRONMENT_DRIFT -> attestation invalidation,
         TEST_NONSEMANTIC/CODE_NONSEMANTIC -> spec quarantine, UNKNOWN -> NEEDS_INPUT.
         Deterministic FAIL is verdict=FAIL with determinism_status=STABLE and
-        outcome_class=DETERMINISTIC_FAIL. No retries may convert UNKNOWN to PASS.
+        flake_class=DETERMINISTIC_FAIL. No retries may convert UNKNOWN to PASS.
       phase_notes:
-        phase_1: "Record determinism_status and outcome_class (flake_class field) in receipt payloads."
+        phase_1: "Record determinism_status and flake_class in receipt payloads."
         phase_2: "Enforce quarantine routing and audit metrics."
       requirement_ids:
         - FAC-REQ-0008

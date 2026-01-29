@@ -517,7 +517,7 @@ sa2_mock_implementation_run_report:
                 rcp_profile_id: string,
                 policy_hash: bytes,
                 determinism_class: string,  // DETERMINISTIC, STABLE, FLAKY
-                flake_class: string,        // Optional: INFRA, TEST_NONSEMANTIC, etc.
+                flake_class: string,        // DETERMINISTIC_FAIL, HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN
                 run_count: uint32,
                 run_receipt_hashes: repeated bytes,
                 stability_digest: bytes,

@@ -215,15 +215,14 @@ prd_constraints_invariants:
         - EVID-0024
     - id: CNS-0023
       statement: |
-        AAT outcomes MUST record determinism_status (STABLE|MISMATCH) and outcome_class
-        (stored in payload field flake_class for compatibility). outcome_class is a
-        canonical enum: DETERMINISTIC_FAIL, HARNESS_FLAKE, ENVIRONMENT_DRIFT,
-        TEST_NONSEMANTIC, UNKNOWN (CODE_NONSEMANTIC optional by policy). determinism_status
-        indicates whether a behavioral mismatch occurred. Rules:
-        - determinism_status=MISMATCH => outcome_class in {HARNESS_FLAKE, ENVIRONMENT_DRIFT,
+        AAT outcomes MUST record determinism_status (STABLE|MISMATCH) and flake_class.
+        flake_class is the canonical field name and uses a fixed enum: DETERMINISTIC_FAIL,
+        HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN.
+        determinism_status indicates whether a behavioral mismatch occurred. Rules:
+        - determinism_status=MISMATCH => flake_class in {HARNESS_FLAKE, ENVIRONMENT_DRIFT,
           TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN}.
-        - determinism_status=STABLE and verdict=FAIL => outcome_class=DETERMINISTIC_FAIL.
-        - determinism_status=STABLE and verdict=PASS may omit outcome_class.
+        - determinism_status=STABLE and verdict=FAIL => flake_class=DETERMINISTIC_FAIL.
+        - determinism_status=STABLE and verdict=PASS may omit flake_class.
       rationale: |
         Classification prevents wasteful retries and avoids throughput collapse.
       enforcement: UNKNOWN => NEEDS_INPUT; HARNESS_FLAKE quarantines runner pool; TEST_NONSEMANTIC quarantines test spec.

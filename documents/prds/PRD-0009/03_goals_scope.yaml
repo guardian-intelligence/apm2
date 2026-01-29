@@ -88,7 +88,7 @@ prd_goals_scope:
     - id: FAC-G-0013
       statement: Flake classification and policy routing - Failures are classified and routed by policy to prevent throughput collapse.
       measurable_outcomes:
-        - GateReceipt payload records determinism_class, determinism_status, and outcome_class (flake_class field) for AAT failures/mismatches.
+        - GateReceipt payload records determinism_class, determinism_status, and flake_class for AAT failures/mismatches.
         - DETERMINISTIC_FAIL = verdict=FAIL with determinism_status=STABLE; UNKNOWN never PASS via retries.
         - HARNESS_FLAKE quarantines runner pool; TEST_NONSEMANTIC quarantines test spec.
     - id: FAC-G-0014
