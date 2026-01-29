@@ -739,7 +739,7 @@ mod base64_vec {
     use base64::engine::general_purpose::STANDARD;
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -1078,6 +1078,18 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
             });
         }
 
+        // Check outbound queue capacity BEFORE any ledger operations to prevent
+        // events being appended but never replicated (INV-F-11)
+        {
+            let queue = self.outbound_queue.read().await;
+            if queue.len() >= MAX_PENDING_PROPOSALS {
+                return Err(ReplicationError::QueueFull {
+                    size: queue.len(),
+                    max: MAX_PENDING_PROPOSALS,
+                });
+            }
+        }
+
         // Convert to ReplicatedEvent and serialize using JCS canonicalization
         // for deterministic output across all nodes (RFC 8785)
         let replicated_event = ReplicatedEvent::from_event_record(event);
@@ -1140,7 +1152,8 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
             order.push_back(sequence_id);
         }
 
-        // Queue for broadcast
+        // Queue for broadcast (capacity already verified above, but check again
+        // in case of concurrent proposals)
         {
             let mut queue = self.outbound_queue.write().await;
             if queue.len() >= MAX_PENDING_PROPOSALS {
@@ -1287,6 +1300,11 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
             nack
         };
 
+        // Check stop state (INV-F-11: all actuation paths must check stop state)
+        if !*self.running.read().await {
+            return Err(make_nack(NackReason::LedgerError));
+        }
+
         // Validate proposal structure (payload size, leader, epoch, hash)
         if let Some(reason) = Self::validate_proposal_structure(&proposal, &config) {
             return Err(make_nack(reason));
@@ -1299,9 +1317,13 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
         }
         drop(keys);
 
-        // Validate sequence ID
-        let last_seq = *self.last_appended_seq.read().await;
-        if let Some(reason) = Self::validate_proposal_sequence(&proposal, last_seq) {
+        // Hold write guard across sequence validation AND backend.append to
+        // prevent race condition where concurrent proposals bypass Gap/Duplicate
+        // checks (the read-await-write pattern is vulnerable to TOCTOU)
+        let mut last_seq_guard = self.last_appended_seq.write().await;
+
+        // Validate sequence ID (under write lock to prevent race)
+        if let Some(reason) = Self::validate_proposal_sequence(&proposal, *last_seq_guard) {
             return Err(make_nack(reason));
         }
 
@@ -1311,18 +1333,16 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
 
         let event = replicated_event.to_event_record();
 
-        // Append to ledger
+        // Append to ledger (under write lock to serialize replication)
         let local_seq_id = self
             .backend
             .append(&proposal.namespace, &event)
             .await
             .map_err(|_| make_nack(NackReason::LedgerError))?;
 
-        // Update last appended sequence
-        {
-            let mut last_seq = self.last_appended_seq.write().await;
-            *last_seq = proposal.sequence_id;
-        }
+        // Update last appended sequence (still holding the write lock)
+        *last_seq_guard = proposal.sequence_id;
+        drop(last_seq_guard);
 
         // Create and sign acknowledgment
         let mut ack = ReplicationAck {
@@ -1354,6 +1374,11 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
     /// Returns an error if the signature is invalid, the peer is unknown,
     /// or the epoch doesn't match the proposal's epoch.
     pub async fn handle_ack(&self, ack: ReplicationAck) -> Result<usize, ReplicationError> {
+        // Check stop state (INV-F-11: all actuation paths must check stop state)
+        if !*self.running.read().await {
+            return Err(ReplicationError::Shutdown);
+        }
+
         // Verify signature
         let keys = self.validator_keys.read().await;
         if let Some(follower_key) = keys.get(&ack.follower_id) {
@@ -1404,6 +1429,11 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
     ///
     /// Returns an error if the signature is invalid or the peer is unknown.
     pub async fn handle_nack(&self, nack: ReplicationNack) -> Result<(), ReplicationError> {
+        // Check stop state (INV-F-11: all actuation paths must check stop state)
+        if !*self.running.read().await {
+            return Err(ReplicationError::Shutdown);
+        }
+
         // Verify signature to prevent state pollution attacks
         let keys = self.validator_keys.read().await;
         if let Some(follower_key) = keys.get(&nack.follower_id) {
