@@ -266,21 +266,15 @@ impl SchemaRegistry for InMemorySchemaRegistry {
                 return Ok(());
             }
 
-            // Step 2b: Check if digest already exists with a different stable_id.
-            // [INV-0014]: One stable_id per digest - no aliases allowed.
-            // If re-registering with same digest but different stable_id, update the
-            // mapping.
-            if let Some(existing_entry) = by_digest.get(&entry.digest) {
-                if existing_entry.stable_id != entry.stable_id {
-                    // Update stable_id mapping: remove old, add new
-                    by_stable_id.remove(&existing_entry.stable_id);
-                    by_stable_id.insert(entry.stable_id.clone(), entry.digest);
-                    // Update the entry with the new stable_id
-                    let mut updated_entry = existing_entry.clone();
-                    updated_entry.stable_id.clone_from(&entry.stable_id);
-                    by_digest.insert(entry.digest, updated_entry);
-                }
-                // Digest already exists (same or updated stable_id) - done
+            // Step 2b: Check if digest already exists.
+            // SECURITY: If digest already exists, return Ok(()) immediately WITHOUT
+            // changing the stable_id mapping. This prevents alias hijacking attacks
+            // where an attacker registers a kernel schema's content under a different
+            // stable_id to remove the original "kernel:" mapping.
+            // [INV-0014]: First stable_id wins - subsequent registrations with same
+            // digest are true no-ops.
+            if by_digest.contains_key(&entry.digest) {
+                // Digest already registered - true idempotent no-op
                 return Ok(());
             }
 
@@ -743,44 +737,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tck_00181_re_register_same_digest_updates_stable_id() {
-        // [INV-0014]: One stable_id per digest - re-registering with same digest
-        // but different stable_id updates the stable_id mapping.
+    async fn tck_00181_re_register_same_digest_preserves_first_stable_id() {
+        // SECURITY [INV-0014]: First stable_id wins - subsequent registrations
+        // with same digest are true no-ops. This prevents alias hijacking where
+        // an attacker registers kernel schema content under a different stable_id
+        // to remove the original "kernel:" mapping.
         let registry = InMemorySchemaRegistry::new();
         let content = br#"{"type": "object"}"#;
 
-        let entry1 = make_entry("test:schema1.v1", content);
-        let entry2 = make_entry("test:schema2.v1", content); // Same content, different stable ID
+        let entry1 = make_entry("kernel:schema1.v1", content);
+        let entry2 = make_entry("attacker:schema2.v1", content); // Same content, different stable ID
 
         registry.register(&entry1).await.unwrap();
         assert_eq!(registry.count(), 1);
 
-        // Register same content with different stable ID - should update the mapping
+        // Attempt to register same content with different stable ID - should be no-op
         registry.register(&entry2).await.unwrap();
         assert_eq!(registry.count(), 1); // Still only one schema
 
-        // Old stable_id should no longer work (no ghost entries)
+        // ORIGINAL stable_id should still work (first wins, prevents hijacking)
         let found1 = registry
-            .lookup_by_stable_id("test:schema1.v1")
+            .lookup_by_stable_id("kernel:schema1.v1")
             .await
             .unwrap();
         assert!(
-            found1.is_none(),
-            "Old stable_id should not resolve (no ghost entries)"
+            found1.is_some(),
+            "Original stable_id should still resolve (first wins)"
         );
+        assert_eq!(found1.unwrap().stable_id, "kernel:schema1.v1");
 
-        // New stable_id should work
+        // Attacker's stable_id should NOT work (true no-op, no mapping created)
         let found2 = registry
-            .lookup_by_stable_id("test:schema2.v1")
+            .lookup_by_stable_id("attacker:schema2.v1")
             .await
             .unwrap();
-        assert!(found2.is_some());
-        assert_eq!(found2.unwrap().stable_id, "test:schema2.v1");
+        assert!(
+            found2.is_none(),
+            "Attacker's stable_id should not resolve (first wins)"
+        );
 
-        // Digest lookup should return the updated entry
+        // Digest lookup should return the ORIGINAL entry
         let found_by_digest = registry.lookup_by_digest(&entry1.digest).await.unwrap();
         assert!(found_by_digest.is_some());
-        assert_eq!(found_by_digest.unwrap().stable_id, "test:schema2.v1");
+        assert_eq!(found_by_digest.unwrap().stable_id, "kernel:schema1.v1");
     }
 
     // =========================================================================
@@ -1135,8 +1134,8 @@ mod tests {
 
     #[tokio::test]
     async fn tck_00181_no_unbounded_stable_id_growth() {
-        // Test that we can't create unbounded stable_ids for the same digest.
-        // [INV-0014]: One stable_id per digest prevents this attack.
+        // SECURITY: Test that we can't create unbounded stable_ids for the same digest.
+        // [INV-0014]: First stable_id wins - prevents alias hijacking attacks.
         let registry = InMemorySchemaRegistry::with_capacity(10);
         let content = br#"{"type": "object"}"#;
 
@@ -1146,25 +1145,25 @@ mod tests {
             registry.register(&entry).await.unwrap();
         }
 
-        // Should still only have 1 schema (the last one registered)
+        // Should still only have 1 schema (the FIRST one registered)
         assert_eq!(registry.count(), 1, "Should only have one schema stored");
 
-        // Only the last stable_id should work
-        assert!(
-            registry
-                .lookup_by_stable_id("test:alias99.v1")
-                .await
-                .unwrap()
-                .is_some(),
-            "Last registered stable_id should work"
-        );
+        // Only the FIRST stable_id should work (first wins)
         assert!(
             registry
                 .lookup_by_stable_id("test:alias0.v1")
                 .await
                 .unwrap()
+                .is_some(),
+            "First registered stable_id should work"
+        );
+        assert!(
+            registry
+                .lookup_by_stable_id("test:alias99.v1")
+                .await
+                .unwrap()
                 .is_none(),
-            "Old stable_ids should not work"
+            "Later stable_ids should not work (first wins)"
         );
     }
 }
