@@ -88,6 +88,16 @@ pub const MAX_REPLICATION_PAYLOAD_SIZE: usize = 1024 * 1024; // 1 MiB
 /// Message type for replication proposals.
 pub const MSG_REPLICATION_PROPOSAL: u32 = 300;
 
+/// Domain separation prefix for proposal signatures (prevents cross-protocol
+/// replay).
+pub const DOMAIN_PREFIX_PROPOSAL: &[u8] = b"APM2-REPLICATION-PROPOSAL-V1:";
+
+/// Domain separation prefix for acknowledgment signatures.
+pub const DOMAIN_PREFIX_ACK: &[u8] = b"APM2-REPLICATION-ACK-V1:";
+
+/// Domain separation prefix for nack signatures.
+pub const DOMAIN_PREFIX_NACK: &[u8] = b"APM2-REPLICATION-NACK-V1:";
+
 /// Message type for replication acknowledgments.
 pub const MSG_REPLICATION_ACK: u32 = 301;
 
@@ -355,9 +365,23 @@ pub struct ReplicationProposal {
 
 impl ReplicationProposal {
     /// Creates the message to sign for this proposal.
+    ///
+    /// The message includes a domain separation prefix and the namespace to
+    /// prevent cross-protocol and cross-namespace replay attacks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the namespace is longer than `u32::MAX` bytes.
     #[must_use]
     pub fn signing_message(&self) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(8 + 8 + 32);
+        let ns_bytes = self.namespace.as_bytes();
+        let mut msg =
+            Vec::with_capacity(DOMAIN_PREFIX_PROPOSAL.len() + 4 + ns_bytes.len() + 8 + 8 + 32);
+        msg.extend_from_slice(DOMAIN_PREFIX_PROPOSAL);
+        msg.extend_from_slice(
+            &(u32::try_from(ns_bytes.len()).expect("namespace too long")).to_le_bytes(),
+        );
+        msg.extend_from_slice(ns_bytes);
         msg.extend_from_slice(&self.epoch.to_le_bytes());
         msg.extend_from_slice(&self.sequence_id.to_le_bytes());
         msg.extend_from_slice(&self.event_hash);
@@ -408,22 +432,38 @@ pub struct ReplicationAck {
     /// The sequence ID being acknowledged.
     pub sequence_id: u64,
 
+    /// Namespace for this acknowledgment.
+    pub namespace: String,
+
     /// The follower's validator ID.
     pub follower_id: ValidatorId,
 
     /// Sequence ID assigned in the follower's local ledger.
     pub local_seq_id: u64,
 
-    /// Ed25519 signature over (`epoch` || `sequence_id` || `local_seq_id`).
+    /// Ed25519 signature over (`namespace` || `epoch` || `sequence_id` ||
+    /// `local_seq_id`).
     #[serde(with = "base64_arr_64")]
     pub signature: [u8; 64],
 }
 
 impl ReplicationAck {
     /// Creates the message to sign for this acknowledgment.
+    ///
+    /// The message includes a domain separation prefix and the namespace.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the namespace is longer than `u32::MAX` bytes.
     #[must_use]
     pub fn signing_message(&self) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(8 + 8 + 8);
+        let ns_bytes = self.namespace.as_bytes();
+        let mut msg = Vec::with_capacity(DOMAIN_PREFIX_ACK.len() + 4 + ns_bytes.len() + 8 + 8 + 8);
+        msg.extend_from_slice(DOMAIN_PREFIX_ACK);
+        msg.extend_from_slice(
+            &(u32::try_from(ns_bytes.len()).expect("namespace too long")).to_le_bytes(),
+        );
+        msg.extend_from_slice(ns_bytes);
         msg.extend_from_slice(&self.epoch.to_le_bytes());
         msg.extend_from_slice(&self.sequence_id.to_le_bytes());
         msg.extend_from_slice(&self.local_seq_id.to_le_bytes());
@@ -461,13 +501,17 @@ pub struct ReplicationNack {
     /// The sequence ID being rejected.
     pub sequence_id: u64,
 
+    /// Namespace for this nack.
+    pub namespace: String,
+
     /// The follower's validator ID.
     pub follower_id: ValidatorId,
 
     /// Reason for rejection.
     pub reason: NackReason,
 
-    /// Ed25519 signature over (`epoch` || `sequence_id` || `reason_code`).
+    /// Ed25519 signature over (`namespace` || `epoch` || `sequence_id` ||
+    /// `reason_code`).
     #[serde(with = "base64_arr_64")]
     pub signature: [u8; 64],
 }
@@ -509,9 +553,21 @@ impl NackReason {
 
 impl ReplicationNack {
     /// Creates the message to sign for this nack.
+    ///
+    /// The message includes a domain separation prefix and the namespace.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the namespace is longer than `u32::MAX` bytes.
     #[must_use]
     pub fn signing_message(&self) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(8 + 8 + 1);
+        let ns_bytes = self.namespace.as_bytes();
+        let mut msg = Vec::with_capacity(DOMAIN_PREFIX_NACK.len() + 4 + ns_bytes.len() + 8 + 8 + 1);
+        msg.extend_from_slice(DOMAIN_PREFIX_NACK);
+        msg.extend_from_slice(
+            &(u32::try_from(ns_bytes.len()).expect("namespace too long")).to_le_bytes(),
+        );
+        msg.extend_from_slice(ns_bytes);
         msg.extend_from_slice(&self.epoch.to_le_bytes());
         msg.extend_from_slice(&self.sequence_id.to_le_bytes());
         msg.push(self.reason.code());
@@ -932,11 +988,15 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
         let config = self.config.read().await;
         let my_id = config.validator_id;
 
+        // Clone namespace for use in the closure
+        let proposal_namespace = proposal.namespace.clone();
+
         // Create a nack helper
         let make_nack = |reason: NackReason| -> ReplicationNack {
             let mut nack = ReplicationNack {
                 epoch: proposal.epoch,
                 sequence_id: proposal.sequence_id,
+                namespace: proposal_namespace.clone(),
                 follower_id: my_id,
                 reason,
                 signature: [0u8; 64],
@@ -1005,6 +1065,7 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
         let mut ack = ReplicationAck {
             epoch: proposal.epoch,
             sequence_id: proposal.sequence_id,
+            namespace: proposal.namespace.clone(),
             follower_id: my_id,
             local_seq_id,
             signature: [0u8; 64],
@@ -1239,6 +1300,7 @@ mod tests {
         let mut ack = ReplicationAck {
             epoch: 1,
             sequence_id: 42,
+            namespace: "test".to_string(),
             follower_id,
             local_seq_id: 100,
             signature: [0u8; 64],
@@ -1277,6 +1339,7 @@ mod tests {
         let ack = ReplicationMessage::Ack(ReplicationAck {
             epoch: 1,
             sequence_id: 1,
+            namespace: "test".to_string(),
             follower_id: [0u8; 32],
             local_seq_id: 1,
             signature: [0u8; 64],
@@ -1286,6 +1349,7 @@ mod tests {
         let nack = ReplicationMessage::Nack(ReplicationNack {
             epoch: 1,
             sequence_id: 1,
+            namespace: "test".to_string(),
             follower_id: [0u8; 32],
             reason: NackReason::Stale,
             signature: [0u8; 64],
@@ -1363,6 +1427,7 @@ mod tests {
             state.record_ack(ReplicationAck {
                 epoch: 1,
                 sequence_id: 42,
+                namespace: "test".to_string(),
                 follower_id,
                 local_seq_id: 100 + u64::from(i),
                 signature: [0u8; 64],
@@ -1375,6 +1440,7 @@ mod tests {
         state.record_nack(ReplicationNack {
             epoch: 1,
             sequence_id: 42,
+            namespace: "test".to_string(),
             follower_id: [10u8; 32],
             reason: NackReason::Gap,
             signature: [0u8; 64],
@@ -1456,6 +1522,7 @@ mod tck_00195_tests {
         let ack = ReplicationAck {
             epoch: 0,
             sequence_id: 0,
+            namespace: String::new(),
             follower_id: [0u8; 32],
             local_seq_id: 0,
             signature: [0u8; 64],
@@ -1530,6 +1597,7 @@ mod tck_00195_tests {
         let ack = ReplicationMessage::Ack(ReplicationAck {
             epoch: 0,
             sequence_id: 0,
+            namespace: String::new(),
             follower_id: [0u8; 32],
             local_seq_id: 0,
             signature: [0u8; 64],
@@ -1539,6 +1607,7 @@ mod tck_00195_tests {
         let nack = ReplicationMessage::Nack(ReplicationNack {
             epoch: 0,
             sequence_id: 0,
+            namespace: String::new(),
             follower_id: [0u8; 32],
             reason: NackReason::Stale,
             signature: [0u8; 64],
