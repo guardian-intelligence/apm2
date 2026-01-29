@@ -1,6 +1,8 @@
 //! `SQLite`-backed ledger storage implementation.
 //!
 //! This module uses `SQLite` with WAL mode for the underlying storage.
+//! The [`SqliteLedgerBackend`] struct implements the [`LedgerBackend`] trait,
+//! providing a concrete storage backend for the APM2 event ledger.
 
 // SQLite returns i64 for row IDs and counts, but they're always non-negative.
 // Timestamps won't overflow u64 until the year 2554.
@@ -17,6 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use thiserror::Error;
+
+use super::backend::LedgerBackend;
 
 /// Schema SQL embedded at compile time.
 const SCHEMA_SQL: &str = include_str!("schema.sql");
@@ -251,13 +255,21 @@ pub struct LedgerStats {
 /// The ledger uses `SQLite`'s WAL mode to allow concurrent reads while
 /// writes are in progress. Events are stored with monotonically increasing
 /// sequence numbers and can never be modified or deleted.
-pub struct Ledger {
+///
+/// This struct implements the [`LedgerBackend`] trait, providing the core
+/// storage operations for the APM2 event-sourcing architecture.
+pub struct SqliteLedgerBackend {
     conn: Arc<std::sync::Mutex<Connection>>,
     #[allow(dead_code)]
     path: Option<std::path::PathBuf>,
 }
 
-impl Ledger {
+/// Type alias for backward compatibility.
+///
+/// Existing code using `Ledger` will continue to work unchanged.
+pub type Ledger = SqliteLedgerBackend;
+
+impl SqliteLedgerBackend {
     /// Opens or creates a ledger at the specified path.
     ///
     /// If the database doesn't exist, it will be created with the
@@ -881,6 +893,28 @@ impl Ledger {
         }
 
         Ok(())
+    }
+}
+
+impl LedgerBackend for SqliteLedgerBackend {
+    fn append(&self, event: &EventRecord) -> Result<u64, LedgerError> {
+        Self::append(self, event)
+    }
+
+    fn read_from(&self, cursor: u64, limit: u64) -> Result<Vec<EventRecord>, LedgerError> {
+        Self::read_from(self, cursor, limit)
+    }
+
+    fn head(&self) -> Result<u64, LedgerError> {
+        self.max_seq_id()
+    }
+
+    fn verify_chain<H, V>(&self, verify_hash_fn: H, verify_sig_fn: V) -> Result<(), LedgerError>
+    where
+        H: Fn(&[u8], &[u8]) -> Vec<u8>,
+        V: Fn(&[u8], &[u8]) -> bool,
+    {
+        Self::verify_chain(self, verify_hash_fn, verify_sig_fn)
     }
 }
 
