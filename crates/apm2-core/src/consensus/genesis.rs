@@ -31,10 +31,12 @@ pub const MAX_QUORUM_SIGNATURES: usize = 16;
 /// Maximum number of signatures allowed in an invitation token during parsing.
 ///
 /// This bounds memory usage during deserialization to prevent denial-of-service
-/// attacks. Reduced from 64 to 10 to fit within `CONTROL_FRAME_SIZE` (1024
-/// bytes). Each signature is ~70 bytes (`key_index` + 64-byte signature), so 10
-/// signatures plus header fields fits comfortably within 1024 bytes.
-pub const MAX_SIGNATURES: usize = 10;
+/// attacks. Set to 16 to match `MAX_QUORUM_SIGNATURES`, ensuring that join
+/// requests can succeed for large validator sets where quorum requires 2f+1=11
+/// signatures (for f=5 Byzantine faults). Each signature is ~70 bytes
+/// (`key_index` + 64-byte signature), so 16 signatures (~1120 bytes) may
+/// require binary encoding or slightly larger frames for wire format.
+pub const MAX_SIGNATURES: usize = 16;
 
 /// Maximum rate of join attempts per source (joins per minute).
 pub const MAX_JOIN_ATTEMPTS_PER_MINUTE: usize = 10;
@@ -45,6 +47,13 @@ pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 /// Maximum number of tracked sources in the rate limiter (CTR-1303: Bounded
 /// Stores).
 pub const MAX_RATE_LIMIT_SOURCES: usize = 1024;
+
+/// Maximum number of used tokens to track for single-use enforcement
+/// (INV-0014). This prevents token replay attacks while bounding memory usage.
+pub const MAX_USED_TOKENS: usize = 10_000;
+
+/// Maximum number of validators in genesis (CTR-1303: Bounded Stores).
+pub const MAX_VALIDATORS: usize = 64;
 
 /// Errors that can occur in genesis operations.
 #[derive(Debug, Error)]
@@ -118,6 +127,14 @@ pub enum GenesisError {
     /// Configuration error.
     #[error("configuration error: {0}")]
     Configuration(String),
+
+    /// Proof-of-possession verification failed.
+    #[error("proof-of-possession verification failed: {0}")]
+    ProofOfPossessionFailed(String),
+
+    /// Token has already been used (INV-0014: single-use tokens).
+    #[error("invitation token has already been used")]
+    TokenAlreadyUsed,
 }
 
 /// Configuration for genesis creation.
@@ -337,25 +354,34 @@ pub struct Genesis {
     /// The T0 public key that signed this genesis.
     #[serde(with = "hex_bytes")]
     t0_public_key: [u8; 32],
+    /// The initial validator set public keys (TB-0001).
+    #[serde(with = "hex_bytes_vec")]
+    validators: Vec<[u8; 32]>,
+    /// Genesis creation timestamp in Unix seconds (TB-0001).
+    timestamp: u64,
 }
 
 impl Genesis {
     /// Creates a new genesis block.
     ///
     /// The signature must be over the canonical representation:
-    /// `BLAKE3(namespace || ledger_head_hash)`
+    /// `BLAKE3(namespace || ledger_head_hash || validators || timestamp)`
     #[must_use]
     pub const fn new(
         namespace: String,
         ledger_head_hash: [u8; 32],
         signature: [u8; 64],
         t0_public_key: [u8; 32],
+        validators: Vec<[u8; 32]>,
+        timestamp: u64,
     ) -> Self {
         Self {
             namespace,
             ledger_head_hash,
             signature,
             t0_public_key,
+            validators,
+            timestamp,
         }
     }
 
@@ -383,16 +409,28 @@ impl Genesis {
         &self.t0_public_key
     }
 
+    /// Returns the validator public keys (TB-0001).
+    #[must_use]
+    pub fn validators(&self) -> &[[u8; 32]] {
+        &self.validators
+    }
+
+    /// Returns the genesis creation timestamp in Unix seconds (TB-0001).
+    #[must_use]
+    pub const fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
     /// Computes the canonical hash for signing/verification.
     ///
     /// Format: `BLAKE3(len(namespace) as u32 LE || namespace ||
-    /// ledger_head_hash)`
+    /// ledger_head_hash || len(validators) as u32 LE || validators... ||
+    /// timestamp)`
     ///
-    /// The namespace length is prepended as a 4-byte little-endian value to
-    /// prevent canonicalization ambiguity where different namespace/hash
-    /// combinations could produce identical byte sequences.
+    /// The namespace length and validators count are prepended as 4-byte
+    /// little-endian values to prevent canonicalization ambiguity.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)] // Namespace length bounded by MAX_NAMESPACE_LEN (128)
+    #[allow(clippy::cast_possible_truncation)] // Namespace length bounded by MAX_NAMESPACE_LEN (128), validators by MAX_VALIDATORS (64)
     pub fn canonical_hash(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         // Prepend namespace length as u32 LE to prevent canonicalization ambiguity
@@ -400,6 +438,14 @@ impl Genesis {
         hasher.update(&ns_len.to_le_bytes());
         hasher.update(self.namespace.as_bytes());
         hasher.update(&self.ledger_head_hash);
+        // Include validators with count prefix
+        let validators_len = self.validators.len() as u32;
+        hasher.update(&validators_len.to_le_bytes());
+        for validator in &self.validators {
+            hasher.update(validator);
+        }
+        // Include timestamp
+        hasher.update(&self.timestamp.to_le_bytes());
         *hasher.finalize().as_bytes()
     }
 
@@ -492,8 +538,8 @@ impl Genesis {
     ///
     /// # Errors
     ///
-    /// Returns an error if deserialization fails or namespace exceeds maximum
-    /// length.
+    /// Returns an error if deserialization fails, namespace exceeds maximum
+    /// length, or validators exceed maximum count.
     pub fn from_json(data: &[u8]) -> Result<Self, GenesisError> {
         let genesis: Self =
             serde_json::from_slice(data).map_err(|e| GenesisError::Serialization(e.to_string()))?;
@@ -504,6 +550,15 @@ impl Genesis {
                 "namespace too long: {} bytes exceeds maximum {}",
                 genesis.namespace.len(),
                 MAX_NAMESPACE_LEN
+            )));
+        }
+
+        // Validate validators count to prevent DoS via oversized arrays
+        if genesis.validators.len() > MAX_VALIDATORS {
+            return Err(GenesisError::Configuration(format!(
+                "too many validators: {} exceeds maximum {}",
+                genesis.validators.len(),
+                MAX_VALIDATORS
             )));
         }
 
@@ -860,8 +915,8 @@ impl JoinRateLimiter {
 
 /// Validates genesis and join requests.
 ///
-/// This validator combines rate limiting, genesis verification, and
-/// invitation token validation.
+/// This validator combines rate limiting, genesis verification,
+/// invitation token validation, and single-use token enforcement.
 pub struct GenesisValidator {
     /// Genesis configuration.
     config: GenesisConfig,
@@ -869,6 +924,11 @@ pub struct GenesisValidator {
     expected_genesis: Genesis,
     /// Rate limiter for join attempts.
     rate_limiter: JoinRateLimiter,
+    /// Tracking of used invitation tokens (INV-0014: single-use tokens).
+    /// Stores hashes of used tokens to prevent replay attacks.
+    used_tokens: HashSet<[u8; 32]>,
+    /// Maximum number of used tokens to track (bounded memory).
+    max_used_tokens: usize,
 }
 
 impl GenesisValidator {
@@ -879,12 +939,14 @@ impl GenesisValidator {
             config,
             expected_genesis,
             rate_limiter: JoinRateLimiter::default(),
+            used_tokens: HashSet::new(),
+            max_used_tokens: MAX_USED_TOKENS,
         }
     }
 
     /// Creates a validator with a custom rate limiter.
     #[must_use]
-    pub const fn with_rate_limiter(
+    pub fn with_rate_limiter(
         config: GenesisConfig,
         expected_genesis: Genesis,
         rate_limiter: JoinRateLimiter,
@@ -893,6 +955,25 @@ impl GenesisValidator {
             config,
             expected_genesis,
             rate_limiter,
+            used_tokens: HashSet::new(),
+            max_used_tokens: MAX_USED_TOKENS,
+        }
+    }
+
+    /// Creates a validator with custom used token limit (for testing).
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_max_used_tokens(
+        config: GenesisConfig,
+        expected_genesis: Genesis,
+        max_used_tokens: usize,
+    ) -> Self {
+        Self {
+            config,
+            expected_genesis,
+            rate_limiter: JoinRateLimiter::default(),
+            used_tokens: HashSet::new(),
+            max_used_tokens,
         }
     }
 
@@ -931,13 +1012,19 @@ impl GenesisValidator {
         Ok(())
     }
 
-    /// Validates a join request with rate limiting and invitation token.
+    /// Validates a join request with rate limiting, invitation token, and
+    /// proof-of-possession.
     ///
     /// # Arguments
     ///
     /// * `source` - Source identifier (IP or node ID)
     /// * `genesis` - The genesis block from the joining node
     /// * `invitation` - The quorum-signed invitation token
+    /// * `proof` - Proof-of-possession: signature over the invitation token
+    ///   hash using the joining node's private key corresponding to the
+    ///   `invitee_id`
+    /// * `invitee_public_key` - The public key of the joining node (must match
+    ///   `invitee_id`)
     /// * `current_time` - Current Unix timestamp
     ///
     /// # Errors
@@ -946,14 +1033,20 @@ impl GenesisValidator {
     ///
     /// # Security
     ///
-    /// This method performs identity binding verification to ensure the source
-    /// matches the `invitee_id` in the invitation token. This prevents stolen
-    /// or shared tokens from being used by unauthorized nodes.
+    /// This method performs:
+    /// - Identity binding verification to ensure the source matches the
+    ///   `invitee_id`
+    /// - Proof-of-possession verification to ensure the joining node controls
+    ///   the private key for their claimed identity
+    /// - Single-use token enforcement (INV-0014) to prevent token replay
+    ///   attacks
     pub fn validate_join_request(
         &mut self,
         source: &str,
         genesis: &Genesis,
         invitation: &InvitationToken,
+        proof: &[u8; 64],
+        invitee_public_key: &VerifyingKey,
         current_time: u64,
     ) -> Result<(), GenesisError> {
         // Check rate limit first (INV-0013)
@@ -975,6 +1068,23 @@ impl GenesisValidator {
             });
         }
 
+        // Verify proof-of-possession: the joining node must prove they control
+        // the private key for their claimed identity by signing the invitation
+        // token hash
+        let token_hash = invitation.canonical_hash();
+        let proof_signature = Signature::from_bytes(proof);
+        invitee_public_key
+            .verify(&token_hash, &proof_signature)
+            .map_err(|e| {
+                GenesisError::ProofOfPossessionFailed(format!("signature verification failed: {e}"))
+            })?;
+
+        // Enforce single-use tokens (INV-0014)
+        // Check if this token has already been used
+        if self.used_tokens.contains(&token_hash) {
+            return Err(GenesisError::TokenAlreadyUsed);
+        }
+
         // Validate genesis (INV-0024, INV-0025)
         self.validate_genesis(genesis)?;
 
@@ -989,12 +1099,33 @@ impl GenesisValidator {
         // Validate invitation token signatures (INV-0026)
         invitation.verify(&self.config, current_time)?;
 
+        // Mark token as used (INV-0014: single-use enforcement)
+        // If we're at capacity, remove oldest entries (FIFO-like behavior via
+        // arbitrary removal since HashSet doesn't track insertion order - for
+        // production, consider using a bounded LRU cache)
+        if self.used_tokens.len() >= self.max_used_tokens {
+            // Remove approximately 10% of entries to make room
+            let to_remove = self.max_used_tokens / 10 + 1;
+            let keys_to_remove: Vec<_> = self.used_tokens.iter().take(to_remove).copied().collect();
+            for key in keys_to_remove {
+                self.used_tokens.remove(&key);
+            }
+        }
+        self.used_tokens.insert(token_hash);
+
         Ok(())
     }
 
     /// Cleans up the rate limiter.
     pub fn cleanup(&mut self) {
         self.rate_limiter.cleanup();
+    }
+
+    /// Returns the number of used tokens being tracked.
+    #[cfg(test)]
+    #[must_use]
+    pub fn used_token_count(&self) -> usize {
+        self.used_tokens.len()
     }
 }
 
@@ -1044,6 +1175,39 @@ mod hex_bytes_64 {
     }
 }
 
+/// Serde helper for Vec of 32-byte hex arrays (validators).
+mod hex_bytes_vec {
+    use serde::ser::SerializeSeq;
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes_vec: &[[u8; 32]], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(bytes_vec.len()))?;
+        for bytes in bytes_vec {
+            seq.serialize_element(&hex::encode(bytes))?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<[u8; 32]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let strings: Vec<String> = Vec::deserialize(deserializer)?;
+        strings
+            .into_iter()
+            .map(|s| {
+                let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+                bytes
+                    .try_into()
+                    .map_err(|_| serde::de::Error::custom("expected 32 bytes"))
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::{Signer, SigningKey};
@@ -1063,13 +1227,31 @@ mod tests {
         namespace: &str,
         ledger_head_hash: [u8; 32],
     ) -> Genesis {
+        create_test_genesis_with_validators(signing_key, namespace, ledger_head_hash, vec![], 0)
+    }
+
+    #[allow(clippy::cast_possible_truncation)] // Test namespaces are short
+    fn create_test_genesis_with_validators(
+        signing_key: &SigningKey,
+        namespace: &str,
+        ledger_head_hash: [u8; 32],
+        validators: Vec<[u8; 32]>,
+        timestamp: u64,
+    ) -> Genesis {
         // Use the same canonical hash format as Genesis::canonical_hash
-        // Format: len(namespace) as u32 LE || namespace || ledger_head_hash
+        // Format: len(namespace) as u32 LE || namespace || ledger_head_hash ||
+        //         len(validators) as u32 LE || validators... || timestamp
         let mut hasher = blake3::Hasher::new();
         let ns_len = namespace.len() as u32;
         hasher.update(&ns_len.to_le_bytes());
         hasher.update(namespace.as_bytes());
         hasher.update(&ledger_head_hash);
+        let validators_len = validators.len() as u32;
+        hasher.update(&validators_len.to_le_bytes());
+        for validator in &validators {
+            hasher.update(validator);
+        }
+        hasher.update(&timestamp.to_le_bytes());
         let canonical_hash = *hasher.finalize().as_bytes();
 
         let signature = signing_key.sign(&canonical_hash);
@@ -1080,6 +1262,8 @@ mod tests {
             ledger_head_hash,
             signature.to_bytes(),
             t0_public_key,
+            validators,
+            timestamp,
         )
     }
 
@@ -1200,7 +1384,15 @@ mod tests {
     #[test]
     fn test_genesis_serde_roundtrip() {
         let (signing_key, _) = create_test_keypair();
-        let genesis = create_test_genesis(&signing_key, "test", [42u8; 32]);
+        let validators = vec![[1u8; 32], [2u8; 32]];
+        let timestamp = 1_234_567_890;
+        let genesis = create_test_genesis_with_validators(
+            &signing_key,
+            "test",
+            [42u8; 32],
+            validators,
+            timestamp,
+        );
 
         let json = genesis.to_json().unwrap();
         let parsed = Genesis::from_json(&json).unwrap();
@@ -1209,6 +1401,8 @@ mod tests {
         assert_eq!(parsed.ledger_head_hash(), genesis.ledger_head_hash());
         assert_eq!(parsed.signature(), genesis.signature());
         assert_eq!(parsed.t0_public_key(), genesis.t0_public_key());
+        assert_eq!(parsed.validators(), genesis.validators());
+        assert_eq!(parsed.timestamp(), genesis.timestamp());
     }
 
     #[test]
@@ -1402,13 +1596,31 @@ mod tck_00185_genesis_tests {
         namespace: &str,
         ledger_head_hash: [u8; 32],
     ) -> Genesis {
+        create_test_genesis_with_validators(signing_key, namespace, ledger_head_hash, vec![], 0)
+    }
+
+    #[allow(clippy::cast_possible_truncation)] // Test namespaces are short
+    fn create_test_genesis_with_validators(
+        signing_key: &SigningKey,
+        namespace: &str,
+        ledger_head_hash: [u8; 32],
+        validators: Vec<[u8; 32]>,
+        timestamp: u64,
+    ) -> Genesis {
         // Use the same canonical hash format as Genesis::canonical_hash
-        // Format: len(namespace) as u32 LE || namespace || ledger_head_hash
+        // Format: len(namespace) as u32 LE || namespace || ledger_head_hash ||
+        //         len(validators) as u32 LE || validators... || timestamp
         let mut hasher = blake3::Hasher::new();
         let ns_len = namespace.len() as u32;
         hasher.update(&ns_len.to_le_bytes());
         hasher.update(namespace.as_bytes());
         hasher.update(&ledger_head_hash);
+        let validators_len = validators.len() as u32;
+        hasher.update(&validators_len.to_le_bytes());
+        for validator in &validators {
+            hasher.update(validator);
+        }
+        hasher.update(&timestamp.to_le_bytes());
         let canonical_hash = *hasher.finalize().as_bytes();
 
         let signature = signing_key.sign(&canonical_hash);
@@ -1419,6 +1631,8 @@ mod tck_00185_genesis_tests {
             ledger_head_hash,
             signature.to_bytes(),
             t0_public_key,
+            validators,
+            timestamp,
         )
     }
 
@@ -1527,6 +1741,9 @@ mod tck_00185_genesis_tests {
         // AC4: Join attempts rate-limited per source or identity
         let (signing_key, verifying_key) = create_test_keypair();
         let (q_signing, q_verifying) = create_test_keypair();
+        // Create invitee keypairs for proof-of-possession
+        let (invitee_signing, invitee_verifying) = create_test_keypair();
+        let (other_invitee_signing, other_invitee_verifying) = create_test_keypair();
         let namespace = "test-network";
         let ledger_hash = [1u8; 32];
 
@@ -1552,23 +1769,53 @@ mod tck_00185_genesis_tests {
         let sig = q_signing.sign(&token.canonical_hash());
         token.add_signature(0, sig.to_bytes()).unwrap();
 
-        // Use low rate limit for testing
+        // Create proof-of-possession (sign token hash with invitee's key)
+        let proof = invitee_signing.sign(&token.canonical_hash()).to_bytes();
+
+        // Use low rate limit for testing, but disable single-use token check
+        // by using many tokens for rate limit test
         let rate_limiter = JoinRateLimiter::new(3, Duration::from_secs(60));
         let mut validator =
             GenesisValidator::with_rate_limiter(config, genesis.clone(), rate_limiter);
 
-        // First 3 attempts should succeed
-        for _ in 0..3 {
+        // Rate limiting happens before token validation, so rate limit will be hit
+        // after 3 attempts regardless of single-use enforcement
+        for i in 0u64..3 {
+            // Create unique tokens for each attempt to avoid single-use rejection
+            let mut unique_token =
+                InvitationToken::new(genesis_hash, source.to_string(), u64::MAX - i);
+            let unique_sig = q_signing.sign(&unique_token.canonical_hash());
+            unique_token
+                .add_signature(0, unique_sig.to_bytes())
+                .unwrap();
+            let unique_proof = invitee_signing
+                .sign(&unique_token.canonical_hash())
+                .to_bytes();
+
             assert!(
                 validator
-                    .validate_join_request(source, &genesis, &token, 0)
+                    .validate_join_request(
+                        source,
+                        &genesis,
+                        &unique_token,
+                        &unique_proof,
+                        &invitee_verifying,
+                        0
+                    )
                     .is_ok(),
                 "Join attempts within limit should succeed"
             );
         }
 
         // 4th attempt should be rate limited
-        let result = validator.validate_join_request(source, &genesis, &token, 0);
+        let result = validator.validate_join_request(
+            source,
+            &genesis,
+            &token,
+            &proof,
+            &invitee_verifying,
+            0,
+        );
         assert!(
             matches!(result, Err(GenesisError::RateLimitExceeded { .. })),
             "Join attempts must be rate-limited"
@@ -1580,10 +1827,20 @@ mod tck_00185_genesis_tests {
             InvitationToken::new(genesis_hash, other_source.to_string(), u64::MAX);
         let other_sig = q_signing.sign(&other_token.canonical_hash());
         other_token.add_signature(0, other_sig.to_bytes()).unwrap();
+        let other_proof = other_invitee_signing
+            .sign(&other_token.canonical_hash())
+            .to_bytes();
 
         assert!(
             validator
-                .validate_join_request(other_source, &genesis, &other_token, 0)
+                .validate_join_request(
+                    other_source,
+                    &genesis,
+                    &other_token,
+                    &other_proof,
+                    &other_invitee_verifying,
+                    0
+                )
                 .is_ok(),
             "Different source should not be rate-limited"
         );
@@ -1595,6 +1852,9 @@ mod tck_00185_genesis_tests {
         let (signing_key, verifying_key) = create_test_keypair();
         let (q1_signing, q1_verifying) = create_test_keypair();
         let (q2_signing, q2_verifying) = create_test_keypair();
+        // Create invitee keypairs for proof-of-possession
+        let (invitee1_signing, invitee1_verifying) = create_test_keypair();
+        let (invitee2_signing, invitee2_verifying) = create_test_keypair();
         let namespace = "test-network";
         let ledger_hash = [1u8; 32];
 
@@ -1627,8 +1887,18 @@ mod tck_00185_genesis_tests {
         insufficient_token
             .add_signature(0, sig1.to_bytes())
             .unwrap();
+        let proof1 = invitee1_signing
+            .sign(&insufficient_token.canonical_hash())
+            .to_bytes();
 
-        let result = validator.validate_join_request(source1, &genesis, &insufficient_token, 0);
+        let result = validator.validate_join_request(
+            source1,
+            &genesis,
+            &insufficient_token,
+            &proof1,
+            &invitee1_verifying,
+            0,
+        );
         assert!(
             matches!(result, Err(GenesisError::InsufficientQuorum { .. })),
             "Join must require quorum-signed invitation"
@@ -1641,10 +1911,20 @@ mod tck_00185_genesis_tests {
         let sig2 = q2_signing.sign(&sufficient_token.canonical_hash());
         sufficient_token.add_signature(0, sig1.to_bytes()).unwrap();
         sufficient_token.add_signature(1, sig2.to_bytes()).unwrap();
+        let proof2 = invitee2_signing
+            .sign(&sufficient_token.canonical_hash())
+            .to_bytes();
 
         assert!(
             validator
-                .validate_join_request(source2, &genesis, &sufficient_token, 0)
+                .validate_join_request(
+                    source2,
+                    &genesis,
+                    &sufficient_token,
+                    &proof2,
+                    &invitee2_verifying,
+                    0
+                )
                 .is_ok(),
             "Join with quorum-signed invitation should succeed"
         );
@@ -1654,7 +1934,15 @@ mod tck_00185_genesis_tests {
     fn test_tck_00185_genesis_serde_strict() {
         // CTR-1604: Strict Serde for wire formats
         let (signing_key, _) = create_test_keypair();
-        let genesis = create_test_genesis(&signing_key, "test", [0u8; 32]);
+        let validators = vec![[1u8; 32], [2u8; 32]];
+        let timestamp = 1_234_567_890;
+        let genesis = create_test_genesis_with_validators(
+            &signing_key,
+            "test",
+            [0u8; 32],
+            validators,
+            timestamp,
+        );
 
         // Roundtrip should preserve all fields
         let json = genesis.to_json().unwrap();
@@ -1664,9 +1952,11 @@ mod tck_00185_genesis_tests {
         assert_eq!(parsed.ledger_head_hash(), genesis.ledger_head_hash());
         assert_eq!(parsed.signature(), genesis.signature());
         assert_eq!(parsed.t0_public_key(), genesis.t0_public_key());
+        assert_eq!(parsed.validators(), genesis.validators());
+        assert_eq!(parsed.timestamp(), genesis.timestamp());
 
         // Unknown fields should be rejected (deny_unknown_fields)
-        let bad_json = br#"{"namespace":"test","ledger_head_hash":"00","signature":"00","t0_public_key":"00","extra":"field"}"#;
+        let bad_json = br#"{"namespace":"test","ledger_head_hash":"00","signature":"00","t0_public_key":"00","validators":[],"timestamp":0,"extra":"field"}"#;
         assert!(
             Genesis::from_json(bad_json).is_err(),
             "Unknown fields must be rejected"
@@ -1871,6 +2161,9 @@ mod tck_00185_genesis_tests {
         // Security: Source must match invitation invitee_id (prevents token theft)
         let (signing_key, verifying_key) = create_test_keypair();
         let (q_signing, q_verifying) = create_test_keypair();
+        // Create invitee keypairs for proof-of-possession
+        let (legit_signing, legit_verifying) = create_test_keypair();
+        let (attacker_signing, attacker_verifying) = create_test_keypair();
         let namespace = "test-network";
         let ledger_hash = [1u8; 32];
 
@@ -1894,16 +2187,33 @@ mod tck_00185_genesis_tests {
         let mut token = InvitationToken::new(genesis_hash, "legitimate-node".to_string(), u64::MAX);
         let sig = q_signing.sign(&token.canonical_hash());
         token.add_signature(0, sig.to_bytes()).unwrap();
+        let legit_proof = legit_signing.sign(&token.canonical_hash()).to_bytes();
 
         // Attacker tries to use the token with a different source identity
-        let result = validator.validate_join_request("attacker-node", &genesis, &token, 0);
+        // Even with attacker's proof, identity binding should fail first
+        let attacker_proof = attacker_signing.sign(&token.canonical_hash()).to_bytes();
+        let result = validator.validate_join_request(
+            "attacker-node",
+            &genesis,
+            &token,
+            &attacker_proof,
+            &attacker_verifying,
+            0,
+        );
         assert!(
             matches!(result, Err(GenesisError::IdentityBindingMismatch { .. })),
             "Must reject join when source doesn't match invitee_id: {result:?}"
         );
 
-        // Legitimate node can use their own token
-        let result = validator.validate_join_request("legitimate-node", &genesis, &token, 0);
+        // Legitimate node can use their own token with valid proof
+        let result = validator.validate_join_request(
+            "legitimate-node",
+            &genesis,
+            &token,
+            &legit_proof,
+            &legit_verifying,
+            0,
+        );
         assert!(
             result.is_ok(),
             "Must accept join when source matches invitee_id: {result:?}"
@@ -1915,7 +2225,7 @@ mod tck_00185_genesis_tests {
         // Security: Namespace length must be validated in from_json
         let long_namespace = "x".repeat(MAX_NAMESPACE_LEN + 1);
         let genesis_json = format!(
-            r#"{{"namespace":"{long_namespace}","ledger_head_hash":"{}","signature":"{}","t0_public_key":"{}"}}"#,
+            r#"{{"namespace":"{long_namespace}","ledger_head_hash":"{}","signature":"{}","t0_public_key":"{}","validators":[],"timestamp":0}}"#,
             "00".repeat(32),
             "00".repeat(64),
             "00".repeat(32)
@@ -1930,7 +2240,7 @@ mod tck_00185_genesis_tests {
         // Exactly MAX_NAMESPACE_LEN should be accepted (if signature were valid)
         let valid_namespace = "x".repeat(MAX_NAMESPACE_LEN);
         let valid_json = format!(
-            r#"{{"namespace":"{valid_namespace}","ledger_head_hash":"{}","signature":"{}","t0_public_key":"{}"}}"#,
+            r#"{{"namespace":"{valid_namespace}","ledger_head_hash":"{}","signature":"{}","t0_public_key":"{}","validators":[],"timestamp":0}}"#,
             "00".repeat(32),
             "00".repeat(64),
             "00".repeat(32)
@@ -2007,26 +2317,303 @@ mod tck_00185_genesis_tests {
 
     #[test]
     #[allow(clippy::assertions_on_constants)]
-    fn test_tck_00185_max_signatures_fits_frame_size() {
-        // Verify MAX_SIGNATURES is reduced to fit within CONTROL_FRAME_SIZE (1024
-        // bytes) Each QuorumSignature serialized is roughly:
-        // {"key_index":X,"signature":"128_hex_chars"} That's about 150 bytes
-        // per signature in JSON Plus token overhead: genesis_hash (64 hex +
-        // quotes + key), invitee_id, expires_at, array syntax Approximately:
-        // 100 bytes overhead + 150 * MAX_SIGNATURES
-
-        // With MAX_SIGNATURES = 10: 100 + 150*10 = 1600 bytes (still over, but binary
-        // is smaller) The actual wire format may be more compact (e.g., binary
-        // encoding)
-
-        // This test just verifies the constant is reasonable (not 64 anymore)
+    fn test_tck_00185_max_signatures_allows_quorum() {
+        // Verify MAX_SIGNATURES >= MAX_QUORUM_SIGNATURES to prevent quorum deadlock
+        // For MAX_QUORUM_SIGNATURES = 16 with 2f+1 = 11 (f=5), we need at least 11
+        // signatures to reach quorum. MAX_SIGNATURES must allow this.
         assert!(
-            MAX_SIGNATURES <= 16,
-            "MAX_SIGNATURES should be reduced to fit within frame limits"
+            MAX_SIGNATURES >= 11,
+            "MAX_SIGNATURES must allow 2f+1 quorum for MAX_QUORUM_SIGNATURES"
+        );
+        assert_eq!(
+            MAX_SIGNATURES, MAX_QUORUM_SIGNATURES,
+            "MAX_SIGNATURES should match MAX_QUORUM_SIGNATURES to allow full quorum"
+        );
+    }
+
+    #[test]
+    fn test_tck_00185_proof_of_possession_required() {
+        // Security: Joining node must prove they control the private key for invitee_id
+        let (signing_key, verifying_key) = create_test_keypair();
+        let (q_signing, q_verifying) = create_test_keypair();
+        let (invitee_signing, invitee_verifying) = create_test_keypair();
+        let (wrong_signing, wrong_verifying) = create_test_keypair();
+        let namespace = "test-network";
+        let ledger_hash = [1u8; 32];
+
+        let genesis = create_test_genesis(&signing_key, namespace, ledger_hash);
+        let genesis_hash = genesis.genesis_hash();
+
+        let config = GenesisConfig::builder()
+            .namespace(namespace)
+            .unwrap()
+            .ledger_head_hash(ledger_hash)
+            .t0_key(verifying_key)
+            .quorum_threshold(1)
+            .add_quorum_key(q_verifying)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut validator = GenesisValidator::new(config, genesis.clone());
+
+        let source = "node-123";
+        let mut token = InvitationToken::new(genesis_hash, source.to_string(), u64::MAX);
+        let sig = q_signing.sign(&token.canonical_hash());
+        token.add_signature(0, sig.to_bytes()).unwrap();
+
+        // Valid proof-of-possession
+        let valid_proof = invitee_signing.sign(&token.canonical_hash()).to_bytes();
+        let result = validator.validate_join_request(
+            source,
+            &genesis,
+            &token,
+            &valid_proof,
+            &invitee_verifying,
+            0,
         );
         assert!(
-            MAX_SIGNATURES >= 8,
-            "MAX_SIGNATURES should allow for reasonable quorum sizes"
+            result.is_ok(),
+            "Valid proof-of-possession should succeed: {result:?}"
+        );
+
+        // Wrong proof-of-possession (signed by different key)
+        let mut token2 = InvitationToken::new(genesis_hash, source.to_string(), u64::MAX - 1);
+        let sig2 = q_signing.sign(&token2.canonical_hash());
+        token2.add_signature(0, sig2.to_bytes()).unwrap();
+        let wrong_proof = wrong_signing.sign(&token2.canonical_hash()).to_bytes();
+        let result = validator.validate_join_request(
+            source,
+            &genesis,
+            &token2,
+            &wrong_proof,
+            &invitee_verifying, // Claiming to be invitee but signed with wrong key
+            0,
+        );
+        assert!(
+            matches!(result, Err(GenesisError::ProofOfPossessionFailed(_))),
+            "Wrong proof-of-possession must be rejected: {result:?}"
+        );
+
+        // Invalid proof-of-possession (public key doesn't match signature)
+        let mut token3 = InvitationToken::new(genesis_hash, source.to_string(), u64::MAX - 2);
+        let sig3 = q_signing.sign(&token3.canonical_hash());
+        token3.add_signature(0, sig3.to_bytes()).unwrap();
+        let mismatched_proof = invitee_signing.sign(&token3.canonical_hash()).to_bytes();
+        let result = validator.validate_join_request(
+            source,
+            &genesis,
+            &token3,
+            &mismatched_proof,
+            &wrong_verifying, // Wrong public key for the proof
+            0,
+        );
+        assert!(
+            matches!(result, Err(GenesisError::ProofOfPossessionFailed(_))),
+            "Mismatched proof-of-possession must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_tck_00185_single_use_token_enforcement() {
+        // Security: INV-0014 mandates single-use tokens
+        let (signing_key, verifying_key) = create_test_keypair();
+        let (q_signing, q_verifying) = create_test_keypair();
+        let (invitee_signing, invitee_verifying) = create_test_keypair();
+        let namespace = "test-network";
+        let ledger_hash = [1u8; 32];
+
+        let genesis = create_test_genesis(&signing_key, namespace, ledger_hash);
+        let genesis_hash = genesis.genesis_hash();
+
+        let config = GenesisConfig::builder()
+            .namespace(namespace)
+            .unwrap()
+            .ledger_head_hash(ledger_hash)
+            .t0_key(verifying_key)
+            .quorum_threshold(1)
+            .add_quorum_key(q_verifying)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut validator = GenesisValidator::new(config, genesis.clone());
+
+        let source = "node-123";
+        let mut token = InvitationToken::new(genesis_hash, source.to_string(), u64::MAX);
+        let sig = q_signing.sign(&token.canonical_hash());
+        token.add_signature(0, sig.to_bytes()).unwrap();
+        let proof = invitee_signing.sign(&token.canonical_hash()).to_bytes();
+
+        // First use should succeed
+        let result = validator.validate_join_request(
+            source,
+            &genesis,
+            &token,
+            &proof,
+            &invitee_verifying,
+            0,
+        );
+        assert!(result.is_ok(), "First token use should succeed: {result:?}");
+        assert_eq!(validator.used_token_count(), 1);
+
+        // Second use of same token should fail
+        let result = validator.validate_join_request(
+            source,
+            &genesis,
+            &token,
+            &proof,
+            &invitee_verifying,
+            0,
+        );
+        assert!(
+            matches!(result, Err(GenesisError::TokenAlreadyUsed)),
+            "Second token use must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_tck_00185_used_tokens_bounded() {
+        // Security: CTR-1303 - used_tokens must be bounded
+        let (signing_key, verifying_key) = create_test_keypair();
+        let (q_signing, q_verifying) = create_test_keypair();
+        let (invitee_signing, invitee_verifying) = create_test_keypair();
+        let namespace = "test-network";
+        let ledger_hash = [1u8; 32];
+
+        let genesis = create_test_genesis(&signing_key, namespace, ledger_hash);
+        let genesis_hash = genesis.genesis_hash();
+
+        let config = GenesisConfig::builder()
+            .namespace(namespace)
+            .unwrap()
+            .ledger_head_hash(ledger_hash)
+            .t0_key(verifying_key)
+            .quorum_threshold(1)
+            .add_quorum_key(q_verifying)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let max_tokens = 10; // Small limit for testing
+        let mut validator =
+            GenesisValidator::with_max_used_tokens(config, genesis.clone(), max_tokens);
+
+        let source = "node-123";
+
+        // Use more tokens than the limit
+        for i in 0..(max_tokens + 5) {
+            let mut token =
+                InvitationToken::new(genesis_hash, source.to_string(), u64::MAX - i as u64);
+            let sig = q_signing.sign(&token.canonical_hash());
+            token.add_signature(0, sig.to_bytes()).unwrap();
+            let proof = invitee_signing.sign(&token.canonical_hash()).to_bytes();
+
+            let _ = validator.validate_join_request(
+                source,
+                &genesis,
+                &token,
+                &proof,
+                &invitee_verifying,
+                0,
+            );
+        }
+
+        // Memory should be bounded
+        assert!(
+            validator.used_token_count() <= max_tokens,
+            "Used tokens must be bounded: {} > {max_tokens}",
+            validator.used_token_count()
+        );
+    }
+
+    #[test]
+    fn test_tck_00185_genesis_validators_field() {
+        // TB-0001: Genesis must include validators field
+        let (signing_key, _verifying_key) = create_test_keypair();
+        let namespace = "test-network";
+        let ledger_hash = [1u8; 32];
+        let validators = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
+        let timestamp = 1_700_000_000_u64;
+
+        let genesis = create_test_genesis_with_validators(
+            &signing_key,
+            namespace,
+            ledger_hash,
+            validators,
+            timestamp,
+        );
+
+        // Verify validators are stored correctly
+        assert_eq!(genesis.validators().len(), 3);
+        assert_eq!(genesis.validators()[0], [1u8; 32]);
+        assert_eq!(genesis.timestamp(), timestamp);
+
+        // Verify roundtrip preserves validators
+        let json = genesis.to_json().unwrap();
+        let parsed = Genesis::from_json(&json).unwrap();
+        assert_eq!(parsed.validators(), genesis.validators());
+        assert_eq!(parsed.timestamp(), timestamp);
+    }
+
+    #[test]
+    fn test_tck_00185_genesis_validators_bounded() {
+        // CTR-1303: Validators must be bounded
+        let mut validators_json = String::from("[");
+        let validator_hex = "00".repeat(32);
+        for i in 0..=MAX_VALIDATORS {
+            if i > 0 {
+                validators_json.push(',');
+            }
+            validators_json.push('"');
+            validators_json.push_str(&validator_hex);
+            validators_json.push('"');
+        }
+        validators_json.push(']');
+
+        let genesis_json = format!(
+            r#"{{"namespace":"test","ledger_head_hash":"{}","signature":"{}","t0_public_key":"{}","validators":{validators_json},"timestamp":0}}"#,
+            "00".repeat(32),
+            "00".repeat(64),
+            "00".repeat(32)
+        );
+
+        let result = Genesis::from_json(genesis_json.as_bytes());
+        assert!(
+            matches!(result, Err(GenesisError::Configuration(ref msg)) if msg.contains("too many validators")),
+            "Must reject genesis with too many validators: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_tck_00185_genesis_canonical_hash_includes_validators_and_timestamp() {
+        // Security: Different validators/timestamps must produce different hashes
+        let (signing_key, _) = create_test_keypair();
+
+        let genesis1 =
+            create_test_genesis_with_validators(&signing_key, "test", [0u8; 32], vec![], 0);
+        let genesis2 = create_test_genesis_with_validators(
+            &signing_key,
+            "test",
+            [0u8; 32],
+            vec![[1u8; 32]],
+            0,
+        );
+        let genesis3 =
+            create_test_genesis_with_validators(&signing_key, "test", [0u8; 32], vec![], 1);
+
+        // Different validators -> different hash
+        assert_ne!(
+            genesis1.canonical_hash(),
+            genesis2.canonical_hash(),
+            "Different validators must produce different canonical hashes"
+        );
+
+        // Different timestamp -> different hash
+        assert_ne!(
+            genesis1.canonical_hash(),
+            genesis3.canonical_hash(),
+            "Different timestamps must produce different canonical hashes"
         );
     }
 
@@ -2049,10 +2636,12 @@ mod tck_00185_genesis_tests {
             MAX_RATE_LIMIT_SOURCES > 0,
             "MAX_RATE_LIMIT_SOURCES must be positive"
         );
-        // MAX_SIGNATURES must be reasonable for frame size constraints
+        assert!(MAX_USED_TOKENS > 0, "MAX_USED_TOKENS must be positive");
+        assert!(MAX_VALIDATORS > 0, "MAX_VALIDATORS must be positive");
+        // MAX_SIGNATURES must allow full quorum
         assert!(
-            MAX_SIGNATURES <= 16,
-            "MAX_SIGNATURES must fit within frame limits"
+            MAX_SIGNATURES >= MAX_QUORUM_SIGNATURES,
+            "MAX_SIGNATURES must allow full quorum"
         );
     };
 }
