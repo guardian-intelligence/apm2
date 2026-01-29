@@ -195,6 +195,15 @@ pub enum ReplicationError {
         peer_id: String,
     },
 
+    /// Stale epoch in ack/nack.
+    #[error("stale epoch: ack epoch {ack_epoch} != proposal epoch {proposal_epoch}")]
+    StaleEpoch {
+        /// The epoch in the ack.
+        ack_epoch: u64,
+        /// The expected proposal epoch.
+        proposal_epoch: u64,
+    },
+
     /// Engine is shutting down.
     #[error("replication engine is shutting down")]
     Shutdown,
@@ -369,38 +378,46 @@ impl ReplicationProposal {
     /// The message includes a domain separation prefix and the namespace to
     /// prevent cross-protocol and cross-namespace replay attacks.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the namespace is longer than `u32::MAX` bytes.
-    #[must_use]
-    pub fn signing_message(&self) -> Vec<u8> {
+    /// Returns an error if the namespace is longer than `u32::MAX` bytes.
+    pub fn signing_message(&self) -> Result<Vec<u8>, ReplicationError> {
         let ns_bytes = self.namespace.as_bytes();
+        let ns_len =
+            u32::try_from(ns_bytes.len()).map_err(|_| ReplicationError::PayloadTooLarge {
+                size: ns_bytes.len(),
+                max: u32::MAX as usize,
+            })?;
         let mut msg =
             Vec::with_capacity(DOMAIN_PREFIX_PROPOSAL.len() + 4 + ns_bytes.len() + 8 + 8 + 32);
         msg.extend_from_slice(DOMAIN_PREFIX_PROPOSAL);
-        msg.extend_from_slice(
-            &(u32::try_from(ns_bytes.len()).expect("namespace too long")).to_le_bytes(),
-        );
+        msg.extend_from_slice(&ns_len.to_le_bytes());
         msg.extend_from_slice(ns_bytes);
         msg.extend_from_slice(&self.epoch.to_le_bytes());
         msg.extend_from_slice(&self.sequence_id.to_le_bytes());
         msg.extend_from_slice(&self.event_hash);
-        msg
+        Ok(msg)
     }
 
     /// Signs this proposal with the given signing key.
-    pub fn sign(&mut self, key: &SigningKey) {
-        let msg = self.signing_message();
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the namespace is too long.
+    pub fn sign(&mut self, key: &SigningKey) -> Result<(), ReplicationError> {
+        let msg = self.signing_message()?;
         self.signature = key.sign(&msg).to_bytes();
+        Ok(())
     }
 
     /// Verifies the signature on this proposal.
     ///
     /// # Errors
     ///
-    /// Returns an error if the signature is invalid.
+    /// Returns an error if the signature is invalid or the namespace is too
+    /// long.
     pub fn verify_signature(&self, public_key: &VerifyingKey) -> Result<(), ReplicationError> {
-        let msg = self.signing_message();
+        let msg = self.signing_message()?;
         let signature = ed25519_dalek::Signature::from_bytes(&self.signature);
         public_key
             .verify_strict(&msg, &signature)
@@ -452,37 +469,45 @@ impl ReplicationAck {
     ///
     /// The message includes a domain separation prefix and the namespace.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the namespace is longer than `u32::MAX` bytes.
-    #[must_use]
-    pub fn signing_message(&self) -> Vec<u8> {
+    /// Returns an error if the namespace is longer than `u32::MAX` bytes.
+    pub fn signing_message(&self) -> Result<Vec<u8>, ReplicationError> {
         let ns_bytes = self.namespace.as_bytes();
+        let ns_len =
+            u32::try_from(ns_bytes.len()).map_err(|_| ReplicationError::PayloadTooLarge {
+                size: ns_bytes.len(),
+                max: u32::MAX as usize,
+            })?;
         let mut msg = Vec::with_capacity(DOMAIN_PREFIX_ACK.len() + 4 + ns_bytes.len() + 8 + 8 + 8);
         msg.extend_from_slice(DOMAIN_PREFIX_ACK);
-        msg.extend_from_slice(
-            &(u32::try_from(ns_bytes.len()).expect("namespace too long")).to_le_bytes(),
-        );
+        msg.extend_from_slice(&ns_len.to_le_bytes());
         msg.extend_from_slice(ns_bytes);
         msg.extend_from_slice(&self.epoch.to_le_bytes());
         msg.extend_from_slice(&self.sequence_id.to_le_bytes());
         msg.extend_from_slice(&self.local_seq_id.to_le_bytes());
-        msg
+        Ok(msg)
     }
 
     /// Signs this acknowledgment with the given signing key.
-    pub fn sign(&mut self, key: &SigningKey) {
-        let msg = self.signing_message();
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the namespace is too long.
+    pub fn sign(&mut self, key: &SigningKey) -> Result<(), ReplicationError> {
+        let msg = self.signing_message()?;
         self.signature = key.sign(&msg).to_bytes();
+        Ok(())
     }
 
     /// Verifies the signature on this acknowledgment.
     ///
     /// # Errors
     ///
-    /// Returns an error if the signature is invalid.
+    /// Returns an error if the signature is invalid or the namespace is too
+    /// long.
     pub fn verify_signature(&self, public_key: &VerifyingKey) -> Result<(), ReplicationError> {
-        let msg = self.signing_message();
+        let msg = self.signing_message()?;
         let signature = ed25519_dalek::Signature::from_bytes(&self.signature);
         public_key
             .verify_strict(&msg, &signature)
@@ -533,6 +558,8 @@ pub enum NackReason {
     LedgerError,
     /// Invalid event hash.
     InvalidHash,
+    /// Payload too large.
+    PayloadTooLarge,
 }
 
 impl NackReason {
@@ -547,6 +574,7 @@ impl NackReason {
             Self::Gap => 5,
             Self::LedgerError => 6,
             Self::InvalidHash => 7,
+            Self::PayloadTooLarge => 8,
         }
     }
 }
@@ -556,28 +584,35 @@ impl ReplicationNack {
     ///
     /// The message includes a domain separation prefix and the namespace.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the namespace is longer than `u32::MAX` bytes.
-    #[must_use]
-    pub fn signing_message(&self) -> Vec<u8> {
+    /// Returns an error if the namespace is longer than `u32::MAX` bytes.
+    pub fn signing_message(&self) -> Result<Vec<u8>, ReplicationError> {
         let ns_bytes = self.namespace.as_bytes();
+        let ns_len =
+            u32::try_from(ns_bytes.len()).map_err(|_| ReplicationError::PayloadTooLarge {
+                size: ns_bytes.len(),
+                max: u32::MAX as usize,
+            })?;
         let mut msg = Vec::with_capacity(DOMAIN_PREFIX_NACK.len() + 4 + ns_bytes.len() + 8 + 8 + 1);
         msg.extend_from_slice(DOMAIN_PREFIX_NACK);
-        msg.extend_from_slice(
-            &(u32::try_from(ns_bytes.len()).expect("namespace too long")).to_le_bytes(),
-        );
+        msg.extend_from_slice(&ns_len.to_le_bytes());
         msg.extend_from_slice(ns_bytes);
         msg.extend_from_slice(&self.epoch.to_le_bytes());
         msg.extend_from_slice(&self.sequence_id.to_le_bytes());
         msg.push(self.reason.code());
-        msg
+        Ok(msg)
     }
 
     /// Signs this nack with the given signing key.
-    pub fn sign(&mut self, key: &SigningKey) {
-        let msg = self.signing_message();
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the namespace is too long.
+    pub fn sign(&mut self, key: &SigningKey) -> Result<(), ReplicationError> {
+        let msg = self.signing_message()?;
         self.signature = key.sign(&msg).to_bytes();
+        Ok(())
     }
 }
 
@@ -694,11 +729,15 @@ mod base64_arr_64 {
 // =============================================================================
 
 /// Tracks acknowledgments for a single proposal.
+///
+/// Note: We only store metadata (epoch, namespace) needed for validation,
+/// not the full proposal, to reduce memory usage (CTR-1303).
 #[derive(Clone, Debug)]
 struct ProposalAckState {
-    /// The proposal being tracked.
-    #[allow(dead_code)] // Will be used for retry logic in future
-    proposal: ReplicationProposal,
+    /// The epoch of the proposal (for ack validation).
+    epoch: u64,
+    /// The namespace of the proposal (for ack validation).
+    namespace: String,
     /// Set of peers that have acknowledged.
     acks: HashMap<ValidatorId, ReplicationAck>,
     /// Set of peers that have rejected.
@@ -707,18 +746,33 @@ struct ProposalAckState {
 
 impl ProposalAckState {
     /// Creates a new ack state for a proposal.
-    fn new(proposal: ReplicationProposal) -> Self {
+    fn new(epoch: u64, namespace: String) -> Self {
         Self {
-            proposal,
+            epoch,
+            namespace,
             acks: HashMap::with_capacity(MAX_ACKS_PER_PROPOSAL),
             nacks: HashMap::with_capacity(MAX_ACKS_PER_PROPOSAL),
         }
     }
 
-    /// Records an acknowledgment.
-    fn record_ack(&mut self, ack: ReplicationAck) {
+    /// Records an acknowledgment, validating epoch and namespace match.
+    ///
+    /// Returns true if the ack was recorded, false if validation failed or
+    /// limit reached.
+    fn record_ack(&mut self, ack: ReplicationAck) -> bool {
+        // Validate epoch matches to prevent stale acks from old epochs
+        if ack.epoch != self.epoch {
+            return false;
+        }
+        // Validate namespace matches to prevent cross-namespace confusion
+        if ack.namespace != self.namespace {
+            return false;
+        }
         if self.acks.len() < MAX_ACKS_PER_PROPOSAL {
             self.acks.insert(ack.follower_id, ack);
+            true
+        } else {
+            false
         }
     }
 
@@ -930,7 +984,7 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
         };
 
         // Sign the proposal
-        proposal.sign(&self.signing_key);
+        proposal.sign(&self.signing_key)?;
 
         // First, append to our own ledger
         let _local_seq_id = self.backend.append(&config.namespace, event).await?;
@@ -947,7 +1001,10 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
                 }
             }
 
-            tracker.insert(sequence_id, ProposalAckState::new(proposal.clone()));
+            tracker.insert(
+                sequence_id,
+                ProposalAckState::new(config.epoch, config.namespace.clone()),
+            );
             order.push_back(sequence_id);
         }
 
@@ -1001,9 +1058,16 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
                 reason,
                 signature: [0u8; 64],
             };
-            nack.sign(&self.signing_key);
+            // Sign will only fail if namespace is > u32::MAX bytes, which is already
+            // validated above, so we can safely ignore the error
+            let _ = nack.sign(&self.signing_key);
             nack
         };
+
+        // Validate payload size to prevent DoS (CTR-1303)
+        if proposal.event_data.len() > MAX_REPLICATION_PAYLOAD_SIZE {
+            return Err(make_nack(NackReason::PayloadTooLarge));
+        }
 
         // Verify the proposal is from the current leader
         if !bool::from(proposal.leader_id.ct_eq(&config.leader_id)) {
@@ -1070,7 +1134,8 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
             local_seq_id,
             signature: [0u8; 64],
         };
-        ack.sign(&self.signing_key);
+        // Namespace was already validated above, so signing should not fail
+        let _ = ack.sign(&self.signing_key);
 
         Ok(ack)
     }
@@ -1087,7 +1152,8 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the signature is invalid or the peer is unknown.
+    /// Returns an error if the signature is invalid, the peer is unknown,
+    /// or the epoch doesn't match the proposal's epoch.
     pub async fn handle_ack(&self, ack: ReplicationAck) -> Result<usize, ReplicationError> {
         // Verify signature
         let keys = self.validator_keys.read().await;
@@ -1100,12 +1166,22 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
         }
         drop(keys);
 
-        // Record the ack
+        // Record the ack (with epoch validation)
         let mut tracker = self.ack_tracker.write().await;
-        tracker.get_mut(&ack.sequence_id).map_or(Ok(0), |state| {
-            state.record_ack(ack);
-            Ok(state.ack_count())
-        })
+        if let Some(state) = tracker.get_mut(&ack.sequence_id) {
+            // record_ack validates epoch internally and returns false if mismatched
+            if state.record_ack(ack.clone()) {
+                Ok(state.ack_count())
+            } else {
+                Err(ReplicationError::StaleEpoch {
+                    ack_epoch: ack.epoch,
+                    proposal_epoch: state.epoch,
+                })
+            }
+        } else {
+            // Proposal not being tracked (already evicted or unknown)
+            Ok(0)
+        }
     }
 
     /// Handles an incoming negative acknowledgment (leader role).
@@ -1258,7 +1334,7 @@ mod tests {
             signature: [0u8; 64],
         };
 
-        proposal.sign(&key);
+        proposal.sign(&key).unwrap();
 
         // Verify with correct key
         assert!(proposal.verify_signature(&key.verifying_key()).is_ok());
@@ -1286,7 +1362,7 @@ mod tests {
             signature: [0u8; 64],
         };
 
-        proposal.sign(&key1);
+        proposal.sign(&key1).unwrap();
 
         // Verify with wrong key should fail
         assert!(proposal.verify_signature(&key2.verifying_key()).is_err());
@@ -1306,7 +1382,7 @@ mod tests {
             signature: [0u8; 64],
         };
 
-        ack.sign(&key);
+        ack.sign(&key).unwrap();
 
         // Verify with correct key
         assert!(ack.verify_signature(&key.verifying_key()).is_ok());
@@ -1321,6 +1397,7 @@ mod tests {
         assert_eq!(NackReason::Gap.code(), 5);
         assert_eq!(NackReason::LedgerError.code(), 6);
         assert_eq!(NackReason::InvalidHash.code(), 7);
+        assert_eq!(NackReason::PayloadTooLarge.code(), 8);
     }
 
     #[test]
@@ -1406,35 +1483,38 @@ mod tests {
 
     #[test]
     fn test_ack_state_tracking() {
-        let proposal = ReplicationProposal {
-            epoch: 1,
-            sequence_id: 42,
-            leader_id: [0u8; 32],
-            namespace: "test".to_string(),
-            event_data: vec![],
-            event_hash: [0u8; 32],
-            signature: [0u8; 64],
-        };
-
-        let mut state = ProposalAckState::new(proposal);
+        let mut state = ProposalAckState::new(1, "test".to_string());
         assert_eq!(state.ack_count(), 0);
         assert_eq!(state.nack_count(), 0);
 
-        // Add acks
+        // Add acks with matching epoch
         for i in 0u8..3 {
             let mut follower_id = [0u8; 32];
             follower_id[0] = i;
-            state.record_ack(ReplicationAck {
+            assert!(state.record_ack(ReplicationAck {
                 epoch: 1,
                 sequence_id: 42,
                 namespace: "test".to_string(),
                 follower_id,
                 local_seq_id: 100 + u64::from(i),
                 signature: [0u8; 64],
-            });
+            }));
         }
 
         assert_eq!(state.ack_count(), 3);
+
+        // Ack with mismatched epoch should be rejected
+        let mut follower_id = [0u8; 32];
+        follower_id[0] = 99;
+        assert!(!state.record_ack(ReplicationAck {
+            epoch: 2, // Wrong epoch
+            sequence_id: 42,
+            namespace: "test".to_string(),
+            follower_id,
+            local_seq_id: 200,
+            signature: [0u8; 64],
+        }));
+        assert_eq!(state.ack_count(), 3); // Count unchanged
 
         // Add nack
         state.record_nack(ReplicationNack {
@@ -1542,14 +1622,15 @@ mod tck_00195_tests {
             NackReason::Gap,
             NackReason::LedgerError,
             NackReason::InvalidHash,
+            NackReason::PayloadTooLarge,
         ];
-        assert_eq!(reasons.len(), 7);
+        assert_eq!(reasons.len(), 8);
     }
 
     #[test]
     fn tck_00195_error_variants() {
         // Verify all error variants exist and can be displayed
-        let errors: [ReplicationError; 11] = [
+        let errors: [ReplicationError; 12] = [
             ReplicationError::NotLeader {
                 expected: String::new(),
                 actual: String::new(),
@@ -1575,9 +1656,13 @@ mod tck_00195_tests {
             ReplicationError::UnknownPeer {
                 peer_id: String::new(),
             },
+            ReplicationError::StaleEpoch {
+                ack_epoch: 0,
+                proposal_epoch: 0,
+            },
             ReplicationError::Shutdown,
         ];
-        assert_eq!(errors.len(), 11);
+        assert_eq!(errors.len(), 12);
     }
 
     #[test]
@@ -1637,5 +1722,625 @@ mod tck_00195_tests {
 
         assert!(!stats.is_leader);
         assert_eq!(stats.epoch, 1);
+    }
+}
+
+/// Integration tests for `ReplicationEngine` state transitions.
+#[cfg(test)]
+mod engine_integration_tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, RwLock};
+
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    use super::*;
+    use crate::consensus::handlers::PeerManager;
+    use crate::ledger::{BoxFuture, EventRecord, HashFn, LedgerBackend, LedgerError, VerifyFn};
+
+    /// A simple in-memory ledger backend for testing.
+    struct MockLedgerBackend {
+        events: RwLock<HashMap<String, Vec<EventRecord>>>,
+        next_seq: AtomicU64,
+    }
+
+    impl MockLedgerBackend {
+        fn new() -> Self {
+            Self {
+                events: RwLock::new(HashMap::new()),
+                next_seq: AtomicU64::new(1),
+            }
+        }
+    }
+
+    impl LedgerBackend for MockLedgerBackend {
+        fn append<'a>(
+            &'a self,
+            namespace: &'a str,
+            event: &'a EventRecord,
+        ) -> BoxFuture<'a, Result<u64, LedgerError>> {
+            Box::pin(async move {
+                let seq_id = self.next_seq.fetch_add(1, Ordering::SeqCst);
+                let mut events = self.events.write().unwrap();
+                let mut cloned = event.clone();
+                cloned.seq_id = Some(seq_id);
+                events
+                    .entry(namespace.to_string())
+                    .or_default()
+                    .push(cloned);
+                Ok(seq_id)
+            })
+        }
+
+        fn read_from<'a>(
+            &'a self,
+            namespace: &'a str,
+            cursor: u64,
+            limit: u64,
+        ) -> BoxFuture<'a, Result<Vec<EventRecord>, LedgerError>> {
+            Box::pin(async move {
+                let events = self.events.read().unwrap();
+                // In tests, limit is always small, so truncation is safe
+                #[allow(clippy::cast_possible_truncation)]
+                let limit_usize = limit as usize;
+                let ns_events = events.get(namespace).map_or_else(Vec::new, |e| {
+                    e.iter()
+                        .filter(|ev| ev.seq_id.unwrap_or(0) >= cursor)
+                        .take(limit_usize)
+                        .cloned()
+                        .collect()
+                });
+                Ok(ns_events)
+            })
+        }
+
+        fn head<'a>(&'a self, namespace: &'a str) -> BoxFuture<'a, Result<u64, LedgerError>> {
+            Box::pin(async move {
+                let events = self.events.read().unwrap();
+                Ok(events
+                    .get(namespace)
+                    .and_then(|e| e.last())
+                    .and_then(|e| e.seq_id)
+                    .unwrap_or(0))
+            })
+        }
+
+        fn verify_chain<'a>(
+            &'a self,
+            _namespace: &'a str,
+            _from_seq_id: u64,
+            _verify_hash_fn: HashFn<'a>,
+            _verify_sig_fn: VerifyFn<'a>,
+        ) -> BoxFuture<'a, Result<(), LedgerError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn generate_test_key() -> SigningKey {
+        SigningKey::generate(&mut OsRng)
+    }
+
+    fn validator_id_from_key(key: &SigningKey) -> ValidatorId {
+        blake3::hash(key.verifying_key().as_bytes()).into()
+    }
+
+    fn create_test_event() -> EventRecord {
+        EventRecord::new(
+            "test.event",
+            "session-123",
+            "actor-456",
+            b"{\"data\": \"test\"}".to_vec(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_leader_propose_success() {
+        let leader_key = generate_test_key();
+        let leader_id = validator_id_from_key(&leader_key);
+
+        let config = ReplicationConfig {
+            validator_id: leader_id,
+            leader_id,
+            epoch: 1,
+            namespace: "test".to_string(),
+            ack_timeout: DEFAULT_ACK_TIMEOUT,
+            quorum_threshold: 2,
+        };
+
+        let backend = Arc::new(MockLedgerBackend::new());
+        let peers = Arc::new(PeerManager::new());
+
+        let engine = ReplicationEngine::new(config, leader_key.clone(), backend.clone(), peers);
+
+        // Register the leader's own key
+        engine
+            .register_validator(leader_id, leader_key.verifying_key())
+            .await;
+
+        // Propose an event
+        let event = create_test_event();
+        let seq_id = engine.propose(&event).await.unwrap();
+
+        assert_eq!(seq_id, 1);
+
+        // Check stats
+        let stats = engine.stats().await;
+        assert!(stats.is_leader);
+        assert_eq!(stats.epoch, 1);
+        assert_eq!(stats.next_sequence_id, 2);
+        assert_eq!(stats.pending_proposals, 1);
+        assert_eq!(stats.tracked_proposals, 1);
+
+        // Verify proposal is in outbound queue
+        let proposal = engine.next_outbound_proposal().await.unwrap();
+        assert_eq!(proposal.epoch, 1);
+        assert_eq!(proposal.sequence_id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_follower_handle_proposal_success() {
+        let leader_key = generate_test_key();
+        let leader_id = validator_id_from_key(&leader_key);
+
+        let follower_key = generate_test_key();
+        let follower_id = validator_id_from_key(&follower_key);
+
+        // Create follower config (not leader)
+        let follower_config = ReplicationConfig {
+            validator_id: follower_id,
+            leader_id,
+            epoch: 1,
+            namespace: "test".to_string(),
+            ack_timeout: DEFAULT_ACK_TIMEOUT,
+            quorum_threshold: 2,
+        };
+
+        let backend = Arc::new(MockLedgerBackend::new());
+        let peers = Arc::new(PeerManager::new());
+
+        let follower_engine = ReplicationEngine::new(
+            follower_config,
+            follower_key.clone(),
+            backend.clone(),
+            peers,
+        );
+
+        // Register the leader's key with the follower
+        follower_engine
+            .register_validator(leader_id, leader_key.verifying_key())
+            .await;
+
+        // Create a proposal from the leader
+        let event = create_test_event();
+        let replicated_event = ReplicatedEvent::from_event_record(&event);
+        let event_data = serde_json::to_vec(&replicated_event).unwrap();
+        let event_hash = ReplicationProposal::compute_event_hash(&event_data);
+
+        let mut proposal = ReplicationProposal {
+            epoch: 1,
+            sequence_id: 1,
+            leader_id,
+            namespace: "test".to_string(),
+            event_data,
+            event_hash,
+            signature: [0u8; 64],
+        };
+        proposal.sign(&leader_key).unwrap();
+
+        // Follower handles the proposal
+        let ack = follower_engine.handle_proposal(proposal).await.unwrap();
+
+        assert_eq!(ack.epoch, 1);
+        assert_eq!(ack.sequence_id, 1);
+        assert_eq!(ack.follower_id, follower_id);
+
+        // Check follower stats
+        let stats = follower_engine.stats().await;
+        assert!(!stats.is_leader);
+        assert_eq!(stats.last_appended_seq, 1);
+    }
+
+    #[tokio::test]
+    async fn test_leader_handle_ack_success() {
+        let leader_key = generate_test_key();
+        let leader_id = validator_id_from_key(&leader_key);
+
+        let follower_key = generate_test_key();
+        let follower_id = validator_id_from_key(&follower_key);
+
+        let config = ReplicationConfig {
+            validator_id: leader_id,
+            leader_id,
+            epoch: 1,
+            namespace: "test".to_string(),
+            ack_timeout: DEFAULT_ACK_TIMEOUT,
+            quorum_threshold: 2,
+        };
+
+        let backend = Arc::new(MockLedgerBackend::new());
+        let peers = Arc::new(PeerManager::new());
+
+        let engine = ReplicationEngine::new(config, leader_key.clone(), backend.clone(), peers);
+
+        // Register both validators
+        engine
+            .register_validator(leader_id, leader_key.verifying_key())
+            .await;
+        engine
+            .register_validator(follower_id, follower_key.verifying_key())
+            .await;
+
+        // Propose an event
+        let event = create_test_event();
+        let seq_id = engine.propose(&event).await.unwrap();
+        assert_eq!(seq_id, 1);
+
+        // Create an ack from the follower
+        let mut ack = ReplicationAck {
+            epoch: 1,
+            sequence_id: 1,
+            namespace: "test".to_string(),
+            follower_id,
+            local_seq_id: 100,
+            signature: [0u8; 64],
+        };
+        ack.sign(&follower_key).unwrap();
+
+        // Leader handles the ack
+        let ack_count = engine.handle_ack(ack).await.unwrap();
+        assert_eq!(ack_count, 1);
+
+        // Check ack state
+        let (acks, nacks) = engine.get_ack_state(1).await.unwrap();
+        assert_eq!(acks, 1);
+        assert_eq!(nacks, 0);
+
+        // Check quorum (leader + 1 follower = 2, threshold is 2)
+        assert!(engine.has_quorum(1).await);
+    }
+
+    #[tokio::test]
+    async fn test_full_replication_roundtrip() {
+        // Create leader
+        let leader_key = generate_test_key();
+        let leader_id = validator_id_from_key(&leader_key);
+
+        // Create followers
+        let follower1_key = generate_test_key();
+        let follower1_id = validator_id_from_key(&follower1_key);
+
+        let follower2_key = generate_test_key();
+        let follower2_id = validator_id_from_key(&follower2_key);
+
+        // Leader engine
+        let leader_config = ReplicationConfig {
+            validator_id: leader_id,
+            leader_id,
+            epoch: 1,
+            namespace: "test".to_string(),
+            ack_timeout: DEFAULT_ACK_TIMEOUT,
+            quorum_threshold: 2,
+        };
+
+        let leader_backend = Arc::new(MockLedgerBackend::new());
+        let leader_peers = Arc::new(PeerManager::new());
+        let leader_engine = ReplicationEngine::new(
+            leader_config,
+            leader_key.clone(),
+            leader_backend.clone(),
+            leader_peers,
+        );
+
+        // Follower 1 engine
+        let follower1_config = ReplicationConfig {
+            validator_id: follower1_id,
+            leader_id,
+            epoch: 1,
+            namespace: "test".to_string(),
+            ack_timeout: DEFAULT_ACK_TIMEOUT,
+            quorum_threshold: 2,
+        };
+
+        let follower1_backend = Arc::new(MockLedgerBackend::new());
+        let follower1_peers = Arc::new(PeerManager::new());
+        let follower1_engine = ReplicationEngine::new(
+            follower1_config,
+            follower1_key.clone(),
+            follower1_backend.clone(),
+            follower1_peers,
+        );
+
+        // Register keys
+        leader_engine
+            .register_validator(leader_id, leader_key.verifying_key())
+            .await;
+        leader_engine
+            .register_validator(follower1_id, follower1_key.verifying_key())
+            .await;
+        leader_engine
+            .register_validator(follower2_id, follower2_key.verifying_key())
+            .await;
+
+        follower1_engine
+            .register_validator(leader_id, leader_key.verifying_key())
+            .await;
+
+        // Step 1: Leader proposes
+        let event = create_test_event();
+        let seq_id = leader_engine.propose(&event).await.unwrap();
+        assert_eq!(seq_id, 1);
+
+        // Step 2: Get proposal from outbound queue
+        let proposal = leader_engine.next_outbound_proposal().await.unwrap();
+        assert_eq!(proposal.sequence_id, 1);
+
+        // Step 3: Follower handles proposal and sends ack
+        let ack = follower1_engine.handle_proposal(proposal).await.unwrap();
+        assert_eq!(ack.sequence_id, 1);
+        assert_eq!(ack.follower_id, follower1_id);
+
+        // Step 4: Leader handles ack
+        let ack_count = leader_engine.handle_ack(ack).await.unwrap();
+        assert_eq!(ack_count, 1);
+
+        // Step 5: Verify quorum reached (leader + follower1 = 2 >= threshold)
+        assert!(leader_engine.has_quorum(1).await);
+
+        // Verify events are stored in both ledgers
+        let leader_events = leader_backend.read_from("test", 0, 10).await.unwrap();
+        assert_eq!(leader_events.len(), 1);
+
+        let follower_events = follower1_backend.read_from("test", 0, 10).await.unwrap();
+        assert_eq!(follower_events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_follower_rejects_stale_epoch_proposal() {
+        let leader_key = generate_test_key();
+        let leader_id = validator_id_from_key(&leader_key);
+
+        let follower_key = generate_test_key();
+        let follower_id = validator_id_from_key(&follower_key);
+
+        // Follower is at epoch 2
+        let follower_config = ReplicationConfig {
+            validator_id: follower_id,
+            leader_id,
+            epoch: 2,
+            namespace: "test".to_string(),
+            ack_timeout: DEFAULT_ACK_TIMEOUT,
+            quorum_threshold: 2,
+        };
+
+        let backend = Arc::new(MockLedgerBackend::new());
+        let peers = Arc::new(PeerManager::new());
+
+        let follower_engine =
+            ReplicationEngine::new(follower_config, follower_key.clone(), backend, peers);
+
+        follower_engine
+            .register_validator(leader_id, leader_key.verifying_key())
+            .await;
+
+        // Create a proposal from epoch 1 (stale)
+        let event = create_test_event();
+        let replicated_event = ReplicatedEvent::from_event_record(&event);
+        let event_data = serde_json::to_vec(&replicated_event).unwrap();
+        let event_hash = ReplicationProposal::compute_event_hash(&event_data);
+
+        let mut proposal = ReplicationProposal {
+            epoch: 1, // Stale epoch
+            sequence_id: 1,
+            leader_id,
+            namespace: "test".to_string(),
+            event_data,
+            event_hash,
+            signature: [0u8; 64],
+        };
+        proposal.sign(&leader_key).unwrap();
+
+        // Follower should reject with Stale nack
+        let result = follower_engine.handle_proposal(proposal).await;
+        assert!(result.is_err());
+        let nack = result.unwrap_err();
+        assert_eq!(nack.reason, NackReason::Stale);
+    }
+
+    #[tokio::test]
+    async fn test_leader_rejects_stale_epoch_ack() {
+        let leader_key = generate_test_key();
+        let leader_id = validator_id_from_key(&leader_key);
+
+        let follower_key = generate_test_key();
+        let follower_id = validator_id_from_key(&follower_key);
+
+        let config = ReplicationConfig {
+            validator_id: leader_id,
+            leader_id,
+            epoch: 1,
+            namespace: "test".to_string(),
+            ack_timeout: DEFAULT_ACK_TIMEOUT,
+            quorum_threshold: 2,
+        };
+
+        let backend = Arc::new(MockLedgerBackend::new());
+        let peers = Arc::new(PeerManager::new());
+
+        let engine = ReplicationEngine::new(config, leader_key.clone(), backend, peers);
+
+        engine
+            .register_validator(leader_id, leader_key.verifying_key())
+            .await;
+        engine
+            .register_validator(follower_id, follower_key.verifying_key())
+            .await;
+
+        // Propose an event
+        let event = create_test_event();
+        let seq_id = engine.propose(&event).await.unwrap();
+        assert_eq!(seq_id, 1);
+
+        // Create an ack with wrong epoch
+        let mut ack = ReplicationAck {
+            epoch: 2, // Wrong epoch
+            sequence_id: 1,
+            namespace: "test".to_string(),
+            follower_id,
+            local_seq_id: 100,
+            signature: [0u8; 64],
+        };
+        ack.sign(&follower_key).unwrap();
+
+        // Leader should reject stale epoch ack
+        let result = engine.handle_ack(ack).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ReplicationError::StaleEpoch {
+                ack_epoch,
+                proposal_epoch,
+            } => {
+                assert_eq!(ack_epoch, 2);
+                assert_eq!(proposal_epoch, 1);
+            },
+            e => panic!("Expected StaleEpoch error, got: {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_follower_rejects_oversized_payload() {
+        let leader_key = generate_test_key();
+        let leader_id = validator_id_from_key(&leader_key);
+
+        let follower_key = generate_test_key();
+        let follower_id = validator_id_from_key(&follower_key);
+
+        let follower_config = ReplicationConfig {
+            validator_id: follower_id,
+            leader_id,
+            epoch: 1,
+            namespace: "test".to_string(),
+            ack_timeout: DEFAULT_ACK_TIMEOUT,
+            quorum_threshold: 2,
+        };
+
+        let backend = Arc::new(MockLedgerBackend::new());
+        let peers = Arc::new(PeerManager::new());
+
+        let follower_engine =
+            ReplicationEngine::new(follower_config, follower_key.clone(), backend, peers);
+
+        follower_engine
+            .register_validator(leader_id, leader_key.verifying_key())
+            .await;
+
+        // Create a proposal with oversized payload
+        let oversized_data = vec![0u8; MAX_REPLICATION_PAYLOAD_SIZE + 1];
+        let event_hash = ReplicationProposal::compute_event_hash(&oversized_data);
+
+        let mut proposal = ReplicationProposal {
+            epoch: 1,
+            sequence_id: 1,
+            leader_id,
+            namespace: "test".to_string(),
+            event_data: oversized_data,
+            event_hash,
+            signature: [0u8; 64],
+        };
+        proposal.sign(&leader_key).unwrap();
+
+        // Follower should reject with PayloadTooLarge nack
+        let result = follower_engine.handle_proposal(proposal).await;
+        assert!(result.is_err());
+        let nack = result.unwrap_err();
+        assert_eq!(nack.reason, NackReason::PayloadTooLarge);
+    }
+
+    #[tokio::test]
+    async fn test_follower_rejects_gap_in_sequence() {
+        let leader_key = generate_test_key();
+        let leader_id = validator_id_from_key(&leader_key);
+
+        let follower_key = generate_test_key();
+        let follower_id = validator_id_from_key(&follower_key);
+
+        let follower_config = ReplicationConfig {
+            validator_id: follower_id,
+            leader_id,
+            epoch: 1,
+            namespace: "test".to_string(),
+            ack_timeout: DEFAULT_ACK_TIMEOUT,
+            quorum_threshold: 2,
+        };
+
+        let backend = Arc::new(MockLedgerBackend::new());
+        let peers = Arc::new(PeerManager::new());
+
+        let follower_engine =
+            ReplicationEngine::new(follower_config, follower_key.clone(), backend, peers);
+
+        follower_engine
+            .register_validator(leader_id, leader_key.verifying_key())
+            .await;
+
+        // Create a proposal with sequence_id = 5 (but follower expects 1)
+        let event = create_test_event();
+        let replicated_event = ReplicatedEvent::from_event_record(&event);
+        let event_data = serde_json::to_vec(&replicated_event).unwrap();
+        let event_hash = ReplicationProposal::compute_event_hash(&event_data);
+
+        let mut proposal = ReplicationProposal {
+            epoch: 1,
+            sequence_id: 5, // Gap - expected 1
+            leader_id,
+            namespace: "test".to_string(),
+            event_data,
+            event_hash,
+            signature: [0u8; 64],
+        };
+        proposal.sign(&leader_key).unwrap();
+
+        // Follower should reject with Gap nack
+        let result = follower_engine.handle_proposal(proposal).await;
+        assert!(result.is_err());
+        let nack = result.unwrap_err();
+        assert_eq!(nack.reason, NackReason::Gap);
+    }
+
+    #[tokio::test]
+    async fn test_non_leader_cannot_propose() {
+        let leader_key = generate_test_key();
+        let leader_id = validator_id_from_key(&leader_key);
+
+        let follower_key = generate_test_key();
+        let follower_id = validator_id_from_key(&follower_key);
+
+        // Follower tries to act as engine but is not leader
+        let follower_config = ReplicationConfig {
+            validator_id: follower_id,
+            leader_id,
+            epoch: 1,
+            namespace: "test".to_string(),
+            ack_timeout: DEFAULT_ACK_TIMEOUT,
+            quorum_threshold: 2,
+        };
+
+        let backend = Arc::new(MockLedgerBackend::new());
+        let peers = Arc::new(PeerManager::new());
+
+        let engine = ReplicationEngine::new(follower_config, follower_key.clone(), backend, peers);
+
+        // Try to propose (should fail - not leader)
+        let event = create_test_event();
+        let result = engine.propose(&event).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ReplicationError::NotLeader { expected, actual } => {
+                assert_eq!(expected, hex::encode(leader_id));
+                assert_eq!(actual, hex::encode(follower_id));
+            },
+            e => panic!("Expected NotLeader error, got: {e:?}"),
+        }
     }
 }
