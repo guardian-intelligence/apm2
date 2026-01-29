@@ -1,7 +1,8 @@
 //! Consensus layer for distributed coordination.
 //!
-//! This module implements peer discovery, mutual TLS networking, and relay
-//! tunneling for the APM2 distributed consensus layer. It provides:
+//! This module implements peer discovery, mutual TLS networking, relay
+//! tunneling, and genesis management for the APM2 distributed consensus layer.
+//! It provides:
 //!
 //! - **Network Transport**: TLS 1.3 mutual authentication with connection
 //!   pooling
@@ -9,6 +10,7 @@
 //! - **Traffic Analysis Mitigation**: Fixed-size control plane frame padding
 //! - **Relay Holon**: Message routing to workers behind NAT
 //! - **Reverse-TLS Tunnels**: Persistent outbound connections for NAT traversal
+//! - **Genesis Management**: Epoch-0 genesis adoption and join validation
 //!
 //! # Security Properties
 //!
@@ -19,6 +21,10 @@
 //! - Tunnel registration requires valid mTLS identity (INV-0021)
 //! - Tunnel heartbeats prevent zombie connections (INV-0022)
 //! - Relay validates worker identity matches certificate CN (INV-0023)
+//! - Genesis signature verified against T0 key (INV-0030)
+//! - Join attempts rate-limited per source (INV-0031)
+//! - Genesis mismatch causes join rejection (INV-0032)
+//! - Invitation tokens require quorum signatures (INV-0033)
 //!
 //! # Example
 //!
@@ -64,12 +70,19 @@
 //! ```
 
 pub mod discovery;
+pub mod genesis;
 pub mod network;
 pub mod relay;
 pub mod tunnel;
 
 pub use discovery::{
     DiscoveryConfig, DiscoveryError, PeerDiscovery, PeerInfo, PeerList, PeerStatus,
+};
+pub use genesis::{
+    Genesis, GenesisConfig, GenesisConfigBuilder, GenesisError, GenesisValidator,
+    INVITATION_TOKEN_VALIDITY, InvitationToken, JOIN_RATE_LIMIT_WINDOW, JoinRateLimiter,
+    MAX_JOIN_ATTEMPTS_PER_MINUTE, MAX_METADATA_LEN, MAX_NAMESPACE_LEN, MAX_QUORUM_SIGNATURES,
+    MIN_QUORUM_SIZE, ValidatorSignature,
 };
 pub use network::{
     CONTROL_FRAME_SIZE, Connection, ConnectionPool, ControlFrame, Network, NetworkConfig,
