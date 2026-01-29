@@ -230,6 +230,17 @@ pub enum AntiEntropyError {
         /// The requested comparison depth.
         depth: usize,
     },
+
+    /// Index overflow during u64 to usize conversion.
+    ///
+    /// On 32-bit platforms, `u64` indices may exceed `usize::MAX`. This error
+    /// is returned when a range index cannot be safely converted to `usize`,
+    /// preventing truncation and potential security issues.
+    #[error("index {index} overflows usize (max: {})", usize::MAX)]
+    IndexOverflow {
+        /// The u64 index that could not be converted.
+        index: u64,
+    },
 }
 
 // ============================================================================
@@ -237,7 +248,8 @@ pub enum AntiEntropyError {
 // ============================================================================
 
 /// A request to exchange Merkle tree digests.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DigestRequest {
     /// The namespace being synchronized.
     pub namespace: String,
@@ -250,7 +262,8 @@ pub struct DigestRequest {
 }
 
 /// A response containing the Merkle tree root digest.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DigestResponse {
     /// The namespace being synchronized.
     pub namespace: String,
@@ -265,7 +278,8 @@ pub struct DigestResponse {
 }
 
 /// A request to compare subtrees at specific ranges.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompareRequest {
     /// The namespace being synchronized.
     pub namespace: String,
@@ -276,7 +290,8 @@ pub struct CompareRequest {
 }
 
 /// A single range query with expected hash.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RangeQuery {
     /// Sequence range [start, end).
     pub range: (u64, u64),
@@ -285,7 +300,8 @@ pub struct RangeQuery {
 }
 
 /// A response with subtree digests for comparison.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompareResponse {
     /// The namespace being synchronized.
     pub namespace: String,
@@ -296,7 +312,8 @@ pub struct CompareResponse {
 }
 
 /// Result of comparing a single range.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RangeDigestResult {
     /// Sequence range [start, end).
     pub range: (u64, u64),
@@ -309,7 +326,8 @@ pub struct RangeDigestResult {
 }
 
 /// A request to transfer events for a range.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventRequest {
     /// The namespace being synchronized.
     pub namespace: String,
@@ -322,7 +340,8 @@ pub struct EventRequest {
 }
 
 /// A response containing events for a range.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventResponse {
     /// The namespace being synchronized.
     pub namespace: String,
@@ -337,13 +356,26 @@ pub struct EventResponse {
 }
 
 /// A compact event representation for sync.
-#[derive(Debug, Clone)]
+///
+/// # Security Note
+///
+/// `SyncEvent` does not include `signature` or `actor_id` fields. This is
+/// intentional: sync events are verified by their hash chain linkage
+/// (`prev_hash` -> `event_hash`) and Merkle proof membership. The hash chain
+/// provides integrity, while the Merkle proof provides authenticity relative to
+/// a trusted root.
+///
+/// If actor-level provenance is needed, the full event record should be
+/// retrieved from the ledger after sync verification completes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SyncEvent {
     /// Sequence ID.
     pub seq_id: u64,
     /// Event type.
     pub event_type: String,
     /// Event payload.
+    #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
     /// Previous event hash.
     pub prev_hash: Hash,
@@ -428,12 +460,23 @@ impl SyncRateLimiter {
                     .retain(|_, (_, last)| now.duration_since(*last) < self.interval);
             }
 
-            // After cleanup, if still at capacity, reject the new peer (fail-closed)
+            // SECURITY: Explicit capacity check after cleanup (fail-closed).
+            // We use strict less-than to ensure we're actually under capacity,
+            // not just at the boundary. This prevents any edge case where
+            // cleanup + immediate insert could exceed capacity.
             if self.requests.len() >= MAX_RATE_LIMIT_PEERS {
                 return Err(AntiEntropyError::RateLimiterAtCapacity {
                     peer_id: peer_id.to_string(),
                 });
             }
+
+            // Final capacity check before insert to prevent TOCTOU issues.
+            // This is defensive - the check above should have caught it,
+            // but we verify again immediately before mutation.
+            debug_assert!(
+                self.requests.len() < MAX_RATE_LIMIT_PEERS,
+                "capacity check should have rejected at-capacity state"
+            );
 
             self.requests.insert(peer_id.to_string(), (1, now));
             Ok(())
@@ -732,11 +775,18 @@ impl AntiEntropyEngine {
         let mut digests = Vec::with_capacity(request.ranges.len());
 
         for query in &request.ranges {
-            // Range indices are bounded by MAX_TREE_LEAVES which fits in usize
-            #[allow(clippy::cast_possible_truncation)]
-            let start = query.range.0 as usize;
-            #[allow(clippy::cast_possible_truncation)]
-            let end = query.range.1 as usize;
+            // SECURITY: Use try_from to safely convert u64 to usize.
+            // On 32-bit platforms, u64 values may exceed usize::MAX, causing
+            // truncation with `as usize`. This would be a security issue as it
+            // could allow accessing unintended tree indices.
+            let start =
+                usize::try_from(query.range.0).map_err(|_| AntiEntropyError::IndexOverflow {
+                    index: query.range.0,
+                })?;
+            let end =
+                usize::try_from(query.range.1).map_err(|_| AntiEntropyError::IndexOverflow {
+                    index: query.range.1,
+                })?;
 
             // Validate comparison depth to prevent DoS via deeply nested requests.
             // Depth is computed as log2(range_size), bounded by MAX_COMPARISON_DEPTH.
@@ -1210,6 +1260,77 @@ mod tck_00191_unit_tests {
         }
     }
 
+    #[test]
+    fn test_rate_limiter_capacity_check_after_cleanup() {
+        // SECURITY TEST: Verify that after cleanup, capacity is still enforced.
+        // Use a very short interval so entries expire quickly.
+        let mut limiter = SyncRateLimiter::with_config(100, Duration::from_millis(1));
+
+        // Fill to capacity
+        for i in 0..MAX_RATE_LIMIT_PEERS {
+            limiter.check(&format!("peer-{i}")).unwrap();
+        }
+
+        // Wait for entries to expire
+        std::thread::sleep(Duration::from_millis(5));
+
+        // After sleep, cleanup should have freed space.
+        // A new peer should now be allowed (cleanup makes room).
+        let result = limiter.check("new-peer-after-cleanup");
+        assert!(
+            result.is_ok(),
+            "new peer should be allowed after expired entries cleanup, got: {result:?}"
+        );
+
+        // Verify we're still enforcing capacity by filling up again
+        // and checking that we reject at capacity.
+        for i in 0..(MAX_RATE_LIMIT_PEERS - 1) {
+            // -1 because we already added "new-peer-after-cleanup"
+            let peer_id = format!("fresh-peer-{i}");
+            let _ = limiter.check(&peer_id); // Ignore errors as we're just filling up
+        }
+
+        // Now we should be at capacity again
+        let result = limiter.check("overflow-peer");
+        assert!(
+            matches!(result, Err(AntiEntropyError::RateLimiterAtCapacity { .. })),
+            "should reject at capacity after refill, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_rate_limiter_strict_capacity_enforcement() {
+        // SECURITY TEST: Verify that capacity is strictly enforced.
+        // We should never exceed MAX_RATE_LIMIT_PEERS entries.
+        let mut limiter = SyncRateLimiter::with_config(100, Duration::from_secs(60));
+
+        // Fill exactly to capacity
+        for i in 0..MAX_RATE_LIMIT_PEERS {
+            limiter.check(&format!("peer-{i}")).unwrap();
+        }
+
+        // Verify we have exactly MAX_RATE_LIMIT_PEERS entries
+        assert_eq!(
+            limiter.requests.len(),
+            MAX_RATE_LIMIT_PEERS,
+            "should have exactly MAX_RATE_LIMIT_PEERS entries"
+        );
+
+        // Try to add one more - should fail
+        let result = limiter.check("overflow-peer");
+        assert!(matches!(
+            result,
+            Err(AntiEntropyError::RateLimiterAtCapacity { .. })
+        ));
+
+        // Verify we still have exactly MAX_RATE_LIMIT_PEERS entries (no overflow)
+        assert_eq!(
+            limiter.requests.len(),
+            MAX_RATE_LIMIT_PEERS,
+            "should still have exactly MAX_RATE_LIMIT_PEERS entries after rejection"
+        );
+    }
+
     // ==================== Sync Session Tests ====================
 
     #[test]
@@ -1558,6 +1679,47 @@ mod tck_00191_unit_tests {
                 Err(AntiEntropyError::ComparisonDepthExceeded { .. })
             ),
             "depth at limit should be allowed, got: {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn test_engine_handle_compare_request_index_overflow_simulation() {
+        // SECURITY TEST: On 64-bit platforms, we can't actually overflow usize
+        // with u64 values (they're the same size). This test verifies the
+        // error handling code compiles and the error type exists.
+        // On 32-bit platforms, this would actually trigger IndexOverflow.
+
+        // Verify the error type exists and formats correctly
+        let err = AntiEntropyError::IndexOverflow { index: u64::MAX };
+        let msg = format!("{err}");
+        assert!(msg.contains("overflows usize"));
+        assert!(msg.contains(&u64::MAX.to_string()));
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "32")]
+    fn test_engine_handle_compare_request_index_overflow_32bit() {
+        // SECURITY TEST: On 32-bit platforms, verify that u64 values > u32::MAX
+        // are properly rejected with IndexOverflow error.
+        let mut engine = AntiEntropyEngine::new();
+        let tree = make_test_tree(8);
+
+        // This value exceeds u32::MAX and would truncate on 32-bit
+        let overflow_index: u64 = (u32::MAX as u64) + 1000;
+        let request = CompareRequest {
+            namespace: "kernel".to_string(),
+            ranges: vec![RangeQuery {
+                range: (0, overflow_index),
+                expected_hash: tree.root(),
+            }],
+            peer_id: "peer-1".to_string(),
+        };
+
+        let result = engine.handle_compare_request(&request, &tree);
+        assert!(
+            matches!(result, Err(AntiEntropyError::IndexOverflow { .. })),
+            "should reject index overflow on 32-bit, got: {result:?}"
         );
     }
 

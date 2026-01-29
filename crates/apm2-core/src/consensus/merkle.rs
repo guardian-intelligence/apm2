@@ -109,6 +109,19 @@ pub enum MerkleError {
         /// The tree size.
         tree_size: usize,
     },
+
+    /// Proof path does not match claimed leaf index.
+    ///
+    /// The proof path encodes the position of the leaf in the tree through
+    /// the direction bits. If the claimed `leaf_index` doesn't match the
+    /// position encoded in the proof path, the proof is invalid.
+    #[error("leaf index mismatch: claimed {claimed}, computed from path {computed}")]
+    LeafIndexMismatch {
+        /// The claimed leaf index in the proof.
+        claimed: usize,
+        /// The index computed from the proof path.
+        computed: usize,
+    },
 }
 
 // ============================================================================
@@ -526,14 +539,44 @@ impl MerkleTree {
 impl MerkleProof {
     /// Verifies this proof against a root hash.
     ///
+    /// This method verifies both:
+    /// 1. That the proof path computes to the expected root hash
+    /// 2. That the claimed `leaf_index` matches the position encoded in the
+    ///    proof path
+    ///
     /// # Arguments
     ///
     /// * `root` - The expected root hash.
     ///
     /// # Errors
     ///
-    /// Returns an error if the proof does not verify against the root.
+    /// Returns `MerkleError::LeafIndexMismatch` if the claimed `leaf_index`
+    /// doesn't match the index computed from the proof path direction bits.
+    ///
+    /// Returns `MerkleError::ProofVerificationFailed` if the computed root
+    /// doesn't match the expected root.
+    ///
+    /// # Security
+    ///
+    /// This prevents an attacker from providing a valid proof for one leaf
+    /// position while claiming it proves a different position. The proof
+    /// path encodes the leaf position through the `is_right` direction
+    /// bits.
     pub fn verify(&self, root: &Hash) -> Result<(), MerkleError> {
+        // First, verify that the claimed leaf_index matches the proof path.
+        // The proof path encodes the position through the is_right bits:
+        // - If is_right is true, the current node is on the right (odd index)
+        // - If is_right is false, the current node is on the left (even index)
+        // Reconstruct the index from the path (LSB to MSB).
+        let computed_index = self.compute_leaf_index();
+        if computed_index != self.leaf_index {
+            return Err(MerkleError::LeafIndexMismatch {
+                claimed: self.leaf_index,
+                computed: computed_index,
+            });
+        }
+
+        // Then verify the hash chain computes to the expected root
         let computed = self.compute_root();
 
         if &computed != root {
@@ -544,6 +587,22 @@ impl MerkleProof {
         }
 
         Ok(())
+    }
+
+    /// Computes the leaf index from the proof path direction bits.
+    ///
+    /// The proof path encodes the leaf position through the `is_right` bits.
+    /// Each level contributes one bit to the index, starting from the LSB.
+    #[must_use]
+    pub fn compute_leaf_index(&self) -> usize {
+        let mut index = 0usize;
+        for (level, (_, is_right)) in self.path.iter().enumerate() {
+            if *is_right {
+                // Current node is on the right, so this bit is 1
+                index |= 1 << level;
+            }
+        }
+        index
     }
 
     /// Computes the root hash from this proof.
@@ -923,6 +982,83 @@ mod tck_00191_unit_tests {
         for i in [0, 100, 500, 999] {
             let proof = tree.proof_for(i).unwrap();
             assert!(proof.verify(&root).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_compute_leaf_index_from_proof() {
+        let hashes = test_hashes(16);
+        let tree = MerkleTree::new(hashes.iter().copied()).unwrap();
+
+        // Verify compute_leaf_index matches for all leaves
+        for i in 0..16 {
+            let proof = tree.proof_for(i).unwrap();
+            assert_eq!(
+                proof.compute_leaf_index(),
+                i,
+                "computed index should match for leaf {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_merkle_proof_index_verification_prevents_spoofing() {
+        // SECURITY TEST: Verify that a proof for one index cannot be used
+        // to claim a different index.
+        let hashes = test_hashes(8);
+        let tree = MerkleTree::new(hashes.iter().copied()).unwrap();
+        let root = tree.root();
+
+        // Get a valid proof for index 3
+        let mut proof = tree.proof_for(3).unwrap();
+        assert!(proof.verify(&root).is_ok());
+
+        // Now try to spoof by claiming this proof is for index 5
+        proof.leaf_index = 5;
+
+        // Verification should fail with LeafIndexMismatch
+        let result = proof.verify(&root);
+        assert!(
+            matches!(
+                result,
+                Err(MerkleError::LeafIndexMismatch {
+                    claimed: 5,
+                    computed: 3
+                })
+            ),
+            "proof with spoofed index should fail with LeafIndexMismatch, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_merkle_proof_index_verification_all_indices() {
+        // Verify index verification works for all possible index spoofing attempts
+        let hashes = test_hashes(8);
+        let tree = MerkleTree::new(hashes.iter().copied()).unwrap();
+        let root = tree.root();
+
+        for real_index in 0..8 {
+            let mut proof = tree.proof_for(real_index).unwrap();
+
+            // Try to claim every other index
+            for claimed_index in 0..8 {
+                proof.leaf_index = claimed_index;
+                let result = proof.verify(&root);
+
+                if claimed_index == real_index {
+                    // Should succeed for the correct index
+                    assert!(
+                        result.is_ok(),
+                        "proof for {real_index} should verify as {claimed_index}"
+                    );
+                } else {
+                    // Should fail for incorrect indices
+                    assert!(
+                        matches!(result, Err(MerkleError::LeafIndexMismatch { .. })),
+                        "proof for {real_index} claimed as {claimed_index} should fail, got: {result:?}"
+                    );
+                }
+            }
         }
     }
 }
