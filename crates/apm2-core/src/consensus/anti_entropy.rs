@@ -1282,15 +1282,18 @@ mod tck_00191_unit_tests {
             "new peer should be allowed after expired entries cleanup, got: {result:?}"
         );
 
-        // Verify we're still enforcing capacity by filling up again
-        // and checking that we reject at capacity.
-        for i in 0..(MAX_RATE_LIMIT_PEERS - 1) {
-            // -1 because we already added "new-peer-after-cleanup"
-            let peer_id = format!("fresh-peer-{i}");
-            let _ = limiter.check(&peer_id); // Ignore errors as we're just filling up
+        // Phase 2: Create a fresh limiter with a long interval to verify capacity
+        // is enforced even when entries don't expire. We use a separate limiter
+        // to avoid timing sensitivity (the short 1ms interval could cause entries
+        // to expire during the fill loop on slow CI machines).
+        let mut limiter = SyncRateLimiter::with_config(100, Duration::from_secs(60));
+
+        // Fill exactly to capacity
+        for i in 0..MAX_RATE_LIMIT_PEERS {
+            limiter.check(&format!("fresh-peer-{i}")).unwrap();
         }
 
-        // Now we should be at capacity again
+        // Now we should be at capacity - new peer should be rejected
         let result = limiter.check("overflow-peer");
         assert!(
             matches!(result, Err(AntiEntropyError::RateLimiterAtCapacity { .. })),
