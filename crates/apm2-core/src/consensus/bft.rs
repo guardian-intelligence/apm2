@@ -105,6 +105,12 @@ pub const MAX_PENDING_BLOCKS: usize = 128;
 /// Bounds state growth to prevent denial-of-service via memory exhaustion.
 pub const MAX_CERTIFIED_BLOCKS: usize = 128;
 
+/// Maximum number of committed block hashes to track.
+///
+/// Bounds state growth to prevent denial-of-service via memory exhaustion.
+/// Older commits are evicted when this limit is reached.
+pub const MAX_COMMITTED_BLOCKS: usize = 256;
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -281,6 +287,16 @@ pub enum BftError {
     /// Internal error.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Block hash mismatch (block hash does not match computed hash of
+    /// components).
+    #[error("block hash mismatch: expected {expected}, got {actual}")]
+    BlockHashMismatch {
+        /// Expected hash (recomputed from components).
+        expected: String,
+        /// Actual hash in the proposal.
+        actual: String,
+    },
 }
 
 // ============================================================================
@@ -916,8 +932,14 @@ pub struct HotStuffState {
     /// Certified blocks by round (`round` -> QC).
     /// Used for 3-chain commit rule verification.
     certified_blocks: HashMap<u64, QuorumCertificate>,
-    /// Committed block hashes in order.
-    committed: Vec<BlockHash>,
+    /// Committed block hashes.
+    /// Uses `HashSet` for O(1) lookup (denial-of-service mitigation) with
+    /// bounded size.
+    committed: HashSet<BlockHash>,
+    /// Oldest committed round (for eviction tracking).
+    oldest_committed_round: u64,
+    /// Last committed block hash (for reporting).
+    last_committed_hash: Option<BlockHash>,
 }
 
 impl HotStuffState {
@@ -937,7 +959,9 @@ impl HotStuffState {
             new_view_messages: HashMap::new(),
             pending_blocks: HashMap::new(),
             certified_blocks: HashMap::new(),
-            committed: Vec::new(),
+            committed: HashSet::new(),
+            oldest_committed_round: 0,
+            last_committed_hash: None,
         }
     }
 
@@ -993,8 +1017,24 @@ impl HotStuffState {
     ///
     /// This is the block at the head of the most recent 3-chain.
     #[must_use]
-    pub fn last_committed_hash(&self) -> Option<BlockHash> {
-        self.committed.last().copied()
+    pub const fn last_committed_hash(&self) -> Option<BlockHash> {
+        self.last_committed_hash
+    }
+
+    /// Returns a reference to the certified blocks map.
+    ///
+    /// Used by `BftMachine` to access certified block state.
+    #[must_use]
+    pub const fn certified_blocks(&self) -> &HashMap<u64, QuorumCertificate> {
+        &self.certified_blocks
+    }
+
+    /// Returns a reference to the pending blocks map.
+    ///
+    /// Used by `BftMachine` to access pending block state.
+    #[must_use]
+    pub const fn pending_blocks(&self) -> &HashMap<BlockHash, (u64, BlockHash)> {
+        &self.pending_blocks
     }
 
     /// Processes an incoming proposal.
@@ -1044,6 +1084,23 @@ impl HotStuffState {
 
         // Validate structure
         proposal.validate_structure()?;
+
+        // Verify block hash matches computed hash of components (binding verification)
+        // This prevents attacks where an adversary substitutes a different block_hash
+        // while keeping the same signature.
+        let computed_hash = Self::compute_block_hash(
+            proposal.epoch,
+            proposal.round,
+            &proposal.payload_hash,
+            &proposal.parent_qc.block_hash,
+        );
+        // Use constant-time comparison to prevent timing attacks
+        if !bool::from(computed_hash.ct_eq(&proposal.block_hash)) {
+            return Err(BftError::BlockHashMismatch {
+                expected: hex::encode(computed_hash),
+                actual: hex::encode(proposal.block_hash),
+            });
+        }
 
         // Check if we already voted
         if proposal.round <= self.last_voted_round {
@@ -1300,6 +1357,65 @@ impl HotStuffState {
         Ok(())
     }
 
+    /// Processes a quorum certificate received from the network.
+    ///
+    /// This method updates the consensus state based on a QC received from
+    /// proposals or broadcasts, not just locally formed QCs. This is critical
+    /// for followers who don't form QCs locally but receive them from leaders.
+    ///
+    /// # Security
+    ///
+    /// The QC signatures MUST be verified by the caller before calling this
+    /// method. This method assumes the QC is cryptographically valid.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if a new block was committed as a result of processing
+    /// this QC.
+    pub fn on_qc(&mut self, qc: &QuorumCertificate) -> bool {
+        // Skip genesis QC - nothing to update
+        if qc.is_genesis() {
+            return false;
+        }
+
+        // Update high_qc if this QC is higher
+        if qc.round > self.high_qc.round {
+            self.high_qc = qc.clone();
+        }
+
+        // Record the certified block
+        self.add_certified_block(qc.clone());
+
+        // Update locked_qc when a 2-chain is formed (HotStuff Theorem 2 safety)
+        // A 2-chain exists when we have QCs for consecutive rounds r and r+1.
+        // We lock on the QC at round r (the parent of the newly certified block).
+        if qc.round >= 2 {
+            let parent_round = qc.round - 1;
+            if let Some(parent_qc) = self.certified_blocks.get(&parent_round).cloned() {
+                // Verify this is actually a chain (the new QC's block has parent_qc's block as
+                // parent)
+                if let Some((_, parent_hash)) = self.pending_blocks.get(&qc.block_hash) {
+                    let is_chain: bool = parent_hash.ct_eq(&parent_qc.block_hash).into();
+                    if is_chain {
+                        // Update locked_qc if the parent is higher than current locked_qc
+                        let should_update = self
+                            .locked_qc
+                            .as_ref()
+                            .is_none_or(|locked| parent_qc.round > locked.round);
+                        if should_update {
+                            self.locked_qc = Some(parent_qc);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check 3-chain commit rule and return whether a commit occurred
+        let committed_before = self.committed.len();
+        self.try_commit();
+        self.committed.len() > committed_before
+    }
+
     /// Attempts to commit blocks using the 3-chain rule.
     ///
     /// A block B is committed when there exists a 3-chain:
@@ -1309,7 +1425,12 @@ impl HotStuffState {
     /// committed when we have QCs for rounds r, r+1, and r+2, where each
     /// QC's block extends the previous (verified via `pending_blocks`
     /// parent tracking).
-    fn try_commit(&mut self) {
+    ///
+    /// # Note
+    ///
+    /// This method is called internally and should also be callable from
+    /// `BftMachine` after updating certified blocks from any source.
+    pub fn try_commit(&mut self) {
         let current_round = self.high_qc.round;
 
         // Need at least 3 rounds to form a 3-chain
@@ -1353,16 +1474,56 @@ impl HotStuffState {
 
         if chain_valid {
             // Commit the grandparent block (head of the 3-chain)
-            // Use constant-time comparison to check if already committed
-            let already_committed = self
-                .committed
-                .iter()
-                .any(|h| h.ct_eq(&grandparent_qc.block_hash).into());
-
-            if !already_committed {
-                self.committed.push(grandparent_qc.block_hash);
+            // O(1) HashSet lookup instead of O(N) Vec scan (DoS mitigation)
+            if !self.committed.contains(&grandparent_qc.block_hash) {
+                self.add_committed_block(grandparent_qc.block_hash, grandparent_round);
                 self.phase = Phase::Committed;
             }
+        }
+    }
+
+    /// Adds a committed block with bounded storage.
+    ///
+    /// If the storage exceeds `MAX_COMMITTED_BLOCKS`, oldest entries are
+    /// evicted.
+    fn add_committed_block(&mut self, block_hash: BlockHash, round: u64) {
+        // Evict oldest entries if at capacity
+        while self.committed.len() >= MAX_COMMITTED_BLOCKS {
+            // We track oldest_committed_round for efficient eviction
+            // Find and remove blocks at or below oldest_committed_round
+            let to_remove: Vec<BlockHash> = self
+                .committed
+                .iter()
+                .filter(|hash| {
+                    // Check if this block is at a round <= oldest_committed_round
+                    // by looking up in pending_blocks
+                    self.pending_blocks
+                        .get(*hash)
+                        .is_some_and(|(r, _)| *r <= self.oldest_committed_round)
+                })
+                .copied()
+                .collect();
+
+            if to_remove.is_empty() {
+                // No blocks to remove based on round, just remove any one block
+                if let Some(hash) = self.committed.iter().next().copied() {
+                    self.committed.remove(&hash);
+                }
+                break;
+            }
+
+            for hash in to_remove {
+                self.committed.remove(&hash);
+            }
+            self.oldest_committed_round += 1;
+        }
+
+        self.committed.insert(block_hash);
+        self.last_committed_hash = Some(block_hash);
+
+        // Update oldest_committed_round if needed
+        if self.oldest_committed_round == 0 || round < self.oldest_committed_round {
+            self.oldest_committed_round = round;
         }
     }
 
@@ -1424,6 +1585,27 @@ impl HotStuffState {
         }
 
         self.certified_blocks.insert(qc.round, qc);
+    }
+
+    /// Computes a block hash from its components.
+    ///
+    /// The block hash is computed as: `BLAKE3(epoch || round || payload_hash ||
+    /// parent_hash)`.
+    ///
+    /// This must match the computation in `BftMachine::compute_block_hash`.
+    #[must_use]
+    pub fn compute_block_hash(
+        epoch: u64,
+        round: u64,
+        payload_hash: &BlockHash,
+        parent_hash: &BlockHash,
+    ) -> BlockHash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&epoch.to_le_bytes());
+        hasher.update(&round.to_le_bytes());
+        hasher.update(payload_hash);
+        hasher.update(parent_hash);
+        hasher.finalize().into()
     }
 }
 

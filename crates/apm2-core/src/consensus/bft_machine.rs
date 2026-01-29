@@ -67,6 +67,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
+use subtle::ConstantTimeEq;
 
 use super::bft::{
     BftError, BlockHash, HotStuffConfig, HotStuffState, NewView, Phase, Proposal,
@@ -264,12 +265,29 @@ impl BftMachine {
     /// * `signing_key` - This node's Ed25519 signing key for message signing
     /// * `now` - Current time as duration since an arbitrary epoch (for
     ///   determinism)
+    ///
+    /// # Panics
+    ///
+    /// Panics if the computed validator ID from `signing_key` does not match
+    /// `config.validator_id`. This is a critical identity mismatch that would
+    /// cause the node to sign messages with credentials that don't match its
+    /// declared identity in the validator set.
     #[must_use]
     pub fn new(config: HotStuffConfig, signing_key: SigningKey, now: Duration) -> Self {
         let base_timeout = config.round_timeout;
         // Pre-compute validator ID to avoid repeated hashing
         let public_key = signing_key.verifying_key();
         let validator_id: ValidatorId = blake3::hash(public_key.as_bytes()).into();
+
+        // CRITICAL: Verify identity match (prevents signing with wrong credentials)
+        assert!(
+            bool::from(validator_id.ct_eq(&config.validator_id)),
+            "BftMachine identity mismatch: signing_key does not match config.validator_id \
+             (computed: {}, config: {})",
+            hex::encode(validator_id),
+            hex::encode(config.validator_id)
+        );
+
         Self {
             state: HotStuffState::new(config),
             signing_key,
@@ -511,15 +529,34 @@ impl BftMachine {
     }
 
     /// Handles a received quorum certificate.
+    ///
+    /// This integrates the QC into `HotStuffState`, updating:
+    /// - `high_qc` if this QC is higher
+    /// - `certified_blocks` for 3-chain tracking
+    /// - `locked_qc` if a 2-chain is formed (safety invariant)
+    ///
+    /// Then checks for commits using the 3-chain rule.
     fn handle_qc(&mut self, qc: &QuorumCertificate, now: Duration) {
-        // Check for commits BEFORE advancing (3-chain rule may be satisfied)
+        // Record QC in state machine - this updates locked_qc, certified_blocks,
+        // and high_qc as needed. Also triggers try_commit internally.
+        let committed = self.state.on_qc(qc);
+
+        // Check for commits (on_qc calls try_commit internally, but we need
+        // to check our deduplication logic and emit Commit actions)
         self.check_commits();
 
-        // A QC for a round higher than current allows us to advance
+        // If a commit occurred, we should emit the Commit action
+        // (check_commits already handles this via last_committed deduplication)
+
+        // A QC for a round >= current allows us to advance
         if qc.round >= self.state.round() {
             // The QC proves we can advance
             self.advance_round(now);
         }
+
+        // Log if committed for debugging (the actual Commit action is emitted by
+        // check_commits)
+        let _ = committed; // suppress unused warning, value is used for side effects
     }
 
     /// Handles a timeout event.
@@ -694,7 +731,24 @@ impl BftMachine {
                         self.check_commits();
                     }
                 },
-                _ => {},
+                BftEvent::NewViewReceived(ref nv) => {
+                    // Handle buffered NewView messages
+                    let old_round = self.state.round();
+                    if self.state.on_new_view(nv).is_ok() && self.state.round() > old_round {
+                        self.on_round_advanced(now);
+                    }
+                },
+                BftEvent::QcReceived(ref qc) => {
+                    // Handle buffered QC messages - integrate into state and check commits
+                    let _committed = self.state.on_qc(qc);
+                    self.check_commits();
+                    if qc.round >= self.state.round() {
+                        self.advance_round(now);
+                    }
+                },
+                BftEvent::Timeout | BftEvent::StartRound { .. } => {
+                    // Timeout and StartRound are not buffered, ignore if found
+                },
             }
         }
     }
@@ -731,10 +785,21 @@ impl BftMachine {
     }
 
     /// Pushes an action to the output queue.
+    ///
+    /// If the queue is full, logs a warning and drops the action.
+    /// This prevents denial-of-service via memory exhaustion while
+    /// making the issue visible for debugging.
     fn push_action(&mut self, action: BftAction) {
         // Enforce bounded queue
         if self.actions.len() < MAX_PENDING_ACTIONS {
             self.actions.push_back(action);
+        } else {
+            // Log warning about dropped action (DoS mitigation with visibility)
+            tracing::warn!(
+                action_type = ?std::mem::discriminant(&action),
+                queue_size = MAX_PENDING_ACTIONS,
+                "BFT action queue full, dropping action"
+            );
         }
     }
 
@@ -1177,15 +1242,19 @@ mod tests {
             };
 
         // === Round 1: Leader (validator 1) proposes B1 ===
-        let genesis_qc = QuorumCertificate::genesis(0, [0u8; 32]);
-        let b1_hash = [1u8; 32];
+        let genesis_hash = [0u8; 32];
+        let genesis_qc = QuorumCertificate::genesis(0, genesis_hash);
+        let payload1_hash = [0x11; 32];
+        // Compute proper block hash using the same algorithm as on_proposal
+        // verification
+        let b1_hash = BftMachine::compute_block_hash(0, 1, &payload1_hash, &genesis_hash);
         let mut proposal1 = Proposal {
             epoch: 0,
             round: 1,
             proposer_id: validators[1].id,
             block_hash: b1_hash,
             parent_qc: genesis_qc,
-            payload_hash: [0x11; 32],
+            payload_hash: payload1_hash,
             signature: [0u8; 64],
         };
         // Sign proposal with leader's key
@@ -1229,14 +1298,16 @@ mod tests {
         assert!(qc_formed, "QC1 should be formed");
 
         // === Round 2: Leader (validator 2) proposes B2 extending B1 ===
-        let b2_hash = [2u8; 32];
+        let payload2_hash = [0x22; 32];
+        // Compute proper block hash - parent is b1_hash from qc1
+        let b2_hash = BftMachine::compute_block_hash(0, 2, &payload2_hash, &b1_hash);
         let mut proposal2 = Proposal {
             epoch: 0,
             round: 2,
             proposer_id: validators[2].id,
             block_hash: b2_hash,
             parent_qc: qc1,
-            payload_hash: [0x22; 32],
+            payload_hash: payload2_hash,
             signature: [0u8; 64],
         };
         let leader2_msg = proposal2.signing_message();
@@ -1260,14 +1331,16 @@ mod tests {
         let _ = machine.handle_event(BftEvent::VoteReceived(vote2_2), TEST_NOW);
 
         // === Round 3: Leader (validator 3) proposes B3 extending B2 ===
-        let b3_hash = [3u8; 32];
+        let payload3_hash = [0x33; 32];
+        // Compute proper block hash - parent is b2_hash from qc2
+        let b3_hash = BftMachine::compute_block_hash(0, 3, &payload3_hash, &b2_hash);
         let mut proposal3 = Proposal {
             epoch: 0,
             round: 3,
             proposer_id: validators[3].id,
             block_hash: b3_hash,
             parent_qc: qc2,
-            payload_hash: [0x33; 32],
+            payload_hash: payload3_hash,
             signature: [0u8; 64],
         };
         let leader3_msg = proposal3.signing_message();
