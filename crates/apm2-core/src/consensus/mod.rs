@@ -68,7 +68,9 @@
 pub mod anti_entropy;
 pub mod bft;
 pub mod bft_machine;
+pub mod crdt;
 pub mod discovery;
+pub mod equivocation;
 pub mod genesis;
 pub mod handlers;
 pub mod merkle;
@@ -76,6 +78,7 @@ pub mod metrics;
 pub mod network;
 pub mod qc_aggregator;
 pub mod relay;
+pub mod replication;
 pub mod tunnel;
 
 // BFT consensus (Chained HotStuff)
@@ -99,8 +102,21 @@ pub use bft_machine::{
     BftAction, BftEvent, BftMachine, MAX_BUFFERED_MESSAGES, MAX_PENDING_ACTIONS, MSG_BFT_NEW_VIEW,
     MSG_BFT_PROPOSAL, MSG_BFT_QC, MSG_BFT_VOTE,
 };
+// HLC-based CRDT merge operators (TCK-00197)
+pub use crdt::{
+    ConflictRecord, CrdtMergeError, GCounter, Hlc, HlcWithNodeId, LwwRegister,
+    MAX_CONFLICTS_PER_BATCH, MAX_KEY_LEN, MAX_NODE_ID_LEN, MAX_SET_ELEMENTS, MergeEngine,
+    MergeOperator, MergeResult, MergeWinner, NodeId, SetUnion, hash_value, validate_key,
+    validate_node_id,
+};
 pub use discovery::{
     DiscoveryConfig, DiscoveryError, PeerDiscovery, PeerInfo, PeerList, PeerStatus,
+};
+// Byzantine equivocation detection (TCK-00196)
+pub use equivocation::{
+    ConflictingProposal, DOMAIN_PREFIX_EQUIVOCATION, EquivocationCheckResult, EquivocationDetector,
+    EquivocationError, EquivocationEvidence, EquivocationType, MAX_CACHED_PROPOSALS,
+    MAX_PROPOSAL_AGE_SECS,
 };
 pub use genesis::{
     Genesis, GenesisConfig, GenesisConfigBuilder, GenesisError, GenesisValidator, InvitationToken,
@@ -139,6 +155,14 @@ pub use relay::process_tunnel_frame;
 pub use relay::{
     CLEANUP_INTERVAL, MAX_PENDING_MESSAGES, MAX_RELAY_ID_LEN, ROUTE_TIMEOUT, RelayConfig,
     RelayConfigBuilder, RelayError, RelayHolon, RelayStats, TunnelRegistry,
+};
+// Leader-based replication (TCK-00195)
+pub use replication::{
+    DEFAULT_ACK_TIMEOUT, MAX_ACKS_PER_PROPOSAL, MAX_PENDING_PROPOSALS,
+    MAX_REPLICATION_PAYLOAD_SIZE, MAX_TRACKED_PROPOSALS, MSG_REPLICATION_ACK, MSG_REPLICATION_NACK,
+    MSG_REPLICATION_PROPOSAL, NackReason, ReplicatedEvent, ReplicationAck, ReplicationConfig,
+    ReplicationEngine, ReplicationError, ReplicationMessage, ReplicationNack, ReplicationProposal,
+    ReplicationStats,
 };
 pub use tunnel::{
     HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, MAX_TUNNEL_ID_LEN, MAX_TUNNELS, MAX_WORKER_ID_LEN,
