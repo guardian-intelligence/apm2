@@ -39,20 +39,29 @@
 //! # Example
 //!
 //! ```rust
+//! use apm2_core::consensus::bft::ValidatorSignature;
 //! use apm2_core::crypto::Signer;
 //! use apm2_core::evidence::{
 //!     DataClassification, EvidenceCategory, EvidencePredicate,
 //!     GatePredicateReceipt, StrictlyOrderedEvidence, TotalOrderProof,
 //! };
 //!
+//! // Create test validator signatures (in production, these come from BFT consensus)
+//! let signatures = vec![
+//!     ValidatorSignature::new([1u8; 32], [0xaa; 64]),
+//!     ValidatorSignature::new([2u8; 32], [0xbb; 64]),
+//!     ValidatorSignature::new([3u8; 32], [0xcc; 64]),
+//! ];
+//!
 //! // Create a TotalOrder proof (from BFT consensus)
-//! let proof = TotalOrderProof {
-//!     epoch: 1,
-//!     round: 5,
-//!     block_hash: [0xab; 32],
-//!     qc_signature_count: 3,
-//!     finalized_at: 1_000_000_000,
-//! };
+//! let proof = TotalOrderProof::new(
+//!     1,             // epoch
+//!     5,             // round
+//!     [0xab; 32],    // block_hash
+//!     signatures,    // validator signatures
+//!     1_000_000_000, // finalized_at
+//! )
+//! .unwrap();
 //!
 //! // Create strictly-ordered evidence
 //! let evidence = StrictlyOrderedEvidence::try_new(
@@ -78,7 +87,8 @@ use serde::{Deserialize, Serialize};
 
 use super::category::EvidenceCategory;
 use super::classification::DataClassification;
-use crate::crypto::Hash;
+use crate::consensus::bft::ValidatorSignature;
+use crate::crypto::{Hash, SIGNATURE_SIZE};
 
 // =============================================================================
 // Constants (CTR-1303: Bounded Collections)
@@ -101,6 +111,18 @@ pub const MAX_EVIDENCE_ID_LEN: usize = 256;
 
 /// Maximum length for work IDs.
 pub const MAX_WORK_ID_LEN: usize = 256;
+
+/// Maximum number of evidence hashes in a gate predicate receipt.
+///
+/// Bounds the size of the `evidence_hashes` list to prevent denial-of-service
+/// via unbounded collections (CTR-1303).
+pub const MAX_EVIDENCE_HASHES: usize = 128;
+
+/// Maximum number of signatures in a `TotalOrder` proof.
+///
+/// Limits the number of validator signatures to prevent denial-of-service
+/// via unbounded collections (CTR-1303).
+pub const MAX_TOTAL_ORDER_SIGNATURES: usize = 16;
 
 /// Minimum quorum signature count for valid `TotalOrder` proof.
 ///
@@ -191,6 +213,33 @@ pub enum StrictlyOrderedError {
         /// Actual hash.
         actual: [u8; 32],
     },
+
+    /// Too many signatures in the `TotalOrder` proof.
+    TooManySignatures {
+        /// Number of signatures present.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Signature count does not match actual signatures in the proof.
+    SignatureCountMismatch {
+        /// Number of signatures in the collection.
+        actual: usize,
+        /// Declared signature count.
+        declared: usize,
+    },
+
+    /// Too many evidence hashes in the gate predicate receipt.
+    TooManyEvidenceHashes {
+        /// Number of hashes present.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Gate predicate receipt is not signed.
+    ReceiptNotSigned,
 }
 
 impl std::fmt::Display for StrictlyOrderedError {
@@ -234,6 +283,21 @@ impl std::fmt::Display for StrictlyOrderedError {
                     &actual[..8]
                 )
             },
+            Self::TooManySignatures { count, max } => {
+                write!(f, "too many signatures: {count} > {max}")
+            },
+            Self::SignatureCountMismatch { actual, declared } => {
+                write!(
+                    f,
+                    "signature count mismatch: {actual} signatures but declared {declared}"
+                )
+            },
+            Self::TooManyEvidenceHashes { count, max } => {
+                write!(f, "too many evidence hashes: {count} > {max}")
+            },
+            Self::ReceiptNotSigned => {
+                write!(f, "gate predicate receipt is not signed")
+            },
         }
     }
 }
@@ -264,7 +328,13 @@ pub struct TotalOrderProof {
     /// Number of quorum certificate signatures.
     ///
     /// Must be at least `MIN_QUORUM_SIGNATURES` for the proof to be valid.
+    /// Must match the length of `signatures`.
     pub qc_signature_count: usize,
+
+    /// Cryptographic signatures from validators.
+    ///
+    /// Bounded by `MAX_TOTAL_ORDER_SIGNATURES` (CTR-1303).
+    pub signatures: Vec<ValidatorSignature>,
 
     /// Timestamp when finalization occurred (Unix nanos).
     pub finalized_at: u64,
@@ -275,19 +345,31 @@ impl TotalOrderProof {
     ///
     /// # Errors
     ///
-    /// Returns an error if the quorum signature count is insufficient.
-    #[allow(clippy::missing_const_for_fn)]
+    /// Returns an error if:
+    /// - The signature count is insufficient (less than
+    ///   `MIN_QUORUM_SIGNATURES`)
+    /// - There are too many signatures (more than `MAX_TOTAL_ORDER_SIGNATURES`)
+    /// - The signature count doesn't match the actual number of signatures
     pub fn new(
         epoch: u64,
         round: u64,
         block_hash: [u8; 32],
-        qc_signature_count: usize,
+        signatures: Vec<ValidatorSignature>,
         finalized_at: u64,
     ) -> Result<Self, StrictlyOrderedError> {
+        let qc_signature_count = signatures.len();
+
         if qc_signature_count < MIN_QUORUM_SIGNATURES {
             return Err(StrictlyOrderedError::InsufficientQuorum {
                 have: qc_signature_count,
                 need: MIN_QUORUM_SIGNATURES,
+            });
+        }
+
+        if qc_signature_count > MAX_TOTAL_ORDER_SIGNATURES {
+            return Err(StrictlyOrderedError::TooManySignatures {
+                count: qc_signature_count,
+                max: MAX_TOTAL_ORDER_SIGNATURES,
             });
         }
 
@@ -296,6 +378,7 @@ impl TotalOrderProof {
             round,
             block_hash,
             qc_signature_count,
+            signatures,
             finalized_at,
         })
     }
@@ -304,8 +387,9 @@ impl TotalOrderProof {
     ///
     /// # Safety
     ///
-    /// This bypasses quorum validation. Use only when you have already
-    /// verified the proof through another mechanism (e.g., BFT machine).
+    /// This bypasses quorum and signature count validation. Use only when you
+    /// have already verified the proof through another mechanism (e.g., BFT
+    /// machine).
     #[must_use]
     #[allow(clippy::missing_const_for_fn)]
     pub fn new_unchecked(
@@ -313,6 +397,7 @@ impl TotalOrderProof {
         round: u64,
         block_hash: [u8; 32],
         qc_signature_count: usize,
+        signatures: Vec<ValidatorSignature>,
         finalized_at: u64,
     ) -> Self {
         Self {
@@ -320,8 +405,26 @@ impl TotalOrderProof {
             round,
             block_hash,
             qc_signature_count,
+            signatures,
             finalized_at,
         }
+    }
+
+    /// Validates that the signature count matches the actual number of
+    /// signatures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the declared signature count doesn't match the
+    /// actual number of signatures in the collection.
+    pub fn validate_signature_count(&self) -> Result<(), StrictlyOrderedError> {
+        if self.qc_signature_count != self.signatures.len() {
+            return Err(StrictlyOrderedError::SignatureCountMismatch {
+                actual: self.signatures.len(),
+                declared: self.qc_signature_count,
+            });
+        }
+        Ok(())
     }
 
     /// Returns true if the proof has sufficient quorum signatures.
@@ -438,6 +541,9 @@ impl StrictlyOrderedEvidence {
                 ),
             });
         }
+
+        // Validate signature count matches actual signatures
+        proof.validate_signature_count()?;
 
         Ok(Self {
             evidence_id: evidence_id.to_string(),
@@ -647,6 +753,51 @@ impl EvidencePredicate {
 // Gate Predicate Receipt
 // =============================================================================
 
+/// Custom serde for `Option<[u8; 64]>` signature (serde doesn't support arrays
+/// > 32).
+mod optional_signature_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::crypto::SIGNATURE_SIZE;
+
+    // Serde requires this specific signature for `with` attribute
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S>(
+        bytes: &Option<[u8; SIGNATURE_SIZE]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match bytes {
+            Some(arr) => arr.as_slice().serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<[u8; SIGNATURE_SIZE]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt = Option::<Vec<u8>>::deserialize(deserializer)?;
+        match opt {
+            Some(vec) => {
+                if vec.len() != SIGNATURE_SIZE {
+                    return Err(serde::de::Error::custom(format!(
+                        "expected {} bytes, got {}",
+                        SIGNATURE_SIZE,
+                        vec.len()
+                    )));
+                }
+                let mut arr = [0u8; SIGNATURE_SIZE];
+                arr.copy_from_slice(&vec);
+                Ok(Some(arr))
+            },
+            None => Ok(None),
+        }
+    }
+}
+
 /// Extended gate receipt with evidence predicates for auditability.
 ///
 /// This extends the base [`GateReceipt`](super::GateReceipt) with predicate
@@ -674,6 +825,8 @@ pub struct GatePredicateReceipt {
     pub evidence_predicates: Vec<EvidencePredicate>,
 
     /// BLAKE3 hash of strictly-ordered evidence included.
+    ///
+    /// Bounded by `MAX_EVIDENCE_HASHES` (CTR-1303).
     pub evidence_hashes: Vec<Hash>,
 
     /// Timestamp when the receipt was generated (Unix nanos).
@@ -684,15 +837,20 @@ pub struct GatePredicateReceipt {
 
     /// Number of evidence items without `TotalOrder` proof.
     pub unordered_count: usize,
+
+    /// Ed25519 signature over the receipt content.
+    #[serde(with = "optional_signature_serde")]
+    signature: Option<[u8; SIGNATURE_SIZE]>,
 }
 
 impl GatePredicateReceipt {
-    /// Creates a new gate predicate receipt.
+    /// Creates a new gate predicate receipt (unsigned).
     ///
     /// # Errors
     ///
-    /// Returns an error if the number of predicates exceeds
-    /// `MAX_EVIDENCE_PREDICATES`.
+    /// Returns an error if:
+    /// - The number of predicates exceeds `MAX_EVIDENCE_PREDICATES`
+    /// - The number of evidence hashes exceeds `MAX_EVIDENCE_HASHES`
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         receipt_id: String,
@@ -713,6 +871,14 @@ impl GatePredicateReceipt {
             });
         }
 
+        // Validate evidence hashes count (CTR-1303)
+        if evidence_hashes.len() > MAX_EVIDENCE_HASHES {
+            return Err(StrictlyOrderedError::TooManyEvidenceHashes {
+                count: evidence_hashes.len(),
+                max: MAX_EVIDENCE_HASHES,
+            });
+        }
+
         Ok(Self {
             receipt_id,
             gate_id,
@@ -723,7 +889,79 @@ impl GatePredicateReceipt {
             generated_at,
             strictly_ordered_count,
             unordered_count,
+            signature: None,
         })
+    }
+
+    /// Creates a new signed gate predicate receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The number of predicates exceeds `MAX_EVIDENCE_PREDICATES`
+    /// - The number of evidence hashes exceeds `MAX_EVIDENCE_HASHES`
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_signed(
+        receipt_id: String,
+        gate_id: String,
+        work_id: String,
+        passed: bool,
+        evidence_predicates: Vec<EvidencePredicate>,
+        evidence_hashes: Vec<Hash>,
+        generated_at: u64,
+        strictly_ordered_count: usize,
+        unordered_count: usize,
+        signature: [u8; SIGNATURE_SIZE],
+    ) -> Result<Self, StrictlyOrderedError> {
+        // Validate predicates count (CTR-1303)
+        if evidence_predicates.len() > MAX_EVIDENCE_PREDICATES {
+            return Err(StrictlyOrderedError::TooManyPredicates {
+                count: evidence_predicates.len(),
+                max: MAX_EVIDENCE_PREDICATES,
+            });
+        }
+
+        // Validate evidence hashes count (CTR-1303)
+        if evidence_hashes.len() > MAX_EVIDENCE_HASHES {
+            return Err(StrictlyOrderedError::TooManyEvidenceHashes {
+                count: evidence_hashes.len(),
+                max: MAX_EVIDENCE_HASHES,
+            });
+        }
+
+        Ok(Self {
+            receipt_id,
+            gate_id,
+            work_id,
+            passed,
+            evidence_predicates,
+            evidence_hashes,
+            generated_at,
+            strictly_ordered_count,
+            unordered_count,
+            signature: Some(signature),
+        })
+    }
+
+    /// Sets the signature on this receipt.
+    #[allow(clippy::missing_const_for_fn)] // const fn cannot have mutable self
+    pub fn set_signature(&mut self, signature: [u8; SIGNATURE_SIZE]) {
+        self.signature = Some(signature);
+    }
+
+    /// Returns whether this receipt has a signature.
+    ///
+    /// Note: This only checks if a signature is present.
+    /// Use cryptographic verification to validate the signature.
+    #[must_use]
+    pub const fn is_signed(&self) -> bool {
+        self.signature.is_some()
+    }
+
+    /// Returns the signature bytes, if present.
+    #[must_use]
+    pub const fn signature(&self) -> Option<&[u8; SIGNATURE_SIZE]> {
+        self.signature.as_ref()
     }
 
     /// Returns true if all predicates were satisfied.
@@ -798,24 +1036,37 @@ impl GatePredicateReceipt {
 mod tests {
     use super::*;
 
+    #[allow(clippy::cast_possible_truncation)]
+    fn make_test_signatures(count: usize) -> Vec<ValidatorSignature> {
+        (0..count)
+            .map(|i| {
+                let mut validator_id = [0u8; 32];
+                validator_id[0] = i as u8;
+                ValidatorSignature::new(validator_id, [0xab; 64])
+            })
+            .collect()
+    }
+
     fn make_valid_proof() -> TotalOrderProof {
-        TotalOrderProof {
-            epoch: 1,
-            round: 5,
-            block_hash: [0xab; 32],
-            qc_signature_count: 3, // Minimum quorum
-            finalized_at: 1_000_000_000,
-        }
+        TotalOrderProof::new(
+            1,
+            5,
+            [0xab; 32],
+            make_test_signatures(3), // Minimum quorum
+            1_000_000_000,
+        )
+        .unwrap()
     }
 
     fn make_insufficient_proof() -> TotalOrderProof {
-        TotalOrderProof {
-            epoch: 1,
-            round: 5,
-            block_hash: [0xab; 32],
-            qc_signature_count: 2, // Below minimum
-            finalized_at: 1_000_000_000,
-        }
+        TotalOrderProof::new_unchecked(
+            1,
+            5,
+            [0xab; 32],
+            2, // Below minimum
+            make_test_signatures(2),
+            1_000_000_000,
+        )
     }
 
     // =========================================================================
@@ -824,16 +1075,19 @@ mod tests {
 
     #[test]
     fn test_total_order_proof_new() {
-        let proof = TotalOrderProof::new(1, 5, [0xab; 32], 3, 1_000_000_000);
+        let signatures = make_test_signatures(3);
+        let proof = TotalOrderProof::new(1, 5, [0xab; 32], signatures, 1_000_000_000);
         assert!(proof.is_ok());
         let proof = proof.unwrap();
         assert!(proof.has_quorum());
         assert_eq!(proof.view(), (1, 5));
+        assert_eq!(proof.signatures.len(), 3);
     }
 
     #[test]
     fn test_total_order_proof_insufficient_quorum() {
-        let result = TotalOrderProof::new(1, 5, [0xab; 32], 2, 1_000_000_000);
+        let signatures = make_test_signatures(2);
+        let result = TotalOrderProof::new(1, 5, [0xab; 32], signatures, 1_000_000_000);
         assert!(matches!(
             result,
             Err(StrictlyOrderedError::InsufficientQuorum { have: 2, need: 3 })
@@ -843,8 +1097,46 @@ mod tests {
     #[test]
     fn test_total_order_proof_unchecked() {
         // _unchecked allows insufficient quorum (for trusted contexts)
-        let proof = TotalOrderProof::new_unchecked(1, 5, [0xab; 32], 1, 1_000_000_000);
+        let proof = TotalOrderProof::new_unchecked(
+            1,
+            5,
+            [0xab; 32],
+            1,
+            make_test_signatures(1),
+            1_000_000_000,
+        );
         assert!(!proof.has_quorum());
+    }
+
+    #[test]
+    fn tck_00198_total_order_proof_rejects_too_many_signatures() {
+        let signatures = make_test_signatures(MAX_TOTAL_ORDER_SIGNATURES + 1);
+        let result = TotalOrderProof::new(1, 5, [0xab; 32], signatures, 1_000_000_000);
+        assert!(matches!(
+            result,
+            Err(StrictlyOrderedError::TooManySignatures { count: 17, max: 16 })
+        ));
+    }
+
+    #[test]
+    fn tck_00198_total_order_proof_signature_count_mismatch() {
+        // Create a proof with mismatched count using new_unchecked
+        let proof = TotalOrderProof::new_unchecked(
+            1,
+            5,
+            [0xab; 32],
+            5,                       // Declared count
+            make_test_signatures(3), // Actual signatures
+            1_000_000_000,
+        );
+        let result = proof.validate_signature_count();
+        assert!(matches!(
+            result,
+            Err(StrictlyOrderedError::SignatureCountMismatch {
+                actual: 3,
+                declared: 5
+            })
+        ));
     }
 
     // =========================================================================
@@ -1235,7 +1527,7 @@ mod tests {
 
     #[test]
     fn tck_00198_serde_deny_unknown_fields_total_order_proof() {
-        let json = r#"{"epoch": 1, "round": 5, "block_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], "qc_signature_count": 3, "finalized_at": 1000000000, "extra_field": "attack"}"#;
+        let json = r#"{"epoch": 1, "round": 5, "block_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], "qc_signature_count": 3, "signatures": [], "finalized_at": 1000000000, "extra_field": "attack"}"#;
 
         let result: Result<TotalOrderProof, _> = serde_json::from_str(json);
         assert!(result.is_err());
@@ -1247,7 +1539,7 @@ mod tests {
     fn tck_00198_serde_deny_unknown_fields_strictly_ordered_evidence() {
         // Note: EvidenceCategory and DataClassification serialize as PascalCase
         // (derived serde), not SCREAMING_SNAKE_CASE
-        let json = r#"{"evidence_id": "evid-001", "work_id": "work-123", "category": "TestResults", "artifact_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], "artifact_size": 1024, "classification": "Internal", "total_order_proof": {"epoch": 1, "round": 5, "block_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], "qc_signature_count": 3, "finalized_at": 1000000000}, "created_at": 1000000000, "extra_field": "attack"}"#;
+        let json = r#"{"evidence_id": "evid-001", "work_id": "work-123", "category": "TestResults", "artifact_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], "artifact_size": 1024, "classification": "Internal", "total_order_proof": {"epoch": 1, "round": 5, "block_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], "qc_signature_count": 3, "signatures": [], "finalized_at": 1000000000}, "created_at": 1000000000, "extra_field": "attack"}"#;
 
         let result: Result<StrictlyOrderedEvidence, _> = serde_json::from_str(json);
         assert!(result.is_err());
@@ -1267,7 +1559,7 @@ mod tests {
 
     #[test]
     fn tck_00198_serde_deny_unknown_fields_gate_predicate_receipt() {
-        let json = r#"{"receipt_id": "rcpt-001", "gate_id": "gate-001", "work_id": "work-123", "passed": true, "evidence_predicates": [], "evidence_hashes": [], "generated_at": 2000000000, "strictly_ordered_count": 0, "unordered_count": 0, "extra_field": "attack"}"#;
+        let json = r#"{"receipt_id": "rcpt-001", "gate_id": "gate-001", "work_id": "work-123", "passed": true, "evidence_predicates": [], "evidence_hashes": [], "generated_at": 2000000000, "strictly_ordered_count": 0, "unordered_count": 0, "signature": null, "extra_field": "attack"}"#;
 
         let result: Result<GatePredicateReceipt, _> = serde_json::from_str(json);
         assert!(result.is_err());
@@ -1298,5 +1590,220 @@ mod tests {
         };
         assert!(err.to_string().contains("100"));
         assert!(err.to_string().contains("64"));
+
+        let err = StrictlyOrderedError::TooManySignatures { count: 20, max: 16 };
+        assert!(err.to_string().contains("20"));
+        assert!(err.to_string().contains("16"));
+
+        let err = StrictlyOrderedError::SignatureCountMismatch {
+            actual: 3,
+            declared: 5,
+        };
+        assert!(err.to_string().contains('3'));
+        assert!(err.to_string().contains('5'));
+
+        let err = StrictlyOrderedError::TooManyEvidenceHashes {
+            count: 200,
+            max: 128,
+        };
+        assert!(err.to_string().contains("200"));
+        assert!(err.to_string().contains("128"));
+
+        let err = StrictlyOrderedError::ReceiptNotSigned;
+        assert!(err.to_string().contains("not signed"));
+    }
+
+    // =========================================================================
+    // Evidence hashes bounds tests (CTR-1303)
+    // =========================================================================
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tck_00198_gate_predicate_receipt_rejects_too_many_evidence_hashes() {
+        let predicates = vec![EvidencePredicate::total_order_finalized(
+            "evid-001",
+            true,
+            1_000_000_000,
+        )];
+
+        // Create more evidence hashes than allowed
+        let evidence_hashes: Vec<Hash> = (0..=MAX_EVIDENCE_HASHES)
+            .map(|i| {
+                let mut hash = [0u8; 32];
+                hash[0] = i as u8;
+                hash
+            })
+            .collect();
+
+        let result = GatePredicateReceipt::try_new(
+            "rcpt-001".to_string(),
+            "gate-001".to_string(),
+            "work-123".to_string(),
+            true,
+            predicates,
+            evidence_hashes,
+            2_000_000_000,
+            0,
+            0,
+        );
+
+        assert!(matches!(
+            result,
+            Err(StrictlyOrderedError::TooManyEvidenceHashes {
+                count: 129,
+                max: 128
+            })
+        ));
+    }
+
+    // =========================================================================
+    // Signed/Unsigned receipt tests
+    // =========================================================================
+
+    #[test]
+    fn tck_00198_gate_predicate_receipt_unsigned_by_default() {
+        let receipt = GatePredicateReceipt::try_new(
+            "rcpt-001".to_string(),
+            "gate-001".to_string(),
+            "work-123".to_string(),
+            true,
+            vec![],
+            vec![],
+            2_000_000_000,
+            0,
+            0,
+        )
+        .unwrap();
+
+        assert!(!receipt.is_signed());
+        assert!(receipt.signature().is_none());
+    }
+
+    #[test]
+    fn tck_00198_gate_predicate_receipt_try_new_signed() {
+        let signature = [0xab; SIGNATURE_SIZE];
+        let receipt = GatePredicateReceipt::try_new_signed(
+            "rcpt-001".to_string(),
+            "gate-001".to_string(),
+            "work-123".to_string(),
+            true,
+            vec![],
+            vec![],
+            2_000_000_000,
+            0,
+            0,
+            signature,
+        )
+        .unwrap();
+
+        assert!(receipt.is_signed());
+        assert_eq!(receipt.signature(), Some(&signature));
+    }
+
+    #[test]
+    fn tck_00198_gate_predicate_receipt_set_signature() {
+        let mut receipt = GatePredicateReceipt::try_new(
+            "rcpt-001".to_string(),
+            "gate-001".to_string(),
+            "work-123".to_string(),
+            true,
+            vec![],
+            vec![],
+            2_000_000_000,
+            0,
+            0,
+        )
+        .unwrap();
+
+        assert!(!receipt.is_signed());
+
+        let signature = [0xcd; SIGNATURE_SIZE];
+        receipt.set_signature(signature);
+
+        assert!(receipt.is_signed());
+        assert_eq!(receipt.signature(), Some(&signature));
+    }
+
+    #[test]
+    fn tck_00198_gate_predicate_receipt_serde_with_signature() {
+        let signature = [0xef; SIGNATURE_SIZE];
+        let receipt = GatePredicateReceipt::try_new_signed(
+            "rcpt-001".to_string(),
+            "gate-001".to_string(),
+            "work-123".to_string(),
+            true,
+            vec![],
+            vec![],
+            2_000_000_000,
+            0,
+            0,
+            signature,
+        )
+        .unwrap();
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&receipt).unwrap();
+        let deserialized: GatePredicateReceipt = serde_json::from_str(&json).unwrap();
+
+        assert!(deserialized.is_signed());
+        assert_eq!(deserialized.signature(), Some(&signature));
+    }
+
+    #[test]
+    fn tck_00198_gate_predicate_receipt_serde_without_signature() {
+        let receipt = GatePredicateReceipt::try_new(
+            "rcpt-001".to_string(),
+            "gate-001".to_string(),
+            "work-123".to_string(),
+            true,
+            vec![],
+            vec![],
+            2_000_000_000,
+            0,
+            0,
+        )
+        .unwrap();
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&receipt).unwrap();
+        let deserialized: GatePredicateReceipt = serde_json::from_str(&json).unwrap();
+
+        assert!(!deserialized.is_signed());
+        assert!(deserialized.signature().is_none());
+    }
+
+    // =========================================================================
+    // StrictlyOrderedEvidence signature count validation tests
+    // =========================================================================
+
+    #[test]
+    fn tck_00198_strictly_ordered_evidence_rejects_signature_count_mismatch() {
+        // Create a proof with mismatched signature count using new_unchecked
+        let proof = TotalOrderProof::new_unchecked(
+            1,
+            5,
+            [0xab; 32],
+            5,                       // Declared count
+            make_test_signatures(3), // Actual signatures (3, not 5)
+            1_000_000_000,
+        );
+
+        let result = StrictlyOrderedEvidence::try_new(
+            "evid-001",
+            "work-123",
+            EvidenceCategory::TestResults,
+            [1u8; 32],
+            1024,
+            DataClassification::Internal,
+            &proof,
+        );
+
+        assert!(matches!(
+            result,
+            Err(StrictlyOrderedError::SignatureCountMismatch {
+                actual: 3,
+                declared: 5
+            })
+        ));
     }
 }
