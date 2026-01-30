@@ -20,6 +20,12 @@
 //! The signature covers the canonical encoding of the lease (excluding the
 //! signature field itself) with the `GATE_LEASE_ISSUED:` domain prefix.
 //!
+//! # AAT Extension
+//!
+//! For AAT gates, the lease includes an optional `aat_extension` field that
+//! binds the lease to specific RCP manifest and view commitment. This is
+//! required by RFC-0015 and TCK-00203.
+//!
 //! # Example
 //!
 //! ```rust
@@ -70,6 +76,38 @@ pub enum LeaseError {
 }
 
 // =============================================================================
+// AatLeaseExtension
+// =============================================================================
+
+/// AAT-specific extension fields for gate leases.
+///
+/// When a lease is issued for an AAT gate, this extension binds the lease
+/// to specific RCP manifest, view commitment, and selection policy.
+///
+/// # Fields
+///
+/// - `view_commitment_hash`: Hash of the view commitment for this AAT run
+/// - `rcp_manifest_hash`: Hash of the RCP manifest for this profile
+/// - `rcp_profile_id`: Identifier of the RCP profile being used
+/// - `selection_policy_id`: Identifier of the selection policy
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AatLeaseExtension {
+    /// Hash of the view commitment for this AAT run.
+    #[serde(with = "serde_bytes")]
+    pub view_commitment_hash: [u8; 32],
+
+    /// Hash of the RCP manifest for this profile.
+    #[serde(with = "serde_bytes")]
+    pub rcp_manifest_hash: [u8; 32],
+
+    /// Identifier of the RCP profile being used.
+    pub rcp_profile_id: String,
+
+    /// Identifier of the selection policy.
+    pub selection_policy_id: String,
+}
+
+// =============================================================================
 // GateLease
 // =============================================================================
 
@@ -91,6 +129,7 @@ pub enum LeaseError {
 /// - `policy_hash`: Hash of the resolved policy tuple
 /// - `issuer_actor_id`: Actor who issued the lease
 /// - `time_envelope_ref`: Reference to time envelope for temporal bounds
+/// - `aat_extension`: Optional AAT-specific extension (required for AAT gates)
 /// - `issuer_signature`: Ed25519 signature with domain separation
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateLease {
@@ -129,6 +168,12 @@ pub struct GateLease {
     /// Reference to the time envelope for temporal bounds.
     pub time_envelope_ref: String,
 
+    /// Optional AAT-specific extension (required for AAT gates).
+    ///
+    /// When `gate_id` is "aat", this field must be present and binds the
+    /// lease to specific RCP manifest and view commitment.
+    pub aat_extension: Option<AatLeaseExtension>,
+
     /// Ed25519 signature over canonical bytes with domain separation.
     #[serde(with = "serde_bytes")]
     pub issuer_signature: [u8; 64],
@@ -139,44 +184,52 @@ impl GateLease {
     ///
     /// The canonical representation includes all fields except the signature,
     /// encoded in a deterministic order.
+    ///
+    /// # Encoding
+    ///
+    /// Uses length-prefixed encoding (4-byte big-endian u32) for
+    /// variable-length strings to prevent canonicalization collision
+    /// attacks.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // String lengths are validated elsewhere
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let capacity = self.lease_id.len()
-            + 1
-            + self.work_id.len()
-            + 1
-            + self.gate_id.len()
-            + 1
+        // Calculate AAT extension size if present
+        let aat_ext_size = self.aat_extension.as_ref().map_or(0, |ext| {
+            1 + 32 + 32 + 4 + ext.rcp_profile_id.len() + 4 + ext.selection_policy_id.len()
+        });
+
+        let capacity = 4 + self.lease_id.len()
+            + 4 + self.work_id.len()
+            + 4 + self.gate_id.len()
             + 32  // changeset_digest
-            + self.executor_actor_id.len()
-            + 1
+            + 4 + self.executor_actor_id.len()
             + 8   // issued_at
             + 8   // expires_at
             + 32  // policy_hash
-            + self.issuer_actor_id.len()
-            + 1
-            + self.time_envelope_ref.len();
+            + 4 + self.issuer_actor_id.len()
+            + 4 + self.time_envelope_ref.len()
+            + aat_ext_size;
 
         let mut bytes = Vec::with_capacity(capacity);
 
-        // 1. lease_id
+        // 1. lease_id (length-prefixed)
+        bytes.extend_from_slice(&(self.lease_id.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.lease_id.as_bytes());
-        bytes.push(0); // null separator
 
-        // 2. work_id
+        // 2. work_id (length-prefixed)
+        bytes.extend_from_slice(&(self.work_id.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.work_id.as_bytes());
-        bytes.push(0);
 
-        // 3. gate_id
+        // 3. gate_id (length-prefixed)
+        bytes.extend_from_slice(&(self.gate_id.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.gate_id.as_bytes());
-        bytes.push(0);
 
         // 4. changeset_digest
         bytes.extend_from_slice(&self.changeset_digest);
 
-        // 5. executor_actor_id
+        // 5. executor_actor_id (length-prefixed)
+        bytes.extend_from_slice(&(self.executor_actor_id.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.executor_actor_id.as_bytes());
-        bytes.push(0);
 
         // 6. issued_at (big-endian)
         bytes.extend_from_slice(&self.issued_at.to_be_bytes());
@@ -187,12 +240,26 @@ impl GateLease {
         // 8. policy_hash
         bytes.extend_from_slice(&self.policy_hash);
 
-        // 9. issuer_actor_id
+        // 9. issuer_actor_id (length-prefixed)
+        bytes.extend_from_slice(&(self.issuer_actor_id.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.issuer_actor_id.as_bytes());
-        bytes.push(0);
 
-        // 10. time_envelope_ref
+        // 10. time_envelope_ref (length-prefixed)
+        bytes.extend_from_slice(&(self.time_envelope_ref.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.time_envelope_ref.as_bytes());
+
+        // 11. aat_extension (optional)
+        if let Some(ref ext) = self.aat_extension {
+            bytes.push(1); // presence flag
+            bytes.extend_from_slice(&ext.view_commitment_hash);
+            bytes.extend_from_slice(&ext.rcp_manifest_hash);
+            bytes.extend_from_slice(&(ext.rcp_profile_id.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(ext.rcp_profile_id.as_bytes());
+            bytes.extend_from_slice(&(ext.selection_policy_id.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(ext.selection_policy_id.as_bytes());
+        } else {
+            bytes.push(0); // absence flag
+        }
 
         bytes
     }
@@ -243,6 +310,7 @@ pub struct GateLeaseBuilder {
     policy_hash: Option<[u8; 32]>,
     issuer_actor_id: Option<String>,
     time_envelope_ref: Option<String>,
+    aat_extension: Option<AatLeaseExtension>,
 }
 
 impl GateLeaseBuilder {
@@ -310,6 +378,13 @@ impl GateLeaseBuilder {
         self
     }
 
+    /// Sets the AAT extension.
+    #[must_use]
+    pub fn aat_extension(mut self, extension: AatLeaseExtension) -> Self {
+        self.aat_extension = Some(extension);
+        self
+    }
+
     /// Builds the lease and signs it with the provided signer.
     ///
     /// # Panics
@@ -364,6 +439,7 @@ impl GateLeaseBuilder {
             policy_hash,
             issuer_actor_id,
             time_envelope_ref,
+            aat_extension: self.aat_extension,
             issuer_signature: [0u8; 64],
         };
 
@@ -494,5 +570,134 @@ pub mod tests {
                 .validate_signature(&signer.verifying_key())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_build_with_aat_extension() {
+        let signer = Signer::generate();
+        let lease = GateLeaseBuilder::new("lease-001", "work-001", "aat")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .aat_extension(AatLeaseExtension {
+                view_commitment_hash: [0x11; 32],
+                rcp_manifest_hash: [0x22; 32],
+                rcp_profile_id: "aat-profile-001".to_string(),
+                selection_policy_id: "policy-001".to_string(),
+            })
+            .build_and_sign(&signer);
+
+        assert_eq!(lease.gate_id, "aat");
+        assert!(lease.aat_extension.is_some());
+        let ext = lease.aat_extension.as_ref().unwrap();
+        assert_eq!(ext.view_commitment_hash, [0x11; 32]);
+        assert_eq!(ext.rcp_manifest_hash, [0x22; 32]);
+        assert_eq!(ext.rcp_profile_id, "aat-profile-001");
+        assert_eq!(ext.selection_policy_id, "policy-001");
+
+        // Signature should be valid
+        assert!(lease.validate_signature(&signer.verifying_key()).is_ok());
+    }
+
+    #[test]
+    fn test_aat_extension_in_canonical_bytes() {
+        let signer = Signer::generate();
+
+        // Create lease without AAT extension
+        let lease_without_ext = GateLeaseBuilder::new("lease-001", "work-001", "gate-build")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        // Create lease with AAT extension
+        let lease_with_ext = GateLeaseBuilder::new("lease-001", "work-001", "gate-build")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .aat_extension(AatLeaseExtension {
+                view_commitment_hash: [0x11; 32],
+                rcp_manifest_hash: [0x22; 32],
+                rcp_profile_id: "aat-profile-001".to_string(),
+                selection_policy_id: "policy-001".to_string(),
+            })
+            .build_and_sign(&signer);
+
+        // Canonical bytes should be different
+        assert_ne!(
+            lease_without_ext.canonical_bytes(),
+            lease_with_ext.canonical_bytes()
+        );
+    }
+
+    #[test]
+    fn test_aat_extension_binds_to_signature() {
+        let signer = Signer::generate();
+        let mut lease = GateLeaseBuilder::new("lease-001", "work-001", "aat")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .aat_extension(AatLeaseExtension {
+                view_commitment_hash: [0x11; 32],
+                rcp_manifest_hash: [0x22; 32],
+                rcp_profile_id: "aat-profile-001".to_string(),
+                selection_policy_id: "policy-001".to_string(),
+            })
+            .build_and_sign(&signer);
+
+        // Modify AAT extension after signing
+        if let Some(ref mut ext) = lease.aat_extension {
+            ext.rcp_manifest_hash = [0xFF; 32];
+        }
+
+        // Signature should now be invalid
+        assert!(lease.validate_signature(&signer.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn test_length_prefixed_canonicalization_prevents_collision() {
+        let signer = Signer::generate();
+
+        // Create two leases with different field values that could collide
+        // with null-termination but not with length-prefixing
+        let lease1 = GateLeaseBuilder::new("ab", "cd", "gate")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("ef")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer")
+            .time_envelope_ref("ref")
+            .build_and_sign(&signer);
+
+        // "ab" + "cd" + "ef" should NOT equal "a" + "bcd" + "ef" with length-prefixing
+        let lease2 = GateLeaseBuilder::new("a", "bcd", "gate")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("ef")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer")
+            .time_envelope_ref("ref")
+            .build_and_sign(&signer);
+
+        // Canonical bytes should be different
+        assert_ne!(lease1.canonical_bytes(), lease2.canonical_bytes());
     }
 }

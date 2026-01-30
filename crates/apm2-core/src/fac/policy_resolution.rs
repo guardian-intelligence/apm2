@@ -59,6 +59,17 @@
 //! ```
 
 use prost::Message;
+
+// =============================================================================
+// Resource Limits
+// =============================================================================
+
+/// Maximum number of RCP profiles allowed in a policy resolution.
+/// This prevents denial-of-service attacks via oversized repeated fields.
+pub const MAX_RCP_PROFILES: usize = 256;
+
+/// Maximum number of verifier policy hashes allowed in a policy resolution.
+pub const MAX_VERIFIER_POLICIES: usize = 256;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -115,6 +126,35 @@ pub enum PolicyResolutionError {
         expected: String,
         /// Actual hash from receipt.
         actual: String,
+    },
+
+    /// Collection size exceeds resource limit.
+    #[error("collection size exceeds limit: {field} has {actual} items, max is {max}")]
+    CollectionTooLarge {
+        /// Name of the field that exceeded the limit.
+        field: &'static str,
+        /// Actual size of the collection.
+        actual: usize,
+        /// Maximum allowed size.
+        max: usize,
+    },
+
+    /// RCP profile ID and manifest hash arrays have mismatched lengths.
+    #[error(
+        "rcp_profile_ids length ({profile_count}) != rcp_manifest_hashes length ({hash_count})"
+    )]
+    ProfileHashLengthMismatch {
+        /// Number of profile IDs.
+        profile_count: usize,
+        /// Number of manifest hashes.
+        hash_count: usize,
+    },
+
+    /// RCP manifest hash mismatch in lease AAT extension.
+    #[error("lease rcp_manifest_hash does not match resolved hash for profile {profile_id}")]
+    RcpManifestHashMismatch {
+        /// The profile ID that was checked.
+        profile_id: String,
     },
 }
 
@@ -236,9 +276,16 @@ impl PolicyResolvedForChangeSet {
     /// Computes the policy hash from the resolved fields.
     ///
     /// The hash is computed over:
-    /// `risk_tier || determinism_class || sorted(rcp_profile_ids) ||
-    ///  sorted(rcp_manifest_hashes) || sorted(verifier_policy_hashes)`
+    /// `risk_tier || determinism_class || sorted_pairs(rcp_profile_ids,
+    /// rcp_manifest_hashes) ||  sorted(verifier_policy_hashes)`
+    ///
+    /// # Encoding
+    ///
+    /// Uses length-prefixed encoding (4-byte big-endian u32) for
+    /// variable-length strings to prevent canonicalization collision
+    /// attacks.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // Collection sizes are validated by MAX_RCP_PROFILES
     fn compute_policy_hash(
         risk_tier: u8,
         determinism_class: u8,
@@ -251,26 +298,29 @@ impl PolicyResolvedForChangeSet {
         // Risk tier and determinism class
         hasher.update(&[risk_tier, determinism_class]);
 
-        // Sorted RCP profile IDs
-        let mut sorted_ids = rcp_profile_ids.to_vec();
-        sorted_ids.sort();
-        for id in &sorted_ids {
-            hasher.update(id.as_bytes());
-            hasher.update(&[0]); // null separator
-        }
-        hasher.update(&[0xFF]); // section separator
+        // Zip, sort by profile ID, then encode pairs together to maintain alignment
+        let mut pairs: Vec<(&String, &[u8; 32])> = rcp_profile_ids
+            .iter()
+            .zip(rcp_manifest_hashes.iter())
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
 
-        // Sorted RCP manifest hashes
-        let mut sorted_manifests = rcp_manifest_hashes.to_vec();
-        sorted_manifests.sort_unstable();
-        for hash in &sorted_manifests {
-            hasher.update(hash);
+        // Write number of pairs as u32
+        hasher.update(&(pairs.len() as u32).to_be_bytes());
+        for (id, hash) in &pairs {
+            // Length-prefixed encoding for profile ID
+            hasher.update(&(id.len() as u32).to_be_bytes());
+            hasher.update(id.as_bytes());
+            // Fixed-length hash (no length prefix needed)
+            hasher.update(*hash);
         }
         hasher.update(&[0xFF]); // section separator
 
         // Sorted verifier policy hashes
         let mut sorted_verifiers = verifier_policy_hashes.to_vec();
         sorted_verifiers.sort_unstable();
+        // Write number of verifier hashes
+        hasher.update(&(sorted_verifiers.len() as u32).to_be_bytes());
         for hash in &sorted_verifiers {
             hasher.update(hash);
         }
@@ -282,26 +332,46 @@ impl PolicyResolvedForChangeSet {
     ///
     /// The canonical representation includes all fields except the signature,
     /// encoded in a deterministic order.
+    ///
+    /// # Encoding
+    ///
+    /// Uses length-prefixed encoding (4-byte big-endian u32) for
+    /// variable-length strings to prevent canonicalization collision
+    /// attacks.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // Collection sizes are validated by MAX_RCP_PROFILES
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let capacity = self.work_id.len()
-            + 1
+        // Capacity includes:
+        // - 4 bytes for work_id length + work_id content
+        // - 32 bytes for changeset_digest
+        // - 32 bytes for resolved_policy_hash
+        // - 2 bytes for risk_tier + determinism_class
+        // - 4 bytes for pairs count
+        // - For each profile: 4 bytes length + content + 32 bytes hash
+        // - 1 byte section separator
+        // - 4 bytes for verifier count + 32 bytes per verifier hash
+        // - 1 byte section separator
+        // - 4 bytes for resolver_actor_id length + content
+        // - 4 bytes for resolver_version length + content
+        let capacity = 4
+            + self.work_id.len()
             + 32 // changeset_digest
             + 32 // resolved_policy_hash
             + 2  // risk_tier + determinism_class
-            + self.resolved_rcp_profile_ids.iter().map(|s| s.len() + 1).sum::<usize>()
-            + self.resolved_rcp_manifest_hashes.len() * 32
+            + 4  // pairs count
+            + self.resolved_rcp_profile_ids.iter().map(|s| 4 + s.len() + 32).sum::<usize>()
+            + 1  // section separator
+            + 4  // verifier count
             + self.resolved_verifier_policy_hashes.len() * 32
-            + self.resolver_actor_id.len()
-            + 1
-            + self.resolver_version.len()
-            + 1;
+            + 1  // section separator
+            + 4 + self.resolver_actor_id.len()
+            + 4 + self.resolver_version.len();
 
         let mut bytes = Vec::with_capacity(capacity);
 
-        // 1. work_id
+        // 1. work_id (length-prefixed)
+        bytes.extend_from_slice(&(self.work_id.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.work_id.as_bytes());
-        bytes.push(0); // null separator
 
         // 2. changeset_digest
         bytes.extend_from_slice(&self.changeset_digest);
@@ -315,36 +385,43 @@ impl PolicyResolvedForChangeSet {
         // 5. resolved_determinism_class
         bytes.push(self.resolved_determinism_class);
 
-        // 6. resolved_rcp_profile_ids (sorted)
-        let mut sorted_ids = self.resolved_rcp_profile_ids.clone();
-        sorted_ids.sort();
-        for id in &sorted_ids {
-            bytes.extend_from_slice(id.as_bytes());
-            bytes.push(0);
-        }
-        bytes.push(0xFF); // section separator
+        // 6+7. resolved_rcp_profile_ids and resolved_rcp_manifest_hashes
+        // Zip, sort by profile ID, maintain alignment
+        let mut pairs: Vec<(&String, &[u8; 32])> = self
+            .resolved_rcp_profile_ids
+            .iter()
+            .zip(self.resolved_rcp_manifest_hashes.iter())
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
 
-        // 7. resolved_rcp_manifest_hashes (sorted)
-        let mut sorted_manifests = self.resolved_rcp_manifest_hashes.clone();
-        sorted_manifests.sort_unstable();
-        for hash in &sorted_manifests {
-            bytes.extend_from_slice(hash);
+        // Write count of pairs
+        bytes.extend_from_slice(&(pairs.len() as u32).to_be_bytes());
+        for (id, hash) in &pairs {
+            // Length-prefixed profile ID
+            bytes.extend_from_slice(&(id.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(id.as_bytes());
+            // Fixed-length hash
+            bytes.extend_from_slice(*hash);
         }
         bytes.push(0xFF); // section separator
 
         // 8. resolved_verifier_policy_hashes (sorted)
         let mut sorted_verifiers = self.resolved_verifier_policy_hashes.clone();
         sorted_verifiers.sort_unstable();
+
+        // Write count of verifier hashes
+        bytes.extend_from_slice(&(sorted_verifiers.len() as u32).to_be_bytes());
         for hash in &sorted_verifiers {
             bytes.extend_from_slice(hash);
         }
         bytes.push(0xFF); // section separator
 
-        // 9. resolver_actor_id
+        // 9. resolver_actor_id (length-prefixed)
+        bytes.extend_from_slice(&(self.resolver_actor_id.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.resolver_actor_id.as_bytes());
-        bytes.push(0);
 
-        // 10. resolver_version
+        // 10. resolver_version (length-prefixed)
+        bytes.extend_from_slice(&(self.resolver_version.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.resolver_version.as_bytes());
 
         bytes
@@ -381,6 +458,23 @@ impl PolicyResolvedForChangeSet {
         .map_err(|e| PolicyResolutionError::InvalidSignature(e.to_string()))
     }
 
+    /// Looks up the manifest hash for a given RCP profile ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `profile_id` - The RCP profile ID to look up
+    ///
+    /// # Returns
+    ///
+    /// `Some(&[u8; 32])` if the profile ID is found, `None` otherwise.
+    #[must_use]
+    pub fn get_manifest_hash_for_profile(&self, profile_id: &str) -> Option<&[u8; 32]> {
+        self.resolved_rcp_profile_ids
+            .iter()
+            .position(|id| id == profile_id)
+            .map(|idx| &self.resolved_rcp_manifest_hashes[idx])
+    }
+
     /// Verifies that a lease's `policy_hash` matches this resolution.
     ///
     /// This is the primary mechanism for ensuring that leases operate under
@@ -401,6 +495,9 @@ impl PolicyResolvedForChangeSet {
     /// changeset digests don't match.
     /// Returns [`PolicyResolutionError::PolicyHashMismatch`] if policy hashes
     /// don't match.
+    /// Returns [`PolicyResolutionError::RcpManifestHashMismatch`] if the lease
+    /// has an AAT extension and its `rcp_manifest_hash` doesn't match the
+    /// resolved hash for the corresponding `rcp_profile_id`.
     pub fn verify_lease_match(&self, lease: &GateLease) -> Result<(), PolicyResolutionError> {
         // Check work_id matches
         if self.work_id != lease.work_id {
@@ -421,6 +518,23 @@ impl PolicyResolvedForChangeSet {
                 resolution_hash: hex_encode(&self.resolved_policy_hash),
                 lease_hash: hex_encode(&lease.policy_hash),
             });
+        }
+
+        // If lease has an AAT extension, verify rcp_manifest_hash matches
+        if let Some(ref aat_ext) = lease.aat_extension {
+            if let Some(resolved_hash) = self.get_manifest_hash_for_profile(&aat_ext.rcp_profile_id)
+            {
+                if &aat_ext.rcp_manifest_hash != resolved_hash {
+                    return Err(PolicyResolutionError::RcpManifestHashMismatch {
+                        profile_id: aat_ext.rcp_profile_id.clone(),
+                    });
+                }
+            } else {
+                // Profile ID not found in resolution - this is a mismatch
+                return Err(PolicyResolutionError::RcpManifestHashMismatch {
+                    profile_id: aat_ext.rcp_profile_id.clone(),
+                });
+            }
         }
 
         Ok(())
@@ -584,6 +698,11 @@ impl PolicyResolvedForChangeSetBuilder {
     ///
     /// Returns [`PolicyResolutionError::MissingField`] if any required field is
     /// not set.
+    /// Returns [`PolicyResolutionError::ProfileHashLengthMismatch`] if
+    /// `resolved_rcp_profile_ids` and `resolved_rcp_manifest_hashes` have
+    /// different lengths.
+    /// Returns [`PolicyResolutionError::CollectionTooLarge`] if any collection
+    /// exceeds resource limits.
     pub fn try_build_and_sign(
         self,
         signer: &crate::crypto::Signer,
@@ -603,13 +722,42 @@ impl PolicyResolvedForChangeSetBuilder {
             .resolver_version
             .ok_or(PolicyResolutionError::MissingField("resolver_version"))?;
 
-        // Sort arrays for canonical encoding
-        let mut resolved_rcp_profile_ids = self.resolved_rcp_profile_ids;
-        resolved_rcp_profile_ids.sort();
+        // Validate length alignment between profile IDs and manifest hashes
+        if self.resolved_rcp_profile_ids.len() != self.resolved_rcp_manifest_hashes.len() {
+            return Err(PolicyResolutionError::ProfileHashLengthMismatch {
+                profile_count: self.resolved_rcp_profile_ids.len(),
+                hash_count: self.resolved_rcp_manifest_hashes.len(),
+            });
+        }
 
-        let mut resolved_rcp_manifest_hashes = self.resolved_rcp_manifest_hashes;
-        resolved_rcp_manifest_hashes.sort_unstable();
+        // Validate resource limits
+        if self.resolved_rcp_profile_ids.len() > MAX_RCP_PROFILES {
+            return Err(PolicyResolutionError::CollectionTooLarge {
+                field: "resolved_rcp_profile_ids",
+                actual: self.resolved_rcp_profile_ids.len(),
+                max: MAX_RCP_PROFILES,
+            });
+        }
+        if self.resolved_verifier_policy_hashes.len() > MAX_VERIFIER_POLICIES {
+            return Err(PolicyResolutionError::CollectionTooLarge {
+                field: "resolved_verifier_policy_hashes",
+                actual: self.resolved_verifier_policy_hashes.len(),
+                max: MAX_VERIFIER_POLICIES,
+            });
+        }
 
+        // Zip profile IDs with manifest hashes, sort by ID, then unzip
+        // This maintains alignment between IDs and their corresponding hashes
+        let mut pairs: Vec<(String, [u8; 32])> = self
+            .resolved_rcp_profile_ids
+            .into_iter()
+            .zip(self.resolved_rcp_manifest_hashes)
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let (resolved_rcp_profile_ids, resolved_rcp_manifest_hashes): (Vec<_>, Vec<_>) =
+            pairs.into_iter().unzip();
+
+        // Sort verifier policy hashes independently (they're not paired)
         let mut resolved_verifier_policy_hashes = self.resolved_verifier_policy_hashes;
         resolved_verifier_policy_hashes.sort_unstable();
 
@@ -692,6 +840,37 @@ impl TryFrom<PolicyResolvedForChangeSetProto> for PolicyResolvedForChangeSet {
     type Error = PolicyResolutionError;
 
     fn try_from(proto: PolicyResolvedForChangeSetProto) -> Result<Self, Self::Error> {
+        // Validate resource limits on repeated fields FIRST to prevent DoS
+        if proto.resolved_rcp_profile_ids.len() > MAX_RCP_PROFILES {
+            return Err(PolicyResolutionError::CollectionTooLarge {
+                field: "resolved_rcp_profile_ids",
+                actual: proto.resolved_rcp_profile_ids.len(),
+                max: MAX_RCP_PROFILES,
+            });
+        }
+        if proto.resolved_rcp_manifest_hashes.len() > MAX_RCP_PROFILES {
+            return Err(PolicyResolutionError::CollectionTooLarge {
+                field: "resolved_rcp_manifest_hashes",
+                actual: proto.resolved_rcp_manifest_hashes.len(),
+                max: MAX_RCP_PROFILES,
+            });
+        }
+        if proto.resolved_verifier_policy_hashes.len() > MAX_VERIFIER_POLICIES {
+            return Err(PolicyResolutionError::CollectionTooLarge {
+                field: "resolved_verifier_policy_hashes",
+                actual: proto.resolved_verifier_policy_hashes.len(),
+                max: MAX_VERIFIER_POLICIES,
+            });
+        }
+
+        // Validate length alignment between profile IDs and manifest hashes
+        if proto.resolved_rcp_profile_ids.len() != proto.resolved_rcp_manifest_hashes.len() {
+            return Err(PolicyResolutionError::ProfileHashLengthMismatch {
+                profile_count: proto.resolved_rcp_profile_ids.len(),
+                hash_count: proto.resolved_rcp_manifest_hashes.len(),
+            });
+        }
+
         let changeset_digest: [u8; 32] = proto.changeset_digest.try_into().map_err(|_| {
             PolicyResolutionError::InvalidData("changeset_digest must be 32 bytes".to_string())
         })?;
@@ -1199,6 +1378,9 @@ pub mod tests {
         let signer = Signer::generate();
 
         // Create with unsorted arrays
+        // Profile IDs and manifest hashes are sorted together as pairs (by profile ID)
+        // Input:  z-profile -> 0x99, a-profile -> 0x11, m-profile -> 0x55
+        // Output: a-profile -> 0x11, m-profile -> 0x55, z-profile -> 0x99
         let resolution = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
             .resolved_risk_tier(1)
             .resolved_determinism_class(0)
@@ -1213,7 +1395,7 @@ pub mod tests {
             .resolver_version("1.0.0")
             .build_and_sign(&signer);
 
-        // Arrays should be sorted after build
+        // Profile IDs should be sorted alphabetically
         assert_eq!(
             resolution.resolved_rcp_profile_ids,
             vec![
@@ -1222,10 +1404,13 @@ pub mod tests {
                 "z-profile".to_string()
             ]
         );
+        // Manifest hashes should follow the same order as their corresponding profile
+        // IDs (pairs sorted by profile ID, maintaining alignment)
         assert_eq!(
             resolution.resolved_rcp_manifest_hashes,
             vec![[0x11; 32], [0x55; 32], [0x99; 32]]
         );
+        // Verifier policy hashes are sorted independently (not paired with anything)
         assert_eq!(
             resolution.resolved_verifier_policy_hashes,
             vec![[0xAA; 32], [0xBB; 32], [0xCC; 32]]
@@ -1254,5 +1439,288 @@ pub mod tests {
                 .validate_signature(&signer.verifying_key())
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn test_profile_hash_length_mismatch_error() {
+        let signer = Signer::generate();
+
+        // Mismatched lengths: 2 profile IDs but 3 manifest hashes
+        let result = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+            .resolved_risk_tier(1)
+            .resolved_determinism_class(0)
+            .resolved_rcp_profile_ids(vec!["profile-1".to_string(), "profile-2".to_string()])
+            .resolved_rcp_manifest_hashes(vec![[0x11; 32], [0x22; 32], [0x33; 32]])
+            .resolver_actor_id("resolver-001")
+            .resolver_version("1.0.0")
+            .try_build_and_sign(&signer);
+
+        assert!(matches!(
+            result,
+            Err(PolicyResolutionError::ProfileHashLengthMismatch {
+                profile_count: 2,
+                hash_count: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn test_collection_too_large_error() {
+        let signer = Signer::generate();
+
+        // Create 257 profile IDs and manifest hashes (exceeds MAX_RCP_PROFILES = 256)
+        let profile_ids: Vec<String> = (0..257).map(|i| format!("profile-{i}")).collect();
+        let manifest_hashes: Vec<[u8; 32]> = (0..257).map(|_| [0x00; 32]).collect();
+
+        let result = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+            .resolved_risk_tier(1)
+            .resolved_determinism_class(0)
+            .resolved_rcp_profile_ids(profile_ids)
+            .resolved_rcp_manifest_hashes(manifest_hashes)
+            .resolver_actor_id("resolver-001")
+            .resolver_version("1.0.0")
+            .try_build_and_sign(&signer);
+
+        assert!(matches!(
+            result,
+            Err(PolicyResolutionError::CollectionTooLarge {
+                field: "resolved_rcp_profile_ids",
+                actual: 257,
+                max: 256
+            })
+        ));
+    }
+
+    #[test]
+    fn test_proto_collection_too_large_error() {
+        // Create proto with too many verifier hashes
+        let mut proto = PolicyResolvedForChangeSetProto {
+            work_id: "work-001".to_string(),
+            changeset_digest: vec![0x42; 32],
+            resolved_policy_hash: vec![0x00; 32],
+            resolved_risk_tier: 0,
+            resolved_determinism_class: 0,
+            resolved_rcp_profile_ids: vec![],
+            resolved_rcp_manifest_hashes: vec![],
+            resolved_verifier_policy_hashes: vec![],
+            resolver_actor_id: "resolver-001".to_string(),
+            resolver_version: "1.0.0".to_string(),
+            resolver_signature: vec![0u8; 64],
+        };
+
+        // Add 257 verifier hashes (exceeds MAX_VERIFIER_POLICIES = 256)
+        for _ in 0..257 {
+            proto.resolved_verifier_policy_hashes.push(vec![0x00; 32]);
+        }
+
+        let result = PolicyResolvedForChangeSet::try_from(proto);
+        assert!(matches!(
+            result,
+            Err(PolicyResolutionError::CollectionTooLarge {
+                field: "resolved_verifier_policy_hashes",
+                actual: 257,
+                max: 256
+            })
+        ));
+    }
+
+    #[test]
+    fn test_proto_profile_hash_length_mismatch() {
+        let proto = PolicyResolvedForChangeSetProto {
+            work_id: "work-001".to_string(),
+            changeset_digest: vec![0x42; 32],
+            resolved_policy_hash: vec![0x00; 32],
+            resolved_risk_tier: 0,
+            resolved_determinism_class: 0,
+            resolved_rcp_profile_ids: vec!["profile-1".to_string()],
+            resolved_rcp_manifest_hashes: vec![vec![0x00; 32], vec![0x11; 32]], // Mismatch: 1 vs 2
+            resolved_verifier_policy_hashes: vec![],
+            resolver_actor_id: "resolver-001".to_string(),
+            resolver_version: "1.0.0".to_string(),
+            resolver_signature: vec![0u8; 64],
+        };
+
+        let result = PolicyResolvedForChangeSet::try_from(proto);
+        assert!(matches!(
+            result,
+            Err(PolicyResolutionError::ProfileHashLengthMismatch {
+                profile_count: 1,
+                hash_count: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn test_get_manifest_hash_for_profile() {
+        let signer = Signer::generate();
+        let resolution = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+            .resolved_risk_tier(1)
+            .resolved_determinism_class(0)
+            .resolved_rcp_profile_ids(vec![
+                "profile-a".to_string(),
+                "profile-b".to_string(),
+                "profile-c".to_string(),
+            ])
+            .resolved_rcp_manifest_hashes(vec![[0xAA; 32], [0xBB; 32], [0xCC; 32]])
+            .resolver_actor_id("resolver-001")
+            .resolver_version("1.0.0")
+            .build_and_sign(&signer);
+
+        // Look up existing profiles
+        assert_eq!(
+            resolution.get_manifest_hash_for_profile("profile-a"),
+            Some(&[0xAA; 32])
+        );
+        assert_eq!(
+            resolution.get_manifest_hash_for_profile("profile-b"),
+            Some(&[0xBB; 32])
+        );
+        assert_eq!(
+            resolution.get_manifest_hash_for_profile("profile-c"),
+            Some(&[0xCC; 32])
+        );
+
+        // Non-existent profile
+        assert_eq!(resolution.get_manifest_hash_for_profile("profile-d"), None);
+    }
+
+    #[test]
+    fn test_verify_lease_match_with_aat_extension() {
+        use crate::fac::AatLeaseExtension;
+
+        let resolver_signer = Signer::generate();
+        let resolution = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+            .resolved_risk_tier(1)
+            .resolved_determinism_class(0)
+            .add_rcp_profile_id("aat-profile-001")
+            .add_rcp_manifest_hash([0x11; 32])
+            .add_verifier_policy_hash([0x22; 32])
+            .resolver_actor_id("resolver-001")
+            .resolver_version("1.0.0")
+            .build_and_sign(&resolver_signer);
+
+        // Create a matching lease with AAT extension
+        let issuer_signer = Signer::generate();
+        let lease = GateLeaseBuilder::new("lease-001", "work-001", "aat")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash(resolution.resolved_policy_hash())
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .aat_extension(AatLeaseExtension {
+                view_commitment_hash: [0x33; 32],
+                rcp_manifest_hash: [0x11; 32], // Matches resolution
+                rcp_profile_id: "aat-profile-001".to_string(),
+                selection_policy_id: "policy-001".to_string(),
+            })
+            .build_and_sign(&issuer_signer);
+
+        // Should match
+        assert!(resolution.verify_lease_match(&lease).is_ok());
+    }
+
+    #[test]
+    fn test_verify_lease_match_aat_extension_hash_mismatch() {
+        use crate::fac::AatLeaseExtension;
+
+        let resolver_signer = Signer::generate();
+        let resolution = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+            .resolved_risk_tier(1)
+            .resolved_determinism_class(0)
+            .add_rcp_profile_id("aat-profile-001")
+            .add_rcp_manifest_hash([0x11; 32])
+            .resolver_actor_id("resolver-001")
+            .resolver_version("1.0.0")
+            .build_and_sign(&resolver_signer);
+
+        // Create a lease with mismatched manifest hash
+        let issuer_signer = Signer::generate();
+        let lease = GateLeaseBuilder::new("lease-001", "work-001", "aat")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash(resolution.resolved_policy_hash())
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .aat_extension(AatLeaseExtension {
+                view_commitment_hash: [0x33; 32],
+                rcp_manifest_hash: [0xFF; 32], // Does NOT match resolution
+                rcp_profile_id: "aat-profile-001".to_string(),
+                selection_policy_id: "policy-001".to_string(),
+            })
+            .build_and_sign(&issuer_signer);
+
+        let result = resolution.verify_lease_match(&lease);
+        assert!(matches!(
+            result,
+            Err(PolicyResolutionError::RcpManifestHashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_verify_lease_match_aat_extension_unknown_profile() {
+        use crate::fac::AatLeaseExtension;
+
+        let resolver_signer = Signer::generate();
+        let resolution = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+            .resolved_risk_tier(1)
+            .resolved_determinism_class(0)
+            .add_rcp_profile_id("aat-profile-001")
+            .add_rcp_manifest_hash([0x11; 32])
+            .resolver_actor_id("resolver-001")
+            .resolver_version("1.0.0")
+            .build_and_sign(&resolver_signer);
+
+        // Create a lease with unknown profile ID
+        let issuer_signer = Signer::generate();
+        let lease = GateLeaseBuilder::new("lease-001", "work-001", "aat")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash(resolution.resolved_policy_hash())
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .aat_extension(AatLeaseExtension {
+                view_commitment_hash: [0x33; 32],
+                rcp_manifest_hash: [0x11; 32],
+                rcp_profile_id: "unknown-profile".to_string(), // Not in resolution
+                selection_policy_id: "policy-001".to_string(),
+            })
+            .build_and_sign(&issuer_signer);
+
+        let result = resolution.verify_lease_match(&lease);
+        assert!(matches!(
+            result,
+            Err(PolicyResolutionError::RcpManifestHashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_length_prefixed_canonicalization_prevents_collision() {
+        let signer = Signer::generate();
+
+        // Create two resolutions with different field values that could collide
+        // with null-termination but not with length-prefixing
+        let resolution1 = PolicyResolvedForChangeSetBuilder::new("ab", [0x42; 32])
+            .resolved_risk_tier(1)
+            .resolved_determinism_class(0)
+            .resolver_actor_id("cd")
+            .resolver_version("1.0")
+            .build_and_sign(&signer);
+
+        // "ab" + "cd" should NOT equal "a" + "bcd" with length-prefixing
+        let resolution2 = PolicyResolvedForChangeSetBuilder::new("a", [0x42; 32])
+            .resolved_risk_tier(1)
+            .resolved_determinism_class(0)
+            .resolver_actor_id("bcd")
+            .resolver_version("1.0")
+            .build_and_sign(&signer);
+
+        // Canonical bytes should be different
+        assert_ne!(resolution1.canonical_bytes(), resolution2.canonical_bytes());
     }
 }
