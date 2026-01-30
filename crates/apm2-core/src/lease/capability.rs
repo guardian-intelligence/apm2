@@ -886,8 +886,53 @@ impl CapabilityRegistryState {
         count
     }
 
+    /// Collects all descendant capability IDs for a given capability.
+    ///
+    /// This performs a breadth-first traversal of the delegation tree to find
+    /// all capabilities that were delegated from the given capability, directly
+    /// or indirectly.
+    fn get_all_descendants(&self, capability_id: &str) -> Vec<String> {
+        let mut descendants = Vec::new();
+        let mut queue = vec![capability_id.to_string()];
+
+        while let Some(current_id) = queue.pop() {
+            if let Some(children) = self.delegation_tree.get(&current_id) {
+                for child_id in children {
+                    descendants.push(child_id.clone());
+                    queue.push(child_id.clone());
+                }
+            }
+        }
+
+        descendants
+    }
+
     /// Removes a capability and cleans up indices.
+    ///
+    /// **Security (HIGH-01)**: This implements cascading revocation. When a
+    /// capability is removed, ALL of its descendants in the delegation tree
+    /// are also removed. This prevents 'dangling authority' where a revoked
+    /// parent would still have active children.
     fn remove(&mut self, capability_id: &str) {
+        // HIGH-01 FIX: Collect all descendants BEFORE removing anything.
+        // This must be done first because removing ancestors would break
+        // the delegation_tree traversal.
+        let descendants = self.get_all_descendants(capability_id);
+
+        // Remove all descendants first (cascading revocation)
+        for descendant_id in descendants {
+            self.remove_single(&descendant_id);
+        }
+
+        // Remove the capability itself
+        self.remove_single(capability_id);
+    }
+
+    /// Removes a single capability without cascading to descendants.
+    ///
+    /// This is an internal helper used by `remove` after descendants have
+    /// already been collected and scheduled for removal.
+    fn remove_single(&mut self, capability_id: &str) {
         if let Some(cap) = self.capabilities.remove(capability_id) {
             // Clean up namespace index
             if let Some(ids) = self.capabilities_by_namespace.get_mut(&cap.namespace) {
@@ -906,7 +951,7 @@ impl CapabilityRegistryState {
                 }
             }
 
-            // Clean up delegation tree (this cap's children - should cascade revoke first)
+            // Clean up delegation tree (this cap's children entry)
             self.delegation_tree.remove(capability_id);
         }
     }
@@ -1996,5 +2041,371 @@ mod tck_00199_tests {
 
         let result: Result<CapabilityProof, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // HIGH-01: Cascading Revocation Tests
+    // =========================================================================
+
+    #[test]
+    fn test_cascading_revocation_removes_all_descendants() {
+        // HIGH-01: When a capability is removed, all descendants must also be removed.
+        // This prevents 'dangling authority' where a revoked parent still has active
+        // children.
+        let mut state = CapabilityRegistryState::new();
+
+        // Create a delegation tree:
+        //   root (alice)
+        //     |
+        //   child1 (bob)
+        //     |
+        //   grandchild1 (carol)
+
+        let root = Capability::new(
+            "cap-root".to_string(),
+            "ns".to_string(),
+            "alice".to_string(),
+            "reg".to_string(),
+            vec![],
+            vec![],
+            1_000_000_000,
+            2_000_000_000,
+            vec![1],
+            true,
+        );
+        state.insert(root).unwrap();
+
+        let child1 = Capability::new_delegated(
+            "cap-child1".to_string(),
+            "cap-root".to_string(),
+            "ns".to_string(),
+            "bob".to_string(),
+            "alice".to_string(),
+            vec![],
+            vec![],
+            1_100_000_000,
+            2_000_000_000,
+            vec![2],
+            true,
+            1,
+        );
+        state.insert(child1).unwrap();
+
+        let grandchild1 = Capability::new_delegated(
+            "cap-grandchild1".to_string(),
+            "cap-child1".to_string(),
+            "ns".to_string(),
+            "carol".to_string(),
+            "bob".to_string(),
+            vec![],
+            vec![],
+            1_200_000_000,
+            2_000_000_000,
+            vec![3],
+            false,
+            2,
+        );
+        state.insert(grandchild1).unwrap();
+
+        // Verify initial state
+        assert_eq!(state.len(), 3);
+        assert!(state.get("cap-root").is_some());
+        assert!(state.get("cap-child1").is_some());
+        assert!(state.get("cap-grandchild1").is_some());
+
+        // Now revoke the root capability
+        if let Some(cap) = state.capabilities.get_mut("cap-root") {
+            cap.state = CapabilityState::Revoked;
+            cap.revoked_at = Some(1_500_000_000);
+        }
+
+        // Prune terminal capabilities (this triggers cascading removal)
+        let pruned = state.prune_terminal();
+
+        // Verify cascading revocation: root and ALL descendants should be removed
+        assert_eq!(pruned, 1); // Only root was marked as terminal
+        assert!(state.get("cap-root").is_none(), "Root should be removed");
+        assert!(
+            state.get("cap-child1").is_none(),
+            "Child should be removed via cascading revocation"
+        );
+        assert!(
+            state.get("cap-grandchild1").is_none(),
+            "Grandchild should be removed via cascading revocation"
+        );
+        assert_eq!(state.len(), 0);
+    }
+
+    #[test]
+    fn test_cascading_revocation_with_multiple_children() {
+        // HIGH-01: Test cascading revocation with a wider tree (multiple children)
+        let mut state = CapabilityRegistryState::new();
+
+        // Create a delegation tree:
+        //        root (alice)
+        //       /     \
+        //   child1   child2
+        //   (bob)    (carol)
+        //     |
+        // grandchild1
+        //   (dave)
+
+        let root = Capability::new(
+            "cap-root".to_string(),
+            "ns".to_string(),
+            "alice".to_string(),
+            "reg".to_string(),
+            vec![],
+            vec![],
+            1_000_000_000,
+            2_000_000_000,
+            vec![1],
+            true,
+        );
+        state.insert(root).unwrap();
+
+        let child1 = Capability::new_delegated(
+            "cap-child1".to_string(),
+            "cap-root".to_string(),
+            "ns".to_string(),
+            "bob".to_string(),
+            "alice".to_string(),
+            vec![],
+            vec![],
+            1_100_000_000,
+            2_000_000_000,
+            vec![2],
+            true,
+            1,
+        );
+        state.insert(child1).unwrap();
+
+        let child2 = Capability::new_delegated(
+            "cap-child2".to_string(),
+            "cap-root".to_string(),
+            "ns".to_string(),
+            "carol".to_string(),
+            "alice".to_string(),
+            vec![],
+            vec![],
+            1_100_000_000,
+            2_000_000_000,
+            vec![3],
+            false,
+            1,
+        );
+        state.insert(child2).unwrap();
+
+        let grandchild1 = Capability::new_delegated(
+            "cap-grandchild1".to_string(),
+            "cap-child1".to_string(),
+            "ns".to_string(),
+            "dave".to_string(),
+            "bob".to_string(),
+            vec![],
+            vec![],
+            1_200_000_000,
+            2_000_000_000,
+            vec![4],
+            false,
+            2,
+        );
+        state.insert(grandchild1).unwrap();
+
+        assert_eq!(state.len(), 4);
+
+        // Revoke the root
+        if let Some(cap) = state.capabilities.get_mut("cap-root") {
+            cap.state = CapabilityState::Revoked;
+        }
+
+        let pruned = state.prune_terminal();
+        assert_eq!(pruned, 1);
+
+        // All capabilities should be removed
+        assert!(state.get("cap-root").is_none());
+        assert!(state.get("cap-child1").is_none());
+        assert!(state.get("cap-child2").is_none());
+        assert!(state.get("cap-grandchild1").is_none());
+        assert_eq!(state.len(), 0);
+    }
+
+    #[test]
+    fn test_cascading_revocation_preserves_unrelated_capabilities() {
+        // HIGH-01: Cascading revocation should only affect descendants, not siblings
+        let mut state = CapabilityRegistryState::new();
+
+        // Create two separate trees:
+        //   root1 (alice)      root2 (eve)
+        //     |                  |
+        //   child1 (bob)      child2 (frank)
+
+        let root1 = Capability::new(
+            "cap-root1".to_string(),
+            "ns".to_string(),
+            "alice".to_string(),
+            "reg".to_string(),
+            vec![],
+            vec![],
+            1_000_000_000,
+            2_000_000_000,
+            vec![1],
+            true,
+        );
+        state.insert(root1).unwrap();
+
+        let child1 = Capability::new_delegated(
+            "cap-child1".to_string(),
+            "cap-root1".to_string(),
+            "ns".to_string(),
+            "bob".to_string(),
+            "alice".to_string(),
+            vec![],
+            vec![],
+            1_100_000_000,
+            2_000_000_000,
+            vec![2],
+            false,
+            1,
+        );
+        state.insert(child1).unwrap();
+
+        let root2 = Capability::new(
+            "cap-root2".to_string(),
+            "ns".to_string(),
+            "eve".to_string(),
+            "reg".to_string(),
+            vec![],
+            vec![],
+            1_000_000_000,
+            2_000_000_000,
+            vec![3],
+            true,
+        );
+        state.insert(root2).unwrap();
+
+        let child2 = Capability::new_delegated(
+            "cap-child2".to_string(),
+            "cap-root2".to_string(),
+            "ns".to_string(),
+            "frank".to_string(),
+            "eve".to_string(),
+            vec![],
+            vec![],
+            1_100_000_000,
+            2_000_000_000,
+            vec![4],
+            false,
+            1,
+        );
+        state.insert(child2).unwrap();
+
+        assert_eq!(state.len(), 4);
+
+        // Revoke only root1
+        if let Some(cap) = state.capabilities.get_mut("cap-root1") {
+            cap.state = CapabilityState::Revoked;
+        }
+
+        let pruned = state.prune_terminal();
+        assert_eq!(pruned, 1);
+
+        // root1 tree should be removed
+        assert!(state.get("cap-root1").is_none());
+        assert!(state.get("cap-child1").is_none());
+
+        // root2 tree should be preserved
+        assert!(state.get("cap-root2").is_some());
+        assert!(state.get("cap-child2").is_some());
+        assert_eq!(state.len(), 2);
+    }
+
+    #[test]
+    fn test_get_all_descendants_returns_correct_ids() {
+        // Direct test of the get_all_descendants helper
+        let mut state = CapabilityRegistryState::new();
+
+        // Create a tree: root -> child1, child2 -> grandchild1
+        let root = Capability::new(
+            "cap-root".to_string(),
+            "ns".to_string(),
+            "alice".to_string(),
+            "reg".to_string(),
+            vec![],
+            vec![],
+            1_000_000_000,
+            2_000_000_000,
+            vec![1],
+            true,
+        );
+        state.insert(root).unwrap();
+
+        let child1 = Capability::new_delegated(
+            "cap-child1".to_string(),
+            "cap-root".to_string(),
+            "ns".to_string(),
+            "bob".to_string(),
+            "alice".to_string(),
+            vec![],
+            vec![],
+            1_100_000_000,
+            2_000_000_000,
+            vec![2],
+            true,
+            1,
+        );
+        state.insert(child1).unwrap();
+
+        let child2 = Capability::new_delegated(
+            "cap-child2".to_string(),
+            "cap-root".to_string(),
+            "ns".to_string(),
+            "carol".to_string(),
+            "alice".to_string(),
+            vec![],
+            vec![],
+            1_100_000_000,
+            2_000_000_000,
+            vec![3],
+            false,
+            1,
+        );
+        state.insert(child2).unwrap();
+
+        let grandchild1 = Capability::new_delegated(
+            "cap-grandchild1".to_string(),
+            "cap-child1".to_string(),
+            "ns".to_string(),
+            "dave".to_string(),
+            "bob".to_string(),
+            vec![],
+            vec![],
+            1_200_000_000,
+            2_000_000_000,
+            vec![4],
+            false,
+            2,
+        );
+        state.insert(grandchild1).unwrap();
+
+        // Test get_all_descendants from root
+        let descendants = state.get_all_descendants("cap-root");
+        assert_eq!(descendants.len(), 3);
+        assert!(descendants.contains(&"cap-child1".to_string()));
+        assert!(descendants.contains(&"cap-child2".to_string()));
+        assert!(descendants.contains(&"cap-grandchild1".to_string()));
+
+        // Test get_all_descendants from child1
+        let descendants = state.get_all_descendants("cap-child1");
+        assert_eq!(descendants.len(), 1);
+        assert!(descendants.contains(&"cap-grandchild1".to_string()));
+
+        // Test get_all_descendants from leaf (no children)
+        let descendants = state.get_all_descendants("cap-grandchild1");
+        assert!(descendants.is_empty());
+
+        // Test get_all_descendants for non-existent capability
+        let descendants = state.get_all_descendants("cap-nonexistent");
+        assert!(descendants.is_empty());
     }
 }
