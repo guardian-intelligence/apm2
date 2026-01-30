@@ -19,23 +19,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     prost_build::Config::new()
         // Generate BTreeMap instead of HashMap for deterministic ordering
         .btree_map(["."])
-        // Derive additional traits for messages (including oneof enums via type_attribute)
-        // Note: Regular enums already have Eq, Hash from prost, but we need to skip them
-        // by using specific message patterns to avoid duplication
+        // Derive additional traits for messages only (enums already have Eq, Hash from prost)
         .message_attribute(".", "#[derive(Eq, Hash)]")
-        // Add Eq, Hash to oneof enums (they don't get these by default)
-        // Use a broad pattern that matches all oneof inner modules
+        // Add Eq, Hash for oneof enums (prost doesn't derive these automatically)
         .type_attribute(".apm2.kernel.v1.KernelEvent.payload", "#[derive(Eq, Hash)]")
         .type_attribute(".apm2.kernel.v1.SessionEvent.event", "#[derive(Eq, Hash)]")
         .type_attribute(".apm2.kernel.v1.WorkEvent.event", "#[derive(Eq, Hash)]")
         .type_attribute(".apm2.kernel.v1.ToolEvent.event", "#[derive(Eq, Hash)]")
         .type_attribute(".apm2.kernel.v1.LeaseEvent.event", "#[derive(Eq, Hash)]")
         .type_attribute(".apm2.kernel.v1.PolicyEvent.event", "#[derive(Eq, Hash)]")
-        .type_attribute(".apm2.kernel.v1.AdjudicationEvent.event", "#[derive(Eq, Hash)]")
+        .type_attribute(
+            ".apm2.kernel.v1.AdjudicationEvent.event",
+            "#[derive(Eq, Hash)]",
+        )
         .type_attribute(".apm2.kernel.v1.EvidenceEvent.event", "#[derive(Eq, Hash)]")
-        .type_attribute(".apm2.kernel.v1.CapabilityEvent.event", "#[derive(Eq, Hash)]")
         .type_attribute(".apm2.kernel.v1.KeyEvent.event", "#[derive(Eq, Hash)]")
-        .type_attribute(".apm2.kernel.v1.GitHubLeaseEvent.event", "#[derive(Eq, Hash)]")
+        .type_attribute(
+            ".apm2.kernel.v1.CapabilityEvent.event",
+            "#[derive(Eq, Hash)]",
+        )
+        .type_attribute(
+            ".apm2.kernel.v1.GitHubLeaseEvent.event",
+            "#[derive(Eq, Hash)]",
+        )
         // Output to src/events/
         .out_dir("src/events")
         .compile_protos(&["../../proto/kernel_events.proto"], &["../../proto"])?;
@@ -50,9 +56,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     prost_build::Config::new()
         // Generate BTreeMap instead of HashMap for deterministic ordering
         .btree_map(["."])
-        // Derive additional traits for messages (including oneof enums via type_attribute)
+        // Derive additional traits for messages only (enums already have Eq, Hash from prost)
         .message_attribute(".", "#[derive(Eq, Hash)]")
-        // Add Eq, Hash to oneof enums (they don't get these by default)
+        // Add Eq, Hash for oneof enums (prost doesn't derive these automatically)
         .type_attribute(".apm2.tool.v1.ToolRequest.tool", "#[derive(Eq, Hash)]")
         .type_attribute(".apm2.tool.v1.ToolResponse.result", "#[derive(Eq, Hash)]")
         // Output to src/tool/
