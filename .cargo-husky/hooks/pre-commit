@@ -13,15 +13,22 @@ echo -e "${GREEN}Running pre-commit hooks...${NC}"
 echo "Checking for merge conflicts and trailing whitespace..."
 git diff --cached --check
 
-# 2. Rust fmt
-echo "Checking formatting (cargo fmt)..."
-cargo fmt --all -- --check
+# 2. Auto-fix compiler warnings (unused imports, etc.)
+echo "Auto-fixing compiler warnings..."
+cargo fix --allow-dirty --allow-staged --quiet 2>/dev/null || true
+# Re-stage any fixed files
+git add -u
 
-# 3. Clippy
+# 3. Rust fmt (auto-fix and re-stage)
+echo "Formatting code (cargo fmt)..."
+cargo fmt --all
+git add -u
+
+# 4. Clippy
 echo "Running Clippy..."
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# 4. Proto verification
+# 5. Proto verification
 echo "Verifying generated proto code..."
 cargo build -p apm2-daemon --quiet 2>/dev/null
 if ! git diff --exit-code crates/apm2-daemon/src/protocol/apm2.daemon.v1.rs > /dev/null; then
@@ -29,7 +36,7 @@ if ! git diff --exit-code crates/apm2-daemon/src/protocol/apm2.daemon.v1.rs > /d
     exit 1
 fi
 
-# 5. Typos
+# 6. Typos
 if command -v typos >/dev/null 2>&1; then
     echo "Checking for typos..."
     typos
@@ -37,7 +44,7 @@ else
     echo -e "${YELLOW}Warning: typos not installed, skipping...${NC}"
 fi
 
-# 6. Taplo (TOML check)
+# 7. Taplo (TOML check)
 if command -v taplo >/dev/null 2>&1; then
     echo "Checking TOML files..."
     taplo check
@@ -46,7 +53,7 @@ else
     echo -e "${YELLOW}Warning: taplo not installed, skipping...${NC}"
 fi
 
-# 7. YAML check
+# 8. YAML check
 if command -v python3 >/dev/null 2>&1; then
     echo "Checking YAML files..."
     # Check if pyyaml is installed
@@ -60,7 +67,7 @@ if command -v python3 >/dev/null 2>&1; then
     find . -name "*.json" -not -path "*/target/*" -exec python3 -m json.tool {} + > /dev/null
 fi
 
-# 8. Markdown lint
+# 9. Markdown lint
 if command -v markdownlint >/dev/null 2>&1; then
     echo "Linting Markdown..."
     markdownlint .
