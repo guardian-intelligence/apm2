@@ -9,6 +9,10 @@
 //! ```text
 //! TokenProvider (trait)
 //!     |
+//!     +-- RateLimitedTokenProvider (production wrapper)
+//!     |       |
+//!     |       +-- wraps any TokenProvider
+//!     |
 //!     +-- MockTokenProvider (for testing)
 //!     |
 //!     +-- GitHubTokenProvider (TODO: real implementation)
@@ -22,7 +26,10 @@
 //! - Tokens are hashed with SHA-256 before storage
 //! - Token storage in OS keyring is recommended (not implemented here)
 //! - Short TTLs are enforced based on risk tier
+//! - Per-episode rate limits prevent token churn attacks (LAW-06)
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use secrecy::SecretString;
@@ -246,6 +253,120 @@ impl TokenProvider for MockTokenProvider {
     }
 }
 
+/// Rate-limited token provider wrapper.
+///
+/// Enforces per-episode token issuance limits to prevent token churn attacks.
+/// This ensures that short TTLs provide meaningful containment by preventing
+/// a compromised agent from maintaining indefinite access through rapid
+/// token renewal (LAW-06: MDL as a Gated Budget).
+///
+/// # Rate Limits by Tier
+///
+/// - **Low**: 10 tokens per episode (read-only, long TTL)
+/// - **Med**: 5 tokens per episode (limited writes, medium TTL)
+/// - **High**: 3 tokens per episode (privileged ops, short TTL)
+///
+/// The inverse relationship between privilege and token budget ensures that
+/// higher-risk operations have stricter containment.
+pub struct RateLimitedTokenProvider<P: TokenProvider> {
+    /// The underlying token provider.
+    inner: P,
+    /// Per-episode issuance counts.
+    /// Key: `episode_id`, Value: tokens issued.
+    issuance_counts: Arc<Mutex<HashMap<String, u32>>>,
+}
+
+impl<P: TokenProvider> RateLimitedTokenProvider<P> {
+    /// Creates a new rate-limited token provider wrapping the given provider.
+    #[must_use]
+    pub fn new(inner: P) -> Self {
+        Self {
+            inner,
+            issuance_counts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Returns the maximum tokens allowed per episode for a given tier.
+    ///
+    /// Higher risk tiers get fewer tokens to ensure containment through
+    /// short TTLs cannot be bypassed by token churn.
+    #[must_use]
+    pub const fn max_tokens_for_tier(tier: RiskTier) -> u32 {
+        match tier {
+            RiskTier::Low => 10, // Read-only, 1hr TTL, low risk
+            RiskTier::Med => 5,  // Limited writes, 30min TTL
+            RiskTier::High => 3, // Privileged, 5min TTL, strict limit
+        }
+    }
+
+    /// Resets the issuance count for an episode.
+    ///
+    /// This should be called when an episode completes to free memory.
+    pub fn reset_episode(&self, episode_id: &str) {
+        if let Ok(mut counts) = self.issuance_counts.lock() {
+            counts.remove(episode_id);
+        }
+    }
+
+    /// Returns the current issuance count for an episode.
+    #[must_use]
+    pub fn get_issuance_count(&self, episode_id: &str) -> u32 {
+        self.issuance_counts
+            .lock()
+            .ok()
+            .and_then(|counts| counts.get(episode_id).copied())
+            .unwrap_or(0)
+    }
+}
+
+impl<P: TokenProvider> TokenProvider for RateLimitedTokenProvider<P> {
+    fn mint_token(&self, request: &TokenRequest) -> Result<TokenResponse, GitHubError> {
+        // Check rate limit before delegating
+        let max_tokens = Self::max_tokens_for_tier(request.risk_tier);
+
+        {
+            let mut counts =
+                self.issuance_counts
+                    .lock()
+                    .map_err(|_| GitHubError::TokenProviderError {
+                        message: "rate limiter lock poisoned".to_string(),
+                    })?;
+
+            let count = counts.entry(request.episode_id.clone()).or_insert(0);
+
+            if *count >= max_tokens {
+                return Err(GitHubError::RateLimitExceeded {
+                    episode_id: request.episode_id.clone(),
+                    issued: *count,
+                    max: max_tokens,
+                    tier: request.risk_tier,
+                });
+            }
+
+            // Increment before minting to prevent race conditions
+            *count += 1;
+        }
+
+        // Delegate to inner provider
+        match self.inner.mint_token(request) {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                // Rollback count on failure
+                if let Ok(mut counts) = self.issuance_counts.lock() {
+                    if let Some(count) = counts.get_mut(&request.episode_id) {
+                        *count = count.saturating_sub(1);
+                    }
+                }
+                Err(e)
+            },
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "rate-limited"
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use secrecy::ExposeSecret;
@@ -443,5 +564,129 @@ mod unit_tests {
 
         let result = provider.mint_token(&request);
         assert!(matches!(result, Err(GitHubError::TierAppMismatch { .. })));
+    }
+
+    #[test]
+    fn test_rate_limited_provider_allows_within_limit() {
+        let inner = MockTokenProvider::new();
+        let provider = RateLimitedTokenProvider::new(inner);
+
+        let request = TokenRequest::new(
+            GitHubApp::Operator,
+            "12345".to_string(),
+            RiskTier::High,
+            "episode-001".to_string(),
+        );
+
+        // High tier allows 3 tokens
+        assert!(provider.mint_token(&request).is_ok());
+        assert!(provider.mint_token(&request).is_ok());
+        assert!(provider.mint_token(&request).is_ok());
+
+        assert_eq!(provider.get_issuance_count("episode-001"), 3);
+    }
+
+    #[test]
+    fn test_rate_limited_provider_blocks_at_limit() {
+        let inner = MockTokenProvider::new();
+        let provider = RateLimitedTokenProvider::new(inner);
+
+        let request = TokenRequest::new(
+            GitHubApp::Operator,
+            "12345".to_string(),
+            RiskTier::High,
+            "episode-001".to_string(),
+        );
+
+        // Exhaust the limit (3 for High tier)
+        for _ in 0..3 {
+            provider.mint_token(&request).unwrap();
+        }
+
+        // Fourth request should fail
+        let result = provider.mint_token(&request);
+        assert!(matches!(
+            result,
+            Err(GitHubError::RateLimitExceeded {
+                issued: 3,
+                max: 3,
+                tier: RiskTier::High,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_rate_limited_provider_separate_episodes() {
+        let inner = MockTokenProvider::new();
+        let provider = RateLimitedTokenProvider::new(inner);
+
+        let request1 = TokenRequest::new(
+            GitHubApp::Operator,
+            "12345".to_string(),
+            RiskTier::High,
+            "episode-001".to_string(),
+        );
+
+        let request2 = TokenRequest::new(
+            GitHubApp::Operator,
+            "12345".to_string(),
+            RiskTier::High,
+            "episode-002".to_string(),
+        );
+
+        // Exhaust episode-001's limit
+        for _ in 0..3 {
+            provider.mint_token(&request1).unwrap();
+        }
+
+        // episode-002 should still work
+        assert!(provider.mint_token(&request2).is_ok());
+        assert_eq!(provider.get_issuance_count("episode-002"), 1);
+    }
+
+    #[test]
+    fn test_rate_limited_provider_reset_episode() {
+        let inner = MockTokenProvider::new();
+        let provider = RateLimitedTokenProvider::new(inner);
+
+        let request = TokenRequest::new(
+            GitHubApp::Operator,
+            "12345".to_string(),
+            RiskTier::High,
+            "episode-001".to_string(),
+        );
+
+        // Use some tokens
+        provider.mint_token(&request).unwrap();
+        provider.mint_token(&request).unwrap();
+        assert_eq!(provider.get_issuance_count("episode-001"), 2);
+
+        // Reset the episode
+        provider.reset_episode("episode-001");
+        assert_eq!(provider.get_issuance_count("episode-001"), 0);
+
+        // Should be able to mint again
+        assert!(provider.mint_token(&request).is_ok());
+    }
+
+    #[test]
+    fn test_rate_limits_inversely_proportional_to_risk() {
+        // Higher risk = fewer tokens (stricter containment)
+        let low_limit =
+            RateLimitedTokenProvider::<MockTokenProvider>::max_tokens_for_tier(RiskTier::Low);
+        let med_limit =
+            RateLimitedTokenProvider::<MockTokenProvider>::max_tokens_for_tier(RiskTier::Med);
+        let high_limit =
+            RateLimitedTokenProvider::<MockTokenProvider>::max_tokens_for_tier(RiskTier::High);
+
+        assert!(
+            low_limit > med_limit,
+            "Low risk should allow more tokens than Med"
+        );
+        assert!(
+            med_limit > high_limit,
+            "Med risk should allow more tokens than High"
+        );
     }
 }

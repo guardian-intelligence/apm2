@@ -156,7 +156,26 @@ pub trait TokenProvider: Send + Sync {
 
 **Implementations:**
 - `MockTokenProvider`: For testing, generates predictable tokens without GitHub API calls
+- `RateLimitedTokenProvider<P>`: Production wrapper that enforces per-episode token quotas
 - `GitHubTokenProvider`: TODO - requires GitHub App credentials infrastructure
+
+### `RateLimitedTokenProvider` (LAW-06 Compliance)
+
+Prevents token churn attacks by enforcing per-episode issuance limits. This ensures
+short TTLs provide meaningful containment—a compromised agent cannot maintain
+indefinite access by rapidly requesting new tokens.
+
+**Rate Limits by Tier:**
+| Tier | Max Tokens/Episode | Rationale |
+|------|-------------------|-----------|
+| Low  | 10 | Read-only, 1hr TTL, low risk |
+| Med  | 5  | Limited writes, 30min TTL |
+| High | 3  | Privileged ops, 5min TTL, strictest |
+
+**Contracts:**
+- [CTR-0610] Higher risk tiers get fewer tokens (inverse proportionality)
+- [CTR-0611] Limits are per-episode, not per-actor (episode is the trust boundary)
+- [CTR-0612] `reset_episode()` must be called when episode completes to free memory
 
 ### `TokenRequest` / `TokenResponse`
 

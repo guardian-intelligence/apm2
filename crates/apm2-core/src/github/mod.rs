@@ -57,7 +57,9 @@ mod token_provider;
 pub use error::GitHubError;
 pub use lease::{GitHubLease, GitHubLeaseState, RevocationReason};
 pub use scope::{GitHubApp, GitHubScope, RiskTier};
-pub use token_provider::{MockTokenProvider, TokenProvider, TokenRequest, TokenResponse};
+pub use token_provider::{
+    MockTokenProvider, RateLimitedTokenProvider, TokenProvider, TokenRequest, TokenResponse,
+};
 
 /// Maximum length for GitHub App IDs.
 pub const MAX_APP_ID_LEN: usize = 64;

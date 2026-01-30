@@ -125,4 +125,19 @@ pub enum GitHubError {
     /// Failed to decode the event payload.
     #[error("failed to decode GitHub lease event: {0}")]
     DecodeError(#[from] prost::DecodeError),
+
+    /// Rate limit exceeded for token issuance.
+    #[error(
+        "token issuance rate limit exceeded for episode {episode_id}: {issued} tokens issued, max {max} for tier {tier}"
+    )]
+    RateLimitExceeded {
+        /// The episode that exceeded its limit.
+        episode_id: String,
+        /// Number of tokens already issued.
+        issued: u32,
+        /// Maximum allowed for the tier.
+        max: u32,
+        /// The risk tier.
+        tier: RiskTier,
+    },
 }
