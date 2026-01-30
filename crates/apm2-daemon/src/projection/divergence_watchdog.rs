@@ -1421,9 +1421,9 @@ impl DivergenceWatchdog {
     ///
     /// **IMPORTANT**: This method does NOT mutate the registry. The caller must
     /// persist the unfreeze event to the ledger first, then call
-    /// [`apply_unfreeze`] to update the local registry. This ensures local
-    /// state and ledger state remain consistent even if the caller crashes
-    /// between operations.
+    /// [`Self::apply_unfreeze`] to update the local registry. This ensures
+    /// local state and ledger state remain consistent even if the caller
+    /// crashes between operations.
     ///
     /// # Correct Usage Pattern
     ///
