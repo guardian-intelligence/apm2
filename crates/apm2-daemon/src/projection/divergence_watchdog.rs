@@ -1226,6 +1226,87 @@ impl FreezeRegistry {
 }
 
 // =============================================================================
+// FreezeCheck Trait
+// =============================================================================
+
+/// Trait for checking freeze status before admission.
+///
+/// This trait abstracts the freeze checking logic, allowing for dependency
+/// injection and easier testing. It provides a standard interface for
+/// components that need to verify whether a scope is frozen before
+/// admitting new work.
+///
+/// # Security
+///
+/// Implementations must ensure that freeze checks are atomic and consistent.
+/// A scope that is frozen must remain frozen until explicitly unfrozen.
+pub trait FreezeCheck: Send + Sync {
+    /// Checks if admission is allowed for the given scope value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DivergenceError::RepoFrozen`] if the scope is frozen.
+    fn check_admission(&self, scope_value: &str) -> Result<(), DivergenceError>;
+
+    /// Returns whether the scope is currently frozen.
+    fn is_frozen(&self, scope_value: &str) -> bool;
+}
+
+impl FreezeCheck for FreezeRegistry {
+    fn check_admission(&self, scope_value: &str) -> Result<(), DivergenceError> {
+        // Delegate to the existing method
+        Self::check_admission(self, scope_value)
+    }
+
+    fn is_frozen(&self, scope_value: &str) -> bool {
+        Self::is_frozen(self, scope_value).is_some()
+    }
+}
+
+// =============================================================================
+// TimeSource Trait
+// =============================================================================
+
+/// Trait for obtaining the current time.
+///
+/// This trait abstracts time access, enabling deterministic testing by
+/// allowing injection of mock time sources. Production code should use
+/// [`SystemTimeSource`], while tests can use custom implementations.
+///
+/// # Security
+///
+/// Time sources are used for:
+/// - Freeze/unfreeze event timestamps
+/// - Time envelope references
+/// - Defect record timestamps
+///
+/// Implementations must return monotonically increasing values to prevent
+/// time-based attacks.
+pub trait TimeSource: Send + Sync {
+    /// Returns the current time in nanoseconds since Unix epoch.
+    fn now_nanos(&self) -> u64;
+
+    /// Returns a time envelope reference for the current time.
+    ///
+    /// The format is typically `htf:tick:{timestamp}`.
+    fn time_envelope_ref(&self, pattern: &str) -> String {
+        pattern.replace("{}", &self.now_nanos().to_string())
+    }
+}
+
+/// System time source using the real system clock.
+///
+/// This is the default implementation for production use.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemTimeSource;
+
+impl TimeSource for SystemTimeSource {
+    fn now_nanos(&self) -> u64 {
+        current_timestamp_ns()
+    }
+}
+
+// =============================================================================
 // DivergenceWatchdog
 // =============================================================================
 
@@ -1233,7 +1314,13 @@ impl FreezeRegistry {
 ///
 /// This watchdog periodically checks whether the external trunk HEAD matches
 /// the ledger's latest merge receipt. On divergence, it emits a freeze event.
-pub struct DivergenceWatchdog {
+///
+/// # Time Source Injection
+///
+/// The watchdog accepts a [`TimeSource`] for testability. In production, use
+/// [`SystemTimeSource`]. For testing, inject a mock time source to control
+/// timestamps deterministically.
+pub struct DivergenceWatchdog<T: TimeSource = SystemTimeSource> {
     /// Signer for freeze events.
     signer: Signer,
     /// Configuration.
@@ -1244,10 +1331,12 @@ pub struct DivergenceWatchdog {
     freeze_counter: std::sync::atomic::AtomicU64,
     /// Counter for generating defect IDs.
     defect_counter: std::sync::atomic::AtomicU64,
+    /// Time source for obtaining current time.
+    time_source: T,
 }
 
-impl DivergenceWatchdog {
-    /// Creates a new divergence watchdog.
+impl DivergenceWatchdog<SystemTimeSource> {
+    /// Creates a new divergence watchdog with the system time source.
     #[must_use]
     pub fn new(signer: Signer, config: DivergenceWatchdogConfig) -> Self {
         Self {
@@ -1256,6 +1345,7 @@ impl DivergenceWatchdog {
             registry: Arc::new(FreezeRegistry::new()),
             freeze_counter: std::sync::atomic::AtomicU64::new(0),
             defect_counter: std::sync::atomic::AtomicU64::new(0),
+            time_source: SystemTimeSource,
         }
     }
 
@@ -1272,6 +1362,48 @@ impl DivergenceWatchdog {
             registry,
             freeze_counter: std::sync::atomic::AtomicU64::new(0),
             defect_counter: std::sync::atomic::AtomicU64::new(0),
+            time_source: SystemTimeSource,
+        }
+    }
+}
+
+impl<T: TimeSource> DivergenceWatchdog<T> {
+    /// Creates a new divergence watchdog with a custom time source.
+    ///
+    /// This constructor is primarily for testing, allowing injection of
+    /// mock time sources for deterministic behavior.
+    #[must_use]
+    pub fn with_time_source(
+        signer: Signer,
+        config: DivergenceWatchdogConfig,
+        time_source: T,
+    ) -> Self {
+        Self {
+            signer,
+            config,
+            registry: Arc::new(FreezeRegistry::new()),
+            freeze_counter: std::sync::atomic::AtomicU64::new(0),
+            defect_counter: std::sync::atomic::AtomicU64::new(0),
+            time_source,
+        }
+    }
+
+    /// Creates a new divergence watchdog with a shared registry and custom time
+    /// source.
+    #[must_use]
+    pub const fn with_registry_and_time_source(
+        signer: Signer,
+        config: DivergenceWatchdogConfig,
+        registry: Arc<FreezeRegistry>,
+        time_source: T,
+    ) -> Self {
+        Self {
+            signer,
+            config,
+            registry,
+            freeze_counter: std::sync::atomic::AtomicU64::new(0),
+            defect_counter: std::sync::atomic::AtomicU64::new(0),
+            time_source,
         }
     }
 
@@ -1298,7 +1430,7 @@ impl DivergenceWatchdog {
         let count = self
             .freeze_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let timestamp = current_timestamp_ns();
+        let timestamp = self.time_source.now_nanos();
         format!("freeze-{timestamp}-{count}")
     }
 
@@ -1307,16 +1439,14 @@ impl DivergenceWatchdog {
         let count = self
             .defect_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let timestamp = current_timestamp_ns();
+        let timestamp = self.time_source.now_nanos();
         format!("defect-divergence-{timestamp}-{count}")
     }
 
     /// Generates a time envelope reference.
     fn generate_time_envelope_ref(&self) -> String {
-        let timestamp = current_timestamp_ns();
-        self.config
-            .time_envelope_pattern
-            .replace("{}", &timestamp.to_string())
+        self.time_source
+            .time_envelope_ref(&self.config.time_envelope_pattern)
     }
 
     /// Checks for divergence between the merge receipt HEAD and external trunk
@@ -1386,7 +1516,7 @@ impl DivergenceWatchdog {
         let freeze_id = self.generate_freeze_id();
         let defect_id = self.generate_defect_id();
         let time_envelope_ref = self.generate_time_envelope_ref();
-        let timestamp = current_timestamp_ns();
+        let timestamp = self.time_source.now_nanos();
 
         // Create the DefectRecord(PROJECTION_DIVERGENCE) first
         let defect = DefectRecord::projection_divergence(
@@ -1537,7 +1667,7 @@ impl DivergenceWatchdog {
     }
 }
 
-impl std::fmt::Debug for DivergenceWatchdog {
+impl<T: TimeSource> std::fmt::Debug for DivergenceWatchdog<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DivergenceWatchdog")
             .field("config", &self.config)

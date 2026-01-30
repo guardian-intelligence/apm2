@@ -77,9 +77,9 @@ pub mod projection_receipt;
 
 // Re-export main types
 pub use divergence_watchdog::{
-    DivergenceError, DivergenceWatchdog, DivergenceWatchdogConfig, FreezeRegistry, FreezeScope,
-    InterventionFreeze, InterventionFreezeBuilder, InterventionUnfreeze,
-    InterventionUnfreezeBuilder, ResolutionType,
+    DivergenceError, DivergenceWatchdog, DivergenceWatchdogConfig, FreezeCheck, FreezeRegistry,
+    FreezeScope, InterventionFreeze, InterventionFreezeBuilder, InterventionUnfreeze,
+    InterventionUnfreezeBuilder, ResolutionType, SystemTimeSource, TimeSource,
 };
 pub use github_sync::{
     GitHubAdapterConfig, GitHubProjectionAdapter, ProjectionAdapter, ProjectionError,
