@@ -312,6 +312,7 @@ holonic_checks:
 | T24 | [39_hazard_catalog_checklists.md](references/39_hazard_catalog_checklists.md) | Hazards |
 | T25 | [40_time_monotonicity_determinism.md](references/40_time_monotonicity_determinism.md) | Time |
 | T26 | [41_apm2_safe_patterns_and_anti_patterns.md](references/41_apm2_safe_patterns_and_anti_patterns.md) | APM2 Patterns |
+| T27 | [42_distributed_security_invariants.md](references/42_distributed_security_invariants.md) | Distributed Security |
 
 ---
 
