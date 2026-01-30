@@ -771,7 +771,7 @@ pub struct CapabilityRevoked {
     /// Revoker's signature over this revocation
     #[prost(bytes = "vec", tag = "6")]
     pub revoker_signature: ::prost::alloc::vec::Vec<u8>,
-    /// If true, only this capability is revoked; if false, cascade to all delegated capabilities
+    /// If true, revocation cascades to all delegated capabilities; if false, only this capability is revoked
     #[prost(bool, tag = "7")]
     pub cascade: bool,
 }

@@ -46,7 +46,7 @@
 //! assert!(capability.is_active());
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -891,15 +891,22 @@ impl CapabilityRegistryState {
     /// This performs a breadth-first traversal of the delegation tree to find
     /// all capabilities that were delegated from the given capability, directly
     /// or indirectly.
+    ///
+    /// Uses a visited set to detect cycles and prevent infinite loops if a
+    /// cycle exists in the delegation tree (due to a bug elsewhere).
     fn get_all_descendants(&self, capability_id: &str) -> Vec<String> {
         let mut descendants = Vec::new();
         let mut queue = vec![capability_id.to_string()];
+        let mut visited = HashSet::new();
+        visited.insert(capability_id.to_string());
 
         while let Some(current_id) = queue.pop() {
             if let Some(children) = self.delegation_tree.get(&current_id) {
                 for child_id in children {
-                    descendants.push(child_id.clone());
-                    queue.push(child_id.clone());
+                    if visited.insert(child_id.clone()) {
+                        descendants.push(child_id.clone());
+                        queue.push(child_id.clone());
+                    }
                 }
             }
         }

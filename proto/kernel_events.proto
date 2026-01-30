@@ -472,7 +472,7 @@ message CapabilityRevoked {
   uint64 revoked_at = 5;
   // Revoker's signature over this revocation
   bytes revoker_signature = 6;
-  // If true, only this capability is revoked; if false, cascade to all delegated capabilities
+  // If true, revocation cascades to all delegated capabilities; if false, only this capability is revoked
   bool cascade = 7;
 }
 
