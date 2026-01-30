@@ -29,35 +29,51 @@
 //! ```rust
 //! use apm2_core::context::{
 //!     AccessLevel, ContextPackManifest, ContextPackManifestBuilder,
-//!     ManifestEntry,
+//!     ManifestEntry, ManifestEntryBuilder,
 //! };
 //!
 //! // Create a manifest with file entries
 //! let manifest =
 //!     ContextPackManifestBuilder::new("manifest-001", "profile-001")
-//!         .add_entry(ManifestEntry {
-//!             stable_id: Some("src-main".to_string()),
-//!             path: "/project/src/main.rs".to_string(),
-//!             content_hash: [0x42; 32],
-//!             access_level: AccessLevel::Read,
-//!         })
-//!         .add_entry(ManifestEntry {
-//!             stable_id: None,
-//!             path: "/project/README.md".to_string(),
-//!             content_hash: [0xAB; 32],
-//!             access_level: AccessLevel::ReadWithZoom,
-//!         })
+//!         .add_entry(
+//!             ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+//!                 .stable_id("src-main")
+//!                 .access_level(AccessLevel::Read)
+//!                 .build(),
+//!         )
+//!         .add_entry(
+//!             ManifestEntryBuilder::new("/project/README.md", [0xAB; 32])
+//!                 .access_level(AccessLevel::ReadWithZoom)
+//!                 .build(),
+//!         )
 //!         .build();
 //!
-//! // Check if a file is allowed
-//! assert!(manifest.is_allowed("/project/src/main.rs", &[0x42; 32]));
+//! // Check if a file is allowed (with hash for ReadWithZoom)
+//! assert!(
+//!     manifest
+//!         .is_allowed("/project/src/main.rs", Some(&[0x42; 32]))
+//!         .unwrap()
+//! );
+//!
+//! // For Read access level, hash check can be omitted
+//! assert!(manifest.is_allowed("/project/src/main.rs", None).unwrap());
 //!
 //! // Wrong hash is rejected
-//! assert!(!manifest.is_allowed("/project/src/main.rs", &[0xFF; 32]));
+//! assert!(
+//!     !manifest
+//!         .is_allowed("/project/src/main.rs", Some(&[0xFF; 32]))
+//!         .unwrap()
+//! );
 //!
 //! // Unknown path is rejected
-//! assert!(!manifest.is_allowed("/project/secret.txt", &[0x00; 32]));
+//! assert!(
+//!     !manifest
+//!         .is_allowed("/project/secret.txt", Some(&[0x00; 32]))
+//!         .unwrap()
+//! );
 //! ```
+
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -151,6 +167,99 @@ pub enum ManifestError {
         /// The path with mismatched hash.
         path: String,
     },
+
+    /// Content hash required but not provided.
+    #[error("content hash required for ReadWithZoom access level: {path}")]
+    ContentHashRequired {
+        /// The path that requires a hash.
+        path: String,
+    },
+
+    /// Invalid path (contains traversal or null bytes).
+    #[error("invalid path: {reason}")]
+    InvalidPath {
+        /// The reason the path is invalid.
+        reason: String,
+    },
+}
+
+// =============================================================================
+// Path Normalization
+// =============================================================================
+
+/// Normalizes a path for secure allowlist matching.
+///
+/// This function ensures paths are in a canonical form to prevent path
+/// traversal attacks. It:
+///
+/// 1. Rejects paths containing embedded null bytes
+/// 2. Converts relative paths to absolute (prefixes with `/`)
+/// 3. Resolves `.` (current directory) and `..` (parent directory) components
+/// 4. Rejects paths where `..` would escape the root
+/// 5. Normalizes multiple consecutive slashes to single slash
+///
+/// # Arguments
+///
+/// * `path` - The path to normalize
+///
+/// # Returns
+///
+/// The normalized absolute path.
+///
+/// # Errors
+///
+/// Returns [`ManifestError::InvalidPath`] if:
+/// - The path contains embedded null bytes
+/// - The path attempts to traverse above the root directory
+///
+/// # Example
+///
+/// ```ignore
+/// assert_eq!(normalize_path("/foo/bar/../baz")?, "/foo/baz");
+/// assert_eq!(normalize_path("/foo/./bar")?, "/foo/bar");
+/// assert_eq!(normalize_path("foo/bar")?, "/foo/bar");
+/// assert!(normalize_path("/foo/../../bar").is_err()); // escapes root
+/// assert!(normalize_path("/foo\0bar").is_err()); // null byte
+/// ```
+pub fn normalize_path(path: &str) -> Result<String, ManifestError> {
+    // Reject embedded null bytes
+    if path.contains('\0') {
+        return Err(ManifestError::InvalidPath {
+            reason: "path contains embedded null byte".to_string(),
+        });
+    }
+
+    // Handle empty path
+    if path.is_empty() {
+        return Err(ManifestError::InvalidPath {
+            reason: "path is empty".to_string(),
+        });
+    }
+
+    // Process components
+    let mut components: Vec<&str> = Vec::new();
+
+    for component in path.split('/') {
+        match component {
+            // Skip empty components (from consecutive slashes) and current dir
+            "" | "." => {},
+            // Handle parent directory
+            ".." => {
+                if components.is_empty() {
+                    // Trying to go above root
+                    return Err(ManifestError::InvalidPath {
+                        reason: format!("path traversal would escape root: {path}"),
+                    });
+                }
+                components.pop();
+            },
+            // Normal component
+            _ => components.push(component),
+        }
+    }
+
+    // Build normalized path (always absolute)
+    Ok(format!("/{}", components.join("/")))
 }
 
 // =============================================================================
@@ -197,6 +306,8 @@ impl From<AccessLevel> for u8 {
 ///
 /// Each entry defines a single file that is permitted to be read, along with
 /// its content hash for integrity verification.
+///
+/// Use [`ManifestEntryBuilder`] to construct entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestEntry {
@@ -205,19 +316,96 @@ pub struct ManifestEntry {
     /// Used for semantic referencing across manifest versions. When present,
     /// allows tracking the same logical file across renames or moves.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stable_id: Option<String>,
+    stable_id: Option<String>,
 
     /// Absolute path to the file.
-    pub path: String,
+    path: String,
 
     /// BLAKE3 hash of the file content.
     ///
     /// Used for integrity verification to prevent TOCTOU attacks.
     #[serde(with = "serde_bytes")]
-    pub content_hash: [u8; 32],
+    content_hash: [u8; 32],
 
     /// Access level for this file.
-    pub access_level: AccessLevel,
+    access_level: AccessLevel,
+}
+
+impl ManifestEntry {
+    /// Returns the stable identifier for this entry, if any.
+    #[must_use]
+    pub fn stable_id(&self) -> Option<&str> {
+        self.stable_id.as_deref()
+    }
+
+    /// Returns the absolute path to the file.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns the BLAKE3 content hash.
+    #[must_use]
+    pub const fn content_hash(&self) -> &[u8; 32] {
+        &self.content_hash
+    }
+
+    /// Returns the access level for this entry.
+    #[must_use]
+    pub const fn access_level(&self) -> AccessLevel {
+        self.access_level
+    }
+}
+
+// =============================================================================
+// ManifestEntryBuilder
+// =============================================================================
+
+/// Builder for constructing [`ManifestEntry`] instances.
+#[derive(Debug)]
+pub struct ManifestEntryBuilder {
+    stable_id: Option<String>,
+    path: String,
+    content_hash: [u8; 32],
+    access_level: AccessLevel,
+}
+
+impl ManifestEntryBuilder {
+    /// Creates a new builder with the required path and content hash.
+    #[must_use]
+    pub fn new(path: impl Into<String>, content_hash: [u8; 32]) -> Self {
+        Self {
+            stable_id: None,
+            path: path.into(),
+            content_hash,
+            access_level: AccessLevel::Read,
+        }
+    }
+
+    /// Sets the stable identifier.
+    #[must_use]
+    pub fn stable_id(mut self, stable_id: impl Into<String>) -> Self {
+        self.stable_id = Some(stable_id.into());
+        self
+    }
+
+    /// Sets the access level.
+    #[must_use]
+    pub const fn access_level(mut self, access_level: AccessLevel) -> Self {
+        self.access_level = access_level;
+        self
+    }
+
+    /// Builds the manifest entry.
+    #[must_use]
+    pub fn build(self) -> ManifestEntry {
+        ManifestEntry {
+            stable_id: self.stable_id,
+            path: self.path,
+            content_hash: self.content_hash,
+            access_level: self.access_level,
+        }
+    }
 }
 
 // =============================================================================
@@ -237,7 +425,7 @@ pub struct ManifestEntry {
 ///   time)
 /// - `profile_id`: Profile that generated this manifest
 /// - `entries`: List of allowed file entries
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextPackManifest {
     /// Unique identifier for this manifest.
@@ -251,14 +439,37 @@ pub struct ContextPackManifest {
     pub profile_id: String,
 
     /// List of allowed file entries.
-    pub entries: Vec<ManifestEntry>,
+    entries: Vec<ManifestEntry>,
+
+    /// Index for O(1) path lookups.
+    /// Maps normalized path to index in entries vector.
+    #[serde(skip)]
+    path_index: HashMap<String, usize>,
 }
+
+impl PartialEq for ContextPackManifest {
+    fn eq(&self, other: &Self) -> bool {
+        // path_index is derived from entries, so we don't need to compare it
+        self.manifest_id == other.manifest_id
+            && self.manifest_hash == other.manifest_hash
+            && self.profile_id == other.profile_id
+            && self.entries == other.entries
+    }
+}
+
+impl Eq for ContextPackManifest {}
 
 impl ContextPackManifest {
     /// Returns the manifest hash.
     #[must_use]
     pub const fn manifest_hash(&self) -> [u8; 32] {
         self.manifest_hash
+    }
+
+    /// Returns a slice of all entries.
+    #[must_use]
+    pub fn entries(&self) -> &[ManifestEntry] {
+        &self.entries
     }
 
     /// Computes the manifest hash from the manifest fields.
@@ -308,66 +519,118 @@ impl ContextPackManifest {
         *hasher.finalize().as_bytes()
     }
 
+    /// Builds the path index from entries.
+    fn build_path_index(entries: &[ManifestEntry]) -> HashMap<String, usize> {
+        let mut index = HashMap::with_capacity(entries.len());
+        for (i, entry) in entries.iter().enumerate() {
+            index.insert(entry.path.clone(), i);
+        }
+        index
+    }
+
     /// Checks if access to a file is allowed.
     ///
     /// This is the primary security check for the context firewall. A file
     /// access is allowed if and only if:
     ///
-    /// 1. The path exists in the manifest
-    /// 2. The content hash matches the manifest entry (constant-time
-    ///    comparison)
+    /// 1. The path exists in the manifest (after normalization)
+    /// 2. The content hash matches (if provided, or required for
+    ///    `ReadWithZoom`)
+    ///
+    /// # Access Level Rules
+    ///
+    /// - **Read**: Hash check is optional. If `content_hash` is `None`, access
+    ///   is granted. If `Some(hash)`, the hash must match.
+    /// - **`ReadWithZoom`**: Hash is required. If `content_hash` is `None`,
+    ///   returns an error.
     ///
     /// # Security Notes
     ///
+    /// - Paths are normalized before lookup to prevent traversal attacks
     /// - Uses constant-time comparison for hash verification to prevent timing
     ///   attacks
-    /// - Both path and hash must match; path-only matching is not sufficient
     ///
     /// # Arguments
     ///
     /// * `path` - The absolute path to check
-    /// * `content_hash` - The BLAKE3 hash of the file content
+    /// * `content_hash` - The BLAKE3 hash of the file content (optional for
+    ///   Read)
     ///
     /// # Returns
     ///
-    /// `true` if access is allowed, `false` otherwise.
+    /// `Ok(true)` if access is allowed, `Ok(false)` if path not found or hash
+    /// mismatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestError::InvalidPath`] if the path is invalid.
+    /// Returns [`ManifestError::ContentHashRequired`] if the entry has
+    /// `ReadWithZoom` access level but no hash was provided.
     ///
     /// # Example
     ///
     /// ```rust
     /// use apm2_core::context::{
     ///     AccessLevel, ContextPackManifest, ContextPackManifestBuilder,
-    ///     ManifestEntry,
+    ///     ManifestEntryBuilder,
     /// };
     ///
     /// let manifest =
     ///     ContextPackManifestBuilder::new("manifest-001", "profile-001")
-    ///         .add_entry(ManifestEntry {
-    ///             stable_id: None,
-    ///             path: "/project/src/main.rs".to_string(),
-    ///             content_hash: [0x42; 32],
-    ///             access_level: AccessLevel::Read,
-    ///         })
+    ///         .add_entry(
+    ///             ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+    ///                 .access_level(AccessLevel::Read)
+    ///                 .build(),
+    ///         )
     ///         .build();
     ///
     /// // Matching path and hash: allowed
-    /// assert!(manifest.is_allowed("/project/src/main.rs", &[0x42; 32]));
+    /// assert!(
+    ///     manifest
+    ///         .is_allowed("/project/src/main.rs", Some(&[0x42; 32]))
+    ///         .unwrap()
+    /// );
+    ///
+    /// // Read access allows omitting hash
+    /// assert!(manifest.is_allowed("/project/src/main.rs", None).unwrap());
     ///
     /// // Wrong hash: denied
-    /// assert!(!manifest.is_allowed("/project/src/main.rs", &[0xFF; 32]));
+    /// assert!(
+    ///     !manifest
+    ///         .is_allowed("/project/src/main.rs", Some(&[0xFF; 32]))
+    ///         .unwrap()
+    /// );
     ///
     /// // Unknown path: denied
-    /// assert!(!manifest.is_allowed("/other/file.rs", &[0x42; 32]));
+    /// assert!(
+    ///     !manifest
+    ///         .is_allowed("/other/file.rs", Some(&[0x42; 32]))
+    ///         .unwrap()
+    /// );
     /// ```
-    #[must_use]
-    pub fn is_allowed(&self, path: &str, content_hash: &[u8; 32]) -> bool {
-        for entry in &self.entries {
-            if entry.path == path {
-                // Use constant-time comparison for security
-                return bool::from(entry.content_hash.ct_eq(content_hash));
-            }
+    pub fn is_allowed(
+        &self,
+        path: &str,
+        content_hash: Option<&[u8; 32]>,
+    ) -> Result<bool, ManifestError> {
+        let normalized = normalize_path(path)?;
+
+        let Some(&idx) = self.path_index.get(&normalized) else {
+            return Ok(false);
+        };
+
+        let entry = &self.entries[idx];
+
+        match (entry.access_level, content_hash) {
+            // ReadWithZoom requires hash
+            (AccessLevel::ReadWithZoom, None) => {
+                Err(ManifestError::ContentHashRequired { path: normalized })
+            },
+            // Hash provided, verify it
+            (_, Some(hash)) => Ok(bool::from(entry.content_hash.ct_eq(hash))),
+            // Read access without hash - allowed
+            (AccessLevel::Read, None) => Ok(true),
         }
-        false
     }
 
     /// Gets a manifest entry by path.
@@ -378,33 +641,40 @@ impl ContextPackManifest {
     ///
     /// # Returns
     ///
-    /// `Some(&ManifestEntry)` if found, `None` otherwise.
+    /// `Ok(Some(&ManifestEntry))` if found, `Ok(None)` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestError::InvalidPath`] if the path is invalid.
     ///
     /// # Example
     ///
     /// ```rust
     /// use apm2_core::context::{
     ///     AccessLevel, ContextPackManifest, ContextPackManifestBuilder,
-    ///     ManifestEntry,
+    ///     ManifestEntryBuilder,
     /// };
     ///
     /// let manifest =
     ///     ContextPackManifestBuilder::new("manifest-001", "profile-001")
-    ///         .add_entry(ManifestEntry {
-    ///             stable_id: Some("main-file".to_string()),
-    ///             path: "/project/src/main.rs".to_string(),
-    ///             content_hash: [0x42; 32],
-    ///             access_level: AccessLevel::Read,
-    ///         })
+    ///         .add_entry(
+    ///             ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+    ///                 .stable_id("main-file")
+    ///                 .access_level(AccessLevel::Read)
+    ///                 .build(),
+    ///         )
     ///         .build();
     ///
-    /// let entry = manifest.get_entry("/project/src/main.rs").unwrap();
-    /// assert_eq!(entry.stable_id, Some("main-file".to_string()));
-    /// assert_eq!(entry.access_level, AccessLevel::Read);
+    /// let entry = manifest.get_entry("/project/src/main.rs").unwrap().unwrap();
+    /// assert_eq!(entry.stable_id(), Some("main-file"));
+    /// assert_eq!(entry.access_level(), AccessLevel::Read);
     /// ```
-    #[must_use]
-    pub fn get_entry(&self, path: &str) -> Option<&ManifestEntry> {
-        self.entries.iter().find(|e| e.path == path)
+    pub fn get_entry(&self, path: &str) -> Result<Option<&ManifestEntry>, ManifestError> {
+        let normalized = normalize_path(path)?;
+        Ok(self
+            .path_index
+            .get(&normalized)
+            .map(|&idx| &self.entries[idx]))
     }
 
     /// Gets a manifest entry by `stable_id`.
@@ -428,10 +698,18 @@ impl ContextPackManifest {
     /// This is a stricter version of `is_allowed` that returns an error with
     /// details about why access was denied.
     ///
+    /// # Access Level Rules
+    ///
+    /// - **Read**: Hash check is optional. If `content_hash` is `None`, access
+    ///   is granted. If `Some(hash)`, the hash must match.
+    /// - **`ReadWithZoom`**: Hash is required. If `content_hash` is `None`,
+    ///   returns an error.
+    ///
     /// # Arguments
     ///
     /// * `path` - The absolute path to check
-    /// * `content_hash` - The BLAKE3 hash of the file content
+    /// * `content_hash` - The BLAKE3 hash of the file content (optional for
+    ///   Read)
     ///
     /// # Returns
     ///
@@ -439,32 +717,43 @@ impl ContextPackManifest {
     ///
     /// # Errors
     ///
+    /// Returns [`ManifestError::InvalidPath`] if the path is invalid.
     /// Returns [`ManifestError::PathNotFound`] if the path is not in the
     /// manifest.
-    ///
+    /// Returns [`ManifestError::ContentHashRequired`] if `ReadWithZoom` but
+    /// hash is `None`.
     /// Returns [`ManifestError::ContentHashMismatch`] if the path exists but
     /// the hash doesn't match.
     pub fn validate_access(
         &self,
         path: &str,
-        content_hash: &[u8; 32],
+        content_hash: Option<&[u8; 32]>,
     ) -> Result<&ManifestEntry, ManifestError> {
+        let normalized = normalize_path(path)?;
+
         let entry = self
-            .entries
-            .iter()
-            .find(|e| e.path == path)
+            .path_index
+            .get(&normalized)
+            .map(|&idx| &self.entries[idx])
             .ok_or_else(|| ManifestError::PathNotFound {
-                path: path.to_string(),
+                path: normalized.clone(),
             })?;
 
-        // Use constant-time comparison for security
-        if !bool::from(entry.content_hash.ct_eq(content_hash)) {
-            return Err(ManifestError::ContentHashMismatch {
-                path: path.to_string(),
-            });
+        match (entry.access_level, content_hash) {
+            // ReadWithZoom requires hash
+            (AccessLevel::ReadWithZoom, None) => {
+                Err(ManifestError::ContentHashRequired { path: normalized })
+            },
+            // Hash provided, verify it
+            (_, Some(hash)) => {
+                if !bool::from(entry.content_hash.ct_eq(hash)) {
+                    return Err(ManifestError::ContentHashMismatch { path: normalized });
+                }
+                Ok(entry)
+            },
+            // Read access without hash - allowed
+            (AccessLevel::Read, None) => Ok(entry),
         }
-
-        Ok(entry)
     }
 
     /// Verifies self-consistency by recomputing the manifest hash and
@@ -497,6 +786,14 @@ impl ContextPackManifest {
         }
 
         Ok(())
+    }
+
+    /// Rebuilds the path index after deserialization.
+    ///
+    /// This is called automatically when needed, but can be called explicitly
+    /// after deserializing a manifest.
+    pub fn rebuild_index(&mut self) {
+        self.path_index = Self::build_path_index(&self.entries);
     }
 }
 
@@ -571,7 +868,11 @@ impl ContextPackManifestBuilder {
     /// Returns [`ManifestError::DuplicatePath`] if duplicate paths are found.
     /// Returns [`ManifestError::DuplicateStableId`] if duplicate `stable_id`s
     /// are found.
-    pub fn try_build(self) -> Result<ContextPackManifest, ManifestError> {
+    /// Returns [`ManifestError::InvalidPath`] if any path contains traversal
+    /// or null bytes.
+    pub fn try_build(mut self) -> Result<ContextPackManifest, ManifestError> {
+        use std::collections::HashSet;
+
         // Validate string lengths
         if self.manifest_id.len() > MAX_STRING_LENGTH {
             return Err(ManifestError::StringTooLong {
@@ -597,12 +898,13 @@ impl ContextPackManifestBuilder {
             });
         }
 
-        // Track paths and stable_ids for duplicate detection
-        let mut paths: Vec<&str> = Vec::with_capacity(self.entries.len());
-        let mut stable_ids: Vec<&str> = Vec::new();
+        // Track paths and stable_ids for duplicate detection using HashSet for O(N)
+        let mut seen_paths: HashSet<String> = HashSet::with_capacity(self.entries.len());
+        let mut seen_stable_ids: HashSet<&str> = HashSet::new();
 
-        for entry in &self.entries {
-            // Validate path length
+        // Normalize paths and check for duplicates
+        for entry in &mut self.entries {
+            // Validate path length before normalization
             if entry.path.len() > MAX_PATH_LENGTH {
                 return Err(ManifestError::PathTooLong {
                     actual: entry.path.len(),
@@ -610,13 +912,24 @@ impl ContextPackManifestBuilder {
                 });
             }
 
-            // Check for duplicate path
-            if paths.contains(&entry.path.as_str()) {
-                return Err(ManifestError::DuplicatePath {
-                    path: entry.path.clone(),
+            // Normalize the path
+            let normalized = normalize_path(&entry.path)?;
+
+            // Check normalized path length
+            if normalized.len() > MAX_PATH_LENGTH {
+                return Err(ManifestError::PathTooLong {
+                    actual: normalized.len(),
+                    max: MAX_PATH_LENGTH,
                 });
             }
-            paths.push(&entry.path);
+
+            // Check for duplicate path (using normalized form)
+            if !seen_paths.insert(normalized.clone()) {
+                return Err(ManifestError::DuplicatePath { path: normalized });
+            }
+
+            // Update entry with normalized path
+            entry.path = normalized;
 
             // Validate and check stable_id
             if let Some(ref stable_id) = entry.stable_id {
@@ -627,14 +940,16 @@ impl ContextPackManifestBuilder {
                         max: MAX_STRING_LENGTH,
                     });
                 }
-                if stable_ids.contains(&stable_id.as_str()) {
+                if !seen_stable_ids.insert(stable_id.as_str()) {
                     return Err(ManifestError::DuplicateStableId {
                         stable_id: stable_id.clone(),
                     });
                 }
-                stable_ids.push(stable_id);
             }
         }
+
+        // Build path index for O(1) lookups
+        let path_index = ContextPackManifest::build_path_index(&self.entries);
 
         // Compute manifest hash
         let manifest_hash = ContextPackManifest::compute_manifest_hash(
@@ -648,6 +963,7 @@ impl ContextPackManifestBuilder {
             manifest_hash,
             profile_id: self.profile_id,
             entries: self.entries,
+            path_index,
         })
     }
 }
@@ -657,30 +973,105 @@ impl ContextPackManifestBuilder {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::large_stack_frames)]
 pub mod tests {
     use super::*;
 
     fn create_test_manifest() -> ContextPackManifest {
         ContextPackManifestBuilder::new("manifest-001", "profile-001")
-            .add_entry(ManifestEntry {
-                stable_id: Some("src-main".to_string()),
-                path: "/project/src/main.rs".to_string(),
-                content_hash: [0x42; 32],
-                access_level: AccessLevel::Read,
-            })
-            .add_entry(ManifestEntry {
-                stable_id: Some("readme".to_string()),
-                path: "/project/README.md".to_string(),
-                content_hash: [0xAB; 32],
-                access_level: AccessLevel::ReadWithZoom,
-            })
-            .add_entry(ManifestEntry {
-                stable_id: None,
-                path: "/project/Cargo.toml".to_string(),
-                content_hash: [0xCD; 32],
-                access_level: AccessLevel::Read,
-            })
+            .add_entry(
+                ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+                    .stable_id("src-main")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/project/README.md", [0xAB; 32])
+                    .stable_id("readme")
+                    .access_level(AccessLevel::ReadWithZoom)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/project/Cargo.toml", [0xCD; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
             .build()
+    }
+
+    // =========================================================================
+    // Path Normalization Tests
+    // =========================================================================
+
+    #[test]
+    fn test_normalize_path_basic() {
+        assert_eq!(normalize_path("/foo/bar").unwrap(), "/foo/bar");
+        assert_eq!(normalize_path("/foo/bar/").unwrap(), "/foo/bar");
+        assert_eq!(normalize_path("/").unwrap(), "/");
+    }
+
+    #[test]
+    fn test_normalize_path_removes_dot() {
+        assert_eq!(normalize_path("/foo/./bar").unwrap(), "/foo/bar");
+        assert_eq!(normalize_path("/./foo/./bar/.").unwrap(), "/foo/bar");
+    }
+
+    #[test]
+    fn test_normalize_path_resolves_dotdot() {
+        assert_eq!(normalize_path("/foo/bar/../baz").unwrap(), "/foo/baz");
+        assert_eq!(
+            normalize_path("/foo/bar/baz/../../qux").unwrap(),
+            "/foo/qux"
+        );
+        assert_eq!(normalize_path("/foo/bar/..").unwrap(), "/foo");
+    }
+
+    #[test]
+    fn test_normalize_path_multiple_slashes() {
+        assert_eq!(normalize_path("/foo//bar").unwrap(), "/foo/bar");
+        assert_eq!(normalize_path("/foo///bar////baz").unwrap(), "/foo/bar/baz");
+    }
+
+    #[test]
+    fn test_normalize_path_relative_becomes_absolute() {
+        assert_eq!(normalize_path("foo/bar").unwrap(), "/foo/bar");
+        assert_eq!(normalize_path("foo").unwrap(), "/foo");
+    }
+
+    #[test]
+    fn test_normalize_path_rejects_traversal_escape() {
+        assert!(matches!(
+            normalize_path("/foo/../../bar"),
+            Err(ManifestError::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            normalize_path("/../foo"),
+            Err(ManifestError::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            normalize_path("/.."),
+            Err(ManifestError::InvalidPath { .. })
+        ));
+    }
+
+    #[test]
+    fn test_normalize_path_rejects_null_bytes() {
+        assert!(matches!(
+            normalize_path("/foo\0bar"),
+            Err(ManifestError::InvalidPath { reason }) if reason.contains("null byte")
+        ));
+        assert!(matches!(
+            normalize_path("/foo/bar\0"),
+            Err(ManifestError::InvalidPath { .. })
+        ));
+    }
+
+    #[test]
+    fn test_normalize_path_rejects_empty() {
+        assert!(matches!(
+            normalize_path(""),
+            Err(ManifestError::InvalidPath { reason }) if reason.contains("empty")
+        ));
     }
 
     // =========================================================================
@@ -693,7 +1084,7 @@ pub mod tests {
 
         assert_eq!(manifest.manifest_id, "manifest-001");
         assert_eq!(manifest.profile_id, "profile-001");
-        assert_eq!(manifest.entries.len(), 3);
+        assert_eq!(manifest.entries().len(), 3);
     }
 
     #[test]
@@ -710,12 +1101,11 @@ pub mod tests {
         let manifest1 = create_test_manifest();
 
         let manifest2 = ContextPackManifestBuilder::new("manifest-002", "profile-001")
-            .add_entry(ManifestEntry {
-                stable_id: None,
-                path: "/project/src/main.rs".to_string(),
-                content_hash: [0x42; 32],
-                access_level: AccessLevel::Read,
-            })
+            .add_entry(
+                ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
             .build();
 
         assert_ne!(manifest1.manifest_hash(), manifest2.manifest_hash());
@@ -730,9 +1120,42 @@ pub mod tests {
         let manifest = create_test_manifest();
 
         // Matching path and hash
-        assert!(manifest.is_allowed("/project/src/main.rs", &[0x42; 32]));
-        assert!(manifest.is_allowed("/project/README.md", &[0xAB; 32]));
-        assert!(manifest.is_allowed("/project/Cargo.toml", &[0xCD; 32]));
+        assert!(
+            manifest
+                .is_allowed("/project/src/main.rs", Some(&[0x42; 32]))
+                .unwrap()
+        );
+        assert!(
+            manifest
+                .is_allowed("/project/README.md", Some(&[0xAB; 32]))
+                .unwrap()
+        );
+        assert!(
+            manifest
+                .is_allowed("/project/Cargo.toml", Some(&[0xCD; 32]))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_is_allowed_read_without_hash() {
+        let manifest = create_test_manifest();
+
+        // Read access level allows omitting hash
+        assert!(manifest.is_allowed("/project/src/main.rs", None).unwrap());
+        assert!(manifest.is_allowed("/project/Cargo.toml", None).unwrap());
+    }
+
+    #[test]
+    fn test_is_allowed_read_with_zoom_requires_hash() {
+        let manifest = create_test_manifest();
+
+        // ReadWithZoom requires hash
+        let result = manifest.is_allowed("/project/README.md", None);
+        assert!(matches!(
+            result,
+            Err(ManifestError::ContentHashRequired { path }) if path == "/project/README.md"
+        ));
     }
 
     #[test]
@@ -740,8 +1163,16 @@ pub mod tests {
         let manifest = create_test_manifest();
 
         // Correct path but wrong hash
-        assert!(!manifest.is_allowed("/project/src/main.rs", &[0xFF; 32]));
-        assert!(!manifest.is_allowed("/project/README.md", &[0x00; 32]));
+        assert!(
+            !manifest
+                .is_allowed("/project/src/main.rs", Some(&[0xFF; 32]))
+                .unwrap()
+        );
+        assert!(
+            !manifest
+                .is_allowed("/project/README.md", Some(&[0x00; 32]))
+                .unwrap()
+        );
     }
 
     #[test]
@@ -749,8 +1180,16 @@ pub mod tests {
         let manifest = create_test_manifest();
 
         // Path not in manifest (even with a "valid" hash)
-        assert!(!manifest.is_allowed("/project/secret.txt", &[0x42; 32]));
-        assert!(!manifest.is_allowed("/other/path.rs", &[0x00; 32]));
+        assert!(
+            !manifest
+                .is_allowed("/project/secret.txt", Some(&[0x42; 32]))
+                .unwrap()
+        );
+        assert!(
+            !manifest
+                .is_allowed("/other/path.rs", Some(&[0x00; 32]))
+                .unwrap()
+        );
     }
 
     #[test]
@@ -758,7 +1197,55 @@ pub mod tests {
         let manifest = ContextPackManifestBuilder::new("manifest-empty", "profile-001").build();
 
         // Empty manifest rejects everything
-        assert!(!manifest.is_allowed("/any/path.rs", &[0x42; 32]));
+        assert!(
+            !manifest
+                .is_allowed("/any/path.rs", Some(&[0x42; 32]))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_is_allowed_with_path_normalization() {
+        let manifest = create_test_manifest();
+
+        // Path with .. that normalizes to allowed path
+        assert!(
+            manifest
+                .is_allowed("/project/src/../src/main.rs", Some(&[0x42; 32]))
+                .unwrap()
+        );
+
+        // Path with . that normalizes to allowed path
+        assert!(
+            manifest
+                .is_allowed("/project/./src/main.rs", Some(&[0x42; 32]))
+                .unwrap()
+        );
+
+        // Path with multiple slashes
+        assert!(
+            manifest
+                .is_allowed("/project//src//main.rs", Some(&[0x42; 32]))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_is_allowed_rejects_traversal_attack() {
+        let manifest = create_test_manifest();
+
+        // Path traversal that would escape root
+        let result = manifest.is_allowed("/project/../../../etc/passwd", Some(&[0x42; 32]));
+        assert!(matches!(result, Err(ManifestError::InvalidPath { .. })));
+    }
+
+    #[test]
+    fn test_is_allowed_rejects_null_byte() {
+        let manifest = create_test_manifest();
+
+        // Null byte injection
+        let result = manifest.is_allowed("/project/src/main.rs\0.txt", Some(&[0x42; 32]));
+        assert!(matches!(result, Err(ManifestError::InvalidPath { .. })));
     }
 
     // =========================================================================
@@ -769,17 +1256,34 @@ pub mod tests {
     fn test_get_entry_found() {
         let manifest = create_test_manifest();
 
-        let entry = manifest.get_entry("/project/src/main.rs").unwrap();
-        assert_eq!(entry.stable_id, Some("src-main".to_string()));
-        assert_eq!(entry.content_hash, [0x42; 32]);
-        assert_eq!(entry.access_level, AccessLevel::Read);
+        let entry = manifest.get_entry("/project/src/main.rs").unwrap().unwrap();
+        assert_eq!(entry.stable_id(), Some("src-main"));
+        assert_eq!(entry.content_hash(), &[0x42; 32]);
+        assert_eq!(entry.access_level(), AccessLevel::Read);
     }
 
     #[test]
     fn test_get_entry_not_found() {
         let manifest = create_test_manifest();
 
-        assert!(manifest.get_entry("/nonexistent/path.rs").is_none());
+        assert!(
+            manifest
+                .get_entry("/nonexistent/path.rs")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_get_entry_with_normalization() {
+        let manifest = create_test_manifest();
+
+        // Should find entry with normalized path
+        let entry = manifest
+            .get_entry("/project/src/../src/main.rs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.path(), "/project/src/main.rs");
     }
 
     #[test]
@@ -787,10 +1291,10 @@ pub mod tests {
         let manifest = create_test_manifest();
 
         let entry = manifest.get_entry_by_stable_id("src-main").unwrap();
-        assert_eq!(entry.path, "/project/src/main.rs");
+        assert_eq!(entry.path(), "/project/src/main.rs");
 
         let entry = manifest.get_entry_by_stable_id("readme").unwrap();
-        assert_eq!(entry.path, "/project/README.md");
+        assert_eq!(entry.path(), "/project/README.md");
     }
 
     #[test]
@@ -809,16 +1313,39 @@ pub mod tests {
         let manifest = create_test_manifest();
 
         let entry = manifest
-            .validate_access("/project/src/main.rs", &[0x42; 32])
+            .validate_access("/project/src/main.rs", Some(&[0x42; 32]))
             .unwrap();
-        assert_eq!(entry.stable_id, Some("src-main".to_string()));
+        assert_eq!(entry.stable_id(), Some("src-main"));
+    }
+
+    #[test]
+    fn test_validate_access_read_without_hash() {
+        let manifest = create_test_manifest();
+
+        // Read access allows omitting hash
+        let entry = manifest
+            .validate_access("/project/src/main.rs", None)
+            .unwrap();
+        assert_eq!(entry.stable_id(), Some("src-main"));
+    }
+
+    #[test]
+    fn test_validate_access_read_with_zoom_requires_hash() {
+        let manifest = create_test_manifest();
+
+        // ReadWithZoom requires hash
+        let result = manifest.validate_access("/project/README.md", None);
+        assert!(matches!(
+            result,
+            Err(ManifestError::ContentHashRequired { path }) if path == "/project/README.md"
+        ));
     }
 
     #[test]
     fn test_validate_access_path_not_found() {
         let manifest = create_test_manifest();
 
-        let result = manifest.validate_access("/nonexistent/path.rs", &[0x42; 32]);
+        let result = manifest.validate_access("/nonexistent/path.rs", Some(&[0x42; 32]));
         assert!(matches!(
             result,
             Err(ManifestError::PathNotFound { path }) if path == "/nonexistent/path.rs"
@@ -829,7 +1356,7 @@ pub mod tests {
     fn test_validate_access_hash_mismatch() {
         let manifest = create_test_manifest();
 
-        let result = manifest.validate_access("/project/src/main.rs", &[0xFF; 32]);
+        let result = manifest.validate_access("/project/src/main.rs", Some(&[0xFF; 32]));
         assert!(matches!(
             result,
             Err(ManifestError::ContentHashMismatch { path }) if path == "/project/src/main.rs"
@@ -843,11 +1370,10 @@ pub mod tests {
     #[test]
     fn test_entries_too_large() {
         let entries: Vec<ManifestEntry> = (0..=MAX_ENTRIES)
-            .map(|i| ManifestEntry {
-                stable_id: None,
-                path: format!("/path/file-{i}.rs"),
-                content_hash: [0x42; 32],
-                access_level: AccessLevel::Read,
+            .map(|i| {
+                ManifestEntryBuilder::new(format!("/path/file-{i}.rs"), [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build()
             })
             .collect();
 
@@ -900,12 +1426,11 @@ pub mod tests {
         let long_path = "/".to_string() + &"x".repeat(MAX_PATH_LENGTH);
 
         let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
-            .add_entry(ManifestEntry {
-                stable_id: None,
-                path: long_path,
-                content_hash: [0x42; 32],
-                access_level: AccessLevel::Read,
-            })
+            .add_entry(
+                ManifestEntryBuilder::new(long_path, [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
             .try_build();
 
         assert!(matches!(result, Err(ManifestError::PathTooLong { .. })));
@@ -916,12 +1441,12 @@ pub mod tests {
         let long_id = "x".repeat(MAX_STRING_LENGTH + 1);
 
         let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
-            .add_entry(ManifestEntry {
-                stable_id: Some(long_id),
-                path: "/project/file.rs".to_string(),
-                content_hash: [0x42; 32],
-                access_level: AccessLevel::Read,
-            })
+            .add_entry(
+                ManifestEntryBuilder::new("/project/file.rs", [0x42; 32])
+                    .stable_id(long_id)
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
             .try_build();
 
         assert!(matches!(
@@ -940,18 +1465,16 @@ pub mod tests {
     #[test]
     fn test_duplicate_path_rejected() {
         let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
-            .add_entry(ManifestEntry {
-                stable_id: None,
-                path: "/project/file.rs".to_string(),
-                content_hash: [0x42; 32],
-                access_level: AccessLevel::Read,
-            })
-            .add_entry(ManifestEntry {
-                stable_id: None,
-                path: "/project/file.rs".to_string(), // Duplicate path
-                content_hash: [0xAB; 32],
-                access_level: AccessLevel::ReadWithZoom,
-            })
+            .add_entry(
+                ManifestEntryBuilder::new("/project/file.rs", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/project/file.rs", [0xAB; 32])
+                    .access_level(AccessLevel::ReadWithZoom)
+                    .build(),
+            )
             .try_build();
 
         assert!(matches!(
@@ -961,20 +1484,42 @@ pub mod tests {
     }
 
     #[test]
+    fn test_duplicate_path_after_normalization_rejected() {
+        // Paths that normalize to the same value should be detected as duplicates
+        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/project/src/../src/main.rs", [0xAB; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .try_build();
+
+        assert!(matches!(
+            result,
+            Err(ManifestError::DuplicatePath { path }) if path == "/project/src/main.rs"
+        ));
+    }
+
+    #[test]
     fn test_duplicate_stable_id_rejected() {
         let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
-            .add_entry(ManifestEntry {
-                stable_id: Some("file-id".to_string()),
-                path: "/project/file1.rs".to_string(),
-                content_hash: [0x42; 32],
-                access_level: AccessLevel::Read,
-            })
-            .add_entry(ManifestEntry {
-                stable_id: Some("file-id".to_string()), // Duplicate stable_id
-                path: "/project/file2.rs".to_string(),
-                content_hash: [0xAB; 32],
-                access_level: AccessLevel::Read,
-            })
+            .add_entry(
+                ManifestEntryBuilder::new("/project/file1.rs", [0x42; 32])
+                    .stable_id("file-id")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/project/file2.rs", [0xAB; 32])
+                    .stable_id("file-id")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
             .try_build();
 
         assert!(matches!(
@@ -998,7 +1543,8 @@ pub mod tests {
     fn test_verify_self_consistency_fails_on_tampered_manifest() {
         // Create a manifest with manually corrupted hash via JSON
         let json = r#"{"manifest_id":"manifest-001","manifest_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"profile_id":"profile-001","entries":[]}"#;
-        let manifest: ContextPackManifest = serde_json::from_str(json).unwrap();
+        let mut manifest: ContextPackManifest = serde_json::from_str(json).unwrap();
+        manifest.rebuild_index();
 
         let result = manifest.verify_self_consistency();
         assert!(
@@ -1013,7 +1559,8 @@ pub mod tests {
 
         // Serialize and deserialize
         let json = serde_json::to_string(&original).unwrap();
-        let recovered: ContextPackManifest = serde_json::from_str(&json).unwrap();
+        let mut recovered: ContextPackManifest = serde_json::from_str(&json).unwrap();
+        recovered.rebuild_index();
 
         // Self-consistency should still pass
         assert!(recovered.verify_self_consistency().is_ok());
@@ -1049,7 +1596,8 @@ pub mod tests {
         let json = serde_json::to_string(&original).unwrap();
 
         // Deserialize back
-        let recovered: ContextPackManifest = serde_json::from_str(&json).unwrap();
+        let mut recovered: ContextPackManifest = serde_json::from_str(&json).unwrap();
+        recovered.rebuild_index();
 
         assert_eq!(original.manifest_id, recovered.manifest_id);
         assert_eq!(original.manifest_hash, recovered.manifest_hash);
@@ -1083,7 +1631,7 @@ pub mod tests {
     fn test_empty_manifest_valid() {
         let manifest = ContextPackManifestBuilder::new("manifest-empty", "profile-001").build();
 
-        assert!(manifest.entries.is_empty());
+        assert!(manifest.entries().is_empty());
         assert!(manifest.verify_self_consistency().is_ok());
     }
 
@@ -1094,15 +1642,18 @@ pub mod tests {
     #[test]
     fn test_entry_without_stable_id() {
         let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
-            .add_entry(ManifestEntry {
-                stable_id: None,
-                path: "/project/file.rs".to_string(),
-                content_hash: [0x42; 32],
-                access_level: AccessLevel::Read,
-            })
+            .add_entry(
+                ManifestEntryBuilder::new("/project/file.rs", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
             .build();
 
-        assert!(manifest.is_allowed("/project/file.rs", &[0x42; 32]));
+        assert!(
+            manifest
+                .is_allowed("/project/file.rs", Some(&[0x42; 32]))
+                .unwrap()
+        );
         assert!(manifest.get_entry_by_stable_id("any").is_none());
     }
 
@@ -1111,22 +1662,28 @@ pub mod tests {
         // Same content hash for different files is valid (same content in
         // different locations)
         let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
-            .add_entry(ManifestEntry {
-                stable_id: None,
-                path: "/project/file1.rs".to_string(),
-                content_hash: [0x42; 32],
-                access_level: AccessLevel::Read,
-            })
-            .add_entry(ManifestEntry {
-                stable_id: None,
-                path: "/project/file2.rs".to_string(),
-                content_hash: [0x42; 32], // Same hash, different path
-                access_level: AccessLevel::Read,
-            })
+            .add_entry(
+                ManifestEntryBuilder::new("/project/file1.rs", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/project/file2.rs", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
             .build();
 
-        assert!(manifest.is_allowed("/project/file1.rs", &[0x42; 32]));
-        assert!(manifest.is_allowed("/project/file2.rs", &[0x42; 32]));
+        assert!(
+            manifest
+                .is_allowed("/project/file1.rs", Some(&[0x42; 32]))
+                .unwrap()
+        );
+        assert!(
+            manifest
+                .is_allowed("/project/file2.rs", Some(&[0x42; 32]))
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1134,25 +1691,172 @@ pub mod tests {
         // This test verifies that hash comparison is done in constant time
         // by ensuring the same result regardless of where bytes differ
         let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
-            .add_entry(ManifestEntry {
-                stable_id: None,
-                path: "/project/file.rs".to_string(),
-                content_hash: [0xFF; 32],
-                access_level: AccessLevel::Read,
-            })
+            .add_entry(
+                ManifestEntryBuilder::new("/project/file.rs", [0xFF; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
             .build();
 
         // Different in first byte
         let mut hash1 = [0xFF; 32];
         hash1[0] = 0x00;
-        assert!(!manifest.is_allowed("/project/file.rs", &hash1));
+        assert!(
+            !manifest
+                .is_allowed("/project/file.rs", Some(&hash1))
+                .unwrap()
+        );
 
         // Different in last byte
         let mut hash2 = [0xFF; 32];
         hash2[31] = 0x00;
-        assert!(!manifest.is_allowed("/project/file.rs", &hash2));
+        assert!(
+            !manifest
+                .is_allowed("/project/file.rs", Some(&hash2))
+                .unwrap()
+        );
 
         // All different
-        assert!(!manifest.is_allowed("/project/file.rs", &[0x00; 32]));
+        assert!(
+            !manifest
+                .is_allowed("/project/file.rs", Some(&[0x00; 32]))
+                .unwrap()
+        );
+    }
+
+    // =========================================================================
+    // ManifestEntry Getter Tests
+    // =========================================================================
+
+    #[test]
+    fn test_manifest_entry_getters() {
+        let entry = ManifestEntryBuilder::new("/project/file.rs", [0x42; 32])
+            .stable_id("test-id")
+            .access_level(AccessLevel::ReadWithZoom)
+            .build();
+
+        assert_eq!(entry.path(), "/project/file.rs");
+        assert_eq!(entry.content_hash(), &[0x42; 32]);
+        assert_eq!(entry.stable_id(), Some("test-id"));
+        assert_eq!(entry.access_level(), AccessLevel::ReadWithZoom);
+    }
+
+    #[test]
+    fn test_manifest_entry_no_stable_id() {
+        let entry = ManifestEntryBuilder::new("/project/file.rs", [0x42; 32])
+            .access_level(AccessLevel::Read)
+            .build();
+
+        assert_eq!(entry.stable_id(), None);
+    }
+
+    // =========================================================================
+    // Path Index Tests
+    // =========================================================================
+
+    #[test]
+    fn test_path_index_built_on_construction() {
+        let manifest = create_test_manifest();
+
+        // Verify O(1) lookup works
+        assert!(
+            manifest
+                .get_entry("/project/src/main.rs")
+                .unwrap()
+                .is_some()
+        );
+        assert!(manifest.get_entry("/project/README.md").unwrap().is_some());
+        assert!(manifest.get_entry("/project/Cargo.toml").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_rebuild_index_after_deserialization() {
+        let original = create_test_manifest();
+        let json = serde_json::to_string(&original).unwrap();
+        let mut recovered: ContextPackManifest = serde_json::from_str(&json).unwrap();
+
+        // Before rebuild, path_index is empty (serde skip)
+        assert!(recovered.path_index.is_empty());
+
+        // Rebuild index
+        recovered.rebuild_index();
+
+        // Now lookups work
+        assert!(
+            recovered
+                .get_entry("/project/src/main.rs")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    // =========================================================================
+    // Path Traversal Attack Tests
+    // =========================================================================
+
+    #[test]
+    fn test_path_traversal_attack_patterns() {
+        let manifest = create_test_manifest();
+
+        // Various traversal patterns that should be handled
+        let attack_patterns = [
+            "/project/../../../etc/passwd",
+            "/../etc/passwd",
+            "/project/src/../../..",
+        ];
+
+        for pattern in attack_patterns {
+            let result = manifest.is_allowed(pattern, Some(&[0x42; 32]));
+            assert!(
+                matches!(result, Err(ManifestError::InvalidPath { .. })),
+                "Pattern '{pattern}' should be rejected as invalid path"
+            );
+        }
+    }
+
+    #[test]
+    fn test_null_byte_injection_patterns() {
+        let manifest = create_test_manifest();
+
+        let attack_patterns = [
+            "/project/src/main.rs\0.txt",
+            "/project/\0/file.rs",
+            "\0/etc/passwd",
+        ];
+
+        for pattern in attack_patterns {
+            let result = manifest.is_allowed(pattern, Some(&[0x42; 32]));
+            assert!(
+                matches!(result, Err(ManifestError::InvalidPath { .. })),
+                "Pattern with null byte should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_rejects_traversal_in_entry_path() {
+        // Paths that would escape root should be rejected at build time
+        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/project/../../etc/passwd", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .try_build();
+
+        assert!(matches!(result, Err(ManifestError::InvalidPath { .. })));
+    }
+
+    #[test]
+    fn test_build_rejects_null_byte_in_entry_path() {
+        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/project/file\0.rs", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .try_build();
+
+        assert!(matches!(result, Err(ManifestError::InvalidPath { .. })));
     }
 }
