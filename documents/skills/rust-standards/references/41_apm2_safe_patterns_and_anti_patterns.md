@@ -18,9 +18,12 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
 - APPLY: CTR-1205.
 - REJECT IF: invalid states are constructible in safe code.
 
-[CONTRACT: CTR-2604] Secrets Use Secret Types (Non-Loggable by Default).
-- REJECT IF: secrets (tokens/keys/passwords) are stored in `String`, `Vec<u8>`, or types that `Debug`/`Display` the value.
-- ENFORCE BY: `secrecy::SecretString`/`SecretVec` + `ExposeSecret` only at the boundary; keep secrets out of structured logs.
+[CONTRACT: CTR-2604] Secrets Are Strongly Typed and Non-Loggable.
+- REJECT IF: secrets (keys, tokens, passwords) are passed as `String`, `&str`, or `Vec<u8>` in public APIs.
+- REJECT IF: secrets are stored in types that `Debug`/`Display` the raw value.
+- ENFORCE BY: `secrecy::Secret<T>` or a custom NewType wrapper that implements `Drop` (zeroize) and `Debug` (redact: `***`).
+- ENFORCE BY: `ExposeSecret` only at the I/O boundary.
+[PROVENANCE] CTR-1505 (Secret Leakage); Prevent accidental logging (CWE-312).
 
 [CONTRACT: CTR-2605] State Machines Are Explicit Enums With Total Transition Logic.
 - REJECT IF: state is modeled as booleans/ints without a closed set of states and explicit transitions.
@@ -41,6 +44,7 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
 - ENFORCE BY: exponential backoff + cap + "circuit open" state with cooldown; record failure history; require explicit reset conditions.
 
 [CONTRACT: CTR-2609] Paths Are Treated as an Input Boundary.
+- APPLY: CTR-1501 (Not UTF-8) and CTR-1504 (Sanitization).
 - REJECT IF: untrusted identifiers are joined into paths without strict validation (path traversal).
 - ENFORCE BY: validate/parse IDs into constrained types; never `join(user_input)`; prefer mapping IDs to safe filenames.
 
@@ -104,6 +108,32 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
   - `let val = input.parse().map_err(|_| Error::InvalidInput)?`
   - Use `unwrap_or(default)` for permissive parsing.
 [PROVENANCE] RSK-0701 (Panic-as-DoS).
+
+[CONTRACT: CTR-2622] Centralized Configuration.
+- REJECT IF: `std::env::var` is called in business logic (outside `crate::config` or `xtask` scripts).
+- ENFORCE BY: Load all config into a typed `Config` struct at startup; pass `Config` or specific fields to components.
+- PROVENANCE: Ensures 12-factor app compliance and testability (environment injection).
+
+[CONTRACT: CTR-2623] No Boolean Blindness in APIs.
+- REJECT IF: public function arguments use `bool` for logic options (e.g., `validate(true)`).
+- ENFORCE BY: Use specific `enum`s (e.g., `ValidationMode::Strict`) or `struct` options patterns.
+- PROVENANCE: Improves readability and prevents regression when refactoring (swapped booleans).
+
+[CONTRACT: CTR-2624] Finite State Machines Are Typed.
+- REJECT IF: internal state or status is represented as a `String` (e.g., `status: "running"`).
+- ENFORCE BY: Use `enum` for all finite states; use `String` only for arbitrary user input or unbounded identifiers.
+- PROVENANCE: Enables compiler-checked exhaustive matching and prevents invalid states.
+
+[RISK: RSK-2625] Unbounded Channels.
+- APPLY: CTR-1004 (Bounded Concurrency).
+- REJECT IF: `std::sync::mpsc::channel()` or `tokio::sync::mpsc::unbounded_channel()` is used without strict, proven upper bounds on production rates.
+- ENFORCE BY: `mpsc::sync_channel(bound)` or `tokio::sync::mpsc::channel(bound)` to provide backpressure.
+- PROVENANCE: Prevents OOM DoS attacks (CWE-400).
+
+[CONTRACT: CTR-2626] Technical Debt Must Be Accounted.
+- REJECT IF: `TODO`, `FIXME`, or `HACK` comments exist without a referenced Ticket ID (e.g., `TODO(TCK-123): ...`).
+- ENFORCE BY: CI lint (grep) that rejects orphaned TODOs.
+- PROVENANCE: Prevents "temporary" hacks from becoming permanent load-bearing tech debt.
 
 ## Anti-Patterns (Lessons Learned)
 
