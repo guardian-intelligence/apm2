@@ -1,0 +1,20 @@
+ticket_meta:
+  ticket:
+    id: "TCK-00278"
+    title: "50/50 Model Distribution for AI Reviews"
+    status: "IN_PROGRESS"
+    created: "2026-01-30"
+    rfc_id: null
+    parent_ticket: null
+    description: |
+      Distribute AI review model usage evenly between gemini-3-pro and
+      gemini-3-flash to balance quota consumption. Adds select_review_model()
+      helper that uses nanosecond-based selection for 50/50 distribution.
+    acceptance_criteria:
+      - "Add select_review_model() function in reviewer_state.rs"
+      - "Update push.rs to use select_review_model() (2 places)"
+      - "Update review.rs to use select_review_model() (1 place)"
+      - "Update check.rs to use select_review_model() (1 place)"
+      - "Update aat.rs to use select_review_model() (1 place)"
+      - "All tests pass"
+      - "No clippy warnings"
