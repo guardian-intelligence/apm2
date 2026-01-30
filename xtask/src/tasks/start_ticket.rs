@@ -288,12 +288,52 @@ pub fn run(target: Option<&str>, print_path_only: bool) -> Result<()> {
             .context("Failed to create worktree with new branch")?;
     }
 
+    // Copy .claude directory to worktree
+    copy_claude_directory(&main_worktree_path, &worktree_path)?;
+    println!("Copied .claude/ to worktree");
+
     println!();
     println!("Worktree created at: {}", worktree_path.display());
     println!();
 
     // Output context for implementation
     print_context(&main_worktree_path, ticket);
+
+    Ok(())
+}
+
+/// Copy `.claude` directory from main worktree to the new worktree.
+///
+/// This ensures Claude Code skills and configuration are available in
+/// ticket worktrees. Silently skips if source `.claude` doesn't exist.
+fn copy_claude_directory(main_worktree: &Path, worktree_path: &Path) -> Result<()> {
+    let source = main_worktree.join(".claude");
+    let dest = worktree_path.join(".claude");
+
+    if !source.exists() {
+        return Ok(());
+    }
+
+    copy_dir_recursive(&source, &dest).context("Failed to copy .claude directory to worktree")?;
+
+    Ok(())
+}
+
+/// Recursively copy a directory and its contents.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
 
     Ok(())
 }
