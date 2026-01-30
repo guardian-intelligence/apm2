@@ -1,0 +1,498 @@
+//! Gate lease types for the Forge Admission Cycle.
+//!
+//! This module defines [`GateLease`] which represents a cryptographically
+//! signed authorization binding an executor to a specific changeset and time
+//! window.
+//!
+//! # Security Model
+//!
+//! Gate leases implement the authority model for the Forge Admission Cycle:
+//!
+//! - **Executor Binding**: The lease binds a specific executor actor to the
+//!   work
+//! - **Changeset Binding**: The changeset digest prevents substitution attacks
+//! - **Time Binding**: The time envelope reference enforces temporal bounds
+//! - **Policy Binding**: The `policy_hash` links to the resolved policy
+//!
+//! # Signature Verification
+//!
+//! All gate leases are signed using domain-separated Ed25519 signatures.
+//! The signature covers the canonical encoding of the lease (excluding the
+//! signature field itself) with the `GATE_LEASE_ISSUED:` domain prefix.
+//!
+//! # Example
+//!
+//! ```rust
+//! use apm2_core::crypto::Signer;
+//! use apm2_core::fac::{GateLease, GateLeaseBuilder};
+//!
+//! // Create a gate lease
+//! let signer = Signer::generate();
+//! let lease = GateLeaseBuilder::new("lease-001", "work-001", "gate-build")
+//!     .changeset_digest([0x42; 32])
+//!     .executor_actor_id("executor-001")
+//!     .issued_at(1704067200000)
+//!     .expires_at(1704070800000)
+//!     .policy_hash([0xab; 32])
+//!     .issuer_actor_id("issuer-001")
+//!     .time_envelope_ref("htf:tick:12345")
+//!     .build_and_sign(&signer);
+//!
+//! // Verify the signature
+//! assert!(lease.validate_signature(&signer.verifying_key()).is_ok());
+//! ```
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use super::domain_separator::{GATE_LEASE_ISSUED_PREFIX, sign_with_domain, verify_with_domain};
+use crate::crypto::{Signature, VerifyingKey};
+
+// =============================================================================
+// Error Types
+// =============================================================================
+
+/// Errors that can occur during gate lease operations.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LeaseError {
+    /// The lease signature is invalid.
+    #[error("invalid lease signature: {0}")]
+    InvalidSignature(String),
+
+    /// Missing required field.
+    #[error("missing required field: {0}")]
+    MissingField(&'static str),
+
+    /// Invalid lease data.
+    #[error("invalid lease data: {0}")]
+    InvalidData(String),
+}
+
+// =============================================================================
+// GateLease
+// =============================================================================
+
+/// A cryptographically signed gate lease binding an executor to a changeset.
+///
+/// The gate lease authorizes a specific executor to run a gate on a specific
+/// changeset within a time window. The lease includes a `policy_hash` that
+/// must match the resolved policy for the changeset.
+///
+/// # Fields
+///
+/// - `lease_id`: Unique identifier for this lease
+/// - `work_id`: Work item this lease applies to
+/// - `gate_id`: Gate this lease authorizes
+/// - `changeset_digest`: Hash binding to specific changeset
+/// - `executor_actor_id`: Actor authorized to execute
+/// - `issued_at`: Timestamp when lease was issued (millis)
+/// - `expires_at`: Timestamp when lease expires (millis)
+/// - `policy_hash`: Hash of the resolved policy tuple
+/// - `issuer_actor_id`: Actor who issued the lease
+/// - `time_envelope_ref`: Reference to time envelope for temporal bounds
+/// - `issuer_signature`: Ed25519 signature with domain separation
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateLease {
+    /// Unique identifier for this lease.
+    pub lease_id: String,
+
+    /// Work item this lease applies to.
+    pub work_id: String,
+
+    /// Gate this lease authorizes execution on.
+    pub gate_id: String,
+
+    /// Hash binding to specific changeset.
+    #[serde(with = "serde_bytes")]
+    pub changeset_digest: [u8; 32],
+
+    /// Actor authorized to execute the gate.
+    pub executor_actor_id: String,
+
+    /// Timestamp when the lease was issued (milliseconds since epoch).
+    pub issued_at: u64,
+
+    /// Timestamp when the lease expires (milliseconds since epoch).
+    pub expires_at: u64,
+
+    /// Hash of the resolved policy tuple.
+    ///
+    /// This must match the `resolved_policy_hash` from the corresponding
+    /// `PolicyResolvedForChangeSet` event.
+    #[serde(with = "serde_bytes")]
+    pub policy_hash: [u8; 32],
+
+    /// Actor who issued this lease.
+    pub issuer_actor_id: String,
+
+    /// Reference to the time envelope for temporal bounds.
+    pub time_envelope_ref: String,
+
+    /// Ed25519 signature over canonical bytes with domain separation.
+    #[serde(with = "serde_bytes")]
+    pub issuer_signature: [u8; 64],
+}
+
+impl GateLease {
+    /// Returns the canonical bytes for signing/verification.
+    ///
+    /// The canonical representation includes all fields except the signature,
+    /// encoded in a deterministic order.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let capacity = self.lease_id.len()
+            + 1
+            + self.work_id.len()
+            + 1
+            + self.gate_id.len()
+            + 1
+            + 32  // changeset_digest
+            + self.executor_actor_id.len()
+            + 1
+            + 8   // issued_at
+            + 8   // expires_at
+            + 32  // policy_hash
+            + self.issuer_actor_id.len()
+            + 1
+            + self.time_envelope_ref.len();
+
+        let mut bytes = Vec::with_capacity(capacity);
+
+        // 1. lease_id
+        bytes.extend_from_slice(self.lease_id.as_bytes());
+        bytes.push(0); // null separator
+
+        // 2. work_id
+        bytes.extend_from_slice(self.work_id.as_bytes());
+        bytes.push(0);
+
+        // 3. gate_id
+        bytes.extend_from_slice(self.gate_id.as_bytes());
+        bytes.push(0);
+
+        // 4. changeset_digest
+        bytes.extend_from_slice(&self.changeset_digest);
+
+        // 5. executor_actor_id
+        bytes.extend_from_slice(self.executor_actor_id.as_bytes());
+        bytes.push(0);
+
+        // 6. issued_at (big-endian)
+        bytes.extend_from_slice(&self.issued_at.to_be_bytes());
+
+        // 7. expires_at (big-endian)
+        bytes.extend_from_slice(&self.expires_at.to_be_bytes());
+
+        // 8. policy_hash
+        bytes.extend_from_slice(&self.policy_hash);
+
+        // 9. issuer_actor_id
+        bytes.extend_from_slice(self.issuer_actor_id.as_bytes());
+        bytes.push(0);
+
+        // 10. time_envelope_ref
+        bytes.extend_from_slice(self.time_envelope_ref.as_bytes());
+
+        bytes
+    }
+
+    /// Validates the lease signature using domain separation.
+    ///
+    /// # Arguments
+    ///
+    /// * `verifying_key` - The public key of the expected issuer
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the signature is valid,
+    /// `Err(LeaseError::InvalidSignature)` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseError::InvalidSignature`] if signature verification
+    /// fails.
+    pub fn validate_signature(&self, verifying_key: &VerifyingKey) -> Result<(), LeaseError> {
+        let signature = Signature::from_bytes(&self.issuer_signature);
+        let canonical = self.canonical_bytes();
+
+        verify_with_domain(
+            verifying_key,
+            GATE_LEASE_ISSUED_PREFIX,
+            &canonical,
+            &signature,
+        )
+        .map_err(|e| LeaseError::InvalidSignature(e.to_string()))
+    }
+}
+
+// =============================================================================
+// Builder
+// =============================================================================
+
+/// Builder for constructing [`GateLease`] instances.
+#[derive(Debug, Default)]
+pub struct GateLeaseBuilder {
+    lease_id: String,
+    work_id: String,
+    gate_id: String,
+    changeset_digest: Option<[u8; 32]>,
+    executor_actor_id: Option<String>,
+    issued_at: Option<u64>,
+    expires_at: Option<u64>,
+    policy_hash: Option<[u8; 32]>,
+    issuer_actor_id: Option<String>,
+    time_envelope_ref: Option<String>,
+}
+
+impl GateLeaseBuilder {
+    /// Creates a new builder with required IDs.
+    #[must_use]
+    pub fn new(
+        lease_id: impl Into<String>,
+        work_id: impl Into<String>,
+        gate_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            lease_id: lease_id.into(),
+            work_id: work_id.into(),
+            gate_id: gate_id.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Sets the changeset digest.
+    #[must_use]
+    pub const fn changeset_digest(mut self, digest: [u8; 32]) -> Self {
+        self.changeset_digest = Some(digest);
+        self
+    }
+
+    /// Sets the executor actor ID.
+    #[must_use]
+    pub fn executor_actor_id(mut self, actor_id: impl Into<String>) -> Self {
+        self.executor_actor_id = Some(actor_id.into());
+        self
+    }
+
+    /// Sets the issuance timestamp (milliseconds since epoch).
+    #[must_use]
+    pub const fn issued_at(mut self, timestamp: u64) -> Self {
+        self.issued_at = Some(timestamp);
+        self
+    }
+
+    /// Sets the expiration timestamp (milliseconds since epoch).
+    #[must_use]
+    pub const fn expires_at(mut self, timestamp: u64) -> Self {
+        self.expires_at = Some(timestamp);
+        self
+    }
+
+    /// Sets the policy hash.
+    #[must_use]
+    pub const fn policy_hash(mut self, hash: [u8; 32]) -> Self {
+        self.policy_hash = Some(hash);
+        self
+    }
+
+    /// Sets the issuer actor ID.
+    #[must_use]
+    pub fn issuer_actor_id(mut self, actor_id: impl Into<String>) -> Self {
+        self.issuer_actor_id = Some(actor_id.into());
+        self
+    }
+
+    /// Sets the time envelope reference.
+    #[must_use]
+    pub fn time_envelope_ref(mut self, ref_id: impl Into<String>) -> Self {
+        self.time_envelope_ref = Some(ref_id.into());
+        self
+    }
+
+    /// Builds the lease and signs it with the provided signer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if required fields are missing.
+    #[must_use]
+    pub fn build_and_sign(self, signer: &crate::crypto::Signer) -> GateLease {
+        self.try_build_and_sign(signer)
+            .expect("missing required field")
+    }
+
+    /// Attempts to build and sign the lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseError::MissingField`] if any required field is not set.
+    pub fn try_build_and_sign(
+        self,
+        signer: &crate::crypto::Signer,
+    ) -> Result<GateLease, LeaseError> {
+        let changeset_digest = self
+            .changeset_digest
+            .ok_or(LeaseError::MissingField("changeset_digest"))?;
+        let executor_actor_id = self
+            .executor_actor_id
+            .ok_or(LeaseError::MissingField("executor_actor_id"))?;
+        let issued_at = self
+            .issued_at
+            .ok_or(LeaseError::MissingField("issued_at"))?;
+        let expires_at = self
+            .expires_at
+            .ok_or(LeaseError::MissingField("expires_at"))?;
+        let policy_hash = self
+            .policy_hash
+            .ok_or(LeaseError::MissingField("policy_hash"))?;
+        let issuer_actor_id = self
+            .issuer_actor_id
+            .ok_or(LeaseError::MissingField("issuer_actor_id"))?;
+        let time_envelope_ref = self
+            .time_envelope_ref
+            .ok_or(LeaseError::MissingField("time_envelope_ref"))?;
+
+        // Create lease with placeholder signature
+        let mut lease = GateLease {
+            lease_id: self.lease_id,
+            work_id: self.work_id,
+            gate_id: self.gate_id,
+            changeset_digest,
+            executor_actor_id,
+            issued_at,
+            expires_at,
+            policy_hash,
+            issuer_actor_id,
+            time_envelope_ref,
+            issuer_signature: [0u8; 64],
+        };
+
+        // Sign the canonical bytes
+        let canonical = lease.canonical_bytes();
+        let signature = sign_with_domain(signer, GATE_LEASE_ISSUED_PREFIX, &canonical);
+        lease.issuer_signature = signature.to_bytes();
+
+        Ok(lease)
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use crate::crypto::Signer;
+
+    fn create_test_lease(signer: &Signer) -> GateLease {
+        GateLeaseBuilder::new("lease-001", "work-001", "gate-build")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(signer)
+    }
+
+    #[test]
+    fn test_build_and_sign() {
+        let signer = Signer::generate();
+        let lease = create_test_lease(&signer);
+
+        assert_eq!(lease.lease_id, "lease-001");
+        assert_eq!(lease.work_id, "work-001");
+        assert_eq!(lease.gate_id, "gate-build");
+        assert_eq!(lease.changeset_digest, [0x42; 32]);
+        assert_eq!(lease.executor_actor_id, "executor-001");
+        assert_eq!(lease.issued_at, 1_704_067_200_000);
+        assert_eq!(lease.expires_at, 1_704_070_800_000);
+        assert_eq!(lease.policy_hash, [0xab; 32]);
+        assert_eq!(lease.issuer_actor_id, "issuer-001");
+        assert_eq!(lease.time_envelope_ref, "htf:tick:12345");
+    }
+
+    #[test]
+    fn test_signature_validation() {
+        let signer = Signer::generate();
+        let lease = create_test_lease(&signer);
+
+        // Valid signature
+        assert!(lease.validate_signature(&signer.verifying_key()).is_ok());
+
+        // Wrong key should fail
+        let other_signer = Signer::generate();
+        assert!(
+            lease
+                .validate_signature(&other_signer.verifying_key())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_signature_binds_to_content() {
+        let signer = Signer::generate();
+        let mut lease = create_test_lease(&signer);
+
+        // Modify content after signing
+        lease.work_id = "work-002".to_string();
+
+        // Signature should now be invalid
+        assert!(lease.validate_signature(&signer.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn test_canonical_bytes_deterministic() {
+        let signer = Signer::generate();
+        let lease1 = create_test_lease(&signer);
+        let lease2 = create_test_lease(&signer);
+
+        // Same content should produce same canonical bytes
+        assert_eq!(lease1.canonical_bytes(), lease2.canonical_bytes());
+    }
+
+    #[test]
+    fn test_missing_field_error() {
+        let signer = Signer::generate();
+
+        // Missing changeset_digest
+        let result = GateLeaseBuilder::new("lease-001", "work-001", "gate-build")
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .try_build_and_sign(&signer);
+
+        assert!(matches!(
+            result,
+            Err(LeaseError::MissingField("changeset_digest"))
+        ));
+    }
+
+    #[test]
+    fn test_domain_separator_prevents_replay() {
+        // Verify that lease uses GATE_LEASE_ISSUED: domain separator
+        // by ensuring a signature created without the prefix fails
+        let signer = Signer::generate();
+        let lease = create_test_lease(&signer);
+
+        // Create a signature without domain prefix
+        let canonical = lease.canonical_bytes();
+        let wrong_signature = signer.sign(&canonical); // No domain prefix!
+
+        // Manually create a lease with the wrong signature
+        let mut bad_lease = lease;
+        bad_lease.issuer_signature = wrong_signature.to_bytes();
+
+        // Verification should fail
+        assert!(
+            bad_lease
+                .validate_signature(&signer.verifying_key())
+                .is_err()
+        );
+    }
+}
