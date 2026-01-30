@@ -671,6 +671,45 @@ pub mod evidence_event {
         GateRunCompleted(super::GateRunCompleted),
     }
 }
+/// GateReceipt envelope with versioning for Forge Admission Cycle.
+/// This is the full receipt structure, distinct from GateReceiptGenerated event.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GateReceipt {
+    /// Unique identifier for this receipt
+    #[prost(string, tag = "1")]
+    pub receipt_id: ::prost::alloc::string::String,
+    /// Gate this receipt is for
+    #[prost(string, tag = "2")]
+    pub gate_id: ::prost::alloc::string::String,
+    /// Lease authorizing this gate execution
+    #[prost(string, tag = "3")]
+    pub lease_id: ::prost::alloc::string::String,
+    /// Hash binding the receipt to specific changeset
+    #[prost(bytes = "vec", tag = "4")]
+    pub changeset_digest: ::prost::alloc::vec::Vec<u8>,
+    /// Actor who executed the gate
+    #[prost(string, tag = "5")]
+    pub executor_actor_id: ::prost::alloc::string::String,
+    /// Receipt envelope version for forward compatibility
+    #[prost(uint32, tag = "6")]
+    pub receipt_version: u32,
+    /// Payload kind: "aat", "quality", "security"
+    #[prost(string, tag = "7")]
+    pub payload_kind: ::prost::alloc::string::String,
+    /// Schema version of the payload
+    #[prost(uint32, tag = "8")]
+    pub payload_schema_version: u32,
+    /// Hash of the payload content
+    #[prost(bytes = "vec", tag = "9")]
+    pub payload_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Hash of the evidence bundle
+    #[prost(bytes = "vec", tag = "10")]
+    pub evidence_bundle_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Ed25519 signature over canonical bytes with GATE_RECEIPT: prefix
+    #[prost(bytes = "vec", tag = "11")]
+    pub receipt_signature: ::prost::alloc::vec::Vec<u8>,
+}
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EvidencePublished {

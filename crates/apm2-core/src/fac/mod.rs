@@ -47,6 +47,7 @@
 mod domain_separator;
 mod gate_run;
 mod lease;
+mod receipt;
 
 // Re-export domain separator constants
 pub use domain_separator::{
@@ -64,4 +65,9 @@ pub use lease::{
     AatLeaseExtension, AatLeaseExtensionProto, GateLease, GateLeaseBuilder, GateLeaseProto,
     GateLeaseScope, LeaseError, LeaseRevoked, LeaseRevokedBuilder, LeaseRevokedProto,
     RevocationReason, is_lease_revoked,
+};
+// Re-export receipt types
+pub use receipt::{
+    GateReceipt, GateReceiptBuilder, GateReceiptProto, PayloadKind, ReceiptError,
+    SUPPORTED_PAYLOAD_KINDS, SUPPORTED_RECEIPT_VERSIONS,
 };

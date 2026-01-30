@@ -400,6 +400,33 @@ message EvidenceEvent {
   }
 }
 
+// GateReceipt envelope with versioning for Forge Admission Cycle.
+// This is the full receipt structure, distinct from GateReceiptGenerated event.
+message GateReceipt {
+  // Unique identifier for this receipt
+  string receipt_id = 1;
+  // Gate this receipt is for
+  string gate_id = 2;
+  // Lease authorizing this gate execution
+  string lease_id = 3;
+  // Hash binding the receipt to specific changeset
+  bytes changeset_digest = 4;
+  // Actor who executed the gate
+  string executor_actor_id = 5;
+  // Receipt envelope version for forward compatibility
+  uint32 receipt_version = 6;
+  // Payload kind: "aat", "quality", "security"
+  string payload_kind = 7;
+  // Schema version of the payload
+  uint32 payload_schema_version = 8;
+  // Hash of the payload content
+  bytes payload_hash = 9;
+  // Hash of the evidence bundle
+  bytes evidence_bundle_hash = 10;
+  // Ed25519 signature over canonical bytes with GATE_RECEIPT: prefix
+  bytes receipt_signature = 11;
+}
+
 message EvidencePublished {
   string evidence_id = 1;
   string work_id = 2;
