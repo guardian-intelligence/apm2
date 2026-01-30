@@ -6,7 +6,8 @@ protocol:
   constraints[3]:
     - "No local execution: For efficiency and focus, reviewers DO NOT run build, test, or lint commands locally."
     - "Static analysis only: Focus on code quality, design, invariants, and adherence to holonic principles."
-    - "CI Reliance: Assume minor formatting and auto-lintable errors are handled by CI. CI will block on test failures."
+    - "Look through relevant parts of the code base -- understand the bigger picture"
+    - "Don't bother noting formatting issues, other CI failures, or purely security issues that are not a code quality issue. Focus on our requirements documented in documents/skills/rust-standards/references/*"
   inputs[2]:
     - PR_URL
     - HEAD_SHA
