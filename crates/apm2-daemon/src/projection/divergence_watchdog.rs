@@ -1364,19 +1364,142 @@ impl DivergenceWatchdogConfig {
 ///
 /// This registry tracks which repositories/scopes are currently frozen
 /// and is used for admission checking.
-#[derive(Debug, Default)]
+///
+/// # Fail-Closed Security Model
+///
+/// The registry supports two operational modes:
+///
+/// 1. **Un-hydrated (Fail-Closed)**: When created via `new()` or
+///    `new_fail_closed()`, the registry blocks ALL admissions until explicitly
+///    hydrated. This prevents a daemon restart from clearing freeze state and
+///    allowing work on compromised repositories.
+///
+/// 2. **Hydrated (Normal Operation)**: After calling `mark_hydrated()`, the
+///    registry only blocks admissions for explicitly frozen scopes.
+///
+/// # Rehydration Strategy
+///
+/// On daemon startup, the caller MUST:
+/// 1. Create the registry with `new_fail_closed()`
+/// 2. Replay ledger events to restore freeze state via `replay_freeze`
+/// 3. Call `mark_hydrated()` to transition to normal operation
+///
+/// ```rust,ignore
+/// // Example rehydration flow
+/// let registry = FreezeRegistry::new_fail_closed();
+///
+/// // Replay freeze events from ledger
+/// for event in ledger.iter_intervention_freezes() {
+///     registry.replay_freeze(&event, &watchdog_key)?;
+/// }
+/// for event in ledger.iter_intervention_unfreezes() {
+///     registry.replay_unfreeze(&event, &watchdog_key)?;
+/// }
+///
+/// // Mark hydrated to allow normal operation
+/// registry.mark_hydrated();
+/// ```
+#[derive(Debug)]
 pub struct FreezeRegistry {
     /// Set of active freeze IDs.
     active_freezes: RwLock<HashSet<String>>,
     /// Map of `scope_value` -> `freeze_id` for quick lookup.
     scope_map: RwLock<std::collections::HashMap<String, String>>,
+    /// Whether the registry has been hydrated from ledger state.
+    /// When `false`, ALL admissions are blocked (fail-closed).
+    hydrated: std::sync::atomic::AtomicBool,
+}
+
+impl Default for FreezeRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FreezeRegistry {
-    /// Creates a new empty freeze registry.
+    /// Creates a new freeze registry in hydrated mode (for testing).
+    ///
+    /// **WARNING**: In production, use [`Self::new_fail_closed`] to ensure
+    /// the fail-closed security model is enforced until ledger rehydration.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            active_freezes: RwLock::default(),
+            scope_map: RwLock::default(),
+            hydrated: std::sync::atomic::AtomicBool::new(true), // Default to hydrated for tests
+        }
+    }
+
+    /// Creates a new freeze registry in fail-closed mode.
+    ///
+    /// The registry will block ALL admissions until [`Self::mark_hydrated`] is
+    /// called. This ensures that a daemon restart cannot clear freeze state.
+    ///
+    /// # Usage
+    ///
+    /// Use this constructor in production code to enforce the fail-closed
+    /// security model:
+    ///
+    /// ```rust,ignore
+    /// let registry = FreezeRegistry::new_fail_closed();
+    /// // ... replay ledger freeze events ...
+    /// registry.mark_hydrated();
+    /// ```
+    #[must_use]
+    pub fn new_fail_closed() -> Self {
+        Self {
+            active_freezes: RwLock::default(),
+            scope_map: RwLock::default(),
+            hydrated: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Marks the registry as hydrated, enabling normal admission checks.
+    ///
+    /// Call this after replaying all freeze/unfreeze events from the ledger.
+    /// Before calling this, ALL admissions will be blocked.
+    pub fn mark_hydrated(&self) {
+        self.hydrated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Returns whether the registry has been hydrated.
+    #[must_use]
+    pub fn is_hydrated(&self) -> bool {
+        self.hydrated.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Replays a freeze event from ledger during rehydration.
+    ///
+    /// This is a wrapper around [`Self::register`] that should be used during
+    /// ledger replay to restore freeze state on startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if signature verification fails.
+    pub fn replay_freeze(
+        &self,
+        freeze: &InterventionFreeze,
+        verifying_key: &VerifyingKey,
+    ) -> Result<(), DivergenceError> {
+        self.register(freeze, verifying_key)
+    }
+
+    /// Replays an unfreeze event from ledger during rehydration.
+    ///
+    /// This is a wrapper around [`Self::unregister`] that should be used during
+    /// ledger replay to restore freeze state on startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if signature verification fails or if the freeze
+    /// doesn't exist (which may indicate out-of-order replay).
+    pub fn replay_unfreeze(
+        &self,
+        unfreeze: &InterventionUnfreeze,
+        verifying_key: &VerifyingKey,
+    ) -> Result<(), DivergenceError> {
+        self.unregister(unfreeze, verifying_key)
     }
 
     /// Registers a freeze in the registry after verifying its signature.
@@ -1551,16 +1674,31 @@ impl FreezeRegistry {
         })
     }
 
-    /// Checks admission and returns an error if the scope is frozen.
+    /// Checks admission and returns an error if the scope is frozen or if
+    /// the registry has not been hydrated yet.
     ///
     /// This method performs hierarchical freeze checking: if any parent
     /// scope is frozen, the admission is rejected.
     ///
+    /// # Fail-Closed Behavior
+    ///
+    /// If the registry has not been hydrated (via [`Self::mark_hydrated`]),
+    /// ALL admissions are blocked. This prevents a daemon restart from clearing
+    /// freeze state and allowing work on compromised repositories.
+    ///
     /// # Errors
     ///
-    /// Returns [`DivergenceError::RepoFrozen`] if the scope or any parent
-    /// scope is frozen.
+    /// Returns [`DivergenceError::RepoFrozen`] if:
+    /// - The scope or any parent scope is frozen, OR
+    /// - The registry has not been hydrated yet (fail-closed)
     pub fn check_admission(&self, scope_value: &str) -> Result<(), DivergenceError> {
+        // Fail-closed: block all admissions until hydrated
+        if !self.is_hydrated() {
+            return Err(DivergenceError::RepoFrozen {
+                freeze_id: "__REGISTRY_NOT_HYDRATED__".to_string(),
+            });
+        }
+
         if let Some(freeze_id) = self.is_frozen(scope_value) {
             return Err(DivergenceError::RepoFrozen { freeze_id });
         }
@@ -1844,9 +1982,16 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
     /// Checks for divergence between the merge receipt HEAD and external trunk
     /// HEAD.
     ///
-    /// If divergence is detected, emits an [`InterventionFreeze`] and a
-    /// [`DefectRecord`] with signal type `PROJECTION_DIVERGENCE`, and
-    /// registers the freeze.
+    /// If divergence is detected AND the repository is not already frozen,
+    /// emits an [`InterventionFreeze`] and a [`DefectRecord`] with signal type
+    /// `PROJECTION_DIVERGENCE`, and registers the freeze.
+    ///
+    /// # Idempotency
+    ///
+    /// If the repository is already frozen (from a prior divergence detection),
+    /// this method returns `None` without creating a new freeze event. This
+    /// prevents unbounded memory growth in the `FreezeRegistry` from repeated
+    /// polls during an adjudication window.
     ///
     /// # Arguments
     ///
@@ -1856,8 +2001,8 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
     ///
     /// # Returns
     ///
-    /// `Some(DivergenceResult)` if divergence is detected, `None` if no
-    /// divergence.
+    /// `Some(DivergenceResult)` if divergence is detected AND a new freeze was
+    /// created. `None` if no divergence OR if already frozen.
     ///
     /// # Errors
     ///
@@ -1872,7 +2017,15 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             return Ok(None);
         }
 
-        // Divergence detected - emit freeze and defect record
+        // Check if already frozen to prevent unbounded memory growth.
+        // If the repository is already frozen (from a prior divergence), we don't
+        // need to create another freeze event. This makes the operation idempotent
+        // and prevents DoS via accumulated freeze IDs in the registry.
+        if self.registry.is_frozen(&self.config.repo_id).is_some() {
+            return Ok(None);
+        }
+
+        // Divergence detected and not already frozen - emit freeze and defect record
         let result = self.on_divergence(merge_receipt_head, external_trunk_head)?;
 
         Ok(Some(result))
@@ -3062,6 +3215,68 @@ pub mod tests {
     }
 
     #[test]
+    fn test_watchdog_divergence_idempotent_when_frozen() {
+        // F-001 fix: check_divergence should be idempotent when already frozen
+        let watchdog = create_test_watchdog();
+
+        let expected_head = [0x42; 32];
+        let actual_head = [0x99; 32];
+
+        // First divergence should create a freeze
+        let result1 = watchdog
+            .check_divergence(expected_head, actual_head)
+            .unwrap();
+        assert!(result1.is_some());
+        assert_eq!(watchdog.registry().active_count(), 1);
+
+        // Second divergence should NOT create another freeze (idempotent)
+        let result2 = watchdog
+            .check_divergence(expected_head, actual_head)
+            .unwrap();
+        assert!(result2.is_none()); // No new freeze because already frozen
+        assert_eq!(watchdog.registry().active_count(), 1); // Still only 1 freeze
+
+        // Even with different heads, should NOT create another freeze
+        let result3 = watchdog.check_divergence([0x11; 32], [0x22; 32]).unwrap();
+        assert!(result3.is_none()); // Still idempotent
+        assert_eq!(watchdog.registry().active_count(), 1);
+    }
+
+    #[test]
+    fn test_registry_fail_closed_when_not_hydrated() {
+        // F-002 fix: Registry should block all admissions when not hydrated
+        let registry = FreezeRegistry::new_fail_closed();
+
+        // Should block ALL admissions before hydration
+        let result = registry.check_admission("any-repo");
+        assert!(matches!(result, Err(DivergenceError::RepoFrozen { .. })));
+
+        // is_frozen returns None (no specific freeze exists)
+        assert!(registry.is_frozen("any-repo").is_none());
+
+        // After hydration, normal operation resumes
+        registry.mark_hydrated();
+        assert!(registry.check_admission("any-repo").is_ok());
+    }
+
+    #[test]
+    fn test_registry_hydration_state() {
+        let registry = FreezeRegistry::new_fail_closed();
+        assert!(!registry.is_hydrated());
+
+        registry.mark_hydrated();
+        assert!(registry.is_hydrated());
+    }
+
+    #[test]
+    fn test_registry_default_is_hydrated() {
+        // Default new() should be hydrated (for backwards compatibility in tests)
+        let registry = FreezeRegistry::new();
+        assert!(registry.is_hydrated());
+        assert!(registry.check_admission("any-repo").is_ok());
+    }
+
+    #[test]
     fn test_watchdog_freeze_signature_valid() {
         let watchdog = create_test_watchdog();
 
@@ -3420,24 +3635,32 @@ pub mod tests {
     }
 
     #[test]
-    fn test_multiple_divergences() {
+    fn test_multiple_divergences_idempotent() {
+        // F-001 fix: Multiple divergences should NOT create multiple freezes.
+        // Once a repository is frozen, subsequent divergences return None
+        // to prevent DoS via unbounded memory growth in the FreezeRegistry.
         let watchdog = create_test_watchdog();
 
-        // Trigger first divergence
+        // Trigger first divergence - should create a freeze
         let result1 = watchdog
             .check_divergence([0x11; 32], [0x22; 32])
             .unwrap()
             .unwrap();
 
-        // Since the same repo is already frozen, further divergence checks
-        // will still return new freeze events (for audit trail)
-        let result2 = watchdog
-            .check_divergence([0x22; 32], [0x33; 32])
-            .unwrap()
-            .unwrap();
+        // Second divergence on the same (already frozen) repo should return None
+        // This is the idempotent behavior that prevents DoS
+        let result2 = watchdog.check_divergence([0x22; 32], [0x33; 32]).unwrap();
 
-        assert_ne!(result1.freeze.freeze_id, result2.freeze.freeze_id);
-        assert_eq!(watchdog.registry().active_count(), 2);
+        assert!(result2.is_none()); // No new freeze because repo is already frozen
+        assert_eq!(watchdog.registry().active_count(), 1); // Still only 1 freeze
+
+        // The original freeze ID is still the only one (test-repo is from
+        // create_test_config)
+        assert!(watchdog.registry().is_frozen("test-repo").is_some());
+        assert_eq!(
+            watchdog.registry().is_frozen("test-repo"),
+            Some(result1.freeze.freeze_id)
+        );
     }
 
     #[test]
