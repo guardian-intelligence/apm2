@@ -31,7 +31,7 @@ pub struct KernelEvent {
     /// Event payload (oneof)
     #[prost(
         oneof = "kernel_event::Payload",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23"
     )]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
@@ -65,6 +65,10 @@ pub mod kernel_event {
         PolicyResolvedForChangeset(super::PolicyResolvedForChangeSet),
         #[prost(message, tag = "21")]
         GateReceipt(super::GateReceipt),
+        #[prost(message, tag = "22")]
+        InterventionFreeze(super::InterventionFreeze),
+        #[prost(message, tag = "23")]
+        InterventionUnfreeze(super::InterventionUnfreeze),
     }
 }
 /// ============================================================

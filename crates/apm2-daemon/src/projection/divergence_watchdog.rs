@@ -63,6 +63,7 @@ use apm2_core::crypto::{Signer, VerifyingKey};
 use apm2_core::fac::{
     INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX, sign_with_domain, verify_with_domain,
 };
+use apm2_holon::defect::DefectRecord;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -72,6 +73,22 @@ use thiserror::Error;
 
 /// Maximum length for string fields to prevent denial-of-service attacks.
 pub const MAX_STRING_LENGTH: usize = 1024;
+
+// =============================================================================
+// DivergenceResult
+// =============================================================================
+
+/// Result of a divergence detection operation.
+///
+/// Contains both the `InterventionFreeze` event and the associated
+/// `DefectRecord(PROJECTION_DIVERGENCE)` for emission to the ledger.
+#[derive(Debug, Clone)]
+pub struct DivergenceResult {
+    /// The freeze event to emit.
+    pub freeze: InterventionFreeze,
+    /// The defect record to emit.
+    pub defect: DefectRecord,
+}
 
 /// Default poll interval for divergence checks (30 seconds).
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -993,8 +1010,9 @@ impl DivergenceWatchdog {
     /// Checks for divergence between the merge receipt HEAD and external trunk
     /// HEAD.
     ///
-    /// If divergence is detected, emits an [`InterventionFreeze`] and registers
-    /// it.
+    /// If divergence is detected, emits an [`InterventionFreeze`] and a
+    /// [`DefectRecord`] with signal type `PROJECTION_DIVERGENCE`, and
+    /// registers the freeze.
     ///
     /// # Arguments
     ///
@@ -1004,7 +1022,7 @@ impl DivergenceWatchdog {
     ///
     /// # Returns
     ///
-    /// `Some(InterventionFreeze)` if divergence is detected, `None` if no
+    /// `Some(DivergenceResult)` if divergence is detected, `None` if no
     /// divergence.
     ///
     /// # Errors
@@ -1014,24 +1032,24 @@ impl DivergenceWatchdog {
         &self,
         merge_receipt_head: [u8; 32],
         external_trunk_head: [u8; 32],
-    ) -> Result<Option<InterventionFreeze>, DivergenceError> {
+    ) -> Result<Option<DivergenceResult>, DivergenceError> {
         // No divergence if heads match
         if merge_receipt_head == external_trunk_head {
             return Ok(None);
         }
 
-        // Divergence detected - emit freeze
-        let freeze = self.on_divergence(merge_receipt_head, external_trunk_head)?;
+        // Divergence detected - emit freeze and defect record
+        let result = self.on_divergence(merge_receipt_head, external_trunk_head)?;
 
-        Ok(Some(freeze))
+        Ok(Some(result))
     }
 
     /// Called when divergence is detected. Creates and registers a freeze
-    /// event.
+    /// event, and emits a `DefectRecord(PROJECTION_DIVERGENCE)`.
     ///
     /// This method:
-    /// 1. Generates a defect ID for the `DefectRecord(PROJECTION_DIVERGENCE)`
-    /// 2. Creates an `InterventionFreeze` event
+    /// 1. Creates a `DefectRecord(PROJECTION_DIVERGENCE)`
+    /// 2. Creates an `InterventionFreeze` event referencing the defect
     /// 3. Registers the freeze in the registry
     ///
     /// # Arguments
@@ -1042,24 +1060,38 @@ impl DivergenceWatchdog {
     ///
     /// # Returns
     ///
-    /// The created [`InterventionFreeze`] event.
+    /// A [`DivergenceResult`] containing both the freeze and defect record.
     ///
     /// # Errors
     ///
-    /// Returns an error if freeze creation or registration fails.
+    /// Returns an error if freeze creation, defect record creation, or
+    /// registration fails.
     pub fn on_divergence(
         &self,
         expected_head: [u8; 32],
         actual_head: [u8; 32],
-    ) -> Result<InterventionFreeze, DivergenceError> {
+    ) -> Result<DivergenceResult, DivergenceError> {
         let freeze_id = self.generate_freeze_id();
         let defect_id = self.generate_defect_id();
         let time_envelope_ref = self.generate_time_envelope_ref();
+        let timestamp = current_timestamp_ns();
 
+        // Create the DefectRecord(PROJECTION_DIVERGENCE) first
+        let defect = DefectRecord::projection_divergence(
+            &defect_id,
+            &self.config.repo_id,
+            expected_head,
+            actual_head,
+            timestamp,
+        )
+        .map_err(|e| DivergenceError::InvalidConfiguration(format!("defect record error: {e}")))?;
+
+        // Create the freeze event referencing the defect
         let freeze = InterventionFreezeBuilder::new(&freeze_id)
             .scope(FreezeScope::Repository)
             .scope_value(&self.config.repo_id)
             .trigger_defect_id(&defect_id)
+            .frozen_at(timestamp)
             .expected_trunk_head(expected_head)
             .actual_trunk_head(actual_head)
             .gate_actor_id(&self.config.actor_id)
@@ -1069,7 +1101,7 @@ impl DivergenceWatchdog {
         // Register the freeze
         self.registry.register(&freeze)?;
 
-        Ok(freeze)
+        Ok(DivergenceResult { freeze, defect })
     }
 
     /// Creates an unfreeze event for a given freeze ID.
@@ -1546,13 +1578,20 @@ pub mod tests {
             .unwrap();
 
         assert!(result.is_some());
-        let freeze = result.unwrap();
+        let divergence_result = result.unwrap();
+        let freeze = &divergence_result.freeze;
 
         assert_eq!(freeze.scope, FreezeScope::Repository);
         assert_eq!(freeze.scope_value, "test-repo");
         assert_eq!(freeze.expected_trunk_head, expected_head);
         assert_eq!(freeze.actual_trunk_head, actual_head);
         assert_eq!(watchdog.registry().active_count(), 1);
+
+        // Verify defect record was also created
+        assert_eq!(
+            divergence_result.defect.defect_class(),
+            "PROJECTION_DIVERGENCE"
+        );
     }
 
     #[test]
@@ -1561,12 +1600,17 @@ pub mod tests {
 
         let expected_head = [0x42; 32];
         let actual_head = [0x99; 32];
-        let freeze = watchdog
+        let divergence_result = watchdog
             .check_divergence(expected_head, actual_head)
             .unwrap()
             .unwrap();
 
-        assert!(freeze.validate_signature(&watchdog.verifying_key()).is_ok());
+        assert!(
+            divergence_result
+                .freeze
+                .validate_signature(&watchdog.verifying_key())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1600,10 +1644,11 @@ pub mod tests {
         // Trigger divergence first
         let expected_head = [0x42; 32];
         let actual_head = [0x99; 32];
-        let freeze = watchdog
+        let divergence_result = watchdog
             .check_divergence(expected_head, actual_head)
             .unwrap()
             .unwrap();
+        let freeze = &divergence_result.freeze;
 
         assert!(watchdog.check_admission().is_err());
 
@@ -1837,10 +1882,11 @@ pub mod tests {
         // 2. Divergence is detected
         let expected_head = [0x42; 32];
         let actual_head = [0x99; 32];
-        let freeze = watchdog
+        let divergence_result = watchdog
             .check_divergence(expected_head, actual_head)
             .unwrap()
             .unwrap();
+        let freeze = &divergence_result.freeze;
 
         // 3. Admission is now blocked
         let err = watchdog.check_admission().unwrap_err();
@@ -1874,19 +1920,48 @@ pub mod tests {
         let watchdog = create_test_watchdog();
 
         // Trigger first divergence
-        let freeze1 = watchdog
+        let result1 = watchdog
             .check_divergence([0x11; 32], [0x22; 32])
             .unwrap()
             .unwrap();
 
         // Since the same repo is already frozen, further divergence checks
         // will still return new freeze events (for audit trail)
-        let freeze2 = watchdog
+        let result2 = watchdog
             .check_divergence([0x22; 32], [0x33; 32])
             .unwrap()
             .unwrap();
 
-        assert_ne!(freeze1.freeze_id, freeze2.freeze_id);
+        assert_ne!(result1.freeze.freeze_id, result2.freeze.freeze_id);
         assert_eq!(watchdog.registry().active_count(), 2);
+    }
+
+    #[test]
+    fn test_divergence_result_contains_defect_record() {
+        let watchdog = create_test_watchdog();
+
+        let expected_head = [0x42; 32];
+        let actual_head = [0x99; 32];
+        let result = watchdog
+            .check_divergence(expected_head, actual_head)
+            .unwrap()
+            .unwrap();
+
+        // Verify the defect record is properly created
+        assert_eq!(result.defect.defect_class(), "PROJECTION_DIVERGENCE");
+        assert_eq!(
+            result.defect.signal().signal_type(),
+            apm2_holon::defect::SignalType::ProjectionDivergence
+        );
+        assert!(
+            result
+                .defect
+                .signal()
+                .details()
+                .contains("divergence detected")
+        );
+
+        // Verify the freeze references the defect
+        assert_eq!(result.freeze.trigger_defect_id, result.defect.defect_id());
     }
 }

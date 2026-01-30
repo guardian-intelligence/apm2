@@ -54,6 +54,8 @@ message KernelEvent {
     GitHubLeaseEvent github_lease = 19;
     PolicyResolvedForChangeSet policy_resolved_for_changeset = 20;
     GateReceipt gate_receipt = 21;
+    InterventionFreeze intervention_freeze = 22;
+    InterventionUnfreeze intervention_unfreeze = 23;
   }
 }
 
