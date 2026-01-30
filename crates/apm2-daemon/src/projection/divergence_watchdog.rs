@@ -60,6 +60,11 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use apm2_core::crypto::{Signer, VerifyingKey};
+use apm2_core::events::{
+    InterventionFreeze as ProtoInterventionFreeze,
+    InterventionResolutionType as ProtoResolutionType, InterventionScope as ProtoScope,
+    InterventionUnfreeze as ProtoInterventionUnfreeze,
+};
 use apm2_core::fac::{
     INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX, sign_with_domain, verify_with_domain,
 };
@@ -237,9 +242,272 @@ impl ResolutionType {
     }
 
     /// Returns whether this resolution type requires an adjudication ID.
+    ///
+    /// # Unfreeze Policy: Manual and Rollback Resolution Types
+    ///
+    /// The `Manual` and `Rollback` resolution types intentionally bypass the
+    /// adjudication ID requirement. This is a deliberate design decision for
+    /// operator emergencies:
+    ///
+    /// - **`Manual`**: Used when an operator needs to immediately unfreeze a
+    ///   repository to restore operations. This should only be used in
+    ///   emergency situations where waiting for formal adjudication would cause
+    ///   unacceptable operational impact. Manual unfreezes create an audit
+    ///   trail but do not require a prior adjudication decision.
+    ///
+    /// - **`Rollback`**: Used when the divergence is resolved by rolling back
+    ///   the external trunk to match the ledger's expected state. Since the
+    ///   rollback itself is the resolution action (rather than accepting either
+    ///   the ledger or external state), no adjudication decision is needed.
+    ///
+    /// Both resolution types still require:
+    /// - A valid signature from an authorized gate actor
+    /// - The freeze to exist in the registry
+    /// - A time envelope reference for temporal authority
+    ///
+    /// All unfreeze events (including Manual and Rollback) are recorded in the
+    /// ledger for audit purposes.
     #[must_use]
     pub const fn requires_adjudication(&self) -> bool {
         matches!(self, Self::Adjudication | Self::AcceptDivergence)
+    }
+}
+
+// =============================================================================
+// Proto Conversion Traits
+// =============================================================================
+//
+// These conversions enable seamless translation between the rich domain types
+// (defined in this module) and the wire format types (Protocol Buffer generated
+// in apm2-core). The manual types provide ergonomic Rust APIs while the proto
+// types are used for serialization/transmission.
+
+impl From<FreezeScope> for ProtoScope {
+    fn from(scope: FreezeScope) -> Self {
+        match scope {
+            FreezeScope::Repository => Self::Repository,
+            FreezeScope::Work => Self::Work,
+            FreezeScope::Namespace => Self::Namespace,
+        }
+    }
+}
+
+impl TryFrom<ProtoScope> for FreezeScope {
+    type Error = DivergenceError;
+
+    fn try_from(scope: ProtoScope) -> Result<Self, Self::Error> {
+        match scope {
+            ProtoScope::Repository => Ok(Self::Repository),
+            ProtoScope::Work => Ok(Self::Work),
+            ProtoScope::Namespace => Ok(Self::Namespace),
+            ProtoScope::Unspecified => Err(DivergenceError::InvalidConfiguration(
+                "unspecified intervention scope".to_string(),
+            )),
+        }
+    }
+}
+
+impl From<FreezeScope> for i32 {
+    fn from(scope: FreezeScope) -> Self {
+        ProtoScope::from(scope) as Self
+    }
+}
+
+impl TryFrom<i32> for FreezeScope {
+    type Error = DivergenceError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        let proto_scope = ProtoScope::try_from(value).map_err(|_| {
+            DivergenceError::InvalidConfiguration(format!("invalid scope value: {value}"))
+        })?;
+        Self::try_from(proto_scope)
+    }
+}
+
+impl From<ResolutionType> for ProtoResolutionType {
+    fn from(resolution: ResolutionType) -> Self {
+        match resolution {
+            ResolutionType::Adjudication => Self::InterventionResolutionAdjudication,
+            ResolutionType::Manual => Self::InterventionResolutionManual,
+            ResolutionType::Rollback => Self::InterventionResolutionRollback,
+            ResolutionType::AcceptDivergence => Self::InterventionResolutionAcceptDivergence,
+        }
+    }
+}
+
+impl TryFrom<ProtoResolutionType> for ResolutionType {
+    type Error = DivergenceError;
+
+    fn try_from(resolution: ProtoResolutionType) -> Result<Self, Self::Error> {
+        match resolution {
+            ProtoResolutionType::InterventionResolutionAdjudication => Ok(Self::Adjudication),
+            ProtoResolutionType::InterventionResolutionManual => Ok(Self::Manual),
+            ProtoResolutionType::InterventionResolutionRollback => Ok(Self::Rollback),
+            ProtoResolutionType::InterventionResolutionAcceptDivergence => {
+                Ok(Self::AcceptDivergence)
+            },
+            ProtoResolutionType::InterventionResolutionUnspecified => {
+                Err(DivergenceError::InvalidResolutionType)
+            },
+        }
+    }
+}
+
+impl From<ResolutionType> for i32 {
+    fn from(resolution: ResolutionType) -> Self {
+        ProtoResolutionType::from(resolution) as Self
+    }
+}
+
+impl TryFrom<i32> for ResolutionType {
+    type Error = DivergenceError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        let proto_resolution = ProtoResolutionType::try_from(value).map_err(|_| {
+            DivergenceError::InvalidConfiguration(format!("invalid resolution type value: {value}"))
+        })?;
+        Self::try_from(proto_resolution)
+    }
+}
+
+impl From<&InterventionFreeze> for ProtoInterventionFreeze {
+    fn from(freeze: &InterventionFreeze) -> Self {
+        Self {
+            freeze_id: freeze.freeze_id.clone(),
+            scope: i32::from(freeze.scope),
+            scope_value: freeze.scope_value.clone(),
+            trigger_defect_id: freeze.trigger_defect_id.clone(),
+            frozen_at: freeze.frozen_at,
+            expected_trunk_head: freeze.expected_trunk_head.to_vec(),
+            actual_trunk_head: freeze.actual_trunk_head.to_vec(),
+            gate_actor_id: freeze.gate_actor_id.clone(),
+            gate_signature: freeze.gate_signature.to_vec(),
+            time_envelope_ref: freeze.time_envelope_ref.clone(),
+        }
+    }
+}
+
+impl From<InterventionFreeze> for ProtoInterventionFreeze {
+    fn from(freeze: InterventionFreeze) -> Self {
+        Self::from(&freeze)
+    }
+}
+
+impl TryFrom<&ProtoInterventionFreeze> for InterventionFreeze {
+    type Error = DivergenceError;
+
+    fn try_from(proto: &ProtoInterventionFreeze) -> Result<Self, Self::Error> {
+        let scope = FreezeScope::try_from(proto.scope)?;
+
+        let expected_trunk_head: [u8; 32] = proto
+            .expected_trunk_head
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                DivergenceError::InvalidConfiguration(format!(
+                    "expected_trunk_head must be 32 bytes, got {}",
+                    proto.expected_trunk_head.len()
+                ))
+            })?;
+
+        let actual_trunk_head: [u8; 32] =
+            proto.actual_trunk_head.as_slice().try_into().map_err(|_| {
+                DivergenceError::InvalidConfiguration(format!(
+                    "actual_trunk_head must be 32 bytes, got {}",
+                    proto.actual_trunk_head.len()
+                ))
+            })?;
+
+        let gate_signature: [u8; 64] =
+            proto.gate_signature.as_slice().try_into().map_err(|_| {
+                DivergenceError::InvalidConfiguration(format!(
+                    "gate_signature must be 64 bytes, got {}",
+                    proto.gate_signature.len()
+                ))
+            })?;
+
+        Ok(Self {
+            freeze_id: proto.freeze_id.clone(),
+            scope,
+            scope_value: proto.scope_value.clone(),
+            trigger_defect_id: proto.trigger_defect_id.clone(),
+            frozen_at: proto.frozen_at,
+            expected_trunk_head,
+            actual_trunk_head,
+            gate_actor_id: proto.gate_actor_id.clone(),
+            gate_signature,
+            time_envelope_ref: proto.time_envelope_ref.clone(),
+        })
+    }
+}
+
+impl TryFrom<ProtoInterventionFreeze> for InterventionFreeze {
+    type Error = DivergenceError;
+
+    fn try_from(proto: ProtoInterventionFreeze) -> Result<Self, Self::Error> {
+        Self::try_from(&proto)
+    }
+}
+
+impl From<&InterventionUnfreeze> for ProtoInterventionUnfreeze {
+    fn from(unfreeze: &InterventionUnfreeze) -> Self {
+        Self {
+            freeze_id: unfreeze.freeze_id.clone(),
+            resolution_type: i32::from(unfreeze.resolution_type),
+            // Proto uses empty string for None (tagged encoding ensures distinct canonical bytes)
+            adjudication_id: unfreeze.adjudication_id.clone().unwrap_or_default(),
+            unfrozen_at: unfreeze.unfrozen_at,
+            gate_actor_id: unfreeze.gate_actor_id.clone(),
+            gate_signature: unfreeze.gate_signature.to_vec(),
+            time_envelope_ref: unfreeze.time_envelope_ref.clone(),
+        }
+    }
+}
+
+impl From<InterventionUnfreeze> for ProtoInterventionUnfreeze {
+    fn from(unfreeze: InterventionUnfreeze) -> Self {
+        Self::from(&unfreeze)
+    }
+}
+
+impl TryFrom<&ProtoInterventionUnfreeze> for InterventionUnfreeze {
+    type Error = DivergenceError;
+
+    fn try_from(proto: &ProtoInterventionUnfreeze) -> Result<Self, Self::Error> {
+        let resolution_type = ResolutionType::try_from(proto.resolution_type)?;
+
+        let gate_signature: [u8; 64] =
+            proto.gate_signature.as_slice().try_into().map_err(|_| {
+                DivergenceError::InvalidConfiguration(format!(
+                    "gate_signature must be 64 bytes, got {}",
+                    proto.gate_signature.len()
+                ))
+            })?;
+
+        // Convert empty string to None for adjudication_id
+        let adjudication_id = if proto.adjudication_id.is_empty() {
+            None
+        } else {
+            Some(proto.adjudication_id.clone())
+        };
+
+        Ok(Self {
+            freeze_id: proto.freeze_id.clone(),
+            resolution_type,
+            adjudication_id,
+            unfrozen_at: proto.unfrozen_at,
+            gate_actor_id: proto.gate_actor_id.clone(),
+            gate_signature,
+            time_envelope_ref: proto.time_envelope_ref.clone(),
+        })
+    }
+}
+
+impl TryFrom<ProtoInterventionUnfreeze> for InterventionUnfreeze {
+    type Error = DivergenceError;
+
+    fn try_from(proto: ProtoInterventionUnfreeze) -> Result<Self, Self::Error> {
+        Self::try_from(&proto)
     }
 }
 
@@ -387,15 +655,37 @@ pub struct InterventionUnfreeze {
     pub time_envelope_ref: String,
 }
 
+/// Tag byte indicating Option<String> is None.
+/// Per CTR-1605/CTR-2610: Using tagged encoding ensures None and Some("")
+/// produce distinct canonical bytes, preventing signature collision.
+const OPTION_TAG_NONE: u8 = 0x00;
+
+/// Tag byte indicating Option<String> is Some.
+const OPTION_TAG_SOME: u8 = 0x01;
+
 impl InterventionUnfreeze {
     /// Returns the canonical bytes for signing/verification.
+    ///
+    /// # Canonicalization Format
+    ///
+    /// The canonical encoding uses tagged Option encoding to distinguish
+    /// between `None` and `Some("")` (empty string), preventing signature
+    /// collision attacks.
+    ///
+    /// For `Option<String>` fields:
+    /// - `None`: Write tag byte `0x00`
+    /// - `Some(s)`: Write tag byte `0x01`, then length-prefixed string
+    ///
+    /// This follows CTR-1605 (Deterministic Canonicalization) and CTR-2610
+    /// (Canonical Representation at Boundaries) which require rejecting
+    /// multiple semantic encodings for critical values.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let adjudication_id_len = self.adjudication_id.as_ref().map_or(0, String::len);
         let capacity = 4 + self.freeze_id.len()
             + 20  // resolution_type (max)
-            + 4 + adjudication_id_len
+            + 1 + 4 + adjudication_id_len  // tag + optional length-prefix + string
             + 8   // unfrozen_at
             + 4 + self.gate_actor_id.len()
             + 4 + self.time_envelope_ref.len();
@@ -411,12 +701,16 @@ impl InterventionUnfreeze {
         bytes.extend_from_slice(&(resolution_bytes.len() as u32).to_be_bytes());
         bytes.extend_from_slice(resolution_bytes);
 
-        // 3. adjudication_id (length-prefixed, 0 length for None)
+        // 3. adjudication_id (tagged encoding for Option<String>)
+        // Per CTR-1605/CTR-2610: None and Some("") must produce distinct bytes
+        // - None: 0x00 tag byte only
+        // - Some(s): 0x01 tag byte + length-prefixed string
         if let Some(ref adj_id) = self.adjudication_id {
+            bytes.push(OPTION_TAG_SOME);
             bytes.extend_from_slice(&(adj_id.len() as u32).to_be_bytes());
             bytes.extend_from_slice(adj_id.as_bytes());
         } else {
-            bytes.extend_from_slice(&0u32.to_be_bytes());
+            bytes.push(OPTION_TAG_NONE);
         }
 
         // 4. unfrozen_at (big-endian)
@@ -837,12 +1131,30 @@ impl FreezeRegistry {
         Self::default()
     }
 
-    /// Registers a freeze in the registry.
+    /// Registers a freeze in the registry after verifying its signature.
+    ///
+    /// Per CTR-2703 (Cryptographically Bound ActorID): Signatures must be
+    /// validated before accepting state mutations. This prevents
+    /// unauthenticated callers from bypassing the watchdog to register
+    /// fraudulent freezes.
+    ///
+    /// # Arguments
+    ///
+    /// * `freeze` - The freeze event to register
+    /// * `verifying_key` - The key to verify the freeze signature against
     ///
     /// # Errors
     ///
-    /// Returns an error if the lock is poisoned.
-    pub fn register(&self, freeze: &InterventionFreeze) -> Result<(), DivergenceError> {
+    /// Returns [`DivergenceError::InvalidFreezeSignature`] if signature
+    /// verification fails. Returns an error if the lock is poisoned.
+    pub(crate) fn register(
+        &self,
+        freeze: &InterventionFreeze,
+        verifying_key: &VerifyingKey,
+    ) -> Result<(), DivergenceError> {
+        // Per CTR-2703: Validate signature before accepting state mutation
+        freeze.validate_signature(verifying_key)?;
+
         let mut active = self
             .active_freezes
             .write()
@@ -1098,13 +1410,33 @@ impl DivergenceWatchdog {
             .time_envelope_ref(&time_envelope_ref)
             .try_build_and_sign(&self.signer)?;
 
-        // Register the freeze
-        self.registry.register(&freeze)?;
+        // Register the freeze (with signature verification per CTR-2703)
+        self.registry
+            .register(&freeze, &self.signer.verifying_key())?;
 
         Ok(DivergenceResult { freeze, defect })
     }
 
     /// Creates an unfreeze event for a given freeze ID.
+    ///
+    /// **IMPORTANT**: This method does NOT mutate the registry. The caller must
+    /// persist the unfreeze event to the ledger first, then call
+    /// [`apply_unfreeze`] to update the local registry. This ensures local
+    /// state and ledger state remain consistent even if the caller crashes
+    /// between operations.
+    ///
+    /// # Correct Usage Pattern
+    ///
+    /// ```rust,ignore
+    /// // 1. Create the unfreeze event (no local state change)
+    /// let unfreeze = watchdog.create_unfreeze(freeze_id, resolution_type, adj_id)?;
+    ///
+    /// // 2. Persist to ledger (may fail)
+    /// ledger.persist(&unfreeze).await?;
+    ///
+    /// // 3. Apply to local registry AFTER successful persistence
+    /// watchdog.apply_unfreeze(&unfreeze.freeze_id)?;
+    /// ```
     ///
     /// # Arguments
     ///
@@ -1115,7 +1447,8 @@ impl DivergenceWatchdog {
     ///
     /// # Returns
     ///
-    /// The created [`InterventionUnfreeze`] event.
+    /// The created [`InterventionUnfreeze`] event. The event is signed but the
+    /// registry is NOT modified.
     ///
     /// # Errors
     ///
@@ -1154,10 +1487,44 @@ impl DivergenceWatchdog {
 
         let unfreeze = builder.try_build_and_sign(&self.signer)?;
 
-        // Unregister the freeze
-        self.registry.unregister(freeze_id)?;
+        // NOTE: We intentionally do NOT unregister the freeze here.
+        // The caller must persist the event to the ledger first, then call
+        // apply_unfreeze() to update local state. This prevents inconsistency
+        // if the caller crashes between local mutation and ledger persistence.
 
         Ok(unfreeze)
+    }
+
+    /// Applies an unfreeze to the local registry after ledger persistence.
+    ///
+    /// This method should be called AFTER the [`InterventionUnfreeze`] event
+    /// has been successfully persisted to the ledger. This ordering ensures
+    /// that the local registry state matches the ledger state even if the
+    /// process crashes.
+    ///
+    /// # Arguments
+    ///
+    /// * `freeze_id` - The ID of the freeze to unregister
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DivergenceError::FreezeNotFound`] if the freeze is not in the
+    /// registry.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Create unfreeze event
+    /// let unfreeze = watchdog.create_unfreeze(freeze_id, ResolutionType::Adjudication, Some("adj-001"))?;
+    ///
+    /// // Persist to ledger first
+    /// ledger.persist_unfreeze(&unfreeze).await?;
+    ///
+    /// // Then apply to local registry
+    /// watchdog.apply_unfreeze(&unfreeze.freeze_id)?;
+    /// ```
+    pub fn apply_unfreeze(&self, freeze_id: &str) -> Result<(), DivergenceError> {
+        self.registry.unregister(freeze_id)
     }
 
     /// Checks if admission is allowed for the configured repository.
@@ -1262,6 +1629,247 @@ pub mod tests {
         assert!(!ResolutionType::Manual.requires_adjudication());
         assert!(!ResolutionType::Rollback.requires_adjudication());
         assert!(ResolutionType::AcceptDivergence.requires_adjudication());
+    }
+
+    // =========================================================================
+    // Proto Conversion Tests
+    // =========================================================================
+
+    #[test]
+    fn test_freeze_scope_proto_conversion() {
+        // Manual -> Proto -> Manual roundtrip
+        assert_eq!(
+            FreezeScope::try_from(ProtoScope::from(FreezeScope::Repository)).unwrap(),
+            FreezeScope::Repository
+        );
+        assert_eq!(
+            FreezeScope::try_from(ProtoScope::from(FreezeScope::Work)).unwrap(),
+            FreezeScope::Work
+        );
+        assert_eq!(
+            FreezeScope::try_from(ProtoScope::from(FreezeScope::Namespace)).unwrap(),
+            FreezeScope::Namespace
+        );
+
+        // Unspecified should fail
+        assert!(FreezeScope::try_from(ProtoScope::Unspecified).is_err());
+    }
+
+    #[test]
+    fn test_freeze_scope_i32_conversion() {
+        // Manual -> i32 -> Manual roundtrip
+        assert_eq!(
+            FreezeScope::try_from(i32::from(FreezeScope::Repository)).unwrap(),
+            FreezeScope::Repository
+        );
+        assert_eq!(
+            FreezeScope::try_from(i32::from(FreezeScope::Work)).unwrap(),
+            FreezeScope::Work
+        );
+        assert_eq!(
+            FreezeScope::try_from(i32::from(FreezeScope::Namespace)).unwrap(),
+            FreezeScope::Namespace
+        );
+
+        // Invalid i32 should fail
+        assert!(FreezeScope::try_from(99i32).is_err());
+    }
+
+    #[test]
+    fn test_resolution_type_proto_conversion() {
+        // Manual -> Proto -> Manual roundtrip
+        assert_eq!(
+            ResolutionType::try_from(ProtoResolutionType::from(ResolutionType::Adjudication))
+                .unwrap(),
+            ResolutionType::Adjudication
+        );
+        assert_eq!(
+            ResolutionType::try_from(ProtoResolutionType::from(ResolutionType::Manual)).unwrap(),
+            ResolutionType::Manual
+        );
+        assert_eq!(
+            ResolutionType::try_from(ProtoResolutionType::from(ResolutionType::Rollback)).unwrap(),
+            ResolutionType::Rollback
+        );
+        assert_eq!(
+            ResolutionType::try_from(ProtoResolutionType::from(ResolutionType::AcceptDivergence))
+                .unwrap(),
+            ResolutionType::AcceptDivergence
+        );
+
+        // Unspecified should fail
+        assert!(
+            ResolutionType::try_from(ProtoResolutionType::InterventionResolutionUnspecified)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_intervention_freeze_proto_conversion() {
+        let signer = Signer::generate();
+        let freeze = InterventionFreezeBuilder::new("freeze-001")
+            .scope(FreezeScope::Repository)
+            .scope_value("test-repo")
+            .trigger_defect_id("defect-001")
+            .frozen_at(1_000_000_000)
+            .expected_trunk_head([0x42; 32])
+            .actual_trunk_head([0x99; 32])
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        // Manual -> Proto
+        let proto: ProtoInterventionFreeze = freeze.clone().into();
+        assert_eq!(proto.freeze_id, freeze.freeze_id);
+        assert_eq!(proto.scope, i32::from(freeze.scope));
+        assert_eq!(proto.scope_value, freeze.scope_value);
+        assert_eq!(proto.trigger_defect_id, freeze.trigger_defect_id);
+        assert_eq!(proto.frozen_at, freeze.frozen_at);
+        assert_eq!(
+            proto.expected_trunk_head,
+            freeze.expected_trunk_head.to_vec()
+        );
+        assert_eq!(proto.actual_trunk_head, freeze.actual_trunk_head.to_vec());
+        assert_eq!(proto.gate_actor_id, freeze.gate_actor_id);
+        assert_eq!(proto.gate_signature, freeze.gate_signature.to_vec());
+        assert_eq!(proto.time_envelope_ref, freeze.time_envelope_ref);
+
+        // Proto -> Manual roundtrip
+        let recovered = InterventionFreeze::try_from(proto).unwrap();
+        assert_eq!(recovered, freeze);
+    }
+
+    #[test]
+    fn test_intervention_unfreeze_proto_conversion() {
+        let signer = Signer::generate();
+        let unfreeze = InterventionUnfreezeBuilder::new("freeze-001")
+            .resolution_type(ResolutionType::Adjudication)
+            .adjudication_id("adj-001")
+            .unfrozen_at(2_000_000_000)
+            .gate_actor_id("operator-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        // Manual -> Proto
+        let proto: ProtoInterventionUnfreeze = unfreeze.clone().into();
+        assert_eq!(proto.freeze_id, unfreeze.freeze_id);
+        assert_eq!(proto.resolution_type, i32::from(unfreeze.resolution_type));
+        assert_eq!(proto.adjudication_id, "adj-001"); // Some -> string
+        assert_eq!(proto.unfrozen_at, unfreeze.unfrozen_at);
+        assert_eq!(proto.gate_actor_id, unfreeze.gate_actor_id);
+        assert_eq!(proto.gate_signature, unfreeze.gate_signature.to_vec());
+        assert_eq!(proto.time_envelope_ref, unfreeze.time_envelope_ref);
+
+        // Proto -> Manual roundtrip
+        let recovered = InterventionUnfreeze::try_from(proto).unwrap();
+        assert_eq!(recovered, unfreeze);
+    }
+
+    #[test]
+    fn test_intervention_unfreeze_proto_conversion_none_adjudication() {
+        let signer = Signer::generate();
+        let unfreeze = InterventionUnfreezeBuilder::new("freeze-001")
+            .resolution_type(ResolutionType::Manual)
+            .unfrozen_at(2_000_000_000)
+            .gate_actor_id("operator-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        // Manual -> Proto (None -> empty string)
+        let proto: ProtoInterventionUnfreeze = unfreeze.clone().into();
+        assert!(proto.adjudication_id.is_empty());
+
+        // Proto -> Manual (empty string -> None)
+        let recovered = InterventionUnfreeze::try_from(proto).unwrap();
+        assert_eq!(recovered.adjudication_id, None);
+        assert_eq!(recovered, unfreeze);
+    }
+
+    // =========================================================================
+    // Canonical Bytes Tagged Encoding Tests
+    // =========================================================================
+
+    #[test]
+    fn test_canonical_bytes_none_vs_empty_string_distinct() {
+        let signer = Signer::generate();
+
+        // Create unfreeze with adjudication_id = None
+        let unfreeze_none = InterventionUnfreezeBuilder::new("freeze-001")
+            .resolution_type(ResolutionType::Manual)
+            .unfrozen_at(1_000_000_000)
+            .gate_actor_id("operator-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        // Create unfreeze with adjudication_id = Some("")
+        let unfreeze_empty = InterventionUnfreezeBuilder::new("freeze-001")
+            .resolution_type(ResolutionType::Manual)
+            .adjudication_id("")
+            .unfrozen_at(1_000_000_000)
+            .gate_actor_id("operator-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        // Per CTR-1605/CTR-2610: None and Some("") must produce DISTINCT canonical
+        // bytes This prevents signature collision attacks
+        assert_ne!(
+            unfreeze_none.canonical_bytes(),
+            unfreeze_empty.canonical_bytes(),
+            "None and Some(\"\") must produce distinct canonical bytes"
+        );
+    }
+
+    #[test]
+    fn test_canonical_bytes_tagged_encoding_format() {
+        let signer = Signer::generate();
+
+        // Create unfreeze with adjudication_id = None
+        let unfreeze_none = InterventionUnfreezeBuilder::new("f")
+            .resolution_type(ResolutionType::Manual)
+            .unfrozen_at(0)
+            .gate_actor_id("a")
+            .time_envelope_ref("t")
+            .build_and_sign(&signer);
+
+        let bytes_none = unfreeze_none.canonical_bytes();
+
+        // Find the position of the adjudication_id tag
+        // Format: freeze_id (4 + len) + resolution_type (4 + len) + tag
+        let freeze_id_len = 1; // "f"
+        let resolution_type_len = 6; // "MANUAL"
+        let expected_tag_pos = 4 + freeze_id_len + 4 + resolution_type_len;
+
+        // Verify tag byte is 0x00 for None
+        assert_eq!(
+            bytes_none[expected_tag_pos], OPTION_TAG_NONE,
+            "None should use tag byte 0x00"
+        );
+
+        // Create unfreeze with adjudication_id = Some("x")
+        let unfreeze_some = InterventionUnfreezeBuilder::new("f")
+            .resolution_type(ResolutionType::Manual)
+            .adjudication_id("x")
+            .unfrozen_at(0)
+            .gate_actor_id("a")
+            .time_envelope_ref("t")
+            .build_and_sign(&signer);
+
+        let bytes_some = unfreeze_some.canonical_bytes();
+
+        // Verify tag byte is 0x01 for Some
+        assert_eq!(
+            bytes_some[expected_tag_pos], OPTION_TAG_SOME,
+            "Some should use tag byte 0x01"
+        );
+
+        // Verify length prefix follows the tag for Some
+        let length_prefix = u32::from_be_bytes([
+            bytes_some[expected_tag_pos + 1],
+            bytes_some[expected_tag_pos + 2],
+            bytes_some[expected_tag_pos + 3],
+            bytes_some[expected_tag_pos + 4],
+        ]);
+        assert_eq!(length_prefix, 1, "Length prefix should be 1 for \"x\"");
     }
 
     // =========================================================================
@@ -1476,11 +2084,36 @@ pub mod tests {
             .time_envelope_ref("htf:tick:12345")
             .build_and_sign(&signer);
 
-        registry.register(&freeze).unwrap();
+        registry.register(&freeze, &signer.verifying_key()).unwrap();
 
         assert_eq!(registry.active_count(), 1);
         assert!(registry.is_frozen("test-repo").is_some());
         assert!(registry.is_frozen("other-repo").is_none());
+    }
+
+    #[test]
+    fn test_registry_register_rejects_invalid_signature() {
+        let signer = Signer::generate();
+        let other_signer = Signer::generate();
+        let registry = FreezeRegistry::new();
+
+        let freeze = InterventionFreezeBuilder::new("freeze-001")
+            .scope(FreezeScope::Repository)
+            .scope_value("test-repo")
+            .trigger_defect_id("defect-001")
+            .expected_trunk_head([0x42; 32])
+            .actual_trunk_head([0x99; 32])
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        // Try to register with wrong verifying key - should fail
+        let result = registry.register(&freeze, &other_signer.verifying_key());
+        assert!(matches!(
+            result,
+            Err(DivergenceError::InvalidFreezeSignature(_))
+        ));
+        assert_eq!(registry.active_count(), 0);
     }
 
     #[test]
@@ -1498,7 +2131,7 @@ pub mod tests {
             .time_envelope_ref("htf:tick:12345")
             .build_and_sign(&signer);
 
-        registry.register(&freeze).unwrap();
+        registry.register(&freeze, &signer.verifying_key()).unwrap();
         assert_eq!(registry.active_count(), 1);
 
         registry.unregister("freeze-001").unwrap();
@@ -1535,7 +2168,7 @@ pub mod tests {
             .time_envelope_ref("htf:tick:12345")
             .build_and_sign(&signer);
 
-        registry.register(&freeze).unwrap();
+        registry.register(&freeze, &signer.verifying_key()).unwrap();
 
         // Should reject admission when frozen
         let result = registry.check_admission("test-repo");
@@ -1652,7 +2285,7 @@ pub mod tests {
 
         assert!(watchdog.check_admission().is_err());
 
-        // Create unfreeze
+        // Create unfreeze (does NOT mutate registry - just creates the event)
         let unfreeze = watchdog
             .create_unfreeze(
                 &freeze.freeze_id,
@@ -1672,8 +2305,27 @@ pub mod tests {
                 .is_ok()
         );
 
-        // Should allow admission after unfreeze
+        // Admission is STILL blocked because we haven't applied the unfreeze yet
+        // This simulates the case where the ledger persistence hasn't happened
+        assert!(watchdog.check_admission().is_err());
+
+        // Now apply the unfreeze (simulating successful ledger persistence)
+        watchdog.apply_unfreeze(&unfreeze.freeze_id).unwrap();
+
+        // Should allow admission after applying unfreeze
         assert!(watchdog.check_admission().is_ok());
+    }
+
+    #[test]
+    fn test_watchdog_apply_unfreeze_not_found() {
+        let watchdog = create_test_watchdog();
+
+        // Try to apply unfreeze for non-existent freeze
+        let result = watchdog.apply_unfreeze("nonexistent");
+        assert!(matches!(
+            result,
+            Err(DivergenceError::FreezeNotFound { .. })
+        ));
     }
 
     #[test]
@@ -1895,7 +2547,7 @@ pub mod tests {
         // 4. Verify freeze signature
         assert!(freeze.validate_signature(&watchdog.verifying_key()).is_ok());
 
-        // 5. Create unfreeze with adjudication
+        // 5. Create unfreeze with adjudication (does NOT mutate registry)
         let unfreeze = watchdog
             .create_unfreeze(
                 &freeze.freeze_id,
@@ -1911,7 +2563,16 @@ pub mod tests {
                 .is_ok()
         );
 
-        // 7. Admission is allowed again
+        // 7. Admission is still blocked (unfreeze not yet applied)
+        assert!(watchdog.check_admission().is_err());
+
+        // 8. Simulate: persist unfreeze to ledger (no-op in test)
+        // In production: ledger.persist(&unfreeze).await?;
+
+        // 9. Apply unfreeze to registry after successful persistence
+        watchdog.apply_unfreeze(&unfreeze.freeze_id).unwrap();
+
+        // 10. Admission is allowed again
         assert!(watchdog.check_admission().is_ok());
     }
 
