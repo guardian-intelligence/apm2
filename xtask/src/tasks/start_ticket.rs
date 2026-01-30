@@ -20,7 +20,9 @@ use anyhow::{Context, Result, bail};
 use xshell::{Shell, cmd};
 
 use crate::ticket_status::{
-    CompletedTicketsResult, get_completed_tickets, get_in_progress_tickets,
+    CompletedTicketsResult, PrDetails, PrQueryResult, ReviewThread, TimelineEntry,
+    get_completed_tickets, get_in_progress_tickets, get_pr_for_branch, get_pr_timeline,
+    get_unresolved_threads,
 };
 use crate::util::main_worktree;
 
@@ -292,8 +294,23 @@ pub fn run(target: Option<&str>, print_path_only: bool) -> Result<()> {
     println!("Worktree created at: {}", worktree_path.display());
     println!();
 
-    // Output context for implementation
-    print_context(&main_worktree_path, ticket);
+    // Check for existing PR and output appropriate context
+    let pr_details = get_pr_for_branch(&sh, &branch_name);
+    match pr_details {
+        PrQueryResult::Success(details) => {
+            print_resume_context(&sh, &main_worktree_path, &worktree_path, ticket, &details);
+        },
+        PrQueryResult::NotFound => {
+            print_new_context(&main_worktree_path, &worktree_path, ticket);
+        },
+        PrQueryResult::NetworkError(msg) => {
+            eprintln!("Warning: {msg}");
+            eprintln!("         Unable to check for existing PR.");
+            eprintln!();
+            // Fall back to new ticket context
+            print_new_context(&main_worktree_path, &worktree_path, ticket);
+        },
+    }
 
     Ok(())
 }
@@ -440,48 +457,33 @@ fn extract_dependencies(content: &str) -> Vec<String> {
     deps
 }
 
-/// Print context information for implementing the ticket.
-fn print_context(main_worktree: &Path, ticket: &TicketInfo) {
-    println!("=== Implementation Context ===");
-    println!();
-
-    // Ticket details
-    println!("Ticket: {} - {}", ticket.id, ticket.title);
+/// Print context information for a NEW ticket (no existing PR).
+fn print_new_context(main_worktree: &Path, worktree_path: &Path, ticket: &TicketInfo) {
+    println!("=== Ticket Context ===");
+    println!("TICKET_ID: {}", ticket.id);
     if !ticket.rfc_id.is_empty() {
-        println!("RFC: {}", ticket.rfc_id);
+        println!("RFC_ID: {}", ticket.rfc_id);
     }
+    println!("WORKTREE_PATH: {}", worktree_path.display());
+    println!("PR_URL: (none)");
     println!();
 
-    // Ticket file
+    // Implementation files
+    println!("=== Implementation Files ===");
     let ticket_yaml = main_worktree.join(format!("documents/work/tickets/{}.yaml", ticket.id));
+    println!("Ticket file: {}", ticket_yaml.display());
 
-    println!("Ticket file:");
-    println!("  - {}", ticket_yaml.display());
-    println!();
-
-    // RFC files (only if ticket has an RFC)
     if !ticket.rfc_id.is_empty() {
         let rfc_dir = main_worktree.join(format!("documents/rfcs/{}", ticket.rfc_id));
         if rfc_dir.exists() {
-            println!("RFC documentation:");
-            if let Ok(entries) = fs::read_dir(&rfc_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path
-                        .extension()
-                        .is_some_and(|ext| ext == "yaml" || ext == "md")
-                    {
-                        println!("  - {}", path.display());
-                    }
-                }
-            }
-            println!();
+            println!("RFC files: {}/*.yaml", rfc_dir.display());
         }
     }
+    println!();
 
     // Dependencies
     if !ticket.dependencies.is_empty() {
-        println!("Dependencies (all COMPLETED):");
+        println!("=== Dependencies (all COMPLETED) ===");
         for dep in &ticket.dependencies {
             println!("  - {dep}");
         }
@@ -489,21 +491,140 @@ fn print_context(main_worktree: &Path, ticket: &TicketInfo) {
     }
 
     // Implementation guidance
-    println!("Next steps:");
+    println!("=== Next Steps (New Ticket) ===");
     println!("  1. Read the ticket YAML file for scope, plan, and criteria");
     if ticket.rfc_id.is_empty() {
         println!("  2. Look at existing implementations in xtask/src/tasks/");
         println!("  3. Implement the feature with tests");
-        println!("  4. Run: cargo xtask check (once implemented)");
-        println!("  5. Commit: cargo xtask commit \"<message>\" (once implemented)");
+        println!("  4. Run: cargo xtask check");
+        println!("  5. Commit: cargo xtask commit \"<message>\"");
+        println!("  6. Push: cargo xtask push");
     } else {
         println!("  2. Read RFC design decisions for patterns to follow");
         println!("  3. Look at existing implementations in xtask/src/tasks/");
         println!("  4. Implement the feature with tests");
-        println!("  5. Run: cargo xtask check (once implemented)");
-        println!("  6. Commit: cargo xtask commit \"<message>\" (once implemented)");
+        println!("  5. Run: cargo xtask check");
+        println!("  6. Commit: cargo xtask commit \"<message>\"");
+        println!("  7. Push: cargo xtask push");
     }
     println!();
+}
+
+/// Print context information for RESUMING work on a ticket with an existing PR.
+fn print_resume_context(
+    sh: &Shell,
+    main_worktree: &Path,
+    worktree_path: &Path,
+    ticket: &TicketInfo,
+    pr_details: &PrDetails,
+) {
+    println!("=== Ticket Context ===");
+    println!("TICKET_ID: {}", ticket.id);
+    if !ticket.rfc_id.is_empty() {
+        println!("RFC_ID: {}", ticket.rfc_id);
+    }
+    println!("WORKTREE_PATH: {}", worktree_path.display());
+    println!("PR_URL: {}", pr_details.url);
+    println!("PR_STATE: {}", pr_details.state);
+    println!(
+        "REVIEW_STATE: {}",
+        pr_details.review_decision.as_deref().unwrap_or("PENDING")
+    );
+    println!();
+
+    // Activity Timeline
+    let timeline = get_pr_timeline(sh, pr_details.number);
+    if !timeline.is_empty() {
+        println!("=== Activity Timeline ===");
+        for entry in &timeline {
+            print_timeline_entry(entry);
+        }
+        println!();
+    }
+
+    // Unresolved Review Threads
+    let threads = get_unresolved_threads(sh, pr_details.number);
+    if !threads.is_empty() {
+        println!("=== Unresolved Review Threads ===");
+        for (i, thread) in threads.iter().enumerate() {
+            print_review_thread(i + 1, thread);
+        }
+        println!();
+    }
+
+    // Implementation files
+    println!("=== Implementation Files ===");
+    let ticket_yaml = main_worktree.join(format!("documents/work/tickets/{}.yaml", ticket.id));
+    println!("Ticket file: {}", ticket_yaml.display());
+
+    if !ticket.rfc_id.is_empty() {
+        let rfc_dir = main_worktree.join(format!("documents/rfcs/{}", ticket.rfc_id));
+        if rfc_dir.exists() {
+            println!("RFC files: {}/*.yaml", rfc_dir.display());
+        }
+    }
+    println!();
+
+    // Resume guidance
+    println!("=== Next Steps (Resume) ===");
+    if threads.is_empty() {
+        println!("  1. Review the activity timeline above for context");
+        println!("  2. Continue implementation or address any feedback");
+        println!("  3. Run: cargo xtask check");
+        println!("  4. Commit: cargo xtask commit \"<message>\"");
+        println!("  5. Push: cargo xtask push");
+    } else {
+        println!("  1. Address unresolved review threads above");
+        println!("  2. Run: cargo xtask check");
+        println!("  3. Commit: cargo xtask commit \"<message>\"");
+        println!("  4. Push: cargo xtask push");
+    }
+    println!();
+}
+
+/// Print a single timeline entry in a readable format.
+fn print_timeline_entry(entry: &TimelineEntry) {
+    let short_timestamp = if entry.timestamp.len() >= 19 {
+        &entry.timestamp[..19] // Just date and time portion
+    } else {
+        &entry.timestamp
+    };
+
+    match entry.event_type.as_str() {
+        "COMMIT" => {
+            let sha = entry.metadata.as_deref().unwrap_or("???????");
+            println!("[{}] COMMIT {} - {}", short_timestamp, sha, entry.content);
+        },
+        "COMMENT" => {
+            println!(
+                "[{}] COMMENT @{} - \"{}\"",
+                short_timestamp, entry.author, entry.content
+            );
+        },
+        "REVIEW" => {
+            println!(
+                "[{}] REVIEW {} - {}",
+                short_timestamp,
+                entry.metadata.as_deref().unwrap_or("COMMENTED"),
+                entry.content
+            );
+        },
+        _ => {
+            println!(
+                "[{}] {} - {}",
+                short_timestamp, entry.event_type, entry.content
+            );
+        },
+    }
+}
+
+/// Print a single review thread.
+fn print_review_thread(index: usize, thread: &ReviewThread) {
+    let line_info = thread.line.map(|l| format!(":{l}")).unwrap_or_default();
+    println!("Thread {}: {}{}", index, thread.path, line_info);
+    for comment in &thread.comments {
+        println!("  {comment}");
+    }
 }
 
 #[cfg(test)]
