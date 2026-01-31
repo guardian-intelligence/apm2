@@ -118,7 +118,19 @@ pub const MAX_IMPORT_ID_LENGTH: usize = 256;
 /// # Builder Pattern
 ///
 /// Use [`CiEvidenceImport::builder()`] to construct instances with validation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// # Security
+///
+/// Deserialization enforces the same resource limits as the builder:
+/// - `workflow_run_id` is limited to [`MAX_WORKFLOW_RUN_ID_LENGTH`] bytes
+/// - `artifact_digests` is limited to [`MAX_ARTIFACT_DIGESTS`] entries
+/// - `webhook_signature_verified` is **always** set to `false` during
+///   deserialization to prevent security invariant bypass via crafted JSON
+///   payloads
+///
+/// This prevents denial-of-service attacks via oversized payloads and ensures
+/// webhook signature verification cannot be bypassed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CiEvidenceImport {
     /// The CI workflow run identifier.
     workflow_run_id: String,
@@ -139,6 +151,73 @@ pub struct CiEvidenceImport {
     ///
     /// Contains the attestation level and evidence metadata.
     attestation: CiAttestation,
+}
+
+/// Custom deserialization that enforces resource limits and security
+/// invariants.
+///
+/// This implementation:
+/// 1. **Always** sets `webhook_signature_verified` to `false` - this field is
+///    ignored during deserialization to prevent security bypass attacks
+///    (SEC-CTRL-FAC-0016)
+/// 2. Validates `workflow_run_id.len() <= MAX_WORKFLOW_RUN_ID_LENGTH`
+/// 3. Validates `artifact_digests.len() <= MAX_ARTIFACT_DIGESTS`
+///
+/// This prevents:
+/// - Security invariant bypass via crafted JSON with
+///   `"webhook_signature_verified": true`
+/// - Denial-of-service attacks via oversized payloads
+impl<'de> Deserialize<'de> for CiEvidenceImport {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        // Helper struct for deserialization.
+        // webhook_signature_verified is captured but ignored - it MUST always
+        // be false after deserialization to prevent security invariant bypass.
+        #[derive(Deserialize)]
+        struct CiEvidenceImportHelper {
+            workflow_run_id: String,
+            // This field is present to allow deserialization of serialized data,
+            // but its value is IGNORED - we always set it to false.
+            #[serde(default)]
+            #[allow(dead_code)]
+            webhook_signature_verified: bool,
+            artifact_digests: Vec<Hash>,
+            attestation: CiAttestation,
+        }
+
+        let helper = CiEvidenceImportHelper::deserialize(deserializer)?;
+
+        // Validate workflow_run_id length
+        if helper.workflow_run_id.len() > MAX_WORKFLOW_RUN_ID_LENGTH {
+            return Err(D::Error::custom(format!(
+                "workflow_run_id exceeds maximum length: {} > {MAX_WORKFLOW_RUN_ID_LENGTH}",
+                helper.workflow_run_id.len(),
+            )));
+        }
+
+        // Validate artifact_digests count
+        if helper.artifact_digests.len() > MAX_ARTIFACT_DIGESTS {
+            return Err(D::Error::custom(format!(
+                "too many artifact digests: {} > {MAX_ARTIFACT_DIGESTS}",
+                helper.artifact_digests.len(),
+            )));
+        }
+
+        Ok(Self {
+            workflow_run_id: helper.workflow_run_id,
+            // SECURITY: Always false after deserialization.
+            // The webhook signature must be verified by the receiving code,
+            // not trusted from wire data. The helper.webhook_signature_verified
+            // value is intentionally ignored.
+            webhook_signature_verified: false,
+            artifact_digests: helper.artifact_digests,
+            attestation: helper.attestation,
+        })
+    }
 }
 
 impl CiEvidenceImport {
@@ -1403,9 +1482,11 @@ pub mod tests {
             .build()
             .unwrap();
 
+        // Create with webhook_signature_verified = false to match post-deserialization
+        // state
         let import = CiEvidenceImport::builder()
             .workflow_run_id("run-serde")
-            .webhook_signature_verified(true)
+            .webhook_signature_verified(false)
             .artifact_digest([0xAA; 32])
             .attestation(attestation)
             .build()
@@ -1413,6 +1494,178 @@ pub mod tests {
 
         let json = serde_json::to_string(&import).unwrap();
         let deserialized: CiEvidenceImport = serde_json::from_str(&json).unwrap();
+
+        // After roundtrip, webhook_signature_verified is always false (security
+        // invariant)
         assert_eq!(import, deserialized);
+        assert!(!deserialized.webhook_signature_verified());
+    }
+
+    // =========================================================================
+    // Deserialization Security Tests (Negative Tests)
+    // =========================================================================
+
+    /// SEC-CTRL-FAC-0016: Tests that `webhook_signature_verified` is ALWAYS
+    /// false after deserialization, regardless of what the JSON payload
+    /// contains. This prevents attackers from bypassing signature verification
+    /// by crafting malicious JSON with `webhook_signature_verified: true`.
+    #[test]
+    fn test_deser_webhook_signature_verified_bypass_prevented() {
+        // Craft malicious JSON with webhook_signature_verified = true
+        let malicious_json = r#"{
+            "workflow_run_id": "attacker-run",
+            "webhook_signature_verified": true,
+            "artifact_digests": [],
+            "attestation": {
+                "level": "L1",
+                "workflow_run_id": "attacker-run",
+                "downloaded_artifact_hashes": []
+            }
+        }"#;
+
+        let import: CiEvidenceImport = serde_json::from_str(malicious_json).unwrap();
+
+        // SECURITY: webhook_signature_verified MUST be false regardless of JSON input
+        assert!(
+            !import.webhook_signature_verified(),
+            "webhook_signature_verified must ALWAYS be false after deserialization"
+        );
+
+        // Validation should fail because webhook signature is not verified
+        let policy = CiImportPolicy::permissive();
+        let cas = MemoryCas::new();
+        let result = validate_ci_import(&import, &policy, &cas);
+        assert!(
+            matches!(result, Err(CiImportError::WebhookSignatureNotVerified)),
+            "import with deserialized webhook_signature_verified=true must fail validation"
+        );
+    }
+
+    /// Tests that oversized `workflow_run_id` is rejected during
+    /// deserialization. This prevents denial-of-service attacks via unbounded
+    /// string allocation.
+    #[test]
+    fn test_deser_rejects_oversized_workflow_run_id() {
+        let oversized_id = "x".repeat(MAX_WORKFLOW_RUN_ID_LENGTH + 1);
+
+        let json = format!(
+            r#"{{
+                "workflow_run_id": "{oversized_id}",
+                "webhook_signature_verified": false,
+                "artifact_digests": [],
+                "attestation": {{
+                    "level": "L0",
+                    "workflow_run_id": "",
+                    "downloaded_artifact_hashes": []
+                }}
+            }}"#,
+        );
+
+        let result: Result<CiEvidenceImport, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "oversized workflow_run_id must be rejected"
+        );
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("workflow_run_id exceeds maximum length"),
+            "error message should mention workflow_run_id limit: {error_msg}"
+        );
+    }
+
+    /// Tests that too many `artifact_digests` is rejected during
+    /// deserialization. This prevents denial-of-service attacks via unbounded
+    /// array allocation.
+    #[test]
+    fn test_deser_rejects_too_many_artifact_digests() {
+        // Create JSON with MAX_ARTIFACT_DIGESTS + 1 entries
+        // Hash is serialized as an array of 32 bytes
+        let hash_array = "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]";
+        let digests: Vec<&str> = (0..=MAX_ARTIFACT_DIGESTS).map(|_| hash_array).collect();
+        let digests_json = digests.join(",");
+
+        let json = format!(
+            r#"{{
+                "workflow_run_id": "test-run",
+                "webhook_signature_verified": false,
+                "artifact_digests": [{digests_json}],
+                "attestation": {{
+                    "level": "L0",
+                    "workflow_run_id": "",
+                    "downloaded_artifact_hashes": []
+                }}
+            }}"#,
+        );
+
+        let result: Result<CiEvidenceImport, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "too many artifact_digests must be rejected"
+        );
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("too many artifact digests"),
+            "error message should mention artifact digests limit: {error_msg}"
+        );
+    }
+
+    /// Tests that maximum allowed sizes are accepted (boundary test).
+    #[test]
+    fn test_deser_accepts_max_allowed_sizes() {
+        let max_id = "x".repeat(MAX_WORKFLOW_RUN_ID_LENGTH);
+
+        let json = format!(
+            r#"{{
+                "workflow_run_id": "{max_id}",
+                "webhook_signature_verified": false,
+                "artifact_digests": [],
+                "attestation": {{
+                    "level": "L0",
+                    "workflow_run_id": "",
+                    "downloaded_artifact_hashes": []
+                }}
+            }}"#,
+        );
+
+        let result: Result<CiEvidenceImport, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_ok(),
+            "max allowed workflow_run_id length should be accepted"
+        );
+    }
+
+    /// Tests that a serialized import with `webhook_signature_verified=true`
+    /// deserializes with `webhook_signature_verified=false`, ensuring that
+    /// persisted data cannot be used to bypass security checks.
+    #[test]
+    fn test_deser_resets_signature_flag_from_trusted_source() {
+        // Simulate a trusted source (e.g., database) that has stored
+        // webhook_signature_verified = true
+        let attestation = CiAttestation::builder()
+            .level(CiAttestationLevel::L1)
+            .workflow_run_id("trusted-run")
+            .build()
+            .unwrap();
+
+        let original = CiEvidenceImport::builder()
+            .workflow_run_id("trusted-run")
+            .webhook_signature_verified(true)
+            .attestation(attestation)
+            .build()
+            .unwrap();
+
+        // Serialize and deserialize (simulates loading from storage)
+        let json = serde_json::to_string(&original).unwrap();
+        let loaded: CiEvidenceImport = serde_json::from_str(&json).unwrap();
+
+        // Even though the original had webhook_signature_verified = true,
+        // the deserialized version MUST have it as false
+        assert!(original.webhook_signature_verified());
+        assert!(
+            !loaded.webhook_signature_verified(),
+            "webhook_signature_verified must be reset to false on deserialization"
+        );
     }
 }
