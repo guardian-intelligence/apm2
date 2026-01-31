@@ -37,3 +37,9 @@ commands[13]:
   - name: security-review-deny
     command: "cargo xtask security-review-exec deny [TCK-XXXXX] --reason <reason>"
     purpose: "Deny PR with a reason after security review."
+  - name: security-review-fix
+    command: "cargo xtask security-review-fix [TCK-XXXXX]"
+    purpose: "Run AI agent to fix security issues in a loop until clean."
+  - name: security-review-fix-max
+    command: "cargo xtask security-review-fix [TCK-XXXXX] --max-iterations <N>"
+    purpose: "Run security fix loop with custom iteration limit."

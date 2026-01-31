@@ -5,7 +5,7 @@ decision_tree:
   nodes[1]:
     - id: NEW_TICKET_FLOW
       purpose: "Implement a ticket from scratch and open a new PR."
-      steps[12]:
+      steps[14]:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables; replace <TICKET_ID> and <RFC_ID> with values extracted from start-ticket output."
         - id: READ_TICKET_CONTEXT
@@ -62,6 +62,15 @@ decision_tree:
         - id: VERIFY_AND_COMMIT
           action: command
           run: "cargo xtask commit \"Initial implementation of <TICKET_ID>\""
+        - id: SECURITY_FIX_LOOP
+          action: command
+          run: "cargo xtask security-review-fix <TICKET_ID>"
+          description: "Run AI agent to fix security issues in a loop until clean."
+          workflow_note: "This command runs autonomously. Check in every 3-5 minutes to monitor progress. The command exits when all security issues are resolved or max iterations (default 10) are reached."
+        - id: COMMIT_SECURITY_FIXES
+          action: command
+          run: "cargo xtask commit \"Security fixes for <TICKET_ID>\""
+          condition: "Only if security-review-fix made changes"
         - id: PUSH_CREATE_PR
           action: command
           run: "cargo xtask push"

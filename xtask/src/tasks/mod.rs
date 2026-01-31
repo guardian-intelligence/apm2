@@ -13,6 +13,7 @@ pub mod lint;
 mod push;
 mod review;
 mod security_review_exec;
+pub mod security_review_fix;
 pub mod selftest;
 mod start_ticket;
 

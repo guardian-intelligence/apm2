@@ -36,6 +36,9 @@
 //! - `capabilities --json` - Output manifest in JSON format
 //! - `selftest` - Run CAC capability selftests
 //! - `selftest --filter <pattern>` - Run only matching tests
+//! - `security-review-fix` - Run AI agent to fix security issues in a loop
+//! - `security-review-fix TCK-XXXXX` - Run for specific ticket
+//! - `security-review-fix --max-iterations 5` - Custom iteration limit
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -194,6 +197,23 @@ enum Commands {
     ///
     /// Exit code is 0 if all tests pass, 1 if any test fails.
     Selftest(tasks::selftest::SelftestArgs),
+
+    /// Run AI agent to fix security issues in a loop.
+    ///
+    /// Spawns an AI agent to review and fix security issues on the current
+    /// branch. The agent edits files, commits fixes, and signals whether
+    /// issues remain. The loop continues until exit 0 (clean) or max
+    /// iterations reached.
+    ///
+    /// Workflow: Start the command and check in every 3-5 minutes.
+    #[command(name = "security-review-fix")]
+    SecurityReviewFix {
+        /// Optional ticket ID (e.g., TCK-00123) for context
+        ticket_id: Option<String>,
+        /// Maximum number of fix iterations (default: 10)
+        #[arg(long, default_value = "10")]
+        max_iterations: u32,
+    },
 }
 
 /// Security review exec subcommands.
@@ -304,5 +324,12 @@ fn main() -> Result<()> {
         Commands::Lint(args) => tasks::lint::run(args),
         Commands::Capabilities(args) => tasks::capabilities::run(args),
         Commands::Selftest(args) => tasks::selftest::run(&args),
+        Commands::SecurityReviewFix {
+            ticket_id,
+            max_iterations,
+        } => tasks::security_review_fix::run(&tasks::security_review_fix::SecurityReviewFixArgs {
+            ticket_id,
+            max_iterations,
+        }),
     }
 }
