@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::error::LeaseError;
 use super::state::{Lease, LeaseState, ReleaseReason};
 use crate::events::{LeaseEvent, lease_event};
+use crate::htf::HtfTick;
 use crate::ledger::EventRecord;
 use crate::reducer::{Reducer, ReducerContext};
 
@@ -102,9 +103,36 @@ impl LeaseReducerState {
             .collect()
     }
 
+    /// Returns all leases that have expired by the given tick but haven't been
+    /// marked as expired yet (still in Active state).
+    ///
+    /// This is the RFC-0016 HTF compliant method using monotonic ticks.
+    /// Wall time changes do not affect this check.
+    ///
+    /// # SEC-CTRL-FAC-0015: Fail-Closed Behavior
+    ///
+    /// Leases without tick-based timing will be included in the result
+    /// (treated as expired) per fail-closed security policy.
+    #[must_use]
+    pub fn get_expired_but_active_at_tick(&self, current_tick: &HtfTick) -> Vec<&Lease> {
+        self.leases
+            .values()
+            .filter(|l| l.is_expired_at_tick(current_tick))
+            .collect()
+    }
+
     /// Returns all leases that have expired by the given time but haven't been
     /// marked as expired yet (still in Active state).
+    ///
+    /// **DEPRECATED**: This method uses wall time which can be manipulated.
+    /// Use [`LeaseReducerState::get_expired_but_active_at_tick`] for RFC-0016
+    /// HTF compliant expiry detection.
     #[must_use]
+    #[deprecated(
+        since = "0.4.0",
+        note = "use get_expired_but_active_at_tick for tick-based expiry (RFC-0016 HTF)"
+    )]
+    #[allow(deprecated)]
     pub fn get_expired_but_active(&self, current_time: u64) -> Vec<&Lease> {
         self.leases
             .values()
