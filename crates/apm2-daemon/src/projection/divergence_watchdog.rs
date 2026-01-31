@@ -1471,8 +1471,9 @@ impl FreezeRegistry {
 
     /// Replays a freeze event from ledger during rehydration.
     ///
-    /// This is a wrapper around [`Self::register`] that should be used during
-    /// ledger replay to restore freeze state on startup.
+    /// This method registers a freeze in the registry after verifying its
+    /// signature. It should be used during ledger replay to restore freeze
+    /// state on startup.
     ///
     /// # Errors
     ///
@@ -1487,8 +1488,9 @@ impl FreezeRegistry {
 
     /// Replays an unfreeze event from ledger during rehydration.
     ///
-    /// This is a wrapper around [`Self::unregister`] that should be used during
-    /// ledger replay to restore freeze state on startup.
+    /// This method removes a freeze from the registry after verifying the
+    /// unfreeze signature. It should be used during ledger replay to restore
+    /// freeze state on startup.
     ///
     /// # Errors
     ///
