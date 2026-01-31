@@ -17,12 +17,13 @@
 //! # Required Run Counts by Risk Tier
 //!
 //! The `required_run_count` function maps risk tiers to minimum run
-//! requirements using the [`RiskTier`] enum:
+//! requirements using the [`RiskTier`] enum. These mappings preserve
+//! backward compatibility with the legacy 3-tier system per SEC-CTRL-FAC-0012:
 //!
 //! - **Tier4** (highest risk): 3 runs required - maximum scrutiny
 //! - **Tier3** (high risk): 3 runs required - elevated scrutiny
-//! - **Tier2** (medium risk): 2 runs required - moderate scrutiny
-//! - **Tier1** (low risk): 1 run required - baseline verification
+//! - **Tier2** (medium-high risk): 3 runs required - preserves legacy HIGH
+//! - **Tier1** (low-medium risk): 2 runs required - preserves legacy MED
 //! - **Tier0** (lowest risk): 1 run required - minimal verification
 //!
 //! [`RiskTier`]: super::policy_resolution::RiskTier
@@ -44,8 +45,8 @@
 //! };
 //! use apm2_core::fac::{DeterminismClass, DeterminismStatus, RiskTier};
 //!
-//! // Determine required runs for a high-risk change
-//! let runs = required_run_count(RiskTier::Tier3);
+//! // Determine required runs for a medium-high risk change (Tier2 = legacy HIGH)
+//! let runs = required_run_count(RiskTier::Tier2);
 //! assert_eq!(runs, 3);
 //!
 //! // Create run digests (simulating 3 identical runs)
@@ -102,21 +103,47 @@ pub const MAX_RUN_RECEIPT_HASHES: usize = 256;
 pub const MAX_RUN_COUNT: u32 = 256;
 
 // =============================================================================
-// Risk Tier Constants
+// Legacy Risk Tier Constants (Deprecated)
 // =============================================================================
+//
+// These constants map legacy risk tier numeric values to names.
+// Prefer using the RiskTier enum directly in new code.
 
 /// Risk tier value for LOW risk (minimal scrutiny).
+/// Deprecated: Use `RiskTier::Tier0` instead.
 pub const RISK_TIER_LOW: u8 = 0;
 
 /// Risk tier value for MEDIUM risk (elevated scrutiny).
+/// Deprecated: Use `RiskTier::Tier1` instead.
 pub const RISK_TIER_MED: u8 = 1;
 
 /// Risk tier value for HIGH risk (maximum scrutiny).
+/// Deprecated: Use `RiskTier::Tier2` instead.
 pub const RISK_TIER_HIGH: u8 = 2;
 
 // =============================================================================
 // Required Run Counts
 // =============================================================================
+//
+// SECURITY INVARIANT (SEC-CTRL-FAC-0012 Anti-Downgrade):
+// These run counts are designed to preserve backward compatibility with the
+// legacy 3-tier system while supporting the new 5-tier system. The key
+// constraint is that numeric risk values must never require fewer runs than
+// they did in the legacy system:
+//
+// Legacy mapping:
+//   LOW  (0) = 1 run
+//   MED  (1) = 2 runs
+//   HIGH (2) = 3 runs
+//
+// New tier mapping (preserves legacy semantics for values 0-2):
+//   Tier0 (0) = 1 run  (same as legacy LOW)
+//   Tier1 (1) = 2 runs (preserves legacy MED requirement)
+//   Tier2 (2) = 3 runs (preserves legacy HIGH requirement)
+//   Tier3 (3) = 3 runs (new tier, max scrutiny)
+//   Tier4 (4) = 3 runs (new tier, max scrutiny)
+//
+// DO NOT reduce these values without security review.
 
 /// Required run count for Tier4 (highest risk).
 pub const REQUIRED_RUNS_TIER4: u32 = 3;
@@ -124,22 +151,27 @@ pub const REQUIRED_RUNS_TIER4: u32 = 3;
 /// Required run count for Tier3 (high risk).
 pub const REQUIRED_RUNS_TIER3: u32 = 3;
 
-/// Required run count for Tier2 (medium risk).
-pub const REQUIRED_RUNS_TIER2: u32 = 2;
+/// Required run count for Tier2 (medium-high risk).
+/// Preserves legacy HIGH (value 2) = 3 runs requirement.
+pub const REQUIRED_RUNS_TIER2: u32 = 3;
 
-/// Required run count for Tier1 (low risk).
-pub const REQUIRED_RUNS_TIER1: u32 = 1;
+/// Required run count for Tier1 (low-medium risk).
+/// Preserves legacy MED (value 1) = 2 runs requirement.
+pub const REQUIRED_RUNS_TIER1: u32 = 2;
 
 /// Required run count for Tier0 (lowest risk).
 pub const REQUIRED_RUNS_TIER0: u32 = 1;
 
-/// Required run count for HIGH risk tier (legacy alias for Tier3+).
+/// Required run count for HIGH risk tier (legacy alias).
+/// Maps to Tier2+ in the new system.
 pub const REQUIRED_RUNS_HIGH: u32 = 3;
 
-/// Required run count for MEDIUM risk tier (legacy alias for Tier2).
+/// Required run count for MEDIUM risk tier (legacy alias).
+/// Maps to Tier1 in the new system.
 pub const REQUIRED_RUNS_MED: u32 = 2;
 
-/// Required run count for LOW risk tier (legacy alias for Tier0-1).
+/// Required run count for LOW risk tier (legacy alias).
+/// Maps to Tier0 in the new system.
 pub const REQUIRED_RUNS_LOW: u32 = 1;
 
 /// Default required run count for unknown risk tiers (fail-closed).
@@ -201,6 +233,14 @@ pub enum DeterminismError {
 /// Uses the [`RiskTier`] enum from policy resolution to ensure type safety
 /// and exhaustive handling of all risk tiers.
 ///
+/// # Security Invariant (SEC-CTRL-FAC-0012)
+///
+/// This mapping preserves backward compatibility with the legacy 3-tier system.
+/// Numeric risk values must never require fewer runs than they did previously:
+/// - Legacy LOW (0) required 1 run -> Tier0 requires 1 run
+/// - Legacy MED (1) required 2 runs -> Tier1 requires 2 runs
+/// - Legacy HIGH (2) required 3 runs -> Tier2 requires 3 runs
+///
 /// # Arguments
 ///
 /// * `risk_tier` - The risk tier enum value
@@ -209,8 +249,8 @@ pub enum DeterminismError {
 ///
 /// The minimum number of runs required for the given risk tier:
 /// - `Tier0` (lowest risk): 1 run
-/// - `Tier1` (low risk): 1 run
-/// - `Tier2` (medium risk): 2 runs
+/// - `Tier1` (low-medium risk): 2 runs (preserves legacy MED)
+/// - `Tier2` (medium-high risk): 3 runs (preserves legacy HIGH)
 /// - `Tier3` (high risk): 3 runs
 /// - `Tier4` (highest risk): 3 runs
 ///
@@ -221,8 +261,8 @@ pub enum DeterminismError {
 /// use apm2_core::fac::determinism::required_run_count;
 ///
 /// assert_eq!(required_run_count(RiskTier::Tier0), 1);
-/// assert_eq!(required_run_count(RiskTier::Tier1), 1);
-/// assert_eq!(required_run_count(RiskTier::Tier2), 2);
+/// assert_eq!(required_run_count(RiskTier::Tier1), 2);
+/// assert_eq!(required_run_count(RiskTier::Tier2), 3);
 /// assert_eq!(required_run_count(RiskTier::Tier3), 3);
 /// assert_eq!(required_run_count(RiskTier::Tier4), 3);
 /// ```
@@ -662,13 +702,15 @@ pub mod tests {
     #[test]
     fn test_required_run_count_tier1() {
         assert_eq!(required_run_count(RiskTier::Tier1), REQUIRED_RUNS_TIER1);
-        assert_eq!(required_run_count(RiskTier::Tier1), 1);
+        // Preserves legacy MED (value 1) = 2 runs requirement
+        assert_eq!(required_run_count(RiskTier::Tier1), 2);
     }
 
     #[test]
     fn test_required_run_count_tier2() {
         assert_eq!(required_run_count(RiskTier::Tier2), REQUIRED_RUNS_TIER2);
-        assert_eq!(required_run_count(RiskTier::Tier2), 2);
+        // Preserves legacy HIGH (value 2) = 3 runs requirement
+        assert_eq!(required_run_count(RiskTier::Tier2), 3);
     }
 
     #[test]
