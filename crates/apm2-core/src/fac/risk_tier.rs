@@ -9,39 +9,49 @@
 //!
 //! - **High**: Maximum scrutiny required. Triggered by changes to critical
 //!   modules (auth, crypto, ledger, tool, kernel, fac, proto, daemon) or
-//!   sensitive patterns (secret, credentials, policy, security), or paths
-//!   exceeding `MAX_PATH_LEN` (fail-closed).
+//!   sensitive path patterns (secret, credentials, policy, security), or paths
+//!   exceeding `MAX_PATH_LEN`, or file count exceeding `MAX_FILES`
+//!   (fail-closed). Also the default tier when no signals are recognized
+//!   (fail-closed security).
 //! - **Med**: Elevated scrutiny required. Triggered by large changesets (lines
 //!   > 500, files > 10, dependency fanout > 20).
-//! - **Low**: Standard scrutiny. Default tier when no risk signals are
-//!   detected.
+//! - **Low**: Standard scrutiny. Assigned only when changeset is explicitly
+//!   recognized as low-risk (small, non-critical changes).
 //!
 //! # Classification Model
 //!
 //! Classification uses a two-tier signal hierarchy:
 //!
 //! 1. **Primary Signals** (-> HIGH):
-//!    - `touches_critical_module`: Changes to auth, crypto, ledger, tool,
-//!      kernel, fac, proto, or daemon modules
-//!    - `matches_sensitive_pattern`: Changes containing "secret",
+//!    - `touches_critical_module`: File paths touching auth, crypto, ledger,
+//!      tool, kernel, fac, proto, or daemon modules
+//!    - `matches_sensitive_pattern`: File paths containing "secret",
 //!      "credentials", "policy", or "security"
 //!    - `path_exceeds_max_len`: Paths longer than `MAX_PATH_LEN` (fail-closed)
+//!    - `files_exceed_max_count`: File count exceeding `MAX_FILES`
+//!      (fail-closed)
 //!
 //! 2. **Secondary Signals** (-> MED):
 //!    - `lines_changed > 500`: Large changesets by line count
 //!    - `files_changed > 10`: Wide-impact changesets by file count
 //!    - `dependency_fanout > 20`: High coupling changesets
 //!
-//! 3. **Default**: LOW when no signals match
+//! 3. **Explicit LOW**: Only assigned when changeset is small and non-critical
+//!
+//! 4. **Default**: HIGH when no signals match (fail-closed security model)
+//!
+//! NOTE: Only file paths are scanned for patterns, NOT file contents.
 //!
 //! # Security Model
 //!
-//! The classification model is permissive by default: when no risk signals
-//! are detected, the changeset receives the LOW tier. Known risk signals
-//! (critical modules, sensitive patterns, size thresholds) escalate to
-//! higher tiers. This "fail-open" approach prioritizes developer velocity
-//! for routine changes while ensuring elevated scrutiny for known risk
-//! indicators.
+//! The classification model uses fail-closed security: when no risk signals
+//! are recognized, the changeset receives the HIGH tier by default. Only
+//! changesets that are explicitly identified as low-risk (small size,
+//! non-critical paths, below all thresholds) receive the LOW tier. This
+//! ensures that unknown or unexpected patterns receive maximum scrutiny.
+//!
+//! NOTE: This module only scans file paths, NOT file contents. Content
+//! scanning requires additional tooling.
 //!
 //! # Example
 //!
@@ -99,15 +109,17 @@ pub const CRITICAL_MODULES: &[&str] = &[
     "auth", "crypto", "ledger", "tool", "kernel", "fac", "proto", "daemon",
 ];
 
-/// Sensitive patterns in file paths or content that trigger HIGH risk tier.
+/// Sensitive patterns in file paths that trigger HIGH risk tier.
 ///
-/// These patterns indicate security-sensitive data or configuration:
+/// These patterns indicate security-sensitive file paths:
 ///
 /// - `secret`: Secrets, API keys, tokens
 /// - `credentials`: Authentication credentials
 /// - `policy`: Security policies and access control
 /// - `security`: Security documentation and threat models (e.g.,
 ///   documents/security/)
+///
+/// NOTE: Only file paths are scanned for these patterns, NOT file contents.
 pub const SENSITIVE_PATTERNS: &[&str] = &["secret", "credentials", "policy", "security"];
 
 // =============================================================================
@@ -132,6 +144,13 @@ pub const FILES_CHANGED_THRESHOLD: usize = 10;
 /// affected) greater than this value are considered medium risk due
 /// to high coupling.
 pub const DEPENDENCY_FANOUT_THRESHOLD: u64 = 20;
+
+/// Maximum number of files allowed in a changeset.
+///
+/// Changesets with more files than this limit are classified as HIGH risk
+/// (fail-closed) to prevent denial-of-service via unbounded file list
+/// processing.
+pub const MAX_FILES: usize = 10000;
 
 // =============================================================================
 // RiskTierClass Enum
@@ -303,17 +322,24 @@ pub struct ChangeSet {
 /// # Classification Logic
 ///
 /// 1. **Primary Signals** (-> HIGH):
+///    - If file count exceeds `MAX_FILES`, return HIGH (fail-closed
+///      denial-of-service protection).
 ///    - If any file path contains a critical module name (auth, crypto, ledger,
-///      tool, kernel), return HIGH.
+///      tool, kernel, fac, proto, daemon), return HIGH.
 ///    - If any file path contains a sensitive pattern (secret, credentials,
-///      policy), return HIGH.
+///      policy, security), return HIGH.
 ///
 /// 2. **Secondary Signals** (-> MED):
 ///    - If `lines_changed` > 500, return MED.
 ///    - If `files_changed` > 10, return MED.
 ///    - If `dependency_fanout` > 20, return MED.
 ///
-/// 3. **Default**: Return LOW.
+/// 3. **Explicit LOW**: Only when all thresholds are below limits and no
+///    critical modules/patterns are detected.
+///
+/// 4. **Default**: Return HIGH (fail-closed security model).
+///
+/// NOTE: Only file paths are scanned, NOT file contents.
 ///
 /// # Arguments
 ///
@@ -338,6 +364,11 @@ pub struct ChangeSet {
 /// ```
 #[must_use]
 pub fn classify_risk(changeset: &ChangeSet) -> RiskTierClass {
+    // Check file count limit (DoS protection) -> HIGH
+    if changeset.files_changed.len() > MAX_FILES {
+        return RiskTierClass::High;
+    }
+
     // Check primary signals -> HIGH
     if touches_critical_module(changeset) {
         return RiskTierClass::High;
@@ -360,8 +391,23 @@ pub fn classify_risk(changeset: &ChangeSet) -> RiskTierClass {
         return RiskTierClass::Med;
     }
 
-    // Default -> LOW
-    RiskTierClass::Low
+    // Explicit LOW: only when all checks pass and changeset is small and
+    // non-critical For an empty changeset or one that passed all checks above,
+    // we need to determine if it's truly a recognized low-risk changeset or an
+    // unknown pattern. A changeset with no files is explicitly low-risk
+    // (nothing to review). A changeset with files that passed all pattern
+    // checks is explicitly low-risk.
+    if changeset.files_changed.is_empty()
+        || (!changeset.files_changed.is_empty()
+            && changeset.lines_changed <= LINES_CHANGED_THRESHOLD
+            && changeset.files_changed.len() <= FILES_CHANGED_THRESHOLD
+            && changeset.dependency_fanout <= DEPENDENCY_FANOUT_THRESHOLD)
+    {
+        return RiskTierClass::Low;
+    }
+
+    // Default -> HIGH (fail-closed security model)
+    RiskTierClass::High
 }
 
 /// Maximum file path length to process for risk classification.
@@ -372,27 +418,24 @@ pub fn classify_risk(changeset: &ChangeSet) -> RiskTierClass {
 /// 4096 bytes is a reasonable limit that covers all practical file paths.
 const MAX_PATH_LEN: usize = 4096;
 
-/// Pre-computed patterns for critical module matching.
+/// Delimiters for aggressive module matching.
 ///
-/// These are computed at compile time to avoid runtime allocations.
-/// Each module has patterns for: /module/, /module., module/, module., -module/
-/// The -module/ pattern handles crate naming conventions like apm2-proto,
-/// apm2-daemon.
-const CRITICAL_MODULE_PATTERNS: &[(&str, &str, &str, &str, &str)] = &[
-    ("/auth/", "/auth.", "auth/", "auth.", "-auth/"),
-    ("/crypto/", "/crypto.", "crypto/", "crypto.", "-crypto/"),
-    ("/ledger/", "/ledger.", "ledger/", "ledger.", "-ledger/"),
-    ("/tool/", "/tool.", "tool/", "tool.", "-tool/"),
-    ("/kernel/", "/kernel.", "kernel/", "kernel.", "-kernel/"),
-    ("/fac/", "/fac.", "fac/", "fac.", "-fac/"),
-    ("/proto/", "/proto.", "proto/", "proto.", "-proto/"),
-    ("/daemon/", "/daemon.", "daemon/", "daemon.", "-daemon/"),
-];
+/// These characters are used to identify module name boundaries in paths.
+/// A module match occurs when the module name appears as a path segment
+/// (surrounded by separators) OR as part of a directory/file name
+/// (preceded or followed by common delimiters like underscore, hyphen).
+const MODULE_DELIMITERS: &[char] = &['/', '\\', '_', '-', '.'];
 
 /// Checks if the changeset touches a critical module.
 ///
 /// A critical module is touched if any file path contains one of the
-/// critical module names as a path component (case-insensitive).
+/// critical module names in any of these forms (case-insensitive):
+/// - As a path segment: `/auth/`, `auth/` at start
+/// - As part of a compound name: `_auth/`, `-auth/`, `auth_`, `auth-`, `auth.`
+/// - At path boundaries: preceded or followed by path separators or delimiters
+///
+/// This aggressive matching ensures that patterns like `auth_impl/`, `_auth/`,
+/// `my-auth-service/`, and `auth.rs` all trigger HIGH risk.
 ///
 /// Uses pre-allocated pattern buffers to avoid denial-of-service via unbounded
 /// allocations. Paths exceeding `MAX_PATH_LEN` are treated as HIGH risk
@@ -414,26 +457,66 @@ fn touches_critical_module(changeset: &ChangeSet) -> bool {
         // Reuse buffer for lowercase conversion
         lower_buf.extend(file_path.chars().map(|c| c.to_ascii_lowercase()));
 
-        for (slash_module_slash, slash_module_dot, module_slash, module_dot, hyphen_module_slash) in
-            CRITICAL_MODULE_PATTERNS
-        {
-            if lower_buf.contains(slash_module_slash)
-                || lower_buf.contains(slash_module_dot)
-                || lower_buf.contains(hyphen_module_slash)
-                || lower_buf.starts_with(module_slash)
-                || lower_buf.starts_with(module_dot)
-            {
-                return true;
-            }
-        }
-
-        // Also check exact match with module names
+        // Check each critical module with aggressive matching
         for module in CRITICAL_MODULES {
-            if lower_buf == *module {
+            if contains_module_aggressively(&lower_buf, module) {
                 return true;
             }
         }
     }
+    false
+}
+
+/// Checks if a path contains a module name using aggressive matching.
+///
+/// Matches if the module appears:
+/// - As a standalone path segment (e.g., `/auth/`, `auth/` at start)
+/// - Preceded by a delimiter (e.g., `_auth`, `-auth`, `/auth`)
+/// - Followed by a delimiter (e.g., `auth_`, `auth-`, `auth.`, `auth/`)
+/// - As an exact match for the entire path
+///
+/// This catches patterns like:
+/// - `/auth/` - standard path segment
+/// - `auth_impl/` - module as prefix with underscore
+/// - `_auth/` - module with leading underscore
+/// - `my-auth/` - module with leading hyphen
+/// - `auth.rs` - module as filename
+fn contains_module_aggressively(path: &str, module: &str) -> bool {
+    // Exact match
+    if path == module {
+        return true;
+    }
+
+    // Find all occurrences of the module name
+    let mut search_start = 0;
+    while let Some(pos) = path[search_start..].find(module) {
+        let abs_pos = search_start + pos;
+        let end_pos = abs_pos + module.len();
+
+        // Check if this is a valid module boundary match
+        let valid_start = abs_pos == 0
+            || path[..abs_pos]
+                .chars()
+                .last()
+                .is_some_and(|c| MODULE_DELIMITERS.contains(&c));
+
+        let valid_end = end_pos == path.len()
+            || path[end_pos..]
+                .chars()
+                .next()
+                .is_some_and(|c| MODULE_DELIMITERS.contains(&c));
+
+        if valid_start && valid_end {
+            return true;
+        }
+
+        // Move past this occurrence
+        search_start = abs_pos + 1;
+        if search_start >= path.len() {
+            break;
+        }
+    }
+
     false
 }
 
@@ -627,14 +710,49 @@ pub mod tests {
 
     #[test]
     fn test_classify_non_critical_module_with_similar_name() {
-        // "authentication" should NOT trigger - we look for "/auth/" not just "auth"
+        // "authentication" should NOT trigger - we look for "auth" as a delimited
+        // segment
         let changeset = ChangeSet {
             files_changed: vec!["src/authentication/utils.rs".to_string()],
             lines_changed: 10,
             dependency_fanout: 1,
         };
-        // This should be LOW since "authentication" != "auth"
+        // This should be LOW since "authentication" contains "auth" but not at a
+        // delimiter boundary
         assert_eq!(classify_risk(&changeset), RiskTierClass::Low);
+    }
+
+    #[test]
+    fn test_classify_critical_module_with_underscore_prefix() {
+        // "_auth/" should trigger with aggressive matching
+        let changeset = ChangeSet {
+            files_changed: vec!["src/_auth/utils.rs".to_string()],
+            lines_changed: 10,
+            dependency_fanout: 1,
+        };
+        assert_eq!(classify_risk(&changeset), RiskTierClass::High);
+    }
+
+    #[test]
+    fn test_classify_critical_module_with_underscore_suffix() {
+        // "auth_impl/" should trigger with aggressive matching
+        let changeset = ChangeSet {
+            files_changed: vec!["src/auth_impl/utils.rs".to_string()],
+            lines_changed: 10,
+            dependency_fanout: 1,
+        };
+        assert_eq!(classify_risk(&changeset), RiskTierClass::High);
+    }
+
+    #[test]
+    fn test_classify_critical_module_compound_name() {
+        // "my-crypto-lib/" should trigger with aggressive matching
+        let changeset = ChangeSet {
+            files_changed: vec!["crates/my-crypto-lib/src/lib.rs".to_string()],
+            lines_changed: 10,
+            dependency_fanout: 1,
+        };
+        assert_eq!(classify_risk(&changeset), RiskTierClass::High);
     }
 
     // =========================================================================
@@ -834,14 +952,15 @@ pub mod tests {
 
     #[test]
     fn test_critical_module_as_file_extension() {
-        // File with .auth extension should NOT trigger (pattern is for directory)
+        // File with .auth extension SHOULD trigger with aggressive matching
+        // since "." is a delimiter
         let changeset = ChangeSet {
             files_changed: vec!["config/app.auth".to_string()],
             lines_changed: 10,
             dependency_fanout: 1,
         };
-        // Should be LOW since ".auth" is not "/auth/"
-        assert_eq!(classify_risk(&changeset), RiskTierClass::Low);
+        // Should be HIGH since ".auth" at end matches with delimiter
+        assert_eq!(classify_risk(&changeset), RiskTierClass::High);
     }
 
     #[test]
@@ -976,5 +1095,46 @@ pub mod tests {
     fn test_risk_tier_error_display() {
         let err = RiskTierError::InvalidTier(5);
         assert!(err.to_string().contains("invalid risk tier value: 5"));
+    }
+
+    // =========================================================================
+    // MAX_FILES DoS Protection Tests
+    // =========================================================================
+
+    #[test]
+    fn test_classify_exceeds_max_files_is_high_risk() {
+        // Changeset exceeding MAX_FILES should be classified as HIGH (fail-closed)
+        let changeset = ChangeSet {
+            files_changed: (0..10001).map(|i| format!("src/file{i}.rs")).collect(),
+            lines_changed: 10,
+            dependency_fanout: 1,
+        };
+        assert_eq!(classify_risk(&changeset), RiskTierClass::High);
+    }
+
+    #[test]
+    fn test_classify_at_max_files_is_not_high_risk() {
+        // Changeset exactly at MAX_FILES should be processed normally
+        let changeset = ChangeSet {
+            files_changed: (0..10000).map(|i| format!("src/file{i}.rs")).collect(),
+            lines_changed: 10,
+            dependency_fanout: 1,
+        };
+        // Many files but under MAX_FILES, no critical modules, should trigger MED
+        // due to FILES_CHANGED_THRESHOLD (> 10)
+        assert_eq!(classify_risk(&changeset), RiskTierClass::Med);
+    }
+
+    // =========================================================================
+    // Fail-Closed Default Behavior Tests
+    // =========================================================================
+
+    #[test]
+    fn test_fail_closed_default_behavior() {
+        // Verify that the classification is fail-closed: empty changesets
+        // that passed all checks should still be classified correctly.
+        // An empty changeset is explicitly low-risk (nothing to review).
+        let changeset = ChangeSet::default();
+        assert_eq!(classify_risk(&changeset), RiskTierClass::Low);
     }
 }
