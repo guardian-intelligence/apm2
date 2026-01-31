@@ -243,3 +243,9 @@ pub use validator::{
     CacValidator, MAX_ARRAY_MEMBERS, MAX_DEPTH, MAX_OBJECT_PROPERTIES, ValidationError,
     validate_cac_artifact,
 };
+
+// Re-export TranscriptChunk from FAC for CAC module discoverability
+// (Q-RFC-FAC-0005: Reuse TranscriptChunk from CAC module)
+pub use crate::fac::transcript_binding::{
+    MAX_CHUNK_CONTENT_BYTES, MAX_TRANSCRIPT_CHUNKS, TranscriptBindingError, TranscriptChunk,
+};
