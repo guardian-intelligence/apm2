@@ -4,7 +4,7 @@
 //! This module defines the [`FlakeRouting`] enum that determines how different
 //! types of test flakiness should be handled by the admission system, and
 //! provides the [`routing_action`](crate::fac::FlakeClass::routing_action)
-//! method on [`FlakeClass`](crate::fac::FlakeClass).
+//! method on [`FlakeClass`].
 //!
 //! # Flake Classes and Routing
 //!
