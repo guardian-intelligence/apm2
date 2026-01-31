@@ -363,6 +363,7 @@ impl LeaseReducer {
             });
         }
 
+
         // Create the lease with tick-based timing if available (RFC-0016 HTF).
         // If tick_rate_hz > 0, use tick-based constructor for SEC-CTRL-FAC-0015
         // compliance.
