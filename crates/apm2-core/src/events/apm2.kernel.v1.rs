@@ -1392,6 +1392,7 @@ pub struct NetworkPolicyProfile {
     pub deny_by_default: bool,
 }
 /// Emitted when a merge is executed atomically after observing the result_selector.
+///
 /// This receipt binds the inputs (base, changeset, policy, receipts) to the
 /// observed outcome (result_selector), ensuring that the merge cannot be
 /// claimed for a different result than what was actually produced.
