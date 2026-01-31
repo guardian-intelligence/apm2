@@ -74,12 +74,14 @@ mod ci_attestation;
 mod ci_import;
 pub mod determinism;
 mod domain_separator;
+pub mod echo_trap;
 pub mod flake_class;
 pub mod harness_sandbox;
 mod key_policy;
 mod lease;
 pub mod merge_receipt;
 mod policy_resolution;
+pub mod quarantine;
 mod receipt;
 pub mod retry_manager;
 pub mod risk_tier;
@@ -139,6 +141,12 @@ pub use domain_separator::{
     POLICY_RESOLVED_PREFIX, PROJECTION_RECEIPT_PREFIX, QUARANTINE_EVENT_PREFIX, sign_with_domain,
     verify_with_domain,
 };
+// Re-export echo-trap detection types
+pub use echo_trap::{
+    ECHO_TRAP_THRESHOLD, EchoTrapDetector, EchoTrapError, EchoTrapEvent, FindingSignature,
+    MAX_SIGNATURE_LENGTH, MAX_SIGNATURES as MAX_ECHO_TRAP_SIGNATURES, SessionTermination,
+    TerminationRationale,
+};
 // Re-export flake classification routing types
 pub use flake_class::FlakeRouting;
 // Re-export harness sandbox types
@@ -168,6 +176,13 @@ pub use policy_resolution::{
     DeterminismClass, MAX_RCP_PROFILES, MAX_STRING_LENGTH, MAX_VERIFIER_POLICIES,
     PolicyResolutionError, PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
     PolicyResolvedForChangeSetProto, RiskTier,
+};
+// Re-export quarantine types
+pub use quarantine::{
+    AATSpecQuarantined, AATSpecQuarantinedProto, MAX_EVIDENCE_REFS, MAX_QUARANTINED_ITEMS,
+    MAX_STRING_LENGTH as MAX_QUARANTINE_STRING_LENGTH, QuarantineCleared, QuarantineClearedProto,
+    QuarantineError, QuarantineEvent, QuarantineProjection, RunnerPoolQuarantined,
+    RunnerPoolQuarantinedProto,
 };
 // Re-export receipt types
 pub use receipt::{
