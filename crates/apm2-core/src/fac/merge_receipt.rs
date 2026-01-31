@@ -43,7 +43,7 @@ pub const MAX_GATE_RECEIPTS: usize = 64;
 // Error Types
 // =============================================================================
 
-/// Errors that can occur during MergeReceipt operations.
+/// Errors that can occur during [`MergeReceipt`] operations.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum MergeReceiptError {
     /// Missing required field.
@@ -111,7 +111,7 @@ pub struct MergeReceipt {
     /// Actor who performed the merge.
     pub gate_actor_id: String,
 
-    /// Ed25519 signature over canonical bytes with MERGE_RECEIPT: domain.
+    /// Ed25519 signature over canonical bytes with `MERGE_RECEIPT:` domain.
     #[serde(with = "serde_bytes")]
     pub gate_signature: [u8; 64],
 }
@@ -134,6 +134,10 @@ impl MergeReceipt {
     /// * `merged_at` - Timestamp of merge
     /// * `gate_actor_id` - ID of the actor performing the merge
     /// * `signer` - Signer to authorize the receipt
+    ///
+    /// # Returns
+    ///
+    /// A signed `MergeReceipt` or error if validation fails.
     ///
     /// # Errors
     ///
