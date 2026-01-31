@@ -21,7 +21,7 @@
 //!
 //! - Signed with `MERGE_RECEIPT:` domain separator
 //! - Canonical encoding enforces deterministic serialization
-//! - Resource limits prevent DoS attacks
+//! - Resource limits prevent denial-of-service attacks
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -135,9 +135,11 @@ impl MergeReceipt {
     /// * `gate_actor_id` - ID of the actor performing the merge
     /// * `signer` - Signer to authorize the receipt
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// A signed `MergeReceipt` or error if validation fails.
+    /// Returns [`MergeReceiptError::StringTooLong`] if any string field exceeds
+    /// `MAX_STRING_LENGTH`, or [`MergeReceiptError::CollectionTooLarge`] if
+    /// `gate_receipt_ids` exceeds `MAX_GATE_RECEIPTS`.
     #[allow(clippy::too_many_arguments)]
     pub fn create_after_observation(
         base_selector: String,
@@ -211,13 +213,15 @@ impl MergeReceipt {
     /// Computes the canonical bytes for signing/verification.
     ///
     /// Encoding:
-    /// - base_selector (len + bytes)
-    /// - changeset_digest (32 bytes)
-    /// - gate_receipt_ids (count + (len + bytes)...) - sorted!
-    /// - policy_hash (32 bytes)
-    /// - result_selector (len + bytes)
-    /// - merged_at (8 bytes BE)
-    /// - gate_actor_id (len + bytes)
+    /// - `base_selector` (len + bytes)
+    /// - `changeset_digest` (32 bytes)
+    /// - `gate_receipt_ids` (count + (len + bytes)...) - sorted!
+    /// - `policy_hash` (32 bytes)
+    /// - `result_selector` (len + bytes)
+    /// - `merged_at` (8 bytes BE)
+    /// - `gate_actor_id` (len + bytes)
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // All strings are bounded by MAX_STRING_LENGTH < u32::MAX
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
@@ -255,6 +259,11 @@ impl MergeReceipt {
     }
 
     /// Verifies the receipt signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MergeReceiptError::SignatureVerificationFailed`] if the
+    /// signature does not match the canonical bytes.
     pub fn verify_signature(&self, key: &VerifyingKey) -> Result<(), MergeReceiptError> {
         let canonical = self.canonical_bytes();
         let signature = Signature::from_bytes(&self.gate_signature);

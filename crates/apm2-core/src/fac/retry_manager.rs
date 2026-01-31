@@ -33,7 +33,8 @@ pub const MAX_GATE_ATTEMPTS: u32 = 3;
 pub const MAX_GLOBAL_EPISODES: u32 = 50;
 
 /// Maximum number of gates tracked.
-/// Prevents DoS via memory exhaustion.
+///
+/// Prevents denial-of-service via memory exhaustion.
 pub const MAX_TRACKED_GATES: usize = 128;
 
 // =============================================================================
@@ -63,7 +64,7 @@ pub enum RetryError {
         max: u32,
     },
 
-    /// Too many gates tracked (DoS protection).
+    /// Too many gates tracked (denial-of-service protection).
     #[error("too many gates tracked ({current} >= {max})")]
     TooManyGates {
         /// Current number of tracked gates.
@@ -115,7 +116,11 @@ impl RetryManager {
     ///
     /// `Ok(true)` if retry is allowed.
     /// `Ok(false)` if retry is NOT allowed (limits reached).
-    /// `Err(RetryError)` for validation errors (e.g. string too long).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RetryError::StringTooLong`] if `gate_id` exceeds
+    /// `MAX_STRING_LENGTH`.
     pub fn can_retry(&self, gate_id: &str) -> Result<bool, RetryError> {
         if gate_id.len() > MAX_STRING_LENGTH {
             return Err(RetryError::StringTooLong {
@@ -143,10 +148,13 @@ impl RetryManager {
     ///
     /// * `gate_id` - The ID of the gate to record.
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// `Ok(())` if the attempt was successfully recorded.
-    /// `Err(RetryError)` if limits would be exceeded or validation fails.
+    /// Returns an error if:
+    /// - [`RetryError::StringTooLong`]: `gate_id` exceeds `MAX_STRING_LENGTH`
+    /// - [`RetryError::GlobalLimitExceeded`]: global episode limit reached
+    /// - [`RetryError::GateLimitExceeded`]: per-gate attempt limit reached
+    /// - [`RetryError::TooManyGates`]: too many unique gates tracked
     pub fn record_attempt(&mut self, gate_id: impl Into<String>) -> Result<(), RetryError> {
         let gate_id = gate_id.into();
 
