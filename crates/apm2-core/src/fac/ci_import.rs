@@ -991,17 +991,18 @@ fn hex_encode(hash: &Hash) -> String {
 ///   was provided
 /// - [`CiImportError::WebhookSignatureNotVerified`]: The webhook signature was
 ///   not verified (SEC-CTRL-FAC-0017)
-/// - [`CiImportError::InsufficientAttestationLevel`]: The attestation level is
-///   L0 (status-only)
+/// - [`CiImportError::InsufficientAttestationLevel`]: The attestation level
+///   does not meet the policy minimum
 ///
 /// # Security
 ///
 /// When CI gating is enabled:
 /// - Plain "success" status without evidence is rejected (`CiEvidenceMissing`)
 /// - Unverified webhook signatures are rejected (`WebhookSignatureNotVerified`)
-/// - L0 attestation (status-only) is rejected (`InsufficientAttestationLevel`)
-/// - L1+ attestation with verified webhook signature is required for transition
-///   approval
+/// - Attestation below the policy minimum is rejected
+///   (`InsufficientAttestationLevel`)
+/// - Attestation meeting or exceeding the policy minimum with verified webhook
+///   signature is required for transition approval
 ///
 /// # Example
 ///
@@ -1011,11 +1012,15 @@ fn hex_encode(hash: &Hash) -> String {
 ///     can_transition_to_ready_for_review,
 /// };
 ///
-/// // CI gating disabled - always allowed
-/// assert!(can_transition_to_ready_for_review(false, None).is_ok());
+/// // CI gating disabled - always allowed (minimum_level ignored)
+/// assert!(
+///     can_transition_to_ready_for_review(false, None, CiAttestationLevel::L1)
+///         .is_ok()
+/// );
 ///
 /// // CI gating enabled with no evidence - rejected
-/// let result = can_transition_to_ready_for_review(true, None);
+/// let result =
+///     can_transition_to_ready_for_review(true, None, CiAttestationLevel::L1);
 /// assert!(matches!(result, Err(CiImportError::CiEvidenceMissing)));
 ///
 /// // CI gating enabled with unverified signature - rejected
@@ -1030,14 +1035,17 @@ fn hex_encode(hash: &Hash) -> String {
 ///     .attestation(unverified_attestation)
 ///     .build()
 ///     .unwrap();
-/// let result =
-///     can_transition_to_ready_for_review(true, Some(&unverified_import));
+/// let result = can_transition_to_ready_for_review(
+///     true,
+///     Some(&unverified_import),
+///     CiAttestationLevel::L1,
+/// );
 /// assert!(matches!(
 ///     result,
 ///     Err(CiImportError::WebhookSignatureNotVerified)
 /// ));
 ///
-/// // CI gating enabled with L0 - rejected
+/// // CI gating enabled with L0 when L1 required - rejected
 /// let l0_attestation = CiAttestation::builder()
 ///     .level(CiAttestationLevel::L0)
 ///     .build()
@@ -1048,13 +1056,17 @@ fn hex_encode(hash: &Hash) -> String {
 ///     .attestation(l0_attestation)
 ///     .build()
 ///     .unwrap();
-/// let result = can_transition_to_ready_for_review(true, Some(&l0_import));
+/// let result = can_transition_to_ready_for_review(
+///     true,
+///     Some(&l0_import),
+///     CiAttestationLevel::L1,
+/// );
 /// assert!(matches!(
 ///     result,
 ///     Err(CiImportError::InsufficientAttestationLevel { .. })
 /// ));
 ///
-/// // CI gating enabled with L1 - allowed
+/// // CI gating enabled with L1 meeting L1 requirement - allowed
 /// let l1_attestation = CiAttestation::builder()
 ///     .level(CiAttestationLevel::L1)
 ///     .workflow_run_id("run-001")
@@ -1066,11 +1078,46 @@ fn hex_encode(hash: &Hash) -> String {
 ///     .attestation(l1_attestation)
 ///     .build()
 ///     .unwrap();
-/// assert!(can_transition_to_ready_for_review(true, Some(&l1_import)).is_ok());
+/// assert!(
+///     can_transition_to_ready_for_review(
+///         true,
+///         Some(&l1_import),
+///         CiAttestationLevel::L1
+///     )
+///     .is_ok()
+/// );
+///
+/// // Policy requiring L2 for high-risk scenarios
+/// let l1_for_l2 = CiEvidenceImport::builder()
+///     .workflow_run_id("run-002")
+///     .webhook_signature_verified(true)
+///     .attestation(
+///         CiAttestation::builder()
+///             .level(CiAttestationLevel::L1)
+///             .workflow_run_id("run-002")
+///             .build()
+///             .unwrap(),
+///     )
+///     .build()
+///     .unwrap();
+/// // L1 does not meet L2 requirement
+/// let result = can_transition_to_ready_for_review(
+///     true,
+///     Some(&l1_for_l2),
+///     CiAttestationLevel::L2,
+/// );
+/// assert!(matches!(
+///     result,
+///     Err(CiImportError::InsufficientAttestationLevel {
+///         actual: CiAttestationLevel::L1,
+///         required: CiAttestationLevel::L2,
+///     })
+/// ));
 /// ```
 pub fn can_transition_to_ready_for_review(
     ci_enabled: bool,
     import: Option<&CiEvidenceImport>,
+    minimum_level: CiAttestationLevel,
 ) -> Result<(), CiImportError> {
     // If CI gating is disabled, transition is always allowed
     if !ci_enabled {
@@ -1086,12 +1133,12 @@ pub fn can_transition_to_ready_for_review(
         return Err(CiImportError::WebhookSignatureNotVerified);
     }
 
-    // Check attestation level - L0 is insufficient
-    let level = import.attestation.level();
-    if level == CiAttestationLevel::L0 {
+    // Check attestation level against policy minimum
+    let actual_level = import.attestation.level();
+    if !import.attestation.meets_minimum(minimum_level) {
         return Err(CiImportError::InsufficientAttestationLevel {
-            actual: level,
-            required: CiAttestationLevel::L1,
+            actual: actual_level,
+            required: minimum_level,
         });
     }
 
@@ -2198,7 +2245,8 @@ pub mod tests {
         #[test]
         fn test_ci_disabled_allows_transition_without_evidence() {
             // CI gating disabled - transition always allowed, even with no evidence
-            let result = can_transition_to_ready_for_review(false, None);
+            // minimum_level is ignored when CI is disabled
+            let result = can_transition_to_ready_for_review(false, None, CiAttestationLevel::L1);
             assert!(result.is_ok());
         }
 
@@ -2217,20 +2265,21 @@ pub mod tests {
                 .build()
                 .unwrap();
 
-            let result = can_transition_to_ready_for_review(false, Some(&import));
+            let result =
+                can_transition_to_ready_for_review(false, Some(&import), CiAttestationLevel::L1);
             assert!(result.is_ok());
         }
 
         #[test]
         fn test_ci_enabled_rejects_missing_evidence() {
             // CI gating enabled with no evidence - plain "success" is rejected
-            let result = can_transition_to_ready_for_review(true, None);
+            let result = can_transition_to_ready_for_review(true, None, CiAttestationLevel::L1);
             assert!(matches!(result, Err(CiImportError::CiEvidenceMissing)));
         }
 
         #[test]
-        fn test_ci_enabled_rejects_l0_attestation() {
-            // CI gating enabled with L0 attestation - rejected
+        fn test_ci_enabled_rejects_l0_when_l1_required() {
+            // CI gating enabled with L0 attestation when L1 required - rejected
             let attestation = CiAttestation::builder()
                 .level(CiAttestationLevel::L0)
                 .build()
@@ -2243,7 +2292,8 @@ pub mod tests {
                 .build()
                 .unwrap();
 
-            let result = can_transition_to_ready_for_review(true, Some(&import));
+            let result =
+                can_transition_to_ready_for_review(true, Some(&import), CiAttestationLevel::L1);
             assert!(
                 matches!(
                     result,
@@ -2252,7 +2302,7 @@ pub mod tests {
                         required: CiAttestationLevel::L1,
                     })
                 ),
-                "Expected InsufficientAttestationLevel for L0, got: {result:?}"
+                "Expected InsufficientAttestationLevel for L0 when L1 required, got: {result:?}"
             );
         }
 
@@ -2276,7 +2326,8 @@ pub mod tests {
                 .build()
                 .unwrap();
 
-            let result = can_transition_to_ready_for_review(true, Some(&import));
+            let result =
+                can_transition_to_ready_for_review(true, Some(&import), CiAttestationLevel::L1);
             assert!(
                 matches!(result, Err(CiImportError::WebhookSignatureNotVerified)),
                 "Expected WebhookSignatureNotVerified error, got: {result:?}"
@@ -2299,7 +2350,8 @@ pub mod tests {
                 .build()
                 .unwrap();
 
-            let result = can_transition_to_ready_for_review(true, Some(&import));
+            let result =
+                can_transition_to_ready_for_review(true, Some(&import), CiAttestationLevel::L1);
             let err = result.unwrap_err();
             assert_eq!(
                 err.to_string(),
@@ -2326,7 +2378,8 @@ pub mod tests {
                 .build()
                 .unwrap();
 
-            let result = can_transition_to_ready_for_review(true, Some(&import));
+            let result =
+                can_transition_to_ready_for_review(true, Some(&import), CiAttestationLevel::L1);
             assert!(
                 matches!(result, Err(CiImportError::WebhookSignatureNotVerified)),
                 "Unverified signature must be rejected even with L2 attestation"
@@ -2334,8 +2387,8 @@ pub mod tests {
         }
 
         #[test]
-        fn test_ci_enabled_accepts_l1_attestation() {
-            // CI gating enabled with L1 attestation - allowed
+        fn test_ci_enabled_accepts_l1_when_l1_required() {
+            // CI gating enabled with L1 attestation meeting L1 requirement - allowed
             let attestation = CiAttestation::builder()
                 .level(CiAttestationLevel::L1)
                 .workflow_run_id("run-001")
@@ -2349,13 +2402,14 @@ pub mod tests {
                 .build()
                 .unwrap();
 
-            let result = can_transition_to_ready_for_review(true, Some(&import));
+            let result =
+                can_transition_to_ready_for_review(true, Some(&import), CiAttestationLevel::L1);
             assert!(result.is_ok());
         }
 
         #[test]
-        fn test_ci_enabled_accepts_l2_attestation() {
-            // CI gating enabled with L2 attestation - allowed (exceeds requirement)
+        fn test_ci_enabled_accepts_l2_when_l1_required() {
+            // CI gating enabled with L2 attestation exceeding L1 requirement - allowed
             let attestation = CiAttestation::builder()
                 .level(CiAttestationLevel::L2)
                 .workflow_run_id("run-002")
@@ -2369,13 +2423,14 @@ pub mod tests {
                 .build()
                 .unwrap();
 
-            let result = can_transition_to_ready_for_review(true, Some(&import));
+            let result =
+                can_transition_to_ready_for_review(true, Some(&import), CiAttestationLevel::L1);
             assert!(result.is_ok());
         }
 
         #[test]
-        fn test_ci_enabled_accepts_l3_attestation() {
-            // CI gating enabled with L3 attestation - allowed (exceeds requirement)
+        fn test_ci_enabled_accepts_l3_when_l1_required() {
+            // CI gating enabled with L3 attestation exceeding L1 requirement - allowed
             let attestation = CiAttestation::builder()
                 .level(CiAttestationLevel::L3)
                 .workflow_run_id("run-003")
@@ -2389,14 +2444,15 @@ pub mod tests {
                 .build()
                 .unwrap();
 
-            let result = can_transition_to_ready_for_review(true, Some(&import));
+            let result =
+                can_transition_to_ready_for_review(true, Some(&import), CiAttestationLevel::L1);
             assert!(result.is_ok());
         }
 
         #[test]
         fn test_error_message_for_ci_evidence_missing() {
             // Verify the error message is descriptive
-            let result = can_transition_to_ready_for_review(true, None);
+            let result = can_transition_to_ready_for_review(true, None, CiAttestationLevel::L1);
             let err = result.unwrap_err();
             assert_eq!(
                 err.to_string(),
@@ -2418,12 +2474,145 @@ pub mod tests {
                 .build()
                 .unwrap();
 
-            let result = can_transition_to_ready_for_review(true, Some(&import));
+            let result =
+                can_transition_to_ready_for_review(true, Some(&import), CiAttestationLevel::L1);
             let err = result.unwrap_err();
             assert!(
                 err.to_string().contains("L0 (status-only) is insufficient"),
                 "Expected error about L0 being insufficient, got: {err}"
             );
+        }
+
+        // =====================================================================
+        // Policy-Based Enforcement Tests
+        // =====================================================================
+
+        /// Tests that L2 can be required by policy for high-risk scenarios.
+        #[test]
+        fn test_policy_requires_l2_rejects_l1() {
+            // High-risk policy requiring L2
+            let attestation = CiAttestation::builder()
+                .level(CiAttestationLevel::L1)
+                .workflow_run_id("run-high-risk")
+                .build()
+                .unwrap();
+
+            let import = CiEvidenceImport::builder()
+                .workflow_run_id("run-high-risk")
+                .webhook_signature_verified(true)
+                .attestation(attestation)
+                .build()
+                .unwrap();
+
+            let result = can_transition_to_ready_for_review(
+                true,
+                Some(&import),
+                CiAttestationLevel::L2, // High-risk requires L2
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(CiImportError::InsufficientAttestationLevel {
+                        actual: CiAttestationLevel::L1,
+                        required: CiAttestationLevel::L2,
+                    })
+                ),
+                "L1 should not meet L2 requirement for high-risk policy, got: {result:?}"
+            );
+        }
+
+        /// Tests that L2 meets L2 requirement.
+        #[test]
+        fn test_policy_requires_l2_accepts_l2() {
+            let attestation = CiAttestation::builder()
+                .level(CiAttestationLevel::L2)
+                .workflow_run_id("run-high-risk-ok")
+                .build()
+                .unwrap();
+
+            let import = CiEvidenceImport::builder()
+                .workflow_run_id("run-high-risk-ok")
+                .webhook_signature_verified(true)
+                .attestation(attestation)
+                .build()
+                .unwrap();
+
+            let result =
+                can_transition_to_ready_for_review(true, Some(&import), CiAttestationLevel::L2);
+            assert!(result.is_ok(), "L2 should meet L2 requirement");
+        }
+
+        /// Tests that L3 exceeds L2 requirement.
+        #[test]
+        fn test_policy_requires_l2_accepts_l3() {
+            let attestation = CiAttestation::builder()
+                .level(CiAttestationLevel::L3)
+                .workflow_run_id("run-high-risk-l3")
+                .build()
+                .unwrap();
+
+            let import = CiEvidenceImport::builder()
+                .workflow_run_id("run-high-risk-l3")
+                .webhook_signature_verified(true)
+                .attestation(attestation)
+                .build()
+                .unwrap();
+
+            let result =
+                can_transition_to_ready_for_review(true, Some(&import), CiAttestationLevel::L2);
+            assert!(result.is_ok(), "L3 should exceed L2 requirement");
+        }
+
+        /// Tests error message when L1 doesn't meet L2 requirement.
+        #[test]
+        fn test_error_message_l1_insufficient_for_l2() {
+            let attestation = CiAttestation::builder()
+                .level(CiAttestationLevel::L1)
+                .workflow_run_id("run-err-l2")
+                .build()
+                .unwrap();
+
+            let import = CiEvidenceImport::builder()
+                .workflow_run_id("run-err-l2")
+                .webhook_signature_verified(true)
+                .attestation(attestation)
+                .build()
+                .unwrap();
+
+            let result =
+                can_transition_to_ready_for_review(true, Some(&import), CiAttestationLevel::L2);
+            let err = result.unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("L1 (signed attestation) is insufficient"),
+                "Error should mention L1 is insufficient, got: {msg}"
+            );
+            assert!(
+                msg.contains("L2 (replayable proof)"),
+                "Error should mention L2 is required, got: {msg}"
+            );
+        }
+
+        /// Tests that L0 can be accepted if policy permits (`minimum_level` =
+        /// L0).
+        #[test]
+        fn test_policy_allows_l0_accepts_l0() {
+            let attestation = CiAttestation::builder()
+                .level(CiAttestationLevel::L0)
+                .build()
+                .unwrap();
+
+            let import = CiEvidenceImport::builder()
+                .workflow_run_id("run-permissive")
+                .webhook_signature_verified(true)
+                .attestation(attestation)
+                .build()
+                .unwrap();
+
+            // Permissive policy allows L0
+            let result =
+                can_transition_to_ready_for_review(true, Some(&import), CiAttestationLevel::L0);
+            assert!(result.is_ok(), "L0 should meet L0 requirement");
         }
     }
 }
