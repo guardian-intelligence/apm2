@@ -526,6 +526,8 @@ impl QuarantineProjection {
     pub fn apply(&mut self, event: QuarantineEvent) -> Result<(), QuarantineError> {
         match event {
             QuarantineEvent::PoolQuarantined(e) => {
+                // Validate event fields (DoS protection for direct domain type usage)
+                validate_pool_quarantined(&e)?;
                 // Check resource limits before adding
                 if self.quarantined_pools.len() >= MAX_QUARANTINED_ITEMS
                     && !self.quarantined_pools.contains(&e.pool_id)
@@ -539,6 +541,8 @@ impl QuarantineProjection {
                 self.quarantined_pools.insert(e.pool_id);
             },
             QuarantineEvent::SpecQuarantined(e) => {
+                // Validate event fields (DoS protection for direct domain type usage)
+                validate_spec_quarantined(&e)?;
                 // Check resource limits before adding
                 if self.quarantined_specs.len() >= MAX_QUARANTINED_ITEMS
                     && !self.quarantined_specs.contains(&e.spec_id)
@@ -552,6 +556,8 @@ impl QuarantineProjection {
                 self.quarantined_specs.insert(e.spec_id);
             },
             QuarantineEvent::Cleared(e) => {
+                // Validate event fields (DoS protection for direct domain type usage)
+                validate_cleared(&e)?;
                 // Remove from both sets (target could be either type)
                 self.quarantined_pools.remove(&e.target_id);
                 self.quarantined_specs.remove(&e.target_id);
@@ -1656,5 +1662,111 @@ pub mod tests {
 
         // Canonical bytes should be identical because evidence_refs are sorted
         assert_eq!(event1.canonical_bytes(), event2.canonical_bytes());
+    }
+
+    // =========================================================================
+    // Apply Validation Tests (DoS protection for direct domain type usage)
+    // =========================================================================
+
+    #[test]
+    fn test_apply_rejects_pool_quarantined_with_oversized_pool_id() {
+        let mut projection = QuarantineProjection::new();
+
+        // Create event with oversized pool_id (bypassing proto conversion)
+        let oversized_pool_id = "x".repeat(MAX_STRING_LENGTH + 1);
+        let event = RunnerPoolQuarantined {
+            quarantine_id: "q-001".to_string(),
+            pool_id: oversized_pool_id,
+            reason: "test".to_string(),
+            evidence_refs: vec![],
+            time_envelope_ref: "htf:tick:1".to_string(),
+            issuer_actor_id: "gate".to_string(),
+            issuer_signature: [0u8; 64],
+        };
+
+        let result = projection.apply(QuarantineEvent::PoolQuarantined(event));
+        assert!(matches!(
+            result,
+            Err(QuarantineError::StringTooLong {
+                field: "pool_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_apply_rejects_spec_quarantined_with_oversized_spec_id() {
+        let mut projection = QuarantineProjection::new();
+
+        // Create event with oversized spec_id (bypassing proto conversion)
+        let oversized_spec_id = "x".repeat(MAX_STRING_LENGTH + 1);
+        let event = AATSpecQuarantined {
+            quarantine_id: "q-001".to_string(),
+            spec_id: oversized_spec_id,
+            reason: "test".to_string(),
+            evidence_refs: vec![],
+            time_envelope_ref: "htf:tick:1".to_string(),
+            issuer_actor_id: "gate".to_string(),
+            issuer_signature: [0u8; 64],
+        };
+
+        let result = projection.apply(QuarantineEvent::SpecQuarantined(event));
+        assert!(matches!(
+            result,
+            Err(QuarantineError::StringTooLong {
+                field: "spec_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_apply_rejects_cleared_with_oversized_target_id() {
+        let mut projection = QuarantineProjection::new();
+
+        // Create event with oversized target_id (bypassing proto conversion)
+        let oversized_target_id = "x".repeat(MAX_STRING_LENGTH + 1);
+        let event = QuarantineCleared {
+            quarantine_id: "q-001".to_string(),
+            target_id: oversized_target_id,
+            cleared_at: 1_704_067_200_000,
+            issuer_actor_id: "gate".to_string(),
+            issuer_signature: [0u8; 64],
+        };
+
+        let result = projection.apply(QuarantineEvent::Cleared(event));
+        assert!(matches!(
+            result,
+            Err(QuarantineError::StringTooLong {
+                field: "target_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_apply_rejects_pool_quarantined_with_too_many_evidence_refs() {
+        let mut projection = QuarantineProjection::new();
+
+        // Create event with too many evidence refs (bypassing proto conversion)
+        let many_refs: Vec<String> = (0..=MAX_EVIDENCE_REFS)
+            .map(|i| format!("evidence-{i:04}"))
+            .collect();
+
+        let event = RunnerPoolQuarantined {
+            quarantine_id: "q-001".to_string(),
+            pool_id: "pool-001".to_string(),
+            reason: "test".to_string(),
+            evidence_refs: many_refs,
+            time_envelope_ref: "htf:tick:1".to_string(),
+            issuer_actor_id: "gate".to_string(),
+            issuer_signature: [0u8; 64],
+        };
+
+        let result = projection.apply(QuarantineEvent::PoolQuarantined(event));
+        assert!(matches!(
+            result,
+            Err(QuarantineError::TooManyEvidenceRefs { .. })
+        ));
     }
 }
