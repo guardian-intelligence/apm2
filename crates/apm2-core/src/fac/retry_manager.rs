@@ -259,7 +259,7 @@ mod tests {
 
         // Fill up global episodes with unique gates
         for i in 0..MAX_GLOBAL_EPISODES {
-            let gate = format!("gate-{}", i);
+            let gate = format!("gate-{i}");
             manager.record_attempt(&gate).unwrap();
         }
 
