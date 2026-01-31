@@ -1113,7 +1113,12 @@ impl TryFrom<AatGateReceiptProto> for AatGateReceipt {
             1 => RiskTier::Tier3, // HIGH maps to Tier3
             2 => RiskTier::Tier2, // MED maps to Tier2
             3 => RiskTier::Tier1, // LOW maps to Tier1
-            _ => RiskTier::Tier0,
+            _ => {
+                return Err(AatReceiptError::InvalidEnumValue {
+                    field: "risk_tier",
+                    value: proto.risk_tier,
+                });
+            },
         };
 
         // Convert attestation
