@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use apm2_core::htf::TimeEnvelopeRef;
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
@@ -53,7 +54,8 @@ pub type Hash = [u8; 32];
 /// Episode event emitted during state transitions.
 ///
 /// These events are designed to be persisted to the ledger for audit
-/// and replay.
+/// and replay. Per RFC-0016 (HTF), all episode events include an optional
+/// `time_envelope_ref` for temporal ordering and causality tracking.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum EpisodeEvent {
@@ -65,6 +67,8 @@ pub enum EpisodeEvent {
         envelope_hash: Hash,
         /// Timestamp when created (nanoseconds since epoch).
         created_at_ns: u64,
+        /// Reference to the `TimeEnvelope` for this event (RFC-0016 HTF).
+        time_envelope_ref: Option<TimeEnvelopeRef>,
     },
     /// Episode started running.
     Started {
@@ -76,6 +80,8 @@ pub enum EpisodeEvent {
         lease_id: String,
         /// Timestamp when started (nanoseconds since epoch).
         started_at_ns: u64,
+        /// Reference to the `TimeEnvelope` for this event (RFC-0016 HTF).
+        time_envelope_ref: Option<TimeEnvelopeRef>,
     },
     /// Episode terminated normally.
     Stopped {
@@ -85,6 +91,8 @@ pub enum EpisodeEvent {
         termination_class: TerminationClass,
         /// Timestamp when terminated (nanoseconds since epoch).
         terminated_at_ns: u64,
+        /// Reference to the `TimeEnvelope` for this event (RFC-0016 HTF).
+        time_envelope_ref: Option<TimeEnvelopeRef>,
     },
     /// Episode was quarantined.
     Quarantined {
@@ -94,6 +102,8 @@ pub enum EpisodeEvent {
         reason: QuarantineReason,
         /// Timestamp when quarantined (nanoseconds since epoch).
         quarantined_at_ns: u64,
+        /// Reference to the `TimeEnvelope` for this event (RFC-0016 HTF).
+        time_envelope_ref: Option<TimeEnvelopeRef>,
     },
 }
 
@@ -117,6 +127,25 @@ impl EpisodeEvent {
             Self::Started { .. } => "episode.started",
             Self::Stopped { .. } => "episode.stopped",
             Self::Quarantined { .. } => "episode.quarantined",
+        }
+    }
+
+    /// Returns the time envelope reference for this event (RFC-0016 HTF).
+    #[must_use]
+    pub const fn time_envelope_ref(&self) -> Option<&TimeEnvelopeRef> {
+        match self {
+            Self::Created {
+                time_envelope_ref, ..
+            }
+            | Self::Started {
+                time_envelope_ref, ..
+            }
+            | Self::Stopped {
+                time_envelope_ref, ..
+            }
+            | Self::Quarantined {
+                time_envelope_ref, ..
+            } => time_envelope_ref.as_ref(),
         }
     }
 }
@@ -311,6 +340,7 @@ impl EpisodeRuntime {
                 episode_id: episode_id.clone(),
                 envelope_hash,
                 created_at_ns: timestamp_ns,
+                time_envelope_ref: None, // Set by HolonicClock when available
             })
             .await;
         }
@@ -422,6 +452,7 @@ impl EpisodeRuntime {
                 session_id: handle.session_id().to_string(),
                 lease_id: handle.lease_id().to_string(),
                 started_at_ns: timestamp_ns,
+                time_envelope_ref: None, // Set by HolonicClock when available
             })
             .await;
         }
@@ -512,6 +543,7 @@ impl EpisodeRuntime {
                 episode_id: episode_id.clone(),
                 termination_class,
                 terminated_at_ns: timestamp_ns,
+                time_envelope_ref: None, // Set by HolonicClock when available
             })
             .await;
         }
@@ -602,6 +634,7 @@ impl EpisodeRuntime {
                 episode_id: episode_id.clone(),
                 reason,
                 quarantined_at_ns: timestamp_ns,
+                time_envelope_ref: None, // Set by HolonicClock when available
             })
             .await;
         }
