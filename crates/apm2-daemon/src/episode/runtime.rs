@@ -298,14 +298,32 @@ impl EpisodeRuntime {
 
     /// Stamps a time envelope and returns the reference.
     ///
-    /// If no clock is configured, returns `None`.
-    async fn stamp_envelope(&self, notes: Option<String>) -> Option<TimeEnvelopeRef> {
-        let clock = self.clock.as_ref()?;
+    /// # Returns
+    ///
+    /// - `Ok(Some(ref))` if clock is configured and stamping succeeds
+    /// - `Ok(None)` if no clock is configured
+    /// - `Err(ClockFailure)` if clock is configured but stamping fails
+    ///
+    /// # Security (SEC-CTRL-FAC-0015 Fail-Closed)
+    ///
+    /// This method enforces fail-closed behavior: if a clock is configured but
+    /// fails to stamp, the error is propagated rather than silently returning
+    /// `None`. This ensures events are not emitted without timestamps when
+    /// temporal authority is expected.
+    async fn stamp_envelope(
+        &self,
+        notes: Option<String>,
+    ) -> Result<Option<TimeEnvelopeRef>, EpisodeError> {
+        let Some(clock) = self.clock.as_ref() else {
+            return Ok(None);
+        };
         match clock.stamp_envelope(notes).await {
-            Ok((_, envelope_ref)) => Some(envelope_ref),
+            Ok((_, envelope_ref)) => Ok(Some(envelope_ref)),
             Err(e) => {
                 warn!("failed to stamp time envelope: {e}");
-                None
+                Err(EpisodeError::ClockFailure {
+                    message: e.to_string(),
+                })
             },
         }
     }
@@ -385,9 +403,10 @@ impl EpisodeRuntime {
         // Emit event (INV-ER002)
         if self.config.emit_events {
             // Stamp time envelope for temporal ordering (RFC-0016 HTF)
+            // Per SEC-CTRL-FAC-0015 (Fail-Closed), propagate clock errors
             let time_envelope_ref = self
                 .stamp_envelope(Some(format!("episode.created:{}", episode_id.as_str())))
-                .await;
+                .await?;
             self.emit_event(EpisodeEvent::Created {
                 episode_id: episode_id.clone(),
                 envelope_hash,
@@ -500,9 +519,10 @@ impl EpisodeRuntime {
         // Emit event (INV-ER002)
         if self.config.emit_events {
             // Stamp time envelope for temporal ordering (RFC-0016 HTF)
+            // Per SEC-CTRL-FAC-0015 (Fail-Closed), propagate clock errors
             let time_envelope_ref = self
                 .stamp_envelope(Some(format!("episode.started:{}", episode_id.as_str())))
-                .await;
+                .await?;
             self.emit_event(EpisodeEvent::Started {
                 episode_id: episode_id.clone(),
                 session_id: handle.session_id().to_string(),
@@ -596,9 +616,10 @@ impl EpisodeRuntime {
         // Emit event (INV-ER002)
         if self.config.emit_events {
             // Stamp time envelope for temporal ordering (RFC-0016 HTF)
+            // Per SEC-CTRL-FAC-0015 (Fail-Closed), propagate clock errors
             let time_envelope_ref = self
                 .stamp_envelope(Some(format!("episode.stopped:{}", episode_id.as_str())))
-                .await;
+                .await?;
             self.emit_event(EpisodeEvent::Stopped {
                 episode_id: episode_id.clone(),
                 termination_class,
@@ -691,9 +712,10 @@ impl EpisodeRuntime {
         // Emit event (INV-ER002)
         if self.config.emit_events {
             // Stamp time envelope for temporal ordering (RFC-0016 HTF)
+            // Per SEC-CTRL-FAC-0015 (Fail-Closed), propagate clock errors
             let time_envelope_ref = self
                 .stamp_envelope(Some(format!("episode.quarantined:{}", episode_id.as_str())))
-                .await;
+                .await?;
             self.emit_event(EpisodeEvent::Quarantined {
                 episode_id: episode_id.clone(),
                 reason,

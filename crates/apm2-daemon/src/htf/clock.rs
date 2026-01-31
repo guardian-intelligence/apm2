@@ -110,15 +110,6 @@ pub enum ClockError {
     #[error("HLC is not enabled for this clock")]
     HlcNotEnabled,
 
-    /// Clock profile hash mismatch.
-    #[error("clock profile hash mismatch: expected {expected}, got {actual}")]
-    ProfileHashMismatch {
-        /// Expected hash (hex).
-        expected: String,
-        /// Actual hash (hex).
-        actual: String,
-    },
-
     /// Canonicalization failed.
     #[error("canonicalization failed: {0}")]
     Canonicalization(#[from] CanonicalizationError),
