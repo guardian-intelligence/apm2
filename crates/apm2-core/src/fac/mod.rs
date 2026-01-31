@@ -120,6 +120,7 @@ pub use key_policy::{
 // Re-export lease types
 pub use lease::{
     AatLeaseExtension, GateLease, GateLeaseBuilder, LeaseError, validate_custody_for_aat_lease,
+    validate_custody_for_aat_lease_by_actor,
 };
 // Re-export policy resolution types
 pub use policy_resolution::{

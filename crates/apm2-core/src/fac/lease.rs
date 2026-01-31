@@ -516,6 +516,20 @@ impl GateLease {
             });
         }
 
+        // Validate rcp_profile_id matches (TCK-00225)
+        if ext.rcp_profile_id != receipt.rcp_profile_id {
+            return Err(LeaseError::AatBindingMismatch {
+                field: "rcp_profile_id",
+            });
+        }
+
+        // Validate selection_policy_id matches (TCK-00225)
+        if ext.selection_policy_id != receipt.selection_policy_id {
+            return Err(LeaseError::AatBindingMismatch {
+                field: "selection_policy_id",
+            });
+        }
+
         Ok(())
     }
 }
@@ -525,9 +539,13 @@ impl GateLease {
 // =============================================================================
 
 /// Validates that an AAT lease executor is in a different custody domain than
-/// the changeset author.
+/// the changeset author using key-based validation.
 ///
-/// This function is the primary defense against self-review attacks, where an
+/// **NOTE**: This function uses `executor_key_id` for validation. For
+/// issuance-time validation where you have an `executor_actor_id` from the
+/// lease, use [`validate_custody_for_aat_lease_by_actor`] instead.
+///
+/// This function is a defense against self-review attacks, where an
 /// author could attempt to review their own code changes. By ensuring the
 /// executor (reviewer) is in a different custody domain than the author, we
 /// enforce separation of concerns.
@@ -609,6 +627,129 @@ pub fn validate_custody_for_aat_lease(
     key_policy
         .validate_coi(executor_key_id, author_actor_id)
         .map_err(LeaseError::from)
+}
+
+/// Validates that an AAT lease executor is in a different custody domain than
+/// the changeset author using actor-based validation.
+///
+/// This function is designed for **issuance-time validation** where the lease
+/// binds `executor_actor_id` rather than a key ID. It validates COI based on
+/// comparing the COI groups of both actors.
+///
+/// # Security Notes
+///
+/// - FAIL-CLOSED: If executor or author cannot be found in the policy, the
+///   function returns an error
+/// - Uses constant-time comparison for COI group comparison
+/// - Checks ALL COI groups the author belongs to (prevents multi-binding
+///   bypass)
+/// - Returns error if ANY of the executor's COI groups overlap with ANY of the
+///   author's COI groups
+///
+/// # Arguments
+///
+/// * `key_policy` - The key policy defining custody domains and COI rules
+/// * `executor_actor_id` - The actor ID of the executor (from
+///   `GateLease.executor_actor_id`)
+/// * `author_actor_id` - The actor ID of the changeset author
+///
+/// # Returns
+///
+/// `Ok(())` if the executor is in a different custody domain than the author.
+///
+/// # Errors
+///
+/// Returns [`LeaseError::KeyPolicyError`] wrapping the underlying error if:
+/// - The executor actor is not found in any custody domain
+/// - The author actor is not found in any custody domain
+/// - A COI violation is detected (same or overlapping custody domains)
+///
+/// # Example
+///
+/// ```rust
+/// use apm2_core::fac::{
+///     CustodyDomain, KeyBinding, KeyPolicy, KeyPolicyBuilder,
+///     validate_custody_for_aat_lease_by_actor,
+/// };
+///
+/// let policy = KeyPolicyBuilder::new("policy-001")
+///     .schema_version(1)
+///     .add_custody_domain(CustodyDomain {
+///         domain_id: "dev-team-a".to_string(),
+///         coi_group_id: "coi-group-alpha".to_string(),
+///         key_bindings: vec![KeyBinding {
+///             key_id: "key-alice".to_string(),
+///             actor_id: "alice".to_string(),
+///         }],
+///     })
+///     .add_custody_domain(CustodyDomain {
+///         domain_id: "dev-team-b".to_string(),
+///         coi_group_id: "coi-group-beta".to_string(),
+///         key_bindings: vec![KeyBinding {
+///             key_id: "key-bob".to_string(),
+///             actor_id: "bob".to_string(),
+///         }],
+///     })
+///     .build();
+///
+/// // Bob can review Alice's code (different custody domains)
+/// assert!(
+///     validate_custody_for_aat_lease_by_actor(&policy, "bob", "alice")
+///         .is_ok()
+/// );
+///
+/// // Alice cannot review her own code (same person)
+/// assert!(
+///     validate_custody_for_aat_lease_by_actor(&policy, "alice", "alice")
+///         .is_err()
+/// );
+/// ```
+pub fn validate_custody_for_aat_lease_by_actor(
+    key_policy: &KeyPolicy,
+    executor_actor_id: &str,
+    author_actor_id: &str,
+) -> Result<(), LeaseError> {
+    // Find ALL COI groups for the executor actor
+    let executor_coi_groups = key_policy.get_coi_groups_for_actor(executor_actor_id);
+
+    if executor_coi_groups.is_empty() {
+        return Err(LeaseError::KeyPolicyError(KeyPolicyError::ActorNotFound {
+            actor_id: executor_actor_id.to_string(),
+        }));
+    }
+
+    // Find ALL COI groups for the author actor
+    let author_coi_groups = key_policy.get_coi_groups_for_actor(author_actor_id);
+
+    if author_coi_groups.is_empty() {
+        return Err(LeaseError::KeyPolicyError(KeyPolicyError::ActorNotFound {
+            actor_id: author_actor_id.to_string(),
+        }));
+    }
+
+    // Check for COI violation: executor's groups must not overlap with author's
+    // groups Use constant-time comparison for each group comparison (RSK-1909)
+    for executor_group in &executor_coi_groups {
+        for author_group in &author_coi_groups {
+            let executor_bytes = executor_group.as_bytes();
+            let author_bytes = author_group.as_bytes();
+
+            // Constant-time comparison requires equal-length inputs
+            let is_equal = if executor_bytes.len() == author_bytes.len() {
+                bool::from(executor_bytes.ct_eq(author_bytes))
+            } else {
+                false
+            };
+
+            if is_equal {
+                return Err(LeaseError::CustodyDomainViolation {
+                    domain_id: executor_group.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // =============================================================================
@@ -1349,10 +1490,13 @@ pub mod tests {
         };
         use crate::fac::policy_resolution::{DeterminismClass, RiskTier};
 
-        /// Helper to create a valid AAT gate receipt with the given hashes.
-        fn create_test_receipt(
+        /// Helper to create a valid AAT gate receipt with the given hashes and
+        /// IDs.
+        fn create_test_receipt_with_ids(
             view_commitment_hash: [u8; 32],
             rcp_manifest_hash: [u8; 32],
+            rcp_profile_id: &str,
+            selection_policy_id: &str,
         ) -> AatGateReceipt {
             let terminal_evidence_digest = [0x77; 32];
             let terminal_verifier_outputs_digest = [0x99; 32];
@@ -1366,7 +1510,7 @@ pub mod tests {
             AatGateReceiptBuilder::new()
                 .view_commitment_hash(view_commitment_hash)
                 .rcp_manifest_hash(rcp_manifest_hash)
-                .rcp_profile_id("profile-001")
+                .rcp_profile_id(rcp_profile_id)
                 .policy_hash([0x33; 32])
                 .determinism_class(DeterminismClass::FullyDeterministic)
                 .determinism_status(DeterminismStatus::Stable)
@@ -1387,7 +1531,7 @@ pub mod tests {
                     predicate_satisfied: true,
                 }])
                 .verifier_policy_hash([0xFF; 32])
-                .selection_policy_id("policy-001")
+                .selection_policy_id(selection_policy_id)
                 .risk_tier(RiskTier::Tier1)
                 .attestation(AatAttestation {
                     container_image_digest: [0x01; 32],
@@ -1399,11 +1543,27 @@ pub mod tests {
                 .expect("valid receipt")
         }
 
-        /// Helper to create a test AAT lease with the given hashes.
-        fn create_test_aat_lease(
+        /// Helper to create a valid AAT gate receipt with the given hashes.
+        fn create_test_receipt(
+            view_commitment_hash: [u8; 32],
+            rcp_manifest_hash: [u8; 32],
+        ) -> AatGateReceipt {
+            // Use default IDs that match the lease helper
+            create_test_receipt_with_ids(
+                view_commitment_hash,
+                rcp_manifest_hash,
+                "aat-profile-001",
+                "policy-001",
+            )
+        }
+
+        /// Helper to create a test AAT lease with the given hashes and IDs.
+        fn create_test_aat_lease_with_ids(
             signer: &Signer,
             view_commitment_hash: [u8; 32],
             rcp_manifest_hash: [u8; 32],
+            rcp_profile_id: &str,
+            selection_policy_id: &str,
         ) -> GateLease {
             GateLeaseBuilder::new("lease-001", "work-001", "aat")
                 .changeset_digest([0x42; 32])
@@ -1416,10 +1576,25 @@ pub mod tests {
                 .aat_extension(AatLeaseExtension {
                     view_commitment_hash,
                     rcp_manifest_hash,
-                    rcp_profile_id: "aat-profile-001".to_string(),
-                    selection_policy_id: "policy-001".to_string(),
+                    rcp_profile_id: rcp_profile_id.to_string(),
+                    selection_policy_id: selection_policy_id.to_string(),
                 })
                 .build_and_sign(signer)
+        }
+
+        /// Helper to create a test AAT lease with the given hashes.
+        fn create_test_aat_lease(
+            signer: &Signer,
+            view_commitment_hash: [u8; 32],
+            rcp_manifest_hash: [u8; 32],
+        ) -> GateLease {
+            create_test_aat_lease_with_ids(
+                signer,
+                view_commitment_hash,
+                rcp_manifest_hash,
+                "aat-profile-001",
+                "policy-001",
+            )
         }
 
         #[test]
@@ -1431,7 +1606,111 @@ pub mod tests {
             let lease = create_test_aat_lease(&signer, view_hash, manifest_hash);
             let receipt = create_test_receipt(view_hash, manifest_hash);
 
-            // Matching hashes should pass validation
+            // Matching hashes and IDs should pass validation
+            assert!(lease.validate_aat_binding(&receipt).is_ok());
+        }
+
+        // =====================================================================
+        // Profile and Policy ID Binding Validation Tests (TCK-00225 BLOCKER)
+        // =====================================================================
+
+        #[test]
+        fn test_validate_aat_binding_rcp_profile_id_mismatch() {
+            let signer = Signer::generate();
+            let view_hash = [0x11; 32];
+            let manifest_hash = [0x22; 32];
+
+            // Lease has profile "aat-profile-001"
+            let lease = create_test_aat_lease(&signer, view_hash, manifest_hash);
+
+            // Receipt has different profile "different-profile"
+            let receipt = create_test_receipt_with_ids(
+                view_hash,
+                manifest_hash,
+                "different-profile",
+                "policy-001",
+            );
+
+            let result = lease.validate_aat_binding(&receipt);
+            assert!(matches!(
+                result,
+                Err(LeaseError::AatBindingMismatch {
+                    field: "rcp_profile_id"
+                })
+            ));
+        }
+
+        #[test]
+        fn test_validate_aat_binding_selection_policy_id_mismatch() {
+            let signer = Signer::generate();
+            let view_hash = [0x11; 32];
+            let manifest_hash = [0x22; 32];
+
+            // Lease has selection_policy_id "policy-001"
+            let lease = create_test_aat_lease(&signer, view_hash, manifest_hash);
+
+            // Receipt has different selection_policy_id "different-policy"
+            let receipt = create_test_receipt_with_ids(
+                view_hash,
+                manifest_hash,
+                "aat-profile-001",
+                "different-policy",
+            );
+
+            let result = lease.validate_aat_binding(&receipt);
+            assert!(matches!(
+                result,
+                Err(LeaseError::AatBindingMismatch {
+                    field: "selection_policy_id"
+                })
+            ));
+        }
+
+        #[test]
+        fn test_validate_aat_binding_both_ids_mismatch() {
+            let signer = Signer::generate();
+            let view_hash = [0x11; 32];
+            let manifest_hash = [0x22; 32];
+
+            let lease = create_test_aat_lease(&signer, view_hash, manifest_hash);
+
+            // Both IDs different
+            let receipt = create_test_receipt_with_ids(
+                view_hash,
+                manifest_hash,
+                "different-profile",
+                "different-policy",
+            );
+
+            // Should fail on rcp_profile_id first (checked after hashes)
+            let result = lease.validate_aat_binding(&receipt);
+            assert!(matches!(
+                result,
+                Err(LeaseError::AatBindingMismatch {
+                    field: "rcp_profile_id"
+                })
+            ));
+        }
+
+        #[test]
+        fn test_validate_aat_binding_all_fields_match() {
+            let signer = Signer::generate();
+            let view_hash = [0x11; 32];
+            let manifest_hash = [0x22; 32];
+            let profile_id = "custom-profile";
+            let policy_id = "custom-policy";
+
+            let lease = create_test_aat_lease_with_ids(
+                &signer,
+                view_hash,
+                manifest_hash,
+                profile_id,
+                policy_id,
+            );
+            let receipt =
+                create_test_receipt_with_ids(view_hash, manifest_hash, profile_id, policy_id);
+
+            // All fields match
             assert!(lease.validate_aat_binding(&receipt).is_ok());
         }
 
@@ -1763,6 +2042,245 @@ pub mod tests {
             let result =
                 super::super::validate_custody_for_aat_lease(&policy, "any-key", "any-actor");
             assert!(result.is_err());
+        }
+
+        // =====================================================================
+        // Actor-Based Custody Validation Tests (TCK-00225 MAJOR)
+        // =====================================================================
+
+        #[test]
+        fn test_validate_custody_by_actor_different_domains_ok() {
+            let policy = KeyPolicyBuilder::new("policy-001")
+                .schema_version(1)
+                .add_custody_domain(CustodyDomain {
+                    domain_id: "dev-team-a".to_string(),
+                    coi_group_id: "coi-group-alpha".to_string(),
+                    key_bindings: vec![KeyBinding {
+                        key_id: "key-alice".to_string(),
+                        actor_id: "alice".to_string(),
+                    }],
+                })
+                .add_custody_domain(CustodyDomain {
+                    domain_id: "dev-team-b".to_string(),
+                    coi_group_id: "coi-group-beta".to_string(),
+                    key_bindings: vec![KeyBinding {
+                        key_id: "key-bob".to_string(),
+                        actor_id: "bob".to_string(),
+                    }],
+                })
+                .build();
+
+            // Bob can review Alice's code (different custody domains)
+            let result =
+                super::super::validate_custody_for_aat_lease_by_actor(&policy, "bob", "alice");
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_validate_custody_by_actor_same_domain_rejected() {
+            let policy = KeyPolicyBuilder::new("policy-001")
+                .schema_version(1)
+                .add_custody_domain(CustodyDomain {
+                    domain_id: "dev-team-a".to_string(),
+                    coi_group_id: "coi-group-alpha".to_string(),
+                    key_bindings: vec![
+                        KeyBinding {
+                            key_id: "key-alice".to_string(),
+                            actor_id: "alice".to_string(),
+                        },
+                        KeyBinding {
+                            key_id: "key-charlie".to_string(),
+                            actor_id: "charlie".to_string(),
+                        },
+                    ],
+                })
+                .build();
+
+            // Alice cannot review her own code (self-review)
+            let result =
+                super::super::validate_custody_for_aat_lease_by_actor(&policy, "alice", "alice");
+            assert!(result.is_err());
+
+            // Charlie cannot review Alice's code (same COI group)
+            let result =
+                super::super::validate_custody_for_aat_lease_by_actor(&policy, "charlie", "alice");
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_validate_custody_by_actor_executor_not_found() {
+            let policy = KeyPolicyBuilder::new("policy-001")
+                .schema_version(1)
+                .add_custody_domain(CustodyDomain {
+                    domain_id: "dev-team-a".to_string(),
+                    coi_group_id: "coi-group-alpha".to_string(),
+                    key_bindings: vec![KeyBinding {
+                        key_id: "key-alice".to_string(),
+                        actor_id: "alice".to_string(),
+                    }],
+                })
+                .build();
+
+            // Unknown executor actor should be rejected (FAIL-CLOSED)
+            let result = super::super::validate_custody_for_aat_lease_by_actor(
+                &policy,
+                "unknown-executor",
+                "alice",
+            );
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_validate_custody_by_actor_author_not_found() {
+            let policy = KeyPolicyBuilder::new("policy-001")
+                .schema_version(1)
+                .add_custody_domain(CustodyDomain {
+                    domain_id: "dev-team-a".to_string(),
+                    coi_group_id: "coi-group-alpha".to_string(),
+                    key_bindings: vec![KeyBinding {
+                        key_id: "key-alice".to_string(),
+                        actor_id: "alice".to_string(),
+                    }],
+                })
+                .build();
+
+            // Unknown author actor should be rejected (FAIL-CLOSED)
+            let result = super::super::validate_custody_for_aat_lease_by_actor(
+                &policy,
+                "alice",
+                "unknown-author",
+            );
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_validate_custody_by_actor_multi_group_author_overlap_rejected() {
+            // CRITICAL: Author belongs to groups {A, B}, executor also in group B
+            let policy = KeyPolicyBuilder::new("policy-001")
+                .schema_version(1)
+                .add_custody_domain(CustodyDomain {
+                    domain_id: "dev-team-a".to_string(),
+                    coi_group_id: "coi-group-alpha".to_string(),
+                    key_bindings: vec![KeyBinding {
+                        key_id: "key-alice-alpha".to_string(),
+                        actor_id: "alice".to_string(), // Alice in group alpha
+                    }],
+                })
+                .add_custody_domain(CustodyDomain {
+                    domain_id: "dev-team-b".to_string(),
+                    coi_group_id: "coi-group-beta".to_string(),
+                    key_bindings: vec![
+                        KeyBinding {
+                            key_id: "key-alice-beta".to_string(),
+                            actor_id: "alice".to_string(), // Alice ALSO in group beta
+                        },
+                        KeyBinding {
+                            key_id: "key-bob".to_string(),
+                            actor_id: "bob".to_string(), // Bob in group beta
+                        },
+                    ],
+                })
+                .build();
+
+            // Bob (group-beta) reviewing Alice (groups alpha, beta): REJECTED
+            // because Alice is also in group-beta
+            let result =
+                super::super::validate_custody_for_aat_lease_by_actor(&policy, "bob", "alice");
+            assert!(
+                result.is_err(),
+                "COI bypass via actor in multiple groups should be rejected"
+            );
+        }
+
+        #[test]
+        fn test_validate_custody_by_actor_multi_group_no_overlap_ok() {
+            // Author in groups {A, B}, executor in group C - no overlap
+            let policy = KeyPolicyBuilder::new("policy-001")
+                .schema_version(1)
+                .add_custody_domain(CustodyDomain {
+                    domain_id: "dev-team-a".to_string(),
+                    coi_group_id: "coi-group-alpha".to_string(),
+                    key_bindings: vec![KeyBinding {
+                        key_id: "key-alice-alpha".to_string(),
+                        actor_id: "alice".to_string(),
+                    }],
+                })
+                .add_custody_domain(CustodyDomain {
+                    domain_id: "dev-team-b".to_string(),
+                    coi_group_id: "coi-group-beta".to_string(),
+                    key_bindings: vec![KeyBinding {
+                        key_id: "key-alice-beta".to_string(),
+                        actor_id: "alice".to_string(),
+                    }],
+                })
+                .add_custody_domain(CustodyDomain {
+                    domain_id: "dev-team-c".to_string(),
+                    coi_group_id: "coi-group-gamma".to_string(),
+                    key_bindings: vec![KeyBinding {
+                        key_id: "key-carol".to_string(),
+                        actor_id: "carol".to_string(),
+                    }],
+                })
+                .build();
+
+            // Carol (group-gamma) can review Alice's (groups alpha, beta) code
+            let result =
+                super::super::validate_custody_for_aat_lease_by_actor(&policy, "carol", "alice");
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_validate_custody_by_actor_empty_policy_fails() {
+            let policy = KeyPolicyBuilder::new("policy-001")
+                .schema_version(1)
+                .build();
+
+            // Empty policy should fail for any executor/author (FAIL-CLOSED)
+            let result = super::super::validate_custody_for_aat_lease_by_actor(
+                &policy,
+                "any-actor",
+                "other-actor",
+            );
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_validate_custody_by_actor_executor_multi_group_overlap_rejected() {
+            // CRITICAL: Executor belongs to groups {A, B}, author in group A
+            let policy = KeyPolicyBuilder::new("policy-001")
+                .schema_version(1)
+                .add_custody_domain(CustodyDomain {
+                    domain_id: "dev-team-a".to_string(),
+                    coi_group_id: "coi-group-alpha".to_string(),
+                    key_bindings: vec![
+                        KeyBinding {
+                            key_id: "key-bob-alpha".to_string(),
+                            actor_id: "bob".to_string(), // Bob in group alpha
+                        },
+                        KeyBinding {
+                            key_id: "key-alice".to_string(),
+                            actor_id: "alice".to_string(), // Alice in group alpha
+                        },
+                    ],
+                })
+                .add_custody_domain(CustodyDomain {
+                    domain_id: "dev-team-b".to_string(),
+                    coi_group_id: "coi-group-beta".to_string(),
+                    key_bindings: vec![KeyBinding {
+                        key_id: "key-bob-beta".to_string(),
+                        actor_id: "bob".to_string(), // Bob ALSO in group beta
+                    }],
+                })
+                .build();
+
+            // Bob (groups alpha, beta) reviewing Alice (group alpha): REJECTED
+            // because Bob is also in group alpha
+            let result =
+                super::super::validate_custody_for_aat_lease_by_actor(&policy, "bob", "alice");
+            assert!(
+                result.is_err(),
+                "COI bypass via executor in multiple groups should be rejected"
+            );
         }
     }
 }
