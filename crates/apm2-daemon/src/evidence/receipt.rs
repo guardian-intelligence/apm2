@@ -1090,6 +1090,38 @@ mod tests {
     }
 
     #[test]
+    fn test_canonical_bytes_includes_time_envelope_ref() {
+        let mut receipt_none = make_test_receipt();
+        receipt_none.time_envelope_ref = None;
+
+        let mut receipt_some = make_test_receipt();
+        let ref_bytes = [0x55; 32];
+        receipt_some.time_envelope_ref = Some(TimeEnvelopeRef::new(ref_bytes));
+
+        let bytes_none = receipt_none.canonical_bytes();
+        let bytes_some = receipt_some.canonical_bytes();
+
+        assert_ne!(
+            bytes_none, bytes_some,
+            "canonical bytes must differ when time_envelope_ref is present"
+        );
+
+        // Verify the bytes are included by decoding or checking length
+        assert!(
+            bytes_some.len() > bytes_none.len(),
+            "receipt with envelope ref should be larger"
+        );
+        
+        // Sanity check: ensure we can roundtrip this field if we were to decode
+        // (We don't have a decode_canonical exposed, but we can verify digest difference)
+        assert_ne!(
+            receipt_none.digest(),
+            receipt_some.digest(),
+            "digests must differ"
+        );
+    }
+
+    #[test]
     fn test_signer_identity_canonical_bytes() {
         let identity = SignerIdentity {
             public_key: [0x12; 32],

@@ -992,4 +992,37 @@ mod tests {
         assert_eq!(consumed.bytes_io, 13);
         assert_eq!(consumed.tool_calls, 1);
     }
+
+    #[tokio::test]
+    async fn test_executor_with_clock_stamps_results() {
+        use crate::htf::{ClockConfig, HolonicClock};
+
+        let tracker = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let clock = Arc::new(HolonicClock::new(ClockConfig::default(), None).unwrap());
+        
+        let mut executor = ToolExecutor::new(tracker, cas).with_clock(clock);
+
+        executor
+            .register_handler(Box::new(MockReadHandler::new()))
+            .unwrap();
+
+        let args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("workspace/file.rs"),
+            offset: None,
+            limit: None,
+        });
+
+        let result = executor.execute(&test_context(), &args).await.unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.time_envelope_ref.is_some(),
+            "ToolResult should have time_envelope_ref when clock is configured"
+        );
+        assert!(
+            result.time_envelope.is_some(),
+            "ToolResult should have time_envelope preimage when clock is configured"
+        );
+    }
 }

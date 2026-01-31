@@ -1212,6 +1212,41 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_result_canonical_bytes_includes_time_envelope_ref() {
+        let mut result_none = ToolResult::success(
+            "req-001",
+            b"output".to_vec(),
+            BudgetDelta::single_call(),
+            Duration::from_millis(100),
+            1000,
+        );
+        result_none.time_envelope_ref = None;
+
+        let mut result_some = result_none.clone();
+        let ref_bytes = [0x99; 32];
+        result_some.time_envelope_ref = Some(TimeEnvelopeRef::new(ref_bytes));
+
+        let bytes_none = result_none.canonical_bytes();
+        let bytes_some = result_some.canonical_bytes();
+
+        assert_ne!(
+            bytes_none, bytes_some,
+            "canonical bytes must differ when time_envelope_ref is present"
+        );
+
+        assert!(
+            bytes_some.len() > bytes_none.len(),
+            "result with envelope ref should be larger"
+        );
+
+        assert_ne!(
+            result_none.digest(),
+            result_some.digest(),
+            "digests must differ"
+        );
+    }
+
+    #[test]
     fn test_broker_request_to_capability_request() {
         let request = BrokerToolRequest::new(
             "req-001",
