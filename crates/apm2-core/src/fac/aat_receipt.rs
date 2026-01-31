@@ -65,7 +65,7 @@
 //! ```rust
 //! use apm2_core::fac::{
 //!     AatAttestation, AatGateReceipt, AatGateReceiptBuilder, AatVerdict,
-//!     DeterminismStatus, FlakeClass, RiskTier as AatRiskTier,
+//!     DeterminismClass, DeterminismStatus, FlakeClass, RiskTier as AatRiskTier,
 //!     TerminalVerifierOutput,
 //! };
 //!
@@ -84,7 +84,7 @@
 //!     .rcp_manifest_hash([0x22; 32])
 //!     .rcp_profile_id("profile-001")
 //!     .policy_hash([0x33; 32])
-//!     .determinism_class(2)
+//!     .determinism_class(DeterminismClass::FullyDeterministic)
 //!     .determinism_status(DeterminismStatus::Stable)
 //!     .flake_class(FlakeClass::DeterministicFail)
 //!     .run_count(3)
