@@ -646,5 +646,4 @@ mod tests {
         assert!(!config.ignore_breaker);
         assert_eq!(config.window.as_secs(), 7 * 86400);
     }
-
 }
