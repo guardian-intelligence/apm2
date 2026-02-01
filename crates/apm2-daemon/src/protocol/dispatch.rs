@@ -1535,7 +1535,11 @@ impl PrivilegedDispatcher {
                 }
             }
         }
-        // Default: empty means no `SoD` check (for backward compatibility)
+        // TCK-00258: Return empty for malformed work_ids.
+        // IMPORTANT: This is fail-open for non-GATE_EXECUTOR roles, but the
+        // SpawnEpisode handler enforces fail-closed for GATE_EXECUTOR.
+        // In production, this would query changeset metadata for author list,
+        // then resolve each author's custody domains via KeyPolicy.
         Vec::new()
     }
 
@@ -1983,10 +1987,23 @@ impl PrivilegedDispatcher {
                 .filter_map(|d| CustodyDomainId::new(d.clone()).ok())
                 .collect();
 
-            // Only validate if both executor and author domains are present
-            // Empty author domains means the changeset metadata wasn't available,
-            // so we skip SoD validation (backward compatibility)
-            if !executor_domains.is_empty() && !author_domains.is_empty() {
+            // TCK-00258: Fail-closed SoD validation for GATE_EXECUTOR.
+            // If author domains cannot be resolved (empty), DENY the spawn.
+            // The absence of author information MUST block, not allow, to prevent
+            // attackers from bypassing SoD by using malformed work_ids.
+            if author_domains.is_empty() {
+                warn!(
+                    work_id = %request.work_id,
+                    "SpawnEpisode rejected: cannot resolve author custody domains for SoD validation"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::SodViolation,
+                    "cannot resolve author custody domains; SoD validation requires author information for GATE_EXECUTOR",
+                ));
+            }
+
+            // Validate SoD: executor domains must not overlap with author domains
+            if !executor_domains.is_empty() {
                 if let Err(CustodyDomainError::Overlap {
                     executor_domain,
                     author_domain,
