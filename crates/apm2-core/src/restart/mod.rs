@@ -809,7 +809,7 @@ mod tck_00243 {
         let _ = RestartManager::with_ticks(config, 1000, 0);
     }
 
-    /// SEC-FIX-001: Legacy record_restart prunes old entries to prevent session
+    /// SEC-FIX-001: Legacy `record_restart` prunes old entries to prevent session
     /// lockout.
     #[test]
     #[allow(deprecated)]
@@ -888,22 +888,22 @@ mod tck_00243 {
         let mut manager = RestartManager::new(config);
 
         // Record restart at 1MHz tick rate
-        let tick_1mhz = HtfTick::new(100, 1_000_000);
-        manager.record_restart_at_tick(Some(1), Duration::from_secs(1), tick_1mhz);
+        let initial_tick = HtfTick::new(100, 1_000_000);
+        manager.record_restart_at_tick(Some(1), Duration::from_secs(1), initial_tick);
 
         // Try to check restart at a DIFFERENT tick rate (10MHz)
-        let tick_10mhz = HtfTick::new(200, 10_000_000);
+        let mismatched_rate_tick = HtfTick::new(200, 10_000_000);
 
         // Should fail closed because history has different tick rate than current_tick
         assert!(
-            !manager.should_restart_at_tick(Some(1), &tick_10mhz),
+            !manager.should_restart_at_tick(Some(1), &mismatched_rate_tick),
             "should fail closed when history tick rate differs from current tick rate"
         );
 
         // With matching tick rate, should allow restart
-        let tick_1mhz_later = HtfTick::new(200, 1_000_000);
+        let matching_rate_tick = HtfTick::new(200, 1_000_000);
         assert!(
-            manager.should_restart_at_tick(Some(1), &tick_1mhz_later),
+            manager.should_restart_at_tick(Some(1), &matching_rate_tick),
             "should allow restart when tick rates match"
         );
     }
