@@ -1136,6 +1136,12 @@ impl ContextPackManifestBuilder {
             }
         }
 
+        // TCK-00255: Sort entries by path for deterministic hashing.
+        // This ensures that the same set of entries produces the same hash
+        // regardless of insertion order, which is required for reliable seal
+        // verification.
+        self.entries.sort_by(|a, b| a.path.cmp(&b.path));
+
         // Build path index for O(1) lookups
         let path_index = ContextPackManifest::build_path_index(&self.entries);
 
@@ -2267,5 +2273,101 @@ pub mod tests {
 
         // verify_seal should pass
         assert!(manifest.verify_seal().is_ok());
+    }
+
+    /// TCK-00255: Verify different insertion orders produce the same seal hash.
+    ///
+    /// This is the critical test for deterministic hashing: entries are sorted
+    /// by path before hashing, so insertion order should not affect the result.
+    #[test]
+    fn tck_00255_insertion_order_independence() {
+        // Add entries in order: A, B, C
+        let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/aaa/file.rs", [0x11; 32])
+                    .stable_id("file-a")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/bbb/file.rs", [0x22; 32])
+                    .stable_id("file-b")
+                    .access_level(AccessLevel::ReadWithZoom)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/ccc/file.rs", [0x33; 32])
+                    .stable_id("file-c")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .build();
+
+        // Add entries in order: C, A, B (different order, same entries)
+        let manifest2 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/ccc/file.rs", [0x33; 32])
+                    .stable_id("file-c")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/aaa/file.rs", [0x11; 32])
+                    .stable_id("file-a")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/bbb/file.rs", [0x22; 32])
+                    .stable_id("file-b")
+                    .access_level(AccessLevel::ReadWithZoom)
+                    .build(),
+            )
+            .build();
+
+        // Add entries in order: B, C, A (yet another order)
+        let manifest3 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/bbb/file.rs", [0x22; 32])
+                    .stable_id("file-b")
+                    .access_level(AccessLevel::ReadWithZoom)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/ccc/file.rs", [0x33; 32])
+                    .stable_id("file-c")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/aaa/file.rs", [0x11; 32])
+                    .stable_id("file-a")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .build();
+
+        // All three manifests should produce the same seal hash
+        let seal1 = manifest1.seal().unwrap();
+        let seal2 = manifest2.seal().unwrap();
+        let seal3 = manifest3.seal().unwrap();
+
+        assert_eq!(
+            seal1, seal2,
+            "Different insertion order produced different hash"
+        );
+        assert_eq!(
+            seal2, seal3,
+            "Different insertion order produced different hash"
+        );
+        assert_eq!(
+            seal1, seal3,
+            "Different insertion order produced different hash"
+        );
+
+        // Verify entries are stored in sorted order
+        assert_eq!(manifest1.entries()[0].path(), "/aaa/file.rs");
+        assert_eq!(manifest1.entries()[1].path(), "/bbb/file.rs");
+        assert_eq!(manifest1.entries()[2].path(), "/ccc/file.rs");
     }
 }
