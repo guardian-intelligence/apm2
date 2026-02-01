@@ -481,6 +481,34 @@ impl CoordinationController {
     }
 
     // =========================================================================
+    // Private Helper Methods
+    // =========================================================================
+
+    /// Validates that the provided tick's rate matches the configured budget
+    /// tick rate.
+    ///
+    /// Per TCK-00242: All tick values within a coordination must use the same
+    /// tick rate as the budget to ensure replay-stable duration calculations.
+    /// Using ticks with different rates would cause temporal confusion where
+    /// elapsed time is computed incorrectly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidTickRate`] if the tick rate doesn't
+    /// match the budget's `tick_rate_hz`.
+    const fn validate_tick_rate(&self, tick: &HtfTick) -> ControllerResult<()> {
+        let expected_hz = self.config.budget.tick_rate_hz;
+        let actual_hz = tick.tick_rate_hz();
+        if actual_hz != expected_hz {
+            return Err(ControllerError::InvalidTickRate {
+                expected_hz,
+                actual_hz,
+            });
+        }
+        Ok(())
+    }
+
+    // =========================================================================
     // Lifecycle Methods
     // =========================================================================
 
@@ -501,7 +529,12 @@ impl CoordinationController {
     ///
     /// Returns [`ControllerError::CoordinationAlreadyExists`] if already
     /// started.
+    /// Returns [`ControllerError::InvalidTickRate`] if tick rate doesn't match
+    /// budget.
     pub fn start(&mut self, current_tick: HtfTick, timestamp_ns: u64) -> ControllerResult<String> {
+        // Validate tick rate matches budget (TCK-00242)
+        self.validate_tick_rate(&current_tick)?;
+
         if self.coordination_id.is_some() {
             return Err(ControllerError::CoordinationAlreadyExists {
                 coordination_id: self.coordination_id.clone().unwrap_or_default(),
@@ -761,8 +794,8 @@ impl CoordinationController {
     ///
     /// # Errors
     ///
-    /// Returns an error if the coordination is not running or `session_id`
-    /// doesn't match the active session.
+    /// Returns an error if the coordination is not running, `session_id`
+    /// doesn't match the active session, or tick rate doesn't match budget.
     #[allow(clippy::too_many_lines)]
     pub fn record_session_termination(
         &mut self,
@@ -773,6 +806,9 @@ impl CoordinationController {
         current_tick: HtfTick,
         timestamp_ns: u64,
     ) -> ControllerResult<TerminationResult> {
+        // Validate tick rate matches budget (TCK-00242)
+        self.validate_tick_rate(&current_tick)?;
+
         let coordination_id =
             self.coordination_id
                 .clone()
@@ -1024,13 +1060,17 @@ impl CoordinationController {
     ///
     /// # Errors
     ///
-    /// Returns an error if already in terminal state.
+    /// Returns an error if already in terminal state or tick rate doesn't match
+    /// budget.
     pub fn complete(
         &mut self,
         stop_condition: StopCondition,
         current_tick: HtfTick,
         timestamp_ns: u64,
     ) -> ControllerResult<CoordinationCompleted> {
+        // Validate tick rate matches budget (TCK-00242)
+        self.validate_tick_rate(&current_tick)?;
+
         if self.status.is_terminal() {
             return Err(ControllerError::CoordinationTerminal {
                 coordination_id: self.coordination_id.clone().unwrap_or_default(),
@@ -1096,7 +1136,8 @@ impl CoordinationController {
     ///
     /// # Errors
     ///
-    /// Returns an error if already in terminal state or receipt storage fails.
+    /// Returns an error if already in terminal state, tick rate doesn't match
+    /// budget, or receipt storage fails.
     pub fn complete_with_cas<C: ContentAddressedStore>(
         &mut self,
         cas: &C,
@@ -1104,6 +1145,9 @@ impl CoordinationController {
         current_tick: HtfTick,
         timestamp_ns: u64,
     ) -> ControllerResult<(CoordinationCompleted, Hash, Hash)> {
+        // Validate tick rate matches budget (TCK-00242)
+        self.validate_tick_rate(&current_tick)?;
+
         if self.status.is_terminal() {
             return Err(ControllerError::CoordinationTerminal {
                 coordination_id: self.coordination_id.clone().unwrap_or_default(),
@@ -1181,13 +1225,17 @@ impl CoordinationController {
     ///
     /// # Errors
     ///
-    /// Returns an error if already in terminal state.
+    /// Returns an error if already in terminal state or tick rate doesn't match
+    /// budget.
     pub fn abort(
         &mut self,
         reason: AbortReason,
         current_tick: HtfTick,
         timestamp_ns: u64,
     ) -> ControllerResult<CoordinationAborted> {
+        // Validate tick rate matches budget (TCK-00242)
+        self.validate_tick_rate(&current_tick)?;
+
         if self.status.is_terminal() {
             return Err(ControllerError::CoordinationTerminal {
                 coordination_id: self.coordination_id.clone().unwrap_or_default(),
@@ -3411,5 +3459,165 @@ mod tests {
             completed_event.receipt_hash, canonical_hash,
             "Completion event hash should match returned canonical hash"
         );
+    }
+
+    // =========================================================================
+    // TCK-00242: Tick Rate Validation Tests
+    // =========================================================================
+
+    /// TCK-00242: Start rejects tick with mismatched rate.
+    ///
+    /// Validates that `start()` returns `InvalidTickRate` when the provided
+    /// tick has a different rate than the budget configuration.
+    #[test]
+    fn tck_00242_start_rejects_mismatched_tick_rate() {
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+
+        // Use a different tick rate (1GHz instead of 1MHz)
+        let wrong_rate_tick = HtfTick::new(1000, 1_000_000_000);
+
+        let result = controller.start(wrong_rate_tick, 1_000_000_000);
+
+        assert!(matches!(
+            result,
+            Err(ControllerError::InvalidTickRate {
+                expected_hz: 1_000_000,
+                actual_hz: 1_000_000_000,
+            })
+        ));
+    }
+
+    /// TCK-00242: Complete rejects tick with mismatched rate.
+    ///
+    /// Validates that `complete()` returns `InvalidTickRate` when the provided
+    /// tick has a different rate than the budget configuration.
+    #[test]
+    fn tck_00242_complete_rejects_mismatched_tick_rate() {
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+        controller.start(tick(1000), 1_000_000_000).unwrap();
+
+        // Process one session to make WorkCompleted valid
+        let spawn = controller
+            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn.session_id,
+                "work-1",
+                SessionOutcome::Success,
+                1000,
+                tick(2000),
+                3_000_000_000,
+            )
+            .unwrap();
+
+        // Use a different tick rate for complete
+        let wrong_rate_tick = HtfTick::new(3000, 1_000_000_000);
+
+        let result =
+            controller.complete(StopCondition::WorkCompleted, wrong_rate_tick, 4_000_000_000);
+
+        assert!(matches!(
+            result,
+            Err(ControllerError::InvalidTickRate {
+                expected_hz: 1_000_000,
+                actual_hz: 1_000_000_000,
+            })
+        ));
+    }
+
+    /// TCK-00242: Abort rejects tick with mismatched rate.
+    ///
+    /// Validates that `abort()` returns `InvalidTickRate` when the provided
+    /// tick has a different rate than the budget configuration.
+    #[test]
+    fn tck_00242_abort_rejects_mismatched_tick_rate() {
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+        controller.start(tick(1000), 1_000_000_000).unwrap();
+
+        // Use a different tick rate for abort
+        let wrong_rate_tick = HtfTick::new(2000, 1_000_000_000);
+
+        let result = controller.abort(AbortReason::NoEligibleWork, wrong_rate_tick, 2_000_000_000);
+
+        assert!(matches!(
+            result,
+            Err(ControllerError::InvalidTickRate {
+                expected_hz: 1_000_000,
+                actual_hz: 1_000_000_000,
+            })
+        ));
+    }
+
+    /// TCK-00242: `record_session_termination` rejects tick with mismatched
+    /// rate.
+    ///
+    /// Validates that `record_session_termination()` returns `InvalidTickRate`
+    /// when the provided tick has a different rate than the budget.
+    #[test]
+    fn tck_00242_record_session_termination_rejects_mismatched_tick_rate() {
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+        controller.start(tick(1000), 1_000_000_000).unwrap();
+
+        let spawn = controller
+            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .unwrap();
+
+        // Use a different tick rate for termination
+        let wrong_rate_tick = HtfTick::new(2000, 1_000_000_000);
+
+        let result = controller.record_session_termination(
+            &spawn.session_id,
+            "work-1",
+            SessionOutcome::Success,
+            1000,
+            wrong_rate_tick,
+            3_000_000_000,
+        );
+
+        assert!(matches!(
+            result,
+            Err(ControllerError::InvalidTickRate {
+                expected_hz: 1_000_000,
+                actual_hz: 1_000_000_000,
+            })
+        ));
+    }
+
+    /// TCK-00242: Correct tick rate is accepted throughout coordination.
+    ///
+    /// Validates that all methods accept ticks with the correct rate.
+    #[test]
+    fn tck_00242_correct_tick_rate_accepted() {
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+
+        // All operations should succeed with correct tick rate
+        controller.start(tick(1000), 1_000_000_000).unwrap();
+
+        let spawn = controller
+            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .unwrap();
+
+        controller
+            .record_session_termination(
+                &spawn.session_id,
+                "work-1",
+                SessionOutcome::Success,
+                1000,
+                tick(2000),
+                3_000_000_000,
+            )
+            .unwrap();
+
+        controller
+            .complete(StopCondition::WorkCompleted, tick(3000), 4_000_000_000)
+            .unwrap();
+
+        assert!(controller.is_terminal());
     }
 }

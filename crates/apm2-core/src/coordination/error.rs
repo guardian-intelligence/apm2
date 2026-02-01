@@ -147,6 +147,21 @@ pub enum ControllerError {
         /// Description of the error.
         message: String,
     },
+
+    /// Tick rate mismatch.
+    ///
+    /// The provided `HtfTick` has a different tick rate than the configured
+    /// budget. This would cause temporal confusion where duration calculations
+    /// produce incorrect results.
+    ///
+    /// Per TCK-00242: All tick values within a coordination must use the same
+    /// tick rate as the budget for replay-stable duration tracking.
+    InvalidTickRate {
+        /// The expected tick rate from the budget configuration.
+        expected_hz: u64,
+        /// The actual tick rate from the provided `HtfTick`.
+        actual_hz: u64,
+    },
 }
 
 impl fmt::Display for ControllerError {
@@ -210,6 +225,15 @@ impl fmt::Display for ControllerError {
             },
             Self::Internal { message } => {
                 write!(f, "internal error: {message}")
+            },
+            Self::InvalidTickRate {
+                expected_hz,
+                actual_hz,
+            } => {
+                write!(
+                    f,
+                    "tick rate mismatch: expected {expected_hz} Hz, got {actual_hz} Hz"
+                )
             },
         }
     }
@@ -311,6 +335,13 @@ mod tests {
                     message: "unexpected state".to_string(),
                 },
                 "internal error: unexpected state",
+            ),
+            (
+                ControllerError::InvalidTickRate {
+                    expected_hz: 1_000_000,
+                    actual_hz: 1_000_000_000,
+                },
+                "tick rate mismatch: expected 1000000 Hz, got 1000000000 Hz",
             ),
         ];
 

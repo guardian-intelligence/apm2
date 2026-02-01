@@ -580,14 +580,23 @@ impl BudgetUsage {
     ///
     /// # Panics
     ///
-    /// This function does not panic. If `current_tick < start_tick`, elapsed
-    /// saturates to 0 (defensive handling per RSK-2504).
-    pub const fn update_elapsed_ticks(
-        &mut self,
-        start_tick: u64,
-        current_tick: u64,
-        tick_rate_hz: u64,
-    ) {
+    /// Panics if `tick_rate_hz` differs from the previously set rate (when
+    /// `self.tick_rate_hz > 0`). This prevents temporal confusion where
+    /// `elapsed_ticks` would become semantically invalid due to rate changes.
+    ///
+    /// If `current_tick < start_tick`, elapsed saturates to 0 (defensive
+    /// handling per RSK-2504).
+    pub fn update_elapsed_ticks(&mut self, start_tick: u64, current_tick: u64, tick_rate_hz: u64) {
+        // Enforce rate immutability once initialized (TCK-00242)
+        // A rate of 0 indicates uninitialized state (from Default or new())
+        assert!(
+            self.tick_rate_hz == 0 || self.tick_rate_hz == tick_rate_hz,
+            "BudgetUsage tick rate mismatch: initialized with {} Hz, attempted update with {} Hz. \
+             Tick rate must remain constant throughout coordination to ensure elapsed_ticks semantics.",
+            self.tick_rate_hz,
+            tick_rate_hz
+        );
+
         self.elapsed_ticks = current_tick.saturating_sub(start_tick);
         self.tick_rate_hz = tick_rate_hz;
     }
@@ -2263,5 +2272,72 @@ mod tests {
             usage.remaining_tokens(&budget),
             restored.remaining_tokens(&budget)
         );
+    }
+
+    // =========================================================================
+    // TCK-00242: BudgetUsage Tick Rate Validation Tests
+    // =========================================================================
+
+    /// TCK-00242: `BudgetUsage` allows first tick rate assignment.
+    ///
+    /// When `tick_rate_hz` is 0 (default/uninitialized), any rate can be set.
+    #[test]
+    fn tck_00242_budget_usage_allows_first_tick_rate() {
+        let mut usage = BudgetUsage::new();
+        assert_eq!(usage.tick_rate_hz, 0);
+
+        // First assignment should work
+        usage.update_elapsed_ticks(0, 1000, 1_000_000);
+
+        assert_eq!(usage.elapsed_ticks, 1000);
+        assert_eq!(usage.tick_rate_hz, 1_000_000);
+    }
+
+    /// TCK-00242: `BudgetUsage` allows same tick rate on subsequent updates.
+    ///
+    /// When the same rate is used, updates should succeed.
+    #[test]
+    fn tck_00242_budget_usage_allows_same_tick_rate() {
+        let mut usage = BudgetUsage::with_tick_rate(1_000_000);
+
+        // First update
+        usage.update_elapsed_ticks(0, 1000, 1_000_000);
+        assert_eq!(usage.elapsed_ticks, 1000);
+
+        // Second update with same rate should work
+        usage.update_elapsed_ticks(0, 2000, 1_000_000);
+        assert_eq!(usage.elapsed_ticks, 2000);
+    }
+
+    /// TCK-00242: `BudgetUsage` panics on tick rate mismatch.
+    ///
+    /// Once initialized with a non-zero rate, attempting to use a different
+    /// rate should panic to prevent temporal confusion.
+    #[test]
+    #[should_panic(expected = "BudgetUsage tick rate mismatch")]
+    fn tck_00242_budget_usage_panics_on_rate_mismatch() {
+        let mut usage = BudgetUsage::with_tick_rate(1_000_000);
+
+        // First update with correct rate
+        usage.update_elapsed_ticks(0, 1000, 1_000_000);
+
+        // Second update with different rate should panic
+        usage.update_elapsed_ticks(0, 2000, 1_000_000_000);
+    }
+
+    /// TCK-00242: `BudgetUsage` from Default still allows rate assignment.
+    ///
+    /// Default-constructed `BudgetUsage` has `tick_rate_hz` = 0, allowing
+    /// first-time assignment.
+    #[test]
+    fn tck_00242_budget_usage_default_allows_rate_assignment() {
+        let mut usage = BudgetUsage::default();
+        assert_eq!(usage.tick_rate_hz, 0);
+
+        // Should be able to set rate
+        usage.update_elapsed_ticks(100, 500, 1_000_000);
+
+        assert_eq!(usage.elapsed_ticks, 400);
+        assert_eq!(usage.tick_rate_hz, 1_000_000);
     }
 }
