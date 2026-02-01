@@ -2160,11 +2160,11 @@ mod unit_tests {
     }
 
     /// TCK-00243: Tests that tick-based quarantine restarts fail closed until
-    /// proper tick resolution (TCK-00240 HolonicClock) is available.
+    /// proper tick resolution (TCK-00240 `HolonicClock`) is available.
     ///
     /// SECURITY FIX: Wall-clock to tick approximation is fundamentally broken
     /// due to epoch mismatch (Unix epoch vs boot-relative ticks). Until we can
-    /// properly resolve the authoritative tick from time_envelope_ref, all
+    /// properly resolve the authoritative tick from `time_envelope_ref`, all
     /// tick-based quarantine restarts must fail closed.
     #[test]
     fn tck_00243_quarantine_expiry_tick_based_fails_closed_until_tick_resolution() {
@@ -2229,7 +2229,7 @@ mod unit_tests {
     /// TCK-00243: Tests that tick-based quarantine restarts fail closed even
     /// when the wall-clock time suggests expiry has passed.
     ///
-    /// SECURITY FIX: Until TCK-00240 (HolonicClock) provides proper tick
+    /// SECURITY FIX: Until TCK-00240 (`HolonicClock`) provides proper tick
     /// resolution, we cannot verify tick-based quarantine expiry securely.
     /// This test ensures we fail closed regardless of wall-clock time.
     #[test]
