@@ -281,28 +281,39 @@ impl WorkRegistry for StubWorkRegistry {
 ///
 /// Per DD-001 and the proto definition, the `actor_id` in the request is a
 /// "display hint" only. The authoritative `actor_id` is derived from the
-/// credential. This implementation uses a fingerprint of the UID and PID
-/// to create a stable identifier.
+/// credential. This implementation uses a fingerprint of the UID and GID
+/// to create a **stable** identifier that does not change per request.
+///
+/// # Stability
+///
+/// The actor ID is derived ONLY from stable credential fields (UID, GID).
+/// It intentionally excludes:
+/// - PID: Changes per process
+/// - Nonce: Changes per request
+///
+/// This ensures the same user always maps to the same `actor_id`.
 ///
 /// # Arguments
 ///
 /// * `credentials` - The peer credentials from `SO_PEERCRED`
-/// * `nonce` - The nonce from the request (used for additional binding)
 ///
 /// # Returns
 ///
 /// A stable actor ID string derived from the credential.
+///
+/// # TODO
+///
+/// - TCK-00253: `credential_signature` field is currently ignored. Integration
+///   with credential verification infrastructure will allow deriving `actor_id`
+///   from cryptographic identity rather than Unix UID/GID.
 #[must_use]
-pub fn derive_actor_id(credentials: &PeerCredentials, nonce: &[u8]) -> String {
-    // Create a fingerprint from UID, GID, and the nonce
-    // This provides a stable identifier that is bound to the credential
+pub fn derive_actor_id(credentials: &PeerCredentials) -> String {
+    // Create a fingerprint from UID and GID only (stable across requests)
+    // Per code quality review: exclude PID (changes per process) and nonce (changes
+    // per request)
     let mut hasher = blake3::Hasher::new();
     hasher.update(&credentials.uid.to_le_bytes());
     hasher.update(&credentials.gid.to_le_bytes());
-    if let Some(pid) = credentials.pid {
-        hasher.update(&pid.to_le_bytes());
-    }
-    hasher.update(nonce);
 
     let hash = hasher.finalize();
     let hash_bytes = hash.as_bytes();
@@ -323,49 +334,24 @@ pub fn derive_actor_id(credentials: &PeerCredentials, nonce: &[u8]) -> String {
 
 /// Generates a unique work ID.
 ///
-/// Uses a combination of timestamp and random bytes for uniqueness.
+/// Uses UUID v4 for uniqueness per RFC-0016 (Hybrid Time Framework compliance).
+/// HTF prohibits `SystemTime::now()` to ensure deterministic replay.
 #[must_use]
 pub fn generate_work_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-
-    // Generate 8 random bytes for uniqueness
-    let random_bytes: [u8; 8] = rand::random();
-    let random_hex = random_bytes
-        .iter()
-        .fold(String::with_capacity(16), |mut acc, b| {
-            use std::fmt::Write;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        });
-
-    format!("W-{timestamp:016x}-{random_hex}")
+    // RFC-0016 HTF compliance: Use UUID v4 instead of SystemTime::now()
+    let uuid = uuid::Uuid::new_v4();
+    format!("W-{uuid}")
 }
 
 /// Generates a unique lease ID.
+///
+/// Uses UUID v4 for uniqueness per RFC-0016 (Hybrid Time Framework compliance).
+/// HTF prohibits `SystemTime::now()` to ensure deterministic replay.
 #[must_use]
 pub fn generate_lease_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-
-    let random_bytes: [u8; 8] = rand::random();
-    let random_hex = random_bytes
-        .iter()
-        .fold(String::with_capacity(16), |mut acc, b| {
-            use std::fmt::Write;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        });
-
-    format!("L-{timestamp:016x}-{random_hex}")
+    // RFC-0016 HTF compliance: Use UUID v4 instead of SystemTime::now()
+    let uuid = uuid::Uuid::new_v4();
+    format!("L-{uuid}")
 }
 
 // ============================================================================
@@ -741,7 +727,7 @@ impl PrivilegedDispatcher {
                 reason: "peer credentials required for work claim".to_string(),
             })?;
 
-        let actor_id = derive_actor_id(peer_creds, &request.nonce);
+        let actor_id = derive_actor_id(peer_creds);
 
         debug!(
             actor_id_hint = %request.actor_id,
@@ -788,6 +774,12 @@ impl PrivilegedDispatcher {
                 reason: format!("work registration failed: {e}"),
             }
         })?;
+
+        // TODO(TCK-00253): Emit signed WorkClaimed event to ledger.
+        // This is pending ledger infrastructure integration. The event should:
+        // - Be signed with the daemon's signing key
+        // - Include work_id, lease_id, actor_id, role, and policy_resolved_ref
+        // - Be persisted to the append-only ledger for audit trail
 
         // Return the work assignment
         Ok(PrivilegedResponse::ClaimWork(ClaimWorkResponse {
@@ -1405,32 +1397,34 @@ mod tests {
 
         /// ADV-005: Actor ID must be derived from credential, not user input.
         ///
-        /// This test verifies that different user-provided `actor_ids` with
-        /// the same credential produce the same derived `actor_id`.
+        /// This test verifies that:
+        /// 1. Different user-provided `actor_ids` with the same credential
+        ///    produce the same derived `actor_id`
+        /// 2. Different nonces do NOT affect the derived `actor_id` (stable
+        ///    identity)
         #[test]
         fn test_actor_id_derived_from_credential_not_user_input() {
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = make_privileged_ctx();
 
-            // Same nonce but different user-provided actor_id
-            let nonce = vec![1, 2, 3, 4, 5, 6, 7, 8];
-
-            // Request 1: User provides "alice"
+            // Request 1: User provides "alice" with nonce A
             let request1 = ClaimWorkRequest {
                 actor_id: "alice".to_string(),
                 role: WorkRole::Implementer.into(),
                 credential_signature: vec![],
-                nonce: nonce.clone(),
+                nonce: vec![1, 2, 3, 4, 5, 6, 7, 8],
             };
             let frame1 = encode_claim_work_request(&request1);
             let response1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
 
-            // Request 2: User provides "bob" (different from alice)
+            // Request 2: User provides "bob" with different nonce B
+            // Per stable actor_id design: same credential = same actor_id regardless of
+            // nonce
             let request2 = ClaimWorkRequest {
                 actor_id: "bob".to_string(),
                 role: WorkRole::Implementer.into(),
                 credential_signature: vec![],
-                nonce,
+                nonce: vec![9, 9, 9, 9], // Different nonce - should NOT change actor_id
             };
             let frame2 = encode_claim_work_request(&request2);
             let response2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
@@ -1447,24 +1441,30 @@ mod tests {
             assert_ne!(resp1.work_id, resp2.work_id);
 
             // But the derived actor_id should be the same since credentials are the same
-            // We verify this by checking the work registry
+            // This is the key ADV-005 invariant: user input (actor_id, nonce) does NOT
+            // affect the derived actor_id - only the Unix credential (UID, GID)
+            // matters.
             let claim1 = dispatcher.work_registry.get_claim(&resp1.work_id);
             let claim2 = dispatcher.work_registry.get_claim(&resp2.work_id);
 
             assert!(claim1.is_some(), "Work claim 1 should be registered");
             assert!(claim2.is_some(), "Work claim 2 should be registered");
 
-            // Same credential + same nonce = same derived actor_id
+            // Same credential = same derived actor_id (stable identity)
             assert_eq!(
                 claim1.unwrap().actor_id,
                 claim2.unwrap().actor_id,
-                "Derived actor_id should be the same for same credential + nonce"
+                "Derived actor_id should be the same for same credential (nonce is ignored)"
             );
         }
 
-        /// Different nonces should produce different `actor_ids`.
+        /// Same credential always produces the same `actor_id` (stable identity).
+        ///
+        /// This is the inverse test of what was previously tested - we now
+        /// verify that nonces do NOT produce different `actor_ids` (which
+        /// was the bug).
         #[test]
-        fn test_different_nonce_produces_different_actor_id() {
+        fn test_same_credential_produces_same_actor_id_regardless_of_nonce() {
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = make_privileged_ctx();
 
@@ -1481,7 +1481,7 @@ mod tests {
                 actor_id: "test".to_string(),
                 role: WorkRole::Implementer.into(),
                 credential_signature: vec![],
-                nonce: vec![2, 2, 2, 2], // Different nonce
+                nonce: vec![2, 2, 2, 2], // Different nonce - should NOT change actor_id
             };
             let frame2 = encode_claim_work_request(&request2);
             let response2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
@@ -1496,10 +1496,10 @@ mod tests {
             let claim1 = dispatcher.work_registry.get_claim(&resp1.work_id).unwrap();
             let claim2 = dispatcher.work_registry.get_claim(&resp2.work_id).unwrap();
 
-            // Different nonces should produce different actor_ids
-            assert_ne!(
+            // Same credential = same actor_id (stable identity per code quality fix)
+            assert_eq!(
                 claim1.actor_id, claim2.actor_id,
-                "Different nonces should produce different actor_ids"
+                "Same credential should produce same actor_id regardless of nonce"
             );
         }
 
@@ -1601,6 +1601,11 @@ mod tests {
         }
 
         /// Test `derive_actor_id` function directly.
+        ///
+        /// Verifies that `actor_id` derivation is:
+        /// 1. Deterministic (same credential = same output)
+        /// 2. Independent of PID (different PIDs with same UID/GID = same
+        ///    output)
         #[test]
         fn test_derive_actor_id_deterministic() {
             let creds = PeerCredentials {
@@ -1608,15 +1613,43 @@ mod tests {
                 gid: 1000,
                 pid: Some(12345),
             };
-            let nonce = vec![1, 2, 3, 4];
 
-            let actor1 = derive_actor_id(&creds, &nonce);
-            let actor2 = derive_actor_id(&creds, &nonce);
+            let actor1 = derive_actor_id(&creds);
+            let actor2 = derive_actor_id(&creds);
 
-            assert_eq!(actor1, actor2, "Same inputs should produce same actor_id");
+            assert_eq!(
+                actor1, actor2,
+                "Same credential should produce same actor_id"
+            );
             assert!(
                 actor1.starts_with("actor:"),
                 "Actor ID should have 'actor:' prefix"
+            );
+
+            // Different PID should NOT change actor_id (stable identity)
+            let creds_different_pid = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(99999), // Different PID
+            };
+
+            let actor3 = derive_actor_id(&creds_different_pid);
+            assert_eq!(
+                actor1, actor3,
+                "Different PID should NOT change actor_id (only UID/GID matter)"
+            );
+
+            // Different UID/GID SHOULD change actor_id
+            let creds_different_user = PeerCredentials {
+                uid: 2000, // Different UID
+                gid: 1000,
+                pid: Some(12345),
+            };
+
+            let actor4 = derive_actor_id(&creds_different_user);
+            assert_ne!(
+                actor1, actor4,
+                "Different UID should produce different actor_id"
             );
         }
 
