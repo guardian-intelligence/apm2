@@ -23,6 +23,7 @@ rfc_rollout_and_ops:
         guardrails:
           - "Unauthorized subscribe attempts return PERMISSION_DENIED."
           - "Pulse size and queue caps enforced."
+          - "Projection-only posture enforced; xtask direct GitHub status writes disabled or routed via daemon (TCK-00309)."
         rollback_steps:
           - "Disable operator subscriptions; revert to Phase 1A shadow emit."
         evidence_ids:

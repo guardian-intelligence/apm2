@@ -35,7 +35,7 @@ rfc_risks_and_open_questions:
       likelihood: "MEDIUM"
       mitigations:
         - "HEF explicitly forbids using GitHub status or pulses as authority."
-        - "Rollout gates require projection-only posture validation."
+        - "TCK-00309 removes or routes direct GitHub status writes through daemon projection logic."
       evidence_ids:
         - "EVID-HEF-0001"
   open_questions:

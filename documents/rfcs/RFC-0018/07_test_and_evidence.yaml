@@ -12,7 +12,7 @@ rfc_test_and_evidence:
           - "EVID-HEF-0007"
       - id: "UT-HEF-0002"
         name: "PulseEnvelope bounded decode"
-        scope: "Unknown-field rejection, size caps"
+        scope: "Unknown-field rejection, size caps, allocation-bomb resistance"
         coverage_target: ">90%"
         framework: "cargo test"
         evidence_ids:
@@ -32,7 +32,7 @@ rfc_test_and_evidence:
           - "EVID-HEF-0006"
       - id: "IT-HEF-0003"
         name: "Backpressure + drop policy"
-        scope: "Queue caps, drop ordering"
+        scope: "Queue caps, subscription explosion handling, rate-limit enforcement, drop ordering"
         test_environment: "Local daemon under load"
         evidence_ids:
           - "EVID-HEF-0007"

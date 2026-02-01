@@ -3,7 +3,7 @@ rfc_evidence_artifact:
   template_version: "2026-01-23"
   id: "EVID-HEF-0007"
   category: "INTEGRATION_TEST_RESULTS"
-  title: "HEF resource governance and backpressure"
+  title: "HEF resource governance, subscription explosion, and backpressure"
   capture:
     paths:
       - "evidence/rfc/RFC-0018/governance/"

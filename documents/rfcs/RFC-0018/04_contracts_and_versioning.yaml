@@ -31,15 +31,20 @@ rfc_contracts_and_versioning:
 
   pulse_protocol_additions:
     proto_file: "proto/apm2d_runtime_v1.proto"
+    tag_allocation_policy:
+      - "Tag numbers are provisional until a collision audit passes."
+      - "Reserve a contiguous HEF tag range in apm2d_runtime_v1.proto."
+      - "Do not ship until the tag map is collision-free across all sockets."
     message_tags:
+      status: "PROVISIONAL"
       session_socket:
-        - "5 = SubscribePulseRequest"
-        - "6 = UnsubscribePulseRequest"
-        - "7 = PulseEvent (server -> client only)"
+        - "TBD (HEF reserved range) = SubscribePulseRequest"
+        - "TBD (HEF reserved range) = UnsubscribePulseRequest"
+        - "TBD (HEF reserved range) = PulseEvent (server -> client only)"
       operator_socket:
-        - "5 = SubscribePulseRequest"
-        - "6 = UnsubscribePulseRequest"
-        - "7 = PulseEvent (server -> client only)"
+        - "TBD (HEF reserved range) = SubscribePulseRequest"
+        - "TBD (HEF reserved range) = UnsubscribePulseRequest"
+        - "TBD (HEF reserved range) = PulseEvent (server -> client only)"
     messages:
       - name: "PulseEnvelopeV1"
         description: "Lossy hint derived from committed ledger+CAS artifacts."

@@ -26,6 +26,7 @@ rfc_ticket_decomposition:
       acceptance_criteria:
         - "PulseEnvelopeV1 fields are bounded and unknown fields are rejected."
         - "Subscribe/Unsubscribe tags reserved for both session and operator sockets."
+        - "Verified tag map has no collisions; apm2d_runtime_v1.proto reserves a HEF tag range."
       evidence_ids:
         - "EVID-HEF-0003"
 
@@ -103,7 +104,9 @@ rfc_ticket_decomposition:
       summary: |
         Implement a daemon-owned outbox populated only after ledger commit.
         Pulse publisher drains outbox, applies ACL filtering, and emits
-        PulseEvent frames. Enforce CAS->ledger->pulse ordering.
+        PulseEvent frames. Enforce CAS->ledger->pulse ordering. apm2-core
+        exposes only a post-commit notification interface; outbox storage stays
+        in the daemon.
       files_to_modify:
         - "crates/apm2-core/src/ledger/ (post-commit hook/outbox integration)"
         - "crates/apm2-daemon/src/protocol/ (pulse publisher + fanout)"
@@ -111,6 +114,7 @@ rfc_ticket_decomposition:
         - "crates/apm2-daemon/src/protocol/pulse_outbox.rs (post-commit queue)"
       acceptance_criteria:
         - "Pulse is emitted only after ledger append succeeds."
+        - "apm2-core has no daemon dependency; outbox state is daemon-owned."
       evidence_ids:
         - "EVID-HEF-0006"
 
@@ -197,7 +201,8 @@ rfc_ticket_decomposition:
       risk_tier: "T3"
       summary: |
         Implement red-team tests: pulse-only admission attempt, unauthorized
-        subscribe/publish, downgrade attempts, oversize frames, replay/reorder/
+        subscribe/publish, downgrade attempts, oversize frames/allocation bomb,
+        subscription explosion + rate-limit enforcement, replay/reorder/
         duplication handling, and pulse loss recovery via ledger catch-up.
       files_to_modify:
         - "crates/apm2-daemon/tests/ (add HEF integration + adversarial tests)"
@@ -213,3 +218,23 @@ rfc_ticket_decomposition:
         - "EVID-HEF-0005"
         - "EVID-HEF-0006"
         - "EVID-HEF-0007"
+
+    - ticket_id: "TCK-00309"
+      title: "HEF: Close xtask/GitHub status bypass surface"
+      requirement_ids:
+        - "REQ-HEF-0001"
+      depends_on: []
+      risk_tier: "T2"
+      summary: |
+        Disable direct gh api /statuses writes for FAC-adjacent signals in xtask,
+        or route them through daemon projection-only logic. Ensure HEF rollout
+        does not depend on GitHub as a truth source.
+      files_to_modify:
+        - "xtask/src/tasks/aat.rs (remove or gate direct status writes)"
+        - "xtask/src/tasks/push.rs (remove or gate direct status writes)"
+        - "xtask/src/tasks/review.rs (remove or gate direct status writes)"
+      files_to_create: []
+      acceptance_criteria:
+        - "FAC-adjacent status updates are emitted only via daemon projection logic or disabled."
+      evidence_ids:
+        - "EVID-HEF-0001"

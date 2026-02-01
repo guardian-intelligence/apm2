@@ -19,6 +19,24 @@ rfc_design_decisions:
       - "gate topics MUST include changeset_digest and gate_id"
       - "topics are ASCII, dot-delimited, length-bounded; wildcard grammar is tightly constrained (no regex)"
 
+  control_loop_consumers:
+    statement: |
+      Scheduler/reducer/CLI/UI are consumers only. Pulses are wakeups; correctness
+      requires ledger cursor catch-up and CAS verification. No pulse may advance
+      admission, gating, or lease state without ledger verification.
+    roles:
+      - name: "Scheduler/Reducer"
+        invariants:
+          - "Treat pulses as wakeups only; always read ledger from cursor."
+          - "Never advance admission/gating/leases without ledger verification."
+      - name: "CLI/UI/Operators"
+        invariants:
+          - "UI refresh triggered by pulse must render from ledger/CAS state."
+          - "Never display pulse payload as authoritative status."
+      - name: "Automation/Watchers"
+        invariants:
+          - "Use pulses to trigger fetch; persist decisions only after ledger verification."
+
   truth_plane_preconditions:
     description: |
       Truth-Plane Preconditions define the minimal ledger/CAS artifacts that must
@@ -271,7 +289,7 @@ rfc_design_decisions:
       title: "Default-deny subscription ACLs and daemon-only publish"
       statement: |
         Operator connections may subscribe broadly; session connections are
-        restricted to their own episode.<episode_id>.* and work.<work_id>.events
+        restricted to their own episode.<episode_id>.{lifecycle,tool,io} and work.<work_id>.events
         topics by default. Capability manifests may further restrict (never
         broaden) session subscriptions. Sessions never publish pulse topics;
         daemon-only publish from outbox after ledger commit.
@@ -344,9 +362,11 @@ rfc_design_decisions:
       title: "Outbox invariant + HTF semantics"
       statement: |
         Pulse emission order is: CAS persist -> ledger commit -> outbox enqueue
-        -> pulse publish. Ordering is authoritative by LedgerTime (cursor/seq);
-        expiry and backoff windows use MonotonicTicks; HLC is advisory only; wall
-        time is observational.
+        -> pulse publish. Outbox storage and fanout live in the daemon; apm2-core
+        exposes only a post-commit notification interface and must not depend on
+        daemon types. Ordering is authoritative by LedgerTime (cursor/seq); expiry
+        and backoff windows use MonotonicTicks; HLC is advisory only; wall time is
+        observational.
       context: |
         Pulses must never outrun authoritative truth and must respect HTF.
       alternatives:
@@ -383,3 +403,27 @@ rfc_design_decisions:
         - "REQ-HEF-0008"
       evidence_ids:
         - "EVID-HEF-0003"
+
+    - id: "DD-HEF-0009"
+      title: "Control-loop consumers treat pulses as wakeups only"
+      statement: |
+        Scheduler/reducer/CLI/UI must treat pulses as wakeups only. Consumers
+        reconcile correctness by reading the ledger from cursor and verifying CAS
+        references. No pulse may advance admission, gating, or lease state without
+        ledger verification.
+      context: |
+        HEF accelerates UX but cannot change authority semantics. Explicitly
+        constraining consumers prevents accidental pulse-as-authority drift.
+      alternatives:
+        - id: "ALT-HEF-0009-A"
+          name: "Allow consumers to treat pulses as authoritative hints"
+          pros: ["Lower latency"]
+          cons: ["Violates FAC truth model; enables spoofed admission"]
+          security_tradeoffs: ["Admission bypass risk"]
+          operability_tradeoffs: ["Harder reconciliation"]
+      chosen_rationale: "Keeps FAC authority model intact while enabling wakeups."
+      impacted_requirement_ids:
+        - "REQ-HEF-0001"
+        - "REQ-HEF-0008"
+      evidence_ids:
+        - "EVID-HEF-0001"
