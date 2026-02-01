@@ -196,7 +196,11 @@ impl RestartCoordinator {
     ///   duration)
     /// * `previous_quarantines` - How many times this session has been
     ///   quarantined
+    // TODO(TCK-00243): Migrate to tick-based quarantine timing.
+    // This function currently uses wall-clock timestamps. The full migration to
+    // tick-based timing is tracked as a follow-up to the initial HTF integration.
     #[must_use]
+    #[allow(deprecated)]
     pub fn should_restart_with_quarantine(
         &self,
         crash_event: &CrashEvent,

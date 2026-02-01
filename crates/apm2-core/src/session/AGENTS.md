@@ -264,19 +264,19 @@ Calculates quarantine duration using exponential backoff (wall clock).
 Calculates quarantine duration in ticks using exponential backoff (RFC-0016 HTF).
 
 #### `QuarantineManager::is_quarantine_expired_at_tick(quarantine_until_tick, current_tick) -> bool`
-Checks if a quarantine has expired based on ticks (RFC-0016 HTF). Fails closed on tick rate mismatch.
+Checks if a quarantine has expired based on ticks (RFC-0016 HTF). Returns `false` (NOT expired) on tick rate mismatch to keep quarantine active (fail-closed).
 
 #### `QuarantineManager::quarantine_until_tick(current_tick, duration_ticks) -> HtfTick`
 Calculates the quarantine expiry tick (RFC-0016 HTF).
 
 #### `QuarantineInfo::is_expired_at_tick(current_tick) -> bool`
-Checks if a quarantine has expired based on ticks (RFC-0016 HTF).
+Checks if a quarantine has expired based on ticks (RFC-0016 HTF). Returns `false` on tick rate mismatch or legacy quarantine (fail-closed).
 
 #### `QuarantineInfo::is_expired_at_tick_or_wall(current_tick, current_wall_ns) -> bool`
-Checks if a quarantine has expired with wall-clock fallback for legacy quarantines.
+Checks if a quarantine has expired with wall-clock fallback for legacy quarantines. Returns `false` on tick rate mismatch (fail-closed).
 
 #### `QuarantineInfo::ticks_remaining(current_tick) -> u64`
-Returns remaining ticks until quarantine expires (RFC-0016 HTF).
+Returns remaining ticks until quarantine expires (RFC-0016 HTF). Returns `u64::MAX` on tick rate mismatch or legacy quarantine (fail-closed).
 
 ### Crash Detection
 

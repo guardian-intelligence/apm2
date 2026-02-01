@@ -45,6 +45,7 @@ use crate::htf::HtfTick;
 /// When tick-based fields are present, they are authoritative. Duration
 /// calculations MUST use tick arithmetic, not wall time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuarantineConfig {
     /// Base duration for the first quarantine.
     /// Retained for backwards compatibility; use tick-based fields when
@@ -170,8 +171,12 @@ impl QuarantineConfig {
     ///
     /// * `base_duration_ticks` - Base quarantine duration in ticks
     /// * `max_duration_ticks` - Maximum quarantine duration in ticks
-    /// * `tick_rate_hz` - Tick rate in Hz (ticks per second)
+    /// * `tick_rate_hz` - Tick rate in Hz (ticks per second), MUST be > 0
     /// * `multiplier` - Exponential backoff multiplier
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tick_rate_hz` is 0 (division by zero protection).
     #[must_use]
     pub const fn with_ticks(
         base_duration_ticks: u64,
@@ -179,6 +184,9 @@ impl QuarantineConfig {
         tick_rate_hz: u64,
         multiplier: f64,
     ) -> Self {
+        // SEC-DoS: Validate tick_rate_hz > 0 to prevent division by zero
+        assert!(tick_rate_hz > 0, "tick_rate_hz must be > 0");
+
         // Calculate wall-clock equivalents for backwards compatibility
         // These are observational only; tick values are authoritative
         let base_secs = base_duration_ticks / tick_rate_hz;
@@ -205,7 +213,63 @@ impl QuarantineConfig {
             && self.max_duration_ticks.is_some()
             && self.tick_rate_hz.is_some()
     }
+
+    /// Validates the configuration, returning an error if invalid.
+    ///
+    /// # SEC-DoS: Tick Rate Validation
+    ///
+    /// This method validates that `tick_rate_hz > 0` when tick-based fields
+    /// are present, preventing division-by-zero panics in duration
+    /// calculations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `tick_rate_hz` is `Some(0)` (would cause division by zero)
+    /// - Tick fields are partially set (incomplete tick configuration)
+    pub fn validate(&self) -> Result<(), QuarantineConfigError> {
+        // Check for zero tick rate
+        if self.tick_rate_hz == Some(0) {
+            return Err(QuarantineConfigError::ZeroTickRate);
+        }
+
+        // Check for partial tick configuration
+        let tick_fields = [
+            self.base_duration_ticks.is_some(),
+            self.max_duration_ticks.is_some(),
+            self.tick_rate_hz.is_some(),
+        ];
+        let tick_count = tick_fields.iter().filter(|&&b| b).count();
+        if tick_count > 0 && tick_count < 3 {
+            return Err(QuarantineConfigError::IncompleteTickConfig);
+        }
+
+        Ok(())
+    }
 }
+
+/// Errors that can occur when validating [`QuarantineConfig`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuarantineConfigError {
+    /// `tick_rate_hz` is set to 0, which would cause division by zero.
+    ZeroTickRate,
+    /// Tick-based fields are partially configured (some but not all are set).
+    IncompleteTickConfig,
+}
+
+impl std::fmt::Display for QuarantineConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroTickRate => write!(f, "tick_rate_hz must be > 0"),
+            Self::IncompleteTickConfig => write!(
+                f,
+                "tick-based config requires all of: base_duration_ticks, max_duration_ticks, tick_rate_hz"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for QuarantineConfigError {}
 
 /// Reason why a session was quarantined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -466,25 +530,32 @@ impl QuarantineManager {
 
     /// Checks if a quarantine has expired based on current tick (RFC-0016 HTF).
     ///
-    /// # SEC-HTF-003: Tick Rate Validation
+    /// # SEC-HTF-003: Tick Rate Validation (FAIL-CLOSED)
     ///
     /// Ticks are node-local and their rates can vary. Comparing raw values
     /// without rate-equality enforcement is dangerous. This method enforces
     /// that `current_tick.tick_rate_hz() ==
     /// quarantine_until_tick.tick_rate_hz()`. If rates differ, returns
-    /// `true` (fail-closed) to prevent incorrect expiry decisions.
+    /// `false` (NOT expired) to keep the quarantine active.
+    ///
+    /// **Critical Security Note**: For quarantine, "expired" means the
+    /// restriction is LIFTED. Fail-closed for quarantine means keeping
+    /// the restriction active (returning `false` = not expired) when
+    /// we cannot reliably determine expiry. This differs from leases
+    /// where `expired = true` correctly removes privilege.
     ///
     /// # Arguments
     /// * `quarantine_until_tick` - Tick when quarantine expires
     /// * `current_tick` - Current tick
     #[must_use]
-    pub fn is_quarantine_expired_at_tick(
+    pub const fn is_quarantine_expired_at_tick(
         quarantine_until_tick: &HtfTick,
         current_tick: &HtfTick,
     ) -> bool {
         // SEC-HTF-003: Enforce tick rate equality. If rates differ, fail-closed.
+        // For quarantine, fail-closed = keep quarantine active = return false.
         if current_tick.tick_rate_hz() != quarantine_until_tick.tick_rate_hz() {
-            return true; // Fail-closed: treat as expired
+            return false; // Fail-closed: keep quarantine active (NOT expired)
         }
         current_tick.value() >= quarantine_until_tick.value()
     }
@@ -526,7 +597,7 @@ impl QuarantineManager {
     /// * `current_tick` - Current tick when quarantine starts
     /// * `duration_ticks` - Quarantine duration in ticks
     #[must_use]
-    pub fn quarantine_until_tick(current_tick: &HtfTick, duration_ticks: u64) -> HtfTick {
+    pub const fn quarantine_until_tick(current_tick: &HtfTick, duration_ticks: u64) -> HtfTick {
         current_tick.saturating_add(duration_ticks)
     }
 }
@@ -616,6 +687,7 @@ impl QuarantineEvaluation {
 /// When tick-based fields are present, they are authoritative. Expiry decisions
 /// MUST use tick comparison, not wall time comparison.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuarantineInfo {
     /// Session ID.
     pub session_id: String,
@@ -727,13 +799,18 @@ impl QuarantineInfo {
     /// Returns true if the current tick is past the quarantine's expiration
     /// tick.
     ///
-    /// # SEC-HTF-003: Tick Rate Validation
+    /// # SEC-HTF-003: Tick Rate Validation (FAIL-CLOSED)
     ///
     /// Ticks are node-local and their rates can vary. Comparing raw values
     /// without rate-equality enforcement is dangerous. This method enforces
     /// that `current_tick.tick_rate_hz() ==
     /// quarantine_until_tick.tick_rate_hz()`. If rates differ, returns
-    /// `true` (fail-closed) to prevent incorrect expiry decisions.
+    /// `false` (NOT expired) to keep the quarantine active.
+    ///
+    /// **Critical Security Note**: For quarantine, "expired" means the
+    /// restriction is LIFTED. Fail-closed for quarantine means keeping
+    /// the restriction active (returning `false` = not expired) when
+    /// we cannot reliably determine expiry.
     ///
     /// # SEC-CTRL-FAC-0015: Legacy Fallback
     ///
@@ -743,10 +820,12 @@ impl QuarantineInfo {
     /// quarantines. Use [`QuarantineInfo::is_expired_at_tick_or_wall`] for
     /// automatic fallback handling.
     #[must_use]
-    pub fn is_expired_at_tick(&self, current_tick: &HtfTick) -> bool {
+    #[expect(clippy::manual_let_else, reason = "let...else is not const-compatible")]
+    pub const fn is_expired_at_tick(&self, current_tick: &HtfTick) -> bool {
         // SEC-CTRL-FAC-0015: For legacy quarantines without tick data, return false.
-        let Some(quarantine_until_tick) = &self.quarantine_until_tick else {
-            return false;
+        let quarantine_until_tick = match &self.quarantine_until_tick {
+            Some(t) => t,
+            None => return false,
         };
 
         QuarantineManager::is_quarantine_expired_at_tick(quarantine_until_tick, current_tick)
@@ -767,47 +846,58 @@ impl QuarantineInfo {
     /// This prevents all legacy quarantines from expiring simultaneously upon
     /// deployment while maintaining security for new tick-based quarantines.
     ///
-    /// # SEC-HTF-003: Tick Rate Validation
+    /// # SEC-HTF-003: Tick Rate Validation (FAIL-CLOSED)
     ///
     /// When tick data is present, tick rates must match. Mismatched rates
-    /// result in fail-closed behavior (returns `true`).
+    /// result in fail-closed behavior (returns `false` = not expired =
+    /// quarantine remains active).
     #[must_use]
     #[allow(deprecated)] // We intentionally use is_expired for legacy fallback
     pub fn is_expired_at_tick_or_wall(&self, current_tick: &HtfTick, current_wall_ns: u64) -> bool {
-        if let Some(quarantine_until_tick) = &self.quarantine_until_tick {
-            // Tick data present: use tick comparison
-            QuarantineManager::is_quarantine_expired_at_tick(quarantine_until_tick, current_tick)
-        } else {
-            // SEC-CTRL-FAC-0015: Legacy quarantine without tick data.
-            // Fall back to wall-clock comparison for migration compatibility.
-            current_wall_ns >= self.quarantine_until
-        }
+        // Tick data present: use tick comparison
+        // SEC-CTRL-FAC-0015: Legacy quarantine without tick data falls back to
+        // wall-clock
+        self.quarantine_until_tick.as_ref().map_or(
+            current_wall_ns >= self.quarantine_until,
+            |quarantine_until_tick| {
+                QuarantineManager::is_quarantine_expired_at_tick(
+                    quarantine_until_tick,
+                    current_tick,
+                )
+            },
+        )
     }
 
-    /// Returns the remaining ticks until quarantine expires, or 0 if expired.
+    /// Returns the remaining ticks until quarantine expires.
     ///
     /// This is the RFC-0016 HTF compliant method using monotonic ticks.
     /// Only meaningful for quarantines with tick-based timing.
     ///
-    /// # SEC-HTF-003: Tick Rate Validation
+    /// # SEC-HTF-003: Tick Rate Validation (FAIL-CLOSED)
     ///
-    /// Returns 0 if tick rates differ, as comparing ticks across different
-    /// rates is invalid.
+    /// Returns `u64::MAX` if tick rates differ, as comparing ticks across
+    /// different rates is invalid. This is fail-closed: treating the
+    /// quarantine as having maximum remaining time keeps it active.
     ///
     /// # SEC-CTRL-FAC-0015: Legacy Fallback
     ///
-    /// Returns 0 if tick-based timing is not available. For legacy quarantines,
-    /// use wall-clock remaining time calculation instead.
+    /// Returns `u64::MAX` if tick-based timing is not available. For legacy
+    /// quarantines, use wall-clock remaining time calculation instead. This
+    /// is fail-closed: callers should check `is_legacy()` first.
     #[must_use]
-    pub fn ticks_remaining(&self, current_tick: &HtfTick) -> u64 {
-        // SEC-CTRL-FAC-0015: Return 0 if tick data is missing (legacy quarantine)
-        let Some(quarantine_until_tick) = &self.quarantine_until_tick else {
-            return 0;
+    #[expect(clippy::manual_let_else, reason = "let...else is not const-compatible")]
+    pub const fn ticks_remaining(&self, current_tick: &HtfTick) -> u64 {
+        // SEC-CTRL-FAC-0015: Return MAX if tick data is missing (legacy quarantine)
+        // This is fail-closed: the quarantine appears to have infinite remaining time.
+        let quarantine_until_tick = match &self.quarantine_until_tick {
+            Some(t) => t,
+            None => return u64::MAX,
         };
 
-        // SEC-HTF-003: Return 0 if tick rates differ (fail-closed)
+        // SEC-HTF-003: Return MAX if tick rates differ (fail-closed)
+        // This keeps the quarantine active when we can't reliably compare ticks.
         if current_tick.tick_rate_hz() != quarantine_until_tick.tick_rate_hz() {
-            return 0;
+            return u64::MAX;
         }
 
         quarantine_until_tick
@@ -1423,7 +1513,7 @@ mod tck_00243 {
     /// by tick-only methods. Instead, callers should use the wall-clock
     /// fallback method `is_expired_at_tick_or_wall`.
     #[test]
-    fn legacy_quarantine_tick_methods_return_false_or_zero() {
+    fn legacy_quarantine_tick_methods_return_false_or_max() {
         // Create quarantine WITHOUT tick data (using legacy constructor)
         let info = QuarantineInfo::new(
             "session-1",
@@ -1441,9 +1531,12 @@ mod tck_00243 {
         assert!(info.quarantine_until_tick.is_none());
         assert!(info.is_legacy());
 
-        // is_expired_at_tick returns false for legacy quarantines
+        // is_expired_at_tick returns false for legacy quarantines (fail-closed: keep
+        // active)
         assert!(!info.is_expired_at_tick(&tick(1500)));
-        assert_eq!(info.ticks_remaining(&tick(1500)), 0);
+        // ticks_remaining returns MAX for legacy quarantines (fail-closed: infinite
+        // remaining)
+        assert_eq!(info.ticks_remaining(&tick(1500)), u64::MAX);
     }
 
     /// TCK-00243: SEC-CTRL-FAC-0015 wall-clock fallback for legacy quarantines.
@@ -1480,8 +1573,10 @@ mod tck_00243 {
     /// TCK-00243: SEC-HTF-003 Tick rate mismatch fails closed.
     ///
     /// When tick rates differ between current tick and quarantine expiry tick,
-    /// the comparison is invalid. The method fails closed (returns true for
-    /// expired) to prevent incorrect expiry decisions.
+    /// the comparison is invalid. The method fails closed: returns `false`
+    /// (NOT expired) to keep the quarantine active. This is the correct
+    /// fail-closed behavior for quarantine (where "expired" = restriction
+    /// lifted).
     #[test]
     fn tick_rate_mismatch_fails_closed() {
         // Quarantine with 1MHz tick rate
@@ -1502,10 +1597,11 @@ mod tck_00243 {
         assert!(!info.is_expired_at_tick(&current_same_rate));
         assert_eq!(info.ticks_remaining(&current_same_rate), 500);
 
-        // Different rate: SEC-HTF-003 fail-closed (treated as expired)
+        // Different rate: SEC-HTF-003 fail-closed (NOT expired = quarantine stays
+        // active)
         let current_diff_rate = HtfTick::new(1500, 10_000_000);
-        assert!(info.is_expired_at_tick(&current_diff_rate)); // Fail-closed!
-        assert_eq!(info.ticks_remaining(&current_diff_rate), 0); // Also fails closed
+        assert!(!info.is_expired_at_tick(&current_diff_rate)); // Fail-closed: quarantine active!
+        assert_eq!(info.ticks_remaining(&current_diff_rate), u64::MAX); // Infinite remaining
     }
 
     /// TCK-00243: Injected ticks work correctly for testing.
@@ -1614,6 +1710,8 @@ mod tck_00243 {
     /// TCK-00243: SEC-HTF-003 tick rate mismatch in combined method.
     ///
     /// When tick rates mismatch, the combined method also fails closed.
+    /// Fail-closed for quarantine means returning `false` (NOT expired)
+    /// to keep the quarantine restriction active.
     #[test]
     fn tick_rate_mismatch_in_combined_method_fails_closed() {
         let info = QuarantineInfo::new_with_ticks(
@@ -1629,9 +1727,9 @@ mod tck_00243 {
             1,
         );
 
-        // Different rate: fails closed even though tick value 1500 < 2000
+        // Different rate: fails closed (NOT expired) - quarantine remains active
         let mismatched_tick = HtfTick::new(1500, 10_000_000); // 10MHz
-        assert!(info.is_expired_at_tick_or_wall(&mismatched_tick, 1_500_000_000));
+        assert!(!info.is_expired_at_tick_or_wall(&mismatched_tick, 1_500_000_000));
     }
 
     /// TCK-00243: Quarantine until tick calculation.
@@ -1669,9 +1767,9 @@ mod tck_00243 {
             &tick(2001)
         ));
 
-        // Rate mismatch: fail-closed
+        // Rate mismatch: fail-closed (NOT expired = quarantine stays active)
         let mismatched = HtfTick::new(1500, 10_000_000);
-        assert!(QuarantineManager::is_quarantine_expired_at_tick(
+        assert!(!QuarantineManager::is_quarantine_expired_at_tick(
             &until,
             &mismatched
         ));
@@ -1739,5 +1837,119 @@ mod tck_00243 {
         assert_eq!(deserialized.base_duration_ticks, Some(1000));
         assert_eq!(deserialized.max_duration_ticks, Some(100_000));
         assert_eq!(deserialized.tick_rate_hz, Some(TICK_RATE_HZ));
+    }
+
+    /// TCK-00243: Config validation detects zero tick rate.
+    #[test]
+    fn config_validation_rejects_zero_tick_rate() {
+        // Valid config
+        let valid = QuarantineConfig::with_ticks(1000, 100_000, TICK_RATE_HZ, 2.0);
+        assert!(valid.validate().is_ok());
+
+        // Zero tick rate via deserialization (constructor panics, so test via JSON)
+        let invalid_json = r#"{
+            "base_duration": {"secs": 300, "nanos": 0},
+            "max_duration": {"secs": 86400, "nanos": 0},
+            "multiplier": 2.0,
+            "violation_threshold": 5,
+            "restart_threshold": 5,
+            "quarantine_on_entropy_exceeded": true,
+            "quarantine_on_non_restartable": true,
+            "base_duration_ticks": 1000,
+            "max_duration_ticks": 100000,
+            "tick_rate_hz": 0
+        }"#;
+        let config: QuarantineConfig = serde_json::from_str(invalid_json).unwrap();
+        assert_eq!(config.validate(), Err(QuarantineConfigError::ZeroTickRate));
+    }
+
+    /// TCK-00243: Config validation detects incomplete tick configuration.
+    #[test]
+    fn config_validation_rejects_incomplete_tick_config() {
+        // Only base_duration_ticks set
+        let partial1_json = r#"{
+            "base_duration": {"secs": 300, "nanos": 0},
+            "max_duration": {"secs": 86400, "nanos": 0},
+            "multiplier": 2.0,
+            "violation_threshold": 5,
+            "restart_threshold": 5,
+            "quarantine_on_entropy_exceeded": true,
+            "quarantine_on_non_restartable": true,
+            "base_duration_ticks": 1000
+        }"#;
+        let config1: QuarantineConfig = serde_json::from_str(partial1_json).unwrap();
+        assert_eq!(
+            config1.validate(),
+            Err(QuarantineConfigError::IncompleteTickConfig)
+        );
+
+        // Two tick fields set but missing tick_rate_hz
+        let partial2_json = r#"{
+            "base_duration": {"secs": 300, "nanos": 0},
+            "max_duration": {"secs": 86400, "nanos": 0},
+            "multiplier": 2.0,
+            "violation_threshold": 5,
+            "restart_threshold": 5,
+            "quarantine_on_entropy_exceeded": true,
+            "quarantine_on_non_restartable": true,
+            "base_duration_ticks": 1000,
+            "max_duration_ticks": 100000
+        }"#;
+        let config2: QuarantineConfig = serde_json::from_str(partial2_json).unwrap();
+        assert_eq!(
+            config2.validate(),
+            Err(QuarantineConfigError::IncompleteTickConfig)
+        );
+    }
+
+    /// TCK-00243: Config validation accepts legacy config (no tick fields).
+    #[test]
+    fn config_validation_accepts_legacy_config() {
+        let config = QuarantineConfig::default();
+        assert!(!config.is_tick_based());
+        assert!(config.validate().is_ok());
+    }
+
+    /// TCK-00243: `with_ticks` constructor panics on zero tick rate.
+    #[test]
+    #[should_panic(expected = "tick_rate_hz must be > 0")]
+    fn with_ticks_panics_on_zero_tick_rate() {
+        let _ = QuarantineConfig::with_ticks(1000, 100_000, 0, 2.0);
+    }
+
+    /// TCK-00243: `deny_unknown_fields` rejects extra fields in
+    /// `QuarantineConfig`.
+    #[test]
+    fn config_deny_unknown_fields() {
+        let invalid_json = r#"{
+            "base_duration": {"secs": 300, "nanos": 0},
+            "max_duration": {"secs": 86400, "nanos": 0},
+            "multiplier": 2.0,
+            "violation_threshold": 5,
+            "restart_threshold": 5,
+            "quarantine_on_entropy_exceeded": true,
+            "quarantine_on_non_restartable": true,
+            "unknown_field": "should_fail"
+        }"#;
+        let result: Result<QuarantineConfig, _> = serde_json::from_str(invalid_json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown field"));
+    }
+
+    /// TCK-00243: `deny_unknown_fields` rejects extra fields in
+    /// `QuarantineInfo`.
+    #[test]
+    fn info_deny_unknown_fields() {
+        let invalid_json = r#"{
+            "session_id": "session-1",
+            "reason": {"Manual": {"reason": "test"}},
+            "quarantined_at": 1000000000,
+            "quarantine_until": 2000000000,
+            "quarantine_count": 1,
+            "unknown_field": "should_fail"
+        }"#;
+        let result: Result<QuarantineInfo, _> = serde_json::from_str(invalid_json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown field"));
     }
 }
