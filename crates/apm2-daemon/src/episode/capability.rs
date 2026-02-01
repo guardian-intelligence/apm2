@@ -419,6 +419,20 @@ pub enum DenyReason {
         /// The shell command that was denied.
         command: String,
     },
+
+    /// Write path is required but not provided.
+    ///
+    /// Per TCK-00254, when `write_allowlist` is configured, the request MUST
+    /// include a path for validation. Fail-closed semantics: missing field =
+    /// deny.
+    WritePathRequired,
+
+    /// Shell command is required but not provided.
+    ///
+    /// Per TCK-00254, when `shell_allowlist` is configured, the request MUST
+    /// include a shell command for validation. Fail-closed semantics: missing
+    /// field = deny.
+    ShellCommandRequired,
 }
 
 impl std::fmt::Display for DenyReason {
@@ -456,6 +470,15 @@ impl std::fmt::Display for DenyReason {
             },
             Self::ShellCommandNotInAllowlist { command } => {
                 write!(f, "shell command not in allowlist: {command}")
+            },
+            Self::WritePathRequired => {
+                write!(f, "write path required when write_allowlist is configured")
+            },
+            Self::ShellCommandRequired => {
+                write!(
+                    f,
+                    "shell command required when shell_allowlist is configured"
+                )
             },
         }
     }
@@ -1002,125 +1025,8 @@ impl CapabilityManifest {
             };
         }
 
-        // TCK-00254: Check tool allowlist (fail-closed)
-        if !self.is_tool_allowed(request.tool_class) {
-            return CapabilityDecision::Deny {
-                reason: DenyReason::ToolNotInAllowlist {
-                    tool_class: request.tool_class,
-                },
-            };
-        }
-
-        // TCK-00254: Check write allowlist for Write operations
-        if request.tool_class == ToolClass::Write {
-            if let Some(ref path) = request.path {
-                if !self.is_write_path_allowed(path) {
-                    return CapabilityDecision::Deny {
-                        reason: DenyReason::WritePathNotInAllowlist {
-                            path: path.to_string_lossy().to_string(),
-                        },
-                    };
-                }
-            }
-        }
-
-        // TCK-00254: Check shell allowlist for Execute operations
-        if request.tool_class == ToolClass::Execute {
-            if let Some(ref command) = request.shell_command {
-                if !self.is_shell_command_allowed(command) {
-                    return CapabilityDecision::Deny {
-                        reason: DenyReason::ShellCommandNotInAllowlist {
-                            command: command.clone(),
-                        },
-                    };
-                }
-            }
-        }
-
-        // Find capabilities matching the tool class
-        let matching: Vec<_> = self.find_by_tool_class(request.tool_class).collect();
-
-        if matching.is_empty() {
-            return CapabilityDecision::Deny {
-                reason: DenyReason::NoMatchingCapability {
-                    tool_class: request.tool_class,
-                },
-            };
-        }
-
-        // Try each matching capability
-        for cap in matching {
-            // Check risk tier
-            if !cap.risk_tier_sufficient(request.risk_tier) {
-                continue;
-            }
-
-            // Check path if applicable
-            if let Some(ref path) = request.path {
-                if !cap.allows_path(path) {
-                    continue;
-                }
-            }
-
-            // Check size limits if applicable
-            if let Some(size) = request.size {
-                let size_allowed = match request.tool_class {
-                    ToolClass::Read => cap.allows_read_size(size),
-                    ToolClass::Write => cap.allows_write_size(size),
-                    _ => true,
-                };
-                if !size_allowed {
-                    continue;
-                }
-            }
-
-            // Check network access if applicable
-            if let Some((ref host, port)) = request.network {
-                if !cap.allows_network(host, port) {
-                    continue;
-                }
-            }
-
-            // All checks passed
-            return CapabilityDecision::Allow {
-                capability_id: cap.capability_id.clone(),
-            };
-        }
-
-        // No capability matched - determine best reason
-        // This provides the most specific denial reason
-        if let Some(ref path) = request.path {
-            return CapabilityDecision::Deny {
-                reason: DenyReason::PathNotAllowed {
-                    path: path.to_string_lossy().to_string(),
-                },
-            };
-        }
-
-        if let Some((ref host, port)) = request.network {
-            return CapabilityDecision::Deny {
-                reason: DenyReason::NetworkNotAllowed {
-                    host: host.clone(),
-                    port,
-                },
-            };
-        }
-
-        // Fall back to risk tier reason
-        if let Some(cap) = self.find_by_tool_class(request.tool_class).next() {
-            return CapabilityDecision::Deny {
-                reason: DenyReason::InsufficientRiskTier {
-                    required: cap.risk_tier_required,
-                    actual: request.risk_tier,
-                },
-            };
-        }
-
-        CapabilityDecision::Deny {
-            reason: DenyReason::NoMatchingCapability {
-                tool_class: request.tool_class,
-            },
-        }
+        // Delegate to the internal validation logic
+        self.validate_request_internal(request)
     }
 
     /// Validates a tool request with a custom clock for expiration checks.
@@ -1154,29 +1060,48 @@ impl CapabilityManifest {
             };
         }
 
-        // TCK-00254: Check write allowlist for Write operations
-        if request.tool_class == ToolClass::Write {
-            if let Some(ref path) = request.path {
-                if !self.is_write_path_allowed(path) {
+        // TCK-00254: Check write allowlist for Write operations (fail-closed)
+        // If write_allowlist is configured, the path MUST be present for validation.
+        if request.tool_class == ToolClass::Write && !self.write_allowlist.is_empty() {
+            match &request.path {
+                Some(path) => {
+                    if !self.is_write_path_allowed(path) {
+                        return CapabilityDecision::Deny {
+                            reason: DenyReason::WritePathNotInAllowlist {
+                                path: path.to_string_lossy().to_string(),
+                            },
+                        };
+                    }
+                },
+                None => {
+                    // SECURITY: Fail-closed - missing path when allowlist is configured
                     return CapabilityDecision::Deny {
-                        reason: DenyReason::WritePathNotInAllowlist {
-                            path: path.to_string_lossy().to_string(),
-                        },
+                        reason: DenyReason::WritePathRequired,
                     };
-                }
+                },
             }
         }
 
-        // TCK-00254: Check shell allowlist for Execute operations
-        if request.tool_class == ToolClass::Execute {
-            if let Some(ref command) = request.shell_command {
-                if !self.is_shell_command_allowed(command) {
+        // TCK-00254: Check shell allowlist for Execute operations (fail-closed)
+        // If shell_allowlist is configured, the shell_command MUST be present for
+        // validation.
+        if request.tool_class == ToolClass::Execute && !self.shell_allowlist.is_empty() {
+            match &request.shell_command {
+                Some(command) => {
+                    if !self.is_shell_command_allowed(command) {
+                        return CapabilityDecision::Deny {
+                            reason: DenyReason::ShellCommandNotInAllowlist {
+                                command: command.clone(),
+                            },
+                        };
+                    }
+                },
+                None => {
+                    // SECURITY: Fail-closed - missing shell_command when allowlist is configured
                     return CapabilityDecision::Deny {
-                        reason: DenyReason::ShellCommandNotInAllowlist {
-                            command: command.clone(),
-                        },
+                        reason: DenyReason::ShellCommandRequired,
                     };
-                }
+                },
             }
         }
 
@@ -3023,5 +2948,125 @@ mod tests {
 
         assert_eq!(request.shell_command, Some("cargo build".to_string()));
         assert_eq!(request.tool_class, ToolClass::Execute);
+    }
+
+    // =========================================================================
+    // TCK-00254: Fail-Closed Semantics Tests
+    // =========================================================================
+
+    #[test]
+    fn test_execute_without_shell_command_when_allowlist_configured_is_denied() {
+        // Create execute capability with shell_allowlist configured
+        let exec_cap = Capability {
+            capability_id: "exec-cap".to_string(),
+            tool_class: ToolClass::Execute,
+            scope: CapabilityScope::allow_all(),
+            risk_tier_required: RiskTier::Tier0,
+        };
+
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .tool_allowlist(vec![ToolClass::Execute])
+            .shell_allowlist(vec!["cargo *".to_string()])
+            .capability(exec_cap)
+            .build()
+            .unwrap();
+
+        // Execute request WITHOUT shell_command should be DENIED
+        // (fail-closed: missing required field when allowlist is configured)
+        let request = ToolRequest::new(ToolClass::Execute, RiskTier::Tier0);
+        let decision = manifest.validate_request(&request);
+
+        assert!(decision.is_denied());
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(
+                matches!(reason, DenyReason::ShellCommandRequired),
+                "expected ShellCommandRequired, got {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_execute_without_shell_command_when_no_allowlist_is_allowed() {
+        // Create execute capability WITHOUT shell_allowlist
+        let exec_cap = Capability {
+            capability_id: "exec-cap".to_string(),
+            tool_class: ToolClass::Execute,
+            scope: CapabilityScope::allow_all(),
+            risk_tier_required: RiskTier::Tier0,
+        };
+
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .tool_allowlist(vec![ToolClass::Execute])
+            // No shell_allowlist configured - empty
+            .capability(exec_cap)
+            .build()
+            .unwrap();
+
+        // Execute request WITHOUT shell_command should be ALLOWED
+        // (no allowlist means no validation required)
+        let request = ToolRequest::new(ToolClass::Execute, RiskTier::Tier0);
+        let decision = manifest.validate_request(&request);
+
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn test_write_without_path_when_allowlist_configured_is_denied() {
+        // Create write capability with write_allowlist configured
+        let write_cap = Capability {
+            capability_id: "write-cap".to_string(),
+            tool_class: ToolClass::Write,
+            scope: CapabilityScope::allow_all(),
+            risk_tier_required: RiskTier::Tier0,
+        };
+
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .tool_allowlist(vec![ToolClass::Write])
+            .write_allowlist(vec![PathBuf::from("/workspace")])
+            .capability(write_cap)
+            .build()
+            .unwrap();
+
+        // Write request WITHOUT path should be DENIED
+        // (fail-closed: missing required field when allowlist is configured)
+        let request = ToolRequest::new(ToolClass::Write, RiskTier::Tier0);
+        let decision = manifest.validate_request(&request);
+
+        assert!(decision.is_denied());
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(
+                matches!(reason, DenyReason::WritePathRequired),
+                "expected WritePathRequired, got {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_write_without_path_when_no_allowlist_is_allowed() {
+        // Create write capability WITHOUT write_allowlist
+        let write_cap = Capability {
+            capability_id: "write-cap".to_string(),
+            tool_class: ToolClass::Write,
+            scope: CapabilityScope::allow_all(),
+            risk_tier_required: RiskTier::Tier0,
+        };
+
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .tool_allowlist(vec![ToolClass::Write])
+            // No write_allowlist configured - empty
+            .capability(write_cap)
+            .build()
+            .unwrap();
+
+        // Write request WITHOUT path should be ALLOWED
+        // (no allowlist means no validation required)
+        let request = ToolRequest::new(ToolClass::Write, RiskTier::Tier0);
+        let decision = manifest.validate_request(&request);
+
+        assert!(decision.is_allowed());
     }
 }
