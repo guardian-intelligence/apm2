@@ -1,0 +1,100 @@
+rfc_test_and_evidence:
+  schema_version: "2026-02-01"
+  template_version: "2026-01-23"
+  test_plan:
+    unit:
+      - id: "UT-HEF-0001"
+        name: "Topic grammar parser and wildcard matcher"
+        scope: "ASCII validation, wildcard limits, bounded matching"
+        coverage_target: ">90%"
+        framework: "cargo test"
+        evidence_ids:
+          - "EVID-HEF-0007"
+      - id: "UT-HEF-0002"
+        name: "PulseEnvelope bounded decode"
+        scope: "Unknown-field rejection, size caps"
+        coverage_target: ">90%"
+        framework: "cargo test"
+        evidence_ids:
+          - "EVID-HEF-0004"
+    integration:
+      - id: "IT-HEF-0001"
+        name: "Subscription ACL enforcement"
+        scope: "operator.sock vs session.sock, capability restrictions"
+        test_environment: "Local daemon + mock subscribers"
+        evidence_ids:
+          - "EVID-HEF-0002"
+      - id: "IT-HEF-0002"
+        name: "Outbox post-commit ordering"
+        scope: "CAS -> ledger -> pulse ordering"
+        test_environment: "Local daemon + ledger"
+        evidence_ids:
+          - "EVID-HEF-0006"
+      - id: "IT-HEF-0003"
+        name: "Backpressure + drop policy"
+        scope: "Queue caps, drop ordering"
+        test_environment: "Local daemon under load"
+        evidence_ids:
+          - "EVID-HEF-0007"
+      - id: "IT-HEF-0004"
+        name: "Pulse-only admission attempt (red-team)"
+        scope: "Ensure pulses cannot admit work"
+        test_environment: "Local daemon + mock admission"
+        evidence_ids:
+          - "EVID-HEF-0001"
+      - id: "IT-HEF-0005"
+        name: "Unauthorized publish/subscribe attempts (red-team)"
+        scope: "Session tries to publish or subscribe privileged topics"
+        test_environment: "Local daemon + session client"
+        evidence_ids:
+          - "EVID-HEF-0002"
+      - id: "IT-HEF-0006"
+        name: "Downgrade attempts (JSON framing)"
+        scope: "Reject JSON frames on ProtocolServer sockets"
+        test_environment: "Local daemon + raw socket"
+        evidence_ids:
+          - "EVID-HEF-0003"
+      - id: "IT-HEF-0007"
+        name: "Replay/reorder/duplication handling"
+        scope: "Deduplication by pulse_id and ledger cursor"
+        test_environment: "Local daemon + pulse client"
+        evidence_ids:
+          - "EVID-HEF-0005"
+    fuzz:
+      - id: "FZ-HEF-0001"
+        name: "Pulse frame fuzzing"
+        scope: "PulseEnvelope and subscription decode paths"
+        framework: "cargo-fuzz"
+        corpus_seed: "proto/apm2d_runtime_v1.proto"
+        evidence_ids:
+          - "EVID-HEF-0004"
+    perf: []
+    chaos:
+      - id: "CH-HEF-0001"
+        name: "Pulse loss recovery"
+        scope: "Drop pulses and recover via ledger catch-up"
+        injection: "Drop N pulses + reconnect"
+        expected_behavior: "Client reconciles via ledger cursor"
+        evidence_ids:
+          - "EVID-HEF-0006"
+  evidence_bundle:
+    root: "evidence/rfc/RFC-0018/"
+    artifact_registry:
+      mode: "FILE_PER_ARTIFACT"
+      local_root: "evidence_artifacts/"
+      local_artifacts:
+        - artifact_id: "EVID-HEF-0001"
+          artifact_ref: "evidence_artifacts/EVID-HEF-0001.yaml#rfc_evidence_artifact"
+        - artifact_id: "EVID-HEF-0002"
+          artifact_ref: "evidence_artifacts/EVID-HEF-0002.yaml#rfc_evidence_artifact"
+        - artifact_id: "EVID-HEF-0003"
+          artifact_ref: "evidence_artifacts/EVID-HEF-0003.yaml#rfc_evidence_artifact"
+        - artifact_id: "EVID-HEF-0004"
+          artifact_ref: "evidence_artifacts/EVID-HEF-0004.yaml#rfc_evidence_artifact"
+        - artifact_id: "EVID-HEF-0005"
+          artifact_ref: "evidence_artifacts/EVID-HEF-0005.yaml#rfc_evidence_artifact"
+        - artifact_id: "EVID-HEF-0006"
+          artifact_ref: "evidence_artifacts/EVID-HEF-0006.yaml#rfc_evidence_artifact"
+        - artifact_id: "EVID-HEF-0007"
+          artifact_ref: "evidence_artifacts/EVID-HEF-0007.yaml#rfc_evidence_artifact"
+      imports: []

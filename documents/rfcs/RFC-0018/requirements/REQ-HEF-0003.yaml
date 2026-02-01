@@ -1,0 +1,19 @@
+rfc_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-HEF-0003"
+  type: "SECURITY"
+  title: "Default-deny ACLs and daemon-only publish"
+  statement: |
+    Pulse subscriptions must be denied by default. operator.sock may subscribe
+    broadly; session.sock is restricted to its own work/episode scope. Sessions
+    never publish pulse topics; daemon-only publish from outbox.
+  acceptance_criteria:
+    - "Session attempts to subscribe to privileged topics are denied."
+    - "Session attempts to publish pulses are denied."
+    - "Operator subscriptions honor ACLs and capability restrictions."
+  evidence:
+    evidence_ids:
+      - "EVID-HEF-0002"
+    inherited_from_prd: false
+    notes: []

@@ -1,0 +1,53 @@
+rfc_risks_and_open_questions:
+  schema_version: "2026-02-01"
+  template_version: "2026-01-23"
+  risks:
+    - id: "RSK-HEF-0001"
+      statement: "Missing truth-plane events for episode lifecycle/tool/io and defect records prevent required Phase-1 topics from being emitted."
+      impact: "HEF topics would be partial; consumers forced back to polling."
+      likelihood: "HIGH"
+      mitigations:
+        - "TCK-00306 adds episode lifecycle/tool/io events to kernel_events.proto."
+        - "TCK-00307 adds DefectRecorded ledger event."
+      evidence_ids:
+        - "EVID-HEF-0006"
+    - id: "RSK-HEF-0002"
+      statement: "Pulse hints could be misused as authoritative admission signals."
+      impact: "Admission bypass or spoofed gate outcomes."
+      likelihood: "MEDIUM"
+      mitigations:
+        - "REQ-HEF-0001 forbids authoritative use; red-team tests enforce fail-closed."
+        - "DD-HEF-0001 + DD-HEF-0008 explicitly prohibit pulse-only decisions."
+      evidence_ids:
+        - "EVID-HEF-0001"
+    - id: "RSK-HEF-0003"
+      statement: "Pulse fanout may introduce DoS risk to daemon (queue growth, CPU)."
+      impact: "Control-plane degradation or outage."
+      likelihood: "MEDIUM"
+      mitigations:
+        - "REQ-HEF-0004 caps queues, rates, and in-flight bytes."
+        - "Drop policy prioritizes critical topics."
+      evidence_ids:
+        - "EVID-HEF-0007"
+    - id: "RSK-HEF-0004"
+      statement: "Legacy bypass surfaces (xtask GitHub status writes) may be mistakenly treated as truth."
+      impact: "Projection-only posture violated; split-brain admission."
+      likelihood: "MEDIUM"
+      mitigations:
+        - "HEF explicitly forbids using GitHub status or pulses as authority."
+        - "Rollout gates require projection-only posture validation."
+      evidence_ids:
+        - "EVID-HEF-0001"
+  open_questions:
+    - id: "Q-HEF-0001"
+      question: "Should episode_id be added to existing Session/Tool kernel events, or should new Episode* events be added?"
+      decision_needed_by: "2026-02-15"
+      resolution_plan: "Prototype both schema options; select minimal-change path that preserves replay determinism."
+    - id: "Q-HEF-0002"
+      question: "Should DefectRecord be embedded directly in ledger events or stored in CAS with hash reference?"
+      decision_needed_by: "2026-02-15"
+      resolution_plan: "Compare size and disclosure impact; choose CAS reference if payload risk is high."
+    - id: "Q-HEF-0003"
+      question: "Do we require a small in-memory pulse replay buffer for short reconnects, or force pure ledger catch-up?"
+      decision_needed_by: "2026-02-20"
+      resolution_plan: "Define operator UX needs; keep buffer optional and non-authoritative if added."

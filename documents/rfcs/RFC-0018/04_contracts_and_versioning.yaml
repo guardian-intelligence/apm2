@@ -1,0 +1,111 @@
+rfc_contracts_and_versioning:
+  schema_version: "2026-02-01"
+  template_version: "2026-01-23"
+  contracts:
+    - id: "CTR-HEF-0001"
+      name: "Pulse Plane IPC (ProtocolServer)"
+      type: "API"
+      versioning:
+        scheme: "SEMVER"
+        current_version: "1.0.0"
+        compatibility_rules:
+          - "Unknown fields are rejected for Subscribe/Unsubscribe (strict decode)."
+          - "PulseEnvelopeV1 is size-bounded (<= 2048 bytes)."
+          - "Topic length <= 128 chars; pulse_id <= 64 chars; IDs are ASCII only."
+          - "New fields must be optional and bounded; removals require major bump."
+      schemas:
+        - id: "SCH-HEF-0001"
+          path: "proto/apm2d_runtime_v1.proto"
+          format: "PROTOBUF"
+          description: "Add PulseEnvelopeV1, PulseSubscribeRequest/Response, PulseUnsubscribeRequest/Response, PulseEvent."
+      evidence_ids:
+        - "EVID-HEF-0003"
+  outputs:
+    artifacts_produced:
+      - "PulseEvent frames delivered over ProtocolServer"
+      - "Subscription registry entries (bounded)"
+    failure_modes:
+      - "PERMISSION_DENIED on unauthorized subscribe"
+      - "RESOURCE_LIMIT on exceeded caps"
+      - "DROP on backpressure"
+
+  pulse_protocol_additions:
+    proto_file: "proto/apm2d_runtime_v1.proto"
+    message_tags:
+      session_socket:
+        - "5 = SubscribePulseRequest"
+        - "6 = UnsubscribePulseRequest"
+        - "7 = PulseEvent (server -> client only)"
+      operator_socket:
+        - "5 = SubscribePulseRequest"
+        - "6 = UnsubscribePulseRequest"
+        - "7 = PulseEvent (server -> client only)"
+    messages:
+      - name: "PulseEnvelopeV1"
+        description: "Lossy hint derived from committed ledger+CAS artifacts."
+        size_limits:
+          max_bytes: 2048
+          max_entities: 8
+          max_cas_refs: 8
+        fields:
+          - "string pulse_id (<=64, ASCII)"
+          - "string topic (<=128, ASCII, dot-delimited)"
+          - "uint32 schema_version = 1"
+          - "uint64 ledger_cursor (seq_id)"
+          - "uint64 ledger_head (optional; 0 if unknown)"
+          - "bytes event_hash (32 bytes, optional)"
+          - "string event_type (<=64)"
+          - "repeated EntityRef entities (opaque IDs: work_id, episode_id, gate_id, defect_id)"
+          - "repeated CasRef cas_refs (hash + size_bytes + kind)"
+          - "optional bytes time_envelope_hash (32 bytes)"
+          - "optional HlcStamp hlc (advisory only)"
+          - "optional BoundedWallInterval wall (observational only)"
+      - name: "EntityRef"
+        fields:
+          - "string kind (WORK|EPISODE|GATE|DEFECT|SESSION)"
+          - "string id (<=128, ASCII)"
+          - "optional bytes digest (32 bytes)"
+      - name: "CasRef"
+        fields:
+          - "bytes hash (32 bytes)"
+          - "uint64 size_bytes"
+          - "string kind (EVIDENCE|TIME_ENVELOPE|TOOL_RESULT|IO_CHUNK)"
+      - name: "PulseSubscribeRequest"
+        description: "Client requests subscription; since_ledger_cursor is for resume hint only."
+        fields:
+          - "string session_token (required on session.sock)"
+          - "string client_sub_id (optional, <=64)"
+          - "repeated string topic_patterns (<=16 patterns, bounded wildcard grammar)"
+          - "uint64 since_ledger_cursor (0 = from now)"
+          - "uint32 max_pulses_per_sec (optional cap requested; server clamps)"
+      - name: "PulseSubscribeResponse"
+        fields:
+          - "string subscription_id (server-generated)"
+          - "uint64 effective_since_cursor"
+          - "repeated string accepted_patterns"
+          - "repeated PatternRejection rejected_patterns"
+      - name: "PatternRejection"
+        fields:
+          - "string pattern"
+          - "string reason_code (INVALID_PATTERN|ACL_DENY|LIMIT_EXCEEDED)"
+      - name: "PulseUnsubscribeRequest"
+        fields:
+          - "string subscription_id"
+      - name: "PulseUnsubscribeResponse"
+        fields:
+          - "bool removed"
+      - name: "PulseEvent"
+        description: "Server-to-client notification containing PulseEnvelopeV1."
+        fields:
+          - "PulseEnvelopeV1 envelope"
+
+  subscribe_semantics:
+    - "SubscribePulseRequest is accepted only after handshake and privilege checks."
+    - "Session subscriptions require valid session_token before ACL evaluation."
+    - "since_ledger_cursor is a resume hint; correctness requires ledger catch-up."
+    - "Pulse replay buffer is optional and non-authoritative; absence is allowed."
+    - "Clients must treat pulses as hints and verify via ledger/CAS."
+
+  downgrade_resistance:
+    - "JSON-framed messages are never accepted on ProtocolServer sockets (DD-009 hard cutover)."
+    - "Any JSON framing received on operator.sock/session.sock results in connection close."

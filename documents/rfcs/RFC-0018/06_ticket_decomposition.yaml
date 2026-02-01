@@ -1,0 +1,215 @@
+rfc_ticket_decomposition:
+  schema_version: "2026-02-01"
+  template_version: "2026-01-23"
+  status: POPULATED
+  notes: |
+    Ticket decomposition for HEF Phase 1. Ordering establishes:
+    1) protocol schema, 2) topic grammar + ACLs, 3) outbox + publisher,
+    4) truth-plane trigger coverage, 5) red-team validation.
+
+  tickets:
+    - ticket_id: "TCK-00300"
+      title: "HEF: Extend ProtocolServer proto with PulseEnvelope + Subscribe/Unsubscribe"
+      requirement_ids:
+        - "REQ-HEF-0002"
+        - "REQ-HEF-0008"
+      depends_on: []
+      risk_tier: "T3"
+      summary: |
+        Extend proto/apm2d_runtime_v1.proto to define PulseEnvelopeV1,
+        PulseSubscribeRequest/Response, PulseUnsubscribeRequest/Response,
+        and PulseEvent (server->client only). Assign new message tags for
+        session and operator sockets.
+      files_to_modify:
+        - "proto/apm2d_runtime_v1.proto (add PulseEnvelopeV1 + subscription messages + tags)"
+      files_to_create: []
+      acceptance_criteria:
+        - "PulseEnvelopeV1 fields are bounded and unknown fields are rejected."
+        - "Subscribe/Unsubscribe tags reserved for both session and operator sockets."
+      evidence_ids:
+        - "EVID-HEF-0003"
+
+    - ticket_id: "TCK-00301"
+      title: "HEF: Topic grammar + wildcard matcher with bounded complexity"
+      requirement_ids:
+        - "REQ-HEF-0007"
+      depends_on:
+        - "TCK-00300"
+      risk_tier: "T2"
+      summary: |
+        Implement parser and matcher for dot-delimited topic grammar with
+        per-segment '*' and terminal '>' wildcards (max 2 wildcards). Enforce
+        ASCII-only, no empty segments, and length bounds.
+      files_to_modify:
+        - "crates/apm2-daemon/src/protocol/mod.rs (wire topic parser)"
+      files_to_create:
+        - "crates/apm2-daemon/src/protocol/pulse_topic.rs (topic validation + matching)"
+      acceptance_criteria:
+        - "Invalid patterns (regex, empty segments, too many wildcards) are rejected."
+      evidence_ids:
+        - "EVID-HEF-0007"
+
+    - ticket_id: "TCK-00302"
+      title: "HEF: Subscription registry + ACL enforcement"
+      requirement_ids:
+        - "REQ-HEF-0003"
+      depends_on:
+        - "TCK-00300"
+        - "TCK-00301"
+      risk_tier: "T3"
+      summary: |
+        Add subscription handling to ProtocolServer dispatchers. Enforce
+        operator/session default-deny ACLs and capability-manifest restrictions.
+        Sessions never publish pulses.
+      files_to_modify:
+        - "crates/apm2-daemon/src/protocol/session_dispatch.rs (Subscribe/Unsubscribe handling)"
+        - "crates/apm2-daemon/src/protocol/dispatch.rs (operator Subscribe/Unsubscribe)"
+      files_to_create:
+        - "crates/apm2-daemon/src/protocol/pulse_acl.rs (ACL evaluation)"
+      acceptance_criteria:
+        - "Session subscriptions are limited to own episode/work topics by default."
+        - "Operator subscriptions can access full topic taxonomy."
+      evidence_ids:
+        - "EVID-HEF-0002"
+
+    - ticket_id: "TCK-00303"
+      title: "HEF: Resource governance + backpressure/drop policy"
+      requirement_ids:
+        - "REQ-HEF-0004"
+      depends_on:
+        - "TCK-00302"
+      risk_tier: "T2"
+      summary: |
+        Enforce caps at daemon boundary: max subscriptions per connection,
+        max patterns, max pulses/sec, max queue depth, and max bytes in-flight.
+        Implement drop policy with ordered priority (episode.<id>.io first).
+      files_to_modify:
+        - "crates/apm2-daemon/src/protocol/ (quota + queue enforcement)"
+      files_to_create: []
+      acceptance_criteria:
+        - "Oversubscription triggers RESOURCE_LIMIT without daemon crash."
+      evidence_ids:
+        - "EVID-HEF-0007"
+
+    - ticket_id: "TCK-00304"
+      title: "HEF: Outbox + pulse publisher (post-commit)"
+      requirement_ids:
+        - "REQ-HEF-0006"
+        - "REQ-HEF-0001"
+      depends_on:
+        - "TCK-00300"
+        - "TCK-00302"
+      risk_tier: "T3"
+      summary: |
+        Implement a daemon-owned outbox populated only after ledger commit.
+        Pulse publisher drains outbox, applies ACL filtering, and emits
+        PulseEvent frames. Enforce CAS->ledger->pulse ordering.
+      files_to_modify:
+        - "crates/apm2-core/src/ledger/ (post-commit hook/outbox integration)"
+        - "crates/apm2-daemon/src/protocol/ (pulse publisher + fanout)"
+      files_to_create:
+        - "crates/apm2-daemon/src/protocol/pulse_outbox.rs (post-commit queue)"
+      acceptance_criteria:
+        - "Pulse is emitted only after ledger append succeeds."
+      evidence_ids:
+        - "EVID-HEF-0006"
+
+    - ticket_id: "TCK-00305"
+      title: "HEF: Topic->trigger mapping for Work and Gate events"
+      requirement_ids:
+        - "REQ-HEF-0001"
+        - "REQ-HEF-0002"
+      depends_on:
+        - "TCK-00304"
+      risk_tier: "T2"
+      summary: |
+        Map kernel events to pulse topics:
+        - WorkEvent -> work.<work_id>.events
+        - GateReceipt -> gate.<work_id>.<changeset_digest>.<gate_id>
+        Add changeset_digest->work_id mapping via PolicyResolvedForChangeSet
+        index to populate gate topics.
+      files_to_modify:
+        - "crates/apm2-core/src/ledger/ (PolicyResolvedForChangeSet lookup)"
+        - "crates/apm2-daemon/src/protocol/ (pulse mapping logic)"
+      files_to_create: []
+      acceptance_criteria:
+        - "Gate pulse includes work_id derived from PolicyResolvedForChangeSet."
+      evidence_ids:
+        - "EVID-HEF-0006"
+
+    - ticket_id: "TCK-00306"
+      title: "HEF NEW WORK REQUIRED: Episode lifecycle/tool/io truth-plane events"
+      requirement_ids:
+        - "REQ-HEF-0001"
+        - "REQ-HEF-0008"
+      depends_on:
+        - "TCK-00300"
+      risk_tier: "T3"
+      summary: |
+        Add episode lifecycle and IO coverage to the truth-plane:
+        - Extend proto/kernel_events.proto with EpisodeCreated/Started/Stopped
+          (or add episode_id to existing Session/Tool events) and an IO artifact
+          reference event.
+        - Emit ledger events from daemon episode runtime.
+      files_to_modify:
+        - "proto/kernel_events.proto (add episode lifecycle + IO event types)"
+        - "crates/apm2-daemon/src/episode/ (emit new ledger events)"
+      files_to_create: []
+      acceptance_criteria:
+        - "Episode pulses are derived from ledger events, not IPC-only messages."
+      evidence_ids:
+        - "EVID-HEF-0006"
+
+    - ticket_id: "TCK-00307"
+      title: "HEF NEW WORK REQUIRED: DefectRecord ledger event"
+      requirement_ids:
+        - "REQ-HEF-0001"
+      depends_on:
+        - "TCK-00300"
+      risk_tier: "T3"
+      summary: |
+        Add DefectRecord to the truth-plane by extending kernel_events.proto
+        with a DefectRecorded event referencing DefectRecord (or CAS hash).
+        Emit defect ledger events from defect producers (projection watchdog,
+        context miss, HTF regression).
+      files_to_modify:
+        - "proto/kernel_events.proto (add DefectRecorded event type)"
+        - "crates/apm2-daemon/src/projection/divergence_watchdog.rs (emit defect ledger event)"
+      files_to_create: []
+      acceptance_criteria:
+        - "defect.new pulses are derived from DefectRecorded ledger events."
+      evidence_ids:
+        - "EVID-HEF-0006"
+
+    - ticket_id: "TCK-00308"
+      title: "HEF: Red-team and resilience test suite"
+      requirement_ids:
+        - "REQ-HEF-0001"
+        - "REQ-HEF-0003"
+        - "REQ-HEF-0004"
+        - "REQ-HEF-0005"
+        - "REQ-HEF-0006"
+        - "REQ-HEF-0008"
+      depends_on:
+        - "TCK-00302"
+        - "TCK-00303"
+        - "TCK-00304"
+      risk_tier: "T3"
+      summary: |
+        Implement red-team tests: pulse-only admission attempt, unauthorized
+        subscribe/publish, downgrade attempts, oversize frames, replay/reorder/
+        duplication handling, and pulse loss recovery via ledger catch-up.
+      files_to_modify:
+        - "crates/apm2-daemon/tests/ (add HEF integration + adversarial tests)"
+      files_to_create:
+        - "crates/apm2-daemon/tests/hef_redteam.rs (pulse-plane red-team suite)"
+      acceptance_criteria:
+        - "All red-team cases fail closed and do not affect admission."
+      evidence_ids:
+        - "EVID-HEF-0001"
+        - "EVID-HEF-0002"
+        - "EVID-HEF-0003"
+        - "EVID-HEF-0004"
+        - "EVID-HEF-0005"
+        - "EVID-HEF-0006"
+        - "EVID-HEF-0007"

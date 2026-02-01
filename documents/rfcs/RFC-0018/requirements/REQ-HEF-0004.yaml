@@ -1,0 +1,18 @@
+rfc_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-HEF-0004"
+  type: "RELIABILITY"
+  title: "Resource governance and drop policy"
+  statement: |
+    The daemon must enforce per-connection caps (subscriptions, patterns,
+    pulses/sec, queue depth, bytes in-flight) with bounded drop policy. Drops
+    must prefer non-critical topics (episode.<id>.io first).
+  acceptance_criteria:
+    - "Exceeding caps returns RESOURCE_LIMIT and does not crash daemon."
+    - "Drop ordering follows defined priority under backpressure."
+  evidence:
+    evidence_ids:
+      - "EVID-HEF-0007"
+    inherited_from_prd: false
+    notes: []
