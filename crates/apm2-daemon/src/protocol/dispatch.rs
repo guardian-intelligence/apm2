@@ -1253,13 +1253,57 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // STUB: Return placeholder response
-        // Full implementation in TCK-00256
+        // TCK-00256: Query work registry for PolicyResolvedForChangeSet
+        // Fail-closed: spawn is only allowed if a valid policy resolution exists
+        // for the work_id. This is established during ClaimWork.
+        let Some(claim) = self.work_registry.get_claim(&request.work_id) else {
+            warn!(
+                work_id = %request.work_id,
+                "SpawnEpisode rejected: policy resolution not found for work_id"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PolicyResolutionMissing,
+                format!(
+                    "policy resolution not found for work_id={}; ClaimWork must be called first",
+                    request.work_id
+                ),
+            ));
+        };
+
+        // TCK-00256: Validate role matches the claimed role
+        // Per DD-001, the role in the spawn request should match the claimed role
+        let request_role = WorkRole::try_from(request.role).unwrap_or(WorkRole::Unspecified);
+        if claim.role != request_role {
+            warn!(
+                work_id = %request.work_id,
+                claimed_role = ?claim.role,
+                request_role = ?request_role,
+                "SpawnEpisode rejected: role mismatch"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "role mismatch: work was claimed as {:?} but spawn requested {:?}",
+                    claim.role, request_role
+                ),
+            ));
+        }
+
+        info!(
+            work_id = %request.work_id,
+            policy_resolved_ref = %claim.policy_resolution.policy_resolved_ref,
+            "SpawnEpisode authorized with policy resolution"
+        );
+
+        // Generate session ID and ephemeral handle
+        let session_id = format!("S-{}", uuid::Uuid::new_v4());
+        let ephemeral_handle = format!("H-{}", uuid::Uuid::new_v4());
+
         Ok(PrivilegedResponse::SpawnEpisode(SpawnEpisodeResponse {
-            session_id: "S-STUB-001".to_string(),
-            capability_manifest_hash: vec![0u8; 32],
+            session_id,
+            capability_manifest_hash: claim.policy_resolution.capability_manifest_hash.to_vec(),
             context_pack_sealed: true,
-            ephemeral_handle: "H-STUB-001".to_string(),
+            ephemeral_handle,
         }))
     }
 
@@ -1430,8 +1474,24 @@ mod tests {
                 pid: Some(12345),
             }));
 
+            // TCK-00256: First claim work to establish policy resolution
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+            let work_id = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => resp.work_id,
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            // Now spawn with the claimed work_id
             let request = SpawnEpisodeRequest {
-                work_id: "W-001".to_string(),
+                work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: None,
             };
@@ -1676,8 +1736,24 @@ mod tests {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
+        // TCK-00256: First claim work to establish policy resolution
+        let claim_request = ClaimWorkRequest {
+            actor_id: "test-actor".to_string(),
+            role: WorkRole::Implementer.into(),
+            credential_signature: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+        };
+        let claim_frame = encode_claim_work_request(&claim_request);
+        let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+        let work_id = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => resp.work_id,
+            _ => panic!("Expected ClaimWork response"),
+        };
+
+        // Now spawn with the claimed work_id
         let request = SpawnEpisodeRequest {
-            work_id: "W-001".to_string(),
+            work_id,
             role: WorkRole::Implementer.into(),
             lease_id: None,
         };
@@ -2221,8 +2297,24 @@ mod tests {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
+        // First, claim work with GateExecutor role to establish policy resolution
+        let claim_request = ClaimWorkRequest {
+            actor_id: "test-actor".to_string(),
+            role: WorkRole::GateExecutor.into(),
+            credential_signature: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+        };
+        let claim_frame = encode_claim_work_request(&claim_request);
+        let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+        let work_id = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => resp.work_id,
+            _ => panic!("Expected ClaimWork response"),
+        };
+
+        // Now spawn with the claimed work_id
         let request = SpawnEpisodeRequest {
-            work_id: "W-001".to_string(),
+            work_id,
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-001".to_string()),
         };
@@ -2331,6 +2423,215 @@ mod tests {
         let encoded = claim_resp.encode();
         assert!(!encoded.is_empty());
         assert_eq!(encoded[0], PrivilegedMessageType::ClaimWork.tag());
+    }
+
+    // ========================================================================
+    // TCK-00256: SpawnEpisode with PolicyResolvedForChangeSet check
+    // ========================================================================
+
+    /// TCK-00256: Spawn without policy resolution fails (fail-closed).
+    ///
+    /// Per acceptance criteria: "Spawn without policy resolution fails"
+    /// This test verifies ADV-004 variant: attempting to spawn an episode
+    /// without first calling `ClaimWork` to establish policy resolution.
+    #[test]
+    fn tck_00256_spawn_without_policy_resolution_fails() {
+        let dispatcher = PrivilegedDispatcher::new();
+        let ctx = make_privileged_ctx();
+
+        // Attempt to spawn for a non-existent work_id (no ClaimWork was called)
+        let request = SpawnEpisodeRequest {
+            work_id: "W-NONEXISTENT".to_string(),
+            role: WorkRole::Implementer.into(),
+            lease_id: None,
+        };
+        let frame = encode_spawn_episode_request(&request);
+
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+        match response {
+            PrivilegedResponse::Error(err) => {
+                assert_eq!(
+                    err.code,
+                    PrivilegedErrorCode::PolicyResolutionMissing as i32,
+                    "Should return PolicyResolutionMissing error"
+                );
+                assert!(
+                    err.message.contains("policy resolution not found"),
+                    "Error message should indicate policy resolution is missing: {}",
+                    err.message
+                );
+            },
+            _ => panic!("Expected PolicyResolutionMissing error, got: {response:?}"),
+        }
+    }
+
+    /// TCK-00256: Valid policy resolution allows spawn.
+    ///
+    /// Per acceptance criteria: "Valid policy resolution allows spawn"
+    /// This test verifies the integration flow: `ClaimWork` followed by
+    /// `SpawnEpisode`.
+    #[test]
+    fn tck_00256_spawn_with_policy_resolution_succeeds() {
+        let dispatcher = PrivilegedDispatcher::new();
+        let ctx = make_privileged_ctx();
+
+        // 1. Claim Work (generates policy resolution and persists it)
+        let claim_req = ClaimWorkRequest {
+            actor_id: "test-actor".to_string(),
+            role: WorkRole::Implementer.into(),
+            credential_signature: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+        };
+        let claim_frame = encode_claim_work_request(&claim_req);
+        let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+        let (work_id, expected_manifest_hash) = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.capability_manifest_hash),
+            _ => panic!("Expected ClaimWork response"),
+        };
+
+        // 2. Spawn Episode (should succeed because ClaimWork persisted the resolution)
+        let spawn_req = SpawnEpisodeRequest {
+            work_id,
+            role: WorkRole::Implementer.into(),
+            lease_id: None,
+        };
+        let spawn_frame = encode_spawn_episode_request(&spawn_req);
+
+        let response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+
+        match response {
+            PrivilegedResponse::SpawnEpisode(resp) => {
+                assert!(
+                    !resp.session_id.is_empty(),
+                    "Session ID should not be empty"
+                );
+                assert!(
+                    resp.session_id.starts_with("S-"),
+                    "Session ID should start with S-"
+                );
+                assert!(
+                    !resp.ephemeral_handle.is_empty(),
+                    "Ephemeral handle should not be empty"
+                );
+                assert!(
+                    resp.ephemeral_handle.starts_with("H-"),
+                    "Ephemeral handle should start with H-"
+                );
+                assert_eq!(
+                    resp.capability_manifest_hash, expected_manifest_hash,
+                    "Capability manifest hash should match the one from ClaimWork"
+                );
+                assert!(resp.context_pack_sealed, "Context pack should be sealed");
+            },
+            PrivilegedResponse::Error(err) => {
+                panic!("Unexpected error: {err:?}");
+            },
+            _ => panic!("Expected SpawnEpisode response"),
+        }
+    }
+
+    /// TCK-00256: `SpawnEpisode` with mismatched role fails.
+    ///
+    /// Per DD-001, the role in the spawn request should match the claimed role.
+    /// This test verifies that attempting to spawn with a different role fails.
+    #[test]
+    fn tck_00256_spawn_with_mismatched_role_fails() {
+        let dispatcher = PrivilegedDispatcher::new();
+        let ctx = make_privileged_ctx();
+
+        // 1. Claim Work with Implementer role
+        let claim_req = ClaimWorkRequest {
+            actor_id: "test-actor".to_string(),
+            role: WorkRole::Implementer.into(),
+            credential_signature: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+        };
+        let claim_frame = encode_claim_work_request(&claim_req);
+        let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+        let work_id = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => resp.work_id,
+            _ => panic!("Expected ClaimWork response"),
+        };
+
+        // 2. Try to spawn with Reviewer role (mismatched)
+        let spawn_req = SpawnEpisodeRequest {
+            work_id,
+            role: WorkRole::Reviewer.into(), // Different from claimed role
+            lease_id: None,
+        };
+        let spawn_frame = encode_spawn_episode_request(&spawn_req);
+
+        let response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+
+        match response {
+            PrivilegedResponse::Error(err) => {
+                assert_eq!(
+                    err.code,
+                    PrivilegedErrorCode::CapabilityRequestRejected as i32,
+                    "Should return CapabilityRequestRejected for role mismatch"
+                );
+                assert!(
+                    err.message.contains("role mismatch"),
+                    "Error message should indicate role mismatch: {}",
+                    err.message
+                );
+            },
+            _ => panic!("Expected role mismatch error, got: {response:?}"),
+        }
+    }
+
+    /// TCK-00256: `SpawnEpisode` returns policy resolution data.
+    ///
+    /// Verifies that the spawn response includes the capability manifest hash
+    /// from the original policy resolution.
+    #[test]
+    fn tck_00256_spawn_returns_policy_resolution_data() {
+        let dispatcher = PrivilegedDispatcher::new();
+        let ctx = make_privileged_ctx();
+
+        // Claim work
+        let claim_req = ClaimWorkRequest {
+            actor_id: "test-actor".to_string(),
+            role: WorkRole::Implementer.into(),
+            credential_signature: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+        };
+        let claim_frame = encode_claim_work_request(&claim_req);
+        let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+        let (work_id, claim_manifest_hash, _claim_context_hash) = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => (
+                resp.work_id,
+                resp.capability_manifest_hash,
+                resp.context_pack_hash,
+            ),
+            _ => panic!("Expected ClaimWork response"),
+        };
+
+        // Spawn episode
+        let spawn_req = SpawnEpisodeRequest {
+            work_id,
+            role: WorkRole::Implementer.into(),
+            lease_id: None,
+        };
+        let spawn_frame = encode_spawn_episode_request(&spawn_req);
+        let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+
+        match spawn_response {
+            PrivilegedResponse::SpawnEpisode(resp) => {
+                // Verify the capability manifest hash matches
+                assert_eq!(
+                    resp.capability_manifest_hash, claim_manifest_hash,
+                    "SpawnEpisode should return same capability_manifest_hash as ClaimWork"
+                );
+                // Verify context pack is marked as sealed
+                assert!(resp.context_pack_sealed);
+            },
+            _ => panic!("Expected SpawnEpisode response"),
+        }
     }
 
     // ========================================================================
