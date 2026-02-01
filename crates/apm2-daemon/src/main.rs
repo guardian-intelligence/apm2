@@ -528,27 +528,29 @@ async fn handle_dual_socket_connection(
 
 /// Check if a request requires privileged (operator) access.
 ///
-/// TCK-00249: Privileged operations can only be invoked via the operator
-/// socket. Session socket connections are limited to session-scoped operations.
+/// TCK-00249: Uses default-deny model. Session socket connections are only
+/// allowed to perform a small whitelist of safe operations. All other
+/// operations require privileged (operator) connection.
+///
+/// # Security (Holonic Seclusion)
+///
+/// Session socket (mode 0660) is accessible to group users. To maintain
+/// seclusion, we only allow `Ping` which cannot leak information about
+/// processes, credentials, logs, or other sensitive data.
+///
+/// Operations that would violate seclusion if allowed on session socket:
+/// - `TailLogs`: Would expose logs from ALL processes to any group user
+/// - `ListProcesses`/`GetProcess`: Would expose process args (may contain
+///   secrets)
+/// - `ListCredentials`/`GetCredential`: Would expose credential metadata
+/// - `Status`: Would expose daemon configuration details
+/// - `*Episode*`: Episode state contains sensitive context
 const fn requires_privilege(request: &apm2_core::ipc::IpcRequest) -> bool {
     use apm2_core::ipc::IpcRequest;
-    matches!(
+    // Default-deny: only explicitly whitelisted operations are unprivileged
+    !matches!(
         request,
-        // Process control operations (privileged)
-        IpcRequest::StartProcess { .. }
-            | IpcRequest::StopProcess { .. }
-            | IpcRequest::RestartProcess { .. }
-            | IpcRequest::ReloadProcess { .. }
-            // Credential management (privileged)
-            | IpcRequest::AddCredential { .. }
-            | IpcRequest::RemoveCredential { .. }
-            | IpcRequest::RefreshCredential { .. }
-            | IpcRequest::SwitchCredential { .. }
-            // Episode management (privileged)
-            | IpcRequest::CreateEpisode { .. }
-            | IpcRequest::StartEpisode { .. }
-            | IpcRequest::StopEpisode { .. }
-            // Daemon control (privileged)
-            | IpcRequest::Shutdown
+        // Session-safe operations (do not leak sensitive information)
+        IpcRequest::Ping
     )
 }
