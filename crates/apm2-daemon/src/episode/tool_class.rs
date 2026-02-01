@@ -20,8 +20,13 @@
 // eliminate type duplication. Per Code Quality Review [MINOR]: ToolClass
 // canonicalization logic was previously fragmented between crates. The
 // canonical definition now lives in apm2-core (TCK-00254).
+//
+// Also re-export allowlist constants and helpers from apm2-core to eliminate
+// duplication (Code Quality Review [MAJOR]). All MAX_*_ALLOWLIST constants
+// and shell_pattern_matches are now defined in apm2-core and re-exported here.
 pub use apm2_core::context::{
-    MAX_TOOL_ALLOWLIST, MAX_TOOL_CLASS_NAME_LEN, ToolClass, ToolClassExt,
+    MAX_SHELL_ALLOWLIST, MAX_SHELL_PATTERN_LEN, MAX_TOOL_ALLOWLIST, MAX_TOOL_CLASS_NAME_LEN,
+    MAX_WRITE_ALLOWLIST, ToolClass, ToolClassExt, shell_pattern_matches,
 };
 
 #[cfg(test)]

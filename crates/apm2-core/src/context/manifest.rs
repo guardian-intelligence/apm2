@@ -109,6 +109,10 @@ pub const MAX_WRITE_ALLOWLIST: usize = 1000;
 /// Per CTR-1303, bounded collections prevent `DoS`.
 pub const MAX_SHELL_ALLOWLIST: usize = 500;
 
+/// Maximum length of a shell pattern.
+/// Per CTR-1303, bounded inputs prevent memory exhaustion.
+pub const MAX_SHELL_PATTERN_LEN: usize = 1024;
+
 /// Maximum string length for tool class names during parsing.
 pub const MAX_TOOL_CLASS_NAME_LEN: usize = 64;
 
@@ -313,6 +317,102 @@ impl ToolClassExt for ToolClass {
 }
 
 // =============================================================================
+// Shell Pattern Matching (TCK-00254)
+//
+// Per Code Quality Review [MAJOR], this function is shared between
+// ContextPackManifest and CapabilityManifest to eliminate duplication.
+// =============================================================================
+
+/// Matches a shell command against a pattern with simple glob support.
+///
+/// Supports `*` as a wildcard that matches any sequence of characters.
+/// Patterns without wildcards require exact match.
+///
+/// # Implementation
+///
+/// Uses streaming iteration over pattern parts to avoid heap allocations
+/// in the hot path (SEC-DOS-MDL-0001). This is critical since this method
+/// is called for every tool request against every pattern in the shell
+/// allowlist (up to `MAX_SHELL_ALLOWLIST` patterns).
+///
+/// # Examples
+///
+/// ```
+/// use apm2_core::context::shell_pattern_matches;
+///
+/// // Exact match (no wildcards)
+/// assert!(shell_pattern_matches("cargo build", "cargo build"));
+/// assert!(!shell_pattern_matches("cargo build", "cargo test"));
+///
+/// // Prefix match
+/// assert!(shell_pattern_matches("cargo *", "cargo build"));
+/// assert!(shell_pattern_matches("cargo *", "cargo test --release"));
+///
+/// // Suffix match
+/// assert!(shell_pattern_matches("* --release", "cargo build --release"));
+///
+/// // Contains match
+/// assert!(shell_pattern_matches("*build*", "cargo build --release"));
+/// ```
+#[must_use]
+pub fn shell_pattern_matches(pattern: &str, command: &str) -> bool {
+    // Check for wildcards first - if none, exact match required
+    if !pattern.contains('*') {
+        return pattern == command;
+    }
+
+    // Streaming iterator over pattern parts (zero allocations)
+    let mut parts = pattern.split('*');
+    let mut remaining = command;
+
+    // Handle first part: must be at start unless pattern starts with '*'
+    if let Some(first) = parts.next() {
+        if !first.is_empty() {
+            // Pattern doesn't start with '*', so first part must be prefix
+            if let Some(stripped) = remaining.strip_prefix(first) {
+                remaining = stripped;
+            } else {
+                return false;
+            }
+        }
+    }
+
+    // Handle middle and last parts
+    // We peek ahead to distinguish middle parts from the last part
+    let mut prev_part: Option<&str> = None;
+    for part in parts {
+        // Process the previous part as a middle part (can be anywhere)
+        if let Some(p) = prev_part {
+            if !p.is_empty() {
+                if let Some(pos) = remaining.find(p) {
+                    remaining = &remaining[pos + p.len()..];
+                } else {
+                    return false;
+                }
+            }
+        }
+        prev_part = Some(part);
+    }
+
+    // Process the last part: must be at end unless pattern ends with '*'
+    if let Some(last_part) = prev_part {
+        if !pattern.ends_with('*') && !last_part.is_empty() {
+            // Pattern doesn't end with '*', so last part must be suffix
+            if !remaining.ends_with(last_part) {
+                return false;
+            }
+        } else if !last_part.is_empty() {
+            // Pattern ends with '*', so last part just needs to exist
+            if !remaining.contains(last_part) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+// =============================================================================
 // Error Types
 // =============================================================================
 
@@ -408,6 +508,26 @@ pub enum ManifestError {
     InvalidPath {
         /// The reason the path is invalid.
         reason: String,
+    },
+
+    /// Write allowlist path is not absolute.
+    ///
+    /// Per CTR-1503, all write paths must be absolute to prevent
+    /// path resolution attacks.
+    #[error("write allowlist path is not absolute: {path}")]
+    WriteAllowlistPathNotAbsolute {
+        /// The path that is not absolute.
+        path: String,
+    },
+
+    /// Write allowlist path contains path traversal.
+    ///
+    /// Per CTR-1503 and CTR-2609, paths must not contain `..` components
+    /// to prevent directory escape attacks.
+    #[error("write allowlist path contains traversal (..): {path}")]
+    WriteAllowlistPathTraversal {
+        /// The path that contains traversal.
+        path: String,
     },
 }
 
@@ -778,74 +898,10 @@ impl ContextPackManifest {
         }
 
         // Check if the command matches any allowed pattern
+        // Uses the module-level shell_pattern_matches function to avoid duplication
         self.shell_allowlist
             .iter()
-            .any(|pattern| Self::shell_pattern_matches(pattern, command))
-    }
-
-    /// Matches a shell command against a pattern with simple glob support.
-    ///
-    /// Supports `*` as a wildcard that matches any sequence of characters.
-    ///
-    /// # Implementation
-    ///
-    /// Uses streaming iteration over pattern parts to avoid heap allocations
-    /// in the hot path (SEC-DOS-MDL-0001).
-    fn shell_pattern_matches(pattern: &str, command: &str) -> bool {
-        // Check for wildcards first - if none, exact match required
-        if !pattern.contains('*') {
-            return pattern == command;
-        }
-
-        // Streaming iterator over pattern parts (zero allocations)
-        let mut parts = pattern.split('*');
-        let mut remaining = command;
-
-        // Handle first part: must be at start unless pattern starts with '*'
-        if let Some(first) = parts.next() {
-            if !first.is_empty() {
-                // Pattern doesn't start with '*', so first part must be prefix
-                if let Some(stripped) = remaining.strip_prefix(first) {
-                    remaining = stripped;
-                } else {
-                    return false;
-                }
-            }
-        }
-
-        // Handle middle and last parts
-        // We peek ahead to distinguish middle parts from the last part
-        let mut prev_part: Option<&str> = None;
-        for part in parts {
-            // Process the previous part as a middle part (can be anywhere)
-            if let Some(p) = prev_part {
-                if !p.is_empty() {
-                    if let Some(pos) = remaining.find(p) {
-                        remaining = &remaining[pos + p.len()..];
-                    } else {
-                        return false;
-                    }
-                }
-            }
-            prev_part = Some(part);
-        }
-
-        // Process the last part: must be at end unless pattern ends with '*'
-        if let Some(last_part) = prev_part {
-            if !pattern.ends_with('*') && !last_part.is_empty() {
-                // Pattern doesn't end with '*', so last part must be suffix
-                if !remaining.ends_with(last_part) {
-                    return false;
-                }
-            } else if !last_part.is_empty() {
-                // Pattern ends with '*', so last part just needs to exist
-                if !remaining.contains(last_part) {
-                    return false;
-                }
-            }
-        }
-
-        true
+            .any(|pattern| shell_pattern_matches(pattern, command))
     }
 
     /// Computes the manifest hash from the manifest fields.
@@ -909,7 +965,7 @@ impl ContextPackManifest {
             .iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect();
-        sorted_write_paths.sort();
+        sorted_write_paths.sort_unstable();
         hasher.update(&(sorted_write_paths.len() as u32).to_be_bytes());
         for path in &sorted_write_paths {
             hasher.update(&(path.len() as u32).to_be_bytes());
@@ -1540,6 +1596,34 @@ impl ContextPackManifestBuilder {
                 actual: self.write_allowlist.len(),
                 max: MAX_WRITE_ALLOWLIST,
             });
+        }
+
+        // Validate write_allowlist paths (TCK-00254: CTR-1503, CTR-2609)
+        // This ensures consistency with CapabilityManifest::validate()
+        for path in &self.write_allowlist {
+            let path_len = path.as_os_str().len();
+            if path_len > MAX_PATH_LENGTH {
+                return Err(ManifestError::PathTooLong {
+                    actual: path_len,
+                    max: MAX_PATH_LENGTH,
+                });
+            }
+
+            // Per CTR-1503: Paths must be absolute
+            if !path.is_absolute() {
+                return Err(ManifestError::WriteAllowlistPathNotAbsolute {
+                    path: path.to_string_lossy().to_string(),
+                });
+            }
+
+            // Per CTR-2609: Reject path traversal (..) to prevent directory escape
+            for component in path.components() {
+                if matches!(component, std::path::Component::ParentDir) {
+                    return Err(ManifestError::WriteAllowlistPathTraversal {
+                        path: path.to_string_lossy().to_string(),
+                    });
+                }
+            }
         }
 
         // Validate shell_allowlist size (TCK-00254)
@@ -2985,5 +3069,87 @@ pub mod tests {
         assert_eq!(manifest1.entries()[0].path(), "/aaa/file.rs");
         assert_eq!(manifest1.entries()[1].path(), "/bbb/file.rs");
         assert_eq!(manifest1.entries()[2].path(), "/ccc/file.rs");
+    }
+
+    // =========================================================================
+    // TCK-00254: Write Allowlist Path Validation Tests
+    //
+    // Per Code Quality Review [MAJOR], ContextPackManifestBuilder must validate
+    // write_allowlist paths for absolute paths and traversal, consistent with
+    // CapabilityManifest::validate().
+    // =========================================================================
+
+    #[test]
+    fn tck_00254_write_allowlist_path_not_absolute() {
+        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .write_allowlist(vec![std::path::PathBuf::from("relative/path")])
+            .try_build();
+
+        assert!(
+            matches!(
+                result,
+                Err(ManifestError::WriteAllowlistPathNotAbsolute { ref path })
+                if path == "relative/path"
+            ),
+            "Expected WriteAllowlistPathNotAbsolute, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn tck_00254_write_allowlist_path_traversal() {
+        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .write_allowlist(vec![std::path::PathBuf::from("/workspace/../etc")])
+            .try_build();
+
+        assert!(
+            matches!(
+                result,
+                Err(ManifestError::WriteAllowlistPathTraversal { ref path })
+                if path == "/workspace/../etc"
+            ),
+            "Expected WriteAllowlistPathTraversal, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn tck_00254_write_allowlist_path_traversal_nested() {
+        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .write_allowlist(vec![std::path::PathBuf::from("/workspace/foo/../../etc")])
+            .try_build();
+
+        assert!(
+            matches!(result, Err(ManifestError::WriteAllowlistPathTraversal { .. })),
+            "Expected WriteAllowlistPathTraversal, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn tck_00254_write_allowlist_valid_absolute_paths() {
+        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .write_allowlist(vec![
+                std::path::PathBuf::from("/workspace"),
+                std::path::PathBuf::from("/home/user/project"),
+            ])
+            .try_build();
+
+        assert!(result.is_ok(), "Expected Ok, got {result:?}");
+        let manifest = result.unwrap();
+        assert_eq!(manifest.write_allowlist.len(), 2);
+    }
+
+    #[test]
+    fn tck_00254_write_allowlist_path_too_long() {
+        let long_path = std::path::PathBuf::from(
+            "/".to_string() + &"x".repeat(MAX_PATH_LENGTH),
+        );
+
+        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .write_allowlist(vec![long_path])
+            .try_build();
+
+        assert!(
+            matches!(result, Err(ManifestError::PathTooLong { .. })),
+            "Expected PathTooLong, got {result:?}"
+        );
     }
 }

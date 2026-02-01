@@ -49,19 +49,13 @@ use super::scope::{CapabilityScope, ScopeError};
 // Allowlist Resource Limits (TCK-00254)
 //
 // Per CTR-1303, all Vec fields must have bounded sizes to prevent DoS.
-// MAX_TOOL_ALLOWLIST is defined in apm2-core and re-exported via tool_class.
+// All MAX_*_ALLOWLIST constants are defined in apm2-core and re-exported via
+// tool_class to eliminate duplication (Code Quality Review [MAJOR]).
 // =============================================================================
-pub use super::tool_class::MAX_TOOL_ALLOWLIST;
-use super::tool_class::ToolClass;
-
-/// Maximum number of paths in the write allowlist.
-pub const MAX_WRITE_ALLOWLIST: usize = 1000;
-
-/// Maximum number of shell patterns in the shell allowlist.
-pub const MAX_SHELL_ALLOWLIST: usize = 500;
-
-/// Maximum length of a shell pattern.
-pub const MAX_SHELL_PATTERN_LEN: usize = 1024;
+pub use super::tool_class::{
+    MAX_SHELL_ALLOWLIST, MAX_SHELL_PATTERN_LEN, MAX_TOOL_ALLOWLIST, MAX_WRITE_ALLOWLIST, ToolClass,
+    shell_pattern_matches,
+};
 
 // =============================================================================
 // Clock Abstraction
@@ -938,77 +932,12 @@ impl CapabilityManifest {
             return false;
         }
 
-        // Check if the command matches any allowed pattern
+        // Check if the command matches any allowed pattern.
+        // Uses the shared shell_pattern_matches function from apm2-core to
+        // eliminate code duplication (Code Quality Review [MAJOR]).
         self.shell_allowlist
             .iter()
-            .any(|pattern| Self::shell_pattern_matches(pattern, command))
-    }
-
-    /// Matches a shell command against a pattern with simple glob support.
-    ///
-    /// Supports `*` as a wildcard that matches any sequence of characters.
-    ///
-    /// # Implementation
-    ///
-    /// Uses streaming iteration over pattern parts to avoid heap allocations
-    /// in the hot path (SEC-DOS-MDL-0001). This is critical since this method
-    /// is called for every tool request against every pattern in the shell
-    /// allowlist (up to `MAX_SHELL_ALLOWLIST` patterns).
-    fn shell_pattern_matches(pattern: &str, command: &str) -> bool {
-        // Check for wildcards first - if none, exact match required
-        if !pattern.contains('*') {
-            return pattern == command;
-        }
-
-        // Streaming iterator over pattern parts (zero allocations)
-        let mut parts = pattern.split('*');
-        let mut remaining = command;
-
-        // Handle first part: must be at start unless pattern starts with '*'
-        if let Some(first) = parts.next() {
-            if !first.is_empty() {
-                // Pattern doesn't start with '*', so first part must be prefix
-                if let Some(stripped) = remaining.strip_prefix(first) {
-                    remaining = stripped;
-                } else {
-                    return false;
-                }
-            }
-        }
-
-        // Handle middle and last parts
-        // We peek ahead to distinguish middle parts from the last part
-        let mut prev_part: Option<&str> = None;
-        for part in parts {
-            // Process the previous part as a middle part (can be anywhere)
-            if let Some(p) = prev_part {
-                if !p.is_empty() {
-                    if let Some(pos) = remaining.find(p) {
-                        remaining = &remaining[pos + p.len()..];
-                    } else {
-                        return false;
-                    }
-                }
-            }
-            prev_part = Some(part);
-        }
-
-        // Process the last part: must be at end unless pattern ends with '*'
-        if let Some(last_part) = prev_part {
-            if !pattern.ends_with('*') && !last_part.is_empty() {
-                // Pattern doesn't end with '*', so last part must be suffix
-                if !remaining.ends_with(last_part) {
-                    return false;
-                }
-            } else if !last_part.is_empty() {
-                // Pattern ends with '*', so last part just needs to exist
-                if !remaining.contains(last_part) {
-                    return false;
-                }
-            }
-        }
-
-        true
+            .any(|pattern| shell_pattern_matches(pattern, command))
     }
 
     /// Validates a tool request against this manifest.
@@ -1265,11 +1194,11 @@ impl CapabilityManifest {
             .iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect();
-        sorted_write_paths.sort();
+        sorted_write_paths.sort_unstable();
 
         // Sort shell allowlist for determinism
         let mut sorted_shell_patterns: Vec<String> = self.shell_allowlist.clone();
-        sorted_shell_patterns.sort();
+        sorted_shell_patterns.sort_unstable();
 
         let proto = CapabilityManifestProto {
             manifest_id: self.manifest_id.clone(),
@@ -2900,47 +2829,24 @@ mod tests {
     #[test]
     fn test_shell_pattern_matching_various_patterns() {
         // Exact match
-        assert!(CapabilityManifest::shell_pattern_matches("ls", "ls"));
-        assert!(!CapabilityManifest::shell_pattern_matches("ls", "ls -la"));
+        assert!(shell_pattern_matches("ls", "ls"));
+        assert!(!shell_pattern_matches("ls", "ls -la"));
 
         // Wildcard at end
-        assert!(CapabilityManifest::shell_pattern_matches(
-            "cargo *",
-            "cargo build"
-        ));
-        assert!(CapabilityManifest::shell_pattern_matches(
-            "cargo *",
-            "cargo test --release"
-        ));
-        assert!(!CapabilityManifest::shell_pattern_matches(
-            "cargo *", "npm run"
-        ));
+        assert!(shell_pattern_matches("cargo *", "cargo build"));
+        assert!(shell_pattern_matches("cargo *", "cargo test --release"));
+        assert!(!shell_pattern_matches("cargo *", "npm run"));
 
         // Wildcard at start
-        assert!(CapabilityManifest::shell_pattern_matches(
-            "* --version",
-            "cargo --version"
-        ));
-        assert!(CapabilityManifest::shell_pattern_matches(
-            "* --version",
-            "node --version"
-        ));
+        assert!(shell_pattern_matches("* --version", "cargo --version"));
+        assert!(shell_pattern_matches("* --version", "node --version"));
 
         // Wildcard in middle
-        assert!(CapabilityManifest::shell_pattern_matches(
-            "git * --amend",
-            "git commit --amend"
-        ));
+        assert!(shell_pattern_matches("git * --amend", "git commit --amend"));
 
         // Multiple wildcards
-        assert!(CapabilityManifest::shell_pattern_matches(
-            "*cargo*",
-            "run cargo build"
-        ));
-        assert!(CapabilityManifest::shell_pattern_matches(
-            "git * * -m *",
-            "git commit -a -m test"
-        ));
+        assert!(shell_pattern_matches("*cargo*", "run cargo build"));
+        assert!(shell_pattern_matches("git * * -m *", "git commit -a -m test"));
     }
 
     #[test]
