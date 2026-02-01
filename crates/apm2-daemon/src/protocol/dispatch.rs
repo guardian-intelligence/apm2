@@ -1405,8 +1405,8 @@ mod tests {
 
         /// ADV-005: Actor ID must be derived from credential, not user input.
         ///
-        /// This test verifies that different user-provided actor_ids with
-        /// the same credential produce the same derived actor_id.
+        /// This test verifies that different user-provided `actor_ids` with
+        /// the same credential produce the same derived `actor_id`.
         #[test]
         fn test_actor_id_derived_from_credential_not_user_input() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -1430,19 +1430,17 @@ mod tests {
                 actor_id: "bob".to_string(),
                 role: WorkRole::Implementer.into(),
                 credential_signature: vec![],
-                nonce: nonce.clone(),
+                nonce,
             };
             let frame2 = encode_claim_work_request(&request2);
             let response2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
 
             // Both should succeed
-            let resp1 = match response1 {
-                PrivilegedResponse::ClaimWork(r) => r,
-                _ => panic!("Expected ClaimWork response"),
+            let PrivilegedResponse::ClaimWork(resp1) = response1 else {
+                panic!("Expected ClaimWork response")
             };
-            let resp2 = match response2 {
-                PrivilegedResponse::ClaimWork(r) => r,
-                _ => panic!("Expected ClaimWork response"),
+            let PrivilegedResponse::ClaimWork(resp2) = response2 else {
+                panic!("Expected ClaimWork response")
             };
 
             // Work IDs should be different (unique per claim)
@@ -1464,7 +1462,7 @@ mod tests {
             );
         }
 
-        /// Different nonces should produce different actor_ids.
+        /// Different nonces should produce different `actor_ids`.
         #[test]
         fn test_different_nonce_produces_different_actor_id() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -1488,13 +1486,11 @@ mod tests {
             let frame2 = encode_claim_work_request(&request2);
             let response2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
 
-            let resp1 = match response1 {
-                PrivilegedResponse::ClaimWork(r) => r,
-                _ => panic!("Expected ClaimWork response"),
+            let PrivilegedResponse::ClaimWork(resp1) = response1 else {
+                panic!("Expected ClaimWork response")
             };
-            let resp2 = match response2 {
-                PrivilegedResponse::ClaimWork(r) => r,
-                _ => panic!("Expected ClaimWork response"),
+            let PrivilegedResponse::ClaimWork(resp2) = response2 else {
+                panic!("Expected ClaimWork response")
             };
 
             let claim1 = dispatcher.work_registry.get_claim(&resp1.work_id).unwrap();
@@ -1604,7 +1600,7 @@ mod tests {
             assert!(result.is_err(), "Should fail when credentials are missing");
         }
 
-        /// Test derive_actor_id function directly.
+        /// Test `derive_actor_id` function directly.
         #[test]
         fn test_derive_actor_id_deterministic() {
             let creds = PeerCredentials {
