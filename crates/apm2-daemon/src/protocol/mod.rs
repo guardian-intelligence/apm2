@@ -111,15 +111,28 @@ pub use credentials::PeerCredentials;
 #[allow(unused_imports)]
 pub use dispatch::{
     // Core dispatcher types
-    ConnectionContext, PrivilegedDispatcher, PrivilegedMessageType, PrivilegedResponse,
-    // Request encoding helpers
-    encode_claim_work_request, encode_issue_capability_request, encode_shutdown_request,
-    encode_spawn_episode_request,
+    ConnectionContext,
     // TCK-00253: Policy resolution and work claim types
-    PolicyResolution, PolicyResolutionError, PolicyResolver, StubPolicyResolver,
-    WorkClaim, WorkRegistry, WorkRegistryError, StubWorkRegistry,
+    PolicyResolution,
+    PolicyResolutionError,
+    PolicyResolver,
+    PrivilegedDispatcher,
+    PrivilegedMessageType,
+    PrivilegedResponse,
+    StubPolicyResolver,
+    StubWorkRegistry,
+    WorkClaim,
+    WorkRegistry,
+    WorkRegistryError,
     // TCK-00253: Actor ID derivation
-    derive_actor_id, generate_lease_id, generate_work_id,
+    derive_actor_id,
+    // Request encoding helpers
+    encode_claim_work_request,
+    encode_issue_capability_request,
+    encode_shutdown_request,
+    encode_spawn_episode_request,
+    generate_lease_id,
+    generate_work_id,
 };
 #[allow(unused_imports)]
 pub use error::{

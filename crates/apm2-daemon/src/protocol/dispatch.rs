@@ -733,10 +733,13 @@ impl PrivilegedDispatcher {
         }
 
         // TCK-00253: Derive authoritative actor_id from credential (not user input)
-        // Per DD-001: "actor_id is a display hint; authoritative actor_id derived from credential"
-        let peer_creds = ctx.peer_credentials().ok_or_else(|| ProtocolError::Serialization {
-            reason: "peer credentials required for work claim".to_string(),
-        })?;
+        // Per DD-001: "actor_id is a display hint; authoritative actor_id derived from
+        // credential"
+        let peer_creds = ctx
+            .peer_credentials()
+            .ok_or_else(|| ProtocolError::Serialization {
+                reason: "peer credentials required for work claim".to_string(),
+            })?;
 
         let actor_id = derive_actor_id(peer_creds, &request.nonce);
 
@@ -1527,7 +1530,8 @@ mod tests {
                         "PolicyResolvedForChangeSet reference should be present"
                     );
                     assert!(
-                        resp.policy_resolved_ref.contains("PolicyResolvedForChangeSet"),
+                        resp.policy_resolved_ref
+                            .contains("PolicyResolvedForChangeSet"),
                         "Reference should indicate PolicyResolvedForChangeSet"
                     );
                     assert_eq!(
@@ -1597,10 +1601,7 @@ mod tests {
             let result = dispatcher.dispatch(&frame, &ctx);
 
             // Should fail because we can't derive actor_id without credentials
-            assert!(
-                result.is_err(),
-                "Should fail when credentials are missing"
-            );
+            assert!(result.is_err(), "Should fail when credentials are missing");
         }
 
         /// Test derive_actor_id function directly.
@@ -1617,7 +1618,10 @@ mod tests {
             let actor2 = derive_actor_id(&creds, &nonce);
 
             assert_eq!(actor1, actor2, "Same inputs should produce same actor_id");
-            assert!(actor1.starts_with("actor:"), "Actor ID should have 'actor:' prefix");
+            assert!(
+                actor1.starts_with("actor:"),
+                "Actor ID should have 'actor:' prefix"
+            );
         }
 
         /// Test work and lease ID generation.
@@ -1631,7 +1635,10 @@ mod tests {
             let lease_id1 = generate_lease_id();
             let lease_id2 = generate_lease_id();
             assert_ne!(lease_id1, lease_id2, "Lease IDs should be unique");
-            assert!(lease_id1.starts_with("L-"), "Lease ID should start with 'L-'");
+            assert!(
+                lease_id1.starts_with("L-"),
+                "Lease ID should start with 'L-'"
+            );
         }
     }
 
