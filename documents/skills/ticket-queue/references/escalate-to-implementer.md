@@ -1,19 +1,19 @@
-title: Escalate Back to Implementer (Fix Required)
+title: Escalate to Implementer
 
 decision_tree:
   entrypoint: ESCALATE
   nodes[1]:
     - id: ESCALATE
-      purpose: "Provide a concrete fix task to the implementer when the ticket is blocked (CI failed, reviews denied, missing PR, etc.)."
+      purpose: "Provide fix task to implementer."
       steps[5]:
         - id: NOTE_VARIABLE_SUBSTITUTION
-          action: "Replace <TICKET_ID> and <CHECK_OUTPUT_SNIPPET>."
+          action: "Replace <TICKET_ID>, <CHECK_OUTPUT_SNIPPET>."
         - id: PREPARE_ESCALATION
-          action: "Summarize the blocking state and include <CHECK_OUTPUT_SNIPPET> (from `gh pr checks` or CI logs)."
+          action: "Summarize block. Include <CHECK_OUTPUT_SNIPPET>."
         - id: ISSUE_IMPLEMENTER_TASK
-          action: "Send the implementer subagent a fresh, short task: fix the blocker, run `cargo xtask commit`, run `cargo xtask push`, and report back when checks are green."
+          action: "Task: fix block, `cargo xtask commit`, `cargo xtask push`. Report when green."
         - id: SUPERVISE_PROGRESS
-          action: "Monitor implementer log/activity every 3 minutes; restart if no progress for 5 minutes."
+          action: "Monitor log every 3m. Restart if no progress for 5m."
         - id: RECHECK
           action: command
           run: "gh pr view --json statusCheckRollup"

@@ -1,13 +1,13 @@
-title: Post-Merge Cleanup and Continue
+title: Post-Merge Cleanup
 
 decision_tree:
   entrypoint: CLEANUP
   nodes[1]:
     - id: CLEANUP
-      purpose: "After a PR merges, run branch cleanup and return to the main queue loop."
+      purpose: "Delete branch after merge."
       steps[2]:
         - id: NOTE_VARIABLE_SUBSTITUTION
-          action: "Replace <BRANCH_NAME> and <TICKET_ID>."
+          action: "Replace <BRANCH_NAME>, <TICKET_ID>."
         - id: FINISH
           action: command
           run: "bash -lc 'set -euo pipefail; git checkout main && git pull && git branch -D <BRANCH_NAME>'"

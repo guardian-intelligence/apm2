@@ -4,43 +4,49 @@ decision_tree:
   entrypoint: DISPATCH
   nodes[1]:
     - id: DISPATCH
-      purpose: "Ensure an implementer subagent is active for this ticket, supervise its progress, enforce review SLA, and keep looping until the PR is merged and cleaned up."
-      steps[11]:
+      purpose: "Activate implementer, supervise progress, enforce SLA, loop until merge."
+      steps[12]:
         - id: NOTE_VARIABLE_SUBSTITUTION
-          action: "Replace <TICKET_ID> and <BRANCH_NAME>. If known, replace <IMPLEMENTER_LOG_FILE> and <IMPLEMENTER_PID> for out-of-band supervision."
+          action: "Replace <TICKET_ID>, <BRANCH_NAME>, <IMPLEMENTER_LOG_FILE>, <IMPLEMENTER_PID>."
         - id: ESTABLISH_IMPLEMENTER_CONTRACT
-          action: "Create/confirm an implementer subagent (separate process/session) that is allowed to edit code. Instruct the subagent to follow the `ticket` protocol (from `documents/skills/ticket/SKILL.md`) for the specific <TICKET_ID>. Do NOT execute that skill yourself; require the subagent to: implement, `cargo xtask commit`, `cargo xtask push`, respond to failures, and get to green."
+          action: "Spawn background implementer. Execute `/ticket <TICKET_ID>`."
         - id: REQUIRE_DEDICATED_LOG
-          action: "The implementer MUST run with a durable log you can tail out-of-band. Prefer the exact commands in `references/commands.md` (`start-claude-implementer-with-log`). Record PID + log path."
+          action: "Use `start-claude-implementer-with-log`. Record PID, log path."
+        - id: VERIFY_SKILL_INVOCATION
+          action: "Check log for `/ticket` call."
         - id: CHECK_CADENCE
-          action: "While implementer is running: follow `references/subagent-supervision.md` (3-minute cadence; STUCK threshold 5 minutes; restart on no-progress; 15-minute hard limit for context rot mitigation)."
+          action: "Follow `references/subagent-supervision.md` (60s cadence; 5m stall; 15m limit)."
         - id: PR_STATUS_CHECK
           action: command
-          run: "gh pr view <BRANCH_NAME> --json state,reviewDecision,statusCheckRollup,headRefOid,url"
+          run: "gh pr view <BRANCH_NAME> --json state,reviewDecision,statusCheckRollup,headRefOid,url,comments"
           capture_as: pr_status_json
+        - id: AI_REVIEW_STATUS_CHECK
+          action: command
+          run: "gh api repos/:owner/:repo/commits/<headRefOid>/status --jq '.statuses[] | select(.context | startswith(\"ai-review/\")) | \"\(.context): \(.state)\"''"
+          capture_as: ai_review_statuses
+        - id: MONITOR_REVIEWER_FEEDBACK
+          action: "Check `pr_status_json` for comments. Verify implementer log action."
         - id: VERIFY_REVIEWER_ALIGNMENT
-          action: "Check `reviewer-state-show` from `references/commands.md`. If active reviewers are tracking a `head_sha` that differs from the PR's `headRefOid`, or if no reviewers are active for an open PR, manually trigger/re-trigger reviews using `trigger-reviews` from `references/commands.md`."
-        - id: VERIFY_CI_LIVENESS
-          action: "If `statusCheckRollup` is ambiguous (e.g., CI reported as 'PENDING' for a long time), use `gh api` from `references/commands.md` (`list-workflow-runs`) to verify if GitHub Actions are actually active and making progress on the branch."
+          action: "Check `reviewer-state-show`. If `head_sha` mismatch or inactive, trigger reviews."
         - id: REVIEW_SLA_ENFORCEMENT
-          action: "If AI reviews are pending, enforce the 15-minute SLA using reviewer PIDs + logs. Do not allow pending reviews to persist beyond 15 minutes."
+          action: "If reviews pending (per `ai_review_statuses`), enforce 15m SLA via reviewer PIDs, logs."
         - id: MERGE_WAIT
-          action: "If CI/reviews are passing and auto-merge is enabled, keep polling until merged."
+          action: "If CI/reviews pass, poll for merge."
         - id: CLEANUP_AFTER_MERGE
-          action: "When merged, run branch cleanup (`references/post-merge-cleanup.md`), then return to the main loop."
+          action: "Run `references/post-merge-cleanup.md`, return to loop."
         - id: LOOP
-          action: "Repeat PR_STATUS_CHECK + supervision until a stop/branch condition triggers."
+          action: "Repeat check and supervision every 60s until stop."
       decisions[5]:
         - id: MERGED
-          if: "pr_status_json indicates state is MERGED"
+          if: "pr_status_json indicates MERGED"
           then:
             next_reference: references/post-merge-cleanup.md
         - id: NO_PR
-          if: "gh pr view fails or indicates no PR exists"
+          if: "gh pr view indicates no PR"
           then:
             next_reference: references/escalate-to-implementer.md
         - id: CI_FAILED
-          if: "pr_status_json indicates any status check conclusion is FAILURE"
+          if: "pr_status_json indicates FAILURE"
           then:
             next_reference: references/escalate-to-implementer.md
         - id: CHANGES_REQUESTED
@@ -48,6 +54,6 @@ decision_tree:
           then:
             next_reference: references/escalate-to-implementer.md
         - id: REVIEWS_PENDING_OR_STUCK
-          if: "pr_status_json indicates reviewDecision is REVIEW_REQUIRED OR reviewer health is stale/dead OR SLA risk"
+          if: "ai_review_statuses indicate pending OR reviewer unhealthy OR SLA risk"
           then:
             next_reference: references/review-sla.md
