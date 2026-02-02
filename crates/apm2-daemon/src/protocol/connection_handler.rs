@@ -7,7 +7,7 @@
 //!
 //! # Protocol Compliance
 //!
-//! Per the protocol specification in [`super::handshake`] and DD-001:
+//! Per the protocol specification in [`handshake`] and DD-001:
 //!
 //! 1. Client sends `Hello` message with protocol version
 //! 2. Server validates and responds with `HelloAck` or `HelloNack`
@@ -311,6 +311,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_statements)]
 mod tests {
     use std::time::Duration;
 
@@ -421,7 +422,8 @@ mod tests {
         assert!(matches!(result, HandshakeResult::Failed));
     }
 
-    /// Test that requires_privilege correctly identifies privileged operations.
+    /// Test that `requires_privilege` correctly identifies privileged
+    /// operations.
     #[test]
     fn test_requires_privilege() {
         // Ping should NOT require privilege
