@@ -50,6 +50,7 @@ use criterion::{
 /// Creates a minimal capability manifest for benchmarking.
 fn create_test_manifest() -> CapabilityManifest {
     CapabilityManifestBuilder::new("bench-manifest")
+        .delegator("bench-delegator")
         .build()
         .expect("failed to build test manifest")
 }
@@ -110,6 +111,13 @@ fn now_ns() -> u64 {
 /// - Warm daemon (runtime pre-created)
 /// - 1000 iterations per sample
 /// - Measure time from `create()` to `start()` completion
+///
+/// # Resource Management
+///
+/// Uses `iter_batched` with fresh `EpisodeRuntime` instances per batch to avoid
+/// hitting `MAX_CONCURRENT_EPISODES` limit during Criterion's many iterations.
+/// The runtime is created in the setup phase (not timed), maintaining the
+/// "warm daemon" methodology required by RFC-0017.
 fn bench_spawn_ack_latency(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -121,71 +129,73 @@ fn bench_spawn_ack_latency(c: &mut Criterion) {
     group.sample_size(100);
     group.measurement_time(Duration::from_secs(10));
 
-    // Pre-create runtime (warm daemon simulation)
     let config = EpisodeRuntimeConfig::default().with_max_concurrent_episodes(100_000);
-    let runtime = Arc::new(rt.block_on(async { EpisodeRuntime::new(config) }));
 
     group.bench_function("create_and_start", |b| {
-        let runtime = Arc::clone(&runtime);
-        let mut counter = 0u64;
+        b.iter_batched(
+            || {
+                // Setup: Create fresh runtime (not timed - this is the "warm daemon")
+                let runtime = Arc::new(rt.block_on(async { EpisodeRuntime::new(config.clone()) }));
+                let envelope_hash = create_envelope_hash(rand::random());
+                (runtime, envelope_hash)
+            },
+            |(runtime, envelope_hash)| {
+                // Timed: Measure spawn acknowledgment on warm daemon
+                rt.block_on(async move {
+                    let timestamp_ns = now_ns();
 
-        b.iter(|| {
-            counter += 1;
-            let runtime = Arc::clone(&runtime);
-            let envelope_hash = create_envelope_hash(counter);
+                    // Create episode (envelope registration)
+                    let episode_id = runtime
+                        .create(black_box(envelope_hash), timestamp_ns)
+                        .await
+                        .expect("failed to create episode");
 
-            rt.block_on(async move {
-                let timestamp_ns = now_ns();
+                    // Start episode (session_id generation)
+                    let handle = runtime
+                        .start(&episode_id, "lease-bench", timestamp_ns)
+                        .await
+                        .expect("failed to start episode");
 
-                // Create episode (envelope registration)
-                let episode_id = runtime
-                    .create(black_box(envelope_hash), timestamp_ns)
-                    .await
-                    .expect("failed to create episode");
-
-                // Start episode (session_id generation)
-                let handle = runtime
-                    .start(&episode_id, "lease-bench", timestamp_ns)
-                    .await
-                    .expect("failed to start episode");
-
-                black_box(handle)
-            })
-        });
+                    black_box(handle)
+                })
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
     // Measure `create()` alone
     group.bench_function("create_only", |b| {
-        let runtime = Arc::clone(&runtime);
-        let mut counter = 0u64;
+        b.iter_batched(
+            || {
+                // Setup: Create fresh runtime (not timed)
+                let runtime = Arc::new(rt.block_on(async { EpisodeRuntime::new(config.clone()) }));
+                let envelope_hash = create_envelope_hash(rand::random());
+                (runtime, envelope_hash)
+            },
+            |(runtime, envelope_hash)| {
+                // Timed: Measure create only
+                rt.block_on(async move {
+                    let timestamp_ns = now_ns();
 
-        b.iter(|| {
-            counter += 1;
-            let runtime = Arc::clone(&runtime);
-            let envelope_hash = create_envelope_hash(counter);
+                    let episode_id = runtime
+                        .create(black_box(envelope_hash), timestamp_ns)
+                        .await
+                        .expect("failed to create episode");
 
-            rt.block_on(async move {
-                let timestamp_ns = now_ns();
-
-                let episode_id = runtime
-                    .create(black_box(envelope_hash), timestamp_ns)
-                    .await
-                    .expect("failed to create episode");
-
-                black_box(episode_id)
-            })
-        });
+                    black_box(episode_id)
+                })
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
     // Measure `start()` alone (requires pre-created episode)
     group.bench_function("start_only", |b| {
-        let runtime = Arc::clone(&runtime);
-
         b.iter_batched(
             || {
-                // Setup: create an episode
-                let runtime = Arc::clone(&runtime);
-                rt.block_on(async move {
+                // Setup: Create runtime and pre-create an episode
+                let runtime = Arc::new(rt.block_on(async { EpisodeRuntime::new(config.clone()) }));
+                rt.block_on(async {
                     let envelope_hash = create_envelope_hash(rand::random());
                     let timestamp_ns = now_ns();
 
@@ -198,6 +208,7 @@ fn bench_spawn_ack_latency(c: &mut Criterion) {
                 })
             },
             |(runtime, episode_id, timestamp_ns)| {
+                // Timed: Measure start only
                 rt.block_on(async move {
                     let handle = runtime
                         .start(&episode_id, "lease-bench", timestamp_ns)
@@ -234,6 +245,13 @@ fn bench_spawn_ack_latency(c: &mut Criterion) {
 /// - Warm daemon (runtime pre-created)
 /// - 100 iterations per sample (longer operation)
 /// - Measure time from `create()` to broker initialized (sandbox ready proxy)
+///
+/// # Note
+///
+/// The "sandbox readiness" signal is proxied using `broker.initialize_with_manifest`
+/// since the full sandbox initialization is not yet implemented. This measures the
+/// capability manifest sealing and policy checking overhead which represents the
+/// primary control plane work in session readiness.
 fn bench_session_ready_latency(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -245,44 +263,51 @@ fn bench_session_ready_latency(c: &mut Criterion) {
     group.sample_size(50);
     group.measurement_time(Duration::from_secs(15));
 
-    // Pre-create runtime (warm daemon simulation)
+    // Pre-create runtime (warm daemon simulation per RFC-0017)
     let config = EpisodeRuntimeConfig::default().with_max_concurrent_episodes(100_000);
 
+    // Use iter_batched to create fresh runtime for each batch, avoiding episode
+    // accumulation while still measuring warm daemon performance (runtime is
+    // pre-created before the timed iteration).
     group.bench_function("full_session_init", |b| {
-        let mut counter = 0u64;
+        b.iter_batched(
+            || {
+                // Setup: Create fresh runtime (not timed - this is the "warm daemon")
+                let runtime = Arc::new(rt.block_on(async { EpisodeRuntime::new(config.clone()) }));
+                let envelope_hash = create_envelope_hash(rand::random());
+                let manifest = create_test_manifest();
+                (runtime, envelope_hash, manifest)
+            },
+            |(runtime, envelope_hash, manifest)| {
+                // Timed: Measure session initialization on warm daemon
+                rt.block_on(async move {
+                    let timestamp_ns = now_ns();
 
-        b.iter(|| {
-            counter += 1;
-            let envelope_hash = create_envelope_hash(counter);
-            let manifest = create_test_manifest();
+                    // Step 1: Create episode
+                    let episode_id = runtime
+                        .create(black_box(envelope_hash), timestamp_ns)
+                        .await
+                        .expect("failed to create episode");
 
-            rt.block_on(async {
-                let runtime = EpisodeRuntime::new(config.clone());
-                let timestamp_ns = now_ns();
+                    // Step 2: Start episode
+                    let handle = runtime
+                        .start(&episode_id, "lease-bench", timestamp_ns)
+                        .await
+                        .expect("failed to start episode");
 
-                // Step 1: Create episode
-                let episode_id = runtime
-                    .create(black_box(envelope_hash), timestamp_ns)
-                    .await
-                    .expect("failed to create episode");
+                    // Step 3: Initialize broker (capability sealing proxy for sandbox ready)
+                    let broker: ToolBroker<StubManifestLoader> =
+                        ToolBroker::new(ToolBrokerConfig::default());
+                    broker
+                        .initialize_with_manifest(manifest)
+                        .await
+                        .expect("failed to initialize broker");
 
-                // Step 2: Start episode
-                let handle = runtime
-                    .start(&episode_id, "lease-bench", timestamp_ns)
-                    .await
-                    .expect("failed to start episode");
-
-                // Step 3: Initialize broker (capability sealing proxy for sandbox ready)
-                let broker: ToolBroker<StubManifestLoader> =
-                    ToolBroker::new(ToolBrokerConfig::default());
-                broker
-                    .initialize_with_manifest(manifest)
-                    .await
-                    .expect("failed to initialize broker");
-
-                black_box((handle, broker))
-            })
-        });
+                    black_box((handle, broker))
+                })
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
     // Benchmark broker initialization alone
@@ -454,6 +479,14 @@ fn bench_tool_mediation_overhead(c: &mut Criterion) {
 /// This measures how spawn latency degrades as the number of concurrent
 /// episodes increases. Per CTR-1303, the runtime must handle up to
 /// `MAX_CONCURRENT_EPISODES` (10,000) episodes.
+///
+/// # Resource Management
+///
+/// Uses `iter_batched` with fresh pre-populated `EpisodeRuntime` instances per
+/// batch. Each batch setup creates a runtime and populates it with the target
+/// number of episodes, then the timed iteration measures adding one more episode.
+/// This avoids unbounded episode accumulation while accurately measuring scaling
+/// behavior.
 fn bench_spawn_scaling(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -466,54 +499,60 @@ fn bench_spawn_scaling(c: &mut Criterion) {
 
     for episode_count in [10, 100, 1000, 5000] {
         let config = EpisodeRuntimeConfig::default().with_max_concurrent_episodes(100_000);
-        let runtime = Arc::new(rt.block_on(async { EpisodeRuntime::new(config) }));
-
-        // Pre-populate with episodes
-        rt.block_on(async {
-            for i in 0..episode_count {
-                let envelope_hash = create_envelope_hash(u64::try_from(i).unwrap_or(0));
-                let timestamp_ns = now_ns();
-
-                let episode_id = runtime
-                    .create(envelope_hash, timestamp_ns)
-                    .await
-                    .expect("failed to create episode");
-
-                runtime
-                    .start(&episode_id, format!("lease-{i}"), timestamp_ns)
-                    .await
-                    .expect("failed to start episode");
-            }
-        });
 
         group.bench_with_input(
             BenchmarkId::from_parameter(episode_count),
             &episode_count,
-            |b, _| {
-                let runtime = Arc::clone(&runtime);
-                let mut counter = u64::try_from(episode_count).unwrap_or(0);
+            |b, &count| {
+                b.iter_batched(
+                    || {
+                        // Setup: Create and pre-populate runtime (not timed)
+                        let runtime =
+                            Arc::new(rt.block_on(async { EpisodeRuntime::new(config.clone()) }));
 
-                b.iter(|| {
-                    counter += 1;
-                    let runtime = Arc::clone(&runtime);
-                    let envelope_hash = create_envelope_hash(counter);
+                        // Pre-populate with episodes
+                        rt.block_on(async {
+                            for i in 0..count {
+                                let envelope_hash =
+                                    create_envelope_hash(u64::try_from(i).unwrap_or(0));
+                                let timestamp_ns = now_ns();
 
-                    rt.block_on(async move {
-                        let timestamp_ns = now_ns();
+                                let episode_id = runtime
+                                    .create(envelope_hash, timestamp_ns)
+                                    .await
+                                    .expect("failed to create episode");
 
-                        let episode_id = runtime
-                            .create(black_box(envelope_hash), timestamp_ns)
-                            .await
-                            .expect("failed to create episode");
+                                runtime
+                                    .start(&episode_id, format!("lease-{i}"), timestamp_ns)
+                                    .await
+                                    .expect("failed to start episode");
+                            }
+                        });
 
-                        let handle = runtime
-                            .start(&episode_id, "lease-scale", timestamp_ns)
-                            .await
-                            .expect("failed to start episode");
+                        let envelope_hash =
+                            create_envelope_hash(rand::random::<u64>() + u64::try_from(count).unwrap_or(0));
+                        (runtime, envelope_hash)
+                    },
+                    |(runtime, envelope_hash)| {
+                        // Timed: Measure spawn latency with pre-populated runtime
+                        rt.block_on(async move {
+                            let timestamp_ns = now_ns();
 
-                        black_box(handle)
-                    })
-                });
+                            let episode_id = runtime
+                                .create(black_box(envelope_hash), timestamp_ns)
+                                .await
+                                .expect("failed to create episode");
+
+                            let handle = runtime
+                                .start(&episode_id, "lease-scale", timestamp_ns)
+                                .await
+                                .expect("failed to start episode");
+
+                            black_box(handle)
+                        })
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
             },
         );
     }
