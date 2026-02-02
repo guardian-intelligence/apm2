@@ -248,10 +248,11 @@ fn bench_spawn_ack_latency(c: &mut Criterion) {
 ///
 /// # Note
 ///
-/// The "sandbox readiness" signal is proxied using `broker.initialize_with_manifest`
-/// since the full sandbox initialization is not yet implemented. This measures the
-/// capability manifest sealing and policy checking overhead which represents the
-/// primary control plane work in session readiness.
+/// The "sandbox readiness" signal is proxied using
+/// `broker.initialize_with_manifest` since the full sandbox initialization is
+/// not yet implemented. This measures the capability manifest sealing and
+/// policy checking overhead which represents the primary control plane work in
+/// session readiness.
 fn bench_session_ready_latency(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -484,9 +485,9 @@ fn bench_tool_mediation_overhead(c: &mut Criterion) {
 ///
 /// Uses `iter_batched` with fresh pre-populated `EpisodeRuntime` instances per
 /// batch. Each batch setup creates a runtime and populates it with the target
-/// number of episodes, then the timed iteration measures adding one more episode.
-/// This avoids unbounded episode accumulation while accurately measuring scaling
-/// behavior.
+/// number of episodes, then the timed iteration measures adding one more
+/// episode. This avoids unbounded episode accumulation while accurately
+/// measuring scaling behavior.
 fn bench_spawn_scaling(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -529,8 +530,9 @@ fn bench_spawn_scaling(c: &mut Criterion) {
                             }
                         });
 
-                        let envelope_hash =
-                            create_envelope_hash(rand::random::<u64>() + u64::try_from(count).unwrap_or(0));
+                        let envelope_hash = create_envelope_hash(
+                            rand::random::<u64>() + u64::try_from(count).unwrap_or(0),
+                        );
                         (runtime, envelope_hash)
                     },
                     |(runtime, envelope_hash)| {
