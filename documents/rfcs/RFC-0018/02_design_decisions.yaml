@@ -480,6 +480,27 @@ rfc_design_decisions:
         never accepted on ProtocolServer sockets.
       context: |
         Reconnect/resume must be ledger-driven and must respect DD-009.
+      anti_patterns:
+        - id: "AP-HEF-0008-001"
+          name: "Replay buffer evolves into durable pubsub"
+          cousin_path: "replay buffer -> persistent queue -> message broker -> authority leakage"
+          description: |
+            The pulse replay buffer MUST remain ephemeral and in-memory only.
+            It MUST NOT:
+              (1) Be persisted to disk or any durable storage medium
+              (2) Provide delivery acknowledgment, exactly-once, or at-least-once semantics
+              (3) Maintain subscription state beyond the lifetime of the connection
+              (4) Be used as a source of truth for ordering, content, or admission decisions
+              (5) Evolve toward message broker, durable queue, or event sourcing patterns
+
+            Any evolution toward durable pubsub functionality requires a separate RFC
+            with explicit security review under GATE-TCK-ANTI-COUSIN.
+          prevention: |
+            Implementers MUST treat ledger catch-up via since_ledger_cursor as the
+            ONLY recovery mechanism. The replay buffer exists solely to reduce
+            ledger query load during brief reconnects (target: < 5 seconds of
+            buffered history).
+          detection: "Code review flag on any disk I/O or acknowledgment logic in pulse buffer"
       alternatives:
         - id: "ALT-HEF-0008-A"
           name: "Durable broker replay"

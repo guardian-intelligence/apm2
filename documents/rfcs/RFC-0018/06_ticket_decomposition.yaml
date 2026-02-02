@@ -110,15 +110,49 @@ rfc_ticket_decomposition:
         PulseEvent frames. Enforce CAS->ledger->pulse ordering. apm2-core
         exposes only a post-commit notification interface; outbox storage stays
         in the daemon.
+      post_commit_notification_interface:
+        description: |
+          Interface specification per FND-RFC-0018-005 remediation. Defines the
+          contract between apm2-core and daemon for ledger commit notifications.
+        struct_definition: |
+          /// Notification sent after ledger commit completes.
+          /// [CTR-POSTCOMMIT-001] Notification is best-effort; failure never blocks commit.
+          /// [CTR-POSTCOMMIT-002] No daemon types in this struct.
+          pub struct CommitNotification {
+              pub seq_id: u64,
+              pub event_hash: [u8; 32],
+              pub event_type: String,
+              pub namespace: String,
+              pub consensus_index: Option<ConsensusIndex>,
+          }
+        channel_type: "tokio::sync::mpsc::Sender<CommitNotification>"
+        pattern: "CHANNEL_BASED"
+        rationale: |
+          Channel-based (not callback) for DD-HEF-0007 compliance: apm2-core must
+          not depend on daemon types. Daemon injects sender at BftLedgerBackend
+          construction; apm2-core sends to channel after on_commit() succeeds.
+        error_handling:
+          on_send_failure: "LOG_WARN_DROP (fire-and-forget; never fails commit)"
+          on_channel_disconnected: "LOG_DEBUG_IGNORE (expected during shutdown)"
+          on_channel_full: "DROP_INCREMENT_METRIC (hef_notification_drops counter)"
+        bounds:
+          channel_capacity: 1024
+          non_blocking: "MUST use try_send(); notify() MUST NOT block"
+        integration_point: "BftLedgerBackend::on_commit() sends after tx.commit() succeeds"
       files_to_modify:
-        - "crates/apm2-core/src/ledger/ (post-commit hook/outbox integration)"
+        - "crates/apm2-core/src/ledger/mod.rs (add CommitNotification + Sender type exports)"
+        - "crates/apm2-core/src/ledger/bft_backend.rs (inject channel sender, send after on_commit())"
         - "crates/apm2-daemon/src/protocol/ (pulse publisher + fanout)"
       files_to_create:
-        - "crates/apm2-daemon/src/protocol/pulse_outbox.rs (post-commit queue)"
+        - "crates/apm2-daemon/src/protocol/pulse_outbox.rs (post-commit queue draining channel)"
       acceptance_criteria:
         - "Pulse is emitted only after ledger append succeeds."
         - "apm2-core has no daemon dependency; outbox state is daemon-owned."
         - "Post-commit hook never fails the ledger append; fanout is decoupled."
+        - "CommitNotification struct defined in apm2-core with no daemon type dependencies."
+        - "Channel-based notification with try_send(); full channel drops notification."
+        - "Notification drops logged at WARN and increment hef_notification_drops metric."
+        - "BftLedgerBackend accepts optional CommitNotificationSender at construction."
       evidence_ids:
         - "EVID-HEF-0006"
 
@@ -153,18 +187,25 @@ rfc_ticket_decomposition:
       depends_on:
         - "TCK-00300"
       risk_tier: "T3"
+      preconditions:
+        - "Q-HEF-0001 resolved: Option A selected (add episode_id field to existing events)"
       summary: |
         Add episode lifecycle and IO coverage to the truth-plane:
-        - Extend proto/kernel_events.proto with EpisodeCreated/Started/Stopped
-          (or add episode_id to existing Session/Tool events) and an IO artifact
-          reference event.
+        - Per Q-HEF-0001 resolution (Option A): Add optional episode_id field to
+          existing Session/Tool kernel events (SessionStarted, SessionProgress,
+          SessionTerminated, SessionQuarantined, ToolRequested, ToolDecided, ToolExecuted).
+        - Add IO artifact reference event for episode.<episode_id>.io topic derivation.
+        - Daemon populates episode_id from episode context when emitting ledger events.
         - Emit ledger events from daemon episode runtime.
       files_to_modify:
-        - "proto/kernel_events.proto (add episode lifecycle + IO event types)"
-        - "crates/apm2-daemon/src/episode/ (emit new ledger events)"
+        - "proto/kernel_events.proto (add optional episode_id field to Session/Tool events + IO artifact event)"
+        - "crates/apm2-daemon/src/episode/ (populate episode_id in ledger event emission)"
       files_to_create: []
       acceptance_criteria:
         - "Episode pulses are derived from ledger events, not IPC-only messages."
+        - "Session/Tool events include optional episode_id field (empty for non-episode sessions)."
+        - "Existing ledger events replay correctly (episode_id defaults to empty string)."
+        - "Topic derivation extracts episode_id from event fields for episode.*.{lifecycle,tool,io} topics."
       evidence_ids:
         - "EVID-HEF-0006"
 
@@ -371,16 +412,25 @@ rfc_ticket_decomposition:
         daemon-side CAS access facade (policy/broker layer) before invoking
         core CAS APIs. Phase 1 session.sock forbids wildcards; allowlists must
         enumerate exact topics.
+      module_structure:
+        evidence_module_exists: true
+        evidence_module_path: "crates/apm2-daemon/src/evidence/mod.rs"
+        cas_access_placement: |
+          cas_access.rs will be added as a submodule of the existing evidence module.
+          Add `pub mod cas_access;` to evidence/mod.rs to wire the facade.
       files_to_modify:
         - "crates/apm2-daemon/src/episode/capability.rs (add topic_allowlist + cas_hash_allowlist fields)"
         - "crates/apm2-daemon/src/protocol/session_dispatch.rs (enforce topic allowlist)"
-        - "crates/apm2-daemon/src/evidence/mod.rs (wire CAS access facade)"
+        - "crates/apm2-daemon/src/evidence/mod.rs (add pub mod cas_access; wire CAS access facade)"
       files_to_create:
-        - "crates/apm2-daemon/src/evidence/cas_access.rs (policy-gated CAS read facade)"
+        - "crates/apm2-daemon/src/evidence/cas_access.rs (policy-gated CAS read facade; submodule of evidence)"
       acceptance_criteria:
         - "Session subscriptions reject any topic not explicitly allowlisted."
         - "Session wildcard patterns are rejected in Phase 1."
         - "CAS reads for ChangeSetBundle/Review artifacts are denied unless hash allowlisted at daemon CAS access facade."
+        - "cas_access.rs MUST be the sole entry point for session-context CAS reads."
+        - "Direct CAS API calls from session_dispatch.rs or consume.rs bypassing the facade are forbidden."
+        - "Module location documented in evidence/mod.rs header comment."
       evidence_ids:
         - "EVID-HEF-0002"
 

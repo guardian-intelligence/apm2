@@ -4,9 +4,12 @@ rfc_meta:
   rfc:
     id: "RFC-0018"
     title: "Holonic Event Fabric (HEF) Phase 1 - Pulse Plane to Accelerate FAC"
-    status: "DRAFT"
+    status: "APPROVED"
+    version: "v4"
     created_date: "2026-02-01"
-    last_updated_date: "2026-02-01"
+    last_updated_date: "2026-02-02"
+    approval_date: "2026-02-02"
+    approval_evidence: "evidence/rfc/RFC-0018/reviews/rfc_finalize_20260202T050000Z.yaml"
   binds_to_prd:
     prd_id: "PRD-0009"
     # prd_base_path is relative to the project root (e.g., documents/prds/PRD-0001/)

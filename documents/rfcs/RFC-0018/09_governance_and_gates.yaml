@@ -28,11 +28,30 @@ rfc_governance_and_gates:
         - "SECURITY_SCAN_RESULTS"
   gate_reviews:
     - gate_id: "GATE-RFC-ARCHITECTURE"
-      status: "PENDING"
-      evidence_ids: []
+      status: "APPROVED"
+      approval_date: "2026-02-02"
+      evidence_ids:
+        - "EVID-HEF-0001"
+        - "EVID-HEF-0002"
+        - "EVID-HEF-0003"
+      council_evidence:
+        - "evidence/rfc/RFC-0018/reviews/rfc_finalize_20260202T050000Z.yaml"
+        - "evidence/rfc/RFC-0018/reviews/sa3_security_assurance_case_20260202.yaml"
+      approval_notes: |
+        FINALIZE council unanimous approval. SA-1 structural convergence assessment
+        achieved 8.89 composite score. All design decisions well-grounded.
     - gate_id: "GATE-RFC-SECURITY"
-      status: "PENDING"
-      evidence_ids: []
+      status: "APPROVED"
+      approval_date: "2026-02-02"
+      evidence_ids:
+        - "EVID-HEF-0001"
+        - "EVID-HEF-0002"
+        - "EVID-HEF-0004"
+      council_evidence:
+        - "evidence/rfc/RFC-0018/reviews/sa3_security_assurance_case_20260202.yaml"
+      approval_notes: |
+        SA-3 produced GSN-style assurance case with STRIDE decomposition.
+        All 6 threat branches achieved HIGH confidence. Watchlist items addressed.
     - gate_id: "GATE-HEF-REDTEAM"
       status: "PENDING"
       evidence_ids:

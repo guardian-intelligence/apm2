@@ -67,8 +67,31 @@ rfc_risks_and_open_questions:
   open_questions:
     - id: "Q-HEF-0001"
       question: "Should episode_id be added to existing Session/Tool kernel events, or should new Episode* events be added?"
-      decision_needed_by: "2026-02-15"
+      decision_needed_by: "2026-02-05"
       resolution_plan: "Prototype both schema options; select minimal-change path that preserves replay determinism."
+      resolution:
+        status: RESOLVED
+        choice: "OPTION_A_ADD_FIELD"
+        date: "2026-02-02"
+        rationale: |
+          Option A (add episode_id field to existing events) is selected based on satisficing analysis:
+          1. Non-breaking proto change (optional field addition to ~7 messages)
+          2. Existing ledger events replay correctly (episode_id defaults to empty)
+          3. Daemon already maps episode_id <-> session_id (apm2d_runtime_v1.proto:35-36)
+          4. Single code path: populate episode_id at daemon emission time
+          5. Topic derivation uses existing event types with episode_id field extraction
+
+          Option B (new Episode* events) was considered but rejected because it
+          requires new event types, new emission paths, and correlation logic
+          between Episode* and existing Session/Tool events.
+        implementation_guidance: |
+          Add optional string episode_id to: SessionStarted, SessionProgress,
+          SessionTerminated, SessionQuarantined, ToolRequested, ToolDecided, ToolExecuted.
+          Daemon populates episode_id from episode context when emitting ledger events.
+          Pulse topic derivation extracts episode_id from events.
+        evidence_refs:
+          - "apm2d_runtime_v1.proto:35-36 (existing episode_id/session_id mapping)"
+          - "SA-2 satisficing analysis (FND-RFC-0018-004 remediation)"
     - id: "Q-HEF-0002"
       question: "Should DefectRecord be embedded directly in ledger events or stored in CAS with hash reference?"
       decision_needed_by: "2026-02-15"
@@ -77,11 +100,55 @@ rfc_risks_and_open_questions:
       question: "Do we require a small in-memory pulse replay buffer for short reconnects, or force pure ledger catch-up?"
       decision_needed_by: "2026-02-20"
       resolution_plan: "Define operator UX needs; keep buffer optional and non-authoritative if added."
+      resolution:
+        status: RESOLVED
+        choice: "OPTIONAL_NON_AUTHORITATIVE_BUFFER"
+        date: "2026-02-02"
+        rationale: |
+          FINALIZE council determined this question was already answered by DD-HEF-0008
+          and AP-HEF-0008-001. The design explicitly specifies:
+          1. Replay buffer is OPTIONAL
+          2. Buffer is non-authoritative (ephemeral, in-memory only)
+          3. Ledger catch-up via since_ledger_cursor is the ONLY recovery mechanism
+          4. Buffer MUST NOT be persisted or provide delivery guarantees
+          5. Target: <5 seconds of buffered history only
+        implementation_guidance: |
+          Buffer implementation is optional. If implemented, MUST comply with
+          AP-HEF-0008-001 constraints. TCK-00308 red-team suite MUST include tests
+          for buffer authority leakage.
     - id: "Q-HEF-0004"
       question: "Should ReviewReceiptRecorded be a new kernel event, or should review success be represented via GateReceipt evidence bundles only?"
       decision_needed_by: "2026-02-20"
       resolution_plan: "Compare schema churn vs audit clarity; keep v0 path consistent with FAC receipt semantics."
+      resolution:
+        status: RESOLVED
+        choice: "NEW_KERNEL_EVENT"
+        date: "2026-02-02"
+        rationale: |
+          FINALIZE council determined this was falsely open - the design had already committed:
+          1. FAC-V0-003 explicitly requires "ReviewReceiptRecorded ledger event referencing CAS hash"
+          2. TCK-00312 specifies ReviewReceiptRecorded event implementation
+          3. Distinct event provides audit clarity and requirement fidelity (REQ-HEF-0011)
+          4. ReviewReceipt serves different purpose than GateReceipt (anchors reviewer outputs vs gate decisions)
+        implementation_guidance: |
+          TCK-00312 implements ReviewReceiptRecorded as specified. Event MUST bind to
+          changeset_digest and ReviewArtifactBundleV1 CAS hash per acceptance criteria.
     - id: "Q-HEF-0005"
       question: "Should changeset_digest remain embedded in ChangeSetBundle (Option A) or move to ledger event only (Option B)?"
       decision_needed_by: "2026-02-22"
       resolution_plan: "For v0, keep Option A to align with CAS/EventHasher BLAKE3 hashing and single canonical bundle witness; reconsider Option B only if ledger-only binding demonstrably simplifies validation and avoids redundancy."
+      resolution:
+        status: RESOLVED
+        choice: "OPTION_A_EMBEDDED"
+        date: "2026-02-02"
+        rationale: |
+          FINALIZE council determined Option A is structurally required by DD-HEF-0010:
+          1. DD-HEF-0010 specifies "changeset_digest computed as BLAKE3-256 over canonical
+             bundle bytes with the changeset_digest field omitted from hash input"
+          2. This specification REQUIRES the digest to be a field within the bundle
+          3. Option B would break the self-referential canonicalization requirement
+          4. Option A provides single canonical bundle witness with self-contained verification
+        implementation_guidance: |
+          TCK-00310 implements ChangeSetBundleV1 with changeset_digest field. Hash input
+          MUST omit the changeset_digest field during BLAKE3 computation. Deterministic
+          digest test validates same inputs produce same digest.
