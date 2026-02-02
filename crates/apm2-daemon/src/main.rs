@@ -366,6 +366,14 @@ async fn main() -> Result<()> {
     let daemon_config = DaemonConfig::new(&args)?;
     let supervisor = init_supervisor(&daemon_config.config);
 
+    // TCK-00268: Initialize Prometheus metrics registry early so we can pass it
+    // to DaemonStateHandle. This allows handlers to record IPC metrics.
+    let metrics_registry = if daemon_config.metrics_disabled {
+        None
+    } else {
+        Some(new_shared_registry().context("failed to initialize metrics registry")?)
+    };
+
     // Create shared state with schema registry and session registry
     // The registries persist for the daemon's lifetime (TCK-00181, TCK-00266)
     //
@@ -377,6 +385,7 @@ async fn main() -> Result<()> {
             supervisor,
             registry, // Pass the registry created during bootstrap
             &daemon_config.state_file_path,
+            metrics_registry.clone(), // TCK-00268: Pass metrics registry for handler access
         )
         .context("failed to initialize persistent session registry")?,
     );
@@ -398,12 +407,8 @@ async fn main() -> Result<()> {
         // usable
     }
 
-    // TCK-00268: Initialize Prometheus metrics registry
-    let metrics_registry =
-        new_shared_registry().context("failed to initialize metrics registry")?;
-
     info!(
-        metrics_enabled = !daemon_config.metrics_disabled,
+        metrics_enabled = metrics_registry.is_some(),
         "Metrics registry initialized"
     );
 
@@ -439,12 +444,9 @@ async fn main() -> Result<()> {
     });
 
     // TCK-00268: Start Prometheus metrics HTTP server
-    let metrics_task = if daemon_config.metrics_disabled {
-        info!("Metrics HTTP server disabled");
-        None
-    } else {
+    let metrics_task = if let Some(ref metrics_reg) = metrics_registry {
         let metrics_addr: SocketAddr = ([127, 0, 0, 1], daemon_config.metrics_port).into();
-        let metrics_reg = Arc::clone(&metrics_registry);
+        let metrics_reg = Arc::clone(metrics_reg);
         info!(
             addr = %metrics_addr,
             "Starting metrics HTTP server"
@@ -454,6 +456,9 @@ async fn main() -> Result<()> {
                 error!("Metrics server error: {}", e);
             }
         }))
+    } else {
+        info!("Metrics HTTP server disabled");
+        None
     };
 
     // Handle Unix signals
