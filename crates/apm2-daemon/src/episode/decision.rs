@@ -675,8 +675,9 @@ pub enum ToolDecision {
         ///
         /// When a termination triggers a refinement workflow (e.g., requesting
         /// expanded context permissions), this field carries the serialized
-        /// `CoordinationEvent` as opaque bytes. The caller (typically `consume.rs`)
-        /// is responsible for deserializing and emitting this event.
+        /// `CoordinationEvent` as opaque bytes. The caller (typically
+        /// `consume.rs`) is responsible for deserializing and emitting
+        /// this event.
         ///
         /// The opaque bytes representation avoids circular dependencies between
         /// `apm2_daemon` decision types and `apm2_core` event types.

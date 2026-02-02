@@ -37,8 +37,8 @@
 
 use std::sync::Arc;
 
-use apm2_core::context::firewall::{ContextAwareValidator, DefaultContextFirewall, FirewallMode};
 use apm2_core::context::ContextPackManifest;
+use apm2_core::context::firewall::{ContextAwareValidator, DefaultContextFirewall, FirewallMode};
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
@@ -496,8 +496,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         // - Execute operations: Check command against shell_allowlist (if configured)
         //
         // NOTE: DefaultContextFirewall::new() is instantiated per-request. This is
-        // acceptable overhead since the struct is lightweight (borrows manifest reference)
-        // and avoids storing additional state in the broker.
+        // acceptable overhead since the struct is lightweight (borrows manifest
+        // reference) and avoids storing additional state in the broker.
         if let Some(context_manifest) = self.context_manifest.read().await.as_ref() {
             // Helper to create termination decision
             // NOTE: We use episode_id as session_id here because the broker operates
@@ -1392,12 +1392,9 @@ mod tests {
         write_paths: Vec<PathBuf>,
         shell_patterns: Vec<String>,
     ) -> apm2_core::context::ContextPackManifest {
-        use apm2_core::context::{
-            AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder,
-        };
+        use apm2_core::context::{AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder};
 
-        let mut builder =
-            ContextPackManifestBuilder::new("ctx-manifest-test", "profile-test");
+        let mut builder = ContextPackManifestBuilder::new("ctx-manifest-test", "profile-test");
 
         for (path, hash) in entries {
             builder = builder.add_entry(
@@ -1488,7 +1485,11 @@ mod tests {
             .unwrap();
 
         // Request should be allowed (both context firewall and capability check pass)
-        let request = make_request("req-allowed", ToolClass::Read, Some("/workspace/allowed.rs"));
+        let request = make_request(
+            "req-allowed",
+            ToolClass::Read,
+            Some("/workspace/allowed.rs"),
+        );
         let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
 
         assert!(
@@ -1582,8 +1583,9 @@ mod tests {
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
 
         // Set up capability manifest allowing writes to /workspace
-        // We give capability manifest a broad write allowlist, so it passes capability check.
-        // The context firewall should then terminate on paths outside ITS allowlist.
+        // We give capability manifest a broad write allowlist, so it passes capability
+        // check. The context firewall should then terminate on paths outside
+        // ITS allowlist.
         let tool_classes = vec![ToolClass::Write];
         let manifest = CapabilityManifest::builder("test-manifest")
             .delegator("test-delegator")
@@ -1610,7 +1612,11 @@ mod tests {
             .unwrap();
 
         // Request to write outside context's allowed path should terminate
-        let request = make_request("req-write-denied", ToolClass::Write, Some("/workspace/secret.txt"));
+        let request = make_request(
+            "req-write-denied",
+            ToolClass::Write,
+            Some("/workspace/secret.txt"),
+        );
         let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
 
         assert!(
@@ -1690,11 +1696,8 @@ mod tests {
 
         // Set up context manifest with shell_allowlist for cargo ONLY
         // This is more restrictive than the capability manifest
-        let context_manifest = make_context_manifest(
-            Vec::new(),
-            Vec::new(),
-            vec!["cargo *".to_string()],
-        );
+        let context_manifest =
+            make_context_manifest(Vec::new(), Vec::new(), vec!["cargo *".to_string()]);
         broker
             .initialize_with_context_manifest(context_manifest)
             .await
@@ -1735,11 +1738,8 @@ mod tests {
         broker.initialize_with_manifest(manifest).await.unwrap();
 
         // Set up context manifest with shell_allowlist for cargo
-        let context_manifest = make_context_manifest(
-            Vec::new(),
-            Vec::new(),
-            vec!["cargo *".to_string()],
-        );
+        let context_manifest =
+            make_context_manifest(Vec::new(), Vec::new(), vec!["cargo *".to_string()]);
         broker
             .initialize_with_context_manifest(context_manifest)
             .await
@@ -1777,11 +1777,8 @@ mod tests {
         broker.initialize_with_manifest(manifest).await.unwrap();
 
         // Set up context manifest with shell_allowlist
-        let context_manifest = make_context_manifest(
-            Vec::new(),
-            Vec::new(),
-            vec!["cargo *".to_string()],
-        );
+        let context_manifest =
+            make_context_manifest(Vec::new(), Vec::new(), vec!["cargo *".to_string()]);
         broker
             .initialize_with_context_manifest(context_manifest)
             .await
@@ -1879,7 +1876,8 @@ mod tests {
         // Empty context allowlists = bypass context firewall for those operations
         let context_manifest = make_context_manifest(
             vec![("/workspace/allowed.rs", [0x42; 32])], // read entries only
-            Vec::new(), // empty write_allowlist - bypass context check
+            Vec::new(),                                  /* empty write_allowlist - bypass
+                                                          * context check */
             Vec::new(), // empty shell_allowlist - bypass context check
         );
         broker
@@ -1887,18 +1885,26 @@ mod tests {
             .await
             .unwrap();
 
-        // Write request should proceed (empty context allowlist = no context firewall check)
+        // Write request should proceed (empty context allowlist = no context firewall
+        // check)
         let write_request = make_request("req-write", ToolClass::Write, Some("/workspace/any.txt"));
-        let write_decision = broker.request(&write_request, timestamp_ns(0)).await.unwrap();
+        let write_decision = broker
+            .request(&write_request, timestamp_ns(0))
+            .await
+            .unwrap();
         assert!(
             write_decision.is_allowed(),
             "write should be allowed when context write_allowlist is empty, got: {write_decision:?}"
         );
 
-        // Execute request should proceed (empty context allowlist = no context firewall check)
+        // Execute request should proceed (empty context allowlist = no context firewall
+        // check)
         let mut exec_request = make_request("req-exec", ToolClass::Execute, None);
         exec_request = exec_request.with_shell_command("any command");
-        let exec_decision = broker.request(&exec_request, timestamp_ns(1)).await.unwrap();
+        let exec_decision = broker
+            .request(&exec_request, timestamp_ns(1))
+            .await
+            .unwrap();
         assert!(
             exec_decision.is_allowed(),
             "execute should be allowed when context shell_allowlist is empty, got: {exec_decision:?}"
