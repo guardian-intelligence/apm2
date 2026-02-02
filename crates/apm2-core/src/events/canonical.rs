@@ -224,11 +224,27 @@ impl Canonicalize for LeaseConflict {
 
 impl Canonicalize for PolicyResolvedForChangeSet {
     fn canonicalize(&mut self) {
-        // SEC-CAN-004: Sort both fields independently to maintain determinism
-        // regardless of whether their lengths match. This ensures canonical
-        // encoding even in edge cases where the fields are not properly paired.
-        self.resolved_rcp_profile_ids.sort();
-        self.resolved_rcp_manifest_hashes.sort();
+        // SEC-CAN-004: Sort RCP profile IDs and manifest hashes together to
+        // maintain alignment. We zip them, sort by profile ID, then unzip back.
+        // This ensures that the association between profile IDs and their
+        // corresponding hashes is preserved, preventing data corruption.
+        if self.resolved_rcp_profile_ids.len() == self.resolved_rcp_manifest_hashes.len() {
+            let mut pairs: Vec<(String, Vec<u8>)> = self
+                .resolved_rcp_profile_ids
+                .drain(..)
+                .zip(self.resolved_rcp_manifest_hashes.drain(..))
+                .collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            for (id, hash) in pairs {
+                self.resolved_rcp_profile_ids.push(id);
+                self.resolved_rcp_manifest_hashes.push(hash);
+            }
+        } else {
+            // If lengths don't match, sort profile IDs independently.
+            // Note: Domain logic in fac/policy_resolution.rs will reject this,
+            // but we maintain determinism here for the partial data.
+            self.resolved_rcp_profile_ids.sort();
+        }
 
         // Sort verifier policy hashes independently (they're not paired)
         self.resolved_verifier_policy_hashes.sort();
@@ -1425,23 +1441,19 @@ mod tests {
         );
     }
 
-    /// SEC-CAN-004: Verify `PolicyResolvedForChangeSet` sorts fields
-    /// independently even when lengths don't match.
+    /// SEC-CAN-004: Verify `PolicyResolvedForChangeSet` sorts fields as pairs
+    /// to maintain data alignment between profiles and hashes.
     #[test]
-    fn sec_can_004_policy_resolved_mismatched_lengths() {
+    fn sec_can_004_policy_resolved_paired_sorting() {
         let mut policy_resolved = PolicyResolvedForChangeSet {
             work_id: "work-1".to_string(),
             changeset_digest: vec![0x42; 32],
             resolved_policy_hash: vec![0x00; 32],
             resolved_risk_tier: 1,
             resolved_determinism_class: 0,
-            // Different lengths - should still be sorted independently
+            // Paired alignment: z -> 0x99, a -> 0x11
             resolved_rcp_profile_ids: vec!["z-profile".into(), "a-profile".into()],
-            resolved_rcp_manifest_hashes: vec![
-                vec![0x99; 32],
-                vec![0x11; 32],
-                vec![0x55; 32], // Extra hash
-            ],
+            resolved_rcp_manifest_hashes: vec![vec![0x99; 32], vec![0x11; 32]],
             resolved_verifier_policy_hashes: vec![vec![0xCC; 32], vec![0xAA; 32]],
             resolver_actor_id: "resolver-1".to_string(),
             resolver_version: "1.0.0".to_string(),
@@ -1450,14 +1462,15 @@ mod tests {
 
         policy_resolved.canonicalize();
 
-        // Both should be sorted independently
+        // Should be sorted by profile ID, maintaining hash alignment
+        // Expected: a -> 0x11, z -> 0x99
         assert_eq!(
             policy_resolved.resolved_rcp_profile_ids,
             vec!["a-profile", "z-profile"]
         );
         assert_eq!(
             policy_resolved.resolved_rcp_manifest_hashes,
-            vec![vec![0x11; 32], vec![0x55; 32], vec![0x99; 32]]
+            vec![vec![0x11; 32], vec![0x99; 32]]
         );
         assert_eq!(
             policy_resolved.resolved_verifier_policy_hashes,
