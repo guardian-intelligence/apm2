@@ -1,6 +1,15 @@
 //! Shared daemon state.
 //!
 //! Provides thread-safe shared state for the daemon.
+//!
+//! # TCK-00287: Security Fixes
+//!
+//! Per the security review, dispatchers and registries must be shared across
+//! connections to prevent state loss and authentication secret rotation issues.
+//! This module provides the `DispatcherState` struct that holds:
+//! - `PrivilegedDispatcher` with shared registries
+//! - `SessionDispatcher` with stable `TokenMinter` secret
+//! - `FailClosedManifestStore` that denies all tools by default
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,12 +22,124 @@ use apm2_core::process::runner::ProcessRunner;
 use apm2_core::schema_registry::InMemorySchemaRegistry;
 use apm2_core::supervisor::Supervisor;
 use apm2_daemon::episode::{
-    InMemorySessionRegistry, PersistentRegistryError, PersistentSessionRegistry,
+    CapabilityManifest, InMemorySessionRegistry, PersistentRegistryError, PersistentSessionRegistry,
 };
 use apm2_daemon::metrics::SharedMetricsRegistry;
+use apm2_daemon::protocol::dispatch::PrivilegedDispatcher;
+use apm2_daemon::protocol::session_dispatch::{ManifestStore, SessionDispatcher};
+use apm2_daemon::protocol::session_token::TokenMinter;
 use apm2_daemon::session::SessionRegistry;
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
+
+// ============================================================================
+// TCK-00287: Fail-Closed Manifest Store
+// ============================================================================
+
+/// A manifest store that always returns `None`, enforcing fail-closed behavior.
+///
+/// Per TCK-00287 security review item 3 (Permissive Default), the `SessionDispatcher`
+/// must deny all tools if no manifest is available. When this store is used with
+/// `SessionDispatcher::with_manifest_store()`, any tool request will be denied
+/// because `get_manifest()` returns `None`, triggering the fail-closed path in
+/// `handle_request_tool()`.
+///
+/// # Security Invariant (INV-TCK-00260-002)
+///
+/// Empty or missing `tool_allowlist` denies all tools (fail-closed).
+#[derive(Debug, Default)]
+pub struct FailClosedManifestStore;
+
+impl ManifestStore for FailClosedManifestStore {
+    fn get_manifest(&self, _session_id: &str) -> Option<Arc<CapabilityManifest>> {
+        // Always return None to trigger fail-closed behavior in SessionDispatcher.
+        // The dispatcher will return SESSION_ERROR_TOOL_NOT_ALLOWED when no manifest
+        // is found for a session.
+        None
+    }
+}
+
+// ============================================================================
+// TCK-00287: Shared Dispatcher State
+// ============================================================================
+
+/// Shared dispatcher state across all connections.
+///
+/// Per TCK-00287 security review:
+/// - Item 1 (Cross-Connection State Loss): Dispatchers must persist across connections
+/// - Item 2 (Authentication Secret Rotation): `TokenMinter` secret must be stable
+/// - Item 3 (Permissive Default): Must use fail-closed manifest store
+///
+/// This struct is created once at daemon startup and shared across all connection
+/// handlers via `Arc`.
+pub struct DispatcherState {
+    /// Privileged endpoint dispatcher with shared registries.
+    ///
+    /// Contains `WorkRegistry`, `SessionRegistry`, and `LedgerEventEmitter` that
+    /// persist across connections.
+    privileged_dispatcher: PrivilegedDispatcher,
+
+    /// Session endpoint dispatcher with stable token minter.
+    ///
+    /// The `TokenMinter` uses a single secret generated at daemon startup,
+    /// ensuring tokens minted on one connection are valid on other connections.
+    session_dispatcher: SessionDispatcher<FailClosedManifestStore>,
+}
+
+impl DispatcherState {
+    /// Creates new dispatcher state with shared registries and stable secrets.
+    ///
+    /// # Arguments
+    ///
+    /// * `metrics_registry` - Optional metrics registry for observability
+    ///
+    /// # Security
+    ///
+    /// - Generates a single HMAC secret for `TokenMinter` at startup
+    /// - Uses `FailClosedManifestStore` to deny all tools by default
+    /// - Registries persist for daemon lifetime
+    #[must_use]
+    pub fn new(metrics_registry: Option<SharedMetricsRegistry>) -> Self {
+        // TCK-00287 Item 2: Generate a single stable secret at daemon startup.
+        // This secret is used for the entire daemon lifetime, ensuring tokens
+        // minted on one connection are valid on other connections.
+        let token_secret = TokenMinter::generate_secret();
+        let token_minter = TokenMinter::new(token_secret);
+
+        // TCK-00287 Item 3: Use fail-closed manifest store.
+        // All tool requests will be denied until a manifest is explicitly
+        // registered for the session.
+        let manifest_store = Arc::new(FailClosedManifestStore);
+        let session_dispatcher =
+            SessionDispatcher::with_manifest_store(token_minter, manifest_store);
+
+        // Create privileged dispatcher with optional metrics
+        let privileged_dispatcher = metrics_registry.map_or_else(
+            PrivilegedDispatcher::new,
+            |metrics| PrivilegedDispatcher::new().with_metrics(metrics),
+        );
+
+        Self {
+            privileged_dispatcher,
+            session_dispatcher,
+        }
+    }
+
+    /// Returns a reference to the privileged dispatcher.
+    #[must_use]
+    pub const fn privileged_dispatcher(&self) -> &PrivilegedDispatcher {
+        &self.privileged_dispatcher
+    }
+
+    /// Returns a reference to the session dispatcher.
+    #[must_use]
+    pub const fn session_dispatcher(&self) -> &SessionDispatcher<FailClosedManifestStore> {
+        &self.session_dispatcher
+    }
+}
+
+/// Shared dispatcher state type alias.
+pub type SharedDispatcherState = Arc<DispatcherState>;
 
 /// Key for looking up process runners: (`ProcessId`, `instance_index`).
 pub type RunnerKey = (ProcessId, u32);

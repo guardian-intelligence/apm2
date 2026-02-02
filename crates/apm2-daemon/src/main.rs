@@ -66,7 +66,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::state::{DaemonStateHandle, SharedState};
+use crate::state::{DaemonStateHandle, DispatcherState, SharedDispatcherState, SharedState};
 
 /// apm2 daemon - AI CLI process manager
 #[derive(Parser, Debug)]
@@ -556,14 +556,25 @@ async fn async_main(args: Args) -> Result<()> {
         info!("Managing {} processes", inner.supervisor.process_count());
     }
 
+    // TCK-00287: Create shared dispatcher state at daemon startup.
+    // Per security review:
+    // - Item 1: Dispatchers persist across connections (no state loss)
+    // - Item 2: TokenMinter uses stable secret (tokens valid across connections)
+    // - Item 3: FailClosedManifestStore denies all tools by default
+    let dispatcher_state: SharedDispatcherState =
+        Arc::new(DispatcherState::new(metrics_registry.clone()));
+
     // TCK-00279: Start ProtocolServer-only control plane
     // This is the ONLY control-plane listener. Legacy JSON IPC has been removed per
     // DD-009.
     let socket_manager = Arc::new(socket_manager);
     let ipc_state = state.clone();
+    let ipc_dispatcher_state = Arc::clone(&dispatcher_state);
     let ipc_socket_manager = Arc::clone(&socket_manager);
     let protocol_server_task = tokio::spawn(async move {
-        if let Err(e) = run_socket_manager_server(ipc_socket_manager, ipc_state).await {
+        if let Err(e) =
+            run_socket_manager_server(ipc_socket_manager, ipc_state, ipc_dispatcher_state).await
+        {
             error!("ProtocolServer error: {}", e);
         }
     });
@@ -734,6 +745,14 @@ async fn perform_crash_recovery(_state: &SharedState) -> Result<()> {
 /// - `operator.sock` (mode 0600): Privileged operations
 /// - `session.sock` (mode 0660): Session-scoped operations
 ///
+/// # TCK-00287 Security Fixes
+///
+/// Per the security review, this function now passes shared dispatcher state
+/// to connection handlers, ensuring:
+/// - Registries persist across connections (Item 1)
+/// - Token secrets are stable (Item 2)
+/// - Fail-closed defaults are enforced (Item 3)
+///
 /// # Acceptance Criteria (TCK-00279)
 ///
 /// - No `ipc_server::run` invocation in default build
@@ -742,6 +761,7 @@ async fn perform_crash_recovery(_state: &SharedState) -> Result<()> {
 async fn run_socket_manager_server(
     socket_manager: Arc<SocketManager>,
     state: SharedState,
+    dispatcher_state: SharedDispatcherState,
 ) -> Result<()> {
     info!("ProtocolServer control plane started (operator.sock + session.sock only)");
 
@@ -759,9 +779,15 @@ async fn run_socket_manager_server(
         match accept_result {
             Ok(Ok((connection, _permit, socket_type))) => {
                 let conn_state = state.clone();
+                let conn_dispatcher_state = Arc::clone(&dispatcher_state);
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_dual_socket_connection(connection, socket_type, conn_state).await
+                    if let Err(e) = handle_dual_socket_connection(
+                        connection,
+                        socket_type,
+                        conn_state,
+                        conn_dispatcher_state,
+                    )
+                    .await
                     {
                         warn!("Connection handler error: {e}");
                     }
@@ -789,23 +815,32 @@ async fn run_socket_manager_server(
 /// in DD-001/DD-008, then processes protobuf messages via tag-based
 /// dispatchers. Legacy JSON IPC has been removed per DD-009.
 ///
+/// # TCK-00287 Security Fixes
+///
+/// Per the security review, this function now:
+/// - **Item 1**: Uses shared dispatchers from `DispatcherState` (no state loss)
+/// - **Item 2**: Token secrets are stable via shared `TokenMinter`
+/// - **Item 3**: Fail-closed defaults via `FailClosedManifestStore`
+/// - **Item 4**: Sends responses back to clients via `connection.framed().send()`
+/// - **Item 5**: Terminates connection on protocol errors (breaks loop)
+///
 /// # JSON Downgrade Rejection (DD-009)
 ///
 /// Per TCK-00287 and DD-009, JSON frames are rejected before reaching handlers.
 /// The tag-based routing validates that the first byte is a valid message type
 /// tag (1-4 for privileged, 1-4 for session). JSON frames starting with `{`
-/// (0x7B = 123) are rejected as unknown message types.
+/// (0x7B = 123) are rejected as unknown message types. Protocol errors terminate
+/// the connection immediately.
 async fn handle_dual_socket_connection(
     mut connection: protocol::server::Connection,
     socket_type: protocol::socket_manager::SocketType,
     _state: SharedState,
+    dispatcher_state: SharedDispatcherState,
 ) -> Result<()> {
     use bytes::Bytes;
-    use futures::StreamExt;
+    use futures::{SinkExt, StreamExt};
     use protocol::connection_handler::{HandshakeResult, perform_handshake};
-    use protocol::dispatch::{ConnectionContext, PrivilegedDispatcher};
-    use protocol::session_dispatch::SessionDispatcher;
-    use protocol::session_token::TokenMinter;
+    use protocol::dispatch::ConnectionContext;
 
     info!(
         socket_type = %socket_type,
@@ -839,12 +874,10 @@ async fn handle_dual_socket_connection(
         },
     };
 
-    // Create dispatchers
-    // Note: Using stub implementations for now. Production would use shared
-    // instances with proper registries, metrics, etc.
-    let privileged_dispatcher = PrivilegedDispatcher::new();
-    let session_dispatcher =
-        SessionDispatcher::new(TokenMinter::new(TokenMinter::generate_secret()));
+    // TCK-00287 Item 1 & 2: Use shared dispatchers from DispatcherState.
+    // These dispatchers persist across connections and use stable secrets.
+    let privileged_dispatcher = dispatcher_state.privileged_dispatcher();
+    let session_dispatcher = dispatcher_state.session_dispatcher();
 
     // TCK-00287: Message dispatch loop
     // Process incoming frames until connection closes or error
@@ -859,19 +892,18 @@ async fn handle_dual_socket_connection(
             },
         };
 
-        // TCK-00287: JSON downgrade rejection (DD-009 fail-closed)
+        // TCK-00287 Item 5: JSON downgrade rejection (DD-009 fail-closed)
         // Validate frame before dispatch. JSON frames start with '{' (0x7B = 123)
         // or '[' (0x5B = 91) which are not valid message type tags.
-        // The dispatcher's tag validation will reject these, but we add an
-        // explicit check here for clearer error messaging.
+        // Per security review: protocol errors MUST terminate connection (DoS mitigation).
         if !frame.is_empty() && is_json_frame(&frame) {
             warn!(
                 socket_type = %socket_type,
                 first_byte = frame[0],
-                "JSON downgrade attempt rejected - protocol requires tag-based binary frames"
+                "JSON downgrade attempt rejected - terminating connection"
             );
-            // Per DD-009: fail-closed, no JSON processing allowed
-            continue;
+            // TCK-00287 Item 5: Terminate connection on protocol violation
+            break;
         }
 
         // Route to appropriate dispatcher based on socket type
@@ -882,11 +914,17 @@ async fn handle_dual_socket_connection(
                 match privileged_dispatcher.dispatch(&frame_bytes, &ctx) {
                     Ok(response) => {
                         info!(socket_type = %socket_type, "Privileged request dispatched successfully");
-                        // TODO: Send response back to client when bidirectional IPC is needed
-                        drop(response);
+                        // TCK-00287 Item 4: Send response back to client
+                        let response_bytes = response.encode();
+                        if let Err(e) = connection.framed().send(response_bytes).await {
+                            warn!(socket_type = %socket_type, error = %e, "Failed to send response");
+                            break;
+                        }
                     },
                     Err(e) => {
-                        warn!(socket_type = %socket_type, error = %e, "Privileged dispatch error");
+                        // TCK-00287 Item 5: Protocol errors terminate connection
+                        warn!(socket_type = %socket_type, error = %e, "Privileged dispatch error - terminating connection");
+                        break;
                     },
                 }
             },
@@ -894,11 +932,17 @@ async fn handle_dual_socket_connection(
                 match session_dispatcher.dispatch(&frame_bytes, &ctx) {
                     Ok(response) => {
                         info!(socket_type = %socket_type, "Session request dispatched successfully");
-                        // TODO: Send response back to client when bidirectional IPC is needed
-                        drop(response);
+                        // TCK-00287 Item 4: Send response back to client
+                        let response_bytes = response.encode();
+                        if let Err(e) = connection.framed().send(response_bytes).await {
+                            warn!(socket_type = %socket_type, error = %e, "Failed to send response");
+                            break;
+                        }
                     },
                     Err(e) => {
-                        warn!(socket_type = %socket_type, error = %e, "Session dispatch error");
+                        // TCK-00287 Item 5: Protocol errors terminate connection
+                        warn!(socket_type = %socket_type, error = %e, "Session dispatch error - terminating connection");
+                        break;
                     },
                 }
             },
