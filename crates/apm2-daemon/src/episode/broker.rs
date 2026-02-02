@@ -353,26 +353,12 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// this store when processing Git/Network tool requests.
     github_store: Option<Arc<dyn GitHubCredentialStore>>,
 
-    /// GitHub installation ID for the current session (TCK-00262).
-    ///
-    /// This is set by the daemon when a session is initialized with a
-    /// GitHub App installation. Tool requests for Git/Network operations
-    /// will use this installation ID to fetch credentials from the store.
-    github_installation_id: tokio::sync::RwLock<Option<String>>,
-
     /// SSH credential store for broker-mediated access (TCK-00263).
     ///
     /// Per RFC-0017 TB-003, SSH credentials (`SSH_AUTH_SOCK`) are held by the
     /// daemon and never exposed to session processes. The broker uses this
     /// store to provide SSH agent access for Git SSH operations.
     ssh_store: Option<Arc<dyn SshCredentialStore>>,
-
-    /// Session ID for SSH credential lookups (TCK-00263).
-    ///
-    /// This is set by the daemon when a session is initialized. Tool requests
-    /// for Git operations with SSH remotes will use this session ID to
-    /// determine the `SSH_AUTH_SOCK` path for subprocess environment.
-    ssh_session_id: tokio::sync::RwLock<Option<String>>,
 }
 
 impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
@@ -390,9 +376,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             loader: None,
             context_manifest: tokio::sync::RwLock::new(None),
             github_store: None,
-            github_installation_id: tokio::sync::RwLock::new(None),
             ssh_store: None,
-            ssh_session_id: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -410,9 +394,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             loader: Some(loader),
             context_manifest: tokio::sync::RwLock::new(None),
             github_store: None,
-            github_installation_id: tokio::sync::RwLock::new(None),
             ssh_store: None,
-            ssh_session_id: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -436,9 +418,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             loader: None,
             context_manifest: tokio::sync::RwLock::new(None),
             github_store: Some(github_store),
-            github_installation_id: tokio::sync::RwLock::new(None),
             ssh_store: None,
-            ssh_session_id: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -463,9 +443,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             loader: None,
             context_manifest: tokio::sync::RwLock::new(None),
             github_store: None,
-            github_installation_id: tokio::sync::RwLock::new(None),
             ssh_store: Some(ssh_store),
-            ssh_session_id: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -491,9 +469,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             loader: None,
             context_manifest: tokio::sync::RwLock::new(None),
             github_store: Some(github_store),
-            github_installation_id: tokio::sync::RwLock::new(None),
             ssh_store: Some(ssh_store),
-            ssh_session_id: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -503,78 +479,102 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         self.github_store.is_some()
     }
 
-    /// Sets the GitHub installation ID for credential lookups.
-    ///
-    /// This should be called when a session is initialized with a GitHub
-    /// App installation. Subsequent Git/Network tool requests will use this
-    /// installation ID to fetch credentials from the store.
-    pub async fn set_github_installation_id(&self, installation_id: String) {
-        let mut guard = self.github_installation_id.write().await;
-        *guard = Some(installation_id);
-        debug!("GitHub installation ID set for credential mediation");
-    }
-
-    /// Clears the GitHub installation ID.
-    ///
-    /// This should be called when a session ends or the GitHub installation
-    /// is revoked.
-    pub async fn clear_github_installation_id(&self) {
-        let mut guard = self.github_installation_id.write().await;
-        *guard = None;
-        debug!("GitHub installation ID cleared");
-    }
-
     /// Returns `true` if an SSH credential store is configured.
     #[must_use]
     pub fn has_ssh_store(&self) -> bool {
         self.ssh_store.is_some()
     }
 
-    /// Sets the session ID for SSH credential lookups (TCK-00263).
-    ///
-    /// This should be called when a session is initialized. The session ID
-    /// is used to look up `SSH_AUTH_SOCK` paths for Git SSH operations.
-    pub async fn set_ssh_session_id(&self, session_id: String) {
-        let mut guard = self.ssh_session_id.write().await;
-        *guard = Some(session_id);
-        debug!("SSH session ID set for credential mediation");
-    }
-
-    /// Clears the SSH session ID (TCK-00263).
-    ///
-    /// This should be called when a session ends.
-    pub async fn clear_ssh_session_id(&self) {
-        let mut guard = self.ssh_session_id.write().await;
-        *guard = None;
-        debug!("SSH session ID cleared");
-    }
-
     /// Returns `true` if SSH agent is available for broker-mediated operations
     /// (TCK-00263).
     ///
-    /// This checks if the daemon has access to an SSH agent (via
-    /// `SSH_AUTH_SOCK`).
-    pub fn is_ssh_agent_available(&self) -> bool {
-        self.ssh_store
-            .as_ref()
-            .is_some_and(|store| store.is_ssh_agent_available())
+    /// This checks if an SSH agent is available, either via a per-session
+    /// socket stored in the keychain, or via the daemon-wide `SSH_AUTH_SOCK`.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_context` - Optional session context for per-session lookup
+    pub async fn is_ssh_agent_available(
+        &self,
+        session_context: Option<&super::decision::SessionContext>,
+    ) -> bool {
+        let Some(store) = self.ssh_store.as_ref() else {
+            return false;
+        };
+
+        // First check per-session SSH agent socket if session context provided
+        if let Some(ctx) = session_context {
+            if let Some(ref session_id) = ctx.ssh_session_id {
+                // Try to get per-session SSH_AUTH_SOCK from keychain
+                if let Ok(path) = tokio::task::spawn_blocking({
+                    let store = Arc::clone(store);
+                    let session_id = session_id.clone();
+                    move || store.get_ssh_auth_sock(&session_id)
+                })
+                .await
+                .unwrap_or(Err(crate::evidence::keychain::KeychainError::LockPoisoned))
+                {
+                    // Check if the socket exists
+                    if std::path::Path::new(&path).exists() {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Fall back to daemon-wide SSH agent check
+        store.is_ssh_agent_available()
     }
 
     /// Gets the `SSH_AUTH_SOCK` path for broker-mediated Git SSH operations
     /// (TCK-00263).
     ///
-    /// Per RFC-0017 TB-003, this returns the daemon's `SSH_AUTH_SOCK` path for
-    /// use in subprocess environment. The session process NEVER has direct
-    /// access to this path - it's only used by the broker when executing
-    /// git commands.
+    /// Per RFC-0017 TB-003, this returns the `SSH_AUTH_SOCK` path for use in
+    /// subprocess environment. The session process NEVER has direct access to
+    /// this path - it's only used by the broker when executing git commands.
+    ///
+    /// # Priority Order (TCK-00263)
+    ///
+    /// 1. Per-session SSH agent socket (if `session_context` is provided and
+    ///    has `ssh_session_id` with a stored socket path)
+    /// 2. Daemon-wide `SSH_AUTH_SOCK` (fallback)
+    ///
+    /// # Arguments
+    ///
+    /// * `session_context` - Optional session context for per-session lookup
     ///
     /// # Returns
     ///
     /// `Some(path)` if SSH agent is available, `None` otherwise.
-    pub fn get_ssh_auth_sock_for_subprocess(&self) -> Option<String> {
-        self.ssh_store
-            .as_ref()
-            .and_then(|store| store.get_daemon_ssh_auth_sock())
+    pub async fn get_ssh_auth_sock_for_subprocess(
+        &self,
+        session_context: Option<&super::decision::SessionContext>,
+    ) -> Option<String> {
+        let store = self.ssh_store.as_ref()?;
+
+        // First try per-session SSH agent socket
+        if let Some(ctx) = session_context {
+            if let Some(ref session_id) = ctx.ssh_session_id {
+                // Try to get per-session SSH_AUTH_SOCK from keychain using spawn_blocking
+                // to avoid blocking I/O in async context
+                if let Ok(Ok(path)) = tokio::task::spawn_blocking({
+                    let store = Arc::clone(store);
+                    let session_id = session_id.clone();
+                    move || store.get_ssh_auth_sock(&session_id)
+                })
+                .await
+                {
+                    // Verify the socket exists
+                    if std::path::Path::new(&path).exists() {
+                        debug!(session_id = %session_id, "using per-session SSH agent socket");
+                        return Some(path);
+                    }
+                }
+            }
+        }
+
+        // Fall back to daemon-wide SSH_AUTH_SOCK
+        store.get_daemon_ssh_auth_sock()
     }
 
     /// Fetches a credential for a tool request if applicable.
@@ -589,30 +589,43 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     ///
     /// For Git tool class:
     /// 1. First try GitHub token (for HTTPS remotes)
-    /// 2. Fall back to `SSH_AUTH_SOCK` (for SSH remotes)
+    /// 2. Fall back to `SSH_AUTH_SOCK` (for SSH remotes, checking per-session
+    ///    socket first)
     ///
     /// For Network tool class:
     /// - Only GitHub tokens are applicable
+    ///
+    /// # Arguments
+    ///
+    /// * `tool_class` - The tool class being requested
+    /// * `session_context` - Optional session context for credential lookup
     ///
     /// # Returns
     ///
     /// `Some(Credential)` if credentials were successfully fetched,
     /// `None` if no credential store is configured or credentials are not
     /// available.
-    async fn fetch_credential_for_request(&self, tool_class: ToolClass) -> Option<Credential> {
+    async fn fetch_credential_for_request(
+        &self,
+        tool_class: ToolClass,
+        session_context: Option<&super::decision::SessionContext>,
+    ) -> Option<Credential> {
         // Only fetch credentials for Git and Network tool classes
         if !matches!(tool_class, ToolClass::Git | ToolClass::Network) {
             return None;
         }
 
         // Try GitHub credentials first (for HTTPS remotes)
-        if let Some(cred) = self.fetch_github_credential_for_request(tool_class).await {
+        if let Some(cred) = self
+            .fetch_github_credential_for_request(tool_class, session_context)
+            .await
+        {
             return Some(cred);
         }
 
         // For Git tool class, also try SSH credentials (TCK-00263)
         if tool_class == ToolClass::Git {
-            if let Some(cred) = self.fetch_ssh_credential_for_request() {
+            if let Some(cred) = self.fetch_ssh_credential_for_request(session_context).await {
                 return Some(cred);
             }
         }
@@ -622,33 +635,54 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
 
     /// Fetches GitHub credentials for a tool request.
     ///
-    /// Per TCK-00262, this checks for GitHub installation ID and fetches the
-    /// corresponding token from the GitHub credential store.
+    /// Per TCK-00262, this checks for GitHub installation ID from the session
+    /// context and fetches the corresponding token from the GitHub credential
+    /// store.
+    ///
+    /// # Arguments
+    ///
+    /// * `tool_class` - The tool class being requested (for logging)
+    /// * `session_context` - Optional session context containing GitHub
+    ///   installation ID
     async fn fetch_github_credential_for_request(
         &self,
         tool_class: ToolClass,
+        session_context: Option<&super::decision::SessionContext>,
     ) -> Option<Credential> {
         // Check if we have a credential store configured
         let store = self.github_store.as_ref()?;
 
-        // Check if we have an installation ID
-        let installation_id = self.github_installation_id.read().await;
-        let installation_id = installation_id.as_ref()?;
+        // Check if we have an installation ID from the session context
+        let ctx = session_context?;
+        let installation_id = ctx.github_installation_id.as_ref()?;
 
-        // Fetch the token from the store
-        match store.get_token(installation_id) {
-            Ok(token) => {
+        // Fetch the token from the store using spawn_blocking to avoid
+        // blocking I/O in async context (keyring crate uses blocking I/O)
+        let store = Arc::clone(store);
+        let installation_id = installation_id.clone();
+        let tool_class_for_log = tool_class;
+
+        match tokio::task::spawn_blocking(move || store.get_token(&installation_id)).await {
+            Ok(Ok(token)) => {
                 debug!(
-                    tool_class = ?tool_class,
+                    tool_class = ?tool_class_for_log,
                     "GitHub credential fetched for tool request"
                 );
                 Some(Credential::new(token))
             },
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(
-                    tool_class = ?tool_class,
+                    tool_class = ?tool_class_for_log,
                     error = %e,
                     "failed to fetch GitHub credential for tool request"
+                );
+                None
+            },
+            Err(e) => {
+                warn!(
+                    tool_class = ?tool_class_for_log,
+                    error = %e,
+                    "spawn_blocking panicked while fetching GitHub credential"
                 );
                 None
             },
@@ -657,20 +691,32 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
 
     /// Fetches SSH credentials for a tool request (TCK-00263).
     ///
-    /// Per RFC-0017 TB-003, this returns the daemon's `SSH_AUTH_SOCK` path as a
+    /// Per RFC-0017 TB-003, this returns the `SSH_AUTH_SOCK` path as a
     /// credential. The session process NEVER has direct access to this path -
     /// it's only used by the broker when executing git commands in subprocess.
+    ///
+    /// # Priority Order (TCK-00263)
+    ///
+    /// 1. Per-session SSH agent socket (if `session_context` is provided and
+    ///    has `ssh_session_id` with a stored socket path)
+    /// 2. Daemon-wide `SSH_AUTH_SOCK` (fallback)
+    ///
+    /// # Arguments
+    ///
+    /// * `session_context` - Optional session context for per-session lookup
     ///
     /// # Returns
     ///
     /// `Some(Credential)` containing the `SSH_AUTH_SOCK` path if available,
     /// `None` if SSH agent is not available.
-    fn fetch_ssh_credential_for_request(&self) -> Option<Credential> {
-        // Check if we have an SSH credential store configured
-        let store = self.ssh_store.as_ref()?;
-
-        // Get the daemon's SSH_AUTH_SOCK path
-        let auth_sock = store.get_daemon_ssh_auth_sock()?;
+    async fn fetch_ssh_credential_for_request(
+        &self,
+        session_context: Option<&super::decision::SessionContext>,
+    ) -> Option<Credential> {
+        // Use the helper that implements priority order
+        let auth_sock = self
+            .get_ssh_auth_sock_for_subprocess(session_context)
+            .await?;
 
         debug!("SSH credential (SSH_AUTH_SOCK) fetched for tool request");
         Some(Credential::new(auth_sock))
@@ -761,10 +807,15 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     /// to prevent authorization bypass. An attacker cannot use cache hits to
     /// circumvent capability checks.
     ///
+    /// Per TCK-00263, session-specific state (like `github_installation_id` and
+    /// `ssh_session_id`) MUST be passed via `session_context` rather than
+    /// stored on the broker to prevent cross-session credential leaks.
+    ///
     /// # Arguments
     ///
     /// * `request` - The tool request to process
     /// * `timestamp_ns` - Current timestamp in nanoseconds
+    /// * `session_context` - Optional session context for credential lookups
     ///
     /// # Returns
     ///
@@ -775,11 +826,12 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     ///
     /// Returns an error if the broker is not initialized or request
     /// validation fails.
-    #[instrument(skip(self, request), fields(request_id = %request.request_id))]
+    #[instrument(skip(self, request, session_context), fields(request_id = %request.request_id))]
     pub async fn request(
         &self,
         request: &BrokerToolRequest,
         timestamp_ns: u64,
+        session_context: Option<&super::decision::SessionContext>,
     ) -> Result<ToolDecision, BrokerError> {
         // Step 1: Validate request structure
         request.validate()?;
@@ -936,10 +988,13 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         }
 
         // Request is authorized - return Allow decision
-        // Step 6: Fetch credentials for Git/Network tools (TCK-00262)
+        // Step 6: Fetch credentials for Git/Network tools (TCK-00262, TCK-00263)
         // Per RFC-0017 TB-003, credentials are attached by the broker, never
-        // exposed to session processes directly.
-        let credential = self.fetch_credential_for_request(request.tool_class).await;
+        // exposed to session processes directly. Session context is used to
+        // look up session-specific credentials without storing them on the broker.
+        let credential = self
+            .fetch_credential_for_request(request.tool_class, session_context)
+            .await;
 
         debug!(capability_id = %capability_id, has_credential = credential.is_some(), "request allowed");
         Ok(ToolDecision::Allow {
@@ -1152,7 +1207,7 @@ mod tests {
         assert!(!broker.is_initialized().await);
 
         let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
-        let result = broker.request(&request, timestamp_ns(0)).await;
+        let result = broker.request(&request, timestamp_ns(0), None).await;
 
         assert!(matches!(result, Err(BrokerError::NotInitialized)));
     }
@@ -1183,7 +1238,10 @@ mod tests {
         broker.initialize_with_manifest(manifest).await.unwrap();
 
         let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(decision.is_allowed());
         if let ToolDecision::Allow { capability_id, .. } = decision {
@@ -1203,7 +1261,10 @@ mod tests {
 
         // Request Write capability when only Read is available
         let request = make_request("req-1", ToolClass::Write, Some("/workspace/file.rs"));
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(decision.is_denied());
     }
@@ -1220,7 +1281,10 @@ mod tests {
 
         // Request path outside of allowed scope
         let request = make_request("req-1", ToolClass::Read, Some("/etc/passwd"));
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(decision.is_denied());
         if let ToolDecision::Deny { reason, .. } = decision {
@@ -1241,7 +1305,10 @@ mod tests {
         let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
 
         // First request - should be allowed
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
         assert!(decision.is_allowed());
 
         // Record a result
@@ -1265,7 +1332,10 @@ mod tests {
             .unwrap();
 
         // Second request with same dedupe key - should be cache hit
-        let decision2 = broker.request(&request, timestamp_ns(1)).await.unwrap();
+        let decision2 = broker
+            .request(&request, timestamp_ns(1), None)
+            .await
+            .unwrap();
         assert!(decision2.is_cache_hit());
 
         if let ToolDecision::DedupeCacheHit { result, .. } = decision2 {
@@ -1290,7 +1360,10 @@ mod tests {
                 ToolClass::Read,
                 Some("/workspace/file.rs"),
             );
-            let decision = broker.request(&request, timestamp_ns(i)).await.unwrap();
+            let decision = broker
+                .request(&request, timestamp_ns(i), None)
+                .await
+                .unwrap();
 
             let result = ToolResult::success(
                 format!("req-{i}"),
@@ -1337,7 +1410,10 @@ mod tests {
         let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
 
         // First request
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
         assert!(decision.is_allowed());
 
         // Record result (won't actually cache)
@@ -1360,7 +1436,10 @@ mod tests {
             .unwrap();
 
         // Second request - should still be allowed (no cache)
-        let decision2 = broker.request(&request, timestamp_ns(1)).await.unwrap();
+        let decision2 = broker
+            .request(&request, timestamp_ns(1), None)
+            .await
+            .unwrap();
         assert!(decision2.is_allowed());
         assert!(!decision2.is_cache_hit());
     }
@@ -1377,7 +1456,10 @@ mod tests {
         broker.initialize_with_manifest(manifest).await.unwrap();
 
         let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(decision.is_allowed());
         if let ToolDecision::Allow { rule_id, .. } = decision {
@@ -1405,7 +1487,7 @@ mod tests {
             RiskTier::Tier0,
         );
 
-        let result = broker.request(&request, timestamp_ns(0)).await;
+        let result = broker.request(&request, timestamp_ns(0), None).await;
         assert!(matches!(result, Err(BrokerError::RequestValidation(_))));
     }
 
@@ -1509,7 +1591,7 @@ mod tests {
         // Create a valid Read request and execute it to populate the cache
         let read_request = make_request("req-read-1", ToolClass::Read, Some("/workspace/file.rs"));
         let decision = broker
-            .request(&read_request, timestamp_ns(0))
+            .request(&read_request, timestamp_ns(0), None)
             .await
             .unwrap();
         assert!(decision.is_allowed(), "read request should be allowed");
@@ -1542,7 +1624,7 @@ mod tests {
         // The Write request should be DENIED (not a cache hit)
         // Authorization check must happen before cache lookup
         let write_decision = broker
-            .request(&write_request, timestamp_ns(1))
+            .request(&write_request, timestamp_ns(1), None)
             .await
             .unwrap();
         assert!(
@@ -1581,7 +1663,10 @@ mod tests {
         )
         .with_path("/workspace/secret.txt");
 
-        let decision1 = broker.request(&request1, timestamp_ns(0)).await.unwrap();
+        let decision1 = broker
+            .request(&request1, timestamp_ns(0), None)
+            .await
+            .unwrap();
         assert!(decision1.is_allowed());
 
         // Record result for episode 1
@@ -1604,7 +1689,10 @@ mod tests {
             .unwrap();
 
         // Episode 1 should get a cache hit
-        let decision1_again = broker.request(&request1, timestamp_ns(1)).await.unwrap();
+        let decision1_again = broker
+            .request(&request1, timestamp_ns(1), None)
+            .await
+            .unwrap();
         assert!(
             decision1_again.is_cache_hit(),
             "episode 1 should get cache hit for its own data"
@@ -1622,7 +1710,10 @@ mod tests {
         .with_path("/workspace/secret.txt");
 
         // Episode 2 must NOT get a cache hit from episode 1's data
-        let decision2 = broker.request(&request2, timestamp_ns(2)).await.unwrap();
+        let decision2 = broker
+            .request(&request2, timestamp_ns(2), None)
+            .await
+            .unwrap();
         assert!(
             !decision2.is_cache_hit(),
             "episode 2 must not receive cache hit from episode 1's data"
@@ -1648,7 +1739,10 @@ mod tests {
         let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
 
         // First request - should be allowed
-        let decision1 = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision1 = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
         assert!(decision1.is_allowed());
 
         // Record result
@@ -1672,7 +1766,10 @@ mod tests {
 
         // Second request with same dedupe key - should get cache hit
         // (after authorization passes)
-        let decision2 = broker.request(&request, timestamp_ns(1)).await.unwrap();
+        let decision2 = broker
+            .request(&request, timestamp_ns(1), None)
+            .await
+            .unwrap();
         assert!(
             decision2.is_cache_hit(),
             "authorized request should get cache hit"
@@ -1794,7 +1891,10 @@ mod tests {
             ToolClass::Read,
             Some("/workspace/allowed.rs"),
         );
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(
             decision.is_allowed(),
@@ -1827,7 +1927,10 @@ mod tests {
 
         // Request for path NOT in context manifest should terminate
         let request = make_request("req-denied", ToolClass::Read, Some("/workspace/secret.rs"));
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(
             decision.is_terminate(),
@@ -1867,7 +1970,10 @@ mod tests {
 
         // Request with NO path should terminate (fail-closed)
         let request = make_request("req-no-path", ToolClass::Read, None);
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(
             decision.is_terminate(),
@@ -1921,7 +2027,10 @@ mod tests {
             ToolClass::Write,
             Some("/workspace/secret.txt"),
         );
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(
             decision.is_terminate(),
@@ -1973,7 +2082,10 @@ mod tests {
             ToolClass::Write,
             Some("/workspace/allowed/file.txt"),
         );
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(
             decision.is_allowed(),
@@ -2010,7 +2122,10 @@ mod tests {
         // Request to execute rm command should terminate
         let mut request = make_request("req-exec-denied", ToolClass::Execute, None);
         request = request.with_shell_command("rm -rf /");
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(
             decision.is_terminate(),
@@ -2052,7 +2167,10 @@ mod tests {
         // Request to execute cargo command should proceed
         let mut request = make_request("req-exec-allowed", ToolClass::Execute, None);
         request = request.with_shell_command("cargo build --release");
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(
             decision.is_allowed(),
@@ -2091,7 +2209,10 @@ mod tests {
         // Request without shell_command should terminate
         let request = make_request("req-exec-no-cmd", ToolClass::Execute, None);
         // Note: not calling with_shell_command
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(
             decision.is_terminate(),
@@ -2140,7 +2261,10 @@ mod tests {
 
         // Request without path should terminate
         let request = make_request("req-write-no-path", ToolClass::Write, None);
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(
             decision.is_terminate(),
@@ -2193,7 +2317,7 @@ mod tests {
         // check)
         let write_request = make_request("req-write", ToolClass::Write, Some("/workspace/any.txt"));
         let write_decision = broker
-            .request(&write_request, timestamp_ns(0))
+            .request(&write_request, timestamp_ns(0), None)
             .await
             .unwrap();
         assert!(
@@ -2206,7 +2330,7 @@ mod tests {
         let mut exec_request = make_request("req-exec", ToolClass::Execute, None);
         exec_request = exec_request.with_shell_command("any command");
         let exec_decision = broker
-            .request(&exec_request, timestamp_ns(1))
+            .request(&exec_request, timestamp_ns(1), None)
             .await
             .unwrap();
         assert!(
@@ -2271,40 +2395,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_credential_broker_set_installation_id() {
-        // TCK-00262: Test set/clear installation ID
-        use crate::evidence::keychain::InMemoryGitHubCredentialStore;
+    async fn test_session_context_creation() {
+        // TCK-00263: Test SessionContext builder pattern
+        use super::super::decision::SessionContext;
 
-        let store = Arc::new(InMemoryGitHubCredentialStore::new());
-        let broker: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_github_store(ToolBrokerConfig::default(), store);
+        // Empty context
+        let ctx = SessionContext::new();
+        assert!(!ctx.has_github_installation());
+        assert!(!ctx.has_ssh_session());
 
-        // Initially no installation ID
-        {
-            let guard = broker.github_installation_id.read().await;
-            assert!(guard.is_none());
-        }
+        // With GitHub installation ID
+        let ctx = SessionContext::new().with_github_installation_id("install-123");
+        assert!(ctx.has_github_installation());
+        assert_eq!(ctx.github_installation_id.as_ref().unwrap(), "install-123");
+        assert!(!ctx.has_ssh_session());
 
-        // Set installation ID
-        broker
-            .set_github_installation_id("install-123".to_string())
-            .await;
-        {
-            let guard = broker.github_installation_id.read().await;
-            assert_eq!(guard.as_ref().unwrap(), "install-123");
-        }
+        // With SSH session ID
+        let ctx = SessionContext::new().with_ssh_session_id("session-456");
+        assert!(!ctx.has_github_installation());
+        assert!(ctx.has_ssh_session());
+        assert_eq!(ctx.ssh_session_id.as_ref().unwrap(), "session-456");
 
-        // Clear installation ID
-        broker.clear_github_installation_id().await;
-        {
-            let guard = broker.github_installation_id.read().await;
-            assert!(guard.is_none());
-        }
+        // With both
+        let ctx = SessionContext::new()
+            .with_github_installation_id("install-123")
+            .with_ssh_session_id("session-456");
+        assert!(ctx.has_github_installation());
+        assert!(ctx.has_ssh_session());
     }
 
     #[tokio::test]
     async fn test_credential_broker_attaches_credential_for_git() {
         // TCK-00262: Git tool requests should have credentials attached
+        use super::super::decision::SessionContext;
         use crate::evidence::keychain::InMemoryGitHubCredentialStore;
 
         let store = Arc::new(InMemoryGitHubCredentialStore::new());
@@ -2323,10 +2446,8 @@ mod tests {
         )]);
         broker.initialize_with_manifest(manifest).await.unwrap();
 
-        // Set installation ID
-        broker
-            .set_github_installation_id("install-456".to_string())
-            .await;
+        // Create session context with installation ID
+        let session_ctx = SessionContext::new().with_github_installation_id("install-456");
 
         // Make Git request
         let request = BrokerToolRequest::new(
@@ -2339,7 +2460,10 @@ mod tests {
         )
         .with_path("/workspace/repo");
 
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), Some(&session_ctx))
+            .await
+            .unwrap();
 
         assert!(decision.is_allowed());
         if let ToolDecision::Allow { credential, .. } = decision {
@@ -2354,6 +2478,7 @@ mod tests {
     #[tokio::test]
     async fn test_credential_broker_attaches_credential_for_network() {
         // TCK-00262: Network tool requests should have credentials attached
+        use super::super::decision::SessionContext;
         use crate::evidence::keychain::InMemoryGitHubCredentialStore;
 
         let store = Arc::new(InMemoryGitHubCredentialStore::new());
@@ -2374,10 +2499,8 @@ mod tests {
             .unwrap();
         broker.initialize_with_manifest(manifest).await.unwrap();
 
-        // Set installation ID
-        broker
-            .set_github_installation_id("install-789".to_string())
-            .await;
+        // Create session context with installation ID
+        let session_ctx = SessionContext::new().with_github_installation_id("install-789");
 
         // Make Network request
         let request = BrokerToolRequest::new(
@@ -2389,7 +2512,10 @@ mod tests {
             RiskTier::Tier0,
         );
 
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), Some(&session_ctx))
+            .await
+            .unwrap();
 
         assert!(decision.is_allowed());
         if let ToolDecision::Allow { credential, .. } = decision {
@@ -2404,6 +2530,7 @@ mod tests {
     #[tokio::test]
     async fn test_credential_broker_no_credential_for_read() {
         // TCK-00262: Read tool requests should NOT have credentials attached
+        use super::super::decision::SessionContext;
         use crate::evidence::keychain::InMemoryGitHubCredentialStore;
 
         let store = Arc::new(InMemoryGitHubCredentialStore::new());
@@ -2419,15 +2546,16 @@ mod tests {
         )]);
         broker.initialize_with_manifest(manifest).await.unwrap();
 
-        // Set installation ID
-        broker
-            .set_github_installation_id("install-abc".to_string())
-            .await;
+        // Create session context with installation ID
+        let session_ctx = SessionContext::new().with_github_installation_id("install-abc");
 
         // Make Read request
         let request = make_request("req-read", ToolClass::Read, Some("/workspace/file.rs"));
 
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), Some(&session_ctx))
+            .await
+            .unwrap();
 
         assert!(decision.is_allowed());
         if let ToolDecision::Allow { credential, .. } = decision {
@@ -2461,7 +2589,10 @@ mod tests {
         )
         .with_path("/workspace/repo");
 
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(decision.is_allowed());
         if let ToolDecision::Allow { credential, .. } = decision {
@@ -2503,7 +2634,10 @@ mod tests {
         )
         .with_path("/workspace/repo");
 
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(decision.is_allowed());
         if let ToolDecision::Allow { credential, .. } = decision {
@@ -2518,6 +2652,7 @@ mod tests {
     async fn test_credential_broker_missing_token_returns_none() {
         // TCK-00262: If token lookup fails, request still succeeds but without
         // credential
+        use super::super::decision::SessionContext;
         use crate::evidence::keychain::InMemoryGitHubCredentialStore;
 
         let store = Arc::new(InMemoryGitHubCredentialStore::new());
@@ -2533,10 +2668,8 @@ mod tests {
         )]);
         broker.initialize_with_manifest(manifest).await.unwrap();
 
-        // Set installation ID (but no token stored for this ID)
-        broker
-            .set_github_installation_id("install-missing".to_string())
-            .await;
+        // Create session context with installation ID (but no token stored for this ID)
+        let session_ctx = SessionContext::new().with_github_installation_id("install-missing");
 
         // Make Git request
         let request = BrokerToolRequest::new(
@@ -2549,7 +2682,10 @@ mod tests {
         )
         .with_path("/workspace/repo");
 
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), Some(&session_ctx))
+            .await
+            .unwrap();
 
         // Request should still be allowed, just without credential
         assert!(decision.is_allowed());
@@ -2603,33 +2739,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ssh_broker_set_session_id() {
-        // TCK-00263: Test set/clear session ID for SSH
-        use crate::evidence::keychain::InMemorySshCredentialStore;
+    async fn test_session_context_for_ssh() {
+        // TCK-00263: Test SessionContext with SSH session ID
+        use super::super::decision::SessionContext;
 
-        let store = Arc::new(InMemorySshCredentialStore::new());
-        let broker: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store);
+        // Create session context with SSH session ID
+        let ctx = SessionContext::new().with_ssh_session_id("session-123");
+        assert!(ctx.has_ssh_session());
+        assert_eq!(ctx.ssh_session_id.as_ref().unwrap(), "session-123");
 
-        // Initially no session ID
-        {
-            let guard = broker.ssh_session_id.read().await;
-            assert!(guard.is_none());
-        }
-
-        // Set session ID
-        broker.set_ssh_session_id("session-123".to_string()).await;
-        {
-            let guard = broker.ssh_session_id.read().await;
-            assert_eq!(guard.as_ref().unwrap(), "session-123");
-        }
-
-        // Clear session ID
-        broker.clear_ssh_session_id().await;
-        {
-            let guard = broker.ssh_session_id.read().await;
-            assert!(guard.is_none());
-        }
+        // Create session context with both GitHub and SSH
+        let ctx = SessionContext::new()
+            .with_github_installation_id("install-abc")
+            .with_ssh_session_id("session-xyz");
+        assert!(ctx.has_github_installation());
+        assert!(ctx.has_ssh_session());
     }
 
     #[tokio::test]
@@ -2641,8 +2765,13 @@ mod tests {
         let store_no_agent = Arc::new(InMemorySshCredentialStore::new());
         let broker_no_agent: ToolBroker<StubManifestLoader> =
             ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store_no_agent);
-        assert!(!broker_no_agent.is_ssh_agent_available());
-        assert!(broker_no_agent.get_ssh_auth_sock_for_subprocess().is_none());
+        assert!(!broker_no_agent.is_ssh_agent_available(None).await);
+        assert!(
+            broker_no_agent
+                .get_ssh_auth_sock_for_subprocess(None)
+                .await
+                .is_none()
+        );
 
         // With daemon SSH_AUTH_SOCK
         let store_with_agent = Arc::new(InMemorySshCredentialStore::with_daemon_auth_sock(
@@ -2650,9 +2779,11 @@ mod tests {
         ));
         let broker_with_agent: ToolBroker<StubManifestLoader> =
             ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store_with_agent);
-        assert!(broker_with_agent.is_ssh_agent_available());
+        assert!(broker_with_agent.is_ssh_agent_available(None).await);
         assert_eq!(
-            broker_with_agent.get_ssh_auth_sock_for_subprocess(),
+            broker_with_agent
+                .get_ssh_auth_sock_for_subprocess(None)
+                .await,
             Some("/tmp/ssh-agent.sock".to_string())
         );
     }
@@ -2688,7 +2819,10 @@ mod tests {
         )
         .with_path("/workspace/repo");
 
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(decision.is_allowed());
         if let ToolDecision::Allow { credential, .. } = decision {
@@ -2727,7 +2861,10 @@ mod tests {
         )
         .with_path("/workspace/repo");
 
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(decision.is_allowed());
         if let ToolDecision::Allow { credential, .. } = decision {
@@ -2767,7 +2904,10 @@ mod tests {
         )
         .with_path("/workspace/repo");
 
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(decision.is_allowed());
         if let ToolDecision::Allow { credential, .. } = decision {
@@ -2781,6 +2921,7 @@ mod tests {
     #[tokio::test]
     async fn test_ssh_broker_github_takes_priority() {
         // TCK-00263: GitHub credentials take priority over SSH credentials
+        use super::super::decision::SessionContext;
         use crate::evidence::keychain::{
             InMemoryGitHubCredentialStore, InMemorySshCredentialStore,
         };
@@ -2807,10 +2948,8 @@ mod tests {
         )]);
         broker.initialize_with_manifest(manifest).await.unwrap();
 
-        // Set GitHub installation ID
-        broker
-            .set_github_installation_id("install-priority".to_string())
-            .await;
+        // Create session context with GitHub installation ID
+        let session_ctx = SessionContext::new().with_github_installation_id("install-priority");
 
         // Make Git request
         let request = BrokerToolRequest::new(
@@ -2823,7 +2962,10 @@ mod tests {
         )
         .with_path("/workspace/repo");
 
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), Some(&session_ctx))
+            .await
+            .unwrap();
 
         assert!(decision.is_allowed());
         if let ToolDecision::Allow { credential, .. } = decision {
@@ -2836,6 +2978,7 @@ mod tests {
     #[tokio::test]
     async fn test_ssh_broker_fallback_to_ssh() {
         // TCK-00263: When GitHub credential fails, fall back to SSH
+        use super::super::decision::SessionContext;
         use crate::evidence::keychain::{
             InMemoryGitHubCredentialStore, InMemorySshCredentialStore,
         };
@@ -2860,10 +3003,9 @@ mod tests {
         )]);
         broker.initialize_with_manifest(manifest).await.unwrap();
 
-        // Set GitHub installation ID (but no token stored for it)
-        broker
-            .set_github_installation_id("install-missing".to_string())
-            .await;
+        // Create session context with GitHub installation ID (but no token stored for
+        // it)
+        let session_ctx = SessionContext::new().with_github_installation_id("install-missing");
 
         // Make Git request
         let request = BrokerToolRequest::new(
@@ -2876,7 +3018,10 @@ mod tests {
         )
         .with_path("/workspace/repo");
 
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), Some(&session_ctx))
+            .await
+            .unwrap();
 
         assert!(decision.is_allowed());
         if let ToolDecision::Allow { credential, .. } = decision {
@@ -2914,7 +3059,10 @@ mod tests {
         // Make Read request
         let request = make_request("req-read", ToolClass::Read, Some("/workspace/file.rs"));
 
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(decision.is_allowed());
         if let ToolDecision::Allow { credential, .. } = decision {
@@ -2958,7 +3106,10 @@ mod tests {
             RiskTier::Tier0,
         );
 
-        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(decision.is_allowed());
         if let ToolDecision::Allow { credential, .. } = decision {
