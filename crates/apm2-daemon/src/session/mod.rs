@@ -87,8 +87,9 @@ pub struct SessionState {
     pub ephemeral_handle: String,
     /// Lease ID authorizing this session.
     ///
-    /// **SECURITY**: This field is redacted in Debug output to prevent
-    /// credential leakage in logs.
+    /// **SECURITY**: This field is redacted in Debug output and skipped during
+    /// serialization to prevent credential leakage.
+    #[serde(skip, default)]
     pub lease_id: String,
     /// Policy resolution reference.
     pub policy_resolved_ref: String,

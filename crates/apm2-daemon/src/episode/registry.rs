@@ -823,9 +823,9 @@ fn current_timestamp_ns() -> u64 {
 // =============================================================================
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 /// Maximum file size for state files (10 MB).
@@ -844,6 +844,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// This struct mirrors [`SessionState`] but omits the `lease_id` field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistableSessionState {
     /// Unique session identifier.
     pub session_id: String,
@@ -901,6 +902,7 @@ impl From<PersistableSessionState> for SessionState {
 /// This file uses [`PersistableSessionState`] which excludes the `lease_id`
 /// bearer token to prevent credential leakage to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistentStateFile {
     /// Version of the state file format for future compatibility.
     version: u32,
@@ -1017,9 +1019,11 @@ impl PersistentSessionRegistry {
         let registry = Self::new(path);
 
         if path.exists() {
-            // SEC-003: Check file size before reading to prevent DoS
-            let metadata = fs::metadata(path)?;
+            // SEC-003: Open file first, then check metadata to avoid TOCTOU
+            let file = File::open(path)?;
+            let metadata = file.metadata()?;
             let file_size = metadata.len();
+
             if file_size > MAX_STATE_FILE_SIZE {
                 return Err(PersistentRegistryError::FileTooLarge {
                     size: file_size,
@@ -1027,9 +1031,8 @@ impl PersistentSessionRegistry {
                 });
             }
 
-            // SEC-003: Use BufReader with serde_json::from_reader for bounded reads
-            let file = File::open(path)?;
-            let reader = BufReader::new(file);
+            // SEC-003: Use BufReader with Read::take for bounded reads (DoS protection)
+            let reader = BufReader::new(file.take(MAX_STATE_FILE_SIZE));
             let state_file: PersistentStateFile = serde_json::from_reader(reader)?;
 
             // Version check for future compatibility
@@ -1089,6 +1092,13 @@ impl PersistentSessionRegistry {
 
         // Ensure parent directory exists
         if let Some(parent) = self.state_file_path.parent() {
+            #[cfg(unix)]
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700) // SEC-002: Owner access only
+                .create(parent)?;
+
+            #[cfg(not(unix))]
             fs::create_dir_all(parent)?;
         }
 
@@ -1116,6 +1126,12 @@ impl PersistentSessionRegistry {
 
         // Atomic rename
         fs::rename(&temp_path, &self.state_file_path)?;
+
+        // Durability: fsync the parent directory to ensure the rename is committed
+        if let Some(parent) = self.state_file_path.parent() {
+            let dir = File::open(parent)?;
+            dir.sync_all()?;
+        }
 
         Ok(())
     }
