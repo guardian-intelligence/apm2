@@ -529,15 +529,19 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     policy_hash: manifest.digest().to_vec(),
                 }));
             }
-            // No manifest found - fail open for now (session may not be fully registered)
-            // In production, this would be a configuration option
+            // No manifest found - fail closed (SEC-CTRL-FAC-0015)
+            // If a manifest store is configured, a manifest MUST be present.
             warn!(
                 session_id = %token.session_id,
-                "No manifest found for session, allowing request (no manifest store entry)"
+                "No manifest found for session, denying request (fail-closed)"
             );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                "capability manifest unavailable",
+            ));
         }
 
-        // No manifest store configured or no manifest found - return stub response
+        // No manifest store configured - return stub response
         // This maintains backward compatibility with existing tests
         Ok(SessionResponse::RequestTool(RequestToolResponse {
             request_id: format!("REQ-{}", token.session_id),
