@@ -3169,7 +3169,7 @@ impl std::error::Error for CustodyDomainError {}
 ///
 /// - Uses constant-time comparison to prevent timing side-channel attacks
 /// - Bounds input sizes to prevent `DoS` via resource exhaustion
-/// - Checks ALL domain combinations (not early-exit on first mismatch)
+/// - Returns early on first overlap detected (fail-fast for security)
 ///
 /// # Example
 ///
@@ -3230,73 +3230,6 @@ pub fn validate_custody_domain_overlap(
     }
 
     Ok(())
-}
-
-/// Extracts custody domains from a list of actor IDs using a domain resolver.
-///
-/// Per REQ-DCP-0006, this helper function maps actor IDs to their associated
-/// custody domains for `SoD` validation.
-///
-/// # Arguments
-///
-/// * `actor_ids` - List of actor identifiers to resolve
-/// * `resolver` - Function that maps an actor ID to its custody domains
-///
-/// # Returns
-///
-/// A deduplicated list of custody domains associated with the actors.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use std::collections::HashMap;
-/// use apm2_daemon::episode::capability::CustodyDomainId;
-///
-/// // Mock resolver: maps actor_id -> domains
-/// let domain_map: HashMap<&str, Vec<&str>> =
-///     [("alice", vec!["team-alpha"]), ("bob", vec!["team-beta"])]
-///         .into_iter()
-///         .collect();
-///
-/// let resolver = |actor_id: &str| -> Vec<CustodyDomainId> {
-///     domain_map
-///         .get(actor_id)
-///         .map(|domains| {
-///             domains
-///                 .iter()
-///                 .filter_map(|d| CustodyDomainId::new(*d).ok())
-///                 .collect()
-///         })
-///         .unwrap_or_default()
-/// };
-///
-/// let actors = vec!["alice".to_string(), "bob".to_string()];
-/// let domains = extract_custody_domains(&actors, resolver);
-/// assert_eq!(domains.len(), 2);
-/// ```
-// TCK-00258: Function is not currently used in dispatch.rs but kept for future
-// use when a proper CustodyDomainResolver is implemented. Tests validate its
-// correctness.
-#[allow(dead_code)]
-pub(crate) fn extract_custody_domains<F>(actor_ids: &[String], resolver: F) -> Vec<CustodyDomainId>
-where
-    F: Fn(&str) -> Vec<CustodyDomainId>,
-{
-    use std::collections::HashSet;
-
-    let mut seen = HashSet::new();
-    let mut domains = Vec::new();
-
-    for actor_id in actor_ids {
-        for domain in resolver(actor_id) {
-            // Deduplicate by domain ID string
-            if seen.insert(domain.as_str().to_string()) {
-                domains.push(domain);
-            }
-        }
-    }
-
-    domains
 }
 
 #[cfg(test)]
@@ -3408,54 +3341,5 @@ mod custody_domain_tests {
 
         let result = validate_custody_domain_overlap(&executor, &authors);
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_extract_custody_domains() {
-        use std::collections::HashMap;
-
-        let domain_map: HashMap<&str, Vec<&str>> = [
-            ("alice", vec!["team-alpha", "team-shared"]),
-            ("bob", vec!["team-beta"]),
-            ("charlie", vec!["team-alpha"]), // Same as alice
-        ]
-        .into_iter()
-        .collect();
-
-        let resolver = |actor_id: &str| -> Vec<CustodyDomainId> {
-            domain_map
-                .get(actor_id)
-                .map(|domains| {
-                    domains
-                        .iter()
-                        .filter_map(|d| CustodyDomainId::new(*d).ok())
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-
-        let actors = vec![
-            "alice".to_string(),
-            "bob".to_string(),
-            "charlie".to_string(),
-        ];
-        let domains = extract_custody_domains(&actors, resolver);
-
-        // Should have 3 unique domains: team-alpha, team-shared, team-beta
-        assert_eq!(domains.len(), 3);
-        let domain_strs: Vec<&str> = domains.iter().map(CustodyDomainId::as_str).collect();
-        assert!(domain_strs.contains(&"team-alpha"));
-        assert!(domain_strs.contains(&"team-shared"));
-        assert!(domain_strs.contains(&"team-beta"));
-    }
-
-    #[test]
-    fn test_extract_custody_domains_unknown_actor() {
-        let resolver = |_actor_id: &str| -> Vec<CustodyDomainId> { vec![] };
-
-        let actors = vec!["unknown".to_string()];
-        let domains = extract_custody_domains(&actors, resolver);
-
-        assert!(domains.is_empty());
     }
 }

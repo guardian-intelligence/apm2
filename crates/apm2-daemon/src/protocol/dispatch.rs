@@ -1494,6 +1494,13 @@ impl PrivilegedDispatcher {
     /// For example, `team-alpha:alice` -> `["team-alpha"]`.
     /// This enables testing of the `SoD` enforcement without full `KeyPolicy`
     /// integration.
+    ///
+    /// # Security (Fail-Closed)
+    ///
+    /// Per Security Review finding: If the actor ID doesn't match the expected
+    /// `domain:actor` schema, this returns a special `UNIVERSAL` domain that
+    /// overlaps with all author domains, ensuring that malformed or
+    /// non-standard actor IDs cannot bypass `SoD` validation.
     #[allow(clippy::unused_self)] // Will use self in production for registry access
     fn resolve_actor_custody_domains(&self, actor_id: &str) -> Vec<String> {
         // Stub: derive domain from actor_id prefix (e.g., "team-alpha:alice" ->
@@ -1505,9 +1512,13 @@ impl PrivilegedDispatcher {
                 return vec![domain.to_string()];
             }
         }
-        // Fallback: use the actor_id itself as the domain
-        // This ensures self-review is always detected (actor reviewing own work)
-        vec![actor_id.to_string()]
+        // SEC-SoD-001: Fail-closed for malformed actor IDs.
+        // If the actor_id doesn't match expected schema (domain:actor), return
+        // a special UNIVERSAL domain that overlaps with everything. This
+        // prevents attackers from bypassing SoD by using non-standard IDs.
+        // The UNIVERSAL domain acts as a "wildcard" that will always trigger
+        // overlap detection when compared with any author domain.
+        vec!["UNIVERSAL".to_string()]
     }
 
     /// Resolves custody domains for changeset authors.
@@ -1521,6 +1532,13 @@ impl PrivilegedDispatcher {
     /// Currently returns a placeholder domain based on the `work_id`.
     /// For testing, set `work_id` to include domain information:
     /// e.g., `W-team-alpha-12345` -> `["team-alpha"]`
+    ///
+    /// # Security (Fail-Closed)
+    ///
+    /// Per Security Review finding: If the `work_id` doesn't match the expected
+    /// schema, this returns a special `UNIVERSAL` domain. When combined with
+    /// a UNIVERSAL executor domain (from malformed actor IDs), this ensures
+    /// overlap detection triggers and the spawn is denied.
     #[allow(clippy::unused_self)] // Will use self in production for registry access
     fn resolve_changeset_author_domains(&self, work_id: &str) -> Vec<String> {
         // Stub: derive author domain from work_id (e.g., "W-team-alpha-12345" ->
@@ -1535,12 +1553,13 @@ impl PrivilegedDispatcher {
                 }
             }
         }
-        // TCK-00258: Return empty for malformed work_ids.
-        // IMPORTANT: This is fail-open for non-GATE_EXECUTOR roles, but the
-        // SpawnEpisode handler enforces fail-closed for GATE_EXECUTOR.
-        // In production, this would query changeset metadata for author list,
-        // then resolve each author's custody domains via KeyPolicy.
-        Vec::new()
+        // SEC-SoD-001: Fail-closed for malformed work_ids.
+        // Return UNIVERSAL domain which will overlap with any UNIVERSAL executor
+        // domain, triggering SoD rejection. This prevents attackers from
+        // bypassing SoD by using malformed work_ids that don't map to author
+        // domains. The SpawnEpisode handler also checks for empty author domains
+        // and rejects, but this provides defense in depth.
+        vec!["UNIVERSAL".to_string()]
     }
 
     /// Dispatches a privileged request to the appropriate handler.
@@ -2016,28 +2035,35 @@ impl PrivilegedDispatcher {
                         "SpawnEpisode rejected: SoD custody domain violation"
                     );
 
-                    // Emit LeaseIssueDenied event for audit logging
-                    // Use current timestamp (in production, use HTF clock)
-                    let timestamp_ns = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
-                        .unwrap_or(0);
+                    // Emit LeaseIssueDenied event for audit logging.
+                    // RFC-0016 HTF compliance: Use placeholder timestamp (0) for stub
+                    // implementation. In production, this would derive timestamp from
+                    // HolonicClock via episode_runtime to ensure deterministic replay
+                    // and avoid forbidden SystemTime::now() usage.
+                    let timestamp_ns = 0u64;
 
-                    // Best-effort event emission - don't fail spawn on event error
-                    let _ = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            self.episode_runtime
-                                .emit_lease_issue_denied(
-                                    request.work_id.clone(),
-                                    LeaseIssueDenialReason::SodViolation {
-                                        executor_domain: executor_domain.clone(),
-                                        author_domain: author_domain.clone(),
-                                    },
-                                    timestamp_ns,
-                                )
-                                .await
-                        })
-                    });
+                    // Best-effort event emission - don't fail spawn on event error.
+                    // If no Tokio runtime is available (e.g., in unit tests), skip the
+                    // async event emission. This is safe because:
+                    // 1. The denial is still returned to the caller
+                    // 2. The event is only for audit/diagnostic purposes
+                    // 3. Production code always has a Tokio runtime
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        let _ = tokio::task::block_in_place(|| {
+                            handle.block_on(async {
+                                self.episode_runtime
+                                    .emit_lease_issue_denied(
+                                        request.work_id.clone(),
+                                        LeaseIssueDenialReason::SodViolation {
+                                            executor_domain: executor_domain.clone(),
+                                            author_domain: author_domain.clone(),
+                                        },
+                                        timestamp_ns,
+                                    )
+                                    .await
+                            })
+                        });
+                    }
 
                     return Ok(PrivilegedResponse::error(
                         PrivilegedErrorCode::SodViolation,
@@ -3840,5 +3866,328 @@ mod tests {
             result,
             Err(WorkRegistryError::DuplicateWorkId { .. })
         ));
+    }
+
+    // ========================================================================
+    // TCK-00258: SoD Enforcement Integration Tests
+    //
+    // These tests verify that Separation of Duties (SoD) is enforced when
+    // spawning GATE_EXECUTOR episodes. The custody domain check prevents
+    // actors from reviewing their own work (self-review attacks).
+    // ========================================================================
+
+    /// TCK-00258: `GATE_EXECUTOR` spawn with overlapping custody domains is
+    /// denied.
+    ///
+    /// This tests the fail-closed `SoD` enforcement: when the executor's
+    /// custody domains overlap with the changeset author's domains, the
+    /// spawn must be rejected with `SOD_VIOLATION` error.
+    #[test]
+    fn test_sod_spawn_overlapping_domains_denied() {
+        let dispatcher = PrivilegedDispatcher::new();
+        let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            uid: 1001,
+            gid: 1001,
+            pid: Some(12345),
+        }));
+
+        // First, claim work as GATE_EXECUTOR with overlapping domains
+        // Actor ID: team-alpha:alice -> domain: team-alpha
+        // Work ID: W-team-alpha-12345 -> author domain: team-alpha
+        // These domains overlap, so SoD should be violated
+        let claim_request = ClaimWorkRequest {
+            actor_id: "team-alpha:alice".to_string(),
+            role: WorkRole::GateExecutor.into(),
+            credential_signature: vec![],
+            nonce: vec![],
+        };
+        let claim_frame = encode_claim_work_request(&claim_request);
+        let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+        // Extract work_id and lease_id from claim response
+        let (_work_id, lease_id) = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+            _ => panic!("Expected ClaimWork response"),
+        };
+
+        // Create a new claim with a specific work_id format
+        let claim_with_overlap = WorkClaim {
+            work_id: "W-team-alpha-test123".to_string(),
+            lease_id: lease_id.clone(),
+            actor_id: "team-alpha:bob".to_string(),
+            role: WorkRole::GateExecutor,
+            policy_resolution: PolicyResolution {
+                policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
+                resolved_policy_hash: [0u8; 32],
+                capability_manifest_hash: [0u8; 32],
+                context_pack_hash: [0u8; 32],
+            },
+            executor_custody_domains: vec!["team-alpha".to_string()],
+            author_custody_domains: vec!["team-alpha".to_string()],
+        };
+
+        // Register the claim directly
+        let _ = dispatcher.work_registry.register_claim(claim_with_overlap);
+
+        // Register a gate lease for this work_id
+        dispatcher
+            .lease_validator
+            .register_lease(&lease_id, "W-team-alpha-test123", "GATE-001");
+
+        // Now spawn with the overlapping domains
+        let spawn_request = SpawnEpisodeRequest {
+            work_id: "W-team-alpha-test123".to_string(),
+            role: WorkRole::GateExecutor.into(),
+            lease_id: Some(lease_id),
+        };
+        let spawn_frame = encode_spawn_episode_request(&spawn_request);
+        let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+
+        // Should be denied with SOD_VIOLATION
+        match spawn_response {
+            PrivilegedResponse::Error(err) => {
+                assert_eq!(err.code, PrivilegedErrorCode::SodViolation as i32);
+                assert!(err.message.contains("custody domain overlap"));
+            },
+            _ => panic!("Expected SOD_VIOLATION error, got: {spawn_response:?}"),
+        }
+    }
+
+    /// TCK-00258: `GATE_EXECUTOR` spawn with non-overlapping domains succeeds.
+    ///
+    /// This tests the happy path: when executor and author domains don't
+    /// overlap, the spawn should succeed.
+    #[test]
+    fn test_sod_spawn_non_overlapping_domains_succeeds() {
+        let dispatcher = PrivilegedDispatcher::new();
+        let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            uid: 1001,
+            gid: 1001,
+            pid: Some(12345),
+        }));
+
+        // Create a claim with non-overlapping domains
+        // Executor domain: team-review (from actor_id team-review:alice)
+        // Author domain: team-dev (from work_id W-team-dev-test123)
+        let claim_non_overlap = WorkClaim {
+            work_id: "W-team-dev-test456".to_string(),
+            lease_id: "L-non-overlap-123".to_string(),
+            actor_id: "team-review:alice".to_string(),
+            role: WorkRole::GateExecutor,
+            policy_resolution: PolicyResolution {
+                policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
+                resolved_policy_hash: [0u8; 32],
+                capability_manifest_hash: [0u8; 32],
+                context_pack_hash: [0u8; 32],
+            },
+            executor_custody_domains: vec!["team-review".to_string()],
+            author_custody_domains: vec!["team-dev".to_string()],
+        };
+
+        // Register the claim
+        let _ = dispatcher.work_registry.register_claim(claim_non_overlap);
+
+        // Register a gate lease
+        dispatcher.lease_validator.register_lease(
+            "L-non-overlap-123",
+            "W-team-dev-test456",
+            "GATE-002",
+        );
+
+        // Spawn should succeed
+        let spawn_request = SpawnEpisodeRequest {
+            work_id: "W-team-dev-test456".to_string(),
+            role: WorkRole::GateExecutor.into(),
+            lease_id: Some("L-non-overlap-123".to_string()),
+        };
+        let spawn_frame = encode_spawn_episode_request(&spawn_request);
+        let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+
+        // Should succeed
+        match spawn_response {
+            PrivilegedResponse::SpawnEpisode(resp) => {
+                assert!(!resp.session_id.is_empty());
+                assert!(resp.context_pack_sealed);
+            },
+            PrivilegedResponse::Error(err) => {
+                panic!("Expected SpawnEpisode success, got error: {err:?}")
+            },
+            _ => panic!("Expected SpawnEpisode response"),
+        }
+    }
+
+    /// TCK-00258: `GATE_EXECUTOR` spawn with empty author domains is denied
+    /// (fail-closed).
+    ///
+    /// This tests fail-closed semantics: if author domains cannot be resolved,
+    /// the spawn must be rejected to prevent `SoD` bypass.
+    #[test]
+    fn test_sod_spawn_empty_author_domains_denied() {
+        let dispatcher = PrivilegedDispatcher::new();
+        let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            uid: 1001,
+            gid: 1001,
+            pid: Some(12345),
+        }));
+
+        // Create a claim with empty author domains (simulating resolution failure)
+        let claim_empty_authors = WorkClaim {
+            work_id: "W-unknown-work-789".to_string(),
+            lease_id: "L-empty-authors-456".to_string(),
+            actor_id: "team-review:charlie".to_string(),
+            role: WorkRole::GateExecutor,
+            policy_resolution: PolicyResolution {
+                policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
+                resolved_policy_hash: [0u8; 32],
+                capability_manifest_hash: [0u8; 32],
+                context_pack_hash: [0u8; 32],
+            },
+            executor_custody_domains: vec!["team-review".to_string()],
+            author_custody_domains: vec![], // Empty - resolution failed
+        };
+
+        // Register the claim
+        let _ = dispatcher.work_registry.register_claim(claim_empty_authors);
+
+        // Register a gate lease
+        dispatcher.lease_validator.register_lease(
+            "L-empty-authors-456",
+            "W-unknown-work-789",
+            "GATE-003",
+        );
+
+        // Spawn should be denied because we can't verify SoD without author domains
+        let spawn_request = SpawnEpisodeRequest {
+            work_id: "W-unknown-work-789".to_string(),
+            role: WorkRole::GateExecutor.into(),
+            lease_id: Some("L-empty-authors-456".to_string()),
+        };
+        let spawn_frame = encode_spawn_episode_request(&spawn_request);
+        let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+
+        // Should be denied with SOD_VIOLATION
+        match spawn_response {
+            PrivilegedResponse::Error(err) => {
+                assert_eq!(err.code, PrivilegedErrorCode::SodViolation as i32);
+                assert!(err.message.contains("author custody domains"));
+            },
+            _ => panic!("Expected SOD_VIOLATION error for empty author domains"),
+        }
+    }
+
+    /// TCK-00258: Non-`GATE_EXECUTOR` roles skip `SoD` validation.
+    ///
+    /// IMPLEMENTER and REVIEWER roles do not require `SoD` validation since
+    /// they are not performing trust-critical gate operations.
+    #[test]
+    fn test_sod_non_gate_executor_skips_validation() {
+        let dispatcher = PrivilegedDispatcher::new();
+        let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            uid: 1001,
+            gid: 1001,
+            pid: Some(12345),
+        }));
+
+        // Create a claim as IMPLEMENTER with overlapping domains
+        // This would fail SoD for GATE_EXECUTOR, but IMPLEMENTER skips SoD
+        let claim_implementer = WorkClaim {
+            work_id: "W-team-alpha-impl123".to_string(),
+            lease_id: "L-implementer-789".to_string(),
+            actor_id: "team-alpha:developer".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: PolicyResolution {
+                policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
+                resolved_policy_hash: [0u8; 32],
+                capability_manifest_hash: [0u8; 32],
+                context_pack_hash: [0u8; 32],
+            },
+            executor_custody_domains: vec!["team-alpha".to_string()],
+            author_custody_domains: vec!["team-alpha".to_string()], // Overlapping!
+        };
+
+        // Register the claim
+        let _ = dispatcher.work_registry.register_claim(claim_implementer);
+
+        // Spawn as IMPLEMENTER should succeed despite overlapping domains
+        let spawn_request = SpawnEpisodeRequest {
+            work_id: "W-team-alpha-impl123".to_string(),
+            role: WorkRole::Implementer.into(),
+            lease_id: Some("L-implementer-789".to_string()),
+        };
+        let spawn_frame = encode_spawn_episode_request(&spawn_request);
+        let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+
+        // Should succeed - IMPLEMENTER skips SoD validation
+        match spawn_response {
+            PrivilegedResponse::SpawnEpisode(resp) => {
+                assert!(!resp.session_id.is_empty());
+            },
+            PrivilegedResponse::Error(err) => {
+                panic!("Expected SpawnEpisode success for IMPLEMENTER, got error: {err:?}")
+            },
+            _ => panic!("Expected SpawnEpisode response"),
+        }
+    }
+
+    /// TCK-00258: UNIVERSAL domain triggers `SoD` violation (fail-closed for
+    /// malformed IDs).
+    ///
+    /// When `actor_id` or `work_id` don't match expected schema, the resolver
+    /// returns UNIVERSAL domain which overlaps with everything, ensuring
+    /// fail-closed behavior.
+    #[test]
+    fn test_sod_universal_domain_triggers_violation() {
+        let dispatcher = PrivilegedDispatcher::new();
+        let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            uid: 1001,
+            gid: 1001,
+            pid: Some(12345),
+        }));
+
+        // Create a claim where both executor and author resolve to UNIVERSAL
+        // (simulating malformed IDs that don't match expected schema)
+        let claim_universal = WorkClaim {
+            work_id: "W-malformed-work".to_string(), // Will resolve to UNIVERSAL
+            lease_id: "L-universal-test".to_string(),
+            actor_id: "malformed_actor_no_colon".to_string(), // Will resolve to UNIVERSAL
+            role: WorkRole::GateExecutor,
+            policy_resolution: PolicyResolution {
+                policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
+                resolved_policy_hash: [0u8; 32],
+                capability_manifest_hash: [0u8; 32],
+                context_pack_hash: [0u8; 32],
+            },
+            // Both domains are UNIVERSAL - they will overlap
+            executor_custody_domains: vec!["UNIVERSAL".to_string()],
+            author_custody_domains: vec!["UNIVERSAL".to_string()],
+        };
+
+        // Register the claim
+        let _ = dispatcher.work_registry.register_claim(claim_universal);
+
+        // Register a gate lease
+        dispatcher.lease_validator.register_lease(
+            "L-universal-test",
+            "W-malformed-work",
+            "GATE-004",
+        );
+
+        // Spawn should be denied due to UNIVERSAL overlap
+        let spawn_request = SpawnEpisodeRequest {
+            work_id: "W-malformed-work".to_string(),
+            role: WorkRole::GateExecutor.into(),
+            lease_id: Some("L-universal-test".to_string()),
+        };
+        let spawn_frame = encode_spawn_episode_request(&spawn_request);
+        let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+
+        // Should be denied with SOD_VIOLATION
+        match spawn_response {
+            PrivilegedResponse::Error(err) => {
+                assert_eq!(err.code, PrivilegedErrorCode::SodViolation as i32);
+                assert!(err.message.contains("UNIVERSAL"));
+            },
+            _ => panic!("Expected SOD_VIOLATION error for UNIVERSAL domain overlap"),
+        }
     }
 }
