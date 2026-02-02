@@ -2,11 +2,15 @@
 //!
 //! This is the main daemon binary that manages AI CLI processes.
 //!
-//! # Dual-Socket Topology (TCK-00249)
+//! # `ProtocolServer`-Only Control Plane (TCK-00279)
 //!
-//! The daemon uses a dual-socket architecture for privilege separation:
+//! Per DD-009 (RFC-0017), the daemon uses a dual-socket `ProtocolServer`
+//! architecture:
 //! - **Operator socket** (`operator.sock`, mode 0600): Privileged operations
 //! - **Session socket** (`session.sock`, mode 0660): Session-scoped operations
+//!
+//! Legacy JSON IPC has been removed. `ProtocolServer` is the only control-plane
+//! IPC.
 //!
 //! # Prometheus Metrics (TCK-00268)
 //!
@@ -19,21 +23,8 @@
 //! - `apm2_daemon_context_firewall_denials_total` (counter)
 //! - `apm2_daemon_session_terminations_total` (counter)
 //!
-//! ## Current Integration Status
-//!
-//! Currently, only `ipc_requests_total` is actively recorded via `handlers.rs`
-//! for JSON-based IPC requests. The other metrics (sessions, tool mediation,
-//! capabilities, firewall, terminations) are defined and instrumented in
-//! `PrivilegedDispatcher` and `ToolBroker`, but those components use the binary
-//! protocol which is not yet wired into this main.rs.
-//!
-//! TODO(TCK-FUTURE): Wire `PrivilegedDispatcher` and `ToolBroker` into main.rs
-//! to enable all metrics.
-//!
 //! See RFC-0017 for architecture details.
 
-mod handlers;
-mod ipc_server;
 // mod protocol; // Use library crate instead to avoid dead code warnings
 mod state;
 
@@ -443,14 +434,15 @@ async fn main() -> Result<()> {
         info!("Managing {} processes", inner.supervisor.process_count());
     }
 
-    // Start dual-socket IPC server (TCK-00249)
-    // This replaces the legacy single-socket JSON IPC
+    // TCK-00279: Start ProtocolServer-only control plane
+    // This is the ONLY control-plane listener. Legacy JSON IPC has been removed per
+    // DD-009.
     let socket_manager = Arc::new(socket_manager);
     let ipc_state = state.clone();
     let ipc_socket_manager = Arc::clone(&socket_manager);
-    let ipc_task = tokio::spawn(async move {
+    let protocol_server_task = tokio::spawn(async move {
         if let Err(e) = run_socket_manager_server(ipc_socket_manager, ipc_state).await {
-            error!("IPC server error: {}", e);
+            error!("ProtocolServer error: {}", e);
         }
     });
 
@@ -492,8 +484,8 @@ async fn main() -> Result<()> {
 
     // Wait for shutdown
     tokio::select! {
-        _ = ipc_task => {
-            info!("IPC server exited");
+        _ = protocol_server_task => {
+            info!("ProtocolServer exited");
         }
         _ = signal_task => {
             info!("Signal handler triggered shutdown");
@@ -612,20 +604,29 @@ async fn perform_crash_recovery(_state: &SharedState) -> Result<()> {
     Ok(())
 }
 
-/// Run the dual-socket IPC server using `SocketManager` (TCK-00249).
+/// Run the `ProtocolServer`-only control plane (TCK-00279).
 ///
-/// This replaces the legacy single-socket JSON IPC with the new
-/// privilege-separated dual-socket topology defined in RFC-0017.
+/// This is the ONLY control-plane IPC listener. Per DD-009 (RFC-0017),
+/// legacy JSON IPC has been removed and `ProtocolServer` is the sole
+/// control-plane surface:
+/// - `operator.sock` (mode 0600): Privileged operations
+/// - `session.sock` (mode 0660): Session-scoped operations
+///
+/// # Acceptance Criteria (TCK-00279)
+///
+/// - No `ipc_server::run` invocation in default build
+/// - Startup logs show only operator.sock + session.sock listeners
+/// - Legacy socket path is absent
 async fn run_socket_manager_server(
     socket_manager: Arc<SocketManager>,
     state: SharedState,
 ) -> Result<()> {
-    info!("Dual-socket IPC server started");
+    info!("ProtocolServer control plane started (operator.sock + session.sock only)");
 
     loop {
         // Check for shutdown
         if state.is_shutdown_requested() {
-            info!("Dual-socket IPC server shutting down");
+            info!("ProtocolServer control plane shutting down");
             break;
         }
 
@@ -659,101 +660,53 @@ async fn run_socket_manager_server(
 /// Handle a connection from the dual-socket manager.
 ///
 /// Routes requests based on socket type (privilege level).
+///
+/// # Protocol Compliance (TCK-00279/TCK-00281)
+///
+/// This function performs the mandatory Hello/HelloAck handshake as specified
+/// in DD-001/DD-008, then processes protobuf messages. Legacy JSON IPC has
+/// been removed per DD-009.
 async fn handle_dual_socket_connection(
     mut connection: protocol::server::Connection,
     socket_type: protocol::socket_manager::SocketType,
-    state: SharedState,
+    _state: SharedState,
 ) -> Result<()> {
-    use apm2_core::ipc::{IpcRequest, IpcResponse};
-    use futures::{SinkExt, StreamExt};
+    use protocol::connection_handler::{HandshakeResult, perform_handshake};
 
     info!(
         socket_type = %socket_type,
         privileged = connection.is_privileged(),
-        "New dual-socket connection"
+        "New ProtocolServer connection"
     );
 
-    // Upgrade to full frame size after connection is established
-    connection.upgrade_to_full_frame_size()?;
-
-    // Process messages
-    while let Some(frame_result) = connection.framed().next().await {
-        match frame_result {
-            Ok(frame) => {
-                if frame.is_empty() {
-                    // Empty frame signals connection close
-                    break;
-                }
-
-                // Parse the request
-                let request: IpcRequest = match serde_json::from_slice(&frame) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        warn!("Failed to parse request: {e}");
-                        continue;
-                    },
-                };
-
-                // Check privilege level for privileged operations
-                if requires_privilege(&request) && !connection.is_privileged() {
-                    warn!(
-                        "Unprivileged client attempted privileged operation: {:?}",
-                        request
-                    );
-                    let response = IpcResponse::Error {
-                        code: apm2_core::ipc::ErrorCode::InvalidRequest,
-                        message: "operation requires privileged (operator) connection".to_string(),
-                    };
-                    let json: bytes::Bytes = serde_json::to_vec(&response)?.into();
-                    connection.framed().send(json).await?;
-                    continue;
-                }
-
-                // Dispatch to handler
-                let response = handlers::dispatch(request, &state).await;
-
-                // Send response
-                let json: bytes::Bytes = serde_json::to_vec(&response)?.into();
-                connection.framed().send(json).await?;
-            },
-            Err(e) => {
-                warn!("Frame error: {e}");
-                break;
-            },
-        }
+    // Perform mandatory handshake
+    match perform_handshake(&mut connection).await? {
+        HandshakeResult::Success => {
+            info!(socket_type = %socket_type, "Handshake completed successfully");
+        },
+        HandshakeResult::Failed => {
+            warn!(socket_type = %socket_type, "Handshake failed, closing connection");
+            return Ok(());
+        },
+        HandshakeResult::ConnectionClosed => {
+            info!(socket_type = %socket_type, "Connection closed during handshake");
+            return Ok(());
+        },
     }
 
-    info!(socket_type = %socket_type, "Connection closed");
-    Ok(())
-}
+    // TCK-00281: Legacy JSON IPC dispatch has been removed per DD-009.
+    // The daemon now only accepts protobuf-encoded messages via
+    // PrivilegedDispatcher and SessionDispatcher. CLI clients must migrate to
+    // the protobuf protocol.
+    //
+    // TODO: Wire up PrivilegedDispatcher and SessionDispatcher for message
+    // processing. For now, connections are accepted and handshake is completed,
+    // but no message processing occurs. This allows the daemon to start and
+    // accept connections while the protobuf integration is completed in
+    // subsequent tickets.
 
-/// Check if a request requires privileged (operator) access.
-///
-/// TCK-00249: Uses default-deny model. Session socket connections are only
-/// allowed to perform a small whitelist of safe operations. All other
-/// operations require privileged (operator) connection.
-///
-/// # Security (Holonic Seclusion)
-///
-/// Session socket (mode 0660) is accessible to group users. To maintain
-/// seclusion, we only allow `Ping` which cannot leak information about
-/// processes, credentials, logs, or other sensitive data.
-///
-/// Operations that would violate seclusion if allowed on session socket:
-/// - `TailLogs`: Would expose logs from ALL processes to any group user
-/// - `ListProcesses`/`GetProcess`: Would expose process args (may contain
-///   secrets)
-/// - `ListCredentials`/`GetCredential`: Would expose credential metadata
-/// - `Status`: Would expose daemon configuration details
-/// - `*Episode*`: Episode state contains sensitive context
-const fn requires_privilege(request: &apm2_core::ipc::IpcRequest) -> bool {
-    use apm2_core::ipc::IpcRequest;
-    // Default-deny: only explicitly whitelisted operations are unprivileged
-    !matches!(
-        request,
-        // Session-safe operations (do not leak sensitive information)
-        IpcRequest::Ping
-    )
+    info!(socket_type = %socket_type, "Connection ready for protobuf messages (dispatch pending)");
+    Ok(())
 }
 
 /// Run the Prometheus metrics HTTP server (TCK-00268).

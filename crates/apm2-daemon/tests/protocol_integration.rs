@@ -750,3 +750,315 @@ async fn test_session_socket_handshake() {
         .expect("server task panicked");
     assert_eq!(socket_type, SocketType::Session);
 }
+
+// ============================================================================
+// ProtocolServer-Only Startup Tests (TCK-00279)
+// ============================================================================
+
+/// INT-00279-01: `ProtocolServer`-only startup.
+///
+/// This test verifies the acceptance criteria for TCK-00279:
+///
+/// 1. **`ProtocolServer` is the only daemon control-plane listener**
+///    - Verification: `SocketManager` binds operator.sock + session.sock
+///
+/// 2. **Legacy JSON IPC startup removed**
+///    - Verification: No `ipc_server` module exists in the daemon binary source
+///    - (This is verified by code inspection and compilation - the module
+///      import was removed)
+///
+/// 3. **Legacy socket path is absent**
+///    - Verification: Default paths use operator.sock and session.sock, not
+///      apm2d.sock
+///
+/// Per DD-009 (RFC-0017), the daemon ONLY uses `ProtocolServer` for
+/// control-plane IPC. The legacy JSON IPC (`ipc_server.rs`) has been removed.
+#[tokio::test]
+async fn test_protocol_only_startup() {
+    let tmp = TempDir::new().unwrap();
+
+    // Define the dual-socket paths per DD-009
+    let operator_path = tmp.path().join("operator.sock");
+    let session_path = tmp.path().join("session.sock");
+
+    // Legacy single-socket path that should NOT be used
+    let legacy_path = tmp.path().join("apm2d.sock");
+
+    // 1. Verify SocketManager creates ONLY operator.sock and session.sock
+    let config = SocketManagerConfig::new(&operator_path, &session_path);
+    let manager = SocketManager::bind(config).unwrap();
+
+    // Verify the dual sockets exist
+    assert!(
+        operator_path.exists(),
+        "operator.sock should exist for ProtocolServer"
+    );
+    assert!(
+        session_path.exists(),
+        "session.sock should exist for ProtocolServer"
+    );
+
+    // Verify legacy single-socket path does NOT exist
+    // (We never created it, and SocketManager shouldn't either)
+    assert!(
+        !legacy_path.exists(),
+        "Legacy apm2d.sock should NOT exist - ProtocolServer uses dual sockets only"
+    );
+
+    // 2. Verify SocketManager paths match what we configured
+    assert_eq!(
+        manager.operator_socket_path(),
+        &operator_path,
+        "SocketManager should bind to configured operator path"
+    );
+    assert_eq!(
+        manager.session_socket_path(),
+        &session_path,
+        "SocketManager should bind to configured session path"
+    );
+
+    // 3. Verify socket permissions match DD-009 requirements
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let operator_mode = std::fs::metadata(&operator_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            operator_mode, 0o600,
+            "operator.sock should have mode 0600 (owner only)"
+        );
+
+        let session_mode = std::fs::metadata(&session_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            session_mode, 0o660,
+            "session.sock should have mode 0660 (owner + group)"
+        );
+    }
+
+    // 4. Verify default paths from EcosystemConfig use dual-socket topology
+    // The default config should point to operator.sock and session.sock,
+    // not the legacy apm2d.sock
+    let default_config = apm2_core::config::EcosystemConfig::default();
+
+    // Get filenames from paths
+    let default_operator_name = default_config
+        .daemon
+        .operator_socket
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let default_session_name = default_config
+        .daemon
+        .session_socket
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    assert_eq!(
+        default_operator_name, "operator.sock",
+        "Default operator socket should be operator.sock"
+    );
+    assert_eq!(
+        default_session_name, "session.sock",
+        "Default session socket should be session.sock"
+    );
+
+    // Cleanup happens automatically when manager is dropped
+    drop(manager);
+
+    // Verify cleanup removed the sockets
+    assert!(
+        !operator_path.exists(),
+        "operator.sock should be cleaned up on drop"
+    );
+    assert!(
+        !session_path.exists(),
+        "session.sock should be cleaned up on drop"
+    );
+}
+
+/// Test that legacy single-socket server config points to the legacy path.
+///
+/// This verifies that `ProtocolServer::default_socket_path()` still returns
+/// the legacy `apm2d.sock` path (for backwards compatibility in the
+/// `ProtocolServer` API), but the daemon uses `SocketManager` with dual sockets
+/// instead.
+///
+/// This test documents the distinction:
+/// - `ProtocolServer` (single-socket): Uses `apm2d.sock` - NOT used by daemon
+/// - `SocketManager` (dual-socket): Uses `operator.sock` + `session.sock` -
+///   USED by daemon
+#[tokio::test]
+async fn test_legacy_protocol_server_path_not_used_by_daemon() {
+    use apm2_daemon::protocol::server::default_socket_path;
+
+    // The legacy ProtocolServer default path
+    let legacy_default = default_socket_path();
+    let legacy_name = legacy_default
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    // ProtocolServer's default is apm2d.sock (for API compatibility)
+    assert_eq!(
+        legacy_name, "apm2d.sock",
+        "ProtocolServer default should be apm2d.sock"
+    );
+
+    // But the daemon uses SocketManager with dual sockets instead
+    let default_config = apm2_core::config::EcosystemConfig::default();
+    let daemon_operator = default_config
+        .daemon
+        .operator_socket
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let daemon_session = default_config
+        .daemon
+        .session_socket
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    // Daemon config uses dual-socket paths, NOT the legacy single socket
+    assert_ne!(
+        daemon_operator, "apm2d.sock",
+        "Daemon should NOT use legacy apm2d.sock for operator"
+    );
+    assert_ne!(
+        daemon_session, "apm2d.sock",
+        "Daemon should NOT use legacy apm2d.sock for session"
+    );
+    assert_eq!(
+        daemon_operator, "operator.sock",
+        "Daemon should use operator.sock"
+    );
+    assert_eq!(
+        daemon_session, "session.sock",
+        "Daemon should use session.sock"
+    );
+}
+
+// ============================================================================
+// Connection Handler Tests (TCK-00279 Fix)
+// ============================================================================
+
+/// INT-00279-02: Mandatory handshake via `perform_handshake`.
+///
+/// This test verifies that the `perform_handshake` function (now in the
+/// library at `apm2_daemon::protocol::connection_handler`) properly implements
+/// the mandatory Hello/HelloAck handshake as specified in DD-001/DD-008.
+///
+/// # TCK-00281: Legacy JSON IPC Removed
+///
+/// Per DD-009, legacy JSON IPC dispatch has been removed. This test now
+/// only verifies the handshake functionality, not JSON request/response
+/// handling. The full request dispatch will be re-implemented using
+/// protobuf in a subsequent ticket.
+#[tokio::test]
+async fn test_perform_handshake_integration() {
+    use std::sync::Arc;
+
+    use apm2_daemon::protocol::connection_handler::{HandshakeResult, perform_handshake};
+    use apm2_daemon::protocol::{
+        ClientHandshake, Connection, HandshakeMessage, SocketManagerConfig,
+        parse_handshake_message, serialize_handshake_message,
+    };
+    use tokio::net::UnixStream;
+
+    let tmp = TempDir::new().unwrap();
+    let operator_path = tmp.path().join("operator.sock");
+    let session_path = tmp.path().join("session.sock");
+
+    let config = SocketManagerConfig::new(&operator_path, &session_path);
+    let manager = Arc::new(apm2_daemon::protocol::SocketManager::bind(config).unwrap());
+
+    // Spawn server using perform_handshake from the library
+    let manager_clone = manager.clone();
+    let server_handle = tokio::spawn(async move {
+        let (mut conn, _permit, socket_type) = manager_clone.accept().await.unwrap();
+        // Test the handshake function directly
+        let result = perform_handshake(&mut conn).await.unwrap();
+        (result, socket_type)
+    });
+
+    // Connect as client
+    let stream = UnixStream::connect(&operator_path).await.unwrap();
+    let mut client_conn = Connection::new_with_credentials(stream, None);
+    let mut client_handshake = ClientHandshake::new("integration-test/1.0");
+
+    // Perform handshake
+    let hello = client_handshake.create_hello();
+    let hello_msg = HandshakeMessage::Hello(hello);
+    let hello_bytes = serialize_handshake_message(&hello_msg).unwrap();
+    client_conn.framed().send(hello_bytes).await.unwrap();
+
+    // Receive HelloAck
+    let response_frame = timeout(Duration::from_secs(2), client_conn.framed().next())
+        .await
+        .expect("handshake response timed out")
+        .expect("stream ended unexpectedly")
+        .expect("failed to receive response");
+
+    let response = parse_handshake_message(&response_frame).expect("failed to parse response");
+    assert!(
+        matches!(response, HandshakeMessage::HelloAck(_)),
+        "Expected HelloAck, got {response:?}"
+    );
+
+    client_handshake.process_response(response).unwrap();
+    assert!(
+        client_handshake.is_completed(),
+        "Client handshake should complete"
+    );
+
+    // Wait for server to finish
+    let (result, socket_type) = timeout(Duration::from_secs(1), server_handle)
+        .await
+        .expect("server timed out")
+        .expect("server task panicked");
+
+    assert!(
+        matches!(result, HandshakeResult::Success),
+        "Handshake should succeed"
+    );
+    assert_eq!(socket_type, SocketType::Operator);
+}
+
+/// INT-00279-03: Handshake handler is in testable library module.
+///
+/// This test verifies that the connection handler logic is in the library
+/// crate where it can be properly unit tested.
+///
+/// Per LAW-05 (testability principle), core security logic should be in
+/// testable library modules, not in the binary.
+///
+/// # TCK-00281: Legacy JSON IPC Removed
+///
+/// Per DD-009, the `requires_privilege` function and JSON dispatch have been
+/// removed. Only handshake-related types remain in the library.
+#[test]
+fn test_handshake_types_are_in_library() {
+    use apm2_daemon::protocol::connection_handler::HandshakeResult;
+
+    // Verify HandshakeResult enum variants are accessible
+    // Simply constructing each variant proves they exist and are public
+    let success = HandshakeResult::Success;
+    let failed = HandshakeResult::Failed;
+    let closed = HandshakeResult::ConnectionClosed;
+
+    // Use the values to avoid unused warnings
+    assert!(matches!(success, HandshakeResult::Success));
+    assert!(matches!(failed, HandshakeResult::Failed));
+    assert!(matches!(closed, HandshakeResult::ConnectionClosed));
+
+    // This test passing means the handshake handler is properly in the library
+}
