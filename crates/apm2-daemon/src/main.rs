@@ -334,6 +334,10 @@ async fn main() -> Result<()> {
             info!("Daemonizing...");
 
             // First fork
+            // SAFETY: fork() is safe to call in a single-threaded context before
+            // any multi-threading begins. At this point, we haven't spawned any
+            // async tasks or threads. The child process will exit immediately
+            // (in the second fork) or continue with daemon initialization.
             match unsafe { fork() }? {
                 ForkResult::Parent { .. } => {
                     // Parent exits
@@ -345,7 +349,10 @@ async fn main() -> Result<()> {
             // Create new session
             setsid()?;
 
-            // Second fork
+            // Second fork (completes double-fork daemon pattern)
+            // SAFETY: fork() is safe to call here because we are still in a
+            // single-threaded context. The first fork's child has called setsid()
+            // and is about to fork again. The grandchild becomes the daemon.
             match unsafe { fork() }? {
                 ForkResult::Parent { .. } => {
                     // Parent exits
