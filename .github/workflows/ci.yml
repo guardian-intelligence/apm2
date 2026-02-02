@@ -224,6 +224,17 @@ jobs:
 
           echo "All unsafe blocks have SAFETY-PROOF documentation"
 
+  # Legacy IPC guard (TCK-00282)
+  # Prevents reintroduction of legacy JSON IPC code removed in TCK-00281
+  legacy-ipc-guard:
+    name: Legacy IPC Guard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check for legacy IPC patterns
+        run: ./scripts/ci/legacy_ipc_guard.sh
+
   # Release build check
   build:
     name: Release Build
@@ -241,7 +252,7 @@ jobs:
   # Final check that all CI jobs passed
   ci-success:
     name: CI Success
-    needs: [fmt, proto-verify, clippy, doc, test, test-vectors, msrv, security, deny, coverage, build, safety-proof-coverage]
+    needs: [fmt, proto-verify, clippy, doc, test, test-vectors, msrv, security, deny, coverage, build, safety-proof-coverage, legacy-ipc-guard]
     if: always()
     runs-on: ubuntu-24.04
     steps:
@@ -259,3 +270,4 @@ jobs:
           if [[ "${{ needs.coverage.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.build.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.safety-proof-coverage.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.legacy-ipc-guard.result }}" != "success" ]]; then exit 1; fi
