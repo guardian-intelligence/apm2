@@ -153,8 +153,7 @@ pub trait Canonicalize {
 ///     time_envelope_ref: None,
 /// };
 ///
-/// // Canonicalize and get domain-prefixed bytes for signing
-/// decided.canonicalize();
+/// // Get domain-prefixed bytes for signing (automatically canonicalizes)
 /// let signing_bytes = decided.canonical_bytes_with_domain();
 /// // signing_bytes = b"apm2.event.tool_decided:" + protobuf_bytes
 /// ```
@@ -167,12 +166,17 @@ pub trait DomainSeparatedCanonical: Canonicalize + Message + Sized {
     /// Returns the canonical bytes with domain prefix for signing.
     ///
     /// This method:
-    /// 1. Serializes the message to protobuf bytes
-    /// 2. Prepends the domain prefix
+    /// 1. Calls `canonicalize()` to ensure repeated fields are sorted
+    /// 2. Serializes the message to protobuf bytes
+    /// 3. Prepends the domain prefix
     ///
-    /// The caller should call `canonicalize()` before this method to ensure
-    /// repeated fields are sorted.
-    fn canonical_bytes_with_domain(&self) -> Vec<u8> {
+    /// By taking `&mut self` and calling `canonicalize()` internally, this
+    /// method ensures that the caller cannot forget to canonicalize before
+    /// signing.
+    fn canonical_bytes_with_domain(&mut self) -> Vec<u8> {
+        // Ensure canonical form before encoding - prevents caller from forgetting
+        self.canonicalize();
+
         let prefix = Self::domain_prefix();
         let payload_bytes = self.encode_to_vec();
 
@@ -701,14 +705,16 @@ mod tests {
 
         policy_resolved.canonicalize();
 
-        // SEC-CAN-004: Profile IDs should be sorted alphabetically (independently)
+        // SEC-CAN-004: Profile IDs should be sorted alphabetically, with their
+        // corresponding manifest hashes moving together (paired sorting).
         assert_eq!(
             policy_resolved.resolved_rcp_profile_ids,
             vec!["a-profile", "m-profile", "z-profile"]
         );
 
-        // SEC-CAN-004: Manifest hashes should be sorted independently (not paired)
-        // This ensures determinism even when lengths don't match.
+        // SEC-CAN-004: Manifest hashes follow the same order as their paired profile
+        // IDs. Input: z -> 0x99, a -> 0x11, m -> 0x55
+        // After paired sort: a -> 0x11, m -> 0x55, z -> 0x99
         assert_eq!(
             policy_resolved.resolved_rcp_manifest_hashes,
             vec![vec![0x11; 32], vec![0x55; 32], vec![0x99; 32]]
@@ -748,7 +754,8 @@ mod tests {
         if let Some(kernel_event::Payload::PolicyResolvedForChangeset(policy_resolved)) =
             &event.payload
         {
-            // SEC-CAN-004: Both fields sorted independently
+            // SEC-CAN-004: Profile IDs and manifest hashes are sorted together as pairs.
+            // Input: z -> 0x99, a -> 0x11. After paired sort: a -> 0x11, z -> 0x99
             assert_eq!(
                 policy_resolved.resolved_rcp_profile_ids,
                 vec!["a-profile", "z-profile"]
@@ -757,6 +764,7 @@ mod tests {
                 policy_resolved.resolved_rcp_manifest_hashes,
                 vec![vec![0x11; 32], vec![0x99; 32]]
             );
+            // Verifier policy hashes are sorted independently (not paired)
             assert_eq!(
                 policy_resolved.resolved_verifier_policy_hashes,
                 vec![vec![0xAA; 32], vec![0xBB; 32]]
@@ -1476,6 +1484,106 @@ mod tests {
             policy_resolved.resolved_verifier_policy_hashes,
             vec![vec![0xAA; 32], vec![0xCC; 32]]
         );
+    }
+
+    /// TCK-00264: Verify paired sorting preserves `profile_id` <->
+    /// `manifest_hash` association.
+    ///
+    /// This is a critical security test. If profile IDs and manifest hashes are
+    /// sorted independently, the association between them is corrupted,
+    /// leading to:
+    /// - Incorrect policy enforcement (wrong RCP manifest for a profile)
+    /// - Signature verification failures
+    /// - Data corruption in audit logs
+    ///
+    /// The correct approach is to zip the arrays, sort by profile ID, then
+    /// unzip.
+    #[test]
+    fn tck_00264_paired_sorting_preserves_association() {
+        // Create unsorted input with DISTINCT values that would sort differently
+        // if sorted independently vs. as pairs.
+        //
+        // Profile IDs (alphabetically): delta < alpha < charlie < bravo (wait, that's
+        // wrong) Let's use: profile-a, profile-b, profile-c, profile-z
+        // With corresponding unique hashes: 0xAA, 0xBB, 0xCC, 0x99
+        //
+        // Input order (unsorted): z, a, c, b
+        // With hashes:            0x99, 0xAA, 0xCC, 0xBB
+        //
+        // WRONG (independent sorting):
+        //   profile_ids: [a, b, c, z]
+        //   hashes: [0x99, 0xAA, 0xBB, 0xCC] (sorted independently by value)
+        //
+        // CORRECT (paired sorting):
+        //   profile_ids: [a, b, c, z]
+        //   hashes: [0xAA, 0xBB, 0xCC, 0x99] (each hash moves with its profile)
+        let mut policy_resolved = PolicyResolvedForChangeSet {
+            work_id: "work-paired-test".to_string(),
+            changeset_digest: vec![0x42; 32],
+            resolved_policy_hash: vec![0x00; 32],
+            resolved_risk_tier: 1,
+            resolved_determinism_class: 0,
+            // Input: z -> 0x99, a -> 0xAA, c -> 0xCC, b -> 0xBB
+            resolved_rcp_profile_ids: vec![
+                "profile-z".into(),
+                "profile-a".into(),
+                "profile-c".into(),
+                "profile-b".into(),
+            ],
+            resolved_rcp_manifest_hashes: vec![
+                vec![0x99; 32], // corresponds to profile-z
+                vec![0xAA; 32], // corresponds to profile-a
+                vec![0xCC; 32], // corresponds to profile-c
+                vec![0xBB; 32], // corresponds to profile-b
+            ],
+            resolved_verifier_policy_hashes: vec![],
+            resolver_actor_id: "resolver-1".to_string(),
+            resolver_version: "1.0.0".to_string(),
+            resolver_signature: vec![0u8; 64],
+        };
+
+        policy_resolved.canonicalize();
+
+        // After paired sorting by profile ID:
+        // profile-a (at index 0) should have hash 0xAA
+        // profile-b (at index 1) should have hash 0xBB
+        // profile-c (at index 2) should have hash 0xCC
+        // profile-z (at index 3) should have hash 0x99
+        assert_eq!(
+            policy_resolved.resolved_rcp_profile_ids,
+            vec!["profile-a", "profile-b", "profile-c", "profile-z"]
+        );
+
+        // The CRITICAL assertion: hashes must follow their paired profile IDs
+        // NOT be sorted independently by their byte values
+        assert_eq!(
+            policy_resolved.resolved_rcp_manifest_hashes,
+            vec![
+                vec![0xAA; 32], // profile-a's hash
+                vec![0xBB; 32], // profile-b's hash
+                vec![0xCC; 32], // profile-c's hash
+                vec![0x99; 32], // profile-z's hash
+            ],
+            "CRITICAL: manifest hashes must preserve association with their profile IDs. \
+             If this fails with hashes sorted by value (0x99, 0xAA, 0xBB, 0xCC), \
+             the code is incorrectly sorting arrays independently instead of as pairs."
+        );
+
+        // Also verify we can look up the correct hash for each profile
+        // This simulates what verify_lease_match does
+        for (idx, profile_id) in policy_resolved.resolved_rcp_profile_ids.iter().enumerate() {
+            let expected_hash = &policy_resolved.resolved_rcp_manifest_hashes[idx];
+            let looked_up = policy_resolved
+                .resolved_rcp_profile_ids
+                .iter()
+                .position(|id| id == profile_id)
+                .map(|i| &policy_resolved.resolved_rcp_manifest_hashes[i]);
+            assert_eq!(
+                looked_up,
+                Some(expected_hash),
+                "Hash lookup for {profile_id} should return the correct paired hash"
+            );
+        }
     }
 
     /// SEC-CAN-002: Verify `KernelEvent` canonicalizes `MergeReceipt` payload.
