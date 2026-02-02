@@ -54,7 +54,7 @@ use super::dedupe::{DedupeCache, DedupeCacheConfig, SharedDedupeCache};
 use super::error::EpisodeId;
 use super::runtime::Hash;
 use super::tool_class::ToolClass;
-use crate::evidence::keychain::GitHubCredentialStore;
+use crate::evidence::keychain::{GitHubCredentialStore, SshCredentialStore};
 
 // =============================================================================
 // BrokerError
@@ -359,6 +359,20 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// GitHub App installation. Tool requests for Git/Network operations
     /// will use this installation ID to fetch credentials from the store.
     github_installation_id: tokio::sync::RwLock<Option<String>>,
+
+    /// SSH credential store for broker-mediated access (TCK-00263).
+    ///
+    /// Per RFC-0017 TB-003, SSH credentials (`SSH_AUTH_SOCK`) are held by the
+    /// daemon and never exposed to session processes. The broker uses this
+    /// store to provide SSH agent access for Git SSH operations.
+    ssh_store: Option<Arc<dyn SshCredentialStore>>,
+
+    /// Session ID for SSH credential lookups (TCK-00263).
+    ///
+    /// This is set by the daemon when a session is initialized. Tool requests
+    /// for Git operations with SSH remotes will use this session ID to
+    /// determine the `SSH_AUTH_SOCK` path for subprocess environment.
+    ssh_session_id: tokio::sync::RwLock<Option<String>>,
 }
 
 impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
@@ -377,6 +391,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             context_manifest: tokio::sync::RwLock::new(None),
             github_store: None,
             github_installation_id: tokio::sync::RwLock::new(None),
+            ssh_store: None,
+            ssh_session_id: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -395,6 +411,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             context_manifest: tokio::sync::RwLock::new(None),
             github_store: None,
             github_installation_id: tokio::sync::RwLock::new(None),
+            ssh_store: None,
+            ssh_session_id: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -419,6 +437,63 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             context_manifest: tokio::sync::RwLock::new(None),
             github_store: Some(github_store),
             github_installation_id: tokio::sync::RwLock::new(None),
+            ssh_store: None,
+            ssh_session_id: tokio::sync::RwLock::new(None),
+        }
+    }
+
+    /// Creates a new tool broker with an SSH credential store.
+    ///
+    /// Per RFC-0017 TB-003 and TCK-00263, SSH credentials (`SSH_AUTH_SOCK`) are
+    /// held by the daemon only. This constructor enables credential mediation
+    /// for Git SSH operations.
+    #[must_use]
+    pub fn with_ssh_store(
+        config: ToolBrokerConfig,
+        ssh_store: Arc<dyn SshCredentialStore>,
+    ) -> Self {
+        let dedupe_cache = Arc::new(DedupeCache::new(config.dedupe_config.clone()));
+
+        Self {
+            config,
+            validator: tokio::sync::RwLock::new(None),
+            dedupe_cache,
+            policy: StubPolicyEngine::new(),
+            cas: Arc::new(StubContentAddressedStore::new()),
+            loader: None,
+            context_manifest: tokio::sync::RwLock::new(None),
+            github_store: None,
+            github_installation_id: tokio::sync::RwLock::new(None),
+            ssh_store: Some(ssh_store),
+            ssh_session_id: tokio::sync::RwLock::new(None),
+        }
+    }
+
+    /// Creates a new tool broker with both GitHub and SSH credential stores.
+    ///
+    /// Per RFC-0017 TB-003, credentials are held by the daemon only. This
+    /// constructor enables credential mediation for both HTTPS and SSH Git
+    /// operations.
+    #[must_use]
+    pub fn with_credential_stores(
+        config: ToolBrokerConfig,
+        github_store: Arc<dyn GitHubCredentialStore>,
+        ssh_store: Arc<dyn SshCredentialStore>,
+    ) -> Self {
+        let dedupe_cache = Arc::new(DedupeCache::new(config.dedupe_config.clone()));
+
+        Self {
+            config,
+            validator: tokio::sync::RwLock::new(None),
+            dedupe_cache,
+            policy: StubPolicyEngine::new(),
+            cas: Arc::new(StubContentAddressedStore::new()),
+            loader: None,
+            context_manifest: tokio::sync::RwLock::new(None),
+            github_store: Some(github_store),
+            github_installation_id: tokio::sync::RwLock::new(None),
+            ssh_store: Some(ssh_store),
+            ssh_session_id: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -449,25 +524,110 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         debug!("GitHub installation ID cleared");
     }
 
+    /// Returns `true` if an SSH credential store is configured.
+    #[must_use]
+    pub fn has_ssh_store(&self) -> bool {
+        self.ssh_store.is_some()
+    }
+
+    /// Sets the session ID for SSH credential lookups (TCK-00263).
+    ///
+    /// This should be called when a session is initialized. The session ID
+    /// is used to look up `SSH_AUTH_SOCK` paths for Git SSH operations.
+    pub async fn set_ssh_session_id(&self, session_id: String) {
+        let mut guard = self.ssh_session_id.write().await;
+        *guard = Some(session_id);
+        debug!("SSH session ID set for credential mediation");
+    }
+
+    /// Clears the SSH session ID (TCK-00263).
+    ///
+    /// This should be called when a session ends.
+    pub async fn clear_ssh_session_id(&self) {
+        let mut guard = self.ssh_session_id.write().await;
+        *guard = None;
+        debug!("SSH session ID cleared");
+    }
+
+    /// Returns `true` if SSH agent is available for broker-mediated operations
+    /// (TCK-00263).
+    ///
+    /// This checks if the daemon has access to an SSH agent (via
+    /// `SSH_AUTH_SOCK`).
+    pub fn is_ssh_agent_available(&self) -> bool {
+        self.ssh_store
+            .as_ref()
+            .is_some_and(|store| store.is_ssh_agent_available())
+    }
+
+    /// Gets the `SSH_AUTH_SOCK` path for broker-mediated Git SSH operations
+    /// (TCK-00263).
+    ///
+    /// Per RFC-0017 TB-003, this returns the daemon's `SSH_AUTH_SOCK` path for
+    /// use in subprocess environment. The session process NEVER has direct
+    /// access to this path - it's only used by the broker when executing
+    /// git commands.
+    ///
+    /// # Returns
+    ///
+    /// `Some(path)` if SSH agent is available, `None` otherwise.
+    pub fn get_ssh_auth_sock_for_subprocess(&self) -> Option<String> {
+        self.ssh_store
+            .as_ref()
+            .and_then(|store| store.get_daemon_ssh_auth_sock())
+    }
+
     /// Fetches a credential for a tool request if applicable.
     ///
     /// Per RFC-0017 TB-003 (Credential Isolation Boundary), credentials are
     /// held by the daemon and never exposed to session processes. This method
     /// fetches credentials for Git/Network tool classes when:
-    /// 1. A GitHub credential store is configured
-    /// 2. A GitHub installation ID is set for the session
+    /// 1. A GitHub credential store is configured with an installation ID, OR
+    /// 2. An SSH credential store is configured with an available SSH agent
+    ///
+    /// # Credential Priority (TCK-00263)
+    ///
+    /// For Git tool class:
+    /// 1. First try GitHub token (for HTTPS remotes)
+    /// 2. Fall back to `SSH_AUTH_SOCK` (for SSH remotes)
+    ///
+    /// For Network tool class:
+    /// - Only GitHub tokens are applicable
     ///
     /// # Returns
     ///
     /// `Some(Credential)` if credentials were successfully fetched,
-    /// `None` if no credential store is configured or no installation ID is
-    /// set.
+    /// `None` if no credential store is configured or credentials are not
+    /// available.
     async fn fetch_credential_for_request(&self, tool_class: ToolClass) -> Option<Credential> {
         // Only fetch credentials for Git and Network tool classes
         if !matches!(tool_class, ToolClass::Git | ToolClass::Network) {
             return None;
         }
 
+        // Try GitHub credentials first (for HTTPS remotes)
+        if let Some(cred) = self.fetch_github_credential_for_request(tool_class).await {
+            return Some(cred);
+        }
+
+        // For Git tool class, also try SSH credentials (TCK-00263)
+        if tool_class == ToolClass::Git {
+            if let Some(cred) = self.fetch_ssh_credential_for_request() {
+                return Some(cred);
+            }
+        }
+
+        None
+    }
+
+    /// Fetches GitHub credentials for a tool request.
+    ///
+    /// Per TCK-00262, this checks for GitHub installation ID and fetches the
+    /// corresponding token from the GitHub credential store.
+    async fn fetch_github_credential_for_request(
+        &self,
+        tool_class: ToolClass,
+    ) -> Option<Credential> {
         // Check if we have a credential store configured
         let store = self.github_store.as_ref()?;
 
@@ -480,7 +640,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             Ok(token) => {
                 debug!(
                     tool_class = ?tool_class,
-                    "credential fetched for tool request"
+                    "GitHub credential fetched for tool request"
                 );
                 Some(Credential::new(token))
             },
@@ -488,11 +648,32 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 warn!(
                     tool_class = ?tool_class,
                     error = %e,
-                    "failed to fetch credential for tool request"
+                    "failed to fetch GitHub credential for tool request"
                 );
                 None
             },
         }
+    }
+
+    /// Fetches SSH credentials for a tool request (TCK-00263).
+    ///
+    /// Per RFC-0017 TB-003, this returns the daemon's `SSH_AUTH_SOCK` path as a
+    /// credential. The session process NEVER has direct access to this path -
+    /// it's only used by the broker when executing git commands in subprocess.
+    ///
+    /// # Returns
+    ///
+    /// `Some(Credential)` containing the `SSH_AUTH_SOCK` path if available,
+    /// `None` if SSH agent is not available.
+    fn fetch_ssh_credential_for_request(&self) -> Option<Credential> {
+        // Check if we have an SSH credential store configured
+        let store = self.ssh_store.as_ref()?;
+
+        // Get the daemon's SSH_AUTH_SOCK path
+        let auth_sock = store.get_daemon_ssh_auth_sock()?;
+
+        debug!("SSH credential (SSH_AUTH_SOCK) fetched for tool request");
+        Some(Credential::new(auth_sock))
     }
 
     /// Initializes the broker with a capability manifest from CAS.
@@ -2389,6 +2570,414 @@ mod tests {
         assert!(
             !debug_output.contains("super_secret_token"),
             "Credential should not expose secret in debug output"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Credential debug should show [REDACTED]"
+        );
+    }
+
+    // =========================================================================
+    // SSH Credential Broker Tests (TCK-00263)
+    //
+    // These tests verify the SSH credential broker functionality per RFC-0017
+    // TB-003 (Credential Isolation Boundary). SSH_AUTH_SOCK is held by the
+    // daemon and mediated to tool requests for Git SSH operations.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_ssh_broker_has_ssh_store() {
+        // TCK-00263: Test has_ssh_store() method
+        use crate::evidence::keychain::InMemorySshCredentialStore;
+
+        // Without store
+        let broker_no_store: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(ToolBrokerConfig::default());
+        assert!(!broker_no_store.has_ssh_store());
+
+        // With store
+        let store = Arc::new(InMemorySshCredentialStore::new());
+        let broker_with_store: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store);
+        assert!(broker_with_store.has_ssh_store());
+    }
+
+    #[tokio::test]
+    async fn test_ssh_broker_set_session_id() {
+        // TCK-00263: Test set/clear session ID for SSH
+        use crate::evidence::keychain::InMemorySshCredentialStore;
+
+        let store = Arc::new(InMemorySshCredentialStore::new());
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store);
+
+        // Initially no session ID
+        {
+            let guard = broker.ssh_session_id.read().await;
+            assert!(guard.is_none());
+        }
+
+        // Set session ID
+        broker.set_ssh_session_id("session-123".to_string()).await;
+        {
+            let guard = broker.ssh_session_id.read().await;
+            assert_eq!(guard.as_ref().unwrap(), "session-123");
+        }
+
+        // Clear session ID
+        broker.clear_ssh_session_id().await;
+        {
+            let guard = broker.ssh_session_id.read().await;
+            assert!(guard.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ssh_broker_agent_availability() {
+        // TCK-00263: Test SSH agent availability detection
+        use crate::evidence::keychain::InMemorySshCredentialStore;
+
+        // Without daemon SSH_AUTH_SOCK
+        let store_no_agent = Arc::new(InMemorySshCredentialStore::new());
+        let broker_no_agent: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store_no_agent);
+        assert!(!broker_no_agent.is_ssh_agent_available());
+        assert!(broker_no_agent.get_ssh_auth_sock_for_subprocess().is_none());
+
+        // With daemon SSH_AUTH_SOCK
+        let store_with_agent = Arc::new(InMemorySshCredentialStore::with_daemon_auth_sock(
+            "/tmp/ssh-agent.sock".to_string(),
+        ));
+        let broker_with_agent: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store_with_agent);
+        assert!(broker_with_agent.is_ssh_agent_available());
+        assert_eq!(
+            broker_with_agent.get_ssh_auth_sock_for_subprocess(),
+            Some("/tmp/ssh-agent.sock".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssh_broker_attaches_credential_for_git() {
+        // TCK-00263: Git tool requests should have SSH credentials attached when
+        // GitHub credentials are not available
+        use crate::evidence::keychain::InMemorySshCredentialStore;
+
+        let store = Arc::new(InMemorySshCredentialStore::with_daemon_auth_sock(
+            "/run/user/1000/ssh-agent.sock".to_string(),
+        ));
+
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store);
+
+        // Set up manifest with Git capability
+        let manifest = make_manifest(vec![make_git_capability(
+            "cap-git",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Make Git request (no GitHub credentials configured)
+        let request = BrokerToolRequest::new(
+            "req-git-ssh",
+            test_episode_id(),
+            ToolClass::Git,
+            test_dedupe_key("git-ssh"),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path("/workspace/repo");
+
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(decision.is_allowed());
+        if let ToolDecision::Allow { credential, .. } = decision {
+            assert!(
+                credential.is_some(),
+                "Git request should have SSH credential attached"
+            );
+            // The credential contains the SSH_AUTH_SOCK path
+            assert_eq!(
+                credential.unwrap().expose_secret(),
+                "/run/user/1000/ssh-agent.sock"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ssh_broker_no_credential_without_store() {
+        // TCK-00263: Without SSH store, Git requests have no SSH credential
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        // Set up manifest with Git capability
+        let manifest = make_manifest(vec![make_git_capability(
+            "cap-git",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Make Git request (no store configured)
+        let request = BrokerToolRequest::new(
+            "req-git-no-store",
+            test_episode_id(),
+            ToolClass::Git,
+            test_dedupe_key("git-no-store"),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path("/workspace/repo");
+
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(decision.is_allowed());
+        if let ToolDecision::Allow { credential, .. } = decision {
+            assert!(
+                credential.is_none(),
+                "Git request without store should have no credential"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ssh_broker_no_credential_without_agent() {
+        // TCK-00263: With SSH store but no agent, Git requests have no credential
+        use crate::evidence::keychain::InMemorySshCredentialStore;
+
+        let store = Arc::new(InMemorySshCredentialStore::new());
+        // Note: No daemon auth sock set, so agent is not available
+
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store);
+
+        // Set up manifest with Git capability
+        let manifest = make_manifest(vec![make_git_capability(
+            "cap-git",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Make Git request
+        let request = BrokerToolRequest::new(
+            "req-git-no-agent",
+            test_episode_id(),
+            ToolClass::Git,
+            test_dedupe_key("git-no-agent"),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path("/workspace/repo");
+
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(decision.is_allowed());
+        if let ToolDecision::Allow { credential, .. } = decision {
+            assert!(
+                credential.is_none(),
+                "Git request without agent should have no credential"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ssh_broker_github_takes_priority() {
+        // TCK-00263: GitHub credentials take priority over SSH credentials
+        use crate::evidence::keychain::{
+            InMemoryGitHubCredentialStore, InMemorySshCredentialStore,
+        };
+
+        let github_store = Arc::new(InMemoryGitHubCredentialStore::new());
+        github_store
+            .store_token("install-priority", "ghp_github_token")
+            .unwrap();
+
+        let ssh_store = Arc::new(InMemorySshCredentialStore::with_daemon_auth_sock(
+            "/tmp/ssh-agent.sock".to_string(),
+        ));
+
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::with_credential_stores(
+            ToolBrokerConfig::default(),
+            github_store,
+            ssh_store,
+        );
+
+        // Set up manifest with Git capability
+        let manifest = make_manifest(vec![make_git_capability(
+            "cap-git",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Set GitHub installation ID
+        broker
+            .set_github_installation_id("install-priority".to_string())
+            .await;
+
+        // Make Git request
+        let request = BrokerToolRequest::new(
+            "req-git-priority",
+            test_episode_id(),
+            ToolClass::Git,
+            test_dedupe_key("git-priority"),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path("/workspace/repo");
+
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(decision.is_allowed());
+        if let ToolDecision::Allow { credential, .. } = decision {
+            assert!(credential.is_some(), "Git request should have credential");
+            // Should be GitHub token, not SSH_AUTH_SOCK
+            assert_eq!(credential.unwrap().expose_secret(), "ghp_github_token");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ssh_broker_fallback_to_ssh() {
+        // TCK-00263: When GitHub credential fails, fall back to SSH
+        use crate::evidence::keychain::{
+            InMemoryGitHubCredentialStore, InMemorySshCredentialStore,
+        };
+
+        let github_store = Arc::new(InMemoryGitHubCredentialStore::new());
+        // Note: No token stored for our installation ID
+
+        let ssh_store = Arc::new(InMemorySshCredentialStore::with_daemon_auth_sock(
+            "/tmp/ssh-fallback.sock".to_string(),
+        ));
+
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::with_credential_stores(
+            ToolBrokerConfig::default(),
+            github_store,
+            ssh_store,
+        );
+
+        // Set up manifest with Git capability
+        let manifest = make_manifest(vec![make_git_capability(
+            "cap-git",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Set GitHub installation ID (but no token stored for it)
+        broker
+            .set_github_installation_id("install-missing".to_string())
+            .await;
+
+        // Make Git request
+        let request = BrokerToolRequest::new(
+            "req-git-fallback",
+            test_episode_id(),
+            ToolClass::Git,
+            test_dedupe_key("git-fallback"),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path("/workspace/repo");
+
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(decision.is_allowed());
+        if let ToolDecision::Allow { credential, .. } = decision {
+            assert!(
+                credential.is_some(),
+                "Git request should fall back to SSH credential"
+            );
+            // Should be SSH_AUTH_SOCK since GitHub token was not found
+            assert_eq!(
+                credential.unwrap().expose_secret(),
+                "/tmp/ssh-fallback.sock"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ssh_broker_no_credential_for_read() {
+        // TCK-00263: Read tool requests should NOT have SSH credentials
+        use crate::evidence::keychain::InMemorySshCredentialStore;
+
+        let store = Arc::new(InMemorySshCredentialStore::with_daemon_auth_sock(
+            "/tmp/ssh-agent.sock".to_string(),
+        ));
+
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store);
+
+        // Set up manifest with Read capability
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-read",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Make Read request
+        let request = make_request("req-read", ToolClass::Read, Some("/workspace/file.rs"));
+
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(decision.is_allowed());
+        if let ToolDecision::Allow { credential, .. } = decision {
+            assert!(
+                credential.is_none(),
+                "Read request should NOT have SSH credential attached"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ssh_broker_no_credential_for_network() {
+        // TCK-00263: Network tool requests should NOT have SSH credentials
+        // (SSH is only for Git operations)
+        use crate::evidence::keychain::InMemorySshCredentialStore;
+
+        let store = Arc::new(InMemorySshCredentialStore::with_daemon_auth_sock(
+            "/tmp/ssh-agent.sock".to_string(),
+        ));
+
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store);
+
+        // Set up manifest with Network capability
+        let tool_classes = vec![ToolClass::Network];
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_network_capability("cap-network")])
+            .tool_allowlist(tool_classes)
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Make Network request
+        let request = BrokerToolRequest::new(
+            "req-network",
+            test_episode_id(),
+            ToolClass::Network,
+            test_dedupe_key("network"),
+            test_args_hash(),
+            RiskTier::Tier0,
+        );
+
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(decision.is_allowed());
+        if let ToolDecision::Allow { credential, .. } = decision {
+            assert!(
+                credential.is_none(),
+                "Network request should NOT have SSH credential (SSH is for Git only)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ssh_credential_is_redacted_in_debug() {
+        // TCK-00263: Verify SSH credential (SSH_AUTH_SOCK path) is redacted in debug
+        let credential = Credential::new("/run/user/1000/ssh-agent.sock");
+        let debug_output = format!("{credential:?}");
+
+        assert!(
+            !debug_output.contains("ssh-agent"),
+            "SSH credential should not expose path in debug output"
         );
         assert!(
             debug_output.contains("[REDACTED]"),
