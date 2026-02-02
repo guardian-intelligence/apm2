@@ -1497,28 +1497,27 @@ impl PrivilegedDispatcher {
     ///
     /// # Security (Fail-Closed)
     ///
-    /// Per Security Review finding: If the actor ID doesn't match the expected
-    /// `domain:actor` schema, this returns a special `UNIVERSAL` domain that
-    /// overlaps with all author domains, ensuring that malformed or
-    /// non-standard actor IDs cannot bypass `SoD` validation.
+    /// Returns an error if the actor ID doesn't match the expected
+    /// `domain:actor` schema. This ensures that malformed or non-standard
+    /// actor IDs cannot bypass `SoD` validation.
     #[allow(clippy::unused_self)] // Will use self in production for registry access
-    fn resolve_actor_custody_domains(&self, actor_id: &str) -> Vec<String> {
+    fn resolve_actor_custody_domains(&self, actor_id: &str) -> Result<Vec<String>, String> {
         // Stub: derive domain from actor_id prefix (e.g., "team-alpha:alice" ->
         // "team-alpha") In production, this would query
         // KeyPolicy.custody_domains
         if let Some(colon_pos) = actor_id.find(':') {
             let domain = &actor_id[..colon_pos];
             if !domain.is_empty() {
-                return vec![domain.to_string()];
+                return Ok(vec![domain.to_string()]);
             }
         }
         // SEC-SoD-001: Fail-closed for malformed actor IDs.
         // If the actor_id doesn't match expected schema (domain:actor), return
-        // a special UNIVERSAL domain that overlaps with everything. This
-        // prevents attackers from bypassing SoD by using non-standard IDs.
-        // The UNIVERSAL domain acts as a "wildcard" that will always trigger
-        // overlap detection when compared with any author domain.
-        vec!["UNIVERSAL".to_string()]
+        // an error. This prevents attackers from bypassing SoD by using
+        // non-standard IDs.
+        Err(format!(
+            "malformed actor_id: {actor_id} (expected domain:actor)"
+        ))
     }
 
     /// Resolves custody domains for changeset authors.
@@ -1535,12 +1534,10 @@ impl PrivilegedDispatcher {
     ///
     /// # Security (Fail-Closed)
     ///
-    /// Per Security Review finding: If the `work_id` doesn't match the expected
-    /// schema, this returns a special `UNIVERSAL` domain. When combined with
-    /// a UNIVERSAL executor domain (from malformed actor IDs), this ensures
-    /// overlap detection triggers and the spawn is denied.
+    /// Returns an error if the `work_id` doesn't match the expected schema.
+    /// This ensures that malformed work IDs cannot bypass `SoD` validation.
     #[allow(clippy::unused_self)] // Will use self in production for registry access
-    fn resolve_changeset_author_domains(&self, work_id: &str) -> Vec<String> {
+    fn resolve_changeset_author_domains(&self, work_id: &str) -> Result<Vec<String>, String> {
         // Stub: derive author domain from work_id (e.g., "W-team-alpha-12345" ->
         // ["team-alpha"]) In production, this would query changeset metadata
         // for author list, then resolve each author's custody domains via
@@ -1549,17 +1546,17 @@ impl PrivilegedDispatcher {
             if let Some(dash_pos) = rest.find('-') {
                 let domain = &rest[..dash_pos];
                 if !domain.is_empty() {
-                    return vec![domain.to_string()];
+                    return Ok(vec![domain.to_string()]);
                 }
             }
         }
         // SEC-SoD-001: Fail-closed for malformed work_ids.
-        // Return UNIVERSAL domain which will overlap with any UNIVERSAL executor
-        // domain, triggering SoD rejection. This prevents attackers from
-        // bypassing SoD by using malformed work_ids that don't map to author
-        // domains. The SpawnEpisode handler also checks for empty author domains
-        // and rejects, but this provides defense in depth.
-        vec!["UNIVERSAL".to_string()]
+        // Return an error if the work_id doesn't match the expected schema.
+        // This prevents attackers from bypassing SoD by using malformed work_ids
+        // that don't map to author domains.
+        Err(format!(
+            "malformed work_id: {work_id} (expected W-domain-suffix)"
+        ))
     }
 
     /// Dispatches a privileged request to the appropriate handler.
@@ -1717,8 +1714,27 @@ impl PrivilegedDispatcher {
         // TCK-00258: Extract custody domains for SoD validation
         // For now, use a stub implementation that derives domain from actor_id
         // In production, this would query the KeyPolicy via CustodyDomainResolver
-        let executor_custody_domains = self.resolve_actor_custody_domains(&actor_id);
-        let author_custody_domains = self.resolve_changeset_author_domains(&work_id);
+        let executor_custody_domains = match self.resolve_actor_custody_domains(&actor_id) {
+            Ok(domains) => domains,
+            Err(e) => {
+                warn!(error = %e, "Failed to resolve executor custody domains");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("failed to resolve executor custody domains: {e}"),
+                ));
+            },
+        };
+
+        let author_custody_domains = match self.resolve_changeset_author_domains(&work_id) {
+            Ok(domains) => domains,
+            Err(e) => {
+                warn!(error = %e, "Failed to resolve author custody domains");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("failed to resolve author custody domains: {e}"),
+                ));
+            },
+        };
 
         // Register the work claim
         let claim = WorkClaim {
@@ -4129,65 +4145,41 @@ mod tests {
         }
     }
 
-    /// TCK-00258: UNIVERSAL domain triggers `SoD` violation (fail-closed for
-    /// malformed IDs).
+    /// Unit test for fail-closed ID resolution (TCK-00258).
     ///
-    /// When `actor_id` or `work_id` don't match expected schema, the resolver
-    /// returns UNIVERSAL domain which overlaps with everything, ensuring
-    /// fail-closed behavior.
+    /// Verifies that the internal resolver methods return errors for malformed
+    /// IDs, rather than falling back to "UNIVERSAL".
     #[test]
-    fn test_sod_universal_domain_triggers_violation() {
+    fn test_internal_resolvers_fail_on_malformed_ids() {
         let dispatcher = PrivilegedDispatcher::new();
-        let ctx = ConnectionContext::privileged(Some(PeerCredentials {
-            uid: 1001,
-            gid: 1001,
-            pid: Some(12345),
-        }));
 
-        // Create a claim where both executor and author resolve to UNIVERSAL
-        // (simulating malformed IDs that don't match expected schema)
-        let claim_universal = WorkClaim {
-            work_id: "W-malformed-work".to_string(), // Will resolve to UNIVERSAL
-            lease_id: "L-universal-test".to_string(),
-            actor_id: "malformed_actor_no_colon".to_string(), // Will resolve to UNIVERSAL
-            role: WorkRole::GateExecutor,
-            policy_resolution: PolicyResolution {
-                policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
-                resolved_policy_hash: [0u8; 32],
-                capability_manifest_hash: [0u8; 32],
-                context_pack_hash: [0u8; 32],
-            },
-            // Both domains are UNIVERSAL - they will overlap
-            executor_custody_domains: vec!["UNIVERSAL".to_string()],
-            author_custody_domains: vec!["UNIVERSAL".to_string()],
-        };
+        // 1. Test resolve_actor_custody_domains
+        // Valid case
+        let valid_actor = dispatcher.resolve_actor_custody_domains("team-alpha:alice");
+        assert!(valid_actor.is_ok());
+        assert_eq!(valid_actor.unwrap(), vec!["team-alpha".to_string()]);
 
-        // Register the claim
-        let _ = dispatcher.work_registry.register_claim(claim_universal);
+        // Malformed case (no colon)
+        let invalid_actor = dispatcher.resolve_actor_custody_domains("malformed_actor");
+        assert!(invalid_actor.is_err());
+        assert!(invalid_actor.unwrap_err().contains("malformed actor_id"));
 
-        // Register a gate lease
-        dispatcher.lease_validator.register_lease(
-            "L-universal-test",
-            "W-malformed-work",
-            "GATE-004",
-        );
+        // 2. Test resolve_changeset_author_domains
+        // Valid case (using simple domain to avoid stub parser ambiguity with hyphens)
+        let valid_work = dispatcher.resolve_changeset_author_domains("W-team-123");
+        assert!(valid_work.is_ok());
+        assert_eq!(valid_work.unwrap(), vec!["team".to_string()]);
 
-        // Spawn should be denied due to UNIVERSAL overlap
-        let spawn_request = SpawnEpisodeRequest {
-            work_id: "W-malformed-work".to_string(),
-            role: WorkRole::GateExecutor.into(),
-            lease_id: Some("L-universal-test".to_string()),
-        };
-        let spawn_frame = encode_spawn_episode_request(&spawn_request);
-        let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+        // Malformed case (no W- prefix)
+        let invalid_work = dispatcher.resolve_changeset_author_domains("InvalidWorkId-123");
+        assert!(invalid_work.is_err());
+        assert!(invalid_work.unwrap_err().contains("malformed work_id"));
 
-        // Should be denied with SOD_VIOLATION
-        match spawn_response {
-            PrivilegedResponse::Error(err) => {
-                assert_eq!(err.code, PrivilegedErrorCode::SodViolation as i32);
-                assert!(err.message.contains("UNIVERSAL"));
-            },
-            _ => panic!("Expected SOD_VIOLATION error for UNIVERSAL domain overlap"),
-        }
+        // Malformed case (W- prefix but no domain separator)
+        let invalid_work_2 = dispatcher.resolve_changeset_author_domains("W-NoSeparator");
+        // This actually returns Err because dash_pos find fails after stripping W-
+        // wait, strip_prefix("W-") gives "NoSeparator". find('-') returns None.
+        // So it falls through to Err.
+        assert!(invalid_work_2.is_err());
     }
 }
