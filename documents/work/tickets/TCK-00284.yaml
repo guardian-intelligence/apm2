@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00284
     title: xtask bypass closure for external projections
-    status: READY
+    status: CANCELLED
   binds:
     rfc_id: RFC-0017
     requirements:
