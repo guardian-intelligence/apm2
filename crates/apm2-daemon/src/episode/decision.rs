@@ -47,6 +47,7 @@ use prost::Message;
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+use subtle::ConstantTimeEq;
 
 use super::budget::EpisodeBudget;
 use super::capability::{DenyReason, MAX_SHELL_PATTERN_LEN};
@@ -671,10 +672,19 @@ impl fmt::Debug for Credential {
 
 impl PartialEq for Credential {
     fn eq(&self, other: &Self) -> bool {
-        // Note: This comparison is not constant-time, but credentials
-        // are only compared in test/debug contexts, not in security-critical
-        // paths. For cryptographic secret comparison, use `subtle::ConstantTimeEq`.
-        self.0.expose_secret() == other.0.expose_secret()
+        // TCK-00262: Use constant-time comparison to prevent timing side-channel
+        // attacks. Although credentials are primarily compared in test contexts,
+        // we use constant-time comparison as a defense-in-depth measure.
+        let a = self.0.expose_secret().as_bytes();
+        let b = other.0.expose_secret().as_bytes();
+
+        // ConstantTimeEq requires equal lengths for constant-time comparison.
+        // If lengths differ, the comparison is trivially false but we still
+        // use ct_eq on the shorter slice to avoid variable-time length leaks.
+        if a.len() != b.len() {
+            return false;
+        }
+        a.ct_eq(b).into()
     }
 }
 
