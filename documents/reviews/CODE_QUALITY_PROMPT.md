@@ -211,6 +211,9 @@ decision_tree:
           - section: "POSITIVE OBSERVATIONS"
             format: "### **POSITIVE OBSERVATIONS (PASS)**"
             content: "What the PR does well; specific invariants correctly upheld"
+          - section: "Footer"
+            format: "---"
+            content: "Reviewed commit: $HEAD_SHA"
       steps[3]:
         - id: WRITE_FINDINGS
           action: write_file

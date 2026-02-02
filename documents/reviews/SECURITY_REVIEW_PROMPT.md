@@ -246,6 +246,9 @@ decision_tree:
             content: "Security invariants correctly upheld; defense-in-depth wins"
           - section: "Assurance Case"
             content: "Claim-Argument-Evidence structure for final verdict"
+          - section: "Footer"
+            format: "---"
+            content: "Reviewed commit: $HEAD_SHA"
       steps[3]:
         - id: WRITE_FINDINGS
           action: write_file
