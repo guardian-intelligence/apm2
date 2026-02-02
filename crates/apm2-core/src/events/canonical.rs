@@ -38,10 +38,11 @@
 use prost::Message;
 
 use super::{
-    AdjudicationRequested, EvidencePublished, GateReceipt, GateReceiptGenerated, KernelEvent,
-    LeaseConflict, PolicyResolvedForChangeSet, SessionTerminated, ToolDecided, ToolExecuted,
-    WorkCompleted, WorkOpened, adjudication_event, evidence_event, kernel_event, lease_event,
-    session_event, tool_event, work_event,
+    AatAttestation, AatGateReceipt, AatSpecQuarantined, AdjudicationRequested, ArtifactManifest,
+    EvidencePublished, GateReceipt, GateReceiptGenerated, KernelEvent, LeaseConflict, MergeReceipt,
+    PolicyResolvedForChangeSet, RunnerPoolQuarantined, SessionTerminated, ToolDecided,
+    ToolExecuted, WorkCompleted, WorkOpened, adjudication_event, evidence_event, kernel_event,
+    lease_event, session_event, tool_event, work_event,
 };
 
 // =============================================================================
@@ -81,6 +82,34 @@ pub const WORK_CLAIMED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_claimed:";
 /// Note: `EpisodeSpawned` event type is defined in apm2-daemon for RFC-0017
 /// Phase 1.
 pub const EPISODE_SPAWNED_DOMAIN_PREFIX: &[u8] = b"apm2.event.episode_spawned:";
+
+/// Domain prefix for `MergeReceipt` events.
+///
+/// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
+pub const MERGE_RECEIPT_DOMAIN_PREFIX: &[u8] = b"apm2.event.merge_receipt:";
+
+/// Domain prefix for `RunnerPoolQuarantined` events.
+///
+/// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
+pub const RUNNER_POOL_QUARANTINED_DOMAIN_PREFIX: &[u8] = b"apm2.event.runner_pool_quarantined:";
+
+/// Domain prefix for `AATSpecQuarantined` events.
+///
+/// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
+pub const AAT_SPEC_QUARANTINED_DOMAIN_PREFIX: &[u8] = b"apm2.event.aat_spec_quarantined:";
+
+/// Domain prefix for `AatGateReceipt` payloads.
+///
+/// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
+/// Note: `AatGateReceipt` is a CAS payload, not a kernel event, but still
+/// requires domain-separated signing for integrity verification.
+pub const AAT_GATE_RECEIPT_DOMAIN_PREFIX: &[u8] = b"apm2.payload.aat_gate_receipt:";
+
+/// Domain prefix for `ArtifactManifest` payloads.
+///
+/// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
+/// Note: `ArtifactManifest` is a CAS payload referenced by gate receipts.
+pub const ARTIFACT_MANIFEST_DOMAIN_PREFIX: &[u8] = b"apm2.payload.artifact_manifest:";
 
 /// Trait for canonicalizing messages before signing.
 ///
@@ -176,6 +205,8 @@ impl Canonicalize for AdjudicationRequested {
 impl Canonicalize for EvidencePublished {
     fn canonicalize(&mut self) {
         self.verification_command_ids.sort();
+        // SEC-CAN-003: Also sort metadata field for determinism.
+        self.metadata.sort();
     }
 }
 
@@ -193,23 +224,11 @@ impl Canonicalize for LeaseConflict {
 
 impl Canonicalize for PolicyResolvedForChangeSet {
     fn canonicalize(&mut self) {
-        // Sort RCP profile IDs and manifest hashes together to maintain alignment.
-        // We zip them, sort by profile ID, then unzip back.
-        if self.resolved_rcp_profile_ids.len() == self.resolved_rcp_manifest_hashes.len() {
-            let mut pairs: Vec<(String, Vec<u8>)> = self
-                .resolved_rcp_profile_ids
-                .drain(..)
-                .zip(self.resolved_rcp_manifest_hashes.drain(..))
-                .collect();
-            pairs.sort_by(|a, b| a.0.cmp(&b.0));
-            for (id, hash) in pairs {
-                self.resolved_rcp_profile_ids.push(id);
-                self.resolved_rcp_manifest_hashes.push(hash);
-            }
-        } else {
-            // If lengths don't match, just sort profile IDs independently
-            self.resolved_rcp_profile_ids.sort();
-        }
+        // SEC-CAN-004: Sort both fields independently to maintain determinism
+        // regardless of whether their lengths match. This ensures canonical
+        // encoding even in edge cases where the fields are not properly paired.
+        self.resolved_rcp_profile_ids.sort();
+        self.resolved_rcp_manifest_hashes.sort();
 
         // Sort verifier policy hashes independently (they're not paired)
         self.resolved_verifier_policy_hashes.sort();
@@ -221,6 +240,95 @@ impl Canonicalize for GateReceipt {
         // GateReceipt has no repeated fields, so no sorting is needed.
         // This implementation exists for completeness and to support
         // KernelEvent canonicalization.
+    }
+}
+
+// =============================================================================
+// SEC-CAN-002: RFC-0017 EVENT CANONICALIZE IMPLEMENTATIONS
+// =============================================================================
+//
+// The following implementations address SEC-CAN-002: Missing Canonicalization
+// for RFC-0017 Events with repeated fields.
+
+impl Canonicalize for MergeReceipt {
+    fn canonicalize(&mut self) {
+        // Sort gate_receipt_ids for deterministic encoding.
+        self.gate_receipt_ids.sort();
+    }
+}
+
+impl DomainSeparatedCanonical for MergeReceipt {
+    fn domain_prefix() -> &'static [u8] {
+        MERGE_RECEIPT_DOMAIN_PREFIX
+    }
+}
+
+impl Canonicalize for RunnerPoolQuarantined {
+    fn canonicalize(&mut self) {
+        // Sort evidence_refs for deterministic encoding.
+        self.evidence_refs.sort();
+    }
+}
+
+impl DomainSeparatedCanonical for RunnerPoolQuarantined {
+    fn domain_prefix() -> &'static [u8] {
+        RUNNER_POOL_QUARANTINED_DOMAIN_PREFIX
+    }
+}
+
+impl Canonicalize for AatSpecQuarantined {
+    fn canonicalize(&mut self) {
+        // Sort evidence_refs for deterministic encoding.
+        self.evidence_refs.sort();
+    }
+}
+
+impl DomainSeparatedCanonical for AatSpecQuarantined {
+    fn domain_prefix() -> &'static [u8] {
+        AAT_SPEC_QUARANTINED_DOMAIN_PREFIX
+    }
+}
+
+impl Canonicalize for AatAttestation {
+    fn canonicalize(&mut self) {
+        // Sort toolchain_digests for deterministic encoding.
+        self.toolchain_digests.sort();
+    }
+}
+
+impl Canonicalize for AatGateReceipt {
+    fn canonicalize(&mut self) {
+        // Sort run_receipt_hashes for deterministic encoding.
+        self.run_receipt_hashes.sort();
+
+        // Sort terminal_verifier_outputs by verifier_kind for determinism.
+        self.terminal_verifier_outputs
+            .sort_by(|a, b| a.verifier_kind.cmp(&b.verifier_kind));
+
+        // Canonicalize nested attestation if present.
+        if let Some(ref mut attestation) = self.attestation {
+            attestation.canonicalize();
+        }
+    }
+}
+
+impl DomainSeparatedCanonical for AatGateReceipt {
+    fn domain_prefix() -> &'static [u8] {
+        AAT_GATE_RECEIPT_DOMAIN_PREFIX
+    }
+}
+
+impl Canonicalize for ArtifactManifest {
+    fn canonicalize(&mut self) {
+        // Sort artifacts by their digest for deterministic encoding.
+        // Digest is a unique identifier for each artifact.
+        self.artifacts.sort_by(|a, b| a.digest.cmp(&b.digest));
+    }
+}
+
+impl DomainSeparatedCanonical for ArtifactManifest {
+    fn domain_prefix() -> &'static [u8] {
+        ARTIFACT_MANIFEST_DOMAIN_PREFIX
     }
 }
 
@@ -275,14 +383,20 @@ impl DomainSeparatedCanonical for SessionTerminated {
 
 impl Canonicalize for KernelEvent {
     fn canonicalize(&mut self) {
-        // Canonicalize nested payload if present
+        // Canonicalize nested payload if present.
+        // SEC-CAN-002: All event types with repeated fields are handled explicitly.
+        // No catch-all `_ => {}` to ensure new event types are reviewed for
+        // canonicalization requirements.
         match &mut self.payload {
             Some(kernel_event::Payload::Work(work_event)) => {
                 if let Some(event) = &mut work_event.event {
                     match event {
                         work_event::Event::Opened(opened) => opened.canonicalize(),
                         work_event::Event::Completed(completed) => completed.canonicalize(),
-                        _ => {},
+                        // These events have no repeated fields:
+                        work_event::Event::Transitioned(_)
+                        | work_event::Event::Aborted(_)
+                        | work_event::Event::PrAssociated(_) => {},
                     }
                 }
             },
@@ -291,20 +405,35 @@ impl Canonicalize for KernelEvent {
                     match event {
                         tool_event::Event::Decided(decided) => decided.canonicalize(),
                         tool_event::Event::Executed(executed) => executed.canonicalize(),
+                        // ToolRequested has no repeated fields.
                         tool_event::Event::Requested(_) => {},
                     }
                 }
             },
             Some(kernel_event::Payload::Session(session_event)) => {
-                if let Some(session_event::Event::Terminated(terminated)) = &mut session_event.event
-                {
-                    terminated.canonicalize();
+                if let Some(event) = &mut session_event.event {
+                    match event {
+                        session_event::Event::Terminated(terminated) => terminated.canonicalize(),
+                        // These events have no repeated fields:
+                        session_event::Event::Started(_)
+                        | session_event::Event::Progress(_)
+                        | session_event::Event::Quarantined(_)
+                        | session_event::Event::CrashDetected(_)
+                        | session_event::Event::RestartScheduled(_) => {},
+                    }
                 }
             },
             Some(kernel_event::Payload::Adjudication(adj_event)) => {
-                if let Some(adjudication_event::Event::Requested(requested)) = &mut adj_event.event
-                {
-                    requested.canonicalize();
+                if let Some(event) = &mut adj_event.event {
+                    match event {
+                        adjudication_event::Event::Requested(requested) => {
+                            requested.canonicalize();
+                        },
+                        // These events have no repeated fields:
+                        adjudication_event::Event::Vote(_)
+                        | adjudication_event::Event::Resolved(_)
+                        | adjudication_event::Event::Timeout(_) => {},
+                    }
                 }
             },
             Some(kernel_event::Payload::Evidence(ev_event)) => {
@@ -316,8 +445,16 @@ impl Canonicalize for KernelEvent {
                 }
             },
             Some(kernel_event::Payload::Lease(lease_event)) => {
-                if let Some(lease_event::Event::Conflict(conflict)) = &mut lease_event.event {
-                    conflict.canonicalize();
+                if let Some(event) = &mut lease_event.event {
+                    match event {
+                        lease_event::Event::Conflict(conflict) => conflict.canonicalize(),
+                        // These events have no repeated fields:
+                        lease_event::Event::Issued(_)
+                        | lease_event::Event::Renewed(_)
+                        | lease_event::Event::Released(_)
+                        | lease_event::Event::Expired(_)
+                        | lease_event::Event::IssueDenied(_) => {},
+                    }
                 }
             },
             Some(kernel_event::Payload::PolicyResolvedForChangeset(policy_resolved)) => {
@@ -326,7 +463,31 @@ impl Canonicalize for KernelEvent {
             Some(kernel_event::Payload::GateReceipt(gate_receipt)) => {
                 gate_receipt.canonicalize();
             },
-            _ => {},
+            // SEC-CAN-002: Handle MergeReceipt with repeated gate_receipt_ids.
+            Some(kernel_event::Payload::MergeReceipt(merge_receipt)) => {
+                merge_receipt.canonicalize();
+            },
+            // SEC-CAN-002: Handle RunnerPoolQuarantined with repeated evidence_refs.
+            Some(kernel_event::Payload::RunnerPoolQuarantined(quarantined)) => {
+                quarantined.canonicalize();
+            },
+            // SEC-CAN-002: Handle AATSpecQuarantined with repeated evidence_refs.
+            Some(kernel_event::Payload::AatSpecQuarantined(quarantined)) => {
+                quarantined.canonicalize();
+            },
+            // These payloads have no repeated fields requiring canonicalization,
+            // and None means no payload to canonicalize:
+            Some(
+                kernel_event::Payload::Policy(_)
+                | kernel_event::Payload::Key(_)
+                | kernel_event::Payload::Capability(_)
+                | kernel_event::Payload::GithubLease(_)
+                | kernel_event::Payload::InterventionFreeze(_)
+                | kernel_event::Payload::InterventionUnfreeze(_)
+                | kernel_event::Payload::AatResultReused(_)
+                | kernel_event::Payload::QuarantineCleared(_),
+            )
+            | None => {},
         }
     }
 }
@@ -524,14 +685,14 @@ mod tests {
 
         policy_resolved.canonicalize();
 
-        // Profile IDs should be sorted alphabetically
+        // SEC-CAN-004: Profile IDs should be sorted alphabetically (independently)
         assert_eq!(
             policy_resolved.resolved_rcp_profile_ids,
             vec!["a-profile", "m-profile", "z-profile"]
         );
 
-        // Manifest hashes should follow the same order as their corresponding profile
-        // IDs
+        // SEC-CAN-004: Manifest hashes should be sorted independently (not paired)
+        // This ensures determinism even when lengths don't match.
         assert_eq!(
             policy_resolved.resolved_rcp_manifest_hashes,
             vec![vec![0x11; 32], vec![0x55; 32], vec![0x99; 32]]
@@ -571,6 +732,7 @@ mod tests {
         if let Some(kernel_event::Payload::PolicyResolvedForChangeset(policy_resolved)) =
             &event.payload
         {
+            // SEC-CAN-004: Both fields sorted independently
             assert_eq!(
                 policy_resolved.resolved_rcp_profile_ids,
                 vec!["a-profile", "z-profile"]
@@ -961,5 +1123,491 @@ mod tests {
         // Verify determinism
         let bytes2 = terminated.canonical_bytes_with_domain();
         assert_eq!(bytes, bytes2, "Golden vector must be stable across runs");
+    }
+
+    // =========================================================================
+    // SEC-CAN-002: Golden Vector Tests for RFC-0017 Events with Repeated Fields
+    // =========================================================================
+
+    use super::{
+        AAT_GATE_RECEIPT_DOMAIN_PREFIX, AAT_SPEC_QUARANTINED_DOMAIN_PREFIX,
+        ARTIFACT_MANIFEST_DOMAIN_PREFIX, MERGE_RECEIPT_DOMAIN_PREFIX,
+        RUNNER_POOL_QUARANTINED_DOMAIN_PREFIX,
+    };
+
+    /// SEC-CAN-002: Verify `MergeReceipt` canonical bytes are deterministic.
+    #[test]
+    fn sec_can_002_merge_receipt_canonical_bytes_deterministic() {
+        use super::MergeReceipt;
+
+        let mut receipt = MergeReceipt {
+            base_selector: "main".to_string(),
+            changeset_digest: vec![0xAB; 32],
+            gate_receipt_ids: vec![
+                "receipt-z".to_string(),
+                "receipt-a".to_string(),
+                "receipt-m".to_string(),
+            ],
+            policy_hash: vec![0xCD; 32],
+            result_selector: "abc123".to_string(),
+            merged_at: 1_234_567_890,
+            gate_actor_id: "gate-actor".to_string(),
+            gate_signature: vec![0u8; 64],
+            time_envelope_ref: None,
+        };
+
+        receipt.canonicalize();
+
+        // Verify gate_receipt_ids are sorted
+        assert_eq!(
+            receipt.gate_receipt_ids,
+            vec!["receipt-a", "receipt-m", "receipt-z"]
+        );
+
+        // Verify canonical bytes with domain prefix
+        let bytes1 = receipt.canonical_bytes_with_domain();
+        let bytes2 = receipt.canonical_bytes_with_domain();
+
+        assert_eq!(bytes1, bytes2, "Canonical bytes must be deterministic");
+        assert!(
+            bytes1.starts_with(MERGE_RECEIPT_DOMAIN_PREFIX),
+            "Canonical bytes must start with domain prefix"
+        );
+    }
+
+    /// SEC-CAN-002: Verify `RunnerPoolQuarantined` canonical bytes are
+    /// deterministic.
+    #[test]
+    fn sec_can_002_runner_pool_quarantined_canonical_bytes_deterministic() {
+        use super::RunnerPoolQuarantined;
+
+        let mut quarantined = RunnerPoolQuarantined {
+            quarantine_id: "quar-001".to_string(),
+            pool_id: "pool-001".to_string(),
+            reason: "flaky infrastructure".to_string(),
+            evidence_refs: vec![
+                "evid-z".to_string(),
+                "evid-a".to_string(),
+                "evid-m".to_string(),
+            ],
+            time_envelope_ref: None,
+            issuer_actor_id: "issuer-001".to_string(),
+            issuer_signature: vec![0u8; 64],
+        };
+
+        quarantined.canonicalize();
+
+        // Verify evidence_refs are sorted
+        assert_eq!(
+            quarantined.evidence_refs,
+            vec!["evid-a", "evid-m", "evid-z"]
+        );
+
+        // Verify canonical bytes with domain prefix
+        let bytes1 = quarantined.canonical_bytes_with_domain();
+        let bytes2 = quarantined.canonical_bytes_with_domain();
+
+        assert_eq!(bytes1, bytes2, "Canonical bytes must be deterministic");
+        assert!(
+            bytes1.starts_with(RUNNER_POOL_QUARANTINED_DOMAIN_PREFIX),
+            "Canonical bytes must start with domain prefix"
+        );
+    }
+
+    /// SEC-CAN-002: Verify `AATSpecQuarantined` canonical bytes are
+    /// deterministic.
+    #[test]
+    fn sec_can_002_aat_spec_quarantined_canonical_bytes_deterministic() {
+        use super::AatSpecQuarantined;
+
+        let mut quarantined = AatSpecQuarantined {
+            quarantine_id: "quar-002".to_string(),
+            spec_id: "spec-001".to_string(),
+            reason: "non-deterministic output".to_string(),
+            evidence_refs: vec![
+                "evid-3".to_string(),
+                "evid-1".to_string(),
+                "evid-2".to_string(),
+            ],
+            time_envelope_ref: None,
+            issuer_actor_id: "issuer-002".to_string(),
+            issuer_signature: vec![0u8; 64],
+        };
+
+        quarantined.canonicalize();
+
+        // Verify evidence_refs are sorted
+        assert_eq!(
+            quarantined.evidence_refs,
+            vec!["evid-1", "evid-2", "evid-3"]
+        );
+
+        // Verify canonical bytes with domain prefix
+        let bytes1 = quarantined.canonical_bytes_with_domain();
+        let bytes2 = quarantined.canonical_bytes_with_domain();
+
+        assert_eq!(bytes1, bytes2, "Canonical bytes must be deterministic");
+        assert!(
+            bytes1.starts_with(AAT_SPEC_QUARANTINED_DOMAIN_PREFIX),
+            "Canonical bytes must start with domain prefix"
+        );
+    }
+
+    /// SEC-CAN-002: Verify `AatGateReceipt` canonical bytes are deterministic.
+    #[test]
+    fn sec_can_002_aat_gate_receipt_canonical_bytes_deterministic() {
+        use super::super::{
+            AatAttestation, AatGateReceipt, AatVerdict, DeterminismStatus, FlakeClass,
+            TerminalVerifierOutput,
+        };
+
+        let mut receipt = AatGateReceipt {
+            view_commitment_hash: vec![0x01; 32],
+            rcp_manifest_hash: vec![0x02; 32],
+            rcp_profile_id: "profile-001".to_string(),
+            policy_hash: vec![0x03; 32],
+            determinism_class: 2,
+            determinism_status: DeterminismStatus::Stable.into(),
+            flake_class: FlakeClass::Unspecified.into(),
+            run_count: 3,
+            run_receipt_hashes: vec![vec![0xCC; 32], vec![0xAA; 32], vec![0xBB; 32]],
+            terminal_evidence_digest: vec![0x04; 32],
+            observational_evidence_digest: vec![0x05; 32],
+            terminal_verifier_outputs_digest: vec![0x06; 32],
+            stability_digest: vec![0x07; 32],
+            verdict: AatVerdict::Pass.into(),
+            transcript_chain_root_hash: vec![0x08; 32],
+            transcript_bundle_hash: vec![0x09; 32],
+            artifact_manifest_hash: vec![0x0A; 32],
+            terminal_verifier_outputs: vec![
+                TerminalVerifierOutput {
+                    verifier_kind: "z-verifier".to_string(),
+                    output_digest: vec![0x10; 32],
+                    predicate_satisfied: true,
+                },
+                TerminalVerifierOutput {
+                    verifier_kind: "a-verifier".to_string(),
+                    output_digest: vec![0x11; 32],
+                    predicate_satisfied: true,
+                },
+            ],
+            verifier_policy_hash: vec![0x0B; 32],
+            selection_policy_id: "policy-001".to_string(),
+            risk_tier: 1,
+            attestation: Some(AatAttestation {
+                container_image_digest: vec![0x0C; 32],
+                toolchain_digests: vec![vec![0xDD; 32], vec![0xAA; 32], vec![0xBB; 32]],
+                runner_identity_key_id: "runner-001".to_string(),
+                network_policy_profile_hash: vec![0x0D; 32],
+            }),
+        };
+
+        receipt.canonicalize();
+
+        // Verify run_receipt_hashes are sorted
+        assert_eq!(
+            receipt.run_receipt_hashes,
+            vec![vec![0xAA; 32], vec![0xBB; 32], vec![0xCC; 32]]
+        );
+
+        // Verify terminal_verifier_outputs are sorted by verifier_kind
+        assert_eq!(
+            receipt.terminal_verifier_outputs[0].verifier_kind,
+            "a-verifier"
+        );
+        assert_eq!(
+            receipt.terminal_verifier_outputs[1].verifier_kind,
+            "z-verifier"
+        );
+
+        // Verify nested attestation toolchain_digests are sorted
+        assert_eq!(
+            receipt.attestation.as_ref().unwrap().toolchain_digests,
+            vec![vec![0xAA; 32], vec![0xBB; 32], vec![0xDD; 32]]
+        );
+
+        // Verify canonical bytes with domain prefix
+        let bytes1 = receipt.canonical_bytes_with_domain();
+        let bytes2 = receipt.canonical_bytes_with_domain();
+
+        assert_eq!(bytes1, bytes2, "Canonical bytes must be deterministic");
+        assert!(
+            bytes1.starts_with(AAT_GATE_RECEIPT_DOMAIN_PREFIX),
+            "Canonical bytes must start with domain prefix"
+        );
+    }
+
+    /// SEC-CAN-002: Verify `ArtifactManifest` canonical bytes are
+    /// deterministic.
+    #[test]
+    fn sec_can_002_artifact_manifest_canonical_bytes_deterministic() {
+        use super::super::{ArtifactDigest, ArtifactManifest, ArtifactType, DataClassification};
+
+        let mut manifest = ArtifactManifest {
+            artifacts: vec![
+                ArtifactDigest {
+                    artifact_type: ArtifactType::Log.into(),
+                    digest: vec![0xCC; 32],
+                    data_classification: DataClassification::Internal.into(),
+                    redaction_applied: false,
+                    redaction_profile_hash: vec![],
+                    retention_window_ref: "30d".to_string(),
+                },
+                ArtifactDigest {
+                    artifact_type: ArtifactType::Junit.into(),
+                    digest: vec![0xAA; 32],
+                    data_classification: DataClassification::Public.into(),
+                    redaction_applied: false,
+                    redaction_profile_hash: vec![],
+                    retention_window_ref: "90d".to_string(),
+                },
+                ArtifactDigest {
+                    artifact_type: ArtifactType::Coverage.into(),
+                    digest: vec![0xBB; 32],
+                    data_classification: DataClassification::Internal.into(),
+                    redaction_applied: false,
+                    redaction_profile_hash: vec![],
+                    retention_window_ref: "30d".to_string(),
+                },
+            ],
+        };
+
+        manifest.canonicalize();
+
+        // Verify artifacts are sorted by digest
+        assert_eq!(manifest.artifacts[0].digest, vec![0xAA; 32]);
+        assert_eq!(manifest.artifacts[1].digest, vec![0xBB; 32]);
+        assert_eq!(manifest.artifacts[2].digest, vec![0xCC; 32]);
+
+        // Verify canonical bytes with domain prefix
+        let bytes1 = manifest.canonical_bytes_with_domain();
+        let bytes2 = manifest.canonical_bytes_with_domain();
+
+        assert_eq!(bytes1, bytes2, "Canonical bytes must be deterministic");
+        assert!(
+            bytes1.starts_with(ARTIFACT_MANIFEST_DOMAIN_PREFIX),
+            "Canonical bytes must start with domain prefix"
+        );
+    }
+
+    /// SEC-CAN-003: Verify `EvidencePublished` sorts both
+    /// `verification_command_ids` and metadata.
+    #[test]
+    fn sec_can_003_evidence_published_sorts_metadata() {
+        let mut published = EvidencePublished {
+            evidence_id: "evid-001".to_string(),
+            work_id: "work-001".to_string(),
+            category: "TEST".to_string(),
+            artifact_hash: vec![0xAB; 32],
+            verification_command_ids: vec!["cmd-z".into(), "cmd-a".into(), "cmd-m".into()],
+            classification: "INTERNAL".to_string(),
+            artifact_size: 1000,
+            metadata: vec![
+                "z-key=z-value".to_string(),
+                "a-key=a-value".to_string(),
+                "m-key=m-value".to_string(),
+            ],
+            time_envelope_ref: None,
+        };
+
+        published.canonicalize();
+
+        // Verify verification_command_ids are sorted
+        assert_eq!(
+            published.verification_command_ids,
+            vec!["cmd-a", "cmd-m", "cmd-z"]
+        );
+
+        // Verify metadata is sorted
+        assert_eq!(
+            published.metadata,
+            vec!["a-key=a-value", "m-key=m-value", "z-key=z-value"]
+        );
+    }
+
+    /// SEC-CAN-004: Verify `PolicyResolvedForChangeSet` sorts fields
+    /// independently even when lengths don't match.
+    #[test]
+    fn sec_can_004_policy_resolved_mismatched_lengths() {
+        let mut policy_resolved = PolicyResolvedForChangeSet {
+            work_id: "work-1".to_string(),
+            changeset_digest: vec![0x42; 32],
+            resolved_policy_hash: vec![0x00; 32],
+            resolved_risk_tier: 1,
+            resolved_determinism_class: 0,
+            // Different lengths - should still be sorted independently
+            resolved_rcp_profile_ids: vec!["z-profile".into(), "a-profile".into()],
+            resolved_rcp_manifest_hashes: vec![
+                vec![0x99; 32],
+                vec![0x11; 32],
+                vec![0x55; 32], // Extra hash
+            ],
+            resolved_verifier_policy_hashes: vec![vec![0xCC; 32], vec![0xAA; 32]],
+            resolver_actor_id: "resolver-1".to_string(),
+            resolver_version: "1.0.0".to_string(),
+            resolver_signature: vec![0u8; 64],
+        };
+
+        policy_resolved.canonicalize();
+
+        // Both should be sorted independently
+        assert_eq!(
+            policy_resolved.resolved_rcp_profile_ids,
+            vec!["a-profile", "z-profile"]
+        );
+        assert_eq!(
+            policy_resolved.resolved_rcp_manifest_hashes,
+            vec![vec![0x11; 32], vec![0x55; 32], vec![0x99; 32]]
+        );
+        assert_eq!(
+            policy_resolved.resolved_verifier_policy_hashes,
+            vec![vec![0xAA; 32], vec![0xCC; 32]]
+        );
+    }
+
+    /// SEC-CAN-002: Verify `KernelEvent` canonicalizes `MergeReceipt` payload.
+    #[test]
+    fn sec_can_002_kernel_event_canonicalize_merge_receipt() {
+        let mut event = KernelEvent {
+            sequence: 1,
+            payload: Some(kernel_event::Payload::MergeReceipt(MergeReceipt {
+                base_selector: "main".to_string(),
+                changeset_digest: vec![0xAB; 32],
+                gate_receipt_ids: vec!["receipt-z".to_string(), "receipt-a".to_string()],
+                policy_hash: vec![0xCD; 32],
+                result_selector: "abc123".to_string(),
+                merged_at: 1_234_567_890,
+                gate_actor_id: "gate-actor".to_string(),
+                gate_signature: vec![0u8; 64],
+                time_envelope_ref: None,
+            })),
+            ..Default::default()
+        };
+
+        event.canonicalize();
+
+        if let Some(kernel_event::Payload::MergeReceipt(receipt)) = &event.payload {
+            assert_eq!(receipt.gate_receipt_ids, vec!["receipt-a", "receipt-z"]);
+        } else {
+            panic!("Expected MergeReceipt payload");
+        }
+    }
+
+    /// SEC-CAN-002: Verify `KernelEvent` canonicalizes `RunnerPoolQuarantined`
+    /// payload.
+    #[test]
+    fn sec_can_002_kernel_event_canonicalize_runner_pool_quarantined() {
+        let mut event = KernelEvent {
+            sequence: 1,
+            payload: Some(kernel_event::Payload::RunnerPoolQuarantined(
+                RunnerPoolQuarantined {
+                    quarantine_id: "quar-001".to_string(),
+                    pool_id: "pool-001".to_string(),
+                    reason: "flaky".to_string(),
+                    evidence_refs: vec!["evid-z".to_string(), "evid-a".to_string()],
+                    time_envelope_ref: None,
+                    issuer_actor_id: "issuer".to_string(),
+                    issuer_signature: vec![0u8; 64],
+                },
+            )),
+            ..Default::default()
+        };
+
+        event.canonicalize();
+
+        if let Some(kernel_event::Payload::RunnerPoolQuarantined(quarantined)) = &event.payload {
+            assert_eq!(quarantined.evidence_refs, vec!["evid-a", "evid-z"]);
+        } else {
+            panic!("Expected RunnerPoolQuarantined payload");
+        }
+    }
+
+    /// SEC-CAN-002: Verify `KernelEvent` canonicalizes `AATSpecQuarantined`
+    /// payload.
+    #[test]
+    fn sec_can_002_kernel_event_canonicalize_aat_spec_quarantined() {
+        let mut event = KernelEvent {
+            sequence: 1,
+            payload: Some(kernel_event::Payload::AatSpecQuarantined(
+                AatSpecQuarantined {
+                    quarantine_id: "quar-002".to_string(),
+                    spec_id: "spec-001".to_string(),
+                    reason: "flaky".to_string(),
+                    evidence_refs: vec!["evid-b".to_string(), "evid-a".to_string()],
+                    time_envelope_ref: None,
+                    issuer_actor_id: "issuer".to_string(),
+                    issuer_signature: vec![0u8; 64],
+                },
+            )),
+            ..Default::default()
+        };
+
+        event.canonicalize();
+
+        if let Some(kernel_event::Payload::AatSpecQuarantined(quarantined)) = &event.payload {
+            assert_eq!(quarantined.evidence_refs, vec!["evid-a", "evid-b"]);
+        } else {
+            panic!("Expected AATSpecQuarantined payload");
+        }
+    }
+
+    /// SEC-CAN-002: Verify all new domain prefixes are unique.
+    #[test]
+    fn sec_can_002_new_domain_prefixes_unique() {
+        let all_prefixes = [
+            TOOL_DECIDED_DOMAIN_PREFIX,
+            TOOL_EXECUTED_DOMAIN_PREFIX,
+            SESSION_TERMINATED_DOMAIN_PREFIX,
+            WORK_CLAIMED_DOMAIN_PREFIX,
+            EPISODE_SPAWNED_DOMAIN_PREFIX,
+            MERGE_RECEIPT_DOMAIN_PREFIX,
+            RUNNER_POOL_QUARANTINED_DOMAIN_PREFIX,
+            AAT_SPEC_QUARANTINED_DOMAIN_PREFIX,
+            AAT_GATE_RECEIPT_DOMAIN_PREFIX,
+            ARTIFACT_MANIFEST_DOMAIN_PREFIX,
+        ];
+
+        // Check uniqueness
+        for (i, prefix_a) in all_prefixes.iter().enumerate() {
+            for (j, prefix_b) in all_prefixes.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        prefix_a, prefix_b,
+                        "Domain prefixes must be unique to prevent replay attacks"
+                    );
+                }
+            }
+        }
+
+        // Verify all prefixes have correct format
+        for prefix in &all_prefixes {
+            let prefix_str = std::str::from_utf8(prefix).expect("Prefix must be valid UTF-8");
+            assert!(
+                prefix_str.starts_with("apm2."),
+                "Prefix must start with 'apm2.'"
+            );
+            assert!(prefix_str.ends_with(':'), "Prefix must end with ':'");
+        }
+    }
+
+    /// SEC-CAN-001: Document that `WorkClaimed` and `EpisodeSpawned` are not
+    /// yet in the kernel proto schema.
+    ///
+    /// These event types are defined in RFC-0017 Phase 1 but are implemented
+    /// in apm2-daemon, not in the kernel proto. When they are added to the
+    /// kernel proto, Canonicalize implementations should be added.
+    #[test]
+    fn sec_can_001_work_claimed_episode_spawned_domain_prefixes_defined() {
+        // Verify the domain prefixes are defined and correct
+        assert_eq!(WORK_CLAIMED_DOMAIN_PREFIX, b"apm2.event.work_claimed:");
+        assert_eq!(
+            EPISODE_SPAWNED_DOMAIN_PREFIX,
+            b"apm2.event.episode_spawned:"
+        );
+
+        // Note: The actual WorkClaimed and EpisodeSpawned types are not in
+        // the kernel proto schema yet. They are defined in apm2-daemon for
+        // RFC-0017 Phase 1. When they are migrated to kernel_events.proto,
+        // Canonicalize implementations should be added here.
     }
 }
