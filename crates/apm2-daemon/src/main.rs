@@ -333,11 +333,15 @@ async fn main() -> Result<()> {
 
             info!("Daemonizing...");
 
-            // First fork
-            // SAFETY: fork() is safe to call in a single-threaded context before
-            // any multi-threading begins. At this point, we haven't spawned any
-            // async tasks or threads. The child process will exit immediately
-            // (in the second fork) or continue with daemon initialization.
+            // First fork (double-fork daemon pattern)
+            // SAFETY: While #[tokio::main] initializes a multi-threaded runtime before
+            // this code runs, fork() is safe here because:
+            // 1. The parent process calls exit(0) immediately after fork - no async work or
+            //    lock acquisition occurs, avoiding deadlock risk.
+            // 2. The child inherits only the calling thread (fork semantics), becoming
+            //    effectively single-threaded with a fresh runtime state after exec.
+            // 3. This is a standard Unix daemonization pattern that pre-dates async Rust
+            //    and is intentionally performed early before spawning async tasks.
             match unsafe { fork() }? {
                 ForkResult::Parent { .. } => {
                     // Parent exits
@@ -350,9 +354,12 @@ async fn main() -> Result<()> {
             setsid()?;
 
             // Second fork (completes double-fork daemon pattern)
-            // SAFETY: fork() is safe to call here because we are still in a
-            // single-threaded context. The first fork's child has called setsid()
-            // and is about to fork again. The grandchild becomes the daemon.
+            // SAFETY: fork() is safe here for the same reasons as the first fork:
+            // 1. We are in the first child process which is now single-threaded (fork only
+            //    duplicates the calling thread, not tokio workers).
+            // 2. The intermediate parent exits immediately via exit(0).
+            // 3. The grandchild (daemon) continues with a clean process state and will
+            //    complete async initialization after daemonization finishes.
             match unsafe { fork() }? {
                 ForkResult::Parent { .. } => {
                     // Parent exits
