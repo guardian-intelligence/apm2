@@ -383,6 +383,91 @@ impl BrokerToolRequest {
         }
         req
     }
+
+    /// Converts to a core `ToolRequest` for policy engine evaluation (TCK-00292).
+    ///
+    /// This enables the real `PolicyEngine` from `apm2-core` to evaluate broker requests.
+    #[must_use]
+    pub fn to_policy_request(&self) -> apm2_core::tool::ToolRequest {
+        use apm2_core::tool::{
+            FileEdit, FileRead, FileWrite, GitOperation, InferenceCall, ShellExec, tool_request,
+        };
+
+        let tool = match self.tool_class {
+            ToolClass::Read => self.path.as_ref().map(|p| {
+                tool_request::Tool::FileRead(FileRead {
+                    path: p.to_string_lossy().to_string(),
+                    offset: 0,
+                    limit: self.size.unwrap_or(0),
+                })
+            }),
+            ToolClass::Write => self.path.as_ref().map(|p| {
+                tool_request::Tool::FileWrite(FileWrite {
+                    path: p.to_string_lossy().to_string(),
+                    content: Vec::new(),
+                    create_only: false,
+                    append: false,
+                })
+            }),
+            ToolClass::Execute => self.shell_command.as_ref().map(|cmd| {
+                tool_request::Tool::ShellExec(ShellExec {
+                    command: cmd.clone(),
+                    cwd: String::new(),
+                    timeout_ms: 0,
+                    network_access: self.network.is_some(),
+                    env: Vec::new(),
+                })
+            }),
+            ToolClass::Git => Some(tool_request::Tool::GitOp(GitOperation {
+                operation: "status".to_string(),
+                args: Vec::new(),
+                cwd: self
+                    .path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            })),
+            ToolClass::Network => self.network.as_ref().map(|(_host, _port)| {
+                tool_request::Tool::ShellExec(ShellExec {
+                    command: String::new(),
+                    cwd: String::new(),
+                    timeout_ms: 0,
+                    network_access: true,
+                    env: Vec::new(),
+                })
+            }),
+            ToolClass::Inference => Some(tool_request::Tool::Inference(InferenceCall {
+                provider: String::new(),
+                model: String::new(),
+                prompt_hash: Vec::new(),
+                max_tokens: 0,
+                temperature_scaled: 0,
+                system_prompt_hash: Vec::new(),
+            })),
+            ToolClass::Artifact => self.path.as_ref().map(|p| {
+                tool_request::Tool::FileRead(FileRead {
+                    path: p.to_string_lossy().to_string(),
+                    offset: 0,
+                    limit: 0,
+                })
+            }),
+            _ => self.path.as_ref().map(|p| {
+                tool_request::Tool::FileEdit(FileEdit {
+                    path: p.to_string_lossy().to_string(),
+                    old_content: String::new(),
+                    new_content: String::new(),
+                })
+            }),
+        };
+
+        apm2_core::tool::ToolRequest {
+            request_id: self.request_id.clone(),
+            session_token: String::new(),
+            dedupe_key: self.dedupe_key.as_str().to_string(),
+            consumption_mode: false,
+            tool,
+        }
+    }
 }
 
 // =============================================================================
