@@ -170,6 +170,14 @@ pub enum ResourceError {
         /// The connection ID that was not found.
         connection_id: String,
     },
+
+    /// Maximum connections exceeded.
+    TooManyConnections {
+        /// Current connection count.
+        current: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for ResourceError {
@@ -225,6 +233,9 @@ impl std::fmt::Display for ResourceError {
             Self::ConnectionNotFound { connection_id } => {
                 write!(f, "connection not found: {connection_id}")
             },
+            Self::TooManyConnections { current, max } => {
+                write!(f, "connection limit exceeded: {current} >= maximum {max}")
+            },
         }
     }
 }
@@ -243,7 +254,8 @@ impl ResourceError {
             | Self::RateLimitExceeded { .. }
             | Self::QueueFull { .. }
             | Self::BytesInFlightExceeded { .. }
-            | Self::PayloadTooLarge { .. } => HefErrorCode::HefErrorResourceLimit,
+            | Self::PayloadTooLarge { .. }
+            | Self::TooManyConnections { .. } => HefErrorCode::HefErrorResourceLimit,
             Self::SubscriptionNotFound { .. } => HefErrorCode::HefErrorSubscriptionNotFound,
             // ConnectionNotFound maps to ResourceLimit as it's a governance issue.
             // Kept as separate match arm for explicit documentation.
@@ -278,7 +290,13 @@ pub struct ResourceQuotaConfig {
     pub max_bytes_in_flight: usize,
     /// Maximum pulse payload size in bytes.
     pub max_pulse_payload_bytes: usize,
+    /// Maximum total connections to the registry.
+    /// Default: 100.
+    pub max_connections: usize,
 }
+
+/// Default maximum connections to the registry.
+pub const MAX_CONNECTIONS: usize = 100;
 
 impl Default for ResourceQuotaConfig {
     fn default() -> Self {
@@ -291,6 +309,7 @@ impl Default for ResourceQuotaConfig {
             max_queue_depth: MAX_QUEUE_DEPTH_PER_SUBSCRIBER,
             max_bytes_in_flight: MAX_BYTES_IN_FLIGHT_PER_SUBSCRIBER,
             max_pulse_payload_bytes: MAX_PULSE_PAYLOAD_BYTES,
+            max_connections: MAX_CONNECTIONS,
         }
     }
 }
@@ -308,6 +327,7 @@ impl ResourceQuotaConfig {
             max_queue_depth: 16,
             max_bytes_in_flight: 16384,
             max_pulse_payload_bytes: 512,
+            max_connections: 10,
         }
     }
 }
@@ -323,20 +343,20 @@ impl ResourceQuotaConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum DropPriority {
-    /// `episode.<episode_id>.io` - Stream output, dropped first.
-    EpisodeIo        = 0,
+    /// Unknown topic category - unclassified topics are dropped first.
+    Unknown          = 0,
+    /// `episode.<episode_id>.io` - Stream output, dropped early.
+    EpisodeIo        = 1,
     /// `episode.<episode_id>.tool` - Tool events.
-    EpisodeTool      = 1,
+    EpisodeTool      = 2,
     /// `episode.<episode_id>.lifecycle` - Lifecycle events.
-    EpisodeLifecycle = 2,
+    EpisodeLifecycle = 3,
     /// `work.<work_id>.events` - Work events.
-    WorkEvents       = 3,
+    WorkEvents       = 4,
     /// `gate.<work_id>.<changeset_digest>.<gate_id>` - Gate receipts.
-    Gate             = 4,
+    Gate             = 5,
     /// `ledger.head` - System ledger head, dropped last (most important).
-    LedgerHead       = 5,
-    /// Unknown topic category, treated as low priority.
-    Unknown          = 6,
+    LedgerHead       = 6,
 }
 
 impl DropPriority {
@@ -480,8 +500,12 @@ impl RateLimiter {
         let elapsed_ms = elapsed.as_millis() as u64;
 
         if elapsed_ms > 0 {
-            // Calculate tokens to add (rate is per second, scale by 1000)
-            let tokens_to_add = (elapsed_ms * self.rate * 1000) / 1000;
+            // Calculate tokens to add (rate is per second, elapsed_ms is in
+            // milliseconds). The formula: tokens = (elapsed_ms / 1000) * rate
+            // Rearranged to avoid float: tokens = elapsed_ms * rate / 1000
+            // But we store scaled tokens (by 1000), so we just use:
+            // scaled_tokens_to_add = elapsed_ms * rate
+            let tokens_to_add = elapsed_ms * self.rate;
             let max_tokens = self.burst * 1000;
             state.tokens = (state.tokens + tokens_to_add).min(max_tokens);
             state.last_refill = now;
@@ -513,7 +537,8 @@ impl RateLimiter {
         let elapsed_ms = elapsed.as_millis() as u64;
 
         if elapsed_ms > 0 {
-            let tokens_to_add = (elapsed_ms * self.rate * 1000) / 1000;
+            // Same formula as try_acquire: scaled_tokens_to_add = elapsed_ms * rate
+            let tokens_to_add = elapsed_ms * self.rate;
             let max_tokens = self.burst * 1000;
             state.tokens = (state.tokens + tokens_to_add).min(max_tokens);
             state.last_refill = now;
@@ -864,9 +889,11 @@ impl ConnectionState {
     ///
     /// * `payload_size` - Size of the pulse payload in bytes
     pub fn record_dequeue(&self, payload_size: usize) {
-        self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+        // Use Release ordering to ensure the dequeue is visible to other threads
+        // that may be checking available capacity with Acquire ordering.
+        self.queue_depth.fetch_sub(1, Ordering::Release);
         self.bytes_in_flight
-            .fetch_sub(payload_size, Ordering::Relaxed);
+            .fetch_sub(payload_size, Ordering::Release);
     }
 
     /// Returns current queue depth.
@@ -923,13 +950,31 @@ impl SubscriptionRegistry {
     /// # Arguments
     ///
     /// * `connection_id` - Unique identifier for the connection
-    pub fn register_connection(&self, connection_id: impl Into<String>) {
+    ///
+    /// # Errors
+    ///
+    /// Returns `ResourceError::TooManyConnections` if the global connection
+    /// limit would be exceeded.
+    pub fn register_connection(
+        &self,
+        connection_id: impl Into<String>,
+    ) -> Result<(), ResourceError> {
         let connection_id = connection_id.into();
         let mut connections = self.connections.write().expect("lock poisoned");
+
+        // Check global connection limit
+        if connections.len() >= self.config.max_connections {
+            return Err(ResourceError::TooManyConnections {
+                current: connections.len(),
+                max: self.config.max_connections,
+            });
+        }
+
         connections.insert(
             connection_id.clone(),
             ConnectionState::new(connection_id, self.config),
         );
+        Ok(())
     }
 
     /// Sets the session ID for a connection.
@@ -1156,15 +1201,29 @@ impl SubscriptionRegistry {
     /// Finds all subscriptions that match a topic.
     ///
     /// Returns a list of `(connection_id, subscription_id)` pairs.
+    ///
+    /// # Performance
+    ///
+    /// This method pre-splits the topic string once and reuses the segments
+    /// across all pattern matches, avoiding O(N*M) string splitting overhead
+    /// where N is the number of patterns and M is the topic segment count.
     #[must_use]
     pub fn find_matching_subscriptions(&self, topic: &str) -> Vec<(String, String)> {
+        // Quick ASCII check (invalid topics never match any pattern)
+        if !topic.is_ascii() {
+            return Vec::new();
+        }
+
+        // Pre-split the topic once to avoid O(N*M) splitting overhead
+        let topic_segments: Vec<&str> = topic.split('.').collect();
+
         let connections = self.connections.read().expect("lock poisoned");
         let mut matches = Vec::new();
 
         for (conn_id, conn) in connections.iter() {
             for sub in conn.subscriptions() {
                 for pattern in &sub.patterns {
-                    if pattern.matches(topic) {
+                    if pattern.matches_segments(&topic_segments) {
                         matches.push((conn_id.clone(), sub.subscription_id.clone()));
                         break; // Don't add same subscription twice
                     }
@@ -1260,12 +1319,22 @@ mod tests {
         use super::*;
 
         #[test]
-        fn episode_io_has_highest_drop_priority() {
+        fn unknown_has_highest_drop_priority() {
+            assert_eq!(
+                DropPriority::from_topic("unknown.topic"),
+                DropPriority::Unknown
+            );
+            // Unknown topics are dropped first (value = 0)
+            assert_eq!(DropPriority::Unknown.value(), 0);
+        }
+
+        #[test]
+        fn episode_io_has_high_drop_priority() {
             assert_eq!(
                 DropPriority::from_topic("episode.EP-001.io"),
                 DropPriority::EpisodeIo
             );
-            assert_eq!(DropPriority::EpisodeIo.value(), 0);
+            assert_eq!(DropPriority::EpisodeIo.value(), 1);
         }
 
         #[test]
@@ -1313,8 +1382,9 @@ mod tests {
 
         #[test]
         fn drop_order_is_correct() {
-            // Verify ordering: EpisodeIo < EpisodeTool < EpisodeLifecycle <
+            // Verify ordering: Unknown < EpisodeIo < EpisodeTool < EpisodeLifecycle <
             // WorkEvents < Gate < LedgerHead
+            assert!(DropPriority::Unknown < DropPriority::EpisodeIo);
             assert!(DropPriority::EpisodeIo < DropPriority::EpisodeTool);
             assert!(DropPriority::EpisodeTool < DropPriority::EpisodeLifecycle);
             assert!(DropPriority::EpisodeLifecycle < DropPriority::WorkEvents);
@@ -1323,14 +1393,14 @@ mod tests {
         }
 
         #[test]
-        fn unknown_topic_is_low_priority() {
+        fn unknown_topic_dropped_first() {
             assert_eq!(
                 DropPriority::from_topic("unknown.topic"),
                 DropPriority::Unknown
             );
-            // Unknown is even lower priority than LedgerHead (dropped first among
-            // unknowns)
-            assert!(DropPriority::Unknown > DropPriority::LedgerHead);
+            // Unknown has lowest priority value (dropped first under backpressure)
+            assert!(DropPriority::Unknown < DropPriority::EpisodeIo);
+            assert!(DropPriority::Unknown < DropPriority::LedgerHead);
         }
     }
 
@@ -1623,7 +1693,7 @@ mod tests {
         fn register_and_unregister_connection() {
             let registry = SubscriptionRegistry::new(ResourceQuotaConfig::for_testing());
 
-            registry.register_connection("conn-1");
+            registry.register_connection("conn-1").unwrap();
             assert_eq!(registry.connection_count(), 1);
 
             registry.unregister_connection("conn-1");
@@ -1631,9 +1701,31 @@ mod tests {
         }
 
         #[test]
+        fn register_connection_exceeds_limit() {
+            let config = ResourceQuotaConfig {
+                max_connections: 2,
+                ..ResourceQuotaConfig::for_testing()
+            };
+            let registry = SubscriptionRegistry::new(config);
+
+            // First two should succeed
+            assert!(registry.register_connection("conn-1").is_ok());
+            assert!(registry.register_connection("conn-2").is_ok());
+            assert_eq!(registry.connection_count(), 2);
+
+            // Third should fail
+            let result = registry.register_connection("conn-3");
+            assert!(matches!(
+                result,
+                Err(ResourceError::TooManyConnections { current: 2, max: 2 })
+            ));
+            assert_eq!(registry.connection_count(), 2);
+        }
+
+        #[test]
         fn add_subscription_through_registry() {
             let registry = SubscriptionRegistry::new(ResourceQuotaConfig::for_testing());
-            registry.register_connection("conn-1");
+            registry.register_connection("conn-1").unwrap();
 
             let sub = SubscriptionState::new("sub-1", "", vec![test_pattern("work.*.events")], 0);
             assert!(registry.add_subscription("conn-1", sub).is_ok());
@@ -1658,11 +1750,11 @@ mod tests {
         fn find_matching_subscriptions() {
             let registry = SubscriptionRegistry::new(ResourceQuotaConfig::for_testing());
 
-            registry.register_connection("conn-1");
+            registry.register_connection("conn-1").unwrap();
             let sub1 = SubscriptionState::new("sub-1", "", vec![test_pattern("work.*.events")], 0);
             registry.add_subscription("conn-1", sub1).unwrap();
 
-            registry.register_connection("conn-2");
+            registry.register_connection("conn-2").unwrap();
             let sub2 = SubscriptionState::new("sub-2", "", vec![test_pattern("ledger.head")], 0);
             registry.add_subscription("conn-2", sub2).unwrap();
 
@@ -1684,7 +1776,7 @@ mod tests {
         #[test]
         fn try_reserve_enqueue_through_registry() {
             let registry = SubscriptionRegistry::new(ResourceQuotaConfig::for_testing());
-            registry.register_connection("conn-1");
+            registry.register_connection("conn-1").unwrap();
 
             // Should succeed for reasonable payload and atomically reserve
             assert!(registry.try_reserve_enqueue("conn-1", 100).is_ok());
@@ -1704,7 +1796,7 @@ mod tests {
         #[test]
         fn remove_subscription_through_registry() {
             let registry = SubscriptionRegistry::new(ResourceQuotaConfig::for_testing());
-            registry.register_connection("conn-1");
+            registry.register_connection("conn-1").unwrap();
 
             let sub = SubscriptionState::new("sub-1", "", vec![test_pattern("work.*.events")], 0);
             registry.add_subscription("conn-1", sub).unwrap();
@@ -1719,7 +1811,7 @@ mod tests {
         #[test]
         fn remove_nonexistent_subscription() {
             let registry = SubscriptionRegistry::new(ResourceQuotaConfig::for_testing());
-            registry.register_connection("conn-1");
+            registry.register_connection("conn-1").unwrap();
 
             let result = registry.remove_subscription("conn-1", "nonexistent");
             assert!(matches!(
