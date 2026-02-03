@@ -233,6 +233,15 @@ impl FilesystemTool {
         let root = self.resolve_path(&req.path)?;
         info!("Listing files: {:?} pattern={:?}", root, req.pattern);
 
+        if req.pattern.contains("..") {
+            return Err(ToolError {
+                error_code: "PATH_TRAVERSAL".to_string(),
+                message: "Path traversal sequences (..) are not allowed".to_string(),
+                retryable: false,
+                retry_after_ms: 0,
+            });
+        }
+
         let mut output = String::new();
         let mut count = 0;
         let max_entries = if req.max_entries == 0 {
@@ -486,6 +495,22 @@ mod tests {
                 offset: 0,
 
                 limit: 0,
+            })
+            .unwrap_err();
+
+        assert_eq!(err.error_code, "PATH_TRAVERSAL");
+    }
+
+    #[test]
+    fn test_list_files_traversal_blocked() {
+        let temp_dir = TempDir::new().unwrap();
+        let tool = FilesystemTool::new(temp_dir.path().to_path_buf());
+
+        let err = tool
+            .list_files(&ListFiles {
+                path: ".".to_string(),
+                pattern: "../secret.txt".to_string(),
+                max_entries: 10,
             })
             .unwrap_err();
 
