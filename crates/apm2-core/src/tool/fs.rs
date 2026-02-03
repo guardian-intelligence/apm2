@@ -686,11 +686,12 @@ mod tests {
 
     #[test]
     fn test_search_respects_limits() {
+        use std::fmt::Write;
+
         let temp_dir = TempDir::new().unwrap();
         let tool = FilesystemTool::new(temp_dir.path().to_path_buf());
 
         // Create a file with many matching lines
-        use std::fmt::Write;
         let mut content = String::new();
         for i in 0..100 {
             writeln!(content, "match line {i}").unwrap();
