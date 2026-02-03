@@ -172,8 +172,8 @@ impl ReasonCode {
     /// Used for canonical encoding and wire format serialization.
     /// Values match the protobuf `ReviewBlockedReasonCode` enum:
     /// - 0 = UNSPECIFIED (not used in Rust)
-    /// - 1 = APPLY_FAILED
-    /// - 2 = TOOL_FAILED
+    /// - 1 = `APPLY_FAILED`
+    /// - 2 = `TOOL_FAILED`
     /// - etc.
     #[must_use]
     pub const fn to_code(self) -> u8 {

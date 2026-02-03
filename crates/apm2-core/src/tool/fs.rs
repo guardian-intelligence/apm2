@@ -417,13 +417,10 @@ impl FilesystemTool {
             if let Ok(path) = entry {
                 // Security: Verify matched path is within workspace boundary.
                 // This guards against symlink attacks and glob edge cases.
-                let canonical_path = match path.canonicalize() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        // If canonicalize fails (e.g., broken symlink), skip the entry
-                        // to avoid exposing information about files we cannot verify.
-                        continue;
-                    },
+                let Ok(canonical_path) = path.canonicalize() else {
+                    // If canonicalize fails (e.g., broken symlink), skip the entry
+                    // to avoid exposing information about files we cannot verify.
+                    continue;
                 };
 
                 if !canonical_path.starts_with(&canonical_root) {
@@ -693,9 +690,10 @@ mod tests {
         let tool = FilesystemTool::new(temp_dir.path().to_path_buf());
 
         // Create a file with many matching lines
+        use std::fmt::Write;
         let mut content = String::new();
         for i in 0..100 {
-            content.push_str(&format!("match line {i}\n"));
+            writeln!(content, "match line {i}").unwrap();
         }
         tool.write(&FileWrite {
             path: "many_matches.txt".to_string(),

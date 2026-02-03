@@ -85,7 +85,7 @@ mod policy_resolution;
 pub mod quarantine;
 mod receipt;
 pub mod retry_manager;
-mod review_blocked;
+pub mod review_blocked;
 pub mod risk_tier;
 pub mod selection_policy;
 mod terminal_verifier;
