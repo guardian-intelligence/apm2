@@ -11,9 +11,12 @@ use apm2_daemon::episode::InMemorySessionRegistry;
 use apm2_daemon::ledger::{SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use apm2_daemon::protocol::credentials::PeerCredentials;
 use apm2_daemon::protocol::dispatch::{
-    ConnectionContext, PrivilegedResponse, encode_claim_work_request, encode_spawn_episode_request,
+    ConnectionContext, PrivilegedResponse, encode_claim_work_request, encode_issue_capability_request,
+    encode_spawn_episode_request,
 };
-use apm2_daemon::protocol::messages::{ClaimWorkRequest, SpawnEpisodeRequest, WorkRole};
+use apm2_daemon::protocol::messages::{
+    CapabilityRequest, ClaimWorkRequest, IssueCapabilityRequest, SpawnEpisodeRequest, WorkRole,
+};
 use apm2_daemon::state::DispatcherState;
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
@@ -152,40 +155,29 @@ async fn test_persistence_end_to_end() {
     };
 
     // 6. IssueCapability
-    // This should succeed because session exists and logic verifies lease
-    // against work_id. Wait, handle_issue_capability calls
-    // `lease_validator.validate_gate_lease`. My implementation of
-    // `handle_issue_capability` calls it unconditionally.
-    // And `SqliteLeaseValidator` checks for `gate_lease_issued` event.
-    // So `IssueCapability` will FAIL for Implementer sessions if
-    // `LeaseValidator` is strict about `gate_lease_issued`.
+    // TCK-00289: Verify that IssueCapability succeeds with persistent registry validation.
+    // The previous steps established a valid Implementer session (session_id) backed by
+    // a persistent work claim.
+    let issue_req = IssueCapabilityRequest {
+        session_id: _session_id,
+        capability_request: Some(CapabilityRequest {
+            tool_class: "file_read".to_string(),
+            read_patterns: vec!["/tmp/**".to_string()],
+            write_patterns: vec![],
+            duration_secs: 60,
+        }),
+    };
 
-    // This confirms my suspicion earlier. `LeaseValidator` as implemented is
-    // for Gates. `IssueCapability` shouldn't use `validate_gate_lease` for
-    // non-gate sessions? Or `LeaseValidator` should be broader.
+    let issue_frame = encode_issue_capability_request(&issue_req);
+    let issue_resp = dispatcher.dispatch(&issue_frame, &ctx).unwrap();
 
-    // For TCK-00289, I am implementing "IssueCapability with lease validation".
-    // If I used `validate_gate_lease`, I restricted it to Gates.
-    // If I want to pass this test for Implementers, I need to fix
-    // `handle_issue_capability` or `LeaseValidator`.
-    // Given `IssueCapability` is general, checking for `gate_lease_issued` is
-    // wrong for `Implementer`.
-
-    // I should modify `handle_issue_capability` to only check
-    // `validate_gate_lease` if the role is GateExecutor? Or just check that
-    // the session's lease_id is valid (exists in work_claims?).
-    // `WorkRegistry` has `get_claim(work_id)`.
-
-    // Correct logic for `handle_issue_capability`:
-    // 1. Get session.
-    // 2. Get claim from `WorkRegistry` using `session.work_id`.
-    // 3. Verify `session.lease_id` matches `claim.lease_id`.
-    // 4. (Optional) if GateExecutor, also verify `gate_lease_issued` (but
-    //    that's done at spawn).
-
-    // Relying on `lease_validator` (which checks `gate_lease_issued`) breaks
-    // `IssueCapability` for Implementers. I will modify `dispatch.rs` to
-    // use `work_registry` for validation instead of `lease_validator`. This
-    // validates the lease against the claim (which is the source of truth for
-    // the session).
+    match issue_resp {
+        PrivilegedResponse::IssueCapability(resp) => {
+            assert!(resp.capability_id.starts_with("C-"));
+            assert!(resp.granted_at > 0);
+            assert!(resp.expires_at > resp.granted_at);
+        }
+        PrivilegedResponse::Error(e) => panic!("IssueCapability failed: {:?}", e),
+        _ => panic!("Expected IssueCapability response"),
+    }
 }
