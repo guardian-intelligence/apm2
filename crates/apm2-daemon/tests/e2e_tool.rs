@@ -530,7 +530,8 @@ async fn test_dedupe_cache_episode_isolation() {
     // Create manifest with Read capability
     let manifest = create_manifest_with_capabilities(vec![read_capability("/workspace")]);
     // NOTE: Use without_policy_check() because this test focuses on dedupe cache
-    // episode isolation, not policy engine integration (TCK-00292 default-deny behavior)
+    // episode isolation, not policy engine integration (TCK-00292 default-deny
+    // behavior)
     let broker: TestToolBroker =
         ToolBroker::new(ToolBrokerConfig::default().without_policy_check());
     broker
