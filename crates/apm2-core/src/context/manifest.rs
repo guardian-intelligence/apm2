@@ -158,6 +158,12 @@ pub enum ToolClass {
 
     /// Artifact operations: CAS publish/fetch.
     Artifact  = 6,
+
+    /// ListFiles operations: directory listing.
+    ListFiles = 7,
+
+    /// Search operations: content search.
+    Search    = 8,
 }
 
 impl ToolClass {
@@ -182,6 +188,8 @@ impl ToolClass {
             4 => Some(Self::Git),
             5 => Some(Self::Inference),
             6 => Some(Self::Artifact),
+            7 => Some(Self::ListFiles),
+            8 => Some(Self::Search),
             _ => None,
         }
     }
@@ -203,6 +211,8 @@ impl ToolClass {
             4 => Some(Self::Git),
             5 => Some(Self::Inference),
             6 => Some(Self::Artifact),
+            7 => Some(Self::ListFiles),
+            8 => Some(Self::Search),
             _ => None,
         }
     }
@@ -226,6 +236,8 @@ impl ToolClass {
             "git" => Some(Self::Git),
             "inference" | "llm" => Some(Self::Inference),
             "artifact" | "cas" => Some(Self::Artifact),
+            "listfiles" | "ls" => Some(Self::ListFiles),
+            "search" | "grep" => Some(Self::Search),
             _ => None,
         }
     }
@@ -241,13 +253,15 @@ impl ToolClass {
             Self::Git => "Git",
             Self::Inference => "Inference",
             Self::Artifact => "Artifact",
+            Self::ListFiles => "ListFiles",
+            Self::Search => "Search",
         }
     }
 
     /// Returns `true` if this tool class represents read-only operations.
     #[must_use]
     pub const fn is_read_only(&self) -> bool {
-        matches!(self, Self::Read)
+        matches!(self, Self::Read | Self::ListFiles | Self::Search)
     }
 
     /// Returns `true` if this tool class can modify state.
@@ -276,6 +290,8 @@ impl ToolClass {
             Self::Git,
             Self::Inference,
             Self::Artifact,
+            Self::ListFiles,
+            Self::Search,
         ]
     }
 }
