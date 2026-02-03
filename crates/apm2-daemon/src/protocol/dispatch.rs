@@ -1087,6 +1087,13 @@ pub fn generate_lease_id() -> String {
 /// based on the socket path:
 /// - operator.sock: `is_privileged = true`
 /// - session.sock: `is_privileged = false`
+///
+/// # TCK-00303: Connection Lifecycle Management
+///
+/// The `connection_id` field is used to track connections in the subscription
+/// registry. When a connection closes, the connection handler MUST call
+/// `subscription_registry.unregister_connection(connection_id)` to free
+/// resources and prevent connection slot leaks.
 #[derive(Debug, Clone)]
 pub struct ConnectionContext {
     /// Whether this connection is privileged (operator socket).
@@ -1098,29 +1105,61 @@ pub struct ConnectionContext {
     /// Session ID for session-scoped connections (None for operator
     /// connections).
     session_id: Option<String>,
+
+    /// Connection ID for subscription registry tracking (TCK-00303).
+    ///
+    /// Generated once when the connection is established and used consistently
+    /// across all subscribe/unsubscribe operations. Must be passed to
+    /// `unregister_connection` when the connection closes to prevent leaks.
+    connection_id: String,
 }
 
 impl ConnectionContext {
     /// Creates a new privileged connection context (operator socket).
+    ///
+    /// # TCK-00303: Connection ID Generation
+    ///
+    /// The `connection_id` is generated from peer credentials (PID-based for
+    /// operator connections) or a UUID if credentials are unavailable.
     #[must_use]
-    pub const fn privileged(peer_credentials: Option<PeerCredentials>) -> Self {
+    pub fn privileged(peer_credentials: Option<PeerCredentials>) -> Self {
+        let connection_id = peer_credentials.as_ref().and_then(|c| c.pid).map_or_else(
+            || format!("CONN-OP-{}", uuid::Uuid::new_v4()),
+            |pid| format!("CONN-OP-{pid}"),
+        );
         Self {
             is_privileged: true,
             peer_credentials,
             session_id: None,
+            connection_id,
         }
     }
 
     /// Creates a new session-scoped connection context (session socket).
+    ///
+    /// # TCK-00303: Connection ID Generation
+    ///
+    /// The `connection_id` is generated from the session ID (if available)
+    /// or peer credentials (PID-based), or a UUID if neither is available.
     #[must_use]
-    pub const fn session(
-        peer_credentials: Option<PeerCredentials>,
-        session_id: Option<String>,
-    ) -> Self {
+    pub fn session(peer_credentials: Option<PeerCredentials>, session_id: Option<String>) -> Self {
+        // For session connections, prefer session_id-based connection ID,
+        // but fall back to PID or UUID if session_id is not yet known
+        // (it may be set later via session token validation)
+        let connection_id = session_id.as_ref().map_or_else(
+            || {
+                peer_credentials.as_ref().and_then(|c| c.pid).map_or_else(
+                    || format!("CONN-SESS-{}", uuid::Uuid::new_v4()),
+                    |pid| format!("CONN-SESS-{pid}"),
+                )
+            },
+            |sid| format!("CONN-SESS-{sid}"),
+        );
         Self {
             is_privileged: false,
             peer_credentials,
             session_id,
+            connection_id,
         }
     }
 
@@ -1140,6 +1179,18 @@ impl ConnectionContext {
     #[must_use]
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// Returns the connection ID for subscription registry tracking.
+    ///
+    /// # TCK-00303: Connection Lifecycle
+    ///
+    /// This ID must be passed to `unregister_connection` when the connection
+    /// closes to free subscription registry slots and prevent `DoS` via
+    /// connection slot exhaustion.
+    #[must_use]
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
     }
 }
 
@@ -3089,13 +3140,12 @@ impl PrivilegedDispatcher {
             }
         }
 
-        // Generate subscription ID and connection ID
+        // Generate subscription ID; use connection ID from context (TCK-00303)
         let subscription_id = format!("SUB-{}", uuid::Uuid::new_v4());
-        // Use PID as connection ID for operator connections, or generate unique ID
-        let connection_id = ctx.peer_credentials().and_then(|c| c.pid).map_or_else(
-            || format!("CONN-OP-{}", uuid::Uuid::new_v4()),
-            |pid| format!("CONN-OP-{pid}"),
-        );
+        // TCK-00303: Use connection_id from context for consistent tracking
+        // across the connection lifecycle. The connection handler will call
+        // unregister_connection with this ID when the connection closes.
+        let connection_id = ctx.connection_id();
 
         // TCK-00303: Wire resource governance - register connection if not exists
         // and add subscription with limit checks
@@ -3123,7 +3173,7 @@ impl PrivilegedDispatcher {
             // Register connection if it doesn't exist (idempotent)
             if let Err(e) = self
                 .subscription_registry
-                .register_connection(&connection_id)
+                .register_connection(connection_id)
             {
                 // Only TooManyConnections is a real error; ignore if connection already exists
                 if matches!(
@@ -3153,7 +3203,7 @@ impl PrivilegedDispatcher {
 
             if let Err(e) = self
                 .subscription_registry
-                .add_subscription(&connection_id, subscription)
+                .add_subscription(connection_id, subscription)
             {
                 warn!(
                     connection_id = %connection_id,
@@ -3245,15 +3295,12 @@ impl PrivilegedDispatcher {
         }
 
         // TCK-00303: Wire resource governance - remove subscription from registry
-        // Use PID as connection ID for operator connections
-        let connection_id = ctx.peer_credentials().and_then(|c| c.pid).map_or_else(
-            || format!("CONN-OP-{}", uuid::Uuid::new_v4()),
-            |pid| format!("CONN-OP-{pid}"),
-        );
+        // Use connection_id from context for consistent tracking
+        let connection_id = ctx.connection_id();
 
         let removed = match self
             .subscription_registry
-            .remove_subscription(&connection_id, &request.subscription_id)
+            .remove_subscription(connection_id, &request.subscription_id)
         {
             Ok(_) => {
                 info!(

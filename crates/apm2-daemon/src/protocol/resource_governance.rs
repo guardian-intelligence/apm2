@@ -747,6 +747,14 @@ impl ConnectionState {
     /// Uses CAS loops to atomically reserve queue depth and bytes in-flight,
     /// preventing race conditions where multiple threads could pass the check
     /// simultaneously before any increment occurs.
+    ///
+    /// # TCK-00304: Wiring Note
+    ///
+    /// This method is called by the pulse publisher (TCK-00304) when delivering
+    /// pulses to subscribers. It enforces rate limits, queue depth, and bytes
+    /// in-flight limits per subscriber. Currently implemented but wiring into
+    /// the pulse delivery path is out of scope for TCK-00303 (registry only)
+    /// and will be completed in TCK-00304 (outbox + pulse publisher).
     pub fn try_reserve_enqueue(&self, payload_size: usize) -> Result<(), ResourceError> {
         // Check payload size first (stateless check, no reservation needed)
         if payload_size > self.config.max_pulse_payload_bytes {

@@ -368,6 +368,19 @@ impl DispatcherState {
     pub const fn session_dispatcher(&self) -> &SessionDispatcher<InMemoryManifestStore> {
         &self.session_dispatcher
     }
+
+    /// Returns the shared subscription registry for connection lifecycle
+    /// management.
+    ///
+    /// # TCK-00303: Connection Cleanup
+    ///
+    /// When a connection closes, the connection handler MUST call
+    /// `unregister_connection(connection_id)` on this registry to free
+    /// resources and prevent `DoS` via connection slot exhaustion.
+    #[must_use]
+    pub const fn subscription_registry(&self) -> &SharedSubscriptionRegistry {
+        self.privileged_dispatcher.subscription_registry()
+    }
 }
 
 /// Shared dispatcher state type alias.

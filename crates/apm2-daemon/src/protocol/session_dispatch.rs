@@ -1363,10 +1363,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
-        // Generate subscription ID and connection ID
+        // Generate subscription ID; use connection ID from context (TCK-00303)
         let subscription_id = format!("SUB-{}", uuid::Uuid::new_v4());
-        // Use session_id as connection ID for session connections
-        let connection_id = format!("CONN-SESS-{}", token.session_id);
+        // TCK-00303: Use connection_id from context for consistent tracking
+        // across the connection lifecycle. The connection handler will call
+        // unregister_connection with this ID when the connection closes.
+        let connection_id = ctx.connection_id();
 
         // TCK-00303: Wire resource governance - register connection if not exists
         // and add subscription with limit checks (only if registry is configured)
@@ -1394,7 +1396,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 }
 
                 // Register connection if it doesn't exist (idempotent)
-                if let Err(e) = registry.register_connection(&connection_id) {
+                if let Err(e) = registry.register_connection(connection_id) {
                     // Only TooManyConnections is a real error
                     if matches!(
                         e,
@@ -1415,7 +1417,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 }
 
                 // Set session ID for the connection
-                if let Err(e) = registry.set_session_id(&connection_id, &token.session_id) {
+                if let Err(e) = registry.set_session_id(connection_id, &token.session_id) {
                     debug!(
                         connection_id = %connection_id,
                         error = %e,
@@ -1431,7 +1433,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     request.since_ledger_cursor,
                 );
 
-                if let Err(e) = registry.add_subscription(&connection_id, subscription) {
+                if let Err(e) = registry.add_subscription(connection_id, subscription) {
                     warn!(
                         session_id = %token.session_id,
                         connection_id = %connection_id,
@@ -1561,11 +1563,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
 
         // TCK-00303: Wire resource governance - remove subscription from registry
-        // Use session_id as connection ID for session connections
-        let connection_id = format!("CONN-SESS-{}", token.session_id);
+        // Use connection_id from context for consistent tracking
+        let connection_id = ctx.connection_id();
 
         let removed = if let Some(ref registry) = self.subscription_registry {
-            match registry.remove_subscription(&connection_id, &request.subscription_id) {
+            match registry.remove_subscription(connection_id, &request.subscription_id) {
                 Ok(_) => {
                     info!(
                         session_id = %token.session_id,
