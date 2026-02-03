@@ -289,6 +289,7 @@ impl EpisodeEvent {
             Self::Quarantined { .. } => "episode.quarantined",
             Self::ClockProfilePublished { .. } => "clock.profile_published",
             Self::LeaseIssueDenied { .. } => "lease.issue_denied",
+            Self::ReviewReceiptRecorded { .. } => "review.receipt_recorded",
         }
     }
 
@@ -313,6 +314,9 @@ impl EpisodeEvent {
             }
             | Self::LeaseIssueDenied {
                 time_envelope_ref, ..
+            }
+            | Self::ReviewReceiptRecorded {
+                time_envelope_ref, ..
             } => time_envelope_ref.as_ref(),
         }
     }
@@ -329,7 +333,8 @@ impl EpisodeEvent {
             | Self::Stopped { time_envelope, .. }
             | Self::Quarantined { time_envelope, .. }
             | Self::ClockProfilePublished { time_envelope, .. }
-            | Self::LeaseIssueDenied { time_envelope, .. } => time_envelope.as_ref(),
+            | Self::LeaseIssueDenied { time_envelope, .. }
+            | Self::ReviewReceiptRecorded { time_envelope, .. } => time_envelope.as_ref(),
         }
     }
 
@@ -1094,6 +1099,39 @@ impl EpisodeRuntime {
             denial_reason = %denial_reason,
             "lease issuance denied"
         );
+        Ok(())
+    }
+
+    /// Records a review receipt (TCK-00312).
+    ///
+    /// This event is emitted when a review completes successfully.
+    /// The receipt binds the review artifacts to the changeset.
+    #[instrument(skip(self, receipt))]
+    pub async fn record_review_receipt(
+        &self,
+        receipt: apm2_core::fac::ReviewReceiptRecorded,
+        timestamp_ns: u64,
+    ) -> Result<(), EpisodeError> {
+        if self.config.emit_events {
+            // Stamp time envelope for temporal ordering (RFC-0016 HTF)
+            let (time_envelope, time_envelope_ref) = match self
+                .stamp_envelope(Some(format!("review.receipt_recorded:{}", receipt.review_id)))
+                .await?
+            {
+                Some((env, env_ref)) => (Some(env), Some(env_ref)),
+                None => (None, None),
+            };
+
+            let review_id = receipt.review_id.clone();
+            self.emit_event(EpisodeEvent::ReviewReceiptRecorded {
+                receipt,
+                recorded_at_ns: timestamp_ns,
+                time_envelope_ref,
+                time_envelope,
+            })
+            .await;
+            info!(review_id = %review_id, "review receipt recorded");
+        }
         Ok(())
     }
 
@@ -2066,5 +2104,38 @@ mod tests {
             events[0].episode_id().is_none(),
             "ClockProfilePublished should not have an episode_id"
         );
+    }
+
+    #[tokio::test]
+    async fn test_record_review_receipt() {
+        use apm2_core::crypto::Signer;
+        use apm2_core::fac::ReviewReceiptRecorded;
+
+        let runtime = EpisodeRuntime::new(test_config());
+        let signer = Signer::generate();
+        
+        let receipt = ReviewReceiptRecorded::create(
+            "rev-001".into(),
+            [0x11; 32],
+            [0x22; 32],
+            [0x33; 32],
+            "actor-001".into(),
+            &signer,
+        ).unwrap();
+
+        runtime
+            .record_review_receipt(receipt.clone(), test_timestamp())
+            .await
+            .unwrap();
+
+        let events = runtime.drain_events().await;
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            EpisodeEvent::ReviewReceiptRecorded { receipt: r, recorded_at_ns, .. } => {
+                assert_eq!(r.review_id, "rev-001");
+                assert_eq!(*recorded_at_ns, test_timestamp());
+            },
+            _ => panic!("Unexpected event type"),
+        }
     }
 }

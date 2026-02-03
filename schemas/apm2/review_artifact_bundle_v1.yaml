@@ -35,6 +35,16 @@ properties:
     items:
       type: "string"
       pattern: "^[a-f0-9]{64}$"
+  metadata:
+    type: "object"
+    description: "Optional key-value metadata for the review (e.g. verdict)."
+    propertyNames:
+      pattern: "^[a-zA-Z0-9_-]{1,64}$"
+    patternProperties:
+      ".*":
+        type: "string"
+        maxLength: 1024
+    maxProperties: 32
   time_envelope_ref:
     type: "string"
     description: "Hex-encoded 32-byte hash of TimeEnvelope stored in CAS."

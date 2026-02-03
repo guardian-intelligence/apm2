@@ -6,6 +6,8 @@
 // - Added ReviewBlockedRecorded to KernelEvent payload (tag 32)
 // - Added ReviewBlockedReasonCode enum for failure classification
 // - Enables work.<work_id>.blocked topic derivation and durable blocked outcomes
+// - Added ReviewReceiptRecorded event for FAC v0 review success (RFC-0018, TCK-00312)
+// - Added ReviewReceiptRecorded to KernelEvent payload (tag 33)
 //
 // CHANGELOG (0.5.0):
 // - Added DefectRecorded event for HEF defect pulse derivation (RFC-0018, TCK-00307)
@@ -115,6 +117,7 @@ message KernelEvent {
     IoArtifactPublished io_artifact_published = 30;
     DefectRecorded defect_recorded = 31;
     ReviewBlockedRecorded review_blocked_recorded = 32;
+    ReviewReceiptRecorded review_receipt_recorded = 33;
   }
 }
 
@@ -1672,5 +1675,37 @@ message ReviewBlockedRecorded {
   string recorder_actor_id = 6;
   // Ed25519 signature over canonical bytes with REVIEW_BLOCKED_RECORDED: domain (64 bytes).
   bytes recorder_signature = 7;
+}
+
+// ============================================================
+// REVIEW RECEIPT EVENTS (TCK-00312)
+// ============================================================
+//
+// ReviewReceiptRecorded events are emitted when a review is successfully
+// completed and artifacts are stored. This binds the review outputs (text,
+// logs, metadata) to the changeset and provides CAS references.
+//
+// Key properties:
+// - Binds review to changeset_digest
+// - References ReviewArtifactBundleV1 in CAS via artifact_bundle_hash
+// - Enables retry bound enforcement via HTF time envelope
+// - Security: Uses REVIEW_RECEIPT_RECORDED: domain prefix
+
+// Emitted when a review is successfully completed and artifacts are stored.
+//
+// Security: The signature uses REVIEW_RECEIPT_RECORDED: domain prefix.
+message ReviewReceiptRecorded {
+  // Unique identifier for this review (e.g. "REV-UUID").
+  string review_id = 1;
+  // BLAKE3 digest of the changeset that was being reviewed (32 bytes).
+  bytes changeset_digest = 2;
+  // BLAKE3 hash of the ReviewArtifactBundleV1 stored in CAS (32 bytes).
+  bytes artifact_bundle_hash = 3;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  optional TimeEnvelopeRef time_envelope_ref = 4;
+  // Actor who performed the review.
+  string reviewer_actor_id = 5;
+  // Ed25519 signature over canonical bytes with REVIEW_RECEIPT_RECORDED: domain (64 bytes).
+  bytes reviewer_signature = 6;
 }
 

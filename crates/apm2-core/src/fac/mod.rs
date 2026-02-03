@@ -86,6 +86,7 @@ pub mod quarantine;
 mod receipt;
 pub mod retry_manager;
 mod review_blocked;
+mod review_receipt;
 pub mod risk_tier;
 pub mod selection_policy;
 mod terminal_verifier;
@@ -231,4 +232,10 @@ pub use terminal_verifier::{
 pub use transcript_binding::{
     AatTranscriptBinding, MAX_CHUNK_CONTENT_BYTES, MAX_RUN_TRANSCRIPT_HASHES,
     MAX_TRANSCRIPT_CHUNKS, TranscriptBindingError, TranscriptChunk,
+};
+
+// Re-export review receipt types
+pub use review_receipt::{
+    BUNDLE_SCHEMA as REVIEW_ARTIFACT_BUNDLE_SCHEMA, BUNDLE_VERSION as REVIEW_ARTIFACT_BUNDLE_VERSION,
+    ReviewArtifactBundleV1, ReviewReceiptError, ReviewReceiptRecorded, ReviewReceiptRecordedProto,
 };
