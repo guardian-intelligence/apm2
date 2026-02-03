@@ -1583,7 +1583,7 @@ enum DefectSource {
 // emission per REQ-HEF-0006 ordering invariant.
 message DefectRecorded {
   // Unique identifier for this defect.
-  // Format: DEF-<uuid> or similar unique string.
+  // Format: `DEF-{uuid}` or similar unique string.
   string defect_id = 1;
   // Classification of the defect type.
   // Examples: PROJECTION_DIVERGENCE, UNPLANNED_CONTEXT_READ, AAT_FAIL

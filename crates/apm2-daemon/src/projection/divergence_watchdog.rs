@@ -2204,19 +2204,18 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         let cas_hash = blake3::hash(&defect_bytes).as_bytes().to_vec();
 
         // Decode time_envelope_ref hex to bytes
-        let time_ref_hash = hex::decode(&time_envelope_ref).unwrap_or_default();
+        // If it's not hex (e.g. htf:tick:...), treat as None for the proto event
+        let time_ref_hash = hex::decode(&time_envelope_ref).ok();
 
         let defect_event = DefectRecorded {
-            defect_id: defect_id.clone(),
+            defect_id,
             defect_type: defect.defect_class().to_string(),
             cas_hash,
             source: DefectSource::DivergenceWatchdog as i32,
             work_id: self.config.repo_id.clone(),
             severity: defect.severity().as_str().to_string(),
             detected_at: timestamp,
-            time_envelope_ref: Some(TimeEnvelopeRef {
-                hash: time_ref_hash,
-            }),
+            time_envelope_ref: time_ref_hash.map(|hash| TimeEnvelopeRef { hash }),
         };
 
         Ok(DivergenceResult {

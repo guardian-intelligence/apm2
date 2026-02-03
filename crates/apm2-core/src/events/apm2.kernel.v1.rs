@@ -1812,7 +1812,7 @@ pub struct IoArtifactPublished {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DefectRecorded {
     /// Unique identifier for this defect.
-    /// Format: DEF-<uuid> or similar unique string.
+    /// Format: `DEF-{uuid}` or similar unique string.
     #[prost(string, tag = "1")]
     pub defect_id: ::prost::alloc::string::String,
     /// Classification of the defect type.
