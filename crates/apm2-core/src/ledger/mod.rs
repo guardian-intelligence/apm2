@@ -157,7 +157,7 @@ impl CommitNotification {
     ///
     /// The `event_type` and `namespace` fields are truncated to their maximum
     /// lengths (`MAX_EVENT_TYPE_LEN` and `MAX_NAMESPACE_LEN`) to prevent
-    /// memory DoS via unbounded string deserialization.
+    /// memory `DoS` via unbounded string deserialization.
     #[must_use]
     pub fn new(
         seq_id: u64,
@@ -183,7 +183,7 @@ impl CommitNotification {
     ///
     /// The `event_type` and `namespace` fields are truncated to their maximum
     /// lengths (`MAX_EVENT_TYPE_LEN` and `MAX_NAMESPACE_LEN`) to prevent
-    /// memory DoS via unbounded string deserialization.
+    /// memory `DoS` via unbounded string deserialization.
     #[must_use]
     pub fn with_consensus(
         seq_id: u64,

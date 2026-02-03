@@ -50,9 +50,7 @@ use std::sync::{Arc, RwLock};
 
 use apm2_core::events::KernelEvent;
 use apm2_core::events::kernel_event::Payload;
-use apm2_core::ledger::{
-    CommitNotification, CommitNotificationReceiver, LedgerBackend,
-};
+use apm2_core::ledger::{CommitNotification, CommitNotificationReceiver, LedgerBackend};
 use bytes::Bytes;
 use prost::Message;
 use tracing::{debug, info, trace, warn};
@@ -68,7 +66,7 @@ use super::resource_governance::SharedSubscriptionRegistry;
 
 /// Schema version for `PulseEnvelopeV1`.
 ///
-/// Per proto definition: "MUST be 1 for PulseEnvelopeV1."
+/// Per proto definition: "MUST be 1 for `PulseEnvelopeV1`."
 pub const PULSE_ENVELOPE_SCHEMA_VERSION: u32 = 1;
 
 /// Maximum pulse ID length per proto bounds.
@@ -87,7 +85,7 @@ pub const PULSE_EVENT_TAG: u8 = 68;
 /// A typical work session produces ~10-100 changesets, so 10,000 entries
 /// provides ample headroom while bounding memory to ~1MB worst case.
 ///
-/// Security: Prevents DoS via unbounded memory growth (TCK-00304 review).
+/// Security: Prevents `DoS` via unbounded memory growth (TCK-00304 review).
 pub const MAX_CHANGESET_MAP_ENTRIES: usize = 10_000;
 
 // ============================================================================
@@ -148,7 +146,7 @@ pub struct PulsePublisher {
     /// Shared subscription registry for ACL filtering and resource governance.
     registry: SharedSubscriptionRegistry,
 
-    /// Connection senders for fanout (connection_id -> sender).
+    /// Connection senders for fanout (`connection_id` -> sender).
     ///
     /// This maps connection IDs to their frame senders. In a real
     /// implementation, this would be wired to the actual connection write
@@ -197,7 +195,7 @@ pub enum TrySendResult {
 /// rather than blocking.
 ///
 /// This prevents a slow consumer on one connection from blocking pulse delivery
-/// to all other connections (head-of-line blocking DoS).
+/// to all other connections (head-of-line blocking `DoS`).
 pub trait PulseFrameSink: Send + Sync {
     /// Attempts to send a pulse frame to the connection without blocking.
     ///
@@ -227,6 +225,7 @@ pub trait PulseFrameSink: Send + Sync {
         since = "0.1.0",
         note = "Use try_send_pulse() for non-blocking semantics"
     )]
+    #[allow(clippy::result_unit_err)]
     fn send_pulse(&self, frame: Bytes) -> Result<(), ()> {
         match self.try_send_pulse(frame) {
             TrySendResult::Sent => Ok(()),
@@ -388,18 +387,15 @@ impl PulsePublisher {
         self.update_index(&kernel_event);
 
         // Build the topic from the notification and payload
-        let topic = match self.derive_topic(&notification, &kernel_event) {
-            Some(t) => t,
-            None => {
-                // Topic derivation failed (invalid topic); drop the notification
-                debug!(
-                    seq_id = notification.seq_id,
-                    event_type = %notification.event_type,
-                    namespace = %notification.namespace,
-                    "Notification dropped: derived topic failed validation"
-                );
-                return;
-            },
+        let Some(topic) = self.derive_topic(&notification, &kernel_event) else {
+            // Topic derivation failed (invalid topic); drop the notification
+            debug!(
+                seq_id = notification.seq_id,
+                event_type = %notification.event_type,
+                namespace = %notification.namespace,
+                "Notification dropped: derived topic failed validation"
+            );
+            return;
         };
 
         // Build the pulse envelope
@@ -818,11 +814,9 @@ mod tests {
             Result<Vec<EventRecord>, apm2_core::ledger::LedgerError>,
         > {
             let events = self.events.lock().unwrap();
-            let result = if let Some(event) = events.get(&cursor) {
-                vec![event.clone()]
-            } else {
-                vec![]
-            };
+            let result = events
+                .get(&cursor)
+                .map_or_else(Vec::new, |event| vec![event.clone()]);
             Box::pin(async { Ok(result) })
         }
 
@@ -846,15 +840,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_channel() {
-        let (sender, mut receiver) = create_commit_notification_channel();
+        let (sender, mut rx) = create_commit_notification_channel();
 
         let notification = CommitNotification::new(1, [0xab; 32], "TestEvent", "kernel");
 
         sender.send(notification.clone()).await.unwrap();
 
-        let received = receiver.recv().await.unwrap();
-        assert_eq!(received.seq_id, 1);
-        assert_eq!(received.event_type, "TestEvent");
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.seq_id, 1);
+        assert_eq!(msg.event_type, "TestEvent");
     }
 
     #[tokio::test]
@@ -1294,11 +1288,13 @@ mod tests {
             #[allow(clippy::cast_possible_truncation)]
             let digest_byte = i as u8; // Safe: test_limit is 100, well within u8 range
             let event = KernelEvent {
-                payload: Some(Payload::PolicyResolvedForChangeset(PolicyResolvedForChangeSet {
-                    changeset_digest: vec![digest_byte; 32],
-                    work_id: format!("work-{i}"),
-                    ..Default::default()
-                })),
+                payload: Some(Payload::PolicyResolvedForChangeset(
+                    PolicyResolvedForChangeSet {
+                        changeset_digest: vec![digest_byte; 32],
+                        work_id: format!("work-{i}"),
+                        ..Default::default()
+                    },
+                )),
                 ..Default::default()
             };
             publisher.update_index(&event);
@@ -1319,10 +1315,12 @@ mod tests {
 
     #[test]
     fn test_max_changeset_map_entries_constant() {
+        // Ensure it's > 0 (const assertion validated at compile time)
+        const _: () = assert!(MAX_CHANGESET_MAP_ENTRIES > 0);
+
         // Verify the constant is set to a reasonable value
         assert_eq!(MAX_CHANGESET_MAP_ENTRIES, 10_000);
-        // Ensure it's > 0 and < u32::MAX to prevent overflow issues
-        assert!(MAX_CHANGESET_MAP_ENTRIES > 0);
+        // Ensure it's < u32::MAX to prevent overflow issues
         assert!(MAX_CHANGESET_MAP_ENTRIES < u32::MAX as usize);
     }
 }

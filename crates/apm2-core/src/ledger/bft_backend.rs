@@ -580,7 +580,7 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
     /// Sets the commit notification sender for HEF outbox integration
     /// (TCK-00304).
     ///
-    /// When set, `on_commit()` will send a [`CommitNotification`] via
+    /// When set, `on_commit()` will send a [`super::CommitNotification`] via
     /// `try_send()` after each successful commit. This is non-blocking
     /// and best-effort per DD-HEF-0007.
     ///
@@ -2330,7 +2330,7 @@ mod tck_00304_commit_notification_tests {
         // Append multiple events
         for i in 0..5u64 {
             let event = EventRecord::new(
-                &format!("event.{i}"),
+                format!("event.{i}"),
                 "session-1",
                 "actor-1",
                 format!("payload-{i}").into_bytes(),
