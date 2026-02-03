@@ -565,12 +565,10 @@ async fn async_main(args: Args) -> Result<()> {
     // BLOCKER 1 FIX: Use with_session_registry to wire global session registry
     // from DaemonStateHandle into PrivilegedDispatcher. This ensures sessions
     // spawned via IPC are visible to daemon's persistent state.
-    let dispatcher_state: SharedDispatcherState = Arc::new(
-        DispatcherState::with_session_registry(
-            state.session_registry().clone(),
-            metrics_registry.clone(),
-        ),
-    );
+    let dispatcher_state: SharedDispatcherState = Arc::new(DispatcherState::with_session_registry(
+        state.session_registry().clone(),
+        metrics_registry.clone(),
+    ));
 
     // TCK-00279: Start ProtocolServer-only control plane
     // This is the ONLY control-plane listener. Legacy JSON IPC has been removed per
@@ -829,7 +827,8 @@ async fn run_socket_manager_server(
 /// - **Item 1**: Uses shared dispatchers from `DispatcherState` (no state loss)
 /// - **Item 2**: Token secrets are stable via shared `TokenMinter`
 /// - **Item 3**: Fail-closed defaults via `FailClosedManifestStore`
-/// - **Item 4**: Sends responses back to clients via `connection.framed().send()`
+/// - **Item 4**: Sends responses back to clients via
+///   `connection.framed().send()`
 /// - **Item 5**: Terminates connection on protocol errors (breaks loop)
 ///
 /// # JSON Downgrade Rejection (DD-009)
@@ -837,8 +836,8 @@ async fn run_socket_manager_server(
 /// Per TCK-00287 and DD-009, JSON frames are rejected before reaching handlers.
 /// The tag-based routing validates that the first byte is a valid message type
 /// tag (1-4 for privileged, 1-4 for session). JSON frames starting with `{`
-/// (0x7B = 123) are rejected as unknown message types. Protocol errors terminate
-/// the connection immediately.
+/// (0x7B = 123) are rejected as unknown message types. Protocol errors
+/// terminate the connection immediately.
 async fn handle_dual_socket_connection(
     mut connection: protocol::server::Connection,
     socket_type: protocol::socket_manager::SocketType,
@@ -903,7 +902,8 @@ async fn handle_dual_socket_connection(
         // TCK-00287 Item 5: JSON downgrade rejection (DD-009 fail-closed)
         // Validate frame before dispatch. JSON frames start with '{' (0x7B = 123)
         // or '[' (0x5B = 91) which are not valid message type tags.
-        // Per security review: protocol errors MUST terminate connection (DoS mitigation).
+        // Per security review: protocol errors MUST terminate connection (DoS
+        // mitigation).
         if !frame.is_empty() && is_json_frame(&frame) {
             warn!(
                 socket_type = %socket_type,

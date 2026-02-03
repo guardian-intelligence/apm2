@@ -26,7 +26,9 @@ use apm2_daemon::episode::{
 };
 use apm2_daemon::metrics::SharedMetricsRegistry;
 use apm2_daemon::protocol::dispatch::PrivilegedDispatcher;
-use apm2_daemon::protocol::session_dispatch::{InMemoryManifestStore, ManifestStore, SessionDispatcher};
+use apm2_daemon::protocol::session_dispatch::{
+    InMemoryManifestStore, ManifestStore, SessionDispatcher,
+};
 use apm2_daemon::protocol::session_token::TokenMinter;
 use apm2_daemon::session::SessionRegistry;
 use chrono::{DateTime, Utc};
@@ -38,11 +40,11 @@ use tokio::sync::RwLock;
 
 /// A manifest store that always returns `None`, enforcing fail-closed behavior.
 ///
-/// Per TCK-00287 security review item 3 (Permissive Default), the `SessionDispatcher`
-/// must deny all tools if no manifest is available. When this store is used with
-/// `SessionDispatcher::with_manifest_store()`, any tool request will be denied
-/// because `get_manifest()` returns `None`, triggering the fail-closed path in
-/// `handle_request_tool()`.
+/// Per TCK-00287 security review item 3 (Permissive Default), the
+/// `SessionDispatcher` must deny all tools if no manifest is available. When
+/// this store is used with `SessionDispatcher::with_manifest_store()`, any tool
+/// request will be denied because `get_manifest()` returns `None`, triggering
+/// the fail-closed path in `handle_request_tool()`.
 ///
 /// # Security Invariant (INV-TCK-00260-002)
 ///
@@ -52,7 +54,8 @@ use tokio::sync::RwLock;
 ///
 /// This struct is currently unused as the implementation now uses
 /// `InMemoryManifestStore` shared between dispatchers. It is kept for potential
-/// future use as a default-deny store for testing or specific security scenarios.
+/// future use as a default-deny store for testing or specific security
+/// scenarios.
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 pub struct FailClosedManifestStore;
@@ -73,10 +76,12 @@ impl ManifestStore for FailClosedManifestStore {
 /// Shared dispatcher state across all connections.
 ///
 /// Per TCK-00287 security review:
-/// - Item 1 (Cross-Connection State Loss): Dispatchers must persist across connections
-/// - Item 2 (Authentication Secret Rotation): `TokenMinter` secret must be stable
-/// - Item 3 (Permissive Default): Must use fail-closed manifest store initially,
-///   but allow manifests to be registered during `SpawnEpisode`
+/// - Item 1 (Cross-Connection State Loss): Dispatchers must persist across
+///   connections
+/// - Item 2 (Authentication Secret Rotation): `TokenMinter` secret must be
+///   stable
+/// - Item 3 (Permissive Default): Must use fail-closed manifest store
+///   initially, but allow manifests to be registered during `SpawnEpisode`
 ///
 /// # TCK-00287 BLOCKER 1, 2, 3 Fixes
 ///
@@ -92,9 +97,9 @@ impl ManifestStore for FailClosedManifestStore {
 pub struct DispatcherState {
     /// Privileged endpoint dispatcher with shared registries.
     ///
-    /// Contains `WorkRegistry`, `SessionRegistry`, and `LedgerEventEmitter` that
-    /// persist across connections. Now also contains shared `TokenMinter` and
-    /// `ManifestStore` for TCK-00287 fixes.
+    /// Contains `WorkRegistry`, `SessionRegistry`, and `LedgerEventEmitter`
+    /// that persist across connections. Now also contains shared
+    /// `TokenMinter` and `ManifestStore` for TCK-00287 fixes.
     privileged_dispatcher: PrivilegedDispatcher,
 
     /// Session endpoint dispatcher with stable token minter.
@@ -116,20 +121,24 @@ impl DispatcherState {
     /// # Security
     ///
     /// - Generates a single HMAC secret for `TokenMinter` at startup
-    /// - Shares `TokenMinter` between both dispatchers for token minting/validation
-    /// - Shares `InMemoryManifestStore` so spawn manifests are visible to session handlers
+    /// - Shares `TokenMinter` between both dispatchers for token
+    ///   minting/validation
+    /// - Shares `InMemoryManifestStore` so spawn manifests are visible to
+    ///   session handlers
     /// - Registries persist for daemon lifetime
     ///
     /// # TCK-00287 Fixes
     ///
-    /// - BLOCKER 1: Uses shared session registry (passed via `with_session_registry`)
+    /// - BLOCKER 1: Uses shared session registry (passed via
+    ///   `with_session_registry`)
     /// - BLOCKER 2: Shares `TokenMinter` so spawn can mint tokens
     /// - MAJOR 3: Shares `ManifestStore` so spawn manifests are visible
     ///
     /// # Note
     ///
-    /// This constructor creates an internal stub session registry. For production
-    /// use with the global daemon session registry, use `with_session_registry`.
+    /// This constructor creates an internal stub session registry. For
+    /// production use with the global daemon session registry, use
+    /// `with_session_registry`.
     #[must_use]
     #[allow(dead_code)] // Kept for testing and potential future use
     pub fn new(metrics_registry: Option<SharedMetricsRegistry>) -> Self {
@@ -145,7 +154,8 @@ impl DispatcherState {
         // tool requests will be denied (fail-closed behavior in handle_request_tool).
         let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-        // TCK-00287: Create session registry (stub for now, use with_session_registry for real)
+        // TCK-00287: Create session registry (stub for now, use with_session_registry
+        // for real)
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
 
         // TCK-00287 BLOCKER 1 & 2: Create privileged dispatcher with shared state
@@ -162,8 +172,8 @@ impl DispatcherState {
             privileged_dispatcher
         };
 
-        // TCK-00287: Create session dispatcher with same token minter and manifest store
-        // This ensures:
+        // TCK-00287: Create session dispatcher with same token minter and manifest
+        // store This ensures:
         // - Tokens minted during SpawnEpisode can be validated
         // - Manifests registered during SpawnEpisode are visible for tool validation
         let session_dispatcher =
@@ -179,13 +189,14 @@ impl DispatcherState {
     ///
     /// # TCK-00287 BLOCKER 1
     ///
-    /// This constructor allows using the global `DaemonStateHandle` session registry
-    /// instead of an internal stub, ensuring sessions spawned via IPC are visible
-    /// to the daemon's persistent state.
+    /// This constructor allows using the global `DaemonStateHandle` session
+    /// registry instead of an internal stub, ensuring sessions spawned via
+    /// IPC are visible to the daemon's persistent state.
     ///
     /// # Arguments
     ///
-    /// * `session_registry` - The global session registry from `DaemonStateHandle`
+    /// * `session_registry` - The global session registry from
+    ///   `DaemonStateHandle`
     /// * `metrics_registry` - Optional metrics registry for observability
     #[must_use]
     pub fn with_session_registry(
@@ -199,7 +210,8 @@ impl DispatcherState {
         // TCK-00287 MAJOR 3: Use shared manifest store.
         let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-        // TCK-00287 BLOCKER 1: Create privileged dispatcher with global session registry
+        // TCK-00287 BLOCKER 1: Create privileged dispatcher with global session
+        // registry
         let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
             Arc::clone(&token_minter),
             Arc::clone(&manifest_store),
@@ -213,7 +225,8 @@ impl DispatcherState {
             privileged_dispatcher
         };
 
-        // TCK-00287: Create session dispatcher with same token minter and manifest store
+        // TCK-00287: Create session dispatcher with same token minter and manifest
+        // store
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store);
 

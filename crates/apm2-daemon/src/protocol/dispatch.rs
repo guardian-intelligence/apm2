@@ -1344,8 +1344,8 @@ impl PrivilegedDispatcher {
     ///   validated by `SessionDispatcher`
     /// - `manifest_store`: Ensures capability manifests registered during
     ///   `SpawnEpisode` are accessible for tool request validation
-    /// - `session_registry`: Uses the global daemon session registry instead
-    ///   of an internal stub
+    /// - `session_registry`: Uses the global daemon session registry instead of
+    ///   an internal stub
     #[must_use]
     pub fn with_shared_state(
         token_minter: Arc<TokenMinter>,
@@ -2112,21 +2112,20 @@ impl PrivilegedDispatcher {
         // The token is HMAC-signed and bound to this session's lease_id.
         let spawn_time = SystemTime::now();
         let ttl = Duration::from_secs(DEFAULT_SESSION_TOKEN_TTL_SECS);
-        let session_token = match self.token_minter.mint(
-            &session_id,
-            &claim.lease_id,
-            spawn_time,
-            ttl,
-        ) {
-            Ok(token) => token,
-            Err(e) => {
-                warn!(error = %e, "Session token minting failed");
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!("session token generation failed: {e}"),
-                ));
-            },
-        };
+        let session_token =
+            match self
+                .token_minter
+                .mint(&session_id, &claim.lease_id, spawn_time, ttl)
+            {
+                Ok(token) => token,
+                Err(e) => {
+                    warn!(error = %e, "Session token minting failed");
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("session token generation failed: {e}"),
+                    ));
+                },
+            };
 
         // Serialize the token to JSON for inclusion in the response
         let session_token_json = match serde_json::to_string(&session_token) {
@@ -2142,9 +2141,10 @@ impl PrivilegedDispatcher {
 
         // TCK-00287 MAJOR 3: Register capability manifest in shared store
         // This allows SessionDispatcher to validate tool requests for this session.
-        // The manifest is constructed from the policy resolution's capability manifest hash.
-        // Note: This uses the stub implementation with a default permissive allowlist.
-        // In production, the actual allowlist should flow through PolicyResolution.
+        // The manifest is constructed from the policy resolution's capability manifest
+        // hash. Note: This uses the stub implementation with an empty
+        // (fail-closed) allowlist. In production, the actual allowlist should
+        // flow through PolicyResolution.
         let manifest = CapabilityManifest::from_hash_with_default_allowlist(
             &claim.policy_resolution.capability_manifest_hash,
         );

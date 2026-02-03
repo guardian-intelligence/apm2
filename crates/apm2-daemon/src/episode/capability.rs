@@ -714,13 +714,14 @@ impl CapabilityManifest {
     /// # TCK-00287
     ///
     /// This method creates a minimal manifest with the given hash as the ID and
-    /// a default permissive tool allowlist for stub/testing purposes. In production,
-    /// the full manifest should be obtained from the governance holon via
-    /// `PolicyResolver`.
+    /// a default permissive tool allowlist for stub/testing purposes. In
+    /// production, the full manifest should be obtained from the governance
+    /// holon via `PolicyResolver`.
     ///
     /// # Arguments
     ///
-    /// * `capability_manifest_hash` - The BLAKE3 hash of the capability manifest
+    /// * `capability_manifest_hash` - The BLAKE3 hash of the capability
+    ///   manifest
     /// * `tool_allowlist` - The list of tool classes allowed for this session
     ///
     /// # Security Note
