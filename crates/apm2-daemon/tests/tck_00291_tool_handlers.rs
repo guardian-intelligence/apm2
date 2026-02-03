@@ -188,7 +188,7 @@ async fn tool_handlers_real_io_execute_timeout() {
 // Sandbox escape tests (symlink-based)
 // =============================================================================
 
-/// Tests that ExecuteHandler rejects cwd paths that resolve outside the
+/// Tests that `ExecuteHandler` rejects cwd paths that resolve outside the
 /// workspace root via symlinks.
 ///
 /// This is a critical security test - an attacker could create a symlink
@@ -221,8 +221,7 @@ async fn tool_handlers_execute_rejects_cwd_symlink_escape() {
     // Must fail with PathValidation error
     assert!(
         matches!(result, Err(ToolHandlerError::PathValidation { .. })),
-        "Expected PathValidation error for symlink escape, got: {:?}",
-        result
+        "Expected PathValidation error for symlink escape, got: {result:?}"
     );
 
     // Verify the error mentions symlink or escape
@@ -234,7 +233,7 @@ async fn tool_handlers_execute_rejects_cwd_symlink_escape() {
     }
 }
 
-/// Tests that ReadFileHandler rejects symlinks that resolve outside the
+/// Tests that `ReadFileHandler` rejects symlinks that resolve outside the
 /// workspace root.
 #[cfg(unix)]
 #[tokio::test]
@@ -262,15 +261,14 @@ async fn tool_handlers_read_rejects_symlink_escape() {
 
     assert!(
         matches!(result, Err(ToolHandlerError::PathValidation { .. })),
-        "Expected PathValidation error for symlink escape, got: {:?}",
-        result
+        "Expected PathValidation error for symlink escape, got: {result:?}"
     );
 
     // Cleanup
     let _ = std::fs::remove_file(external_file);
 }
 
-/// Tests that WriteFileHandler rejects symlinks that resolve outside the
+/// Tests that `WriteFileHandler` rejects symlinks that resolve outside the
 /// workspace root.
 #[cfg(unix)]
 #[tokio::test]
@@ -300,8 +298,7 @@ async fn tool_handlers_write_rejects_symlink_escape() {
 
     assert!(
         matches!(result, Err(ToolHandlerError::PathValidation { .. })),
-        "Expected PathValidation error for symlink escape, got: {:?}",
-        result
+        "Expected PathValidation error for symlink escape, got: {result:?}"
     );
 
     // Verify the external file was NOT modified
@@ -315,7 +312,7 @@ async fn tool_handlers_write_rejects_symlink_escape() {
     let _ = std::fs::remove_file(external_file);
 }
 
-/// Tests that ExecuteHandler handles non-existent cwd gracefully.
+/// Tests that `ExecuteHandler` handles non-existent cwd gracefully.
 #[tokio::test]
 async fn tool_handlers_execute_nonexistent_cwd() {
     let temp = TempDir::new().unwrap();
@@ -335,7 +332,6 @@ async fn tool_handlers_execute_nonexistent_cwd() {
     // Should fail because the directory doesn't exist
     assert!(
         matches!(result, Err(ToolHandlerError::ExecutionFailed { .. })),
-        "Expected ExecutionFailed for non-existent cwd, got: {:?}",
-        result
+        "Expected ExecutionFailed for non-existent cwd, got: {result:?}"
     );
 }
