@@ -64,6 +64,7 @@ use apm2_core::events::{
     InterventionFreeze as ProtoInterventionFreeze,
     InterventionResolutionType as ProtoResolutionType, InterventionScope as ProtoScope,
     InterventionUnfreeze as ProtoInterventionUnfreeze, TimeEnvelopeRef,
+    DefectRecorded, DefectSource,
 };
 use apm2_core::fac::{
     INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX, sign_with_domain, verify_with_domain,
@@ -341,6 +342,8 @@ pub struct DivergenceResult {
     pub freeze: InterventionFreeze,
     /// The defect record to emit.
     pub defect: DefectRecord,
+    /// The defect event to emit to the ledger.
+    pub defect_event: DefectRecorded,
 }
 
 /// Default poll interval for divergence checks (30 seconds).
@@ -2191,7 +2194,29 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         self.registry
             .register(&freeze, &self.signer.verifying_key())?;
 
-        Ok(DivergenceResult { freeze, defect })
+        // TCK-00307: Create DefectRecorded event
+        // We compute the CAS hash by hashing the serialized DefectRecord.
+        // In a real system, this would happen after storing in CAS, but for
+        // divergence detection, we are the producer.
+        let defect_bytes = serde_json::to_vec(&defect).map_err(|e| DivergenceError::InvalidConfiguration(format!("serialization error: {e}")))?;
+        // Use BLAKE3 for CAS hash (RFC-0018)
+        let cas_hash = blake3::hash(&defect_bytes).as_bytes().to_vec();
+
+        // Decode time_envelope_ref hex to bytes
+        let time_ref_hash = hex::decode(&time_envelope_ref).unwrap_or_default();
+
+        let defect_event = DefectRecorded {
+            defect_id: defect_id.clone(),
+            defect_type: defect.defect_class().to_string(),
+            cas_hash,
+            source: DefectSource::DivergenceWatchdog as i32,
+            work_id: self.config.repo_id.clone(),
+            severity: defect.severity().as_str().to_string(),
+            detected_at: timestamp,
+            time_envelope_ref: Some(TimeEnvelopeRef { hash: time_ref_hash }),
+        };
+
+        Ok(DivergenceResult { freeze, defect, defect_event })
     }
 
     /// Creates an unfreeze event for a given freeze ID.
@@ -3908,5 +3933,13 @@ pub mod tests {
 
         // Verify the freeze references the defect
         assert_eq!(result.freeze.trigger_defect_id, result.defect.defect_id());
+        
+        // TCK-00307: Verify DefectRecorded event is created
+        assert_eq!(result.defect_event.defect_id, result.defect.defect_id());
+        assert_eq!(result.defect_event.defect_type, "PROJECTION_DIVERGENCE");
+        assert_eq!(result.defect_event.source, DefectSource::DivergenceWatchdog as i32);
+        assert_eq!(result.defect_event.work_id, "test-repo");
+        assert_eq!(result.defect_event.severity, "S0");
+        assert!(!result.defect_event.cas_hash.is_empty()); // Hash should be present
     }
 }
