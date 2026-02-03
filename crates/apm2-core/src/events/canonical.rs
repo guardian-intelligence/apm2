@@ -118,6 +118,22 @@ pub const ARTIFACT_MANIFEST_DOMAIN_PREFIX: &[u8] = b"apm2.payload.artifact_manif
 /// the changeset digest and CAS hash before any review begins.
 pub const CHANGESET_PUBLISHED_DOMAIN_PREFIX: &[u8] = b"apm2.event.changeset_published:";
 
+/// Domain prefix for `ReviewReceiptRecorded` events.
+///
+/// Per RFC-0018 HEF: domain prefixes prevent cross-context replay.
+/// Used when signing/verifying review receipt events that anchor
+/// the review artifact bundle and changeset digest after review completion.
+/// Note: This re-exports the FAC module prefix for ledger compatibility.
+pub const REVIEW_RECEIPT_RECORDED_DOMAIN_PREFIX: &[u8] = crate::fac::REVIEW_RECEIPT_RECORDED_PREFIX;
+
+/// Domain prefix for `ReviewBlockedRecorded` events.
+///
+/// Per RFC-0018 HEF: domain prefixes prevent cross-context replay.
+/// Used when signing/verifying review blocked events that anchor
+/// the blocked logs and reason code when review cannot proceed.
+/// Note: This re-exports the FAC module prefix for ledger compatibility.
+pub const REVIEW_BLOCKED_RECORDED_DOMAIN_PREFIX: &[u8] = crate::fac::REVIEW_BLOCKED_RECORDED_PREFIX;
+
 /// Trait for canonicalizing messages before signing.
 ///
 /// Types implementing this trait have repeated fields that must be sorted

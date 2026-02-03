@@ -45,8 +45,10 @@ use apm2_core::crypto::Signer;
 use apm2_core::events::CHANGESET_PUBLISHED_DOMAIN_PREFIX;
 use apm2_core::fac::{
     ChangeKind, ChangeSetBundleV1, ChangeSetPublished, ChangeSetPublishedProto, FileChange,
-    GateReceiptBuilder, GitObjectRef, HashAlgo, ReasonCode, ReviewArtifactBundleV1,
-    ReviewBlockedRecorded, ReviewMetadata, ReviewReceiptRecorded, ReviewVerdict, sign_with_domain,
+    GateReceiptBuilder, GitObjectRef, HashAlgo, REVIEW_BLOCKED_RECORDED_PREFIX,
+    REVIEW_RECEIPT_RECORDED_PREFIX, ReasonCode, ReviewArtifactBundleV1, ReviewBlockedRecorded,
+    ReviewBlockedRecordedProto, ReviewMetadata, ReviewReceiptRecorded, ReviewReceiptRecordedProto,
+    ReviewVerdict, sign_with_domain,
 };
 use apm2_core::htf::TimeEnvelopeRef;
 use apm2_core::ledger::{EventRecord, Ledger};
@@ -622,21 +624,80 @@ fn test_fac_v0_full_e2e_autonomous_flow() {
     println!("  - ledger_seq: {seq_changeset}");
 
     // =========================================================================
-    // Step 3: Simulate reviewer episode (deterministic, no LLM)
+    // Step 3: Simulate reviewer episode with tool log generation
     // =========================================================================
-    // In a real system, this would spawn an episode with FileRead, GitOperation,
-    // and ArtifactFetch tools. For the test, we simulate the outcome.
+    // Note: Full episode runtime (TCK-00256, TCK-00260) and workspace apply
+    // (TCK-00311) are exercised by their respective tickets. This test validates
+    // the evidence chain: tool logs -> CAS -> ReviewArtifactBundle -> ledger.
+    //
+    // We simulate tool execution but store REAL tool logs in CAS to validate
+    // the CAS storage and hash binding requirements of REQ-HEF-0010.
     harness.advance_time(5 * ONE_SEC_MS); // Simulate review duration
 
-    println!("[FAC-V0-E2E] Step 3: Reviewer episode simulated");
+    // Store simulated tool logs in CAS (validating CAS storage path)
+    let file_read_log = format!(
+        r#"{{"tool":"FileRead","path":"src/lib.rs","timestamp_ms":{},"bytes_read":1024,"status":"success"}}"#,
+        harness.current_timestamp_ms
+    );
+    let file_read_log_result = harness
+        .cas
+        .store(file_read_log.as_bytes())
+        .expect("CAS store file read log");
+
+    let git_op_log = format!(
+        r#"{{"tool":"GitOperation","op":"diff","timestamp_ms":{},"files_changed":2,"status":"success"}}"#,
+        harness.current_timestamp_ms + 100
+    );
+    let git_op_log_result = harness
+        .cas
+        .store(git_op_log.as_bytes())
+        .expect("CAS store git op log");
+
+    println!("[FAC-V0-E2E] Step 3: Reviewer episode simulated with CAS-stored tool logs");
     println!("  - Duration: 5s (simulated)");
-    println!("  - Tools used: FileRead, GitOperation (simulated)");
+    println!(
+        "  - FileRead log CAS hash: {}",
+        hex::encode(file_read_log_result.hash)
+    );
+    println!(
+        "  - GitOperation log CAS hash: {}",
+        hex::encode(git_op_log_result.hash)
+    );
 
     // =========================================================================
-    // Step 4: Create ReviewArtifactBundleV1 and store in CAS
+    // Step 4: Create ReviewArtifactBundleV1 with actual tool log hashes
     // =========================================================================
     let review_time_envelope = harness.test_envelope_hash();
-    let review_bundle = create_test_review_artifact_bundle(changeset_digest, review_time_envelope);
+
+    // Build review artifact bundle with actual CAS-stored tool log hashes
+    let metadata = ReviewMetadata::new()
+        .with_reviewer_actor_id(&harness.reviewer_actor_id)
+        .with_verdict(ReviewVerdict::Approve)
+        .with_started_at((harness.current_timestamp_ms - 5 * ONE_SEC_MS) * 1_000_000)
+        .with_completed_at(harness.current_timestamp_ms * 1_000_000);
+
+    let review_text = format!(
+        "Review of changeset {}: Code changes look good. src/lib.rs modified, src/new_module.rs added.",
+        hex::encode(changeset_digest)
+    );
+    let review_text_result = harness
+        .cas
+        .store(review_text.as_bytes())
+        .expect("CAS store review text");
+
+    let review_bundle = ReviewArtifactBundleV1::builder()
+        .review_id(format!("review-{work_id}"))
+        .changeset_digest(changeset_digest)
+        .review_text_hash(review_text_result.hash) // Actual CAS hash
+        .tool_log_hashes(vec![
+            file_read_log_result.hash, // Actual CAS hash from FileRead
+            git_op_log_result.hash,    // Actual CAS hash from GitOperation
+        ])
+        .time_envelope_ref(review_time_envelope)
+        .metadata(metadata)
+        .build()
+        .expect("valid review artifact bundle");
+
     let review_bundle_hash = review_bundle.compute_cas_hash();
 
     let review_json = serde_json::to_vec(&review_bundle).expect("review serialization");
@@ -646,11 +707,28 @@ fn test_fac_v0_full_e2e_autonomous_flow() {
         "CAS hash must match computed hash"
     );
 
-    println!("[FAC-V0-E2E] Step 4: ReviewArtifactBundleV1 stored");
+    // Verify tool logs are retrievable from CAS (MAJOR-2 partial fix)
+    let retrieved_file_log = harness
+        .cas
+        .retrieve(&file_read_log_result.hash)
+        .expect("retrieve file read log");
+    assert_eq!(retrieved_file_log, file_read_log.as_bytes());
+    let retrieved_git_log = harness
+        .cas
+        .retrieve(&git_op_log_result.hash)
+        .expect("retrieve git op log");
+    assert_eq!(retrieved_git_log, git_op_log.as_bytes());
+
+    println!("[FAC-V0-E2E] Step 4: ReviewArtifactBundleV1 stored with verified tool logs");
     println!(
         "  - artifact_bundle_hash: {}",
         hex::encode(review_bundle_hash)
     );
+    println!(
+        "  - review_text_hash: {}",
+        hex::encode(review_text_result.hash)
+    );
+    println!("  - tool_log_count: 2 (CAS-verified)");
 
     // =========================================================================
     // Step 5: Emit ReviewReceiptRecorded event to ledger
@@ -675,8 +753,53 @@ fn test_fac_v0_full_e2e_autonomous_flow() {
         "ReviewReceiptRecorded signature must verify"
     );
 
-    println!("[FAC-V0-E2E] Step 5: ReviewReceiptRecorded emitted");
+    // Append ReviewReceiptRecorded to ledger (MAJOR-1 fix: ledger anchoring)
+    let review_proto: ReviewReceiptRecordedProto = review_receipt.clone().into();
+    let review_payload = review_proto.encode_to_vec();
+    let review_prev_hash = harness.ledger.last_event_hash().expect("ledger head");
+    let review_ledger_sig = sign_with_domain(
+        &harness.reviewer_signer,
+        REVIEW_RECEIPT_RECORDED_PREFIX,
+        &review_payload,
+    );
+
+    let mut review_record = EventRecord::new(
+        "review_receipt_recorded",
+        "session-fac-v0-e2e",
+        &harness.reviewer_actor_id,
+        review_payload,
+    );
+    review_record.prev_hash = Some(review_prev_hash);
+    review_record.signature = Some(review_ledger_sig.to_bytes().to_vec());
+
+    let seq_review = harness
+        .ledger
+        .append_verified(&review_record, &harness.reviewer_signer.verifying_key())
+        .expect("append ReviewReceiptRecorded");
+
+    // Verify ledger persistence by reading back
+    let retrieved_review = harness
+        .ledger
+        .read_one(seq_review)
+        .expect("read review event");
+    assert_eq!(retrieved_review.event_type, "review_receipt_recorded");
+    let decoded_review_proto =
+        ReviewReceiptRecordedProto::decode(retrieved_review.payload.as_slice())
+            .expect("decode review proto");
+    let decoded_review: ReviewReceiptRecorded =
+        decoded_review_proto.try_into().expect("convert review");
+    assert_eq!(decoded_review.changeset_digest, changeset_digest);
+    assert!(
+        decoded_review
+            .verify_signature(&harness.reviewer_signer.verifying_key())
+            .is_ok(),
+        "Retrieved ReviewReceiptRecorded signature must verify"
+    );
+
+    println!("[FAC-V0-E2E] Step 5: ReviewReceiptRecorded emitted to ledger");
     println!("  - receipt_id: {}", review_receipt.receipt_id);
+    println!("  - ledger_seq: {seq_review}");
+    println!("  - ledger_verified: true");
 
     // =========================================================================
     // Step 6: Create GateReceipt for review gate
@@ -810,6 +933,9 @@ fn test_fac_v0_full_e2e_autonomous_flow() {
 }
 
 /// Test: Full E2E flow with `ReviewBlocked` path.
+///
+/// This test validates ledger anchoring for `ReviewBlockedRecorded` events
+/// per REQ-HEF-0011 acceptance criteria.
 #[test]
 fn test_fac_v0_e2e_blocked_path() {
     // Pre-flight
@@ -854,14 +980,69 @@ fn test_fac_v0_e2e_blocked_path() {
         "ReviewBlockedRecorded signature must verify"
     );
 
+    // Step 3: Append ReviewBlockedRecorded to ledger (MAJOR-1 fix: ledger
+    // anchoring)
+    let blocked_proto: ReviewBlockedRecordedProto = blocked.clone().into();
+    let blocked_payload = blocked_proto.encode_to_vec();
+    let blocked_prev_hash = harness.ledger.last_event_hash().expect("ledger head");
+    let blocked_ledger_sig = sign_with_domain(
+        &harness.reviewer_signer,
+        REVIEW_BLOCKED_RECORDED_PREFIX,
+        &blocked_payload,
+    );
+
+    let mut blocked_record = EventRecord::new(
+        "review_blocked_recorded",
+        "session-fac-v0-blocked",
+        &harness.reviewer_actor_id,
+        blocked_payload,
+    );
+    blocked_record.prev_hash = Some(blocked_prev_hash);
+    blocked_record.signature = Some(blocked_ledger_sig.to_bytes().to_vec());
+
+    let seq_blocked = harness
+        .ledger
+        .append_verified(&blocked_record, &harness.reviewer_signer.verifying_key())
+        .expect("append ReviewBlockedRecorded");
+
+    // Verify ledger persistence by reading back
+    let retrieved_blocked = harness
+        .ledger
+        .read_one(seq_blocked)
+        .expect("read blocked event");
+    assert_eq!(retrieved_blocked.event_type, "review_blocked_recorded");
+    let decoded_blocked_proto =
+        ReviewBlockedRecordedProto::decode(retrieved_blocked.payload.as_slice())
+            .expect("decode blocked proto");
+    let decoded_blocked: ReviewBlockedRecorded =
+        decoded_blocked_proto.try_into().expect("convert blocked");
+    assert_eq!(decoded_blocked.changeset_digest, changeset_digest);
+    assert_eq!(decoded_blocked.reason_code, ReasonCode::ApplyFailed);
+    assert!(
+        decoded_blocked
+            .verify_signature(&harness.reviewer_signer.verifying_key())
+            .is_ok(),
+        "Retrieved ReviewBlockedRecorded signature must verify"
+    );
+
+    // Verify CAS logs are retrievable
+    let retrieved_logs = harness
+        .cas
+        .retrieve(&logs_result.hash)
+        .expect("retrieve logs");
+    assert_eq!(retrieved_logs, blocked_logs.as_bytes());
+
     // Verify retryability
     assert!(blocked.reason_code.is_retryable());
 
-    println!("[FAC-V0-BLOCKED] ReviewBlockedRecorded emitted");
+    println!("[FAC-V0-BLOCKED] ReviewBlockedRecorded emitted to ledger");
     println!("  - blocked_id: {}", blocked.blocked_id);
     println!("  - reason_code: {}", blocked.reason_code);
     println!("  - is_retryable: {}", blocked.reason_code.is_retryable());
-    println!("  [OK] Blocked path verified");
+    println!("  - ledger_seq: {seq_blocked}");
+    println!("  - ledger_verified: true");
+    println!("  - cas_logs_verified: true");
+    println!("  [OK] Blocked path with ledger anchoring verified");
 }
 
 // ============================================================================
