@@ -505,7 +505,8 @@ impl Canonicalize for KernelEvent {
                 | kernel_event::Payload::InterventionFreeze(_)
                 | kernel_event::Payload::InterventionUnfreeze(_)
                 | kernel_event::Payload::AatResultReused(_)
-                | kernel_event::Payload::QuarantineCleared(_),
+                | kernel_event::Payload::QuarantineCleared(_)
+                | kernel_event::Payload::ChangesetPublished(_),
             )
             | None => {},
         }
