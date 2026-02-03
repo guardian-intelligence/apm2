@@ -11,8 +11,8 @@ use apm2_daemon::episode::InMemorySessionRegistry;
 use apm2_daemon::ledger::{SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use apm2_daemon::protocol::credentials::PeerCredentials;
 use apm2_daemon::protocol::dispatch::{
-    ConnectionContext, PrivilegedResponse, encode_claim_work_request, encode_issue_capability_request,
-    encode_spawn_episode_request,
+    ConnectionContext, PrivilegedResponse, encode_claim_work_request,
+    encode_issue_capability_request, encode_spawn_episode_request,
 };
 use apm2_daemon::protocol::messages::{
     CapabilityRequest, ClaimWorkRequest, IssueCapabilityRequest, SpawnEpisodeRequest, WorkRole,
@@ -149,17 +149,17 @@ async fn test_persistence_end_to_end() {
     let spawn_frame_impl = encode_spawn_episode_request(&spawn_req_impl);
     let spawn_resp_impl = dispatcher.dispatch(&spawn_frame_impl, &ctx).unwrap();
 
-    let _session_id = match spawn_resp_impl {
+    let session_id = match spawn_resp_impl {
         PrivilegedResponse::SpawnEpisode(resp) => resp.session_id,
         _ => panic!("Expected SpawnEpisode response"),
     };
 
     // 6. IssueCapability
-    // TCK-00289: Verify that IssueCapability succeeds with persistent registry validation.
-    // The previous steps established a valid Implementer session (session_id) backed by
-    // a persistent work claim.
+    // TCK-00289: Verify that IssueCapability succeeds with persistent registry
+    // validation. The previous steps established a valid Implementer session
+    // (session_id) backed by a persistent work claim.
     let issue_req = IssueCapabilityRequest {
-        session_id: _session_id,
+        session_id,
         capability_request: Some(CapabilityRequest {
             tool_class: "file_read".to_string(),
             read_patterns: vec!["/tmp/**".to_string()],
@@ -176,8 +176,8 @@ async fn test_persistence_end_to_end() {
             assert!(resp.capability_id.starts_with("C-"));
             assert!(resp.granted_at > 0);
             assert!(resp.expires_at > resp.granted_at);
-        }
-        PrivilegedResponse::Error(e) => panic!("IssueCapability failed: {:?}", e),
+        },
+        PrivilegedResponse::Error(e) => panic!("IssueCapability failed: {e:?}"),
         _ => panic!("Expected IssueCapability response"),
     }
 }
