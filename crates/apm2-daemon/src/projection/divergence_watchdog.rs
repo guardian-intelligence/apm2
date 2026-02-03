@@ -1,6 +1,34 @@
 // AGENT-AUTHORED (TCK-00213)
 //! Divergence watchdog for the FAC (Forge Admission Cycle).
 //!
+//! # TODO (TCK-00307 Security Review - BLOCKER 2)
+//!
+//! The `DivergenceWatchdog` is fully implemented but not yet wired into the
+//! daemon's main execution path. To complete the integration:
+//!
+//! 1. **Instantiate watchdog in `main.rs`**: Create a `DivergenceWatchdog` with
+//!    a signer from the daemon's key material and a `DivergenceWatchdogConfig`.
+//!
+//! 2. **Wire to ledger**: Pass the `ledger` (from `DispatcherState` or
+//!    `SqliteLedgerEventEmitter`) to emit `DefectRecorded` events via
+//!    `ledger.emit_defect_recorded()`.
+//!
+//! 3. **Source external trunk HEAD**: Implement a polling mechanism that
+//!    fetches the external trunk HEAD from GitHub (via
+//!    `GitHubProjectionAdapter` or direct API calls) and compares against the
+//!    ledger's `MergeReceipt` HEAD.
+//!
+//! 4. **Spawn background task**: Add a `tokio::spawn` that runs
+//!    `watchdog.check_divergence()` at `poll_interval` intervals.
+//!
+//! 5. **Handle results**: When divergence is detected, emit the
+//!    `DefectRecorded` event from `DivergenceResult::defect_event` to the
+//!    ledger.
+//!
+//! This integration is out of scope for TCK-00307 (which focuses on fixing the
+//! `DefectRecorded` event format), but is required for full S0 severity defect
+//! detection. See RFC-0015 for the full specification.
+//!
 //! This module implements the [`DivergenceWatchdog`] which monitors for
 //! divergence between the ledger's merge receipts and the external trunk HEAD.
 //! When divergence is detected, it emits an [`InterventionFreeze`] to halt

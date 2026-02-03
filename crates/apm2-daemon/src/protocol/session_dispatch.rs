@@ -65,6 +65,7 @@ use std::time::SystemTime;
 
 use apm2_core::coordination::ContextRefinementRequest;
 use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
+use apm2_holon::defect::DefectRecord;
 use bytes::Bytes;
 use prost::Message;
 use tracing::{debug, error, info, warn};
@@ -558,7 +559,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
-    fn emit_htf_regression_defect(&self, current: u64, _previous: u64) {
+    fn emit_htf_regression_defect(&self, current: u64, previous: u64) {
         if let Some(ref ledger) = self.ledger {
             let defect_id = format!("DEF-REGRESSION-{}", uuid::Uuid::new_v4());
 
@@ -574,11 +575,43 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 .as_bytes()
                 .to_vec();
 
-            // Create DefectRecorded event
+            // TCK-00307 BLOCKER 1 FIX: Create structured DefectRecord and store in CAS.
+            // Per the DefectRecorded protocol, cas_hash must point to a full DefectRecord
+            // JSON artifact, not a raw string or placeholder.
+            let defect_record = match DefectRecord::clock_regression(
+                &defect_id,
+                "system",
+                current,
+                previous,
+                timestamp_ns,
+            ) {
+                Ok(record) => record,
+                Err(e) => {
+                    error!("Failed to create clock regression DefectRecord: {}", e);
+                    return;
+                },
+            };
+
+            // Serialize DefectRecord to JSON for CAS storage
+            let defect_json = match serde_json::to_vec(&defect_record) {
+                Ok(json) => json,
+                Err(e) => {
+                    error!("Failed to serialize clock regression DefectRecord: {}", e);
+                    return;
+                },
+            };
+
+            // Store in CAS if available, otherwise compute hash for reference
+            let cas_hash = self.cas.as_ref().map_or_else(
+                || blake3::hash(&defect_json).as_bytes().to_vec(),
+                |cas| cas.store(&defect_json).to_vec(),
+            );
+
+            // Create DefectRecorded event with proper CAS hash
             let defect = DefectRecorded {
                 defect_id,
                 defect_type: "CLOCK_REGRESSION".to_string(),
-                cas_hash: vec![0u8; 32], // Not stored in CAS for now
+                cas_hash,
                 source: DefectSource::HtfRegression as i32,
                 work_id: "system".to_string(),
                 severity: "S0".to_string(),
@@ -628,15 +661,42 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 .as_bytes()
                 .to_vec();
 
-            // Construct payload description
-            let description = format!("Context miss for path: {path}");
-            let payload = description.as_bytes();
+            // TCK-00307 BLOCKER 1 FIX: Create structured DefectRecord and store in CAS.
+            // Per the DefectRecorded protocol, cas_hash must point to a full DefectRecord
+            // JSON artifact, not a raw description string.
+            //
+            // Note: DefectRecord::pack_miss requires a pack_hash, but for context misses
+            // detected during session dispatch, we may not have the pack hash available.
+            // We use a zero hash as a placeholder - the path in the signal details is the
+            // key information for debugging.
+            let defect_record = match DefectRecord::pack_miss(
+                &defect_id,
+                session_id,
+                path,
+                [0u8; 32], // Pack hash not available in this context
+                timestamp_ns,
+            ) {
+                Ok(record) => record,
+                Err(e) => {
+                    error!("Failed to create context miss DefectRecord: {}", e);
+                    return;
+                },
+            };
 
-            // Store in CAS if available
-            let cas_hash = self
-                .cas
-                .as_ref()
-                .map_or_else(|| vec![0u8; 32], |cas| cas.store(payload).to_vec());
+            // Serialize DefectRecord to JSON for CAS storage
+            let defect_json = match serde_json::to_vec(&defect_record) {
+                Ok(json) => json,
+                Err(e) => {
+                    error!("Failed to serialize context miss DefectRecord: {}", e);
+                    return;
+                },
+            };
+
+            // Store in CAS if available, otherwise compute hash for reference
+            let cas_hash = self.cas.as_ref().map_or_else(
+                || blake3::hash(&defect_json).as_bytes().to_vec(),
+                |cas| cas.store(&defect_json).to_vec(),
+            );
 
             let defect = DefectRecorded {
                 defect_id,
