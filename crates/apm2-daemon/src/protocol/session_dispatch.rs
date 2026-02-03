@@ -86,7 +86,10 @@ use crate::episode::decision::{BrokerToolRequest, DedupeKey, ToolDecision};
 use crate::episode::envelope::RiskTier;
 use crate::episode::executor::ContentAddressedStore;
 use crate::episode::{CapabilityManifest, EpisodeId, SharedToolBroker, ToolClass};
-use crate::htf::HolonicClock;
+use crate::htf::{ClockError, HolonicClock};
+use crate::session::consume::ConsumeSessionError;
+use apm2_core::coordination::ContextRefinementRequest;
+use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
 
 // ============================================================================
 // Message Type Tags (for routing)
@@ -556,6 +559,59 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
+    fn emit_htf_regression_defect(&self, _current: u64, _previous: u64) {
+        if let Some(ref ledger) = self.ledger {
+            let defect_id = format!("DEF-REGRESSION-{}", uuid::Uuid::new_v4());
+            // Create DefectRecorded event
+            let defect = DefectRecorded {
+                defect_id,
+                defect_type: "CLOCK_REGRESSION".to_string(),
+                cas_hash: vec![0u8; 32], // Not stored in CAS for now
+                source: DefectSource::HtfRegression as i32,
+                work_id: "system".to_string(),
+                severity: "S0".to_string(),
+                detected_at: 0,
+                time_envelope_ref: None,
+            };
+
+            if let Err(e) = ledger.emit_defect_recorded(&defect, 0) {
+                error!("Failed to emit clock regression defect: {}", e);
+            }
+        }
+    }
+
+    fn emit_context_miss_defect(&self, session_id: &str, path: &str) {
+        if let Some(ref ledger) = self.ledger {
+            let defect_id = format!("DEF-MISS-{}", uuid::Uuid::new_v4());
+
+            // Construct payload description
+            let description = format!("Context miss for path: {}", path);
+            let payload = description.as_bytes();
+
+            // Store in CAS if available
+            let cas_hash = if let Some(ref cas) = self.cas {
+                cas.store(payload).to_vec()
+            } else {
+                vec![0u8; 32]
+            };
+
+            let defect = DefectRecorded {
+                defect_id,
+                defect_type: "UNPLANNED_CONTEXT_READ".to_string(),
+                cas_hash,
+                source: DefectSource::ContextMiss as i32,
+                work_id: session_id.to_string(),
+                severity: "S2".to_string(),
+                detected_at: 0,
+                time_envelope_ref: None,
+            };
+
+            if let Err(e) = ledger.emit_defect_recorded(&defect, 0) {
+                error!("Failed to emit context miss defect: {}", e);
+            }
+        }
+    }
+
     /// Dispatches a session-scoped request to the appropriate handler.
     ///
     /// # Message Format
@@ -800,7 +856,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 handle.block_on(async { broker.request(&broker_request, timestamp_ns, None).await })
             });
 
-            return Self::handle_broker_decision(decision, &token.session_id, tool_class);
+            return self.handle_broker_decision(decision, &token.session_id, tool_class);
         }
 
         // Legacy fallback: TCK-00260 manifest store validation
@@ -859,6 +915,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// Handles the broker decision and converts it to a `SessionResponse`.
     #[allow(clippy::unnecessary_wraps)]
     fn handle_broker_decision(
+        &self,
         decision: Result<ToolDecision, crate::episode::BrokerError>,
         session_id: &str,
         tool_class: ToolClass,
@@ -921,7 +978,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             Ok(ToolDecision::Terminate {
                 request_id,
                 termination_info,
-                ..
+                refinement_event,
             }) => {
                 error!(
                     session_id = %session_id,
@@ -929,6 +986,16 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     reason = %termination_info.rationale_code,
                     "Tool request triggered session termination"
                 );
+
+                // TCK-00307: Emit DefectRecorded for ContextMiss
+                if termination_info.rationale_code == "CONTEXT_MISS" {
+                    if let Some(event_bytes) = refinement_event {
+                        if let Ok(req) = serde_json::from_slice::<ContextRefinementRequest>(&event_bytes) {
+                            self.emit_context_miss_defect(session_id, &req.missed_path);
+                        }
+                    }
+                }
+
                 Ok(SessionResponse::error(
                     SessionErrorCode::SessionErrorToolNotAllowed,
                     format!(
@@ -972,6 +1039,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // comments that would be less readable with map_or_else or if let/else.
         match &self.clock {
             Some(clock) => clock.now_hlc().map(|hlc| hlc.wall_ns).map_err(|e| {
+                if let ClockError::ClockRegression { current, previous } = e {
+                    self.emit_htf_regression_defect(current, previous);
+                }
                 error!("HolonicClock failed: {}", e);
                 ProtocolError::Serialization {
                     reason: format!("clock failure: {e}"),

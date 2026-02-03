@@ -415,7 +415,9 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         Ok(signed_event)
     }
 
-    fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent> {
+        fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent> {
+
+    
         let Ok(conn) = self.conn.lock() else {
             return Vec::new();
         };
