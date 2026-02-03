@@ -190,7 +190,7 @@ pub enum EpisodeEvent {
     /// This event is emitted when a review episode completes successfully
     /// and its artifacts are bundled and stored.
     ReviewReceiptRecorded {
-        /// The full ReviewReceiptRecorded event.
+        /// The full `ReviewReceiptRecorded` event.
         receipt: apm2_core::fac::ReviewReceiptRecorded,
         /// Timestamp when recorded (nanoseconds since epoch).
         recorded_at_ns: u64,

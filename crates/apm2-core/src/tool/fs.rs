@@ -333,6 +333,12 @@ impl FilesystemTool {
             .to_string();
         info!("Searching for '{}' in scope: {:?}", req.query, pattern_str);
 
+        // Canonicalize workspace root for boundary checks on matched paths
+        let canonical_root = self
+            .workspace_root
+            .canonicalize()
+            .map_err(|e| Self::map_io_error(&e))?;
+
         let mut output = String::new();
         let mut line_count = 0;
         let mut byte_count = 0;
@@ -357,45 +363,52 @@ impl FilesystemTool {
                 break;
             }
 
-            match entry {
-                Ok(path) => {
-                    if path.is_file() {
-                        // Read file line by line
-                        let file = fs::File::open(&path).map_err(|e| Self::map_io_error(&e))?;
-                        let reader = std::io::BufReader::new(file);
-                        use std::io::BufRead;
+            if let Ok(path) = entry {
+                // Security: Verify matched path is within workspace boundary.
+                // This guards against symlink attacks and glob edge cases.
+                let Ok(canonical_path) = path.canonicalize() else {
+                    // If canonicalize fails (e.g., broken symlink), skip the entry
+                    // to avoid exposing information about files we cannot verify.
+                    continue;
+                };
 
-                        let rel_path = path
-                            .strip_prefix(&self.workspace_root)
-                            .unwrap_or(&path)
-                            .to_string_lossy()
-                            .into_owned();
+                if !canonical_path.starts_with(&canonical_root) {
+                    // Skip files outside the sandbox boundary silently
+                    // (do not expose that they exist)
+                    continue;
+                }
 
-                        for (i, line) in reader.lines().enumerate() {
-                            if line_count >= max_lines || byte_count >= max_bytes {
-                                break;
-                            }
-                            match line {
-                                Ok(content) => {
-                                    if content.contains(&req.query) {
-                                        let matched_line =
-                                            format!("{}:{}:{}\n", rel_path, i + 1, content);
-                                        let len = matched_line.len() as u64;
-                                        if byte_count + len > max_bytes {
-                                            break;
-                                        }
-                                        output.push_str(&matched_line);
-                                        byte_count += len;
-                                        line_count += 1;
-                                    }
-                                },
-                                Err(_) => continue, // Skip binary/invalid utf8 lines
-                            }
+                if path.is_file() {
+                    use std::io::BufRead;
+                    // Read file line by line
+                    let file = fs::File::open(&path).map_err(|e| Self::map_io_error(&e))?;
+                    let reader = std::io::BufReader::new(file);
+
+                    let rel_path = path
+                        .strip_prefix(&self.workspace_root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned();
+
+                    for (i, line) in reader.lines().enumerate() {
+                        if line_count >= max_lines || byte_count >= max_bytes {
+                            break;
                         }
+                        if let Ok(content) = line {
+                            if content.contains(&req.query) {
+                                let matched_line = format!("{}:{}:{}\n", rel_path, i + 1, content);
+                                let len = matched_line.len() as u64;
+                                if byte_count + len > max_bytes {
+                                    break;
+                                }
+                                output.push_str(&matched_line);
+                                byte_count += len;
+                                line_count += 1;
+                            }
+                        } // Skip binary/invalid utf8 lines
                     }
-                },
-                Err(_) => continue,
-            }
+                }
+            } // Skip invalid glob entries
         }
 
         Ok(output.into_bytes())

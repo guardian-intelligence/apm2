@@ -242,23 +242,23 @@ impl ReviewReceiptRecorded {
 
     /// Computes canonical bytes for signing.
     /// Encoding:
-    /// - review_id (len + bytes)
-    /// - changeset_digest (32 bytes)
-    /// - artifact_bundle_hash (32 bytes)
-    /// - time_envelope_ref (32 bytes)
-    /// - reviewer_actor_id (len + bytes)
+    /// - `review_id` (len + bytes)
+    /// - `changeset_digest` (32 bytes)
+    /// - `artifact_bundle_hash` (32 bytes)
+    /// - `time_envelope_ref` (32 bytes)
+    /// - `reviewer_actor_id` (len + bytes)
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         
-        bytes.extend_from_slice(&(self.review_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&u32::try_from(self.review_id.len()).unwrap_or(u32::MAX).to_be_bytes());
         bytes.extend_from_slice(self.review_id.as_bytes());
         
         bytes.extend_from_slice(&self.changeset_digest);
         bytes.extend_from_slice(&self.artifact_bundle_hash);
         bytes.extend_from_slice(&self.time_envelope_ref);
         
-        bytes.extend_from_slice(&(self.reviewer_actor_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&u32::try_from(self.reviewer_actor_id.len()).unwrap_or(u32::MAX).to_be_bytes());
         bytes.extend_from_slice(self.reviewer_actor_id.as_bytes());
         
         bytes
@@ -409,8 +409,8 @@ mod tests {
         assert!(bundle.validate().is_ok());
         
         // Test metadata limit
-        for i in 0..MAX_METADATA_KEYS + 1 {
-            bundle.metadata.insert(format!("k{}", i), "v".into());
+        for i in 0..=MAX_METADATA_KEYS {
+            bundle.metadata.insert(format!("k{i}"), "v".into());
         }
         assert!(matches!(bundle.validate(), Err(ReviewReceiptError::ListTooLong { field: "metadata", .. })));
     }
