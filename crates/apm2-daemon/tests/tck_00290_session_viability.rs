@@ -1,11 +1,11 @@
-//! TCK-00290: Session dispatcher viability - RequestTool execution + real
-//! EmitEvent/PublishEvidence
+//! TCK-00290: Session dispatcher viability - `RequestTool` execution + real
+//! `EmitEvent`/`PublishEvidence`
 //!
 //! This test module verifies the session dispatcher's viability with:
-//! - RequestTool execution via manifest validation (no stub Allow path)
-//! - EmitEvent persistence to ledger (no stub response)
-//! - PublishEvidence storage in CAS (real hashes)
-//! - StreamTelemetry fail-closed (SESSION_ERROR_NOT_IMPLEMENTED)
+//! - `RequestTool` execution via manifest validation (no stub Allow path)
+//! - `EmitEvent` persistence to ledger (no stub response)
+//! - `PublishEvidence` storage in CAS (real hashes)
+//! - `StreamTelemetry` fail-closed (`SESSION_ERROR_NOT_IMPLEMENTED`)
 //!
 //! # Verification Commands
 //!
@@ -93,7 +93,7 @@ fn make_test_manifest(tools: Vec<ToolClass>) -> apm2_daemon::episode::Capability
 // Verification: cargo test -p apm2-daemon session_request_tool_exec
 // =============================================================================
 
-/// Verify RequestTool with configured manifest store returns Allow for valid
+/// Verify `RequestTool` with configured manifest store returns Allow for valid
 /// tool.
 #[test]
 fn session_request_tool_exec_allow_with_manifest() {
@@ -137,7 +137,7 @@ fn session_request_tool_exec_allow_with_manifest() {
     }
 }
 
-/// Verify RequestTool denies tool not in allowlist.
+/// Verify `RequestTool` denies tool not in allowlist.
 #[test]
 fn session_request_tool_exec_deny_not_in_allowlist() {
     let minter = test_minter();
@@ -177,7 +177,7 @@ fn session_request_tool_exec_deny_not_in_allowlist() {
     }
 }
 
-/// Verify RequestTool denies when session has no manifest (fail-closed).
+/// Verify `RequestTool` denies when session has no manifest (fail-closed).
 #[test]
 fn session_request_tool_exec_deny_no_manifest_for_session() {
     let minter = test_minter();
@@ -214,7 +214,7 @@ fn session_request_tool_exec_deny_no_manifest_for_session() {
     }
 }
 
-/// Verify RequestTool with no manifest store configured returns fail-closed
+/// Verify `RequestTool` with no manifest store configured returns fail-closed
 /// error.
 #[test]
 fn session_request_tool_exec_deny_no_store_configured() {
@@ -254,7 +254,8 @@ fn session_request_tool_exec_deny_no_store_configured() {
 // Verification: cargo test -p apm2-daemon session_event_evidence_persist
 // =============================================================================
 
-/// Verify EmitEvent with configured ledger persists and returns real event ID.
+/// Verify `EmitEvent` with configured ledger persists and returns real event
+/// ID.
 #[test]
 fn session_event_evidence_persist_emit_event_success() {
     let minter = test_minter();
@@ -296,7 +297,7 @@ fn session_event_evidence_persist_emit_event_success() {
     }
 }
 
-/// Verify EmitEvent without ledger returns fail-closed error.
+/// Verify `EmitEvent` without ledger returns fail-closed error.
 #[test]
 fn session_event_evidence_persist_emit_event_no_ledger() {
     let minter = test_minter();
@@ -333,7 +334,7 @@ fn session_event_evidence_persist_emit_event_no_ledger() {
     }
 }
 
-/// Verify PublishEvidence with configured CAS stores and returns real hash.
+/// Verify `PublishEvidence` with configured CAS stores and returns real hash.
 #[test]
 fn session_event_evidence_persist_publish_evidence_success() {
     let temp_dir = TempDir::new().unwrap();
@@ -388,7 +389,7 @@ fn session_event_evidence_persist_publish_evidence_success() {
     }
 }
 
-/// Verify PublishEvidence without CAS returns fail-closed error.
+/// Verify `PublishEvidence` without CAS returns fail-closed error.
 #[test]
 fn session_event_evidence_persist_publish_evidence_no_cas() {
     let minter = test_minter();
@@ -425,7 +426,7 @@ fn session_event_evidence_persist_publish_evidence_no_cas() {
     }
 }
 
-/// Verify StreamTelemetry returns NOT_IMPLEMENTED (fail-closed).
+/// Verify `StreamTelemetry` returns `NOT_IMPLEMENTED` (fail-closed).
 #[test]
 fn session_event_evidence_persist_stream_telemetry_not_implemented() {
     let minter = test_minter();
@@ -492,8 +493,7 @@ fn session_event_evidence_persist_full_config_integration() {
     store.register("session-001", manifest);
 
     // Create fully-configured dispatcher
-    let dispatcher =
-        SessionDispatcher::with_all_stores(minter.clone(), store, ledger.clone(), cas.clone());
+    let dispatcher = SessionDispatcher::with_all_stores(minter.clone(), store, ledger, cas);
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
@@ -562,7 +562,7 @@ fn session_event_evidence_persist_full_config_integration() {
 // Additional edge case tests
 // =============================================================================
 
-/// Verify EmitEvent sequence numbers are monotonically increasing.
+/// Verify `EmitEvent` sequence numbers are monotonically increasing.
 #[test]
 fn session_event_evidence_persist_emit_event_sequence_monotonic() {
     let minter = test_minter();
@@ -600,7 +600,7 @@ fn session_event_evidence_persist_emit_event_sequence_monotonic() {
     }
 }
 
-/// Verify PublishEvidence with different retention hints returns different
+/// Verify `PublishEvidence` with different retention hints returns different
 /// TTLs.
 #[test]
 fn session_event_evidence_persist_publish_evidence_retention_hints() {

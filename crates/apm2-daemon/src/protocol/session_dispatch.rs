@@ -284,11 +284,11 @@ impl ManifestStore for InMemoryManifestStore {
 /// # TCK-00290: Real Handler Implementations
 ///
 /// Per TCK-00290, the dispatcher uses real backing stores:
-/// - **RequestTool**: Requires `manifest_store` (fail-closed without it)
-/// - **EmitEvent**: Requires `ledger` for persistent events (fail-closed)
-/// - **PublishEvidence**: Requires `cas` for artifact storage (fail-closed)
-/// - **StreamTelemetry**: Explicitly disabled (fail-closed, returns
-///   NOT_IMPLEMENTED)
+/// - **`RequestTool`**: Requires `manifest_store` (fail-closed without it)
+/// - **`EmitEvent`**: Requires `ledger` for persistent events (fail-closed)
+/// - **`PublishEvidence`**: Requires `cas` for artifact storage (fail-closed)
+/// - **`StreamTelemetry`**: Explicitly disabled (fail-closed, returns
+///   `NOT_IMPLEMENTED`)
 ///
 /// # Security Contract
 ///
@@ -301,10 +301,10 @@ impl ManifestStore for InMemoryManifestStore {
 /// - Empty `tool_allowlist` denies all tools (fail-closed)
 ///
 /// Per INV-TCK-00290-001 through INV-TCK-00290-004:
-/// - RequestTool requires manifest store (fail-closed)
-/// - EmitEvent requires ledger (fail-closed)
-/// - PublishEvidence requires CAS (fail-closed)
-/// - StreamTelemetry disabled until implemented (fail-closed)
+/// - `RequestTool` requires manifest store (fail-closed)
+/// - `EmitEvent` requires ledger (fail-closed)
+/// - `PublishEvidence` requires CAS (fail-closed)
+/// - `StreamTelemetry` disabled until implemented (fail-closed)
 pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// Token minter for validation.
     token_minter: TokenMinter,
@@ -312,9 +312,9 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     decode_config: DecodeConfig,
     /// Manifest store for capability validation (TCK-00260).
     manifest_store: Option<Arc<M>>,
-    /// Ledger event emitter for EmitEvent persistence (TCK-00290).
+    /// Ledger event emitter for `EmitEvent` persistence (TCK-00290).
     ledger: Option<Arc<dyn LedgerEventEmitter>>,
-    /// Content-addressed store for PublishEvidence (TCK-00290).
+    /// Content-addressed store for `PublishEvidence` (TCK-00290).
     cas: Option<Arc<dyn ContentAddressedStore>>,
     /// Event sequence counter (per-session, monotonic).
     event_seq: AtomicU64,
@@ -326,10 +326,10 @@ impl SessionDispatcher<InMemoryManifestStore> {
     /// **Note**: This creates a dispatcher without backing stores. Per
     /// TCK-00290, handlers will return fail-closed errors when their stores
     /// are unavailable:
-    /// - RequestTool: Returns `TOOL_NOT_ALLOWED` (no manifest store)
-    /// - EmitEvent: Returns `SESSION_ERROR_INTERNAL` (no ledger)
-    /// - PublishEvidence: Returns `SESSION_ERROR_INTERNAL` (no CAS)
-    /// - StreamTelemetry: Returns `SESSION_ERROR_NOT_IMPLEMENTED`
+    /// - `RequestTool`: Returns `TOOL_NOT_ALLOWED` (no manifest store)
+    /// - `EmitEvent`: Returns `SESSION_ERROR_INTERNAL` (no ledger)
+    /// - `PublishEvidence`: Returns `SESSION_ERROR_INTERNAL` (no CAS)
+    /// - `StreamTelemetry`: Returns `SESSION_ERROR_NOT_IMPLEMENTED`
     #[must_use]
     pub fn new(token_minter: TokenMinter) -> Self {
         Self {
@@ -396,9 +396,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     ///
     /// This is the production-ready constructor that configures all
     /// dependencies for real handler implementations:
-    /// - `manifest_store`: For RequestTool capability validation
-    /// - `ledger`: For EmitEvent persistence
-    /// - `cas`: For PublishEvidence artifact storage
+    /// - `manifest_store`: For `RequestTool` capability validation
+    /// - `ledger`: For `EmitEvent` persistence
+    /// - `cas`: For `PublishEvidence` artifact storage
     ///
     /// # Arguments
     ///
@@ -423,14 +423,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
-    /// Sets the ledger event emitter for EmitEvent persistence.
+    /// Sets the ledger event emitter for `EmitEvent` persistence.
     #[must_use]
     pub fn with_ledger(mut self, ledger: Arc<dyn LedgerEventEmitter>) -> Self {
         self.ledger = Some(ledger);
         self
     }
 
-    /// Sets the content-addressed store for PublishEvidence.
+    /// Sets the content-addressed store for `PublishEvidence`.
     #[must_use]
     pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
         self.cas = Some(cas);
@@ -785,6 +785,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         payload: &[u8],
         ctx: &ConnectionContext,
     ) -> ProtocolResult<SessionResponse> {
+        // Default TTL: 24 hours for standard evidence, configurable in future
+        // Per RFC-0018, retention is determined by evidence kind and policy
+        const STANDARD_TTL: u64 = 86400; // 24 hours
+        const EXTENDED_TTL: u64 = 604_800; // 7 days
+        const AUDIT_TTL: u64 = 2_592_000; // 30 days
+
         let request = PublishEvidenceRequest::decode_bounded(payload, &self.decode_config)
             .map_err(|e| ProtocolError::Serialization {
                 reason: format!("invalid PublishEvidenceRequest: {e}"),
@@ -838,13 +844,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             "PublishEvidence stored in CAS"
         );
 
-        // Default TTL: 24 hours for standard evidence, configurable in future
-        // Per RFC-0018, retention is determined by evidence kind and policy
         let ttl_secs = match request.retention_hint {
-            0 => 86400,     // Standard: 24 hours
-            1 => 604_800,   // Extended: 7 days
-            2 => 2_592_000, // Audit: 30 days
-            _ => 86400,     // Default to standard
+            1 => EXTENDED_TTL,
+            2 => AUDIT_TTL,
+            _ => STANDARD_TTL,
         };
 
         Ok(SessionResponse::PublishEvidence(PublishEvidenceResponse {
@@ -858,7 +861,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     ///
     /// # TCK-00290: Fail-Closed (Not Implemented)
     ///
-    /// Per TCK-00290 and SEC-CTRL-FAC-0015, StreamTelemetry is explicitly
+    /// Per TCK-00290 and SEC-CTRL-FAC-0015, `StreamTelemetry` is explicitly
     /// disabled until a proper implementation is available. This handler
     /// returns `SESSION_ERROR_NOT_IMPLEMENTED` for all requests.
     ///
@@ -995,11 +998,11 @@ mod tests {
     mod session_routing {
         use super::*;
 
-        /// TCK-00290: RequestTool without manifest store returns fail-closed
+        /// TCK-00290: `RequestTool` without manifest store returns fail-closed
         /// error.
         ///
-        /// Per INV-TCK-00290-001, RequestTool requires a manifest store.
-        /// Without it, returns SESSION_ERROR_TOOL_NOT_ALLOWED.
+        /// Per INV-TCK-00290-001, `RequestTool` requires a manifest store.
+        /// Without it, returns `SESSION_ERROR_TOOL_NOT_ALLOWED`.
         #[test]
         fn test_request_tool_routing_fail_closed() {
             let minter = test_minter();
@@ -1033,10 +1036,10 @@ mod tests {
             }
         }
 
-        /// TCK-00290: EmitEvent without ledger returns fail-closed error.
+        /// TCK-00290: `EmitEvent` without ledger returns fail-closed error.
         ///
-        /// Per INV-TCK-00290-002, EmitEvent requires a ledger.
-        /// Without it, returns SESSION_ERROR_INTERNAL.
+        /// Per INV-TCK-00290-002, `EmitEvent` requires a ledger.
+        /// Without it, returns `SESSION_ERROR_INTERNAL`.
         #[test]
         fn test_emit_event_routing_fail_closed() {
             let minter = test_minter();
@@ -1070,10 +1073,10 @@ mod tests {
             }
         }
 
-        /// TCK-00290: PublishEvidence without CAS returns fail-closed error.
+        /// TCK-00290: `PublishEvidence` without CAS returns fail-closed error.
         ///
-        /// Per INV-TCK-00290-003, PublishEvidence requires a CAS.
-        /// Without it, returns SESSION_ERROR_INTERNAL.
+        /// Per INV-TCK-00290-003, `PublishEvidence` requires a CAS.
+        /// Without it, returns `SESSION_ERROR_INTERNAL`.
         #[test]
         fn test_publish_evidence_routing_fail_closed() {
             let minter = test_minter();
@@ -1107,9 +1110,10 @@ mod tests {
             }
         }
 
-        /// TCK-00290: StreamTelemetry returns NOT_IMPLEMENTED (fail-closed).
+        /// TCK-00290: `StreamTelemetry` returns `NOT_IMPLEMENTED`
+        /// (fail-closed).
         ///
-        /// Per INV-TCK-00290-004, StreamTelemetry is disabled until
+        /// Per INV-TCK-00290-004, `StreamTelemetry` is disabled until
         /// implemented.
         #[test]
         fn test_stream_telemetry_routing_not_implemented() {
@@ -1358,11 +1362,11 @@ mod tests {
         }
     }
 
-    /// TCK-00290: StreamTelemetry returns NOT_IMPLEMENTED even with missing
+    /// TCK-00290: `StreamTelemetry` returns `NOT_IMPLEMENTED` even with missing
     /// frame.
     ///
-    /// Since StreamTelemetry is disabled (fail-closed), it doesn't validate the
-    /// frame before rejecting with NOT_IMPLEMENTED.
+    /// Since `StreamTelemetry` is disabled (fail-closed), it doesn't validate
+    /// the frame before rejecting with `NOT_IMPLEMENTED`.
     #[test]
     fn test_stream_telemetry_requires_frame() {
         let minter = test_minter();
