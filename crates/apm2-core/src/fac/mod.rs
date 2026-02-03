@@ -84,6 +84,7 @@ pub mod merge_receipt;
 mod policy_resolution;
 pub mod quarantine;
 mod receipt;
+mod review_blocked;
 pub mod retry_manager;
 pub mod risk_tier;
 pub mod selection_policy;
@@ -147,7 +148,7 @@ pub use domain_separator::{
     GATE_LEASE_ISSUED_PREFIX, GATE_RECEIPT_PREFIX, GATE_RUN_COMPLETED_PREFIX,
     INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX, LEASE_REVOKED_PREFIX,
     LEDGER_EVENT_PREFIX, MERGE_RECEIPT_PREFIX, POLICY_RESOLVED_PREFIX, PROJECTION_RECEIPT_PREFIX,
-    QUARANTINE_EVENT_PREFIX, sign_with_domain, verify_with_domain,
+    QUARANTINE_EVENT_PREFIX, REVIEW_BLOCKED_RECORDED_PREFIX, sign_with_domain, verify_with_domain,
 };
 // Re-export echo-trap detection types
 pub use echo_trap::{
@@ -196,6 +197,13 @@ pub use quarantine::{
 pub use receipt::{
     GateReceipt, GateReceiptBuilder, GateReceiptProto, ReceiptError, SUPPORTED_PAYLOAD_KINDS,
     SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
+};
+// Re-export review blocked types
+pub use review_blocked::{
+    MAX_BLOCKED_ID_LENGTH, MAX_STRING_LENGTH as MAX_REVIEW_BLOCKED_STRING_LENGTH, ReasonCode,
+    ReviewBlockedError, ReviewBlockedRecorded, ReviewBlockedRecordedBuilder,
+    ReviewBlockedRecordedProto, SCHEMA_IDENTIFIER as REVIEW_BLOCKED_SCHEMA_IDENTIFIER,
+    SCHEMA_VERSION as REVIEW_BLOCKED_SCHEMA_VERSION,
 };
 // Re-export retry manager types
 pub use retry_manager::{
