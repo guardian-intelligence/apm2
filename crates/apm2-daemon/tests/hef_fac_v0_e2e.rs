@@ -40,6 +40,7 @@
 //! ```
 
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 
 use apm2_core::crypto::Signer;
@@ -48,18 +49,20 @@ use apm2_core::events::{
     REVIEW_RECEIPT_RECORDED_DOMAIN_PREFIX, ReviewBlockedRecorded, ReviewReceiptRecorded,
 };
 use apm2_core::fac::{
-    ChangeKind, ChangeSetBundleV1, FileChange, GitObjectRef, HashAlgo, sign_with_domain,
+    ChangeKind, ChangeSetBundleV1, FileChange, GitObjectRef, HashAlgo, ReasonCode,
+    ReviewArtifactBundleV1, ReviewMetadata, ReviewVerdict, sign_with_domain,
 };
 use apm2_core::htf::Canonicalizable;
 use apm2_core::ledger::{EventRecord, Ledger};
 use apm2_daemon::cas::{DurableCas, DurableCasConfig};
 use apm2_daemon::episode::executor::ContentAddressedStore;
-use apm2_daemon::episode::tool_handler::{ReadArgs, ToolArgs};
+use apm2_daemon::episode::tool_handler::{ArtifactArgs, GitArgs, ReadArgs, ToolArgs};
 use apm2_daemon::episode::workspace::validate_file_changes;
 use apm2_daemon::episode::{
-    BudgetTracker, Capability, CapabilityManifestBuilder, CapabilityScope, CapabilityValidator,
-    EpisodeBudget, ExecutionContext, ReadFileHandler, RiskTier, ToolClass, ToolExecutor,
-    ToolRequest, WorkspaceError, WorkspaceManager,
+    ArtifactFetchHandler, BudgetTracker, Capability, CapabilityManifestBuilder, CapabilityScope,
+    CapabilityValidator, EpisodeBudget, ExecutionContext, GitOperationHandler, ReadFileHandler,
+    RiskTier, ToolClass, ToolExecutor, ToolRequest, WorkspaceError, WorkspaceManager,
+    create_artifact_bundle,
 };
 use apm2_daemon::projection::{
     GitHubAdapterConfig, GitHubProjectionAdapter, ProjectedStatus, ProjectionAdapter,
@@ -144,11 +147,19 @@ impl FacV0TestHarness {
             .build();
         let budget_tracker = Arc::new(BudgetTracker::from_envelope(budget));
 
-        // Create executor with real ReadFileHandler rooted at workspace
+        // Create executor with real handlers rooted at workspace
         let mut executor = ToolExecutor::new(budget_tracker, cas.clone());
         executor
             .register_handler(Box::new(ReadFileHandler::with_root(workspace_root)))
             .expect("register ReadFileHandler");
+        executor
+            .register_handler(Box::new(GitOperationHandler::with_root(
+                temp_dir.path().to_path_buf(),
+            )))
+            .expect("register GitOperationHandler");
+        executor
+            .register_handler(Box::new(ArtifactFetchHandler::new(cas.clone())))
+            .expect("register ArtifactFetchHandler");
 
         // Create signer
         let signer = Signer::generate();
@@ -187,6 +198,44 @@ impl FacV0TestHarness {
             request_id,
             self.current_timestamp_ms * 1_000_000, // Convert to nanoseconds
         )
+    }
+
+    /// Initializes a git repository in the workspace for `GitOperation` tests.
+    fn init_git_repo(&self) {
+        let git_dir = self.workspace_root().join(".git");
+        if git_dir.exists() {
+            return;
+        }
+
+        self.run_git(&["init"]);
+        self.run_git(&["config", "user.email", "fac-v0@example.com"]);
+        self.run_git(&["config", "user.name", "FAC V0 Harness"]);
+    }
+
+    /// Commits all current changes in the workspace.
+    fn git_commit_all(&self, message: &str) {
+        self.run_git(&["add", "."]);
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(self.workspace_root())
+            .args(["commit", "-m", message])
+            .env("GIT_AUTHOR_NAME", "FAC V0 Harness")
+            .env("GIT_AUTHOR_EMAIL", "fac-v0@example.com")
+            .env("GIT_COMMITTER_NAME", "FAC V0 Harness")
+            .env("GIT_COMMITTER_EMAIL", "fac-v0@example.com")
+            .status()
+            .expect("git commit");
+        assert!(status.success(), "git commit failed");
+    }
+
+    fn run_git(&self, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(self.workspace_root())
+            .args(args)
+            .status()
+            .expect("git command");
+        assert!(status.success(), "git {args:?} failed");
     }
 
     /// Creates a signed ledger event for `ChangeSetPublished`.
@@ -262,13 +311,13 @@ impl FacV0TestHarness {
         &self,
         blocked_id: &str,
         changeset_digest: [u8; 32],
-        reason_code: i32,
+        reason_code: ReasonCode,
         cas_log_hash: [u8; 32],
     ) -> EventRecord {
         let event = ReviewBlockedRecorded {
             blocked_id: blocked_id.to_string(),
             changeset_digest: changeset_digest.to_vec(),
-            reason_code,
+            reason_code: i32::from(reason_code.to_code()),
             blocked_log_hash: cas_log_hash.to_vec(),
             time_envelope_ref: None,
             recorder_actor_id: self.actor_id(),
@@ -302,9 +351,38 @@ impl FacV0TestHarness {
 ///
 /// Per REQ-HEF-0010, the reviewer profile allows:
 /// - Read: File reading for code review
+/// - Git: Diff/status for workspace inspection
+/// - Artifact: Fetch review artifacts from CAS
 /// - Denies: Write, Execute, Network (safety constraints)
 fn create_reviewer_capability_manifest() -> apm2_daemon::episode::CapabilityManifest {
     CapabilityManifestBuilder::new("reviewer-fac-v0-manifest")
+        .delegator("fac-v0-orchestrator")
+        .capability(
+            Capability::builder("cap-reviewer-read", ToolClass::Read)
+                .scope(CapabilityScope::allow_all())
+                .build()
+                .expect("valid read capability"),
+        )
+        .capability(
+            Capability::builder("cap-reviewer-git", ToolClass::Git)
+                .scope(CapabilityScope::allow_all())
+                .build()
+                .expect("valid git capability"),
+        )
+        .capability(
+            Capability::builder("cap-reviewer-artifact", ToolClass::Artifact)
+                .scope(CapabilityScope::allow_all())
+                .build()
+                .expect("valid artifact capability"),
+        )
+        .tool_allowlist(vec![ToolClass::Read, ToolClass::Git, ToolClass::Artifact])
+        .build()
+        .expect("valid manifest")
+}
+
+/// Creates a read-only capability manifest (for negative enforcement tests).
+fn create_read_only_capability_manifest() -> apm2_daemon::episode::CapabilityManifest {
+    CapabilityManifestBuilder::new("reviewer-read-only-manifest")
         .delegator("fac-v0-orchestrator")
         .capability(
             Capability::builder("cap-reviewer-read", ToolClass::Read)
@@ -340,17 +418,6 @@ fn create_test_changeset_bundle(files: Vec<(&str, ChangeKind)>) -> ChangeSetBund
         .binary_detected(false)
         .build()
         .expect("valid changeset bundle")
-}
-
-/// Reason codes for `ReviewBlocked` per REQ-HEF-0011.
-#[allow(dead_code)]
-mod reason_code {
-    pub const BINARY_UNSUPPORTED: i32 = 1;
-    pub const PATH_TRAVERSAL: i32 = 2;
-    pub const APPLY_FAILED: i32 = 3;
-    pub const TOOL_FAILED: i32 = 4;
-    pub const MISSING_ARTIFACT: i32 = 5;
-    pub const INVALID_BUNDLE: i32 = 6;
 }
 
 // =============================================================================
@@ -455,12 +522,25 @@ async fn test_review_receipt_ledger_anchoring() {
     let tool_log = r#"{"tool": "FileRead", "success": true}"#;
     let tool_log_hash = harness.cas.store(tool_log.as_bytes());
 
-    // Combine into artifact bundle
-    let artifact_bundle = serde_json::json!({
-        "review_text_hash": hex::encode(review_text_hash),
-        "tool_log_hashes": [hex::encode(tool_log_hash)],
-    });
-    let artifact_bundle_bytes = serde_json::to_vec(&artifact_bundle).expect("serialize bundle");
+    let metadata = ReviewMetadata::new()
+        .with_reviewer_actor_id("reviewer-fac-v0-test")
+        .with_verdict(ReviewVerdict::Approve)
+        .with_started_at(harness.current_timestamp_ms * 1_000_000)
+        .with_completed_at((harness.current_timestamp_ms + 1) * 1_000_000);
+
+    let artifact_bundle = create_artifact_bundle(
+        "review-receipt-test".to_string(),
+        bundle.changeset_digest,
+        review_text_hash,
+        vec![tool_log_hash],
+        [0u8; 32],
+        Some(metadata),
+    )
+    .expect("build artifact bundle");
+
+    artifact_bundle.validate().expect("artifact bundle valid");
+    let artifact_bundle_bytes =
+        serde_json::to_vec(&artifact_bundle).expect("serialize artifact bundle");
     let artifact_bundle_hash = harness.cas.store(&artifact_bundle_bytes);
 
     // Create and append ReviewReceiptRecorded
@@ -493,9 +573,11 @@ async fn test_review_receipt_ledger_anchoring() {
         .cas
         .retrieve(&artifact_bundle_hash)
         .expect("retrieve artifact bundle");
-    let parsed: serde_json::Value =
+    let parsed: ReviewArtifactBundleV1 =
         serde_json::from_slice(&retrieved_bundle).expect("parse artifact bundle");
-    assert_eq!(parsed["review_text_hash"], hex::encode(review_text_hash));
+    assert_eq!(parsed.review_text_hash, hex::encode(review_text_hash));
+    assert_eq!(parsed.tool_log_hashes.len(), 1);
+    assert_eq!(parsed.tool_log_hashes[0], hex::encode(tool_log_hash));
 }
 
 // =============================================================================
@@ -545,7 +627,7 @@ async fn test_review_blocked_binary_unsupported() {
     let blocked_event = harness.create_review_blocked_event(
         "BLK-binary-001",
         bundle.changeset_digest,
-        reason_code::BINARY_UNSUPPORTED,
+        ReasonCode::BinaryUnsupported,
         cas_log_hash,
     );
 
@@ -560,7 +642,10 @@ async fn test_review_blocked_binary_unsupported() {
         .expect("decode ReviewBlockedRecorded");
 
     assert_eq!(decoded.blocked_id, "BLK-binary-001");
-    assert_eq!(decoded.reason_code, reason_code::BINARY_UNSUPPORTED);
+    assert_eq!(
+        decoded.reason_code,
+        i32::from(ReasonCode::BinaryUnsupported.to_code())
+    );
     assert_eq!(decoded.blocked_log_hash, cas_log_hash.to_vec());
 }
 
@@ -607,7 +692,7 @@ async fn test_review_blocked_path_traversal() {
     let blocked_event = harness.create_review_blocked_event(
         "BLK-traversal-001",
         bundle.changeset_digest,
-        reason_code::PATH_TRAVERSAL,
+        ReasonCode::InvalidBundle,
         cas_log_hash,
     );
 
@@ -621,7 +706,292 @@ async fn test_review_blocked_path_traversal() {
     let decoded = ReviewBlockedRecorded::decode(stored.payload.as_slice())
         .expect("decode ReviewBlockedRecorded");
 
-    assert_eq!(decoded.reason_code, reason_code::PATH_TRAVERSAL);
+    assert_eq!(
+        decoded.reason_code,
+        i32::from(ReasonCode::InvalidBundle.to_code())
+    );
+}
+
+/// Tests `ReviewBlockedRecorded` for apply failure mapping.
+#[tokio::test]
+async fn test_review_blocked_apply_failed() {
+    enforce_evid_hef_0012_env_constraints();
+
+    let harness = FacV0TestHarness::new();
+    let bundle = create_test_changeset_bundle(vec![("src/apply.rs", ChangeKind::Modify)]);
+
+    let bundle_bytes = bundle.canonical_bytes().expect("serialize bundle");
+    let cas_hash = harness.cas.store(&bundle_bytes);
+    let cs_event = harness.create_changeset_published_event(
+        "work-apply-failed",
+        bundle.changeset_digest,
+        cas_hash,
+    );
+    harness
+        .ledger
+        .append_verified(&cs_event, &harness.signer.verifying_key())
+        .expect("append changeset_published");
+
+    let error = WorkspaceError::ApplyFailed("apply failed".into());
+    let error_log = serde_json::json!({
+        "error": error.to_string(),
+        "changeset_digest": hex::encode(bundle.changeset_digest),
+    });
+    let cas_log_hash = harness.cas.store(error_log.to_string().as_bytes());
+
+    let blocked_event = harness.create_review_blocked_event(
+        "BLK-apply-001",
+        bundle.changeset_digest,
+        error.reason_code(),
+        cas_log_hash,
+    );
+
+    let seq_id = harness
+        .ledger
+        .append_verified(&blocked_event, &harness.signer.verifying_key())
+        .expect("append review_blocked_recorded");
+
+    let stored = harness.ledger.read_one(seq_id).expect("read_one");
+    let decoded = ReviewBlockedRecorded::decode(stored.payload.as_slice())
+        .expect("decode ReviewBlockedRecorded");
+
+    assert_eq!(
+        decoded.reason_code,
+        i32::from(ReasonCode::ApplyFailed.to_code())
+    );
+    assert_eq!(decoded.blocked_log_hash, cas_log_hash.to_vec());
+}
+
+/// Tests `ReviewBlockedRecorded` for tool failure on `GitOperation` bounds.
+#[tokio::test]
+async fn test_review_blocked_tool_failure_on_git_bounds() {
+    enforce_evid_hef_0012_env_constraints();
+
+    let harness = FacV0TestHarness::new();
+    let bundle = create_test_changeset_bundle(vec![("big.txt", ChangeKind::Modify)]);
+
+    let bundle_bytes = bundle.canonical_bytes().expect("serialize bundle");
+    let cas_hash = harness.cas.store(&bundle_bytes);
+    let cs_event = harness.create_changeset_published_event(
+        "work-tool-failed",
+        bundle.changeset_digest,
+        cas_hash,
+    );
+    harness
+        .ledger
+        .append_verified(&cs_event, &harness.signer.verifying_key())
+        .expect("append changeset_published");
+
+    let big_path = harness.workspace_root().join("big.txt");
+    std::fs::write(&big_path, b"base\n").expect("write base file");
+    harness.init_git_repo();
+    harness.git_commit_all("init-big");
+
+    let line_count = apm2_daemon::episode::GIT_DIFF_MAX_LINES + 10;
+    let mut large = String::new();
+    for _ in 0..line_count {
+        large.push_str("line\n");
+    }
+    std::fs::write(&big_path, large.as_bytes()).expect("write large diff");
+
+    let ctx = harness.execution_context("req-git-bounds");
+    let git_args = ToolArgs::Git(GitArgs {
+        operation: "diff".to_string(),
+        args: vec!["big.txt".to_string()],
+        repo_path: None,
+    });
+
+    let result = harness
+        .tool_executor
+        .execute(&ctx, &git_args)
+        .await
+        .expect("execute git diff");
+    assert!(
+        !result.success,
+        "git diff should fail when output exceeds bounds"
+    );
+
+    let error_message = result
+        .error_message
+        .unwrap_or_else(|| "git diff failed".to_string());
+    let error_log = serde_json::json!({
+        "error": error_message,
+        "operation": "diff",
+        "changeset_digest": hex::encode(bundle.changeset_digest),
+    });
+    let cas_log_hash = harness.cas.store(error_log.to_string().as_bytes());
+
+    let blocked_event = harness.create_review_blocked_event(
+        "BLK-tool-001",
+        bundle.changeset_digest,
+        ReasonCode::ToolFailed,
+        cas_log_hash,
+    );
+
+    let seq_id = harness
+        .ledger
+        .append_verified(&blocked_event, &harness.signer.verifying_key())
+        .expect("append review_blocked_recorded");
+
+    let stored = harness.ledger.read_one(seq_id).expect("read_one");
+    let decoded = ReviewBlockedRecorded::decode(stored.payload.as_slice())
+        .expect("decode ReviewBlockedRecorded");
+
+    assert_eq!(
+        decoded.reason_code,
+        i32::from(ReasonCode::ToolFailed.to_code())
+    );
+}
+
+/// Tests `ReviewBlockedRecorded` for missing artifact fetch.
+#[tokio::test]
+async fn test_review_blocked_missing_artifact() {
+    enforce_evid_hef_0012_env_constraints();
+
+    let harness = FacV0TestHarness::new();
+    let bundle = create_test_changeset_bundle(vec![("src/missing.rs", ChangeKind::Modify)]);
+
+    let bundle_bytes = bundle.canonical_bytes().expect("serialize bundle");
+    let cas_hash = harness.cas.store(&bundle_bytes);
+    let cs_event = harness.create_changeset_published_event(
+        "work-missing-artifact",
+        bundle.changeset_digest,
+        cas_hash,
+    );
+    harness
+        .ledger
+        .append_verified(&cs_event, &harness.signer.verifying_key())
+        .expect("append changeset_published");
+
+    let missing_hash = [0x11; 32];
+    let ctx = harness.execution_context("req-missing-artifact");
+    let artifact_args = ToolArgs::Artifact(ArtifactArgs {
+        stable_id: None,
+        content_hash: Some(missing_hash),
+        expected_hash: None,
+        max_bytes: 1024,
+        format: None,
+    });
+    let result = harness
+        .tool_executor
+        .execute(&ctx, &artifact_args)
+        .await
+        .expect("execute artifact fetch");
+    assert!(
+        !result.success,
+        "artifact fetch should fail for missing content"
+    );
+
+    let error_message = result
+        .error_message
+        .unwrap_or_else(|| "missing artifact".to_string());
+    let error_log = serde_json::json!({
+        "error": error_message,
+        "content_hash": hex::encode(missing_hash),
+    });
+    let cas_log_hash = harness.cas.store(error_log.to_string().as_bytes());
+
+    let blocked_event = harness.create_review_blocked_event(
+        "BLK-missing-001",
+        bundle.changeset_digest,
+        ReasonCode::MissingArtifact,
+        cas_log_hash,
+    );
+    let seq_id = harness
+        .ledger
+        .append_verified(&blocked_event, &harness.signer.verifying_key())
+        .expect("append review_blocked_recorded");
+
+    let stored = harness.ledger.read_one(seq_id).expect("read_one");
+    let decoded = ReviewBlockedRecorded::decode(stored.payload.as_slice())
+        .expect("decode ReviewBlockedRecorded");
+    assert_eq!(
+        decoded.reason_code,
+        i32::from(ReasonCode::MissingArtifact.to_code())
+    );
+}
+
+/// Tests `ReviewBlockedRecorded` for invalid bundle validation.
+#[tokio::test]
+async fn test_review_blocked_invalid_bundle() {
+    enforce_evid_hef_0012_env_constraints();
+
+    let harness = FacV0TestHarness::new();
+    let mut invalid_bundle =
+        create_test_changeset_bundle(vec![("src/invalid.rs", ChangeKind::Modify)]);
+    let expected_digest = invalid_bundle.changeset_digest;
+    invalid_bundle.changeset_digest = [0u8; 32];
+    let validation = invalid_bundle.validate();
+    assert!(validation.is_err(), "invalid bundle should fail validation");
+
+    let error_log = serde_json::json!({
+        "error": validation.err().unwrap().to_string(),
+        "changeset_digest": hex::encode(expected_digest),
+    });
+    let cas_log_hash = harness.cas.store(error_log.to_string().as_bytes());
+
+    let blocked_event = harness.create_review_blocked_event(
+        "BLK-invalid-001",
+        expected_digest,
+        ReasonCode::InvalidBundle,
+        cas_log_hash,
+    );
+    let seq_id = harness
+        .ledger
+        .append_verified(&blocked_event, &harness.signer.verifying_key())
+        .expect("append review_blocked_recorded");
+
+    let stored = harness.ledger.read_one(seq_id).expect("read_one");
+    let decoded = ReviewBlockedRecorded::decode(stored.payload.as_slice())
+        .expect("decode ReviewBlockedRecorded");
+    assert_eq!(
+        decoded.reason_code,
+        i32::from(ReasonCode::InvalidBundle.to_code())
+    );
+}
+
+/// Tests `ReviewBlockedRecorded` for timeout mapping.
+#[tokio::test]
+async fn test_review_blocked_timeout() {
+    enforce_evid_hef_0012_env_constraints();
+
+    let harness = FacV0TestHarness::new();
+    let bundle = create_test_changeset_bundle(vec![("src/timeout.rs", ChangeKind::Modify)]);
+
+    let bundle_bytes = bundle.canonical_bytes().expect("serialize bundle");
+    let cas_hash = harness.cas.store(&bundle_bytes);
+    let cs_event =
+        harness.create_changeset_published_event("work-timeout", bundle.changeset_digest, cas_hash);
+    harness
+        .ledger
+        .append_verified(&cs_event, &harness.signer.verifying_key())
+        .expect("append changeset_published");
+
+    let error = WorkspaceError::Timeout("tool timeout".into());
+    let error_log = serde_json::json!({
+        "error": error.to_string(),
+        "changeset_digest": hex::encode(bundle.changeset_digest),
+    });
+    let cas_log_hash = harness.cas.store(error_log.to_string().as_bytes());
+
+    let blocked_event = harness.create_review_blocked_event(
+        "BLK-timeout-001",
+        bundle.changeset_digest,
+        error.reason_code(),
+        cas_log_hash,
+    );
+    let seq_id = harness
+        .ledger
+        .append_verified(&blocked_event, &harness.signer.verifying_key())
+        .expect("append review_blocked_recorded");
+
+    let stored = harness.ledger.read_one(seq_id).expect("read_one");
+    let decoded = ReviewBlockedRecorded::decode(stored.payload.as_slice())
+        .expect("decode ReviewBlockedRecorded");
+    assert_eq!(
+        decoded.reason_code,
+        i32::from(ReasonCode::Timeout.to_code())
+    );
 }
 
 // =============================================================================
@@ -767,28 +1137,47 @@ async fn test_fac_v0_full_e2e_autonomous_flow() {
     harness.advance_time(100);
 
     // =========================================================================
-    // Step 5: Create test file and validate tool request
+    // Step 5: Create test file, initialize git repo, and validate tool requests
     // =========================================================================
     let test_file_path = harness.workspace_root().join("src/lib.rs");
     std::fs::create_dir_all(test_file_path.parent().unwrap()).expect("create workspace dirs");
-    std::fs::write(
-        &test_file_path,
-        b"// Test file for FAC v0 E2E\nfn main() { println!(\"Hello, FAC!\"); }\n",
-    )
-    .expect("create test file");
+    let initial_contents =
+        b"// Test file for FAC v0 E2E\nfn main() { println!(\"Hello, FAC!\"); }\n";
+    std::fs::write(&test_file_path, initial_contents).expect("create test file");
+
+    harness.init_git_repo();
+    harness.git_commit_all("init-fac-v0-e2e");
+
+    // Modify file to produce a diff for GitOperation
+    let updated_contents = b"// Test file for FAC v0 E2E\nfn main() { println!(\"Hello, FAC!\"); }\n// follow-up change\n";
+    std::fs::write(&test_file_path, updated_contents).expect("update test file");
 
     let read_request = ToolRequest::new(ToolClass::Read, RiskTier::default())
         .with_path(test_file_path.clone())
         .with_size(4096);
+    let git_request = ToolRequest::new(ToolClass::Git, RiskTier::default())
+        .with_path(harness.workspace_root().clone());
+    let artifact_request =
+        ToolRequest::new(ToolClass::Artifact, RiskTier::default()).with_size(4096);
 
     let decision = harness.capability_validator.validate(&read_request);
     assert!(
         decision.is_allowed(),
         "Read tool should be allowed: {decision:?}"
     );
+    let git_decision = harness.capability_validator.validate(&git_request);
+    assert!(
+        git_decision.is_allowed(),
+        "Git tool should be allowed: {git_decision:?}"
+    );
+    let artifact_decision = harness.capability_validator.validate(&artifact_request);
+    assert!(
+        artifact_decision.is_allowed(),
+        "Artifact tool should be allowed: {artifact_decision:?}"
+    );
 
     // =========================================================================
-    // Step 6: Execute REAL tool via ToolExecutor
+    // Step 6: Execute real tools via ToolExecutor (Read + Git)
     // =========================================================================
     let ctx = harness.execution_context("req-read-001");
     let read_args = ToolArgs::Read(ReadArgs {
@@ -797,64 +1186,126 @@ async fn test_fac_v0_full_e2e_autonomous_flow() {
         limit: Some(4096),
     });
 
-    let tool_result = harness
+    let read_result = harness
         .tool_executor
         .execute(&ctx, &read_args)
         .await
         .expect("tool execution");
 
-    assert!(tool_result.success, "tool execution should succeed");
+    assert!(read_result.success, "read execution should succeed");
     assert!(
-        String::from_utf8_lossy(&tool_result.output).contains("FAC v0 E2E"),
+        String::from_utf8_lossy(&read_result.output).contains("FAC v0 E2E"),
         "output should contain test file content"
+    );
+
+    let git_args = ToolArgs::Git(GitArgs {
+        operation: "diff".to_string(),
+        args: vec!["src/lib.rs".to_string()],
+        repo_path: None,
+    });
+    let git_result = harness
+        .tool_executor
+        .execute(&ctx, &git_args)
+        .await
+        .expect("git operation");
+
+    assert!(git_result.success, "git operation should succeed");
+    assert!(
+        String::from_utf8_lossy(&git_result.output).contains("follow-up change"),
+        "git diff should include updated line"
     );
 
     harness.advance_time(50);
 
     // =========================================================================
-    // Step 7: Store tool output in CAS
+    // Step 7: Store tool outputs in CAS
     // =========================================================================
     #[allow(clippy::cast_possible_truncation)]
-    let duration_ms = tool_result.duration.as_millis() as u64;
-    let tool_log = serde_json::json!({
+    let read_duration_ms = read_result.duration.as_millis() as u64;
+    let read_log = serde_json::json!({
         "tool": "FileRead",
         "path": "src/lib.rs",
-        "success": tool_result.success,
-        "bytes_read": tool_result.output.len(),
-        "duration_ms": duration_ms,
+        "success": read_result.success,
+        "bytes_read": read_result.output.len(),
+        "duration_ms": read_duration_ms,
     });
-    let tool_log_hash = harness.cas.store(tool_log.to_string().as_bytes());
+    let read_log_hash = harness.cas.store(read_log.to_string().as_bytes());
+
+    #[allow(clippy::cast_possible_truncation)]
+    let git_duration_ms = git_result.duration.as_millis() as u64;
+    let git_log = serde_json::json!({
+        "tool": "GitOperation",
+        "operation": "diff",
+        "pathspecs": ["src/lib.rs"],
+        "success": git_result.success,
+        "bytes_output": git_result.output.len(),
+        "duration_ms": git_duration_ms,
+    });
+    let git_log_hash = harness.cas.store(git_log.to_string().as_bytes());
 
     // Verify CAS storage
-    let retrieved_log = harness.cas.retrieve(&tool_log_hash);
-    assert!(
-        retrieved_log.is_some(),
-        "tool log should be retrievable from CAS"
-    );
+    assert!(harness.cas.retrieve(&read_log_hash).is_some());
+    assert!(harness.cas.retrieve(&git_log_hash).is_some());
 
     harness.advance_time(25);
 
     // =========================================================================
-    // Step 8: Create review artifact bundle
+    // Step 8: Execute ArtifactFetch and store log in CAS
     // =========================================================================
     let review_text = "LGTM - Code changes look good. No security issues found.";
     let review_text_hash = harness.cas.store(review_text.as_bytes());
 
-    let artifact_bundle = serde_json::json!({
-        "review_text_hash": hex::encode(review_text_hash),
-        "tool_log_hashes": [hex::encode(tool_log_hash)],
-        "metadata": {
-            "reviewer": "reviewer-fac-v0-e2e",
-            "verdict": "APPROVE",
-            "started_at": harness.current_timestamp_ms - 225,
-            "completed_at": harness.current_timestamp_ms,
-        }
+    let artifact_args = ToolArgs::Artifact(ArtifactArgs {
+        stable_id: None,
+        content_hash: Some(review_text_hash),
+        expected_hash: None,
+        max_bytes: 4096,
+        format: None,
     });
-    let artifact_bundle_bytes = serde_json::to_vec(&artifact_bundle).expect("serialize");
+    let artifact_result = harness
+        .tool_executor
+        .execute(&ctx, &artifact_args)
+        .await
+        .expect("artifact fetch");
+
+    assert!(artifact_result.success, "artifact fetch should succeed");
+    assert_eq!(artifact_result.output, review_text.as_bytes());
+
+    #[allow(clippy::cast_possible_truncation)]
+    let artifact_duration_ms = artifact_result.duration.as_millis() as u64;
+    let artifact_log = serde_json::json!({
+        "tool": "ArtifactFetch",
+        "success": artifact_result.success,
+        "bytes_output": artifact_result.output.len(),
+        "duration_ms": artifact_duration_ms,
+    });
+    let artifact_log_hash = harness.cas.store(artifact_log.to_string().as_bytes());
+
+    // =========================================================================
+    // Step 9: Create review artifact bundle
+    // =========================================================================
+    let metadata = ReviewMetadata::new()
+        .with_reviewer_actor_id("reviewer-fac-v0-e2e")
+        .with_verdict(ReviewVerdict::Approve)
+        .with_started_at((harness.current_timestamp_ms - 225) * 1_000_000)
+        .with_completed_at(harness.current_timestamp_ms * 1_000_000);
+
+    let artifact_bundle = create_artifact_bundle(
+        "review-fac-v0-e2e".to_string(),
+        bundle.changeset_digest,
+        review_text_hash,
+        vec![read_log_hash, git_log_hash, artifact_log_hash],
+        [0u8; 32],
+        Some(metadata),
+    )
+    .expect("build artifact bundle");
+
+    let artifact_bundle_bytes =
+        serde_json::to_vec(&artifact_bundle).expect("serialize artifact bundle");
     let artifact_bundle_hash = harness.cas.store(&artifact_bundle_bytes);
 
     // =========================================================================
-    // Step 9: Anchor ReviewReceiptRecorded to ledger (REQ-HEF-0011)
+    // Step 10: Anchor ReviewReceiptRecorded to ledger (REQ-HEF-0011)
     // =========================================================================
     let rr_event = harness.create_review_receipt_event(
         "RR-fac-v0-e2e-001",
@@ -883,7 +1334,7 @@ async fn test_fac_v0_full_e2e_autonomous_flow() {
     );
 
     // =========================================================================
-    // Step 10: Verify ledger chain integrity
+    // Step 11: Verify ledger chain integrity
     // =========================================================================
     let stats = harness.ledger.stats().expect("get stats");
     assert_eq!(stats.event_count, 2, "Should have 2 ledger events");
@@ -975,7 +1426,7 @@ async fn test_fac_v0_e2e_blocked_path() {
     let blocked_event = harness.create_review_blocked_event(
         "BLK-e2e-001",
         bundle.changeset_digest,
-        reason_code::BINARY_UNSUPPORTED,
+        ReasonCode::BinaryUnsupported,
         cas_log_hash,
     );
 
@@ -992,7 +1443,10 @@ async fn test_fac_v0_e2e_blocked_path() {
     let blk_decoded = ReviewBlockedRecorded::decode(blk_stored.payload.as_slice())
         .expect("decode ReviewBlockedRecorded");
 
-    assert_eq!(blk_decoded.reason_code, reason_code::BINARY_UNSUPPORTED);
+    assert_eq!(
+        blk_decoded.reason_code,
+        i32::from(ReasonCode::BinaryUnsupported.to_code())
+    );
     assert_eq!(blk_decoded.blocked_log_hash, cas_log_hash.to_vec());
 }
 
@@ -1037,6 +1491,20 @@ fn test_capability_validator_enforces_tool_profile() {
     assert!(
         validator.validate(&read_request).is_allowed(),
         "Read should be allowed"
+    );
+
+    // Git should be allowed
+    let git_request = ToolRequest::new(ToolClass::Git, RiskTier::default());
+    assert!(
+        validator.validate(&git_request).is_allowed(),
+        "Git should be allowed"
+    );
+
+    // Artifact should be allowed
+    let artifact_request = ToolRequest::new(ToolClass::Artifact, RiskTier::default());
+    assert!(
+        validator.validate(&artifact_request).is_allowed(),
+        "Artifact should be allowed"
     );
 
     // Write should be denied
@@ -1224,14 +1692,12 @@ fn test_workspace_snapshot_captures_state() {
 
 /// Tests that Git and Artifact tool classes are properly enforced.
 ///
-/// Per REQ-HEF-0010, the FAC reviewer should have restricted access to
-/// `GitOperation` and `ArtifactFetch` tool classes. This test verifies
-/// that the capability validator correctly rejects these tool classes
-/// when not explicitly granted.
+/// This test verifies that a read-only manifest rejects Git and Artifact
+/// tool classes when they are not explicitly granted.
 #[test]
 fn test_git_artifact_tool_class_enforcement() {
-    // Create a reviewer manifest that only allows Read and ListFiles
-    let manifest = create_reviewer_capability_manifest();
+    // Create a reviewer manifest that only allows Read
+    let manifest = create_read_only_capability_manifest();
     let validator = CapabilityValidator::new(manifest).expect("valid validator");
 
     // Git tool class should be denied (not in reviewer profile)
@@ -1461,7 +1927,7 @@ async fn test_blocked_review_projection_flow() {
     let blocked_event = harness.create_review_blocked_event(
         "BLK-projection-001",
         bundle.changeset_digest,
-        reason_code::BINARY_UNSUPPORTED,
+        ReasonCode::BinaryUnsupported,
         log_hash,
     );
     harness

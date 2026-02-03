@@ -61,11 +61,17 @@ pub const MAX_HANDLERS: usize = 64;
 /// Requests for larger artifacts must be chunked or use streaming APIs.
 pub const ARTIFACT_FETCH_MAX_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 
-/// Maximum output bytes for git operations (256 KiB per REQ-HEF-0010).
-pub const GIT_OUTPUT_MAX_BYTES: usize = 256 * 1024; // 256 KiB
+/// Maximum output bytes for `git diff` (256 KiB per REQ-HEF-0010).
+pub const GIT_DIFF_MAX_BYTES: usize = 256 * 1024; // 256 KiB
 
-/// Maximum output lines for git operations (4000 per REQ-HEF-0010).
-pub const GIT_OUTPUT_MAX_LINES: usize = 4000;
+/// Maximum output lines for `git diff` (4000 per REQ-HEF-0010).
+pub const GIT_DIFF_MAX_LINES: usize = 4000;
+
+/// Maximum output bytes for `git status` (16 KiB per REQ-HEF-0010).
+pub const GIT_STATUS_MAX_BYTES: usize = 16 * 1024; // 16 KiB
+
+/// Maximum output lines for `git status` (500 per REQ-HEF-0010).
+pub const GIT_STATUS_MAX_LINES: usize = 500;
 
 // =============================================================================
 // ToolArgs
