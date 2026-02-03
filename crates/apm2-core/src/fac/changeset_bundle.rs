@@ -7,16 +7,16 @@
 //!
 //! # Design Overview
 //!
-//! The [`ChangeSetBundleV1`] struct represents the canonical form of a changeset
-//! bundle stored in CAS. The [`ChangeSetPublished`] event anchors the changeset
-//! digest and CAS hash in the ledger.
+//! The [`ChangeSetBundleV1`] struct represents the canonical form of a
+//! changeset bundle stored in CAS. The [`ChangeSetPublished`] event anchors the
+//! changeset digest and CAS hash in the ledger.
 //!
 //! # Security Properties
 //!
-//! - **Deterministic Digest**: The `changeset_digest` is computed over canonical
-//!   bundle bytes with the `changeset_digest` field itself excluded from the hash
-//!   input. This prevents circular dependency and ensures the same inputs always
-//!   produce the same digest.
+//! - **Deterministic Digest**: The `changeset_digest` is computed over
+//!   canonical bundle bytes with the `changeset_digest` field itself excluded
+//!   from the hash input. This prevents circular dependency and ensures the
+//!   same inputs always produce the same digest.
 //!
 //! - **Domain Separation**: The `ChangeSetPublished` event signature uses the
 //!   `CHANGESET_PUBLISHED:` domain prefix to prevent replay attacks.
@@ -29,7 +29,8 @@
 //! ```rust
 //! use apm2_core::crypto::Signer;
 //! use apm2_core::fac::{
-//!     ChangeSetBundleV1, ChangeSetPublished, FileChange, ChangeKind, GitObjectRef, HashAlgo,
+//!     ChangeKind, ChangeSetBundleV1, ChangeSetPublished, FileChange,
+//!     GitObjectRef, HashAlgo,
 //! };
 //!
 //! // Create a changeset bundle
@@ -59,10 +60,11 @@
 //!     "work-001".to_string(),
 //!     digest,
 //!     cas_hash,
-//!     1704067200000,
+//!     1_704_067_200_000,
 //!     "publisher-001".to_string(),
 //!     &signer,
-//! ).expect("valid event");
+//! )
+//! .expect("valid event");
 //!
 //! // Verify signature
 //! assert!(event.verify_signature(&signer.verifying_key()).is_ok());
@@ -74,7 +76,6 @@ use thiserror::Error;
 use super::domain_separator::{CHANGESET_PUBLISHED_PREFIX, sign_with_domain, verify_with_domain};
 use super::policy_resolution::MAX_STRING_LENGTH;
 use crate::crypto::{Signature, Signer, VerifyingKey};
-
 // Re-export proto type for wire format serialization
 pub use crate::events::ChangeSetPublished as ChangeSetPublishedProto;
 
@@ -358,7 +359,8 @@ pub struct ChangeSetBundleV1 {
 
 /// Serde helper for hex-encoded 32-byte arrays.
 mod hex_serde {
-    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -407,7 +409,8 @@ impl ChangeSetBundleV1 {
     /// - `diff_format` (len + bytes)
     /// - `diff_hash` (32 bytes)
     /// - `file_manifest` (count + sorted entries)
-    ///   - each entry: `path` (len + bytes) + `change_kind` (1 byte) + `old_path` (1 byte flag + len + bytes if present)
+    ///   - each entry: `path` (len + bytes) + `change_kind` (1 byte) +
+    ///     `old_path` (1 byte flag + len + bytes if present)
     /// - `binary_detected` (1 byte: 0 or 1)
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // All strings are bounded
@@ -481,7 +484,8 @@ impl ChangeSetBundleV1 {
 
     /// Computes the BLAKE3 digest over canonical bytes.
     ///
-    /// This is the deterministic digest computation used for `changeset_digest`.
+    /// This is the deterministic digest computation used for
+    /// `changeset_digest`.
     #[must_use]
     pub fn compute_digest(&self) -> [u8; 32] {
         let canonical = self.canonical_bytes_for_digest();
@@ -603,7 +607,8 @@ impl ChangeSetBundleV1Builder {
 
     /// Builds the `ChangeSetBundleV1`.
     ///
-    /// The `changeset_digest` is computed automatically from the canonical bytes.
+    /// The `changeset_digest` is computed automatically from the canonical
+    /// bytes.
     ///
     /// # Errors
     ///
@@ -669,9 +674,11 @@ impl ChangeSetBundleV1Builder {
 // ChangeSetPublished
 // =============================================================================
 
-/// Event emitted when a changeset is published to CAS and anchored in the ledger.
+/// Event emitted when a changeset is published to CAS and anchored in the
+/// ledger.
 ///
-/// This event MUST be emitted before any review activities begin for a work item.
+/// This event MUST be emitted before any review activities begin for a work
+/// item.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeSetPublished {
     /// Work item ID this changeset belongs to.
@@ -686,7 +693,8 @@ pub struct ChangeSetPublished {
     pub published_at: u64,
     /// Actor who published the changeset.
     pub publisher_actor_id: String,
-    /// Ed25519 signature over canonical bytes with `CHANGESET_PUBLISHED:` domain.
+    /// Ed25519 signature over canonical bytes with `CHANGESET_PUBLISHED:`
+    /// domain.
     #[serde(with = "serde_bytes")]
     pub publisher_signature: [u8; 64],
 }
@@ -923,7 +931,7 @@ mod tests {
         // The changeset_digest is 32 bytes. If it were included, the canonical bytes
         // would contain it. We verify by checking that changing the digest doesn't
         // change the canonical bytes.
-        let mut modified_bundle = bundle.clone();
+        let mut modified_bundle = bundle;
         modified_bundle.changeset_digest = [0xFF; 32];
 
         let modified_canonical = modified_bundle.canonical_bytes_for_digest();
@@ -1042,7 +1050,7 @@ mod tests {
             "work-001".to_string(),
             [0x11; 32],
             [0x22; 32],
-            1704067200000,
+            1_704_067_200_000,
             "publisher-001".to_string(),
             &signer,
         )
@@ -1059,7 +1067,7 @@ mod tests {
             "work-001".to_string(),
             [0x11; 32],
             [0x22; 32],
-            1704067200000,
+            1_704_067_200_000,
             "publisher-001".to_string(),
             &signer,
         )
@@ -1079,7 +1087,7 @@ mod tests {
             "work-001".to_string(),
             [0x11; 32],
             [0x22; 32],
-            1704067200000,
+            1_704_067_200_000,
             "publisher-001".to_string(),
             &signer,
         )
