@@ -92,6 +92,7 @@ use apm2_core::events::{
     DefectRecorded, DefectSource, InterventionFreeze as ProtoInterventionFreeze,
     InterventionResolutionType as ProtoResolutionType, InterventionScope as ProtoScope,
     InterventionUnfreeze as ProtoInterventionUnfreeze, TimeEnvelopeRef,
+    DefectRecorded, DefectSource,
 };
 use apm2_core::fac::{
     INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX, sign_with_domain, verify_with_domain,
