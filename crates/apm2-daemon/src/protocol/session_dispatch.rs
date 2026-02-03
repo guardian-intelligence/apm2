@@ -40,7 +40,8 @@
 //! - [INV-TCK-00290-001] RequestTool requires manifest store (fail-closed)
 //! - [INV-TCK-00290-002] EmitEvent requires ledger (fail-closed)
 //! - [INV-TCK-00290-003] PublishEvidence requires CAS (fail-closed)
-//! - [INV-TCK-00290-004] StreamTelemetry disabled until implemented (fail-closed)
+//! - [INV-TCK-00290-004] StreamTelemetry disabled until implemented
+//!   (fail-closed)
 //!
 //! # Message Flow
 //!
@@ -58,8 +59,8 @@
 //! └─────────────────┘     └─────────────────┘
 //! ```
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use bytes::Bytes;
@@ -286,7 +287,8 @@ impl ManifestStore for InMemoryManifestStore {
 /// - **RequestTool**: Requires `manifest_store` (fail-closed without it)
 /// - **EmitEvent**: Requires `ledger` for persistent events (fail-closed)
 /// - **PublishEvidence**: Requires `cas` for artifact storage (fail-closed)
-/// - **StreamTelemetry**: Explicitly disabled (fail-closed, returns NOT_IMPLEMENTED)
+/// - **StreamTelemetry**: Explicitly disabled (fail-closed, returns
+///   NOT_IMPLEMENTED)
 ///
 /// # Security Contract
 ///
@@ -321,8 +323,9 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
 impl SessionDispatcher<InMemoryManifestStore> {
     /// Creates a new dispatcher with the given token minter.
     ///
-    /// **Note**: This creates a dispatcher without backing stores. Per TCK-00290,
-    /// handlers will return fail-closed errors when their stores are unavailable:
+    /// **Note**: This creates a dispatcher without backing stores. Per
+    /// TCK-00290, handlers will return fail-closed errors when their stores
+    /// are unavailable:
     /// - RequestTool: Returns `TOOL_NOT_ALLOWED` (no manifest store)
     /// - EmitEvent: Returns `SESSION_ERROR_INTERNAL` (no ledger)
     /// - PublishEvidence: Returns `SESSION_ERROR_INTERNAL` (no CAS)
@@ -388,10 +391,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
-    /// Creates a fully-configured dispatcher with all backing stores (TCK-00290).
+    /// Creates a fully-configured dispatcher with all backing stores
+    /// (TCK-00290).
     ///
-    /// This is the production-ready constructor that configures all dependencies
-    /// for real handler implementations:
+    /// This is the production-ready constructor that configures all
+    /// dependencies for real handler implementations:
     /// - `manifest_store`: For RequestTool capability validation
     /// - `ledger`: For EmitEvent persistence
     /// - `cas`: For PublishEvidence artifact storage
@@ -774,8 +778,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// # Security (INV-TCK-00290-003)
     ///
     /// Per SEC-CTRL-FAC-0015 and RFC-0018 HEF requirements, the CAS must be
-    /// configured for this handler to function. Returning stub responses without
-    /// persistence would violate evidence durability requirements.
+    /// configured for this handler to function. Returning stub responses
+    /// without persistence would violate evidence durability requirements.
     fn handle_publish_evidence(
         &self,
         payload: &[u8],
@@ -825,11 +829,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
         // Build storage path using hash prefix sharding (consistent with DurableCas)
         let hex_hash = hex::encode(hash);
-        let storage_path = format!(
-            "evidence/{}/{}",
-            &hex_hash[..4],
-            &hex_hash[4..]
-        );
+        let storage_path = format!("evidence/{}/{}", &hex_hash[..4], &hex_hash[4..]);
 
         info!(
             session_id = %token.session_id,
@@ -995,7 +995,8 @@ mod tests {
     mod session_routing {
         use super::*;
 
-        /// TCK-00290: RequestTool without manifest store returns fail-closed error.
+        /// TCK-00290: RequestTool without manifest store returns fail-closed
+        /// error.
         ///
         /// Per INV-TCK-00290-001, RequestTool requires a manifest store.
         /// Without it, returns SESSION_ERROR_TOOL_NOT_ALLOWED.
@@ -1108,7 +1109,8 @@ mod tests {
 
         /// TCK-00290: StreamTelemetry returns NOT_IMPLEMENTED (fail-closed).
         ///
-        /// Per INV-TCK-00290-004, StreamTelemetry is disabled until implemented.
+        /// Per INV-TCK-00290-004, StreamTelemetry is disabled until
+        /// implemented.
         #[test]
         fn test_stream_telemetry_routing_not_implemented() {
             let minter = test_minter();
@@ -1356,7 +1358,8 @@ mod tests {
         }
     }
 
-    /// TCK-00290: StreamTelemetry returns NOT_IMPLEMENTED even with missing frame.
+    /// TCK-00290: StreamTelemetry returns NOT_IMPLEMENTED even with missing
+    /// frame.
     ///
     /// Since StreamTelemetry is disabled (fail-closed), it doesn't validate the
     /// frame before rejecting with NOT_IMPLEMENTED.

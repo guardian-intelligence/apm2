@@ -22,14 +22,12 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use secrecy::SecretString;
-use tempfile::TempDir;
-
 use apm2_daemon::cas::{DurableCas, DurableCasConfig};
 use apm2_daemon::episode::executor::ContentAddressedStore;
 use apm2_daemon::episode::{
     Capability, CapabilityManifestBuilder, CapabilityScope, RiskTier, ToolClass,
 };
+use apm2_daemon::protocol::LedgerEventEmitter;
 use apm2_daemon::protocol::credentials::PeerCredentials;
 use apm2_daemon::protocol::dispatch::{ConnectionContext, StubLedgerEventEmitter};
 use apm2_daemon::protocol::messages::{
@@ -37,12 +35,12 @@ use apm2_daemon::protocol::messages::{
     RetentionHint, SessionErrorCode, StreamTelemetryRequest, TelemetryFrame,
 };
 use apm2_daemon::protocol::session_dispatch::{
-    InMemoryManifestStore, SessionDispatcher, SessionResponse,
-    encode_emit_event_request, encode_publish_evidence_request, encode_request_tool_request,
-    encode_stream_telemetry_request,
+    InMemoryManifestStore, SessionDispatcher, SessionResponse, encode_emit_event_request,
+    encode_publish_evidence_request, encode_request_tool_request, encode_stream_telemetry_request,
 };
 use apm2_daemon::protocol::session_token::TokenMinter;
-use apm2_daemon::protocol::LedgerEventEmitter;
+use secrecy::SecretString;
+use tempfile::TempDir;
 
 // =============================================================================
 // Test Helpers
@@ -95,7 +93,8 @@ fn make_test_manifest(tools: Vec<ToolClass>) -> apm2_daemon::episode::Capability
 // Verification: cargo test -p apm2-daemon session_request_tool_exec
 // =============================================================================
 
-/// Verify RequestTool with configured manifest store returns Allow for valid tool.
+/// Verify RequestTool with configured manifest store returns Allow for valid
+/// tool.
 #[test]
 fn session_request_tool_exec_allow_with_manifest() {
     let minter = test_minter();
@@ -125,7 +124,10 @@ fn session_request_tool_exec_allow_with_manifest() {
                 DecisionType::Allow as i32,
                 "Tool should be allowed"
             );
-            assert!(!resp.policy_hash.is_empty(), "Policy hash should be present");
+            assert!(
+                !resp.policy_hash.is_empty(),
+                "Policy hash should be present"
+            );
             assert!(
                 resp.request_id.starts_with("REQ-"),
                 "Request ID should have REQ- prefix"
@@ -212,7 +214,8 @@ fn session_request_tool_exec_deny_no_manifest_for_session() {
     }
 }
 
-/// Verify RequestTool with no manifest store configured returns fail-closed error.
+/// Verify RequestTool with no manifest store configured returns fail-closed
+/// error.
 #[test]
 fn session_request_tool_exec_deny_no_store_configured() {
     let minter = test_minter();
@@ -371,7 +374,10 @@ fn session_event_evidence_persist_publish_evidence_success() {
             // Verify artifact was actually stored in CAS
             let hash: [u8; 32] = resp.artifact_hash.try_into().unwrap();
             let retrieved = cas.retrieve(&hash);
-            assert!(retrieved.is_some(), "Artifact should be retrievable from CAS");
+            assert!(
+                retrieved.is_some(),
+                "Artifact should be retrievable from CAS"
+            );
             assert_eq!(
                 retrieved.unwrap(),
                 artifact_content,
@@ -486,12 +492,8 @@ fn session_event_evidence_persist_full_config_integration() {
     store.register("session-001", manifest);
 
     // Create fully-configured dispatcher
-    let dispatcher = SessionDispatcher::with_all_stores(
-        minter.clone(),
-        store,
-        ledger.clone(),
-        cas.clone(),
-    );
+    let dispatcher =
+        SessionDispatcher::with_all_stores(minter.clone(), store, ledger.clone(), cas.clone());
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
@@ -598,7 +600,8 @@ fn session_event_evidence_persist_emit_event_sequence_monotonic() {
     }
 }
 
-/// Verify PublishEvidence with different retention hints returns different TTLs.
+/// Verify PublishEvidence with different retention hints returns different
+/// TTLs.
 #[test]
 fn session_event_evidence_persist_publish_evidence_retention_hints() {
     let temp_dir = TempDir::new().unwrap();
@@ -607,8 +610,7 @@ fn session_event_evidence_persist_publish_evidence_retention_hints() {
     let cas_config = DurableCasConfig::new(temp_dir.path());
     let cas: Arc<dyn ContentAddressedStore> = Arc::new(DurableCas::new(cas_config).unwrap());
 
-    let dispatcher =
-        SessionDispatcher::with_manifest_store(minter.clone(), store).with_cas(cas);
+    let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store).with_cas(cas);
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
