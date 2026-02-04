@@ -4349,12 +4349,12 @@ mod cas_loader_tests {
         let hash = loader.store_manifest(&manifest).expect("should store");
 
         // Load it back
-        let loaded = loader.load_manifest(&hash).expect("should load");
+        let retrieved = loader.load_manifest(&hash).expect("should load");
 
         // Verify it matches
-        assert_eq!(loaded.manifest_id, manifest.manifest_id);
-        assert_eq!(loaded.delegator_id, manifest.delegator_id);
-        assert_eq!(loaded.capabilities.len(), manifest.capabilities.len());
+        assert_eq!(retrieved.manifest_id, manifest.manifest_id);
+        assert_eq!(retrieved.delegator_id, manifest.delegator_id);
+        assert_eq!(retrieved.capabilities.len(), manifest.capabilities.len());
     }
 
     #[test]
