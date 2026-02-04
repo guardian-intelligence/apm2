@@ -22,9 +22,7 @@ fn test_checkout_rejects_argument_injection() {
     let result = manager.checkout("main");
     assert!(matches!(
         result,
-        Err(
-            WorkspaceError::GitOperationFailed(_) | WorkspaceError::BaseCommitNotFound(_)
-        )
+        Err(WorkspaceError::GitOperationFailed(_) | WorkspaceError::BaseCommitNotFound(_))
     ));
 }
 

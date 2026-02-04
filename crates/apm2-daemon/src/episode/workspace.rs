@@ -610,10 +610,7 @@ pub fn validate_path_with_symlink_check(
 /// # Errors
 ///
 /// Returns error if any intermediate directory resolves outside the workspace.
-fn validate_parent_path_symlinks(
-    path: &Path,
-    canonical_root: &Path,
-) -> Result<(), WorkspaceError> {
+fn validate_parent_path_symlinks(path: &Path, canonical_root: &Path) -> Result<(), WorkspaceError> {
     // Walk up the path to find the first existing ancestor
     let mut current = path.to_path_buf();
 
@@ -648,7 +645,8 @@ fn validate_parent_path_symlinks(
 ///
 /// 1. The path passes syntactic validation
 /// 2. If the file exists: the resolved path is within the workspace
-/// 3. If the file doesn't exist: the existing parent path is within the workspace
+/// 3. If the file doesn't exist: the existing parent path is within the
+///    workspace
 ///
 /// This prevents attacks where an intermediate directory is a symlink pointing
 /// outside the workspace (e.g., `workspace/subdir -> /etc/`).
@@ -660,7 +658,8 @@ fn validate_parent_path_symlinks(
 ///
 /// # Errors
 ///
-/// Returns error if the path fails syntactic validation or escapes the workspace.
+/// Returns error if the path fails syntactic validation or escapes the
+/// workspace.
 pub fn validate_path_filesystem_aware(
     path: &str,
     workspace_root: &Path,
@@ -1189,9 +1188,10 @@ impl WorkspaceManager {
     /// # Arguments
     ///
     /// * `work_id` - Unique work identifier
-    /// * `timestamp_ns` - Optional timestamp in nanoseconds. If None, uses current
-    ///   system time. For HTF determinism, callers should pass a timestamp from
-    ///   `HolonicClock` instead of relying on `SystemTime::now()`.
+    /// * `timestamp_ns` - Optional timestamp in nanoseconds. If None, uses
+    ///   current system time. For HTF determinism, callers should pass a
+    ///   timestamp from `HolonicClock` instead of relying on
+    ///   `SystemTime::now()`.
     ///
     /// # Errors
     ///
@@ -1269,9 +1269,9 @@ impl WorkspaceManager {
     /// # Arguments
     ///
     /// * `bundle` - The changeset bundle to apply
-    /// * `timestamp_ns` - Optional timestamp in nanoseconds. If None, uses current
-    ///   system time. For HTF determinism, callers should pass a timestamp from
-    ///   `HolonicClock`.
+    /// * `timestamp_ns` - Optional timestamp in nanoseconds. If None, uses
+    ///   current system time. For HTF determinism, callers should pass a
+    ///   timestamp from `HolonicClock`.
     ///
     /// # Errors
     ///
@@ -1341,9 +1341,9 @@ impl WorkspaceManager {
     ///
     /// * `bundle` - The changeset bundle to apply
     /// * `diff_bytes` - The raw diff bytes
-    /// * `timestamp_ns` - Optional timestamp in nanoseconds. If None, uses current
-    ///   system time. For HTF determinism, callers should pass a timestamp from
-    ///   `HolonicClock`.
+    /// * `timestamp_ns` - Optional timestamp in nanoseconds. If None, uses
+    ///   current system time. For HTF determinism, callers should pass a
+    ///   timestamp from `HolonicClock`.
     ///
     /// # Errors
     ///
@@ -1489,7 +1489,8 @@ impl WorkspaceManager {
     /// to prevent resource exhaustion from oversized files.
     fn verify_file_sizes(&self, bundle: &ChangeSetBundleV1) -> Result<(), WorkspaceError> {
         for change in &bundle.file_manifest {
-            // Only check files that should exist after apply (Add, Modify, or Rename destination)
+            // Only check files that should exist after apply (Add, Modify, or Rename
+            // destination)
             if matches!(
                 change.change_kind,
                 ChangeKind::Add | ChangeKind::Modify | ChangeKind::Rename
@@ -1566,7 +1567,8 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    /// Verifies git apply --numstat output using streaming to prevent memory exhaustion.
+    /// Verifies git apply --numstat output using streaming to prevent memory
+    /// exhaustion.
     fn verify_numstat_output(
         &self,
         diff_bytes: &[u8],
@@ -1644,7 +1646,8 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    /// Verifies git apply --summary output using streaming to prevent memory exhaustion.
+    /// Verifies git apply --summary output using streaming to prevent memory
+    /// exhaustion.
     fn verify_summary_output(
         &self,
         diff_bytes: &[u8],
@@ -1860,11 +1863,15 @@ impl WorkspaceManager {
     /// # Security (BLOCKER FIX #3, MAJOR FIX #5)
     ///
     /// This function implements several security protections:
-    /// - **Symlink protection**: Does not follow symlinks to prevent traversal outside workspace
-    /// - **Depth limit**: Enforces `MAX_PATH_DEPTH` to prevent deep recursion attacks
-    /// - **Count limit**: Enforces `MAX_WORKSPACE_FILES` to prevent memory exhaustion
+    /// - **Symlink protection**: Does not follow symlinks to prevent traversal
+    ///   outside workspace
+    /// - **Depth limit**: Enforces `MAX_PATH_DEPTH` to prevent deep recursion
+    ///   attacks
+    /// - **Count limit**: Enforces `MAX_WORKSPACE_FILES` to prevent memory
+    ///   exhaustion
     fn count_workspace_files(&self) -> Result<usize, WorkspaceError> {
-        /// Counts files recursively with symlink protection and resource limits.
+        /// Counts files recursively with symlink protection and resource
+        /// limits.
         ///
         /// # Arguments
         /// * `path` - Current directory to scan
@@ -2735,8 +2742,7 @@ mod tests {
             Err(WorkspaceError::SymlinkEscape { path }) => {
                 assert!(
                     path.contains("outside") || path.contains("evil_dir"),
-                    "Error path should reference the escaped location, got: {}",
-                    path
+                    "Error path should reference the escaped location, got: {path}"
                 );
             },
             Err(other) => panic!("Expected SymlinkEscape, got: {other:?}"),
@@ -2803,7 +2809,8 @@ mod tests {
         }
     }
 
-    /// BLOCKER FIX #3: Test that count_workspace_files doesn't follow symlinks
+    /// BLOCKER FIX #3: Test that `count_workspace_files` doesn't follow
+    /// symlinks
     #[cfg(unix)]
     #[test]
     fn test_count_workspace_files_no_symlink_follow() {
@@ -2837,12 +2844,11 @@ mod tests {
         // NOT 2 + 1000 from the outside directory
         assert!(
             count <= 10,
-            "File count should be small (symlinks not followed), got: {}",
-            count
+            "File count should be small (symlinks not followed), got: {count}"
         );
     }
 
-    /// MAJOR FIX #5: Test recursion depth limit in count_workspace_files
+    /// MAJOR FIX #5: Test recursion depth limit in `count_workspace_files`
     #[test]
     fn test_count_workspace_files_depth_limit() {
         // Create temp directory
@@ -2862,12 +2868,11 @@ mod tests {
         // Should fail with RecursionDepthExceeded
         assert!(
             matches!(result, Err(WorkspaceError::RecursionDepthExceeded { .. })),
-            "Expected RecursionDepthExceeded, got: {:?}",
-            result
+            "Expected RecursionDepthExceeded, got: {result:?}"
         );
     }
 
-    /// MAJOR FIX #6: Test MAX_FILE_SIZE enforcement
+    /// MAJOR FIX #6: Test `MAX_FILE_SIZE` enforcement
     #[test]
     fn test_file_too_large_error() {
         let err = WorkspaceError::FileTooLarge {
@@ -2896,7 +2901,7 @@ mod tests {
         assert_eq!(snapshot.snapshot_at_ns, explicit_ts);
     }
 
-    /// MAJOR FIX #7: Test apply_with_timestamp for HTF determinism
+    /// MAJOR FIX #7: Test `apply_with_timestamp` for HTF determinism
     #[test]
     fn test_apply_with_explicit_timestamp() {
         use apm2_core::fac::{FileChange, GitObjectRef, HashAlgo};
@@ -2949,7 +2954,7 @@ mod tests {
         assert!(err.is_retryable());
     }
 
-    /// Test validate_parent_path_symlinks function
+    /// Test `validate_parent_path_symlinks` function
     #[cfg(unix)]
     #[test]
     fn test_validate_parent_path_symlinks() {
@@ -2975,14 +2980,13 @@ mod tests {
 
         assert!(
             matches!(result, Err(WorkspaceError::SymlinkEscape { .. })),
-            "Expected SymlinkEscape, got: {:?}",
-            result
+            "Expected SymlinkEscape, got: {result:?}"
         );
 
         // Test with a valid path (no symlinks)
         let valid_path = workspace_root.join("subdir").join("nonexistent.txt");
         std::fs::create_dir_all(workspace_root.join("subdir")).expect("create subdir");
         let result = validate_parent_path_symlinks(&valid_path, &canonical_root);
-        assert!(result.is_ok(), "Valid path should succeed: {:?}", result);
+        assert!(result.is_ok(), "Valid path should succeed: {result:?}");
     }
 }
