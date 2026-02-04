@@ -1,7 +1,7 @@
-use std::path::PathBuf;
+//! TCK-00318 security tests for workspace operations.
 
 use apm2_core::fac::{ChangeKind, ChangeSetBundleV1, FileChange, GitObjectRef, HashAlgo};
-use apm2_daemon::episode::workspace::{WorkspaceConfig, WorkspaceError, WorkspaceManager};
+use apm2_daemon::episode::workspace::{WorkspaceError, WorkspaceManager};
 
 #[test]
 fn test_checkout_rejects_argument_injection() {
@@ -22,7 +22,9 @@ fn test_checkout_rejects_argument_injection() {
     let result = manager.checkout("main");
     assert!(matches!(
         result,
-        Err(WorkspaceError::GitOperationFailed(_)) | Err(WorkspaceError::BaseCommitNotFound(_))
+        Err(
+            WorkspaceError::GitOperationFailed(_) | WorkspaceError::BaseCommitNotFound(_)
+        )
     ));
 }
 
@@ -88,7 +90,7 @@ fn test_apply_rejects_diff_manifest_mismatch() {
         Err(WorkspaceError::DiffManifestMismatch { diff_path }) => {
             assert!(diff_path.contains("secret.txt"));
         },
-        Err(e) => panic!("Expected DiffManifestMismatch, got: {:?}", e),
+        Err(e) => panic!("Expected DiffManifestMismatch, got: {e:?}"),
         Ok(_) => panic!("Expected error, got success"),
     }
 }

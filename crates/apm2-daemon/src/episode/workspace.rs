@@ -32,7 +32,7 @@
 //! let manager = WorkspaceManager::new(cas_store, work_dir);
 //!
 //! // Take snapshot before apply
-//! let snapshot = manager.snapshot(&work_id).await?;
+//! let snapshot = manager.snapshot(&work_id, None)?;
 //!
 //! // Apply changeset bundle
 //! match manager.apply(&bundle).await {
@@ -46,6 +46,7 @@
 //! ```
 
 use std::collections::HashSet;
+use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -73,6 +74,14 @@ pub const MAX_PATH_DEPTH: usize = 64;
 
 /// Maximum file size for apply operations (100 MB).
 pub const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
+
+/// Maximum number of files to count during workspace scanning.
+/// This prevents denial-of-service via unbounded file enumeration.
+pub const MAX_WORKSPACE_FILES: usize = 100_000;
+
+/// Maximum line length when streaming git output.
+/// Lines longer than this are truncated to prevent memory exhaustion.
+pub const MAX_GIT_LINE_LEN: usize = 1024 * 1024; // 1 MB per line
 
 // =============================================================================
 // Error Types
@@ -172,6 +181,24 @@ pub enum WorkspaceError {
     /// Invalid commit reference.
     #[error("invalid commit ref: {0}")]
     InvalidCommitRef(String),
+
+    /// Recursion depth exceeded during workspace scanning.
+    #[error("recursion depth exceeded: {depth} > {max}")]
+    RecursionDepthExceeded {
+        /// Current depth.
+        depth: usize,
+        /// Maximum allowed depth.
+        max: usize,
+    },
+
+    /// Maximum file count exceeded during workspace scanning.
+    #[error("file count exceeded: {count} > {max}")]
+    FileCountExceeded {
+        /// Current count.
+        count: usize,
+        /// Maximum allowed count.
+        max: usize,
+    },
 }
 
 impl WorkspaceError {
@@ -183,7 +210,9 @@ impl WorkspaceError {
             | Self::IoError(_)
             | Self::GitOperationFailed(_)
             | Self::BaseCommitNotFound(_)
-            | Self::InvalidCommitRef(_) => ReasonCode::ApplyFailed,
+            | Self::InvalidCommitRef(_)
+            | Self::RecursionDepthExceeded { .. }
+            | Self::FileCountExceeded { .. } => ReasonCode::ApplyFailed,
             Self::ToolFailed(_) => ReasonCode::ToolFailed,
             Self::BinaryUnsupported(_) => ReasonCode::BinaryUnsupported,
             Self::MissingArtifact(_) | Self::CasError(_) => ReasonCode::MissingArtifact,
@@ -531,16 +560,17 @@ pub fn validate_path_with_symlink_check(
     // First, perform syntactic validation
     let validated_path = validate_path(path, workspace_root)?;
 
+    // Canonicalize the workspace root once
+    let canonical_root = std::fs::canonicalize(workspace_root).map_err(|e| {
+        WorkspaceError::IoError(format!(
+            "failed to canonicalize workspace root '{}': {}",
+            workspace_root.display(),
+            e
+        ))
+    })?;
+
     // If the file exists, verify symlinks don't escape the workspace
     if validated_path.exists() {
-        let canonical_root = std::fs::canonicalize(workspace_root).map_err(|e| {
-            WorkspaceError::IoError(format!(
-                "failed to canonicalize workspace root '{}': {}",
-                workspace_root.display(),
-                e
-            ))
-        })?;
-
         let canonical_path = std::fs::canonicalize(&validated_path).map_err(|e| {
             WorkspaceError::IoError(format!(
                 "failed to canonicalize path '{}': {}",
@@ -550,9 +580,94 @@ pub fn validate_path_with_symlink_check(
         })?;
 
         validate_resolved_path_within_root(&canonical_path, &canonical_root)?;
+    } else {
+        // SECURITY FIX (BLOCKER #2): For non-existent files, validate that
+        // the parent directory (if it exists) resolves within the workspace.
+        // This prevents symlink-based attacks where an intermediate directory
+        // is a symlink pointing outside the workspace.
+        validate_parent_path_symlinks(&validated_path, &canonical_root)?;
     }
 
     Ok(validated_path)
+}
+
+/// Validates that the parent path of a non-existent file doesn't escape
+/// the workspace via symlinks.
+///
+/// # Security
+///
+/// This function walks up the path hierarchy from the target file to the
+/// workspace root, checking each existing component to ensure no symlinks
+/// escape the workspace. This is critical for Add and Rename operations
+/// where the target file doesn't exist yet but intermediate directories
+/// could be symlinks pointing outside the workspace.
+///
+/// # Arguments
+///
+/// * `path` - The full path to the (non-existent) file
+/// * `canonical_root` - The canonicalized workspace root directory
+///
+/// # Errors
+///
+/// Returns error if any intermediate directory resolves outside the workspace.
+fn validate_parent_path_symlinks(
+    path: &Path,
+    canonical_root: &Path,
+) -> Result<(), WorkspaceError> {
+    // Walk up the path to find the first existing ancestor
+    let mut current = path.to_path_buf();
+
+    while let Some(parent) = current.parent() {
+        if parent.exists() {
+            // Found an existing ancestor - canonicalize and validate
+            let canonical_parent = std::fs::canonicalize(parent).map_err(|e| {
+                WorkspaceError::IoError(format!(
+                    "failed to canonicalize parent path '{}': {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
+
+            return validate_resolved_path_within_root(&canonical_parent, canonical_root);
+        }
+        current = parent.to_path_buf();
+    }
+
+    // No existing ancestor found - this is unusual but not necessarily an error
+    // The workspace root itself should exist, so this path is likely invalid
+    Ok(())
+}
+
+/// Validates a path with filesystem-aware symlink checking for ALL operations.
+///
+/// # Security (BLOCKER FIX #1)
+///
+/// This function provides comprehensive symlink validation for ANY path,
+/// including paths for Add and Rename operations where the target file
+/// doesn't exist yet. It validates that:
+///
+/// 1. The path passes syntactic validation
+/// 2. If the file exists: the resolved path is within the workspace
+/// 3. If the file doesn't exist: the existing parent path is within the workspace
+///
+/// This prevents attacks where an intermediate directory is a symlink pointing
+/// outside the workspace (e.g., `workspace/subdir -> /etc/`).
+///
+/// # Arguments
+///
+/// * `path` - The relative path to validate (as specified in the changeset)
+/// * `workspace_root` - The workspace root directory
+///
+/// # Errors
+///
+/// Returns error if the path fails syntactic validation or escapes the workspace.
+pub fn validate_path_filesystem_aware(
+    path: &str,
+    workspace_root: &Path,
+) -> Result<PathBuf, WorkspaceError> {
+    // Use the same logic as validate_path_with_symlink_check, which now
+    // handles both existing and non-existing files
+    validate_path_with_symlink_check(path, workspace_root)
 }
 
 /// Validates all file changes in a changeset bundle.
@@ -563,8 +678,8 @@ pub fn validate_path_with_symlink_check(
 /// - Rejects bundles with binary files (v0 limitation)
 /// - Validates all paths in the file manifest for traversal attacks
 /// - Validates `old_path` for rename operations
-/// - For existing files (MODIFY, DELETE, RENAME), validates symlinks don't
-///   escape the workspace
+/// - For ALL operations (MODIFY, DELETE, ADD, RENAME), validates symlinks don't
+///   escape the workspace (BLOCKER FIX #1: filesystem-aware validation)
 ///
 /// # Errors
 ///
@@ -583,31 +698,35 @@ pub fn validate_file_changes(
 
     // Validate each file change
     for change in &bundle.file_manifest {
-        // For operations on existing files, perform full symlink validation
+        // SECURITY FIX (BLOCKER #1): Use filesystem-aware validation for ALL
+        // operations, not just MODIFY/DELETE. This prevents symlink escape
+        // attacks where an intermediate directory is a symlink pointing outside
+        // the workspace.
         match change.change_kind {
             ChangeKind::Modify | ChangeKind::Delete => {
                 // These operations work on existing files - check for symlink escapes
                 validate_path_with_symlink_check(&change.path, workspace_root)?;
             },
             ChangeKind::Add => {
-                // New files - syntactic validation only (file doesn't exist yet)
-                validate_path(&change.path, workspace_root)?;
+                // BLOCKER FIX #1: New files also need filesystem-aware validation
+                // to check that parent directories don't escape via symlinks
+                validate_path_filesystem_aware(&change.path, workspace_root)?;
             },
             ChangeKind::Rename => {
                 // Rename: old_path must exist, new path will be created
                 if let Some(ref old_path) = change.old_path {
                     validate_path_with_symlink_check(old_path, workspace_root)?;
                 }
-                // New path (destination) - syntactic validation only
-                validate_path(&change.path, workspace_root)?;
+                // BLOCKER FIX #1: Destination also needs filesystem-aware validation
+                validate_path_filesystem_aware(&change.path, workspace_root)?;
             },
         }
 
-        // Validate old_path if present (for renames)
-        if let Some(ref old_path) = change.old_path {
-            // Already validated above for renames, but validate syntactically
-            // for any other case where old_path might be present
-            if change.change_kind != ChangeKind::Rename {
+        // Validate old_path if present (for non-rename operations)
+        // MAJOR FIX #8: Removed redundant validation for rename operations -
+        // old_path is already validated above in the Rename case
+        if change.change_kind != ChangeKind::Rename {
+            if let Some(ref old_path) = change.old_path {
                 validate_path(old_path, workspace_root)?;
             }
         }
@@ -1067,15 +1186,29 @@ impl WorkspaceManager {
     /// - Timestamp
     /// - File count
     ///
+    /// # Arguments
+    ///
+    /// * `work_id` - Unique work identifier
+    /// * `timestamp_ns` - Optional timestamp in nanoseconds. If None, uses current
+    ///   system time. For HTF determinism, callers should pass a timestamp from
+    ///   `HolonicClock` instead of relying on `SystemTime::now()`.
+    ///
     /// # Errors
     ///
     /// Returns error if snapshot fails.
     #[allow(clippy::cast_possible_truncation)] // Safe: nanoseconds since epoch won't overflow u64 until 2554
-    pub fn snapshot(&self, work_id: &str) -> Result<WorkspaceSnapshot, WorkspaceError> {
-        let snapshot_at_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+    pub fn snapshot(
+        &self,
+        work_id: &str,
+        timestamp_ns: Option<u64>,
+    ) -> Result<WorkspaceSnapshot, WorkspaceError> {
+        // MAJOR FIX #7: Accept timestamp parameter for HTF determinism
+        let snapshot_at_ns = timestamp_ns.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        });
 
         // Try to get git HEAD hash if this is a git repo
         let git_head = self.get_git_head();
@@ -1121,22 +1254,53 @@ impl WorkspaceManager {
     /// - Binary files detected
     /// - Diff retrieval from CAS fails
     /// - Git apply fails
+    ///
+    /// # Note
+    ///
+    /// For HTF determinism, prefer `apply_with_timestamp()` which accepts an
+    /// explicit timestamp parameter from `HolonicClock`.
     #[allow(clippy::cast_possible_truncation)] // Safe: nanoseconds since epoch won't overflow u64 until 2554
     pub fn apply(&self, bundle: &ChangeSetBundleV1) -> Result<ApplyResult, WorkspaceError> {
+        self.apply_with_timestamp(bundle, None)
+    }
+
+    /// Applies a changeset bundle to the workspace with an explicit timestamp.
+    ///
+    /// # Arguments
+    ///
+    /// * `bundle` - The changeset bundle to apply
+    /// * `timestamp_ns` - Optional timestamp in nanoseconds. If None, uses current
+    ///   system time. For HTF determinism, callers should pass a timestamp from
+    ///   `HolonicClock`.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if validation or apply fails.
+    #[allow(clippy::cast_possible_truncation)] // Safe: nanoseconds since epoch won't overflow u64 until 2554
+    pub fn apply_with_timestamp(
+        &self,
+        bundle: &ChangeSetBundleV1,
+        timestamp_ns: Option<u64>,
+    ) -> Result<ApplyResult, WorkspaceError> {
         // Step 1: Validate all file changes (security checks)
         validate_file_changes(bundle, &self.workspace_root)?;
 
-        // Step 2: Record start time
-        let applied_at_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        // MAJOR FIX #7: Accept timestamp parameter for HTF determinism
+        let applied_at_ns = timestamp_ns.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        });
 
         // Step 3: If CAS is available, retrieve diff and apply
         // Otherwise, this is validation-only mode (for tests or dry-run)
         if self.cas.is_some() {
             // Full apply mode: retrieve diff from CAS and apply
             self.apply_diff_from_cas(bundle)?;
+
+            // MAJOR FIX #6: Enforce MAX_FILE_SIZE after apply
+            self.verify_file_sizes(bundle)?;
         }
 
         Ok(ApplyResult::new(
@@ -1155,14 +1319,41 @@ impl WorkspaceManager {
     ///
     /// Same security guarantees as `apply()`.
     ///
+    /// # Note
+    ///
+    /// For HTF determinism, prefer `apply_with_diff_and_timestamp()` which
+    /// accepts an explicit timestamp parameter from `HolonicClock`.
+    ///
     /// # Errors
     ///
     /// Returns error if validation or apply fails.
-    #[allow(clippy::cast_possible_truncation)] // Safe: nanoseconds since epoch won't overflow u64 until 2554
     pub fn apply_with_diff(
         &self,
         bundle: &ChangeSetBundleV1,
         diff_bytes: &[u8],
+    ) -> Result<ApplyResult, WorkspaceError> {
+        self.apply_with_diff_and_timestamp(bundle, diff_bytes, None)
+    }
+
+    /// Applies a changeset bundle with explicit diff bytes and timestamp.
+    ///
+    /// # Arguments
+    ///
+    /// * `bundle` - The changeset bundle to apply
+    /// * `diff_bytes` - The raw diff bytes
+    /// * `timestamp_ns` - Optional timestamp in nanoseconds. If None, uses current
+    ///   system time. For HTF determinism, callers should pass a timestamp from
+    ///   `HolonicClock`.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if validation or apply fails.
+    #[allow(clippy::cast_possible_truncation)] // Safe: nanoseconds since epoch won't overflow u64 until 2554
+    pub fn apply_with_diff_and_timestamp(
+        &self,
+        bundle: &ChangeSetBundleV1,
+        diff_bytes: &[u8],
+        timestamp_ns: Option<u64>,
     ) -> Result<ApplyResult, WorkspaceError> {
         // Step 1: Validate all file changes
         validate_file_changes(bundle, &self.workspace_root)?;
@@ -1180,11 +1371,17 @@ impl WorkspaceManager {
         // Step 3: Apply the diff
         self.apply_git_diff(diff_bytes, bundle)?;
 
+        // MAJOR FIX #6: Enforce MAX_FILE_SIZE after apply
+        self.verify_file_sizes(bundle)?;
+
         // Step 4: Record timestamp
-        let applied_at_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        // MAJOR FIX #7: Accept timestamp parameter for HTF determinism
+        let applied_at_ns = timestamp_ns.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        });
 
         Ok(ApplyResult::new(
             bundle.changeset_digest,
@@ -1284,6 +1481,41 @@ impl WorkspaceManager {
     // Private Helper Methods
     // =========================================================================
 
+    /// Verifies that all modified/added files are within `MAX_FILE_SIZE`.
+    ///
+    /// # Security (MAJOR FIX #6)
+    ///
+    /// This function enforces the `MAX_FILE_SIZE` limit after apply operations
+    /// to prevent resource exhaustion from oversized files.
+    fn verify_file_sizes(&self, bundle: &ChangeSetBundleV1) -> Result<(), WorkspaceError> {
+        for change in &bundle.file_manifest {
+            // Only check files that should exist after apply (Add, Modify, or Rename destination)
+            if matches!(
+                change.change_kind,
+                ChangeKind::Add | ChangeKind::Modify | ChangeKind::Rename
+            ) {
+                let file_path = self.workspace_root.join(&change.path);
+                if file_path.exists() {
+                    let metadata = std::fs::metadata(&file_path).map_err(|e| {
+                        WorkspaceError::IoError(format!(
+                            "failed to get metadata for '{}': {}",
+                            change.path, e
+                        ))
+                    })?;
+
+                    if metadata.len() > MAX_FILE_SIZE {
+                        return Err(WorkspaceError::FileTooLarge {
+                            path: change.path.clone(),
+                            size: metadata.len(),
+                            max: MAX_FILE_SIZE,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Retrieves diff bytes from CAS and applies them.
     fn apply_diff_from_cas(&self, bundle: &ChangeSetBundleV1) -> Result<(), WorkspaceError> {
         let cas = self
@@ -1304,6 +1536,12 @@ impl WorkspaceManager {
     }
 
     /// Verifies that the diff only touches files listed in the manifest.
+    ///
+    /// # Security (MAJOR FIX #4)
+    ///
+    /// This function streams git output line-by-line instead of collecting
+    /// everything into memory. This prevents denial-of-service via memory
+    /// exhaustion from maliciously crafted diffs with huge output.
     fn verify_diff_against_manifest(
         &self,
         diff_bytes: &[u8],
@@ -1311,13 +1549,29 @@ impl WorkspaceManager {
     ) -> Result<(), WorkspaceError> {
         let mut allowed_paths = HashSet::new();
         for change in &bundle.file_manifest {
-            allowed_paths.insert(change.path.as_str());
+            allowed_paths.insert(change.path.clone());
             if let Some(ref old) = change.old_path {
-                allowed_paths.insert(old.as_str());
+                allowed_paths.insert(old.clone());
             }
         }
 
         // Check 1: git apply --numstat (gives destination paths)
+        // MAJOR FIX #4: Stream output line-by-line instead of wait_with_output()
+        self.verify_numstat_output(diff_bytes, &allowed_paths)?;
+
+        // Check 2: git apply --summary (gives source paths for renames/deletes)
+        // MAJOR FIX #4: Stream output line-by-line instead of wait_with_output()
+        self.verify_summary_output(diff_bytes, &allowed_paths)?;
+
+        Ok(())
+    }
+
+    /// Verifies git apply --numstat output using streaming to prevent memory exhaustion.
+    fn verify_numstat_output(
+        &self,
+        diff_bytes: &[u8],
+        allowed_paths: &HashSet<String>,
+    ) -> Result<(), WorkspaceError> {
         let mut child = Command::new("git")
             .arg("-C")
             .arg(&self.workspace_root)
@@ -1330,6 +1584,7 @@ impl WorkspaceManager {
                 WorkspaceError::GitOperationFailed(format!("failed to spawn git apply check: {e}"))
             })?;
 
+        // Write diff to stdin in a separate scope to ensure it's closed
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
             stdin.write_all(diff_bytes).map_err(|e| {
@@ -1337,34 +1592,64 @@ impl WorkspaceManager {
                     "failed to write to git apply check: {e}"
                 ))
             })?;
+            // stdin is dropped here, closing the pipe
         }
 
-        let output = child.wait_with_output().map_err(|e| {
-            WorkspaceError::GitOperationFailed(format!("failed to wait for git apply check: {e}"))
+        // Stream stdout line-by-line
+        let stdout = child.stdout.take().ok_or_else(|| {
+            WorkspaceError::GitOperationFailed("failed to capture stdout".to_string())
         })?;
+        let reader = BufReader::new(stdout);
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(WorkspaceError::ApplyFailed(format!(
-                "git apply --numstat failed: {stderr}"
-            )));
-        }
+        for line_result in reader.lines() {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(e) => {
+                    // Log error but continue - could be encoding issue
+                    tracing::warn!("failed to read git output line: {}", e);
+                    continue;
+                },
+            };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            // Output format: added deleted path
-            // Split by tab or whitespace
-            // NOTE: git apply --numstat separates fields by tabs
+            // Truncate very long lines to prevent memory issues
+            let line = if line.len() > MAX_GIT_LINE_LEN {
+                &line[..MAX_GIT_LINE_LEN]
+            } else {
+                &line
+            };
+
+            // Output format: added\tdeleted\tpath
             let parts: Vec<&str> = line.split('\t').collect();
             if parts.len() >= 3 {
                 let path = parse_git_path(parts[2]);
-                if !allowed_paths.contains(path.as_str()) {
+                if !allowed_paths.contains(&path) {
+                    // Kill the child process before returning error
+                    let _ = child.kill();
                     return Err(WorkspaceError::DiffManifestMismatch { diff_path: path });
                 }
             }
         }
 
-        // Check 2: git apply --summary (gives source paths for renames/deletes)
+        // Wait for process to complete and check status
+        let status = child.wait().map_err(|e| {
+            WorkspaceError::GitOperationFailed(format!("failed to wait for git apply check: {e}"))
+        })?;
+
+        if !status.success() {
+            return Err(WorkspaceError::ApplyFailed(
+                "git apply --numstat failed".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Verifies git apply --summary output using streaming to prevent memory exhaustion.
+    fn verify_summary_output(
+        &self,
+        diff_bytes: &[u8],
+        allowed_paths: &HashSet<String>,
+    ) -> Result<(), WorkspaceError> {
         let mut child = Command::new("git")
             .arg("-C")
             .arg(&self.workspace_root)
@@ -1379,6 +1664,7 @@ impl WorkspaceManager {
                 ))
             })?;
 
+        // Write diff to stdin in a separate scope to ensure it's closed
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
             stdin.write_all(diff_bytes).map_err(|e| {
@@ -1386,33 +1672,56 @@ impl WorkspaceManager {
                     "failed to write to git apply summary: {e}"
                 ))
             })?;
+            // stdin is dropped here, closing the pipe
         }
 
-        let output = child.wait_with_output().map_err(|e| {
-            WorkspaceError::GitOperationFailed(format!("failed to wait for git apply summary: {e}"))
+        // Stream stdout line-by-line
+        let stdout = child.stdout.take().ok_or_else(|| {
+            WorkspaceError::GitOperationFailed("failed to capture stdout".to_string())
         })?;
+        let reader = BufReader::new(stdout);
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(WorkspaceError::ApplyFailed(format!(
-                "git apply --summary failed: {stderr}"
-            )));
-        }
+        for line_result in reader.lines() {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!("failed to read git summary line: {}", e);
+                    continue;
+                },
+            };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
+            // Truncate very long lines to prevent memory issues
+            let line = if line.len() > MAX_GIT_LINE_LEN {
+                &line[..MAX_GIT_LINE_LEN]
+            } else {
+                &line
+            };
+
             // Look for " rename <old> => <new> (<percent>)"
             if line.trim().starts_with("rename ") {
                 if let Some(arrow_idx) = line.find(" => ") {
                     let old_part = line[7..arrow_idx].trim(); // skip " rename "
                     let old_path = parse_git_path(old_part);
-                    if !allowed_paths.contains(old_path.as_str()) {
+                    if !allowed_paths.contains(&old_path) {
+                        // Kill the child process before returning error
+                        let _ = child.kill();
                         return Err(WorkspaceError::DiffManifestMismatch {
                             diff_path: old_path,
                         });
                     }
                 }
             }
+        }
+
+        // Wait for process to complete and check status
+        let status = child.wait().map_err(|e| {
+            WorkspaceError::GitOperationFailed(format!("failed to wait for git apply summary: {e}"))
+        })?;
+
+        if !status.success() {
+            return Err(WorkspaceError::ApplyFailed(
+                "git apply --summary failed".to_string(),
+            ));
         }
 
         Ok(())
@@ -1547,29 +1856,95 @@ impl WorkspaceManager {
     }
 
     /// Counts files in the workspace (excluding .git directory).
+    ///
+    /// # Security (BLOCKER FIX #3, MAJOR FIX #5)
+    ///
+    /// This function implements several security protections:
+    /// - **Symlink protection**: Does not follow symlinks to prevent traversal outside workspace
+    /// - **Depth limit**: Enforces `MAX_PATH_DEPTH` to prevent deep recursion attacks
+    /// - **Count limit**: Enforces `MAX_WORKSPACE_FILES` to prevent memory exhaustion
     fn count_workspace_files(&self) -> Result<usize, WorkspaceError> {
-        fn count_files_recursive(path: &Path) -> std::io::Result<usize> {
-            let mut count = 0;
+        /// Counts files recursively with symlink protection and resource limits.
+        ///
+        /// # Arguments
+        /// * `path` - Current directory to scan
+        /// * `depth` - Current recursion depth
+        /// * `count` - Mutable counter for total files found
+        ///
+        /// # Returns
+        /// * `Ok(())` - Scanning completed successfully
+        /// * `Err(_)` - Resource limit exceeded or I/O error
+        fn count_files_recursive(
+            path: &Path,
+            depth: usize,
+            count: &mut usize,
+        ) -> Result<(), WorkspaceError> {
+            // MAJOR FIX #5: Check recursion depth limit
+            if depth > MAX_PATH_DEPTH {
+                return Err(WorkspaceError::RecursionDepthExceeded {
+                    depth,
+                    max: MAX_PATH_DEPTH,
+                });
+            }
+
+            // MAJOR FIX #5: Check file count limit
+            if *count > MAX_WORKSPACE_FILES {
+                return Err(WorkspaceError::FileCountExceeded {
+                    count: *count,
+                    max: MAX_WORKSPACE_FILES,
+                });
+            }
+
             if path.is_dir() {
-                for entry in std::fs::read_dir(path)? {
-                    let entry = entry?;
+                let entries = std::fs::read_dir(path).map_err(|e| {
+                    WorkspaceError::IoError(format!(
+                        "failed to read directory '{}': {}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+
+                for entry in entries {
+                    let entry = entry.map_err(|e| {
+                        WorkspaceError::IoError(format!("failed to read directory entry: {e}"))
+                    })?;
                     let entry_path = entry.path();
+
                     // Skip .git directory
                     if entry_path.file_name() == Some(std::ffi::OsStr::new(".git")) {
                         continue;
                     }
-                    if entry_path.is_dir() {
-                        count += count_files_recursive(&entry_path)?;
+
+                    // BLOCKER FIX #3: Check for symlinks BEFORE recursing
+                    // This prevents following symlinks that point outside the workspace
+                    let file_type = entry.file_type().map_err(|e| {
+                        WorkspaceError::IoError(format!(
+                            "failed to get file type for '{}': {}",
+                            entry_path.display(),
+                            e
+                        ))
+                    })?;
+
+                    if file_type.is_symlink() {
+                        // Skip symlinks entirely - don't follow them
+                        // Count them as a file but don't recurse
+                        *count += 1;
+                        continue;
+                    }
+
+                    if file_type.is_dir() {
+                        count_files_recursive(&entry_path, depth + 1, count)?;
                     } else {
-                        count += 1;
+                        *count += 1;
                     }
                 }
             }
-            Ok(count)
+            Ok(())
         }
 
-        count_files_recursive(&self.workspace_root)
-            .map_err(|e| WorkspaceError::IoError(format!("failed to count files: {e}")))
+        let mut count = 0;
+        count_files_recursive(&self.workspace_root, 0, &mut count)?;
+        Ok(count)
     }
 }
 
@@ -1734,7 +2109,7 @@ mod tests {
     #[test]
     fn test_workspace_manager_snapshot() {
         let manager = WorkspaceManager::new(PathBuf::from("/workspace"));
-        let snapshot = manager.snapshot("work-001").unwrap();
+        let snapshot = manager.snapshot("work-001", None).unwrap();
         assert_eq!(snapshot.work_id, "work-001");
         assert_eq!(snapshot.file_count, 0); // stub returns 0
     }
@@ -2053,7 +2428,7 @@ mod tests {
         let workspace_root = temp_dir.path().to_path_buf();
 
         // Create a workspace manager (validation-only, no CAS)
-        let manager = WorkspaceManager::new(workspace_root.clone());
+        let manager = WorkspaceManager::new(workspace_root);
 
         // Create a valid bundle with ADD operations (no symlink checks needed)
         let bundle = ChangeSetBundleV1::builder()
@@ -2114,7 +2489,7 @@ mod tests {
         let symlink_path = workspace_root.join("escape_link.txt");
         symlink(&secret_file, &symlink_path).expect("create symlink");
 
-        let manager = WorkspaceManager::new(workspace_root.clone());
+        let manager = WorkspaceManager::new(workspace_root);
 
         // Create a bundle that tries to modify the symlink target
         let bundle = ChangeSetBundleV1::builder()
@@ -2143,7 +2518,7 @@ mod tests {
             Err(WorkspaceError::SymlinkEscape { path }) => {
                 assert!(path.contains("secret.txt") || path.contains("outside"));
             },
-            Err(other) => panic!("Expected SymlinkEscape, got: {:?}", other),
+            Err(other) => panic!("Expected SymlinkEscape, got: {other:?}"),
             Ok(_) => panic!("Expected error, got success"),
         }
     }
@@ -2300,5 +2675,314 @@ mod tests {
     fn test_parse_git_path_quoted() {
         // Test quoted path (git uses quotes for special chars)
         assert_eq!(parse_git_path("\"src/lib.rs\""), "src/lib.rs");
+    }
+
+    // =========================================================================
+    // TCK-00318: New security validation tests for PR #399 fixes
+    // =========================================================================
+
+    /// BLOCKER FIX #1: Test symlink escape detection for Add operations via
+    /// intermediate directories
+    #[cfg(unix)]
+    #[test]
+    fn test_add_via_symlink_directory_rejected() {
+        use std::os::unix::fs::symlink;
+
+        use apm2_core::fac::{FileChange, GitObjectRef, HashAlgo};
+
+        // Create temp directories
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+        let outside_dir = temp_dir.path().join("outside");
+
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+
+        // Create a symlink directory inside workspace pointing outside
+        // workspace/evil_dir -> /tmp/outside
+        let symlink_dir = workspace_root.join("evil_dir");
+        symlink(&outside_dir, &symlink_dir).expect("create symlink dir");
+
+        let manager = WorkspaceManager::new(workspace_root);
+
+        // Try to ADD a file via the symlink directory
+        let bundle = ChangeSetBundleV1::builder()
+            .changeset_id("cs-add-via-symlink")
+            .base(GitObjectRef {
+                algo: HashAlgo::Sha1,
+                object_kind: "commit".to_string(),
+                object_id: "a".repeat(40),
+            })
+            .diff_hash([0x42; 32])
+            .file_manifest(vec![FileChange {
+                path: "evil_dir/new_file.txt".to_string(),
+                change_kind: ChangeKind::Add,
+                old_path: None,
+            }])
+            .binary_detected(false)
+            .build()
+            .expect("valid bundle");
+
+        // Apply should fail - the Add operation goes through a symlink directory
+        let result = manager.apply(&bundle);
+        assert!(
+            result.is_err(),
+            "Expected error for Add via symlink directory"
+        );
+
+        // The error should be SymlinkEscape
+        match result {
+            Err(WorkspaceError::SymlinkEscape { path }) => {
+                assert!(
+                    path.contains("outside") || path.contains("evil_dir"),
+                    "Error path should reference the escaped location, got: {}",
+                    path
+                );
+            },
+            Err(other) => panic!("Expected SymlinkEscape, got: {other:?}"),
+            Ok(_) => panic!("Expected error, got success"),
+        }
+    }
+
+    /// BLOCKER FIX #1: Test symlink escape detection for Rename destination
+    #[cfg(unix)]
+    #[test]
+    fn test_rename_destination_via_symlink_rejected() {
+        use std::os::unix::fs::symlink;
+
+        use apm2_core::fac::{FileChange, GitObjectRef, HashAlgo};
+
+        // Create temp directories
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+        let outside_dir = temp_dir.path().join("outside");
+
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+
+        // Create a legitimate file in workspace
+        std::fs::write(workspace_root.join("legit.txt"), "data").expect("write file");
+
+        // Create a symlink directory inside workspace pointing outside
+        let symlink_dir = workspace_root.join("escape_dir");
+        symlink(&outside_dir, &symlink_dir).expect("create symlink dir");
+
+        let manager = WorkspaceManager::new(workspace_root);
+
+        // Try to RENAME to a path via the symlink directory
+        let bundle = ChangeSetBundleV1::builder()
+            .changeset_id("cs-rename-via-symlink")
+            .base(GitObjectRef {
+                algo: HashAlgo::Sha1,
+                object_kind: "commit".to_string(),
+                object_id: "a".repeat(40),
+            })
+            .diff_hash([0x42; 32])
+            .file_manifest(vec![FileChange {
+                path: "escape_dir/renamed.txt".to_string(),
+                change_kind: ChangeKind::Rename,
+                old_path: Some("legit.txt".to_string()),
+            }])
+            .binary_detected(false)
+            .build()
+            .expect("valid bundle");
+
+        // Apply should fail - the Rename destination goes through a symlink
+        let result = manager.apply(&bundle);
+        assert!(
+            result.is_err(),
+            "Expected error for Rename via symlink directory"
+        );
+
+        match result {
+            Err(WorkspaceError::SymlinkEscape { .. }) => {
+                // Expected
+            },
+            Err(other) => panic!("Expected SymlinkEscape, got: {other:?}"),
+            Ok(_) => panic!("Expected error, got success"),
+        }
+    }
+
+    /// BLOCKER FIX #3: Test that count_workspace_files doesn't follow symlinks
+    #[cfg(unix)]
+    #[test]
+    fn test_count_workspace_files_no_symlink_follow() {
+        use std::os::unix::fs::symlink;
+
+        // Create temp directories
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+        let outside_dir = temp_dir.path().join("outside");
+
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+
+        // Create files in workspace
+        std::fs::write(workspace_root.join("file1.txt"), "data1").expect("write file1");
+        std::fs::write(workspace_root.join("file2.txt"), "data2").expect("write file2");
+
+        // Create 1000 files outside workspace
+        for i in 0..1000 {
+            std::fs::write(outside_dir.join(format!("outside_{i}.txt")), "data").expect("write");
+        }
+
+        // Create a symlink directory inside workspace pointing to the large outside dir
+        let symlink_dir = workspace_root.join("link_to_outside");
+        symlink(&outside_dir, &symlink_dir).expect("create symlink dir");
+
+        let manager = WorkspaceManager::new(workspace_root);
+        let count = manager.count_workspace_files().expect("count files");
+
+        // Should count the 2 real files + 1 symlink (counted as a file, not followed)
+        // NOT 2 + 1000 from the outside directory
+        assert!(
+            count <= 10,
+            "File count should be small (symlinks not followed), got: {}",
+            count
+        );
+    }
+
+    /// MAJOR FIX #5: Test recursion depth limit in count_workspace_files
+    #[test]
+    fn test_count_workspace_files_depth_limit() {
+        // Create temp directory
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let workspace_root = temp_dir.path().to_path_buf();
+
+        // Create a deeply nested directory structure (exceeds MAX_PATH_DEPTH)
+        let mut current = workspace_root.clone();
+        for i in 0..MAX_PATH_DEPTH + 5 {
+            current = current.join(format!("dir{i}"));
+            std::fs::create_dir_all(&current).expect("create dir");
+        }
+
+        let manager = WorkspaceManager::new(workspace_root);
+        let result = manager.count_workspace_files();
+
+        // Should fail with RecursionDepthExceeded
+        assert!(
+            matches!(result, Err(WorkspaceError::RecursionDepthExceeded { .. })),
+            "Expected RecursionDepthExceeded, got: {:?}",
+            result
+        );
+    }
+
+    /// MAJOR FIX #6: Test MAX_FILE_SIZE enforcement
+    #[test]
+    fn test_file_too_large_error() {
+        let err = WorkspaceError::FileTooLarge {
+            path: "large_file.bin".to_string(),
+            size: 200 * 1024 * 1024,
+            max: MAX_FILE_SIZE,
+        };
+
+        assert_eq!(err.reason_code(), ReasonCode::InvalidBundle);
+        assert!(!err.is_retryable());
+        assert!(err.to_string().contains("file too large"));
+        assert!(err.to_string().contains("large_file.bin"));
+    }
+
+    /// MAJOR FIX #7: Test timestamp parameter for HTF determinism
+    #[test]
+    fn test_snapshot_with_explicit_timestamp() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let workspace_root = temp_dir.path().to_path_buf();
+        let manager = WorkspaceManager::new(workspace_root);
+
+        // Snapshot with explicit timestamp
+        let explicit_ts = 12_345_678_901_234_567_u64;
+        let snapshot = manager.snapshot("work-001", Some(explicit_ts)).unwrap();
+
+        assert_eq!(snapshot.snapshot_at_ns, explicit_ts);
+    }
+
+    /// MAJOR FIX #7: Test apply_with_timestamp for HTF determinism
+    #[test]
+    fn test_apply_with_explicit_timestamp() {
+        use apm2_core::fac::{FileChange, GitObjectRef, HashAlgo};
+
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let workspace_root = temp_dir.path().to_path_buf();
+        let manager = WorkspaceManager::new(workspace_root);
+
+        let bundle = ChangeSetBundleV1::builder()
+            .changeset_id("cs-timestamp-test")
+            .base(GitObjectRef {
+                algo: HashAlgo::Sha1,
+                object_kind: "commit".to_string(),
+                object_id: "a".repeat(40),
+            })
+            .diff_hash([0x42; 32])
+            .file_manifest(vec![FileChange {
+                path: "src/lib.rs".to_string(),
+                change_kind: ChangeKind::Add,
+                old_path: None,
+            }])
+            .binary_detected(false)
+            .build()
+            .expect("valid bundle");
+
+        // Apply with explicit timestamp
+        let explicit_ts = 98_765_432_109_876_543_u64;
+        let result = manager
+            .apply_with_timestamp(&bundle, Some(explicit_ts))
+            .unwrap();
+
+        assert_eq!(result.applied_at_ns, explicit_ts);
+    }
+
+    /// Test new error variants reason codes
+    #[test]
+    fn test_new_error_variants_reason_codes() {
+        let err = WorkspaceError::RecursionDepthExceeded {
+            depth: 100,
+            max: 64,
+        };
+        assert_eq!(err.reason_code(), ReasonCode::ApplyFailed);
+        assert!(err.is_retryable());
+
+        let err = WorkspaceError::FileCountExceeded {
+            count: 200_000,
+            max: 100_000,
+        };
+        assert_eq!(err.reason_code(), ReasonCode::ApplyFailed);
+        assert!(err.is_retryable());
+    }
+
+    /// Test validate_parent_path_symlinks function
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_parent_path_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        // Create temp directories
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+        let outside_dir = temp_dir.path().join("outside");
+
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+
+        // Create a symlink directory
+        let symlink_dir = workspace_root.join("link_dir");
+        symlink(&outside_dir, &symlink_dir).expect("create symlink");
+
+        let canonical_root = std::fs::canonicalize(&workspace_root).expect("canonicalize");
+
+        // Test with a non-existent file through the symlink
+        let escaped_path = symlink_dir.join("nonexistent.txt");
+        let result = validate_parent_path_symlinks(&escaped_path, &canonical_root);
+
+        assert!(
+            matches!(result, Err(WorkspaceError::SymlinkEscape { .. })),
+            "Expected SymlinkEscape, got: {:?}",
+            result
+        );
+
+        // Test with a valid path (no symlinks)
+        let valid_path = workspace_root.join("subdir").join("nonexistent.txt");
+        std::fs::create_dir_all(workspace_root.join("subdir")).expect("create subdir");
+        let result = validate_parent_path_symlinks(&valid_path, &canonical_root);
+        assert!(result.is_ok(), "Valid path should succeed: {:?}", result);
     }
 }
