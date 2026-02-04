@@ -92,6 +92,17 @@
         "UNBOUNDED_SEARCH",
         "SCHEMA_DRIFT"
       ],
+      "violation_code": [
+        "SILENT_MEMORY_MUTATION",
+        "MONITOR_GAMING",
+        "CONTEXT_BLEED",
+        "UNBOUNDED_SEARCH",
+        "EVALUATOR_DRIFT",
+        "REASONING_DEGENERATION",
+        "POLICY_VIOLATION",
+        "MEASUREMENT_INTEGRITY",
+        "SCHEMA_VIOLATION"
+      ],
       "action_type": [
         "UPDATE_DOCS",
         "UPDATE_TEMPLATES",
@@ -145,6 +156,10 @@
         },
         "defect_domain": {
           "$ref": "apm2.defects.taxonomy.v1#/enums/defect_domain"
+        },
+        "violation_code": {
+          "$ref": "apm2.defects.taxonomy.v1#/enums/violation_code",
+          "description": "Specific Law/Mechanism violation code if applicable."
         },
         "stage_detected": {
           "$ref": "apm2.defects.taxonomy.v1#/enums/stage_detected"

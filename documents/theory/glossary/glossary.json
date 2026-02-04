@@ -65,6 +65,20 @@
       "node_class": "NORMATIVE"
     },
     {
+      "id": "term:admission_gate",
+      "term": "Admission Gate",
+      "definition": "A specialized Gate that controls the entry of ChangeSets into the Forge. It ensures that only work meeting strict criteria (e.g., passing AAT, no security regressions) is admitted for merging.",
+      "operationalization": "Implemented as `AdmissionGate` in `crates/apm2-core/src/cac/admission.rs`. Generates `AdmissionReceipt` upon success.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-14"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/cac/admission.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
       "id": "term:ledger",
       "term": "Ledger",
       "definition": "The Topology of Truth. An append-only, cryptographically verifiable log of all significant events. It serves as the single source of truth for the system state.",
@@ -169,6 +183,51 @@
         "crates/apm2-core/src/evidence/receipt.rs",
         "crates/apm2-daemon/src/protocol/apm2.daemon.v1.rs",
         "crates/apm2-daemon/src/evidence/signer.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:merge_receipt",
+      "term": "MergeReceipt",
+      "definition": "A proof that a ChangeSet was successfully merged into the canonical branch. It serves as the authoritative record of code evolution, binding the specific Commit ID to the approved ChangeSet.",
+      "operationalization": "Implemented as `MergeReceipt` in `crates/apm2-core/src/fac/merge_receipt.rs`. Recorded on the ledger as a `MergeReceipt` event.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/fac/merge_receipt.rs",
+        "crates/apm2-core/src/events/apm2.kernel.v1.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:review_receipt",
+      "term": "ReviewReceipt",
+      "definition": "A proof that a human or automated reviewer has approved a ChangeSet. It captures the reviewer's identity, the specific artifacts reviewed, and the verdict.",
+      "operationalization": "Implemented as `ReviewReceiptRecorded` in `crates/apm2-core/src/fac/review_receipt.rs`. Includes a `ReviewReceiptRecordedBuilder` for construction.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/fac/review_receipt.rs",
+        "crates/apm2-core/src/events/apm2.kernel.v1.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:aat",
+      "term": "Automated Acceptance Testing (AAT)",
+      "definition": "A rigorous, machine-driven verification process where ChangeSets are subjected to a defined `AatSpec` (suite of tests) to produce an `AatGateReceipt`.",
+      "operationalization": "Defined by `AatSpec` (`crates/apm2-core/src/fac/aat_spec.rs`) and produced as `AatGateReceipt` (`crates/apm2-core/src/fac/aat_receipt.rs`).",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-04"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/fac/aat_spec.rs",
+        "crates/apm2-core/src/fac/aat_receipt.rs"
       ],
       "node_class": "NORMATIVE"
     },
@@ -411,6 +470,16 @@
       "relation": "implements"
     },
     {
+      "source": "term:admission_gate",
+      "target": "term:gate",
+      "relation": "implements"
+    },
+    {
+      "source": "term:admission_gate",
+      "target": "term:change_set",
+      "relation": "governs"
+    },
+    {
       "source": "term:ledger",
       "target": "term:evidence",
       "relation": "depends_on"
@@ -469,6 +538,21 @@
       "source": "term:change_set",
       "target": "term:plan",
       "relation": "depends_on"
+    },
+    {
+      "source": "term:merge_receipt",
+      "target": "term:change_set",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:review_receipt",
+      "target": "term:change_set",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:aat",
+      "target": "term:gate",
+      "relation": "implements"
     },
     {
       "source": "term:snapshot",

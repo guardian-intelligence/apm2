@@ -14,7 +14,7 @@ variables:
   PR_URL: "$PR_URL"
   HEAD_SHA: "$HEAD_SHA"
 
-references[40]:
+references[41]:
   - path: "@documents/skills/modes-of-reasoning/artifacts/79-adversarial-red-team.json"
     purpose: "Mode #79: Adversarial / Red-Team Reasoning"
   - path: "@documents/skills/modes-of-reasoning/artifacts/08-counterexample-guided.json"
@@ -75,8 +75,8 @@ references[40]:
     purpose: "RS-41: Safe Patterns"
   - path: "@documents/skills/rust-standards/references/42_distributed_security_invariants.md"
     purpose: "RS-42: Distributed Invariants"
-  - path: "@documents/skills/glossary/SKILL.md"
-    purpose: "Project Glossary"
+  - path: "@documents/theory/glossary/glossary.json"
+    purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: "@documents/theory/laws.json"
     purpose: "LAW-03: Monotone Ledger"
   - path: "@documents/theory/laws.json"

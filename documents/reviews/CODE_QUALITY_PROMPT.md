@@ -14,7 +14,9 @@ variables:
   PR_URL: "$PR_URL"
   HEAD_SHA: "$HEAD_SHA"
 
-references[36]:
+references[37]:
+  - path: "@documents/theory/glossary/glossary.json"
+    purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: "@documents/skills/modes-of-reasoning/artifacts/07-type-theoretic.json"
     purpose: "Mode #07: Type-Theoretic Reasoning"
   - path: "@documents/skills/modes-of-reasoning/artifacts/40-mechanistic.json"

@@ -19,7 +19,9 @@ protocol:
 variables:
   TICKET_ID_OPTIONAL: "$1"
 
-references[19]:
+references[20]:
+  - path: "@documents/theory/glossary/glossary.json"
+    purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: references/ticket-workflow.md
     purpose: "Primary decision tree for new ticket vs existing PR follow-up."
   - path: references/commands.md

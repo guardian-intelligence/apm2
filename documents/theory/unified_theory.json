@@ -2032,27 +2032,32 @@
       },
       "MECH-MEMORY-GOVERNANCE": {
         "node_class": "NORMATIVE",
-        "name": "Memory evolution governance",
-        "role": "Agent-controlled memory updates (linking, evolution, decay) MUST be recorded as ledger events. Memory retrieval operations are auditable tool invocations.",
+        "name": "Durable memory governance",
+        "role": "Governance of the persistent semantic graph. All updates to durable memory (Index/CAS) MUST be causal ledger transitions; private working memory is exempt but ephemeral.",
         "properties": [
-          "memory mutations logged as ledger events",
-          "silent memory updates produce SILENT_MEMORY_MUTATION defect",
-          "retrieval operations subject to capability policy (LAW-05)",
-          "memory linking/evolution operations have explicit contracts"
+          "mutations (assert/link/prune) logged as domain-specific ledger events",
+          "silent updates (index state changes without matching event) trigger SILENT_MEMORY_MUTATION defect",
+          "retrieval operations are auditable tools that return content-addressed subsets",
+          "memory evolution is a function of (State_t + Event) -> State_{t+1}"
         ],
-        "rationale": "Memory is becoming a 'programmable substrate' with operations/mutation, not passive retrieval. Treating memory as a learned data structure requires governance.",
+        "rationale": "Prevents 'split-brain' between the agent's learned state and the auditable log. Memory is a learned data structure that must be deterministically replayable.",
         "law_refs": [
           "LAW-03",
-          "LAW-05"
+          "LAW-05",
+          "LAW-07"
         ],
         "fact_bindings": {
           "event_kinds": {
             "emits": {
               "DefectRecorded": true,
+              "MemoryFactAsserted": true,
+              "MemoryLinkCreated": true,
+              "MemoryPruned": true,
               "ToolExecuted": true
             },
             "requires": {
-              "LeaseIssued": true
+              "LeaseIssued": true,
+              "PolicyLoaded": true
             }
           },
           "receipt_kinds": {
@@ -2289,6 +2294,12 @@
           },
           "usd": {
             "dimension": "currency"
+          },
+          "joules": {
+            "dimension": "energy"
+          },
+          "mwh": {
+            "dimension": "energy"
           },
           "score": {
             "dimension": "dimensionless"
@@ -2848,6 +2859,26 @@
         "LedgerCompacted": {
           "node_class": "NORMATIVE",
           "domain": "ledger",
+          "planned_extension": true
+        },
+        "MemoryFactAsserted": {
+          "node_class": "NORMATIVE",
+          "domain": "memory",
+          "planned_extension": true
+        },
+        "MemoryLinkCreated": {
+          "node_class": "NORMATIVE",
+          "domain": "memory",
+          "planned_extension": true
+        },
+        "MemoryPruned": {
+          "node_class": "NORMATIVE",
+          "domain": "memory",
+          "planned_extension": true
+        },
+        "TheoryUpdate": {
+          "node_class": "NORMATIVE",
+          "domain": "governance",
           "planned_extension": true
         }
       }
@@ -3533,103 +3564,103 @@
     "glossary_alignment": {
       "canonical_terms": {
         "Holon": {
-          "ref": "documents/skills/glossary/references/holon.md",
+          "ref": "documents/theory/glossary/glossary.json#term:holon",
           "node_class": "BACKGROUND"
         },
         "Ledger": {
-          "ref": "documents/skills/glossary/references/ledger.md",
+          "ref": "documents/theory/glossary/glossary.json#term:ledger",
           "node_class": "BACKGROUND"
         },
         "Work Substrate": {
-          "ref": "documents/skills/glossary/references/work_substrate.md",
+          "ref": "documents/theory/glossary/glossary.json",
           "node_class": "BACKGROUND"
         },
         "Plan": {
-          "ref": "documents/skills/glossary/references/plan.md",
+          "ref": "documents/theory/glossary/glossary.json#term:plan",
           "node_class": "BACKGROUND"
         },
         "ChangeSet": {
-          "ref": "documents/skills/glossary/references/change_set.md",
+          "ref": "documents/theory/glossary/glossary.json#term:change_set",
           "node_class": "BACKGROUND"
         },
         "Gate": {
-          "ref": "documents/skills/glossary/references/gate.md",
+          "ref": "documents/theory/glossary/glossary.json#term:gate",
           "node_class": "BACKGROUND"
         },
         "Terminal Verifier": {
-          "ref": "documents/skills/glossary/references/terminal_verifier.md",
+          "ref": "documents/theory/glossary/glossary.json",
           "node_class": "BACKGROUND"
         },
         "Evidence": {
-          "ref": "documents/skills/glossary/references/evidence.md",
+          "ref": "documents/theory/glossary/glossary.json#term:evidence",
           "node_class": "BACKGROUND"
         },
         "Attestation": {
-          "ref": "documents/skills/glossary/references/attestation.md",
+          "ref": "documents/theory/glossary/glossary.json",
           "node_class": "BACKGROUND"
         },
         "Finding": {
-          "ref": "documents/skills/glossary/references/finding.md",
+          "ref": "documents/theory/glossary/glossary.json#term:finding",
           "node_class": "BACKGROUND"
         },
         "Countermeasure": {
-          "ref": "documents/skills/glossary/references/countermeasure.md",
+          "ref": "documents/theory/glossary/glossary.json",
           "node_class": "BACKGROUND"
         },
         "Merge Receipt": {
-          "ref": "documents/skills/glossary/references/merge_receipt.md",
+          "ref": "documents/theory/glossary/glossary.json",
           "node_class": "BACKGROUND"
         },
         "Lease/Budget": {
-          "ref": "documents/skills/glossary/references/lease_and_budget.md",
+          "ref": "documents/theory/glossary/glossary.json#term:lease",
           "node_class": "BACKGROUND"
         },
         "OCAP": {
-          "ref": "documents/skills/glossary/references/ocap.md",
+          "ref": "documents/theory/glossary/glossary.json#term:ocap",
           "node_class": "BACKGROUND"
         },
         "Checkpointing": {
-          "ref": "documents/skills/glossary/references/checkpointing.md",
+          "ref": "documents/theory/glossary/glossary.json#term:checkpoint_store",
           "node_class": "BACKGROUND"
         },
         "ContextPack": {
-          "ref": "documents/skills/glossary/references/context_pack.md",
+          "ref": "documents/theory/glossary/glossary.json#term:context_pack",
           "node_class": "BACKGROUND"
         },
         "Content Resolver": {
-          "ref": "documents/skills/glossary/references/content_resolver.md",
+          "ref": "documents/theory/glossary/glossary.json",
           "node_class": "BACKGROUND"
         },
         "View Commitment": {
-          "ref": "documents/skills/glossary/references/view_commitment.md",
+          "ref": "documents/theory/glossary/glossary.json",
           "node_class": "BACKGROUND"
         },
         "Git Digest Conventions": {
-          "ref": "documents/skills/glossary/references/git_digest_conventions.md",
+          "ref": "documents/theory/glossary/glossary.json",
           "node_class": "BACKGROUND"
         },
         "Workspace Delta": {
-          "ref": "documents/skills/glossary/references/workspace_delta.md",
+          "ref": "documents/theory/glossary/glossary.json#term:workspace_delta",
           "node_class": "BACKGROUND"
         },
         "Selector": {
-          "ref": "documents/skills/glossary/references/selector.md",
+          "ref": "documents/theory/glossary/glossary.json",
           "node_class": "BACKGROUND"
         },
         "Summary Receipt": {
-          "ref": "documents/skills/glossary/references/summary_receipt.md",
+          "ref": "documents/theory/glossary/glossary.json",
           "node_class": "BACKGROUND"
         },
         "Commitment Filter": {
-          "ref": "documents/skills/glossary/references/commitment_filter.md",
+          "ref": "documents/theory/glossary/glossary.json",
           "node_class": "BACKGROUND"
         },
         "Oracle": {
-          "ref": "documents/skills/glossary/references/oracle.md",
+          "ref": "documents/theory/glossary/glossary.json",
           "node_class": "BACKGROUND"
         },
         "Interface Variety": {
-          "ref": "documents/skills/glossary/references/interface_variety.md",
+          "ref": "documents/theory/glossary/glossary.json",
           "node_class": "BACKGROUND"
         }
       }
@@ -3653,7 +3684,7 @@
           "node_class": "BACKGROUND"
         },
         "glossary": {
-          "ref": "documents/skills/glossary/SKILL.md",
+          "ref": "documents/theory/glossary/glossary.json",
           "node_class": "BACKGROUND"
         }
       },

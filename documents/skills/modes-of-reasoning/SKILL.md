@@ -11,6 +11,7 @@ A practical taxonomy of 81 reasoning modes stored as CAC artifacts. For backgrou
 
 ## Artifact References
 
+- **Glossary**: `documents/theory/glossary/glossary.json` - REQUIRED READING: APM2 terminology and ontology
 - **Mode artifacts**: `artifacts/{NN}-{name}.json` (e.g., `artifacts/58-mechanism-design.json`)
 - **Selector artifact**: `artifacts/selector.json` - contains axes, patterns, and heuristics for mode selection
 - **Stable IDs**: `dcp://apm2.agents/mor/mode/{name}@1`

@@ -19,7 +19,9 @@ protocol:
 variables:
   TARGET_RFC: "$1"
 
-references[5]:
+references[6]:
+  - path: "../../theory/glossary/glossary.json"
+    purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: references/orchestrator-loop.md
     purpose: "Main loop: dispatch, monitor, fix, repeat until merged."
   - path: references/commands.md

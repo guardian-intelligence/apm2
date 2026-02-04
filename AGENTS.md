@@ -100,7 +100,7 @@
   "doc_refs": {
     "documents_index": "documents/README.md",
     "skills_root": "documents/skills/",
-    "glossary_root": "documents/skills/glossary/",
+    "glossary_root": "documents/theory/glossary/",
     "holonic_unified_theory": "documents/theory/unified_theory.json",
     "security_policy": "SECURITY.md",
     "security_docs_root": "documents/security/",

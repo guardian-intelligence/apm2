@@ -20,7 +20,9 @@ protocol:
 variables:
   TARGET_RFC: "$1"
 
-references[10]:
+references[11]:
+  - path: "@documents/theory/glossary/glossary.json"
+    purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: references/ticket-queue-workflow.md
     purpose: "Decision tree: select ticket, dispatch implementer, loop."
   - path: references/commands.md
