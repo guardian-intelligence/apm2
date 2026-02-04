@@ -197,9 +197,11 @@ pub use executor::{
     new_shared_executor,
 };
 pub use handle::{MAX_SESSION_ID_LEN, SessionHandle, SessionSnapshot, StopSignal};
+// Re-export handler types (TCK-00291, TCK-00315, TCK-00319)
+#[allow(deprecated)]
 pub use handlers::{
-    ArtifactFetchHandler, ExecuteHandler, GitOperationHandler, ReadFileHandler, WriteFileHandler,
-    register_stub_handlers,
+    ArtifactFetchHandler, ExecuteHandler, GitOperationHandler, ListFilesHandler, ReadFileHandler,
+    SearchHandler, WriteFileHandler, register_handlers_with_root, register_stub_handlers,
 };
 // Re-export PTY types (TCK-00161)
 pub use output::{MAX_CHUNK_SIZE, PtyOutput, PtyOutputRecord, SequenceGenerator, StreamKind};

@@ -47,7 +47,7 @@ use super::tool_class::ToolClass;
 use super::tool_handler::{ToolArgs, ToolHandler, ToolHandlerError, ToolResultData};
 
 // =============================================================================
-// Path Validation Helper
+// Path Validation Helpers (TCK-00319 Security Module)
 // =============================================================================
 
 /// Validates a path for security issues.
@@ -138,6 +138,145 @@ fn validate_resolved_path_within_root(
         });
     }
     Ok(())
+}
+
+/// Rejects symlinks at any component of the path (TOCTOU mitigation).
+///
+/// # Security
+///
+/// Per CTR-1503 and RSK-1501 (TOCTOU):
+/// - Uses `symlink_metadata()` to detect symlinks WITHOUT following them
+/// - Checks each path component for symlink status
+/// - Rejects any symlink found in the path chain
+///
+/// This provides defense-in-depth against TOCTOU races where a symlink could
+/// be created between path validation and file access. While this doesn't
+/// eliminate all TOCTOU windows, it significantly reduces the attack surface.
+///
+/// # Arguments
+///
+/// * `path` - The path to check (should be the full resolved path)
+/// * `root` - The workspace root (components within root are checked)
+///
+/// # Errors
+///
+/// Returns error if any component of the path (within the workspace) is a
+/// symlink.
+#[allow(dead_code)] // Will be integrated into handlers incrementally
+fn reject_symlinks_in_path(path: &Path, root: &Path) -> Result<(), ToolHandlerError> {
+    // Get the relative portion of the path (components after root)
+    // Path doesn't start with root - this is a containment violation
+    let Ok(relative) = path.strip_prefix(root) else {
+        return Err(ToolHandlerError::PathValidation {
+            path: path.display().to_string(),
+            reason: "path does not start with workspace root".to_string(),
+        });
+    };
+
+    // Check each component by building up the path progressively
+    let mut check_path = root.to_path_buf();
+    for component in relative.components() {
+        check_path.push(component);
+
+        // Use symlink_metadata to check WITHOUT following symlinks
+        // This is the key TOCTOU mitigation: we detect symlinks before access
+        match std::fs::symlink_metadata(&check_path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(ToolHandlerError::PathValidation {
+                        path: check_path.display().to_string(),
+                        reason: format!(
+                            "symlink detected at '{}'; symlinks are not allowed in workspace paths \
+                             (CTR-1503: symlink escape prevention)",
+                            check_path.display()
+                        ),
+                    });
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Path component doesn't exist yet - this is OK for write operations
+                // where we're creating new files. Stop checking here.
+                break;
+            },
+            Err(e) => {
+                // Other errors (permission denied, etc.) - fail closed
+                return Err(ToolHandlerError::ExecutionFailed {
+                    message: format!(
+                        "failed to check path component '{}' for symlinks: {}",
+                        check_path.display(),
+                        e
+                    ),
+                });
+            },
+        }
+    }
+
+    Ok(())
+}
+
+/// Validates path with full TOCTOU mitigation for existing files.
+///
+/// # Security
+///
+/// This function combines multiple layers of defense per TCK-00319:
+///
+/// 1. **Syntactic validation** - Rejects `..`, absolute paths, null bytes
+/// 2. **Symlink component check** - Uses `symlink_metadata` on each component
+/// 3. **Canonical containment** - Verifies resolved path stays within root
+///
+/// The symlink component check (step 2) provides TOCTOU mitigation by detecting
+/// symlinks BEFORE canonicalization. This prevents the attack where:
+/// - Attacker creates `workspace/evil` as a regular directory
+/// - Validation passes
+/// - Attacker swaps `workspace/evil` for a symlink to `/etc/shadow`
+/// - File access follows the symlink
+///
+/// By checking for symlinks at each component FIRST, we reduce the TOCTOU
+/// window.
+///
+/// # Arguments
+///
+/// * `relative_path` - The relative path to validate
+/// * `root` - The workspace root (must be canonical)
+///
+/// # Errors
+///
+/// Returns error if the path fails any validation check.
+#[allow(dead_code)] // Will be integrated into handlers incrementally
+fn validate_path_with_toctou_mitigation(
+    relative_path: &Path,
+    canonical_root: &Path,
+) -> Result<PathBuf, ToolHandlerError> {
+    // Step 1: Syntactic validation
+    validate_path(relative_path)?;
+
+    // Step 2: Build the full path
+    let full_path = canonical_root.join(relative_path);
+
+    // Step 3: TOCTOU mitigation - check for symlinks at each component
+    // This must happen BEFORE canonicalize() to prevent symlink swap attacks
+    reject_symlinks_in_path(&full_path, canonical_root)?;
+
+    // Step 4: Canonicalize and verify containment (defense in depth)
+    // Even after symlink checks, verify the resolved path stays in workspace
+    if full_path.exists() {
+        let canonical_path =
+            std::fs::canonicalize(&full_path).map_err(|e| ToolHandlerError::ExecutionFailed {
+                message: format!(
+                    "failed to canonicalize path '{}': {}",
+                    full_path.display(),
+                    e
+                ),
+            })?;
+
+        validate_resolved_path_within_root(&canonical_path, canonical_root)?;
+        Ok(canonical_path)
+    } else {
+        // Path doesn't exist yet - return the non-canonical path
+        // This is OK because reject_symlinks_in_path verified no symlinks
+        // exist in the path components that DO exist
+        Ok(full_path)
+    }
 }
 
 // =============================================================================
@@ -2291,6 +2430,24 @@ impl ToolHandler for SearchHandler {
 /// let mut executor = ToolExecutor::new(tracker, cas.clone());
 /// register_stub_handlers(&mut executor, cas).expect("handlers registered");
 /// ```
+/// Registers all handlers with an executor using CWD as root.
+///
+/// **DEPRECATED**: Use `register_handlers_with_root` for production code.
+/// This function exists for backward compatibility and test convenience only.
+/// Using CWD as the workspace root is a security anti-pattern that can expose
+/// the daemon's working directory to tool operations.
+///
+/// # Security Warning
+///
+/// Per TCK-00319, tool handlers MUST be rooted to an explicit workspace
+/// directory, not the daemon's CWD. Failure to do so can result in:
+/// - Tool operations accessing daemon-local files
+/// - Path traversal attacks escaping the intended workspace
+/// - Reviewers observing incorrect filesystem state
+#[deprecated(
+    since = "0.1.0",
+    note = "use register_handlers_with_root with explicit workspace path instead"
+)]
 pub fn register_stub_handlers(
     executor: &mut super::executor::ToolExecutor,
     cas: std::sync::Arc<dyn ContentAddressedStore>,
@@ -2302,6 +2459,82 @@ pub fn register_stub_handlers(
     executor.register_handler(Box::new(ArtifactFetchHandler::new(cas)))?;
     executor.register_handler(Box::new(ListFilesHandler::new()))?;
     executor.register_handler(Box::new(SearchHandler::new()))?;
+    Ok(())
+}
+
+/// Registers all handlers with an executor rooted to a specific workspace.
+///
+/// This is the **preferred** way to register tool handlers for production use.
+/// All filesystem-accessing handlers are bound to the specified workspace root,
+/// preventing access to daemon CWD or other directories.
+///
+/// # Security
+///
+/// Per TCK-00319 (Root tool handlers per workspace):
+/// - All tool handlers are rooted to `workspace_root`
+/// - Path traversal prevention is enforced via canonical root containment
+///   checks
+/// - Symlink escapes are blocked via `validate_resolved_path_within_root`
+/// - ListFiles/Search operations reflect the patched workspace state
+///
+/// # Arguments
+///
+/// * `executor` - The tool executor to register handlers with
+/// * `cas` - Content-addressed store for artifact operations
+/// * `workspace_root` - Absolute path to the workspace directory (MUST exist)
+///
+/// # Errors
+///
+/// Returns error if:
+/// - The workspace root does not exist or cannot be canonicalized
+/// - Handler registration fails
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::path::Path;
+/// use apm2_daemon::episode::executor::ToolExecutor;
+/// use apm2_daemon::episode::handlers::register_handlers_with_root;
+///
+/// let workspace = Path::new("/var/lib/apm2/workspaces/episode-123");
+/// let mut executor = ToolExecutor::new(tracker, cas.clone());
+/// register_handlers_with_root(&mut executor, cas, workspace)?;
+/// ```
+pub fn register_handlers_with_root(
+    executor: &mut super::executor::ToolExecutor,
+    cas: std::sync::Arc<dyn ContentAddressedStore>,
+    workspace_root: &Path,
+) -> Result<(), super::executor::ExecutorError> {
+    // Validate workspace root exists and can be canonicalized (fail-closed)
+    // This catches misconfiguration early rather than at first tool execution
+    if !workspace_root.exists() {
+        return Err(super::executor::ExecutorError::ExecutionFailed {
+            message: format!(
+                "workspace root does not exist: {}",
+                workspace_root.display()
+            ),
+        });
+    }
+
+    // Canonicalize early to catch symlink issues at registration time
+    let canonical_root = std::fs::canonicalize(workspace_root).map_err(|e| {
+        super::executor::ExecutorError::ExecutionFailed {
+            message: format!(
+                "failed to canonicalize workspace root '{}': {}",
+                workspace_root.display(),
+                e
+            ),
+        }
+    })?;
+
+    // Register all handlers with the canonical workspace root
+    executor.register_handler(Box::new(ReadFileHandler::with_root(&canonical_root)))?;
+    executor.register_handler(Box::new(WriteFileHandler::with_root(&canonical_root)))?;
+    executor.register_handler(Box::new(ExecuteHandler::with_root(&canonical_root)))?;
+    executor.register_handler(Box::new(GitOperationHandler::with_root(&canonical_root)))?;
+    executor.register_handler(Box::new(ArtifactFetchHandler::new(cas)))?;
+    executor.register_handler(Box::new(ListFilesHandler::with_root(&canonical_root)))?;
+    executor.register_handler(Box::new(SearchHandler::with_root(&canonical_root)))?;
     Ok(())
 }
 
@@ -2522,6 +2755,210 @@ mod tests {
         assert!(
             matches!(result, Err(ToolHandlerError::PathValidation { .. })),
             "Parent paths should be rejected"
+        );
+    }
+
+    // =========================================================================
+    // Symlink escape prevention tests (TCK-00319)
+    // =========================================================================
+
+    #[test]
+    fn test_reject_symlinks_in_path_no_symlink_ok() {
+        // Create a real temp directory with no symlinks
+        let temp_dir = TempDir::new().expect("temp dir");
+        let root = temp_dir.path();
+
+        // Create a nested directory structure
+        let nested = root.join("subdir").join("deep");
+        std::fs::create_dir_all(&nested).expect("create dirs");
+
+        // Create a file in the nested directory
+        let file_path = nested.join("file.txt");
+        std::fs::write(&file_path, "content").expect("write file");
+
+        // Should pass - no symlinks in path
+        assert!(
+            reject_symlinks_in_path(&file_path, root).is_ok(),
+            "Path with no symlinks should be allowed"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_reject_symlinks_in_path_direct_symlink_blocked() {
+        // Create a temp directory with a symlink to an external target
+        let temp_dir = TempDir::new().expect("temp dir");
+        let root = temp_dir.path();
+
+        // Create a symlink pointing outside the workspace
+        let symlink_path = root.join("escape");
+        std::os::unix::fs::symlink("/etc/passwd", &symlink_path).expect("create symlink");
+
+        // Should reject - direct symlink escape attempt
+        let result = reject_symlinks_in_path(&symlink_path, root);
+        assert!(
+            matches!(result, Err(ToolHandlerError::PathValidation { .. })),
+            "Direct symlink escape should be blocked"
+        );
+        if let Err(ToolHandlerError::PathValidation { reason, .. }) = result {
+            assert!(
+                reason.contains("symlink"),
+                "Error should mention symlink: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_reject_symlinks_in_path_nested_symlink_blocked() {
+        // Create a temp directory with a nested symlink
+        let temp_dir = TempDir::new().expect("temp dir");
+        let root = temp_dir.path();
+
+        // Create a regular subdir
+        let subdir = root.join("subdir");
+        std::fs::create_dir(&subdir).expect("create subdir");
+
+        // Create a symlink inside the subdir pointing outside
+        let symlink_path = subdir.join("evil");
+        std::os::unix::fs::symlink("/etc/shadow", &symlink_path).expect("create symlink");
+
+        // Should reject - nested symlink escape attempt
+        let result = reject_symlinks_in_path(&symlink_path, root);
+        assert!(
+            matches!(result, Err(ToolHandlerError::PathValidation { .. })),
+            "Nested symlink escape should be blocked"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_reject_symlinks_in_path_directory_symlink_blocked() {
+        // Create a temp directory with a symlinked directory
+        let temp_dir = TempDir::new().expect("temp dir");
+        let root = temp_dir.path();
+
+        // Create a symlink to /etc (directory symlink)
+        let symlink_dir = root.join("etc_link");
+        std::os::unix::fs::symlink("/etc", &symlink_dir).expect("create symlink");
+
+        // Try to access a file through the symlinked directory
+        let target_path = symlink_dir.join("passwd");
+
+        // Should reject - the directory component is a symlink
+        let result = reject_symlinks_in_path(&target_path, root);
+        assert!(
+            matches!(result, Err(ToolHandlerError::PathValidation { .. })),
+            "Directory symlink escape should be blocked"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_reject_symlinks_in_path_relative_symlink_escape_blocked() {
+        // Create a temp directory structure with a relative symlink that escapes
+        let temp_dir = TempDir::new().expect("temp dir");
+        let root = temp_dir.path();
+
+        // Create a subdir
+        let subdir = root.join("subdir");
+        std::fs::create_dir(&subdir).expect("create subdir");
+
+        // Create a relative symlink that escapes via ../../../etc
+        let symlink_path = subdir.join("escape");
+        std::os::unix::fs::symlink("../../../etc/passwd", &symlink_path).expect("create symlink");
+
+        // Should reject - relative symlink escape attempt
+        let result = reject_symlinks_in_path(&symlink_path, root);
+        assert!(
+            matches!(result, Err(ToolHandlerError::PathValidation { .. })),
+            "Relative symlink escape should be blocked"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_reject_symlinks_in_path_chain_escape_blocked() {
+        // Create a temp directory with a chain of symlinks
+        let temp_dir = TempDir::new().expect("temp dir");
+        let root = temp_dir.path();
+
+        // Create first symlink pointing to a directory in root
+        let link1 = root.join("link1");
+        let target_dir = root.join("target");
+        std::fs::create_dir(&target_dir).expect("create target dir");
+        std::os::unix::fs::symlink(&target_dir, &link1).expect("create symlink 1");
+
+        // Should reject at the first symlink, even though it points inside workspace
+        let result = reject_symlinks_in_path(&link1, root);
+        assert!(
+            matches!(result, Err(ToolHandlerError::PathValidation { .. })),
+            "Any symlink in path should be blocked (defense in depth)"
+        );
+    }
+
+    #[test]
+    fn test_reject_symlinks_nonexistent_path_ok() {
+        // Test that nonexistent paths are allowed (for write operations)
+        let temp_dir = TempDir::new().expect("temp dir");
+        let root = temp_dir.path();
+
+        // Path that doesn't exist
+        let new_file = root.join("subdir").join("newfile.txt");
+
+        // Should pass - nonexistent paths are OK (checked at write time)
+        assert!(
+            reject_symlinks_in_path(&new_file, root).is_ok(),
+            "Nonexistent paths should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_validate_path_with_toctou_mitigation_ok() {
+        // Test the full TOCTOU-mitigating validation
+        let temp_dir = TempDir::new().expect("temp dir");
+        let canonical_root = std::fs::canonicalize(temp_dir.path()).expect("canonicalize");
+
+        // Create a file
+        let file = temp_dir.path().join("test.txt");
+        std::fs::write(&file, "content").expect("write");
+
+        // Should pass
+        let result = validate_path_with_toctou_mitigation(Path::new("test.txt"), &canonical_root);
+        assert!(result.is_ok(), "Valid path should pass TOCTOU validation");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_validate_path_with_toctou_mitigation_symlink_blocked() {
+        // Test that TOCTOU validation blocks symlinks
+        let temp_dir = TempDir::new().expect("temp dir");
+        let canonical_root = std::fs::canonicalize(temp_dir.path()).expect("canonicalize");
+
+        // Create a symlink to /etc/passwd
+        let symlink = temp_dir.path().join("escape");
+        std::os::unix::fs::symlink("/etc/passwd", &symlink).expect("create symlink");
+
+        // Should fail - symlink detected
+        let result = validate_path_with_toctou_mitigation(Path::new("escape"), &canonical_root);
+        assert!(
+            result.is_err(),
+            "TOCTOU validation should block symlink escape"
+        );
+    }
+
+    #[test]
+    fn test_validate_path_with_toctou_mitigation_traversal_blocked() {
+        // Test that TOCTOU validation blocks path traversal
+        let temp_dir = TempDir::new().expect("temp dir");
+        let canonical_root = std::fs::canonicalize(temp_dir.path()).expect("canonicalize");
+
+        // Should fail - path traversal
+        let result =
+            validate_path_with_toctou_mitigation(Path::new("../../../etc/passwd"), &canonical_root);
+        assert!(
+            result.is_err(),
+            "TOCTOU validation should block path traversal"
         );
     }
 
@@ -3282,5 +3719,212 @@ mod tests {
             max_lines: None,
         });
         assert_eq!(args.tool_class(), ToolClass::Search);
+    }
+
+    // =========================================================================
+    // ListFilesHandler symlink escape tests (TCK-00319)
+    // =========================================================================
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_listfiles_rejects_symlink_escape() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+
+        // Create a symlink pointing to /etc
+        let symlink_path = root.join("escape");
+        std::os::unix::fs::symlink("/etc", &symlink_path).expect("create symlink");
+
+        let handler = ListFilesHandler::with_root(root);
+        let args = ToolArgs::ListFiles(ListFilesArgs {
+            path: PathBuf::from("escape"),
+            pattern: None,
+            max_entries: None,
+        });
+
+        // Should fail - symlink escape attempt
+        let result = handler.execute(&args, None).await;
+        assert!(
+            result.is_err(),
+            "ListFilesHandler should reject symlink escape"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_listfiles_rejects_nested_symlink_in_path() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+
+        // Create a regular subdir
+        let subdir = root.join("subdir");
+        std::fs::create_dir(&subdir).expect("create subdir");
+
+        // Create a symlink inside the subdir pointing outside
+        let symlink_path = subdir.join("evil");
+        std::os::unix::fs::symlink("/etc", &symlink_path).expect("create symlink");
+
+        let handler = ListFilesHandler::with_root(root);
+        let args = ToolArgs::ListFiles(ListFilesArgs {
+            path: PathBuf::from("subdir/evil"),
+            pattern: None,
+            max_entries: None,
+        });
+
+        // Should fail - nested symlink escape
+        let result = handler.execute(&args, None).await;
+        assert!(
+            result.is_err(),
+            "ListFilesHandler should reject nested symlink escape"
+        );
+    }
+
+    // =========================================================================
+    // SearchHandler symlink escape tests (TCK-00319)
+    // =========================================================================
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_search_rejects_symlink_scope() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+
+        // Create a symlink pointing to /etc
+        let symlink_path = root.join("escape");
+        std::os::unix::fs::symlink("/etc", &symlink_path).expect("create symlink");
+
+        let handler = SearchHandler::with_root(root);
+        let args = ToolArgs::Search(SearchArgs {
+            query: "root".to_string(),
+            scope: PathBuf::from("escape"),
+            max_bytes: None,
+            max_lines: None,
+        });
+
+        // Should fail - symlink escape attempt
+        let result = handler.execute(&args, None).await;
+        assert!(result.is_err(), "SearchHandler should reject symlink scope");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_search_skips_symlink_files_during_traversal() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+
+        // Create a regular file
+        let file = root.join("safe.txt");
+        std::fs::write(&file, "search me").expect("write file");
+
+        // Create a symlink to /etc/passwd
+        let symlink = root.join("danger.txt");
+        std::os::unix::fs::symlink("/etc/passwd", &symlink).expect("create symlink");
+
+        let handler = SearchHandler::with_root(root);
+        let args = ToolArgs::Search(SearchArgs {
+            query: "search".to_string(),
+            scope: PathBuf::from("."),
+            max_bytes: None,
+            max_lines: None,
+        });
+
+        // Should succeed but only search safe.txt (symlinks are skipped in traversal)
+        let result = handler.execute(&args, None).await.expect("execute search");
+        let output = result.output_str().expect("utf8 output");
+
+        // Should find the match in safe.txt
+        assert!(
+            output.contains("safe.txt"),
+            "Should find content in regular file: {output}"
+        );
+        // Should NOT show results from /etc/passwd
+        assert!(
+            !output.contains("root:"),
+            "Should not leak content from symlinked file: {output}"
+        );
+    }
+
+    // =========================================================================
+    // GitOperationHandler symlink tests (TCK-00319)
+    // =========================================================================
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_git_handler_rejects_symlink_repo_path() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+
+        // Create a real git repo
+        let real_repo = root.join("real_repo");
+        std::fs::create_dir(&real_repo).expect("create dir");
+        init_git_repo(&real_repo);
+
+        // Create a symlink to /etc
+        let symlink = root.join("evil_link");
+        std::os::unix::fs::symlink("/etc", &symlink).expect("create symlink");
+
+        let handler = GitOperationHandler::with_root(root);
+        let args = ToolArgs::Git(GitArgs {
+            operation: "status".to_string(),
+            args: vec![],
+            repo_path: Some(PathBuf::from("evil_link")),
+        });
+
+        // Should fail - symlink escape via repo_path
+        let result = handler.execute(&args, None).await;
+        assert!(
+            result.is_err(),
+            "GitOperationHandler should reject symlink repo_path"
+        );
+    }
+
+    // =========================================================================
+    // register_handlers_with_root tests (TCK-00319)
+    // =========================================================================
+
+    #[test]
+    fn test_register_handlers_with_root_validates_existence() {
+        use crate::episode::broker::StubContentAddressedStore;
+        use crate::episode::budget::EpisodeBudget;
+        use crate::episode::budget_tracker::BudgetTracker;
+        use crate::episode::executor::ToolExecutor;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let budget = EpisodeBudget::builder().tool_calls(100).build();
+        let tracker = Arc::new(BudgetTracker::from_envelope(budget));
+        let mut executor = ToolExecutor::new(tracker, cas.clone());
+
+        // Try to register with nonexistent workspace
+        let nonexistent = temp_dir.path().join("does_not_exist");
+        let result = register_handlers_with_root(&mut executor, cas, &nonexistent);
+
+        assert!(result.is_err(), "Should reject nonexistent workspace root");
+    }
+
+    #[test]
+    fn test_register_handlers_with_root_works_with_valid_path() {
+        use crate::episode::broker::StubContentAddressedStore;
+        use crate::episode::budget::EpisodeBudget;
+        use crate::episode::budget_tracker::BudgetTracker;
+        use crate::episode::executor::ToolExecutor;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let budget = EpisodeBudget::builder().tool_calls(100).build();
+        let tracker = Arc::new(BudgetTracker::from_envelope(budget));
+        let mut executor = ToolExecutor::new(tracker, cas.clone());
+
+        // Register with valid workspace
+        let result = register_handlers_with_root(&mut executor, cas, &workspace);
+
+        assert!(
+            result.is_ok(),
+            "Should accept valid workspace root: {:?}",
+            result.err()
+        );
     }
 }
