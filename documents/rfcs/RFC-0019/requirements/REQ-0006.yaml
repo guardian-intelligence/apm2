@@ -15,6 +15,12 @@ requirement:
     4. Define ProjectionReceiptRecorded kernel event referencing CAS hash of projection receipt bundle
     5. Projection must be idempotent (restarts don't duplicate comments)
     6. Projection can detect tamper (optional v0.1)
+
+    Truth boundary:
+    - Projection MUST treat GitHub as an output target only. GitHub reads may be used for
+      best-effort UX (e.g., check-before-write), but MUST NOT be used as authoritative truth
+      for admission/projection decisions.
+    - Idempotency MUST be achieved via internal receipts (CAS+ledger), not by trusting GitHub state.
   rationale: |
     Current state: projection module exists but "not wired into main daemon"
     (crates/apm2-daemon/src/projection/mod.rs:3-12). This means review results
@@ -31,3 +37,4 @@ requirement:
     - "EVID-0006"
   source_refs:
     - "crates/apm2-daemon/src/projection/mod.rs:3-12"
+    - "crates/apm2-daemon/src/projection/github_sync.rs"

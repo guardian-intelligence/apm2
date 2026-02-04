@@ -11,6 +11,11 @@ requirement:
     Manifests must be stored as CAS artifacts (hash-addressed).
     SpawnEpisode must load manifests by hash.
     Policy resolution must decide which manifest hash is assigned to the session.
+
+    Manifest design requirements (minimum for reviewer v0):
+    - Explicit allowlist of tool classes + per-capability risk tier requirements.
+    - CAS hash allowlist for artifact fetches required for review (diff bundle, review artifacts).
+    - No discovery: sessions cannot enumerate capabilities they do not already possess (OCAP-only).
   rationale: |
     Current state: SpawnEpisode creates CapabilityManifest with empty allowlist
     (crates/apm2-daemon/src/protocol/dispatch.rs:2916-2926). This means the system
@@ -24,3 +29,4 @@ requirement:
     - "EVID-0002"
   source_refs:
     - "crates/apm2-daemon/src/protocol/dispatch.rs:2916-2926"
+    - "crates/apm2-daemon/src/episode/capability.rs"

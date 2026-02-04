@@ -1,32 +1,42 @@
 requirement:
   schema_version: "2026-01-23"
   id: "REQ-0004"
-  title: "Tool log capture into review artifacts (TCK-00312 closure)"
+  title: "Tool result hash propagation (executor -> events -> artifacts)"
   category: "FUNCTIONAL"
   priority: "P1"
   status: "PROPOSED"
   statement: |
-    Tool execution must propagate CAS hashes for receipts:
-    1. ToolExecutor (or broker/executor wrapper) must return CAS hash for each tool result
-    2. CAS hashes must be accumulated per-episode
-    3. ReviewArtifactBundleV1 must include tool_log_hashes = collected result hashes
+    Every tool actuation MUST produce a durable, content-addressed output that can be
+    referenced by events and receipts.
 
-    Canonical "tool log artifact" format must be decided:
-    - Option A: each ToolResultData CAS hash is a log entry
-    - Option B: additionally store compact ToolLogIndex artifact listing all hashes
+    Minimum requirements (v4, hash-first plumbing):
+    1. After executing a tool handler, the kernel MUST store `ToolResultData` in CAS and
+       obtain `result_hash` (content address).
+    2. `result_hash` MUST be surfaced upward:
+       - returned from the tool execution stack (executor/broker/runtime)
+       - attached to the tool lifecycle signal that crosses the session boundary
+         (at minimum: `ToolExecuted` / tool response)
+    3. The episode runtime MUST accumulate tool result hashes in deterministic order
+       (monotonic tool sequence order) so downstream tickets can build:
+       - ToolExecutionReceipts (proof-carrying tool use)
+       - ToolLogIndexV1 (single-pointer audit index)
+       - ReviewArtifactBundle bindings (tool_log_index_hash)
+
+    Non-goals for this requirement:
+    - defining ToolExecutionReceipt / ToolLogIndexV1 schema (REQ-0010)
+    - choosing ReviewArtifactBundle v1 vs v2 fields (REQ-0008 / REQ-0010)
   rationale: |
     Current state: ToolExecutor::execute stores ToolResultData in CAS and obtains result_hash,
-    but does not return it or aggregate it for ReviewArtifactBundle tool logs
-    (crates/apm2-daemon/src/episode/executor.rs:458-501). ReviewArtifactBundle expects
-    tool_log_hashes (crates/apm2-daemon/src/episode/workspace.rs:480-515).
+    but does not surface it out of the executor (crates/apm2-daemon/src/episode/executor.rs:420-540).
+    Additionally, the session-scoped IPC `RequestToolResponse` does not include a result hash
+    (proto/apm2d_runtime_v1.proto:408-422), preventing kernel-side evidence propagation.
   acceptance_criteria:
-    - "ToolExecutor returns CAS hash for each tool result"
-    - "Per-episode accumulator collects all tool result hashes"
-    - "ReviewReceiptRecorded references ReviewArtifactBundle with tool_log_hashes"
-    - "All tool_log_hashes resolve in CAS"
-    - "Tool logs can be replayed/audited offline"
+    - "ToolExecutor surfaces CAS result_hash for each tool execution"
+    - "Tool lifecycle events and tool responses include result_hash"
+    - "Episode runtime accumulates tool result hashes in deterministic order"
+    - "All referenced result_hash values resolve in CAS"
   evidence_ids:
     - "EVID-0004"
   source_refs:
-    - "crates/apm2-daemon/src/episode/executor.rs:458-501"
-    - "crates/apm2-daemon/src/episode/workspace.rs:480-515"
+    - "crates/apm2-daemon/src/episode/executor.rs:420-540"
+    - "proto/apm2d_runtime_v1.proto:397-422"

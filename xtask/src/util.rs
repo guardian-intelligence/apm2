@@ -541,8 +541,9 @@ pub fn current_branch(sh: &Shell) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serial_test::serial;
+
+    use super::*;
 
     #[test]
     fn test_validate_ticket_branch_valid_with_rfc() {

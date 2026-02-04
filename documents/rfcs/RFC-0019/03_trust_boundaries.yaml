@@ -133,3 +133,92 @@ rfc_trust_boundaries:
           description: "Duplicate projections on restart"
           mitigation: "Durable projection receipts with idempotency keys"
       evidence_ids: []
+
+    - id: "TB-0006"
+      name: "ContextPack Firewall Boundary"
+      description: |
+        All diffs, tool outputs, and workspace material are adversarial inputs.
+        Episodes MUST consume bounded context via sealed ContextPacks and a broker-side
+        context firewall. Reads outside the ContextPack surface are denied (fail closed)
+        and recorded as defects/blocked outcomes.
+      actors:
+        - "Session (reviewer agent)"
+        - "ToolBroker (kernel)"
+        - "ContextFirewall (kernel)"
+        - "CAS"
+      entrypoints:
+        - "SpawnEpisode context_pack_hash binding"
+        - "Tool requests requiring repository reads"
+      data_flows:
+        - "context_pack_hash -> CAS lookup -> ContextPack manifest/spec -> Broker enforcement"
+        - "Tool request -> ContextFirewall -> Allow/Deny -> Tool execution (if allowed) -> CAS"
+      authn_authz:
+        authn: "ContextPack identified by content hash (CAS-addressed)"
+        authz: "ContextPack allowlists bound at spawn; broker denies out-of-pack reads"
+      risks:
+        - id: "RSK-TB-010"
+          description: "Context poisoning/prompt injection via diffs and tool outputs"
+          mitigation: "Sealed ContextPacks + structured tool APIs + hash-addressed evidence; zoom-in only by hash under budgets"
+        - id: "RSK-TB-011"
+          description: "Ambient discovery/read paths bypass firewall"
+          mitigation: "Deny all non-pack reads by default; conformance tests enforce fail-closed behavior"
+      evidence_ids: []
+
+    - id: "TB-0007"
+      name: "Stop-State Gate Boundary"
+      description: |
+        Stop-order gating is mandatory: before any actuation (tool execution, evidence publish,
+        event emission, external projection), the kernel MUST verify stop-state. If stop-state is
+        missing or unverifiable, the actuation is denied (fail closed).
+      actors:
+        - "Kernel stop gate"
+        - "ToolBroker"
+        - "SessionDispatcher"
+        - "ProjectionWorker"
+        - "Ledger"
+      entrypoints:
+        - "RequestTool"
+        - "PublishEvidence"
+        - "EmitEvent"
+        - "Projection worker actuation"
+      data_flows:
+        - "stop_condition_hash -> verify binding -> allow/deny actuation"
+      authn_authz:
+        authn: "Stop-state referenced by hash and bound by delegation (PermeabilityReceipt/lease)"
+        authz: "Stop gate is authoritative; denial is terminal/blocked per policy"
+      risks:
+        - id: "RSK-TB-012"
+          description: "Actuation proceeds despite missing/unverifiable stop-state"
+          mitigation: "Fail closed; treat as defect; record ReviewBlockedRecorded with STOP_STATE_MISSING"
+      evidence_ids: []
+
+    - id: "TB-0008"
+      name: "Harness Adapter Boundary (external CLI integration)"
+      description: |
+        External agent harnesses (vendor CLIs, local inference) are untrusted processes.
+        Agent outputs are hints; the ledger is authoritative. Kernel-side tool execution is
+        mandatory; adapters normalize harness I/O into tool intents and lifecycle signals.
+        Adapter selection is explicit and hash-addressed via AgentAdapterProfileV1.
+      actors:
+        - "Agent harness process"
+        - "AdapterRuntime"
+        - "SessionDispatcher"
+        - "ToolBroker"
+        - "CAS/Ledger"
+      entrypoints:
+        - "Adapter spawn using adapter_profile_hash"
+        - "Structured output / tool intent parsing"
+      data_flows:
+        - "Harness output -> Adapter parse -> ToolRequest -> Broker -> ToolExec -> CAS -> injected result -> Harness"
+        - "Adapter + Broker -> Ledger events attributing (work_id, episode_id, session_id, adapter_profile_hash)"
+      authn_authz:
+        authn: "Adapter profile hash + session identity"
+        authz: "Broker capability manifest enforcement; adapter cannot execute tools directly"
+      risks:
+        - id: "RSK-TB-013"
+          description: "Output-format drift causes mis-parse or silent tool bypass"
+          mitigation: "Conformance tests + strict parsing + fail-closed on parse errors"
+        - id: "RSK-TB-014"
+          description: "Misconfigured adapter profile grants ambient authority"
+          mitigation: "Profiles are hash-addressed and audited; kernel-side tool execution enforced; deny on misconfiguration"
+      evidence_ids: []

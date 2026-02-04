@@ -14,6 +14,11 @@ requirement:
        - Stage 3: xtask write path removed or restricted to local/dev
     3. No GitHub write occurs without explicit allow flags
     4. FAC projection receipts are durable and independently auditable
+
+    Security posture:
+    - Default behavior MUST be least authority: no GitHub writes unless explicitly enabled.
+    - When writes are enabled, xtask MUST emit durable projection receipts (CAS) so reviewers can
+      attribute every external write to a verifiable internal event chain.
   rationale: |
     xtask already has explicit guardrails for status writes (xtask/src/util.rs:287-330).
     The goal is to shift writes from xtask to the projection worker while maintaining

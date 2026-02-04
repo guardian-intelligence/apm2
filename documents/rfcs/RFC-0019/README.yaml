@@ -13,6 +13,10 @@ rfc_readme:
     RFC-0019 builds on RFC-0018 (HEF/FAC v0 primitives) and addresses the missing
     daemon control-plane wiring: session viability, workspace apply, tool log capture,
     episode event persistence, and projection worker integration.
+
+    RFC-0019 also makes receipts holon-ready (ViewCommitment + ContextPack bindings),
+    and defines an adapter profile contract for running heterogeneous agent CLIs under
+    kernel-side tool execution.
   key_files:
     - file: "00_meta.yaml"
       purpose: "RFC metadata, bindings, dependencies"
@@ -27,14 +31,14 @@ rfc_readme:
     - file: "05_rollout_and_ops.yaml"
       purpose: "Phased rollout plan and operational runbooks"
     - file: "06_ticket_decomposition.yaml"
-      purpose: "Engineering tickets (TCK-00316 through TCK-00324)"
+      purpose: "Engineering tickets (TCK-00316 through TCK-00330)"
     - file: "07_test_and_evidence.yaml"
       purpose: "Test plan and evidence registry"
     - file: "08_risks_and_open_questions.yaml"
       purpose: "Risk analysis and open questions"
     - file: "09_governance_and_gates.yaml"
       purpose: "Gate reviews and waivers"
-  status: "DRAFT"
-  version: "v0"
-  lifecycle_stage: "DISCOVERY"
-  next_action: "Council review for v0 discovery; advance to v2 (Grounded)"
+  status: "APPROVED"
+  version: "v4"
+  lifecycle_stage: "FINALIZED"
+  next_action: "Implement remaining tickets; collect evidence for EVID-0001..EVID-0010; keep receipts replayable from CAS+ledger"

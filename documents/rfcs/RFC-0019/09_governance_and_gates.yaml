@@ -16,13 +16,27 @@ rfc_governance_and_gates:
         - "CAPABILITY_ENFORCEMENT_TESTS"
   gate_reviews:
     - gate_id: "GATE-RFC-ARCHITECTURE"
-      status: "PENDING"
-      evidence_ids: []
-      notes: "Requires review of SessionDispatcher wiring and projection worker design"
+      status: "APPROVED"
+      evidence_ids:
+        - "EVID-GROUND-001"
+        - "EVID-GROUND-002"
+        - "EVID-GROUND-003"
+        - "EVID-GROUND-004"
+        - "EVID-GROUND-005"
+        - "EVID-GROUND-006"
+        - "EVID-GROUND-007"
+      notes: "Reviewed in v4 finalize council; SA-1 (Architectural Rigorist) approved"
+      review_ref: "evidence/rfc/RFC-0019/reviews/rfc_finalize_v4_20260204.yaml"
     - gate_id: "GATE-RFC-SECURITY"
-      status: "PENDING"
-      evidence_ids: []
-      notes: "Requires review of trust boundaries TB-0001 through TB-0004 and risk mitigations"
+      status: "APPROVED"
+      evidence_ids:
+        - "RSK-0001"
+        - "RSK-0002"
+        - "RSK-0003"
+        - "RSK-0004"
+        - "RSK-0005"
+      notes: "Reviewed in v4 finalize council; SA-3 (Security Guardian) approved; RSK-0005 accepted with rationale"
+      review_ref: "evidence/rfc/RFC-0019/reviews/rfc_finalize_v4_20260204.yaml"
   waivers:
     - id: "WVR-0001"
       scope:
