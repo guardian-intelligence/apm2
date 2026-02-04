@@ -444,22 +444,28 @@ impl DispatcherState {
 
         // Register tool handler factories
         // Use closure factories to create fresh handlers for each episode/executor
+        // TCK-00319: Using deprecated .new() methods - these use CWD as root which is
+        // acceptable for dev/testing but production should migrate to workspace-rooted
+        // handlers via register_handlers_with_root() or explicit with_root() calls.
         let cas_for_handlers = Arc::clone(&cas);
-        episode_runtime = episode_runtime
-            // ReadFileHandler
-            .with_handler_factory(|| Box::new(ReadFileHandler::new()))
-            // WriteFileHandler
-            .with_handler_factory(|| Box::new(WriteFileHandler::new()))
-            // ExecuteHandler
-            .with_handler_factory(|| Box::new(ExecuteHandler::new()))
-            // GitOperationHandler
-            .with_handler_factory(|| Box::new(GitOperationHandler::new()))
-            // ArtifactFetchHandler (needs CAS)
-            .with_handler_factory(move || Box::new(ArtifactFetchHandler::new(cas_for_handlers.clone())))
-            // ListFilesHandler
-            .with_handler_factory(|| Box::new(ListFilesHandler::new()))
-            // SearchHandler
-            .with_handler_factory(|| Box::new(SearchHandler::new()));
+        #[allow(deprecated)]
+        {
+            episode_runtime = episode_runtime
+                // ReadFileHandler
+                .with_handler_factory(|| Box::new(ReadFileHandler::new()))
+                // WriteFileHandler
+                .with_handler_factory(|| Box::new(WriteFileHandler::new()))
+                // ExecuteHandler
+                .with_handler_factory(|| Box::new(ExecuteHandler::new()))
+                // GitOperationHandler
+                .with_handler_factory(|| Box::new(GitOperationHandler::new()))
+                // ArtifactFetchHandler (needs CAS)
+                .with_handler_factory(move || Box::new(ArtifactFetchHandler::new(cas_for_handlers.clone())))
+                // ListFilesHandler
+                .with_handler_factory(|| Box::new(ListFilesHandler::new()))
+                // SearchHandler
+                .with_handler_factory(|| Box::new(SearchHandler::new()));
+        }
 
         let episode_runtime = Arc::new(episode_runtime);
 
