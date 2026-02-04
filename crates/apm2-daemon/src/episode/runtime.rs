@@ -853,8 +853,7 @@ impl EpisodeRuntime {
 
             // Initialize tool executor if CAS is configured
             if let Some(ref cas) = self.cas {
-                let budget_tracker =
-                    Arc::new(BudgetTracker::from_envelope(self.default_budget));
+                let budget_tracker = Arc::new(BudgetTracker::from_envelope(self.default_budget));
                 let mut executor = ToolExecutor::new(budget_tracker, cas.clone());
 
                 if let Some(ref clock) = self.clock {

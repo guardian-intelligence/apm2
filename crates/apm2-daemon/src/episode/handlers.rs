@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tracing::warn;
 
 use super::decision::{BudgetDelta, Credential, MAX_TOOL_OUTPUT_SIZE};
 use super::executor::ContentAddressedStore;

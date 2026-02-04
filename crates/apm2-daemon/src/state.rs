@@ -430,8 +430,15 @@ impl DispatcherState {
         let lease_validator = Arc::new(SqliteLeaseValidator::new(Arc::clone(&sqlite_conn)));
 
         // TCK-00316: Initialize EpisodeRuntime with CAS and handlers
-        let mut episode_runtime = EpisodeRuntime::new(EpisodeRuntimeConfig::default());
-        episode_runtime = episode_runtime.with_cas(Arc::clone(&cas));
+        // Use safe production defaults:
+        // - max_concurrent_episodes = 100 (thread exhaustion protection for sync
+        //   dispatch)
+        // - default_budget = EpisodeBudget::default() (resource exhaustion protection)
+        let runtime_config = EpisodeRuntimeConfig::default().with_max_concurrent_episodes(100);
+        let mut episode_runtime = EpisodeRuntime::new(runtime_config);
+        episode_runtime = episode_runtime
+            .with_cas(Arc::clone(&cas))
+            .with_default_budget(crate::episode::EpisodeBudget::default());
 
         // Register tool handler factories
         // Use closure factories to create fresh handlers for each episode/executor
