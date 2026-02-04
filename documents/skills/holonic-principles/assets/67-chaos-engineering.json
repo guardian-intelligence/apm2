@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/chaos-engineering@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 67,
+    "name": "chaos-engineering",
+    "title": "Chaos engineering: validate assumptions under controlled failure",
+    "formal": "inject faults to test resilience, not just correctness.",
+    "apm2_mapping": "use fault injection as continuous safety tests: partitions, message drops, clock skew, corrupted artifacts, revoked capabilities. APM2\u2019s event sourcing makes postmortems crisp because you can replay history.",
+    "connections": [
+      31,
+      99
+    ]
+  }
+}

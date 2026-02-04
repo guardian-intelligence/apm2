@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/hierarchical-rl@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 80,
+    "name": "hierarchical-rl",
+    "title": "Hierarchical RL: delegation as options with initiation/termination",
+    "formal": "options (o) have policies (\\pi_o), initiation sets (I_o), termination (\\beta_o).",
+    "apm2_mapping": "holons supervising sub-holons are options. Encode initiation/termination conditions as contracts and stop conditions in the holon trait context. Delegation without termination conditions is how you get infinite recursion and runaway autonomy.",
+    "connections": [
+      72,
+      94
+    ]
+  }
+}

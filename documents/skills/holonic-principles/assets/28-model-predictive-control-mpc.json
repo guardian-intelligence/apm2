@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/model-predictive-control-mpc@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 28,
+    "name": "model-predictive-control-mpc",
+    "title": "Model predictive control (MPC): stability under constraints/delays",
+    "formal": "optimize control sequence (u_{t:t+H}) over horizon (H) subject to dynamics (x_{t+1}=f(x_t,u_t)) and constraints.",
+    "apm2_mapping": "governance and autoscaling are controllers. The \u201cplant\u201d is: queue lengths, token burn, tool pool occupancy, ledger growth. MPC suggests: don\u2019t react to instantaneous spikes; plan with constraints (budgets, risk tiers) and with known delays (CI latency, network partitions). Encode the plant model and constraints in policies, not ad-hoc code.",
+    "connections": [
+      29,
+      63
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/skill-discovery-option-libraries@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 81,
+    "name": "skill-discovery-option-libraries",
+    "title": "Skill discovery + option libraries: store verified playbooks as callable skills",
+    "formal": "convert experience into reusable policies with known preconditions and effects.",
+    "apm2_mapping": "this is literally the \u201cskills\u201d directory philosophy: executable specifications. But the key word is **verified**: store not just the steps but the evidence patterns and the gates that validate them.",
+    "connections": [
+      92,
+      98
+    ]
+  }
+}

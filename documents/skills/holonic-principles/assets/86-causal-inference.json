@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/causal-inference@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 86,
+    "name": "causal-inference",
+    "title": "Causal inference: don\u2019t remediate based on spurious correlation",
+    "formal": "distinguish (P(Y|X)) from (P(Y|do(X))); interventions matter.",
+    "apm2_mapping": "auto-remediation must be intervention-driven: test a change, observe the counterfactual, roll back if not causal. Canarying and controlled experiments are the causal tool.",
+    "connections": [
+      67,
+      99
+    ]
+  }
+}

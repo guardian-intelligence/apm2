@@ -542,6 +542,7 @@ pub fn current_branch(sh: &Shell) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_validate_ticket_branch_valid_with_rfc() {
@@ -657,6 +658,7 @@ mod tests {
     // =============================================================================
 
     #[test]
+    #[serial]
     #[allow(unsafe_code)]
     fn test_use_hef_projection_env_var() {
         // SERIAL TEST: Modifies environment variables, must be single test
@@ -690,6 +692,7 @@ mod tests {
     // =============================================================================
 
     #[test]
+    #[serial]
     #[allow(unsafe_code)]
     fn test_is_strict_mode_env_var() {
         // SERIAL TEST: Modifies environment variables
@@ -715,6 +718,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[allow(unsafe_code)]
     fn test_allow_status_writes_env_var() {
         // SERIAL TEST: Modifies environment variables
@@ -740,6 +744,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[allow(unsafe_code)]
     fn test_check_status_write_allowed_hef_projection() {
         // HEF projection takes precedence over all other flags
@@ -775,6 +780,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[allow(unsafe_code)]
     fn test_check_status_write_allowed_strict_mode_blocked() {
         // Strict mode without allow flag should block
@@ -809,6 +815,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[allow(unsafe_code)]
     fn test_check_status_write_allowed_strict_mode_with_allow() {
         // Strict mode with allow flag should proceed
@@ -833,6 +840,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[allow(unsafe_code)]
     fn test_check_status_write_allowed_non_strict_mode() {
         // Non-strict mode (default) should always proceed
@@ -909,6 +917,7 @@ mod tests {
     // =============================================================================
 
     #[test]
+    #[serial]
     #[allow(unsafe_code)]
     fn test_emit_internal_from_env() {
         // SERIAL TEST: Modifies environment variables, must be single test

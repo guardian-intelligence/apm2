@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/actor-model@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 52,
+    "name": "actor-model",
+    "title": "Actor model: isolate failures by message-driven components with supervision",
+    "formal": "actors have mailboxes; no shared mutable state; supervisors restart.",
+    "apm2_mapping": "holons are actors: they intake work, execute bounded episodes, emit artifacts, and can be supervised/escalated. Keep the actor boundary crisp: message schemas + capability tokens are the only ingress.",
+    "connections": [
+      53,
+      55
+    ]
+  }
+}

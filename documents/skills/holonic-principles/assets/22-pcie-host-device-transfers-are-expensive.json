@@ -1,0 +1,22 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/pcie-host-device-transfers-are-expensive@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 22,
+    "name": "pcie-host-device-transfers-are-expensive",
+    "title": "PCIe host\u2194device transfers are expensive: treat boundaries as quota\u2019d interfaces",
+    "formal": "crossing bus boundaries costs latency and bandwidth; avoid chatty transfers.",
+    "apm2_mapping": "\u201cboundary\u201d = **tool call**. Every tool call crosses a trust boundary and should carry explicit budgets, schemas, and receipts. APM2 does this with protobuf tool requests, validation, policy evaluation, and budget consumption accounting. Don\u2019t bypass that boundary \u201cfor convenience.\u201d",
+    "connections": [
+      38,
+      90,
+      91
+    ]
+  }
+}

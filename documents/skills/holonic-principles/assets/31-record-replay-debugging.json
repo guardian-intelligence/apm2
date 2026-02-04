@@ -1,0 +1,22 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/record-replay-debugging@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 31,
+    "name": "record-replay-debugging",
+    "title": "Record/replay debugging: capture minimal deterministic traces",
+    "formal": "reproduce by recording nondeterministic inputs and replaying under deterministic execution.",
+    "apm2_mapping": "the ledger + CAS is the natural record/replay substrate. The missing piece is **tool determinism receipts**: store tool request, tool response hash, environment snapshot hash (hermeticity), and attach to work/gate receipts. If an action can\u2019t be replayed from receipts, it is not fully verified.",
+    "connections": [
+      58,
+      92,
+      95
+    ]
+  }
+}

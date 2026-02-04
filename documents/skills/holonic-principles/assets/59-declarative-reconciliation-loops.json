@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/declarative-reconciliation-loops@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 59,
+    "name": "declarative-reconciliation-loops",
+    "title": "Declarative reconciliation loops: desired vs observed state",
+    "formal": "controllers compute (diff(desired, observed)) and apply corrections until convergence.",
+    "apm2_mapping": "reducers are \u201cobserved state,\u201d PRDs/RFCs/tickets are \u201cdesired state,\u201d and gates are reconciliation checks. Extend reconciliation to infrastructure: policy bundles, schema registries, key distribution.",
+    "connections": [
+      47,
+      60
+    ]
+  }
+}

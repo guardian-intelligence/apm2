@@ -1,0 +1,22 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/work-span-model@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 7,
+    "name": "work-span-model",
+    "title": "Work\u2013span model: optimize critical path under verification constraints",
+    "formal": "(T_p \\ge \\max(W/p,; S)), where (W) = total work, (S) = span (critical path).",
+    "apm2_mapping": "APM2\u2019s \u201cwork\u201d is not just code changes; it\u2019s **verified progress**. Verification adds edges to the DAG, increasing span. So decomposition must explicitly minimize **verification span**, not just implementation span. The work module already models parent_work_ids and transitions; use that DAG to compute span and to choose parallelization that doesn\u2019t explode evidence dependencies.",
+    "connections": [
+      8,
+      9,
+      95
+    ]
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/post-quantum-migration-requires-crypto-agility-and-hybrid-modes@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 41,
+    "name": "post-quantum-migration-requires-crypto-agility-and-hybrid-modes",
+    "title": "Post-quantum migration requires crypto agility and hybrid modes",
+    "formal": "plan for hybrid key exchange/signatures: classical + PQ, with version negotiation and downgrade protection.",
+    "apm2_mapping": "APM2\u2019s signing/verification and identity protocols should be versioned and negotiation\u2011safe now, not after you ship global. Treat crypto algorithms as policy-configured primitives with signed policy bundles.",
+    "connections": [
+      93
+    ]
+  }
+}

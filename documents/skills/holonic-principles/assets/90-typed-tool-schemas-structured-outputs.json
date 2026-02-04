@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/typed-tool-schemas-structured-outputs@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 90,
+    "name": "typed-tool-schemas-structured-outputs",
+    "title": "Typed tool schemas + structured outputs: validate and parse, don\u2019t \u201cinterpret\u201d prose",
+    "formal": "schemas define admissible messages; parsing failures are denials.",
+    "apm2_mapping": "protobuf + validation is exactly right. The next step is ensuring every tool response is also structured and content-addressed, so downstream reasoning is about hashes and receipts, not uncontrolled text.",
+    "connections": [
+      31,
+      92
+    ]
+  }
+}

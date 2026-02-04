@@ -1,0 +1,23 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/sociotechnical-incident-response@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 99,
+    "name": "sociotechnical-incident-response",
+    "title": "Sociotechnical incident response: convert failure into stronger contracts and rollback triggers",
+    "formal": "postmortems produce actionable countermeasures; automate rollback based on SLO/budget triggers.",
+    "apm2_mapping": "incidents should mint new defects and new gates. If a failure mode happens twice, governance failed. Tie rollback triggers to burn-rate and to explicit receipts, not human panic. This is how Phase\u20111 recursion becomes monotonic improvement.",
+    "connections": [
+      63,
+      64,
+      67,
+      92
+    ]
+  }
+}

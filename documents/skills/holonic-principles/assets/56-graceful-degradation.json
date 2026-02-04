@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/graceful-degradation@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 56,
+    "name": "graceful-degradation",
+    "title": "Graceful degradation: preserve core functions under failure",
+    "formal": "drop optional features first; preserve invariants.",
+    "apm2_mapping": "under control-plane distress, the system must remain **readable**: ledger and evidence retrieval should keep working even if scheduling and tool orchestration degrade. That\u2019s \u201ccontent plane readable when control plane unhealthy.\u201d",
+    "connections": [
+      25,
+      66
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/consensus-keeps-one-truth-for-critical-control-state-minimize-what-needs-consensus@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 49,
+    "name": "consensus-keeps-one-truth-for-critical-control-state-minimize-what-needs-consensus",
+    "title": "Consensus keeps one truth for critical control state; minimize what needs consensus",
+    "formal": "consensus replicates a state machine; cost is high, so keep the replicated state small.",
+    "apm2_mapping": "store bulk data in CAS; store events in ledger; replicate only the minimal \u201cpointers\u201d and membership state. The BFT backend exists; your future pain will be \u201cwhat did we mistakenly put into consensus?\u201d Keep it austere.",
+    "connections": [
+      45,
+      47
+    ]
+  }
+}

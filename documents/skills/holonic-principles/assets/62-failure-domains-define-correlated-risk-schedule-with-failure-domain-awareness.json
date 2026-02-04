@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/failure-domains-define-correlated-risk-schedule-with-failure-domain-awareness@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 62,
+    "name": "failure-domains-define-correlated-risk-schedule-with-failure-domain-awareness",
+    "title": "Failure domains define correlated risk; schedule with failure-domain awareness",
+    "formal": "correlated failures violate independence assumptions; replication must straddle domains.",
+    "apm2_mapping": "for consensus and evidence replication, spread across domains (rack, ToR switch, power feed). For work scheduling, avoid placing all parents/children in same failure domain.",
+    "connections": [
+      24,
+      49
+    ]
+  }
+}

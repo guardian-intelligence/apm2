@@ -1,0 +1,24 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/roofline-model@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 2,
+    "name": "roofline-model",
+    "title": "Roofline model: performance is min(compute peak, bandwidth peak \u00d7 arithmetic intensity)",
+    "formal": "[\nP = \\min(P_{\\text{peak}}, ; BW_{\\text{peak}} \\cdot AI)\n]\nwhere (AI = \\frac{\\text{FLOPs}}{\\text{bytes moved}}). This is the cleanest \u201cwhy is my code slow?\u201d litmus test.",
+    "apm2_mapping": "APM2\u2019s *dominant* workload is often \u201cmove bytes and validate them\u201d (ledger/event replay, CAS retrieval, schema validation, policy eval), which is usually **bandwidth/latency bound**, not FLOP bound. That means performance wins come from: (a) fewer bytes (principle 5), (b) fewer round\u2011trips (13), (c) deterministic compression (66), and (d) locality (20\u201322). Treat \u201cbytes moved per verified progress\u201d as a first\u2011class metric in the observability plane.",
+    "connections": [
+      3,
+      4,
+      5,
+      9,
+      66
+    ]
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/congestion-control-aqm-decide-whether-the-system-collapses-under-load@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 25,
+    "name": "congestion-control-aqm-decide-whether-the-system-collapses-under-load",
+    "title": "Congestion control + AQM decide whether the system collapses under load",
+    "formal": "queue discipline (RED/CoDel) and pacing prevent bufferbloat and collapse.",
+    "apm2_mapping": "HEF resource governance is AQM: bounded queues, rate limits, drop priority. Extend the same design to: tool execution pools, ledger append contention, CAS retrieval, and CI import. The measurable goal is stability under load (no oscillation, bounded tail latency).",
+    "connections": [
+      9,
+      26,
+      27,
+      28,
+      29,
+      53
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/slos-error-budgets@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 63,
+    "name": "slos-error-budgets",
+    "title": "SLOs + error budgets: reliability becomes an optimization constraint",
+    "formal": "error budget = allowed failures within window; treat reliability as spendable.",
+    "apm2_mapping": "APM2\u2019s autonomy levels should \u201cspend\u201d reliability budget. High-risk autonomous actions must require more budget headroom (i.e., be conservative when budget is low). Encode this into gates and policies.",
+    "connections": [
+      64,
+      94
+    ]
+  }
+}

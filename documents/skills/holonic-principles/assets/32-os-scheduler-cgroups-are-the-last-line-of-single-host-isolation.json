@@ -1,0 +1,20 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/os-scheduler-cgroups-are-the-last-line-of-single-host-isolation@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 32,
+    "name": "os-scheduler-cgroups-are-the-last-line-of-single-host-isolation",
+    "title": "OS scheduler + cgroups are the last line of single-host isolation",
+    "formal": "kernel primitives enforce CPU/mem/IO quotas; without them, \u201cpolicy\u201d is advisory.",
+    "apm2_mapping": "APM2\u2019s policy engine must compile down to kernel-enforced constraints for high-risk executors: cgroups, namespaces, seccomp. The \u201cpolicy said no network\u201d is meaningless if the process can still open sockets.",
+    "connections": [
+      91
+    ]
+  }
+}

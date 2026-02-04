@@ -1,0 +1,23 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/mdps@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 78,
+    "name": "mdps",
+    "title": "MDPs: sequential decision-making optimizing long-run cost",
+    "formal": "state (s), actions (a), transitions (P(s'|s,a)), reward (R).",
+    "apm2_mapping": "the factory loop is an MDP: choose next action (tool call, gate, escalation) to optimize long-run \u201cverified progress per cost\u201d under constraints. But don\u2019t let RL \u201coptimize\u201d without governance: it will Goodhart metrics.",
+    "connections": [
+      84,
+      85,
+      86,
+      94
+    ]
+  }
+}

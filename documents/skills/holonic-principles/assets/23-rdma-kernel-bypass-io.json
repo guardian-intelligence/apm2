@@ -1,0 +1,24 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/rdma-kernel-bypass-io@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 23,
+    "name": "rdma-kernel-bypass-io",
+    "title": "RDMA/kernel-bypass IO: higher performance, more footguns",
+    "formal": "bypassing kernel reduces overhead but removes safety rails; correctness burden shifts to user code.",
+    "apm2_mapping": "any \u201cfast path\u201d (direct executor access, privileged tools, bypassed gates) must be wrapped in **typed, verified libraries** and restricted to high-trust actors. Otherwise you just created a privileged injection surface.",
+    "connections": [
+      33,
+      38,
+      89,
+      90,
+      91
+    ]
+  }
+}

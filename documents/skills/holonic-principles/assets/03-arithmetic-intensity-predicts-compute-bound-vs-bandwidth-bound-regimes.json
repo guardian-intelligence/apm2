@@ -1,0 +1,24 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/arithmetic-intensity-predicts-compute-bound-vs-bandwidth-bound-regimes@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 3,
+    "name": "arithmetic-intensity-predicts-compute-bound-vs-bandwidth-bound-regimes",
+    "title": "Arithmetic intensity predicts compute\u2011bound vs bandwidth\u2011bound regimes",
+    "formal": "(AI) is the slope of the bandwidth line in roofline. If your algorithm\u2019s (AI) is low, adding more compute doesn\u2019t help.",
+    "apm2_mapping": "translate (AI) into *cognitive* and *governance* terms:\n\n* **Data\u2011plane AI:** validation and hashing are memory bound; optimize for fewer passes and smaller payloads (13).\n* **Control\u2011plane AI:** \u201cverification work per byte of evidence\u201d is what matters. Evidence must be compact but sufficient (92).\n  If a gate requires fetching huge context, it is low \u201cverification intensity\u201d and will dominate budgets. This is exactly why APM2 pushes ContextPacks and content hashes: ship **references** not blobs.",
+    "connections": [
+      4,
+      5,
+      45,
+      92,
+      97
+    ]
+  }
+}

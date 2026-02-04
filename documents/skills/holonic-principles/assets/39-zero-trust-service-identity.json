@@ -1,0 +1,20 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/zero-trust-service-identity@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 39,
+    "name": "zero-trust-service-identity",
+    "title": "Zero-trust service identity: authenticate/authorize every hop",
+    "formal": "assume hostile networks; use strong identities and per-request authorization.",
+    "apm2_mapping": "the consensus layer uses mutual TLS; extend this to all internal planes, including pulse/HEF distribution and any external adapters. \u201cInside the rack\u201d is not a boundary.",
+    "connections": [
+      40
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/distributed-constraint-optimization-auctions@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 83,
+    "name": "distributed-constraint-optimization-auctions",
+    "title": "Distributed constraint optimization + auctions: scalable allocation mechanisms",
+    "formal": "agents bid; allocation solves approximate global objective under limited coordination.",
+    "apm2_mapping": "use market-like allocation for compute slots, inference tokens, and CI capacity across holons, but only for *non-authority* resources. Authority allocation is governance, not an auction.",
+    "connections": [
+      84,
+      85
+    ]
+  }
+}

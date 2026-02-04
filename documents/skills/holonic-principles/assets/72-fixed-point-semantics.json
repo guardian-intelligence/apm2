@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/fixed-point-semantics@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 72,
+    "name": "fixed-point-semantics",
+    "title": "Fixed-point semantics: recursive definitions as least fixed points",
+    "formal": "holonic nesting and recursion must be specified as fixed points to avoid ambiguity.",
+    "apm2_mapping": "\u201cholon supervising holon\u201d is recursion. Define nesting semantics so that delegation, budgets, and stop conditions compose and terminate. Otherwise you get spawn storms.",
+    "connections": [
+      53,
+      80
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/bare-metal-provisioning@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 61,
+    "name": "bare-metal-provisioning",
+    "title": "Bare metal provisioning: you need a substrate API (BMC/Redfish/PXE/golden images)",
+    "formal": "if you own hardware, provisioning is control theory + security.",
+    "apm2_mapping": "Phase\u20114/5 require fleet control. Define a rack substrate API early, or you\u2019ll re-invent cloud primitives badly.",
+    "connections": [
+      36,
+      37
+    ]
+  }
+}

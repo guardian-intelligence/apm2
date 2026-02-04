@@ -1,0 +1,23 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/kernel-fusion@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 13,
+    "name": "kernel-fusion",
+    "title": "Kernel fusion: reduce memory round-trips",
+    "formal": "fuse ops to avoid writing intermediate tensors to memory.",
+    "apm2_mapping": "in APM2, \u201cfusion\u201d means: avoid multi-step parse\u2192validate\u2192transform passes over the same data. Canonicalize once, validate once, hash once, store once, then only ship references. Evidence and CAC pipelines already push in this direction. Make it explicit: one pass from untrusted input to canonical form + receipt.",
+    "connections": [
+      45,
+      46,
+      47,
+      90
+    ]
+  }
+}

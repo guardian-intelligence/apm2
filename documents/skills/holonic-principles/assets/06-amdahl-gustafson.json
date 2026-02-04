@@ -1,0 +1,22 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/amdahl-gustafson@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 6,
+    "name": "amdahl-gustafson",
+    "title": "Amdahl + Gustafson: small serial paths dominate at scale",
+    "formal": "Amdahl:\n[\nS(N)=\\frac{1}{(1-p)+p/N}\n]\nGustafson: scaled speedup grows with problem size:\n[\nS(N)=N-(1-p)(N-1)\n]",
+    "apm2_mapping": "APM2\u2019s serial fraction is the **control plane**: policy decisions, lease issuance, ledger append, gate adjudication. If those are slow or flaky, the whole holarchy stalls. Hence: keep control-plane state minimal (49), deterministic (59), and always-on. Anything expensive must move to the data plane with receipts.",
+    "connections": [
+      49,
+      59,
+      63
+    ]
+  }
+}

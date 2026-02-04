@@ -1,0 +1,22 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/landauer-s-principle@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 1,
+    "name": "landauer-s-principle",
+    "title": "Landauer\u2019s principle: erasure costs energy, so \u201cfree compute\u201d is fake",
+    "formal": "any logically irreversible bit erase dissipates at least\n[\nE_{\\min} = kT \\ln 2 \\quad \\text{joules per bit}\n]\nwhere (k) is Boltzmann\u2019s constant and (T) is temperature. Real systems are orders of magnitude above this bound, but the direction is immutable: *compute \u2192 heat \u2192 limits*.",
+    "apm2_mapping": "treat **token budgets**, **tool budgets**, and **artifact bytes** not as \u201cproduct limits\u201d but as **thermodynamic proxies**: every extra tool call and every extra token is irrecoverable physical work somewhere. APM2 already encodes this as session budgets (`apm2_core::budget`) and ContextPack budgets (CAC). The missing step is to express *energy/cost* as a first\u2011class budget dimension and bind it to receipts (so \u201cwe spent X\u201d is auditable, not narrative).",
+    "connections": [
+      8,
+      27,
+      63
+    ]
+  }
+}

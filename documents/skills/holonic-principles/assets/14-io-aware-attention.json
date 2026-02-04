@@ -1,0 +1,22 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/io-aware-attention@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 14,
+    "name": "io-aware-attention",
+    "title": "IO-aware attention: long-context inference is memory traffic dominated",
+    "formal": "attention complexity and bandwidth dominate as context grows; KV reads/writes dominate decode.",
+    "apm2_mapping": "this is why **ContextPack budgets** matter. Long context is a systems problem: caching, invalidation, and eviction are required (15, 97). In APM2, \u201clong context\u201d is mostly *retrieved documents + evidence + diffs*. Treat that as cacheable content-addressed artifacts with explicit TTL and version bindings.",
+    "connections": [
+      15,
+      96,
+      97
+    ]
+  }
+}

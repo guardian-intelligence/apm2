@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/cognitive-memory-hierarchy-maps-to-caches-and-stores@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 96,
+    "name": "cognitive-memory-hierarchy-maps-to-caches-and-stores",
+    "title": "Cognitive memory hierarchy maps to caches and stores: tier memory explicitly",
+    "formal": "working memory (fast/volatile), episodic memory (append-only), semantic memory (index).",
+    "apm2_mapping": "working context is lossy and budgeted; episodic memory is ledger; semantic memory is future index, but must be versioned and invalidated like caches.",
+    "connections": [
+      21,
+      97
+    ]
+  }
+}

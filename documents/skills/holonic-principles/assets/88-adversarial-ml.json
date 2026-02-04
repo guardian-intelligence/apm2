@@ -1,0 +1,22 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/adversarial-ml@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 88,
+    "name": "adversarial-ml",
+    "title": "Adversarial ML: treat inputs as attack surfaces",
+    "formal": "optimize worst-case loss under bounded perturbations; in practice, treat all model inputs as untrusted.",
+    "apm2_mapping": "prompts, retrieved context, tool outputs are *untrusted*. The safe design is: strict schemas, capability separation, hermetic sandboxes, and denial-by-default tools.",
+    "connections": [
+      89,
+      90,
+      91
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/mechanism-design@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 85,
+    "name": "mechanism-design",
+    "title": "Mechanism design: make truthful reporting stable",
+    "formal": "design incentives so truthful reporting is a dominant strategy or equilibrium.",
+    "apm2_mapping": "\u201creward\u201d should mean \u201cadvance work state\u201d only when evidence checks pass. If an agent can progress by persuasion, you\u2019ve built a lying machine. Gates and receipts are the incentive mechanism.",
+    "connections": [
+      92,
+      94
+    ]
+  }
+}

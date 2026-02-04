@@ -1,0 +1,23 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/monads-algebraic-effects@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 74,
+    "name": "monads-algebraic-effects",
+    "title": "Monads/algebraic effects: disciplined sequencing of side effects",
+    "formal": "effects are explicit; handlers interpret them; sequencing becomes structured.",
+    "apm2_mapping": "treat tool usage as effectful computation: requests are effect values; the kernel is the handler enforcing policy and budgets. This is how you prevent \u201cagent prose\u201d from being an implicit effect system.",
+    "connections": [
+      69,
+      70,
+      89,
+      90
+    ]
+  }
+}

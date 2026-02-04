@@ -1,0 +1,23 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/capability-based-security@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 38,
+    "name": "capability-based-security",
+    "title": "Capability-based security: prevent ambient authority via attenuable tokens",
+    "formal": "authority is represented explicitly as a capability object; delegation is attenuation:\n[\ncap' \\preceq cap\n]\nin a partial order of privilege.",
+    "apm2_mapping": "APM2 already implements OCAP in the lease/capability system: scope hashes, budgets, expiry, delegation depth, signatures. This is the primary defense against confused-deputy prompt injection. Treat capability attenuation as a *lattice* (71): operations should be monotone (only reduce privileges).",
+    "connections": [
+      71,
+      89,
+      90,
+      91
+    ]
+  }
+}

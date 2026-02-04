@@ -1,0 +1,23 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/differential-testing-continuous-red-teaming@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 98,
+    "name": "differential-testing-continuous-red-teaming",
+    "title": "Differential testing + continuous red-teaming: find regressions and exploit paths",
+    "formal": "compare behaviors across implementations/versions; adversarial suites probe weak spots.",
+    "apm2_mapping": "red-team the tool protocol, policy engine, and gate semantics continuously. Differentially test canonicalization, hashing, schema validation, and replay determinism. These are the parts attackers target because they define truth.",
+    "connections": [
+      67,
+      88,
+      89,
+      90
+    ]
+  }
+}

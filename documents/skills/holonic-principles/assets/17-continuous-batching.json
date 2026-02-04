@@ -1,0 +1,22 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/continuous-batching@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 17,
+    "name": "continuous-batching",
+    "title": "Continuous batching: separate prefill from decode; schedule on token throughput",
+    "formal": "throughput is tokens/sec, not requests/sec; prefill is parallelizable, decode is sequential.",
+    "apm2_mapping": "for inference, the scheduler should think in **token budget burn rate**. For the control plane, think in **event throughput** and **receipt throughput**, not \u201cnumber of sessions.\u201d Track costs per stage (prefill/context compilation, tool actuation, verification) and allocate capacity accordingly.",
+    "connections": [
+      8,
+      9,
+      27
+    ]
+  }
+}

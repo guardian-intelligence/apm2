@@ -1,0 +1,23 @@
+{
+  "schema": "cac.holonic_principle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/holon/principle/quantization-aware-training-inference@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T00:00:00Z"
+  },
+  "payload": {
+    "id": 11,
+    "name": "quantization-aware-training-inference",
+    "title": "Quantization-aware training/inference: \u201ccapability\u201d depends on deployment format",
+    "formal": "accuracy is a function of quantization scheme (q(\\cdot)), hardware kernels, and calibration.",
+    "apm2_mapping": "model selection in APM2 cannot be \u201cmodel name only.\u201d It must be \u201cmodel \u00d7 runtime profile \u00d7 context budget \u00d7 reliability constraints.\u201d This is why a model_router exists: route based on SLOs, cost, and risk. Store **capability profiles** as versioned artifacts, and treat them as inputs to scheduling and policy.",
+    "connections": [
+      17,
+      18,
+      63,
+      66
+    ]
+  }
+}
