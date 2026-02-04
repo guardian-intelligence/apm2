@@ -462,7 +462,10 @@ impl EpisodeRuntime {
             clock: None,
             cas: None,
             handler_factories: RwLock::new(Vec::new()),
-            default_budget: EpisodeBudget::unlimited(),
+            // SEC-CTRL-FAC-0015: Fail-closed default budget prevents DoS
+            // via unbounded resource consumption. Consumers can override
+            // with `with_default_budget()` if needed.
+            default_budget: EpisodeBudget::default(),
         }
     }
 
@@ -488,7 +491,8 @@ impl EpisodeRuntime {
             clock: Some(clock),
             cas: None,
             handler_factories: RwLock::new(Vec::new()),
-            default_budget: EpisodeBudget::unlimited(),
+            // SEC-CTRL-FAC-0015: Fail-closed default budget
+            default_budget: EpisodeBudget::default(),
         }
     }
 

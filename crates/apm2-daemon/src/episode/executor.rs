@@ -480,8 +480,8 @@ impl ToolExecutor {
         );
 
         // Step 6: Store result in CAS
-        let result_hash = self.store_result_data(&result_data)?;
-        debug!(result_hash = %hex::encode(&result_hash[..8]), "result stored in CAS");
+        let cas_hash = self.store_result_data(&result_data)?;
+        debug!(cas_hash = %hex::encode(&cas_hash[..8]), "result stored in CAS");
 
         // Step 7: Build result
         let duration = start_time.elapsed();
@@ -490,13 +490,18 @@ impl ToolExecutor {
         let duration_ns = duration.as_nanos() as u64;
         let completed_at_ns = ctx.started_at_ns.saturating_add(duration_ns);
 
+        // SEC-CTRL-FAC-0015 BLOCKER FIX: Set CAS hash for evidence integrity.
+        // The CAS hash references the full ToolResultData (output, error_output,
+        // budget) so clients can retrieve complete execution data when inline
+        // results are size-limited.
         let mut result = ToolResult::success(
             &ctx.request_id,
             result_data.output,
             result_data.budget_consumed,
             duration,
             completed_at_ns,
-        );
+        )
+        .with_cas_hash(cas_hash);
 
         // Step 8: Stamp time envelope (RFC-0016 HTF, TCK-00240)
         // Per SEC-CTRL-FAC-0015, if clock is configured, stamping must succeed
