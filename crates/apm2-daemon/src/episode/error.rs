@@ -169,6 +169,13 @@ pub enum EpisodeError {
         message: String,
     },
 
+    /// Execution failed.
+    #[error("execution failed: {message}")]
+    ExecutionFailed {
+        /// Error message.
+        message: String,
+    },
+
     /// Custody domain violation (`SoD` enforcement).
     ///
     /// Per REQ-DCP-0006, spawn is rejected when executor custody domain
@@ -205,6 +212,7 @@ impl EpisodeError {
             Self::EnvelopeValidation { .. } => "envelope_validation",
             Self::Internal { .. } => "internal",
             Self::ClockFailure { .. } => "clock_failure",
+            Self::ExecutionFailed { .. } => "execution_failed",
             Self::CustodyDomainViolation { .. } => "custody_domain_violation",
         }
     }

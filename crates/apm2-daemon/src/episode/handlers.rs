@@ -2233,19 +2233,21 @@ impl ToolHandler for SearchHandler {
 /// use apm2_daemon::episode::handlers::register_stub_handlers;
 ///
 /// let mut executor = ToolExecutor::new(tracker, cas.clone());
-/// register_stub_handlers(&mut executor, cas).expect("handlers registered");
+/// register_stub_handlers(&mut executor, cas, Some(workspace_root)).expect("handlers registered");
 /// ```
 pub fn register_stub_handlers(
     executor: &mut super::executor::ToolExecutor,
     cas: std::sync::Arc<dyn ContentAddressedStore>,
+    root: Option<std::path::PathBuf>,
 ) -> Result<(), super::executor::ExecutorError> {
-    executor.register_handler(Box::new(ReadFileHandler::new()))?;
-    executor.register_handler(Box::new(WriteFileHandler::new()))?;
-    executor.register_handler(Box::new(ExecuteHandler::new()))?;
-    executor.register_handler(Box::new(GitOperationHandler::new()))?;
+    let root = root.unwrap_or_else(|| std::path::PathBuf::from("."));
+    executor.register_handler(Box::new(ReadFileHandler::with_root(root.clone())))?;
+    executor.register_handler(Box::new(WriteFileHandler::with_root(root.clone())))?;
+    executor.register_handler(Box::new(ExecuteHandler::with_root(root.clone())))?;
+    executor.register_handler(Box::new(GitOperationHandler::with_root(root.clone())))?;
     executor.register_handler(Box::new(ArtifactFetchHandler::new(cas)))?;
-    executor.register_handler(Box::new(ListFilesHandler::new()))?;
-    executor.register_handler(Box::new(SearchHandler::new()))?;
+    executor.register_handler(Box::new(ListFilesHandler::with_root(root.clone())))?;
+    executor.register_handler(Box::new(SearchHandler::with_root(root)))?;
     Ok(())
 }
 
@@ -3226,5 +3228,41 @@ mod tests {
             max_lines: None,
         });
         assert_eq!(args.tool_class(), ToolClass::Search);
+    }
+
+    // =========================================================================
+    // Symlink Escape Tests (TCK-00319)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_listfiles_symlink_escape_blocked() {
+        use std::os::unix::fs::symlink;
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path().join("root");
+        let secret = temp_dir.path().join("secret.txt");
+        std::fs::create_dir(&root).expect("create root");
+        std::fs::write(&secret, "secret").expect("write secret");
+
+        // Create symlink inside root pointing to secret outside
+        let link_path = root.join("escape_link");
+        symlink(&secret, &link_path).expect("create symlink");
+
+        let handler = ListFilesHandler::with_root(&root);
+        let args = ToolArgs::ListFiles(ListFilesArgs {
+            path: PathBuf::from("escape_link"), // Try to list the symlink target
+            pattern: None,
+            max_entries: None,
+        });
+
+        // Should fail because target is outside root
+        // validate_resolved_path_within_root returns PathValidation via From implementation
+        let result = handler.execute(&args).await;
+        match result {
+            Err(ToolHandlerError::PathValidation { reason, .. }) => {
+                assert!(reason.contains("escapes workspace root"));
+            },
+            Err(e) => panic!("expected PathValidation, got {e:?}"),
+            Ok(_) => panic!("expected failure, got success"),
+        }
     }
 }

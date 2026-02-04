@@ -15,6 +15,7 @@
 //! - [INV-ES004] State timestamps are monotonically increasing
 
 use std::fmt;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -163,6 +164,8 @@ pub enum EpisodeState {
         lease_id: String,
         /// Session ID for the running episode.
         session_id: String,
+        /// Path to the episode workspace root (TCK-00319).
+        workspace_root: PathBuf,
     },
 
     /// Episode has terminated normally.
@@ -272,6 +275,15 @@ impl EpisodeState {
             _ => None,
         }
     }
+
+    /// Returns the workspace root path if the episode is running.
+    #[must_use]
+    pub fn workspace_root(&self) -> Option<&PathBuf> {
+        match self {
+            Self::Running { workspace_root, .. } => Some(workspace_root),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for EpisodeState {
@@ -353,6 +365,7 @@ mod tests {
             envelope_hash: [1u8; 32],
             lease_id: "lease-123".to_string(),
             session_id: "session-456".to_string(),
+            workspace_root: PathBuf::from("/workspace"),
         }
     }
 
@@ -427,6 +440,13 @@ mod tests {
 
         assert!(terminated_state().session_id().is_none());
         assert!(terminated_state().lease_id().is_none());
+    }
+
+    #[test]
+    fn test_workspace_root_accessor() {
+        assert!(created_state().workspace_root().is_none());
+        assert_eq!(running_state().workspace_root(), Some(&PathBuf::from("/workspace")));
+        assert!(terminated_state().workspace_root().is_none());
     }
 
     // Transition validation tests

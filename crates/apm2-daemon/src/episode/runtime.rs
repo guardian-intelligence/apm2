@@ -40,6 +40,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
 use super::error::{EpisodeError, EpisodeId};
+use super::executor::{ContentAddressedStore, ExecutionContext, ToolExecutor};
 use super::handle::{SessionHandle, StopSignal};
 use super::state::{EpisodeState, QuarantineReason, TerminationClass};
 use crate::htf::HolonicClock;
@@ -379,6 +380,8 @@ struct EpisodeEntry {
     state: EpisodeState,
     /// Session handle if running.
     handle: Option<SessionHandle>,
+    /// Tool executor if running.
+    executor: Option<Arc<ToolExecutor>>,
 }
 
 /// Episode runtime for managing daemon-hosted episodes.
@@ -429,6 +432,8 @@ pub struct EpisodeRuntime {
     /// When present, all episode events are stamped with a `TimeEnvelopeRef`
     /// for temporal ordering and causality tracking.
     clock: Option<Arc<HolonicClock>>,
+    /// CAS for tool results.
+    cas: Arc<dyn ContentAddressedStore>,
 }
 
 impl EpisodeRuntime {
@@ -446,6 +451,7 @@ impl EpisodeRuntime {
             session_seq: AtomicU64::new(1),
             episode_seq: AtomicU64::new(1),
             clock: None,
+            cas: Arc::new(super::broker::StubContentAddressedStore::new()),
         }
     }
 
@@ -469,6 +475,7 @@ impl EpisodeRuntime {
             session_seq: AtomicU64::new(1),
             episode_seq: AtomicU64::new(1),
             clock: Some(clock),
+            cas: Arc::new(super::broker::StubContentAddressedStore::new()),
         }
     }
 
@@ -560,6 +567,89 @@ impl EpisodeRuntime {
     #[must_use]
     pub const fn clock(&self) -> Option<&Arc<HolonicClock>> {
         self.clock.as_ref()
+    }
+
+    /// Sets the CAS for tool results.
+    #[must_use]
+    pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
+        self.cas = cas;
+        self
+    }
+
+    fn now_ns(&self) -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        self.clock.as_ref().map_or_else(
+            || {
+                // Fallback to SystemTime if no clock (for tests)
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0)
+            },
+            |clock| {
+                // Use HLC if available
+                clock.now_hlc().map(|t| t.wall_ns).unwrap_or(0)
+            },
+        )
+    }
+
+    /// Executes a tool in the context of an episode.
+    ///
+    /// # Arguments
+    ///
+    /// * `episode_id` - The episode to execute the tool in
+    /// * `request_id` - The request ID for this execution
+    /// * `args` - The tool arguments
+    ///
+    /// # Returns
+    ///
+    /// The tool result.
+    ///
+    /// # Errors
+    ///
+    /// - `EpisodeError::NotFound` if the episode doesn't exist
+    /// - `EpisodeError::InvalidTransition` if the episode is not running
+    /// - `EpisodeError::ExecutionFailed` if execution fails
+    #[instrument(skip(self, args))]
+    pub async fn execute_tool(
+        &self,
+        episode_id: &EpisodeId,
+        request_id: &str,
+        args: &super::tool_handler::ToolArgs,
+    ) -> Result<super::decision::ToolResult, EpisodeError> {
+        let executor = {
+            let episodes = self.episodes.read().await;
+            let entry = episodes
+                .get(episode_id.as_str())
+                .ok_or_else(|| EpisodeError::NotFound {
+                    id: episode_id.as_str().to_string(),
+                })?;
+
+            if !entry.state.is_running() {
+                return Err(EpisodeError::InvalidTransition {
+                    id: episode_id.as_str().to_string(),
+                    from: entry.state.state_name(),
+                    to: "execute_tool",
+                });
+            }
+
+            entry
+                .executor
+                .clone()
+                .ok_or_else(|| EpisodeError::Internal {
+                    message: "executor not initialized for running episode".to_string(),
+                })?
+        };
+
+        let timestamp_ns = self.now_ns();
+        let ctx = ExecutionContext::new(episode_id.clone(), request_id, timestamp_ns);
+
+        executor
+            .execute(&ctx, args)
+            .await
+            .map_err(|e| EpisodeError::ExecutionFailed {
+                message: e.to_string(),
+            })
     }
 
     /// Stamps a time envelope and returns both the envelope and its reference.
@@ -670,6 +760,7 @@ impl EpisodeRuntime {
                 EpisodeEntry {
                     state,
                     handle: None,
+                    executor: None,
                 },
             );
         }
@@ -707,6 +798,7 @@ impl EpisodeRuntime {
     /// * `episode_id` - The episode to start
     /// * `lease_id` - Lease authorizing execution
     /// * `timestamp_ns` - Current timestamp in nanoseconds since epoch
+    /// * `workspace_root` - Path to the episode workspace root (TCK-00319)
     ///
     /// # Returns
     ///
@@ -728,6 +820,7 @@ impl EpisodeRuntime {
         episode_id: &EpisodeId,
         lease_id: impl Into<String>,
         timestamp_ns: u64,
+        workspace_root: std::path::PathBuf,
     ) -> Result<SessionHandle, EpisodeError> {
         let lease_id = lease_id.into();
 
@@ -778,7 +871,34 @@ impl EpisodeRuntime {
                 envelope_hash,
                 lease_id: lease_id.clone(),
                 session_id: session_id.clone(),
+                workspace_root: workspace_root.clone(),
             };
+
+            // Initialize budget tracker (default for now until envelope is loaded)
+            // TODO(TCK-00319): Load budget from envelope
+            let budget = super::budget::EpisodeBudget::builder()
+                .tokens(1_000_000)
+                .tool_calls(10_000)
+                .wall_ms(3_600_000)
+                .bytes_io(100_000_000)
+                .build();
+            let tracker = Arc::new(super::budget_tracker::BudgetTracker::from_envelope(budget));
+
+            let mut executor = ToolExecutor::new(tracker, self.cas.clone());
+            if let Some(ref clock) = self.clock {
+                executor = executor.with_clock(clock.clone());
+            }
+
+            // Register handlers rooted at workspace_root
+            if let Err(e) = super::handlers::register_stub_handlers(
+                &mut executor,
+                self.cas.clone(),
+                Some(workspace_root),
+            ) {
+                return Err(EpisodeError::Internal {
+                    message: format!("handler registration failed: {e}"),
+                });
+            }
 
             // Create session handle and store a clone in the entry.
             // Both the caller's handle and the runtime's handle share the same
@@ -792,6 +912,7 @@ impl EpisodeRuntime {
                 timestamp_ns,
             );
             entry.handle = Some(handle.clone());
+            entry.executor = Some(Arc::new(executor));
 
             handle
         };
@@ -1323,7 +1444,7 @@ mod tests {
             .unwrap();
 
         let handle = runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await
             .unwrap();
 
@@ -1346,7 +1467,7 @@ mod tests {
         runtime.drain_events().await; // Clear create event
 
         runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await
             .unwrap();
 
@@ -1363,7 +1484,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await
             .unwrap();
 
@@ -1394,7 +1515,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await
             .unwrap();
         runtime.drain_events().await; // Clear previous events
@@ -1421,7 +1542,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await
             .unwrap();
 
@@ -1443,7 +1564,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await
             .unwrap();
         runtime.drain_events().await;
@@ -1470,7 +1591,7 @@ mod tests {
             .await
             .unwrap();
         let handle = runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await
             .unwrap();
 
@@ -1506,7 +1627,7 @@ mod tests {
             .await
             .unwrap();
         let handle1 = runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await
             .unwrap();
 
@@ -1541,13 +1662,13 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .start(&episode_id, "lease-1", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await
             .unwrap();
 
         // Try to start again - should fail
         let result = runtime
-            .start(&episode_id, "lease-2", test_timestamp() + 2000)
+            .start(&episode_id, "lease-2", test_timestamp() + 2000, std::path::PathBuf::from("/tmp/workspace"))
             .await;
         assert!(matches!(
             result,
@@ -1585,7 +1706,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .start(&episode_id, "lease-1", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await
             .unwrap();
         runtime
@@ -1599,7 +1720,7 @@ mod tests {
 
         // Try to start again after termination - should fail
         let result = runtime
-            .start(&episode_id, "lease-2", test_timestamp() + 3000)
+            .start(&episode_id, "lease-2", test_timestamp() + 3000, std::path::PathBuf::from("/tmp/workspace"))
             .await;
         assert!(matches!(
             result,
@@ -1615,7 +1736,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .start(&episode_id, "lease-1", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await
             .unwrap();
         runtime
@@ -1649,7 +1770,7 @@ mod tests {
         let result = runtime.observe(&fake_id).await;
         assert!(matches!(result, Err(EpisodeError::NotFound { .. })));
 
-        let result = runtime.start(&fake_id, "lease-1", test_timestamp()).await;
+        let result = runtime.start(&fake_id, "lease-1", test_timestamp(), std::path::PathBuf::from("/tmp/workspace")).await;
         assert!(matches!(result, Err(EpisodeError::NotFound { .. })));
     }
 
@@ -1687,7 +1808,7 @@ mod tests {
         assert_eq!(runtime.total_count().await, 1);
 
         runtime
-            .start(&ep1, "lease-1", test_timestamp() + 1000)
+            .start(&ep1, "lease-1", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await
             .unwrap();
         assert_eq!(runtime.active_count().await, 1);
@@ -1707,7 +1828,7 @@ mod tests {
         // Create and terminate an episode
         let ep1 = runtime.create([1u8; 32], test_timestamp()).await.unwrap();
         runtime
-            .start(&ep1, "lease-1", test_timestamp() + 1000)
+            .start(&ep1, "lease-1", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await
             .unwrap();
         runtime
@@ -1737,7 +1858,7 @@ mod tests {
             .unwrap();
 
         let result = runtime
-            .start(&episode_id, "", test_timestamp() + 1000)
+            .start(&episode_id, "", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await;
         assert!(matches!(result, Err(EpisodeError::InvalidLease { .. })));
     }
@@ -1774,7 +1895,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&ep, "lease-1", test_timestamp() + 1000)
+            .start(&ep, "lease-1", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await
             .unwrap();
         runtime
@@ -1897,7 +2018,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await
             .unwrap();
         runtime
@@ -1935,7 +2056,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", test_timestamp() + 1000, std::path::PathBuf::from("/tmp/workspace"))
             .await
             .unwrap();
         runtime

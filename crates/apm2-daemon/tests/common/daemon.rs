@@ -187,7 +187,14 @@ impl TestDaemon {
     ) -> Result<SessionHandle, apm2_daemon::episode::EpisodeError> {
         let timestamp = self.advance_time_ms(1);
         let lease_id = format!("lease-{}", self.current_timestamp_ns());
-        self.runtime.start(episode_id, lease_id, timestamp).await
+        self.runtime
+            .start(
+                episode_id,
+                lease_id,
+                timestamp,
+                self.temp_dir.path().to_path_buf(),
+            )
+            .await
     }
 
     /// Starts an episode with a specific lease ID.
@@ -199,7 +206,14 @@ impl TestDaemon {
         lease_id: impl Into<String>,
     ) -> Result<SessionHandle, apm2_daemon::episode::EpisodeError> {
         let timestamp = self.advance_time_ms(1);
-        self.runtime.start(episode_id, lease_id, timestamp).await
+        self.runtime
+            .start(
+                episode_id,
+                lease_id,
+                timestamp,
+                self.temp_dir.path().to_path_buf(),
+            )
+            .await
     }
 
     /// Stops an episode with the specified termination class.
