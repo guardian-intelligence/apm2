@@ -21,6 +21,23 @@
 //! - `ListFiles`: Directory listing for navigation
 //! - `Search`: Content search for code analysis
 //!
+//! # Handler-Layer Enforcement for Git and Artifact
+//!
+//! While `ToolClass::Git` and `ToolClass::Artifact` have `can_mutate() == true`
+//! at the type level, the reviewer manifest grants these capabilities with the
+//! understanding that **read-only enforcement is performed at the handler
+//! layer**:
+//!
+//! - `Git` capability: The git handler only allows read-only commands (diff,
+//!   status, log) and rejects write commands (push, commit, checkout)
+//! - `Artifact` capability: The artifact handler only allows fetch/get
+//!   operations and rejects publish/put operations
+//!
+//! This design provides defense-in-depth:
+//! 1. Manifest allowlist controls which tool classes are accessible
+//! 2. Handler implementations control which operations are permitted
+//! 3. Both layers must agree for an operation to proceed (fail-closed)
+//!
 //! # Denied Operations (fail-closed)
 //!
 //! - `Write`: File modifications (reviewer cannot modify code)

@@ -158,13 +158,14 @@ pub use broker::{
 pub use budget::{EpisodeBudget, EpisodeBudgetBuilder};
 // Re-export tool execution types (TCK-00165)
 pub use budget_tracker::{BudgetExhaustedError, BudgetSnapshot, BudgetTracker};
-// Re-export capability types (TCK-00163, TCK-00254, TCK-00258)
+// Re-export capability types (TCK-00163, TCK-00254, TCK-00258, TCK-00317)
 pub use capability::{
     Capability, CapabilityBuilder, CapabilityDecision, CapabilityError, CapabilityManifest,
     CapabilityManifestBuilder, CapabilityValidator, CustodyDomainError, CustodyDomainId,
-    DenyReason, MAX_ACTOR_ID_LEN, MAX_CAPABILITIES, MAX_CAPABILITY_ID_LEN,
-    MAX_CUSTODY_DOMAINS_PER_REQUEST, MAX_MANIFEST_ID_LEN, MAX_SHELL_ALLOWLIST,
-    MAX_SHELL_PATTERN_LEN, MAX_WRITE_ALLOWLIST, ToolRequest, validate_custody_domain_overlap,
+    DenyReason, InMemoryCasManifestLoader, MAX_ACTOR_ID_LEN, MAX_CAPABILITIES,
+    MAX_CAPABILITY_ID_LEN, MAX_CUSTODY_DOMAINS_PER_REQUEST, MAX_MANIFEST_ID_LEN,
+    MAX_SHELL_ALLOWLIST, MAX_SHELL_PATTERN_LEN, MAX_WRITE_ALLOWLIST, ManifestLoader, ToolRequest,
+    validate_custody_domain_overlap,
 };
 // Re-export Claude Code adapter types (TCK-00173)
 pub use claude_code::{
