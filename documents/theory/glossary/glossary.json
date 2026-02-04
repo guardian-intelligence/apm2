@@ -446,6 +446,37 @@
         "crates/apm2-core/src/supervisor/mod.rs"
       ],
       "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:hef",
+      "term": "Holonic Event Fabric (HEF)",
+      "definition": "A non-authoritative Pulse Plane for lossy event notifications, designed to accelerate UX and reduce polling by deriving 'pulses' from the authoritative Truth Plane (Ledger + CAS).",
+      "operationalization": "Implemented via `PulseEnvelopeV1` (proto), `PulsePublisher` (`crates/apm2-daemon/src/protocol/pulse_outbox.rs`), and resource governance logic (`crates/apm2-daemon/src/protocol/resource_governance.rs`).",
+      "theory_refs": [
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/protocol/pulse_outbox.rs",
+        "crates/apm2-daemon/src/protocol/resource_governance.rs",
+        "proto/apm2d_runtime_v1.proto"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:htf",
+      "term": "Holonic Time Fabric (HTF)",
+      "definition": "The protocol substrate defining the time model for APM2. It prohibits wall-clock authority in favor of explicit, verifiable clocks (LedgerTime, MonotonicTicks, CausalTime).",
+      "operationalization": "Implemented via `HtfTick` and `LedgerTime` (`crates/apm2-core/src/htf/types.rs`), `HolonicClock` (`crates/apm2-daemon/src/htf/clock.rs`), and `TimeEnvelope`.",
+      "theory_refs": [
+        "LAW-04",
+        "LAW-09"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/htf/mod.rs",
+        "crates/apm2-daemon/src/htf/clock.rs",
+        "crates/apm2-core/src/htf/types.rs"
+      ],
+      "node_class": "NORMATIVE"
     }
   ],
   "edges": [
@@ -558,6 +589,21 @@
       "source": "term:snapshot",
       "target": "term:ledger",
       "relation": "refines"
+    },
+    {
+      "source": "term:hef",
+      "target": "term:ledger",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:htf",
+      "target": "term:ledger",
+      "relation": "governs"
+    },
+    {
+      "source": "term:htf",
+      "target": "term:lease",
+      "relation": "governs"
     }
   ]
 }
