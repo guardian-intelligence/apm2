@@ -639,7 +639,8 @@ async fn async_main(args: Args) -> Result<()> {
                 Ok(mut github_config) => {
                     // Load token from environment if specified
                     // Note: clippy::option_if_let_else is suppressed because the suggested
-                    // map_or pattern doesn't work well with mutable captures (github_config mutation)
+                    // map_or pattern doesn't work well with mutable captures (github_config
+                    // mutation)
                     #[allow(clippy::option_if_let_else)]
                     let has_token = if let Some(ref token_env) = projection_config.github_token_env
                     {
@@ -674,13 +675,10 @@ async fn async_main(args: Args) -> Result<()> {
                     let signer = apm2_core::crypto::Signer::generate();
 
                     // Determine cache path for idempotency
-                    let cache_path = daemon_config
-                        .ledger_db_path
-                        .as_ref()
-                        .map_or_else(
-                            || std::env::temp_dir().join("apm2_projection_cache.db"),
-                            |p| p.with_extension("projection_cache.db"),
-                        );
+                    let cache_path = daemon_config.ledger_db_path.as_ref().map_or_else(
+                        || std::env::temp_dir().join("apm2_projection_cache.db"),
+                        |p| p.with_extension("projection_cache.db"),
+                    );
 
                     // Create adapter - use mock mode if no token, real mode otherwise
                     let adapter_result = if has_token {

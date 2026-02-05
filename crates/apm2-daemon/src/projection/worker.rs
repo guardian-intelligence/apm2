@@ -828,8 +828,9 @@ impl LedgerTailer {
     ///
     /// # MAJOR FIX: Potential Data Loss via Non-Unique Watermark
     ///
-    /// Now accepts both `timestamp_ns` and `event_id` to form a composite cursor.
-    /// This ensures correct ordering when multiple events share a timestamp.
+    /// Now accepts both `timestamp_ns` and `event_id` to form a composite
+    /// cursor. This ensures correct ordering when multiple events share a
+    /// timestamp.
     ///
     /// # At-Least-Once Delivery
     ///
