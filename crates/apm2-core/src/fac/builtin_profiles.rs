@@ -1035,7 +1035,7 @@ mod tests {
             for (key, value) in &profile.capability_map {
                 assert!(
                     value.starts_with("kernel."),
-                    Capability '{key}' must map to kernel tool class, got '{value}'
+                    "Capability '{key}' must map to kernel tool class, got '{value}'"
                 );
             }
         }
@@ -1115,7 +1115,7 @@ mod tests {
             for (key, value) in &profile.capability_map {
                 assert!(
                     value.starts_with("kernel."),
-                    Capability '{key}' must map to kernel tool class, got '{value}'
+                    "Capability '{key}' must map to kernel tool class, got '{value}'"
                 );
             }
         }
@@ -1185,7 +1185,7 @@ mod tests {
             for (key, value) in &profile.capability_map {
                 assert!(
                     value.starts_with("kernel."),
-                    Capability '{key}' must map to kernel tool class, got '{value}'
+                    "Capability '{key}' must map to kernel tool class, got '{value}'"
                 );
             }
         }
@@ -1226,10 +1226,7 @@ mod tests {
         fn conformance_all_profiles_tool_bridge() {
             for profile in all_builtin_profiles() {
                 let tb = profile.tool_bridge.as_ref().unwrap_or_else(|| {
-                    panic!(
-                        "Profile '{}' should have tool_bridge",
-                        profile.profile_id
-                    )
+                    panic!("Profile '{}' should have tool_bridge", profile.profile_id)
                 });
 
                 assert!(
@@ -1392,13 +1389,12 @@ mod tests {
             let cas = MemoryCas::new();
 
             for profile in all_builtin_profiles() {
-                let hash = profile.store_in_cas(&cas).unwrap_or_else(|_| {
-                    panic!("Store '{}' should succeed", profile.profile_id)
-                });
+                let hash = profile
+                    .store_in_cas(&cas)
+                    .unwrap_or_else(|_| panic!("Store '{}' should succeed", profile.profile_id));
 
-                let loaded = AgentAdapterProfileV1::load_from_cas(&cas, &hash).unwrap_or_else(|_| {
-                    panic!("Load '{}' should succeed", profile.profile_id)
-                });
+                let loaded = AgentAdapterProfileV1::load_from_cas(&cas, &hash)
+                    .unwrap_or_else(|_| panic!("Load '{}' should succeed", profile.profile_id));
 
                 // Field-by-field comparison
                 assert_eq!(
@@ -1504,9 +1500,9 @@ mod tests {
 
             for profile in all_builtin_profiles() {
                 // Store profile in CAS
-                let profile_hash = profile.store_in_cas(&cas).unwrap_or_else(|_| {
-                    panic!("Store '{}' should succeed", profile.profile_id)
-                });
+                let profile_hash = profile
+                    .store_in_cas(&cas)
+                    .unwrap_or_else(|_| panic!("Store '{}' should succeed", profile.profile_id));
 
                 // Simulate non-interactive receipt production
                 // In real usage, this would be a ToolExecutionReceipt or similar
@@ -1541,15 +1537,13 @@ mod tests {
                     .try_into()
                     .expect("Profile hash should be 32 bytes");
 
-                let recovered_profile =
-                    AgentAdapterProfileV1::load_from_cas(&cas, &recovered_hash).unwrap_or_else(
-                        |_| {
-                            panic!(
-                                "Profile '{}' should be recoverable from receipt hash",
-                                profile.profile_id
-                            )
-                        },
-                    );
+                let recovered_profile = AgentAdapterProfileV1::load_from_cas(&cas, &recovered_hash)
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "Profile '{}' should be recoverable from receipt hash",
+                            profile.profile_id
+                        )
+                    });
 
                 assert_eq!(
                     profile.profile_id, recovered_profile.profile_id,
