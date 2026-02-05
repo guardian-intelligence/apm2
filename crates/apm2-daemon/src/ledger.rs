@@ -652,7 +652,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
         // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
         // (Time & Monotonicity)
-        // TCK-00330: adapter_profile_hash provides ledger attribution for profile-based auditing
+        // TCK-00330: adapter_profile_hash provides ledger attribution for profile-based
+        // auditing
         let payload = serde_json::json!({
             "event_type": "episode_run_attributed",
             "work_id": work_id,

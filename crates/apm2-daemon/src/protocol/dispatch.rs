@@ -355,8 +355,9 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// - `session_id`: The session that executed the run
     /// - `adapter_profile_hash`: CAS hash of the `AgentAdapterProfileV1` used
     ///
-    /// Per REQ-0009, ledger events must include `adapter_profile_hash` attribution
-    /// to enable audit trail reconstruction and profile-specific analysis.
+    /// Per REQ-0009, ledger events must include `adapter_profile_hash`
+    /// attribution to enable audit trail reconstruction and
+    /// profile-specific analysis.
     ///
     /// # Arguments
     ///
@@ -1108,7 +1109,8 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
         // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
         // (Time & Monotonicity)
-        // TCK-00330: adapter_profile_hash provides ledger attribution for profile-based auditing
+        // TCK-00330: adapter_profile_hash provides ledger attribution for profile-based
+        // auditing
         let payload_json = serde_json::json!({
             "event_type": "episode_run_attributed",
             "work_id": work_id,

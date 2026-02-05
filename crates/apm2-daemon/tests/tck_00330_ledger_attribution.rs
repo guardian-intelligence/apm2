@@ -8,8 +8,8 @@
 
 use apm2_core::evidence::MemoryCas;
 use apm2_core::fac::{
-    all_builtin_profiles, claude_code_profile, codex_cli_profile, gemini_cli_profile,
-    local_inference_profile, AgentAdapterProfileV1,
+    AgentAdapterProfileV1, all_builtin_profiles, claude_code_profile, codex_cli_profile,
+    gemini_cli_profile, local_inference_profile,
 };
 use apm2_daemon::protocol::dispatch::{LedgerEventEmitter, StubLedgerEventEmitter};
 
@@ -103,11 +103,23 @@ fn test_events_separated_by_work_id() {
     let profile_hash = [0x42u8; 32];
 
     emitter
-        .emit_episode_run_attributed("work-001", "episode-001", "session-001", &profile_hash, 1000)
+        .emit_episode_run_attributed(
+            "work-001",
+            "episode-001",
+            "session-001",
+            &profile_hash,
+            1000,
+        )
         .expect("emit should succeed");
 
     emitter
-        .emit_episode_run_attributed("work-002", "episode-002", "session-002", &profile_hash, 2000)
+        .emit_episode_run_attributed(
+            "work-002",
+            "episode-002",
+            "session-002",
+            &profile_hash,
+            2000,
+        )
         .expect("emit should succeed");
 
     // Query each work_id separately
@@ -193,7 +205,13 @@ fn verify_non_interactive_receipt_production(
     let timestamp_ns = 1_704_067_200_000_000_000u64;
 
     let event = emitter
-        .emit_episode_run_attributed(&work_id, &episode_id, &session_id, &profile_hash, timestamp_ns)
+        .emit_episode_run_attributed(
+            &work_id,
+            &episode_id,
+            &session_id,
+            &profile_hash,
+            timestamp_ns,
+        )
         .expect("emit should succeed");
 
     // Step 3: Verify event contains correct attribution
@@ -240,7 +258,13 @@ fn test_event_signature_verification() {
 
     let profile_hash = [0x42u8; 32];
     let event = emitter
-        .emit_episode_run_attributed("work-001", "episode-001", "session-001", &profile_hash, 1000)
+        .emit_episode_run_attributed(
+            "work-001",
+            "episode-001",
+            "session-001",
+            &profile_hash,
+            1000,
+        )
         .expect("emit should succeed");
 
     // Verify signature length (Ed25519 = 64 bytes)
@@ -275,7 +299,13 @@ fn test_tampered_payload_fails_verification() {
 
     let profile_hash = [0x42u8; 32];
     let event = emitter
-        .emit_episode_run_attributed("work-001", "episode-001", "session-001", &profile_hash, 1000)
+        .emit_episode_run_attributed(
+            "work-001",
+            "episode-001",
+            "session-001",
+            &profile_hash,
+            1000,
+        )
         .expect("emit should succeed");
 
     // Tamper with payload

@@ -905,15 +905,21 @@ mod tests {
             let profile = claude_code_profile();
 
             // Hash should be computable
-            let hash = profile.compute_cas_hash().expect("CAS hash should be computable");
+            let hash = profile
+                .compute_cas_hash()
+                .expect("CAS hash should be computable");
             assert_ne!(hash, [0u8; 32], "CAS hash should be non-zero");
 
             // Hash should be deterministic (call twice)
-            let hash2 = profile.compute_cas_hash().expect("CAS hash should be computable");
+            let hash2 = profile
+                .compute_cas_hash()
+                .expect("CAS hash should be computable");
             assert_eq!(hash, hash2, "CAS hash should be deterministic");
 
             // Profile should be storable in CAS
-            let stored_hash = profile.store_in_cas(&cas).expect("Store in CAS should succeed");
+            let stored_hash = profile
+                .store_in_cas(&cas)
+                .expect("Store in CAS should succeed");
             assert_eq!(hash, stored_hash, "Stored hash should match computed hash");
         }
 
@@ -983,13 +989,19 @@ mod tests {
             let cas = MemoryCas::new();
             let profile = gemini_cli_profile();
 
-            let hash = profile.compute_cas_hash().expect("CAS hash should be computable");
+            let hash = profile
+                .compute_cas_hash()
+                .expect("CAS hash should be computable");
             assert_ne!(hash, [0u8; 32], "CAS hash should be non-zero");
 
-            let hash2 = profile.compute_cas_hash().expect("CAS hash should be computable");
+            let hash2 = profile
+                .compute_cas_hash()
+                .expect("CAS hash should be computable");
             assert_eq!(hash, hash2, "CAS hash should be deterministic");
 
-            let stored_hash = profile.store_in_cas(&cas).expect("Store in CAS should succeed");
+            let stored_hash = profile
+                .store_in_cas(&cas)
+                .expect("Store in CAS should succeed");
             assert_eq!(hash, stored_hash, "Stored hash should match computed hash");
         }
 
@@ -1048,13 +1060,19 @@ mod tests {
             let cas = MemoryCas::new();
             let profile = codex_cli_profile();
 
-            let hash = profile.compute_cas_hash().expect("CAS hash should be computable");
+            let hash = profile
+                .compute_cas_hash()
+                .expect("CAS hash should be computable");
             assert_ne!(hash, [0u8; 32], "CAS hash should be non-zero");
 
-            let hash2 = profile.compute_cas_hash().expect("CAS hash should be computable");
+            let hash2 = profile
+                .compute_cas_hash()
+                .expect("CAS hash should be computable");
             assert_eq!(hash, hash2, "CAS hash should be deterministic");
 
-            let stored_hash = profile.store_in_cas(&cas).expect("Store in CAS should succeed");
+            let stored_hash = profile
+                .store_in_cas(&cas)
+                .expect("Store in CAS should succeed");
             assert_eq!(hash, stored_hash, "Stored hash should match computed hash");
         }
 
@@ -1108,7 +1126,8 @@ mod tests {
             }
         }
 
-        /// Conformance test: Local inference profile instantiation and validation.
+        /// Conformance test: Local inference profile instantiation and
+        /// validation.
         #[test]
         fn conformance_local_inference_instantiation() {
             let profile = local_inference_profile();
@@ -1124,13 +1143,19 @@ mod tests {
             let cas = MemoryCas::new();
             let profile = local_inference_profile();
 
-            let hash = profile.compute_cas_hash().expect("CAS hash should be computable");
+            let hash = profile
+                .compute_cas_hash()
+                .expect("CAS hash should be computable");
             assert_ne!(hash, [0u8; 32], "CAS hash should be non-zero");
 
-            let hash2 = profile.compute_cas_hash().expect("CAS hash should be computable");
+            let hash2 = profile
+                .compute_cas_hash()
+                .expect("CAS hash should be computable");
             assert_eq!(hash, hash2, "CAS hash should be deterministic");
 
-            let stored_hash = profile.store_in_cas(&cas).expect("Store in CAS should succeed");
+            let stored_hash = profile
+                .store_in_cas(&cas)
+                .expect("Store in CAS should succeed");
             assert_eq!(hash, stored_hash, "Stored hash should match computed hash");
         }
 
@@ -1208,12 +1233,16 @@ mod tests {
         #[test]
         fn conformance_all_profiles_tool_bridge() {
             for profile in all_builtin_profiles() {
-                let tb = profile
-                    .tool_bridge
-                    .as_ref()
-                    .expect(&format!("Profile '{}' should have tool_bridge", profile.profile_id));
+                let tb = profile.tool_bridge.as_ref().expect(&format!(
+                    "Profile '{}' should have tool_bridge",
+                    profile.profile_id
+                ));
 
-                assert!(tb.enabled, "Profile '{}' tool_bridge should be enabled", profile.profile_id);
+                assert!(
+                    tb.enabled,
+                    "Profile '{}' tool_bridge should be enabled",
+                    profile.profile_id
+                );
                 assert_eq!(
                     tb.protocol_version, "TI1",
                     "Profile '{}' should use TI1 protocol",
@@ -1511,8 +1540,8 @@ mod tests {
                 );
 
                 // Verify profile can be recovered from receipt
-                let recovered_hash = hex::decode(receipt_hash)
-                    .expect("Profile hash should be valid hex");
+                let recovered_hash =
+                    hex::decode(receipt_hash).expect("Profile hash should be valid hex");
                 let recovered_hash: [u8; 32] = recovered_hash
                     .try_into()
                     .expect("Profile hash should be 32 bytes");
