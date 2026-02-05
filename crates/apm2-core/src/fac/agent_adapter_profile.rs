@@ -405,8 +405,9 @@ impl ToolBridgeConfig {
                 "max_result_size must be non-zero".to_string(),
             ));
         }
-        if self.max_args_size > 100 * 1024 * 1024 { // 100MB limit
-             return Err(AgentAdapterProfileError::InvalidToolBridge(
+        if self.max_args_size > 100 * 1024 * 1024 {
+            // 100MB limit
+            return Err(AgentAdapterProfileError::InvalidToolBridge(
                 "max_args_size exceeds safety limit (100MB)".to_string(),
             ));
         }
@@ -452,7 +453,8 @@ impl VersionProbe {
     ///
     /// # Errors
     ///
-    /// Returns error if command or regex exceeds maximum length, or regex is invalid.
+    /// Returns error if command or regex exceeds maximum length, or regex is
+    /// invalid.
     pub fn validate(&self) -> Result<(), AgentAdapterProfileError> {
         if self.command.is_empty() {
             return Err(AgentAdapterProfileError::MissingField(
@@ -478,9 +480,10 @@ impl VersionProbe {
                 max: MAX_VERSION_PROBE_REGEX_LENGTH,
             });
         }
-        
+
         // Compile regex to validate syntax
-        Regex::new(&self.regex).map_err(|e| AgentAdapterProfileError::InvalidRegex(e.to_string()))?;
+        Regex::new(&self.regex)
+            .map_err(|e| AgentAdapterProfileError::InvalidRegex(e.to_string()))?;
 
         Ok(())
     }
@@ -761,7 +764,7 @@ impl AgentAdapterProfileV1 {
             }
             // Syntax check: alphanumeric + underscore
             if !key.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                 return Err(AgentAdapterProfileError::InvalidPath {
+                return Err(AgentAdapterProfileError::InvalidPath {
                     field: "env_template.key",
                     reason: format!("invalid env key syntax: {key}"),
                 });
@@ -868,7 +871,11 @@ impl AgentAdapterProfileV1 {
     pub fn compute_cas_hash(&self) -> Result<[u8; 32], AgentAdapterProfileError> {
         self.canonical_bytes()
             .map(|bytes| *blake3::hash(&bytes).as_bytes())
-            .map_err(|e| AgentAdapterProfileError::SerializationError(format!("canonicalization failed: {e}")))
+            .map_err(|e| {
+                AgentAdapterProfileError::SerializationError(format!(
+                    "canonicalization failed: {e}"
+                ))
+            })
     }
 
     /// Stores this profile in CAS and returns its hash.
@@ -1517,7 +1524,10 @@ mod tests {
             .build();
         assert!(matches!(
             result,
-            Err(AgentAdapterProfileError::InvalidPath { field: "command", .. })
+            Err(AgentAdapterProfileError::InvalidPath {
+                field: "command",
+                ..
+            })
         ));
     }
 

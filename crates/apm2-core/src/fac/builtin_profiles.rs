@@ -765,11 +765,17 @@ mod tests {
     fn test_profile_hashes_are_deterministic() {
         let profile1 = claude_code_profile();
         let profile2 = claude_code_profile();
-        assert_eq!(profile1.compute_cas_hash().unwrap(), profile2.compute_cas_hash().unwrap());
+        assert_eq!(
+            profile1.compute_cas_hash().unwrap(),
+            profile2.compute_cas_hash().unwrap()
+        );
 
         let profile3 = gemini_cli_profile();
         let profile4 = gemini_cli_profile();
-        assert_eq!(profile3.compute_cas_hash().unwrap(), profile4.compute_cas_hash().unwrap());
+        assert_eq!(
+            profile3.compute_cas_hash().unwrap(),
+            profile4.compute_cas_hash().unwrap()
+        );
     }
 
     #[test]

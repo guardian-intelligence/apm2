@@ -69,8 +69,6 @@ pub enum AdapterRegistryError {
     #[error("profile validation failed: {0}")]
     ProfileInvalid(String),
 
-
-
     /// No profile hash available (legacy mode).
     #[error("no profile hash available: registry was created in legacy mode")]
     NoProfileHash,
