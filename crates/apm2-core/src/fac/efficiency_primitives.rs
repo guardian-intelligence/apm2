@@ -89,7 +89,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::crypto::Hash;
@@ -140,6 +141,110 @@ pub const EFFICIENCY_PRIMITIVES_SCHEMA: &str = "apm2.efficiency_primitives.v1";
 
 /// Schema version.
 pub const EFFICIENCY_PRIMITIVES_VERSION: &str = "1.0.0";
+
+// =============================================================================
+// Bounded Deserialization Helpers (SEC-CTRL-FAC-0016)
+// =============================================================================
+
+/// Deserialize a Vec with a maximum size bound to prevent OOM attacks.
+///
+/// Per SEC-CTRL-FAC-0016, all collections deserialized from untrusted input
+/// must enforce size limits during parsing to prevent DoS via memory exhaustion.
+fn deserialize_bounded_vec<'de, D, T>(
+    deserializer: D,
+    max_items: usize,
+    field_name: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T> {
+        max_items: usize,
+        field_name: &'static str,
+        _marker: std::marker::PhantomData<T>,
+    }
+
+    impl<'de, T> Visitor<'de> for BoundedVecVisitor<T>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a sequence with at most {} items",
+                self.max_items
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut vec = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(self.max_items));
+
+            while let Some(item) = seq.next_element()? {
+                if vec.len() >= self.max_items {
+                    return Err(de::Error::custom(format!(
+                        "collection '{}' exceeds maximum size of {}",
+                        self.field_name, self.max_items
+                    )));
+                }
+                vec.push(item);
+            }
+
+            Ok(vec)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor {
+        max_items,
+        field_name,
+        _marker: std::marker::PhantomData,
+    })
+}
+
+/// Deserialize changed_files with MAX_CHANGED_FILES bound.
+fn deserialize_changed_files<'de, D>(deserializer: D) -> Result<Vec<ChangedFile>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_CHANGED_FILES, "changed_files")
+}
+
+/// Deserialize findings with MAX_FINDINGS bound.
+fn deserialize_findings<'de, D>(deserializer: D) -> Result<Vec<Finding>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_FINDINGS, "findings")
+}
+
+/// Deserialize tool_outputs with MAX_TOOL_OUTPUTS bound.
+fn deserialize_tool_outputs<'de, D>(deserializer: D) -> Result<Vec<ToolOutputRef>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_TOOL_OUTPUTS, "tool_outputs")
+}
+
+/// Deserialize deltas with MAX_DELTAS bound.
+fn deserialize_deltas<'de, D>(deserializer: D) -> Result<Vec<ContextDelta>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_DELTAS, "deltas")
+}
+
+/// Deserialize zoom_selectors with MAX_ZOOM_SELECTORS bound.
+fn deserialize_zoom_selectors<'de, D>(deserializer: D) -> Result<Vec<ZoomSelector>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_ZOOM_SELECTORS, "zoom_selectors")
+}
 
 // =============================================================================
 // Error Types
@@ -443,10 +548,19 @@ pub struct ContextDelta {
     /// Target iteration number.
     pub to_iteration: u64,
     /// Files changed in this delta.
+    ///
+    /// Per SEC-CTRL-FAC-0016, bounded during deserialization to prevent OOM.
+    #[serde(deserialize_with = "deserialize_changed_files")]
     pub changed_files: Vec<ChangedFile>,
     /// Findings discovered in this iteration.
+    ///
+    /// Per SEC-CTRL-FAC-0016, bounded during deserialization to prevent OOM.
+    #[serde(deserialize_with = "deserialize_findings")]
     pub findings: Vec<Finding>,
     /// Tool outputs produced in this iteration.
+    ///
+    /// Per SEC-CTRL-FAC-0016, bounded during deserialization to prevent OOM.
+    #[serde(deserialize_with = "deserialize_tool_outputs")]
     pub tool_outputs: Vec<ToolOutputRef>,
     /// CAS hash of the summary receipt for this iteration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -834,13 +948,31 @@ impl ToolOutputCache {
     ///
     /// Panics if the internal lock is poisoned (indicates a thread panic).
     pub fn store(&self, key: &CacheKey, output: &[u8]) -> Result<Hash, EfficiencyError> {
-        // Check entry limit
+        // SEC-CTRL-FAC-0017: Enforce hard cap with FIFO eviction.
+        // First evict expired entries, then if still at capacity, evict oldest.
         {
             let index = self.index.read().expect("lock poisoned");
             if index.len() >= self.config.max_entries {
-                // Evict expired entries first
                 drop(index);
                 self.evict_expired();
+
+                // After evicting expired, check if we're still at capacity
+                // If so, evict the oldest entry (FIFO policy)
+                let mut index = self.index.write().expect("lock poisoned");
+                while index.len() >= self.config.max_entries {
+                    // Find and remove the oldest entry
+                    let oldest_key = index
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.created_at)
+                        .map(|(k, _)| k.clone());
+
+                    if let Some(key_to_remove) = oldest_key {
+                        index.remove(&key_to_remove);
+                    } else {
+                        // No entries to remove (shouldn't happen if len >= max_entries)
+                        break;
+                    }
+                }
             }
         }
 
@@ -1122,8 +1254,14 @@ pub struct IterationContext {
     /// Context budget in bytes.
     pub context_budget_bytes: usize,
     /// Deltas from recent iterations.
+    ///
+    /// Per SEC-CTRL-FAC-0016, bounded during deserialization to prevent OOM.
+    #[serde(deserialize_with = "deserialize_deltas")]
     pub deltas: Vec<ContextDelta>,
     /// Available zoom selectors.
+    ///
+    /// Per SEC-CTRL-FAC-0016, bounded during deserialization to prevent OOM.
+    #[serde(deserialize_with = "deserialize_zoom_selectors")]
     pub zoom_selectors: Vec<ZoomSelector>,
     /// Total files changed across all deltas.
     pub total_files_changed: u64,
