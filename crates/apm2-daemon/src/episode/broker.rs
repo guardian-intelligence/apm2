@@ -106,8 +106,8 @@ pub enum BrokerError {
 
     /// Context pack not found in CAS (TCK-00326).
     ///
-    /// Per RFC-0019, this triggers ReviewBlockedRecorded emission
-    /// with reason_code MISSING_ARTIFACT.
+    /// Per RFC-0019, this triggers `ReviewBlockedRecorded` emission
+    /// with `reason_code` `MISSING_ARTIFACT`.
     #[error("context pack not found in CAS: hash {hash}")]
     ContextPackNotFound {
         /// Hex-encoded hash of the missing context pack.
@@ -116,8 +116,8 @@ pub enum BrokerError {
 
     /// Context pack seal verification failed (TCK-00326).
     ///
-    /// Per RFC-0019, this triggers ReviewBlockedRecorded emission
-    /// with reason_code INVALID_BUNDLE.
+    /// Per RFC-0019, this triggers `ReviewBlockedRecorded` emission
+    /// with `reason_code` `INVALID_BUNDLE`.
     #[error("context pack seal invalid: {reason}")]
     ContextPackSealInvalid {
         /// Reason for seal verification failure.
@@ -156,10 +156,10 @@ impl BrokerError {
         matches!(self, Self::ExecutionFailed { .. })
     }
 
-    /// Returns `true` if this error should trigger ReviewBlockedRecorded
+    /// Returns `true` if this error should trigger `ReviewBlockedRecorded`
     /// (TCK-00326).
     ///
-    /// Per RFC-0019, context pack errors should emit a ReviewBlockedRecorded
+    /// Per RFC-0019, context pack errors should emit a `ReviewBlockedRecorded`
     /// event to the ledger for audit and fail-closed behavior.
     #[must_use]
     pub const fn should_emit_review_blocked(&self) -> bool {
@@ -1065,7 +1065,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     /// (TCK-00326).
     ///
     /// This method:
-    /// 1. Loads the sealed ContextPackManifest from CAS using its hash
+    /// 1. Loads the sealed `ContextPackManifest` from CAS using its hash
     /// 2. Verifies the seal integrity
     /// 3. Initializes the context firewall for subsequent tool requests
     ///
@@ -1077,13 +1077,13 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     /// - Deserialization failure:
     ///   [`BrokerError::ContextPackDeserializationFailed`]
     ///
-    /// All of these errors should trigger ReviewBlockedRecorded emission
+    /// All of these errors should trigger `ReviewBlockedRecorded` emission
     /// by the caller.
     ///
     /// # Arguments
     ///
-    /// * `context_pack_hash` - BLAKE3 hash of the sealed ContextPackManifest in
-    ///   CAS
+    /// * `context_pack_hash` - BLAKE3 hash of the sealed `ContextPackManifest`
+    ///   in CAS
     ///
     /// # Errors
     ///
@@ -1175,7 +1175,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
 
         debug!(
             manifest_id = %manifest.manifest_id,
-            cas_hash = %hex::encode(&hash),
+            cas_hash = %hex::encode(hash),
             "context pack sealed and stored in CAS"
         );
 
