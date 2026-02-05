@@ -17,14 +17,15 @@ use std::sync::{Arc, Mutex};
 
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
+use apm2_core::fac::REVIEW_RECEIPT_RECORDED_PREFIX;
 use ed25519_dalek::Signer;
 use rusqlite::{Connection, OptionalExtension, params};
 use tracing::info;
 
 use crate::protocol::dispatch::{
-    DEFECT_RECORDED_DOMAIN_PREFIX, LeaseValidationError, LeaseValidator, LedgerEventEmitter,
-    LedgerEventError, SignedLedgerEvent, WORK_CLAIMED_DOMAIN_PREFIX, WorkClaim, WorkRegistry,
-    WorkRegistryError,
+    DEFECT_RECORDED_DOMAIN_PREFIX, EPISODE_EVENT_DOMAIN_PREFIX, LeaseValidationError,
+    LeaseValidator, LedgerEventEmitter, LedgerEventError, SignedLedgerEvent,
+    WORK_CLAIMED_DOMAIN_PREFIX, WorkClaim, WorkRegistry, WorkRegistryError,
 };
 
 /// Durable ledger event emitter backed by `SQLite`.
@@ -462,8 +463,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         payload: &[u8],
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        // Domain prefix for episode events (TCK-00321)
-        const EPISODE_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.episode:";
+        // TCK-00321: EPISODE_EVENT_DOMAIN_PREFIX imported from crate::protocol::dispatch
+        // to maintain single source of truth for domain prefixes.
 
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
@@ -548,8 +549,9 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         reviewer_actor_id: &str,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        // Domain prefix for review receipt events (TCK-00321)
-        const REVIEW_RECEIPT_DOMAIN_PREFIX: &[u8] = b"apm2.event.review_receipt:";
+        // TCK-00321: Use REVIEW_RECEIPT_RECORDED_PREFIX from apm2_core::fac for
+        // protocol compatibility across daemon/core boundary.
+        // (Previously used daemon-local prefix; now aligned with core.)
 
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
@@ -577,8 +579,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
         // Build canonical bytes for signing (domain prefix + JCS payload)
         let mut canonical_bytes =
-            Vec::with_capacity(REVIEW_RECEIPT_DOMAIN_PREFIX.len() + payload_bytes.len());
-        canonical_bytes.extend_from_slice(REVIEW_RECEIPT_DOMAIN_PREFIX);
+            Vec::with_capacity(REVIEW_RECEIPT_RECORDED_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(REVIEW_RECEIPT_RECORDED_PREFIX);
         canonical_bytes.extend_from_slice(&payload_bytes);
 
         // Sign the canonical bytes

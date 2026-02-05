@@ -32,6 +32,7 @@ use std::time::{Duration, SystemTime};
 
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
+use apm2_core::fac::REVIEW_RECEIPT_RECORDED_PREFIX;
 use bytes::Bytes;
 use prost::Message;
 use subtle::ConstantTimeEq;
@@ -343,10 +344,9 @@ pub const DEFECT_RECORDED_DOMAIN_PREFIX: &[u8] = b"apm2.event.defect_recorded:";
 /// Per RFC-0017 and TCK-00264: domain prefixes prevent cross-context replay.
 pub const EPISODE_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.episode:";
 
-/// Domain separation prefix for `ReviewReceiptRecorded` events (TCK-00321).
-///
-/// Per RFC-0017 and TCK-00264: domain prefixes prevent cross-context replay.
-pub const REVIEW_RECEIPT_DOMAIN_PREFIX: &[u8] = b"apm2.event.review_receipt:";
+// Note: `REVIEW_RECEIPT_RECORDED_PREFIX` is imported from `apm2_core::fac`
+// to ensure protocol compatibility across the daemon/core boundary (TCK-00321).
+// See `apm2_core::fac::domain_separator` for the canonical definition.
 
 /// Maximum length for ID fields (`work_id`, `lease_id`, etc.).
 ///
@@ -968,9 +968,11 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         let payload_bytes = canonical_payload.as_bytes().to_vec();
 
         // Build canonical bytes for signing (domain prefix + JCS payload)
+        // TCK-00321: Use REVIEW_RECEIPT_RECORDED_PREFIX from apm2_core::fac for
+        // protocol compatibility across daemon/core boundary.
         let mut canonical_bytes =
-            Vec::with_capacity(REVIEW_RECEIPT_DOMAIN_PREFIX.len() + payload_bytes.len());
-        canonical_bytes.extend_from_slice(REVIEW_RECEIPT_DOMAIN_PREFIX);
+            Vec::with_capacity(REVIEW_RECEIPT_RECORDED_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(REVIEW_RECEIPT_RECORDED_PREFIX);
         canonical_bytes.extend_from_slice(&payload_bytes);
 
         // Sign the canonical bytes
