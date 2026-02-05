@@ -3779,4 +3779,166 @@ mod tests {
             }
         }
     }
+
+    // ========================================================================
+    // TCK-00344: SessionStatus Integration Tests
+    // ========================================================================
+
+    /// IT-00344-SS: SessionStatus handler tests.
+    ///
+    /// These tests verify that the SessionStatus endpoint correctly queries
+    /// the session registry and returns session state, or falls back to
+    /// token-based status when the registry is not wired or the session
+    /// is not yet registered.
+    mod session_status_handlers {
+        use super::*;
+        use crate::episode::InMemorySessionRegistry;
+        use crate::protocol::messages::WorkRole;
+        use crate::session::SessionState;
+
+        /// IT-00344-SS-01: SessionStatus returns ACTIVE with full session data
+        /// when session registry is wired and session is registered.
+        #[test]
+        fn test_session_status_returns_active_with_registry() {
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+
+            // Create a session registry and register a session
+            let registry: Arc<dyn crate::session::SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+
+            let session = SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-SS-001".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-SS-001".to_string(),
+                ephemeral_handle: "handle-ss-001".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: Some("E-SS-001".to_string()),
+            };
+            registry
+                .register_session(session)
+                .expect("session registration should succeed");
+
+            // Create dispatcher with session registry wired
+            let dispatcher = SessionDispatcher::new(minter.clone()).with_session_registry(registry);
+
+            let token = test_token(&minter);
+            let request = SessionStatusRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+            };
+            let frame = encode_session_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::SessionStatus(resp) => {
+                    assert_eq!(resp.session_id, "session-001");
+                    assert_eq!(resp.state, "ACTIVE");
+                    assert_eq!(resp.work_id, "W-SS-001");
+                    assert_eq!(resp.role, i32::from(WorkRole::Implementer));
+                    assert_eq!(resp.episode_id, Some("E-SS-001".to_string()));
+                    assert!(resp.duration_ms > 0, "duration_ms should be non-zero");
+                },
+                other => panic!("Expected SessionStatus response, got: {other:?}"),
+            }
+        }
+
+        /// IT-00344-SS-02: SessionStatus returns ACTIVE with minimal data when
+        /// session registry is not wired (falls back to token-based status).
+        #[test]
+        fn test_session_status_without_registry_falls_back_to_token() {
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+
+            // No session registry wired
+            let dispatcher = SessionDispatcher::new(minter.clone());
+
+            let token = test_token(&minter);
+            let request = SessionStatusRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+            };
+            let frame = encode_session_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::SessionStatus(resp) => {
+                    assert_eq!(resp.session_id, "session-001");
+                    assert_eq!(resp.state, "ACTIVE");
+                    // Without registry, work_id and role are defaults
+                    assert!(resp.work_id.is_empty());
+                    assert_eq!(resp.role, 0);
+                },
+                other => panic!("Expected SessionStatus response, got: {other:?}"),
+            }
+        }
+
+        /// IT-00344-SS-03: SessionStatus rejects invalid session token.
+        #[test]
+        fn test_session_status_rejects_invalid_token() {
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+            let dispatcher = SessionDispatcher::new(minter);
+
+            let request = SessionStatusRequest {
+                session_token: "invalid-token-not-a-real-jwt".to_string(),
+            };
+            let frame = encode_session_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorInvalid as i32,
+                        "Expected SESSION_ERROR_INVALID error"
+                    );
+                },
+                other => panic!("Expected error for invalid token, got: {other:?}"),
+            }
+        }
+
+        /// IT-00344-SS-04: SessionStatus is denied from operator socket
+        /// (PERMISSION_DENIED).
+        #[test]
+        fn test_session_status_denied_from_operator_socket() {
+            let minter = test_minter();
+            let ctx = make_privileged_ctx();
+            let dispatcher = SessionDispatcher::new(minter);
+
+            // Use a dummy payload - doesn't matter since it should be rejected
+            // before parsing
+            let request = SessionStatusRequest {
+                session_token: "dummy".to_string(),
+            };
+            let frame = encode_session_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorPermissionDenied as i32,
+                        "Expected PERMISSION_DENIED for operator context"
+                    );
+                },
+                other => panic!("Expected PERMISSION_DENIED, got: {other:?}"),
+            }
+        }
+
+        /// IT-00344-SS-05: SessionStatus encoding uses correct tag (tag 6).
+        #[test]
+        fn test_session_status_encoding_tag() {
+            let request = SessionStatusRequest {
+                session_token: "test-token".to_string(),
+            };
+            let encoded = encode_session_status_request(&request);
+            assert_eq!(
+                encoded[0],
+                SessionMessageType::SessionStatus.tag(),
+                "SessionStatus tag should be 6"
+            );
+            assert_eq!(encoded[0], 6u8, "SessionStatus tag value should be 6");
+        }
+    }
 }

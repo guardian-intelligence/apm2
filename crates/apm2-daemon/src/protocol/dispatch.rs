@@ -7867,4 +7867,301 @@ mod tests {
             assert_eq!(encoded[0], PrivilegedMessageType::ReloadProcess.tag());
         }
     }
+
+    // ========================================================================
+    // TCK-00344: WorkStatus Integration Tests
+    // ========================================================================
+
+    /// IT-00344: WorkStatus handler tests.
+    ///
+    /// These tests verify the WorkStatus endpoint can look up session and
+    /// work-claim state by work_id, exercising the full path through the
+    /// session registry (`find_session_by_work_id`) and work registry.
+    mod work_status_handlers {
+        use super::*;
+        use crate::session::SessionState;
+
+        /// Helper to create a privileged context for operator connections.
+        fn privileged_ctx() -> ConnectionContext {
+            ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }))
+        }
+
+        /// IT-00344-01: WorkStatus returns SPAWNED for a registered session.
+        ///
+        /// Verifies the end-to-end path:
+        /// 1. Register a session in the session registry
+        /// 2. Send a WorkStatus request with matching work_id
+        /// 3. Receive a response with status "SPAWNED" and correct metadata
+        #[test]
+        fn test_work_status_returns_spawned_for_session() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            // Register a session associated with the work_id
+            let session = SessionState {
+                session_id: "S-WS-001".to_string(),
+                work_id: "W-WORK-001".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-WS-001".to_string(),
+                ephemeral_handle: "handle-ws-001".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: Some("E-WS-001".to_string()),
+            };
+            dispatcher
+                .session_registry
+                .register_session(session)
+                .expect("session registration should succeed");
+
+            // Query WorkStatus
+            let request = WorkStatusRequest {
+                work_id: "W-WORK-001".to_string(),
+            };
+            let frame = encode_work_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::WorkStatus(resp) => {
+                    assert_eq!(resp.work_id, "W-WORK-001");
+                    assert_eq!(resp.status, "SPAWNED");
+                    assert_eq!(resp.session_id, Some("S-WS-001".to_string()));
+                    assert_eq!(resp.role, Some(WorkRole::Implementer.into()));
+                },
+                other => panic!("Expected WorkStatus response, got: {other:?}"),
+            }
+        }
+
+        /// IT-00344-02: WorkStatus returns CLAIMED for work that has been
+        /// claimed but not yet spawned.
+        #[test]
+        fn test_work_status_returns_claimed_for_work_claim() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            // Register a work claim (no session spawned yet)
+            let claim = WorkClaim {
+                work_id: "W-CLAIM-001".to_string(),
+                lease_id: "L-CLAIM-001".to_string(),
+                actor_id: "actor:alice".to_string(),
+                role: WorkRole::Reviewer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "resolved-ref".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            // Query WorkStatus
+            let request = WorkStatusRequest {
+                work_id: "W-CLAIM-001".to_string(),
+            };
+            let frame = encode_work_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::WorkStatus(resp) => {
+                    assert_eq!(resp.work_id, "W-CLAIM-001");
+                    assert_eq!(resp.status, "CLAIMED");
+                    assert_eq!(resp.actor_id, Some("actor:alice".to_string()));
+                    assert_eq!(resp.role, Some(WorkRole::Reviewer.into()));
+                    assert_eq!(resp.lease_id, Some("L-CLAIM-001".to_string()));
+                },
+                other => panic!("Expected WorkStatus response, got: {other:?}"),
+            }
+        }
+
+        /// IT-00344-03: WorkStatus returns WorkNotFound for unknown work_id.
+        #[test]
+        fn test_work_status_returns_not_found() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            let request = WorkStatusRequest {
+                work_id: "W-NONEXISTENT".to_string(),
+            };
+            let frame = encode_work_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::WorkNotFound as i32,
+                        "Expected WorkNotFound error code"
+                    );
+                    assert!(
+                        err.message.contains("W-NONEXISTENT"),
+                        "Error should reference the work_id: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        /// IT-00344-04: WorkStatus rejects empty work_id.
+        #[test]
+        fn test_work_status_rejects_empty_work_id() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            let request = WorkStatusRequest {
+                work_id: String::new(),
+            };
+            let frame = encode_work_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("empty"),
+                        "Error should mention empty work_id: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for empty work_id, got: {other:?}"),
+            }
+        }
+
+        /// IT-00344-05: WorkStatus rejects oversized work_id (CTR-1603).
+        #[test]
+        fn test_work_status_rejects_oversized_work_id() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            let request = WorkStatusRequest {
+                work_id: "W-".to_string() + &"x".repeat(MAX_ID_LENGTH),
+            };
+            let frame = encode_work_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("exceeds maximum"),
+                        "Error should mention size limit: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for oversized work_id, got: {other:?}"),
+            }
+        }
+
+        /// IT-00344-06: WorkStatus is denied from session socket
+        /// (PERMISSION_DENIED).
+        #[test]
+        fn test_work_status_denied_from_session_socket() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::session(
+                Some(PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12346),
+                }),
+                Some("session-001".to_string()),
+            );
+
+            let request = WorkStatusRequest {
+                work_id: "W-001".to_string(),
+            };
+            let frame = encode_work_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(err.code, PrivilegedErrorCode::PermissionDenied as i32);
+                },
+                other => panic!("Expected PERMISSION_DENIED, got: {other:?}"),
+            }
+        }
+
+        /// IT-00344-07: WorkStatus encoding uses correct tag (tag 15).
+        #[test]
+        fn test_work_status_encoding_tag() {
+            let request = WorkStatusRequest {
+                work_id: "W-001".to_string(),
+            };
+            let encoded = encode_work_status_request(&request);
+            assert_eq!(
+                encoded[0],
+                PrivilegedMessageType::WorkStatus.tag(),
+                "WorkStatus tag should be 15"
+            );
+            assert_eq!(encoded[0], 15u8, "WorkStatus tag value should be 15");
+        }
+
+        /// IT-00344-08: Full ClaimWork -> SpawnEpisode -> WorkStatus flow.
+        ///
+        /// Exercises the complete lifecycle: claim work, spawn an episode
+        /// (which registers a session in the shared registry), then query
+        /// WorkStatus to verify the session is visible.
+        #[test]
+        fn test_claim_spawn_then_work_status() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            // Step 1: ClaimWork
+            let claim_request = ClaimWorkRequest {
+                actor_id: "team-alpha:alice".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                other => panic!("Expected ClaimWork response, got: {other:?}"),
+            };
+
+            // Step 2: SpawnEpisode
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: "/tmp".to_string(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+
+            // Verify spawn succeeded
+            match &spawn_response {
+                PrivilegedResponse::SpawnEpisode(resp) => {
+                    assert!(!resp.session_id.is_empty(), "Should get a session_id");
+                },
+                other => panic!("Expected SpawnEpisode response, got: {other:?}"),
+            }
+
+            // Step 3: WorkStatus query
+            let status_request = WorkStatusRequest {
+                work_id: work_id.clone(),
+            };
+            let status_frame = encode_work_status_request(&status_request);
+            let status_response = dispatcher.dispatch(&status_frame, &ctx).unwrap();
+
+            match status_response {
+                PrivilegedResponse::WorkStatus(resp) => {
+                    assert_eq!(resp.work_id, work_id);
+                    assert_eq!(
+                        resp.status, "SPAWNED",
+                        "Work should be SPAWNED after episode creation"
+                    );
+                    assert!(
+                        resp.session_id.is_some(),
+                        "Should have session_id for spawned work"
+                    );
+                },
+                other => panic!("Expected WorkStatus response, got: {other:?}"),
+            }
+        }
+    }
 }
