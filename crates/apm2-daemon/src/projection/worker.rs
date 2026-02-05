@@ -630,7 +630,7 @@ impl LedgerTailer {
     /// Creates a new ledger tailer with a custom ID.
     ///
     /// MAJOR FIX: Potential Data Loss via Non-Unique Watermark
-    /// Now loads both timestamp_ns and event_id for composite cursor.
+    /// Now loads both `timestamp_ns` and `event_id` for composite cursor.
     #[allow(clippy::cast_sign_loss)]
     pub fn with_id(conn: Arc<Mutex<Connection>>, tailer_id: &str) -> Self {
         // Load persisted watermark if available (now includes event_id)
@@ -678,7 +678,7 @@ impl LedgerTailer {
     /// Called after processing events to ensure crash recovery.
     ///
     /// MAJOR FIX: Potential Data Loss via Non-Unique Watermark
-    /// Now persists both timestamp_ns and event_id for composite cursor.
+    /// Now persists both `timestamp_ns` and `event_id` for composite cursor.
     #[allow(clippy::cast_possible_wrap)]
     fn persist_watermark(&self) -> Result<(), ProjectionWorkerError> {
         let conn = self
@@ -715,7 +715,7 @@ impl LedgerTailer {
     /// # MAJOR FIX: Potential Data Loss via Non-Unique Watermark
     ///
     /// Uses a composite cursor `(timestamp_ns, event_id)` to handle timestamp
-    /// collisions. Events are ordered by timestamp first, then by event_id
+    /// collisions. Events are ordered by timestamp first, then by `event_id`
     /// (lexicographically) for deterministic ordering within the same
     /// timestamp.
     ///
@@ -828,7 +828,7 @@ impl LedgerTailer {
     ///
     /// # MAJOR FIX: Potential Data Loss via Non-Unique Watermark
     ///
-    /// Now accepts both timestamp_ns and event_id to form a composite cursor.
+    /// Now accepts both `timestamp_ns` and `event_id` to form a composite cursor.
     /// This ensures correct ordering when multiple events share a timestamp.
     ///
     /// # At-Least-Once Delivery
@@ -862,7 +862,7 @@ impl LedgerTailer {
     /// (Major fix: Thread blocking in async context).
     ///
     /// MAJOR FIX: Potential Data Loss via Non-Unique Watermark
-    /// Uses composite cursor (timestamp_ns, event_id) in the query.
+    /// Uses composite cursor (`timestamp_ns`, `event_id`) in the query.
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     pub async fn poll_events_async(
         &self,
@@ -958,7 +958,7 @@ impl LedgerTailer {
     /// (Major fix: Thread blocking in async context).
     ///
     /// MAJOR FIX: Potential Data Loss via Non-Unique Watermark
-    /// Now accepts both timestamp_ns and event_id for composite cursor.
+    /// Now accepts both `timestamp_ns` and `event_id` for composite cursor.
     #[allow(clippy::cast_possible_wrap)]
     pub async fn acknowledge_async(
         &mut self,
@@ -1678,7 +1678,7 @@ impl ProjectionWorker {
 
             // Project status (uses parsed verdict, not hardcoded success)
             let projection_receipt = adapter
-                .project_status(&work_id, changeset_digest, ledger_head, status)
+                .project_status(work_id, changeset_digest, ledger_head, status)
                 .await
                 .map_err(|e| ProjectionWorkerError::ProjectionFailed(e.to_string()))?;
 
@@ -1712,7 +1712,7 @@ impl ProjectionWorker {
                 // Record that comment was posted for idempotency
                 self.work_index.record_comment_posted(
                     &comment_receipt_id,
-                    &work_id,
+                    work_id,
                     pr_metadata.pr_number,
                     "review",
                 )?;

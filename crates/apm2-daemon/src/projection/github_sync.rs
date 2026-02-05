@@ -815,7 +815,7 @@ use hyper_util::rt::TokioExecutor;
 /// Type alias for the persistent HTTPS client.
 ///
 /// MAJOR FIX: Network Resource Exhaustion (Self-DoS)
-/// Previously, each request created a new HttpsConnector and Client,
+/// Previously, each request created a new `HttpsConnector` and `Client`,
 /// exhausting network resources under load. Now we reuse a single client.
 type PersistentHttpsClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
@@ -828,18 +828,19 @@ type PersistentHttpsClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 /// - AD-CMP-001: Cognitive complexity reduced via helper methods
 ///
 /// MAJOR FIX: Network Resource Exhaustion (Self-DoS)
-/// The client now uses a persistent HttpsConnector and Client that are
+/// The client now uses a persistent `HttpsConnector` and `Client` that are
 /// lazily initialized once and reused for all requests. This prevents
 /// resource exhaustion from creating new TLS connections per request.
 struct GitHubClient {
     config: GitHubAdapterConfig,
     /// Lazily-initialized persistent HTTPS client for connection reuse.
-    /// Using std::sync::OnceLock for thread-safe lazy initialization.
+    /// Using `std::sync::OnceLock` for thread-safe lazy initialization.
     http_client: OnceLock<PersistentHttpsClient>,
 }
 
 impl GitHubClient {
     /// Creates a new GitHub client with lazy-initialized persistent connection.
+    #[allow(clippy::missing_const_for_fn)] // OnceLock::new() is not const in stable Rust
     fn new(config: GitHubAdapterConfig) -> Self {
         Self {
             config,
