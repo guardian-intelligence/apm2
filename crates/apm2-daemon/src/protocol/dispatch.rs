@@ -7890,7 +7890,8 @@ mod tests {
             }))
         }
 
-        /// IT-00344-01: `WorkStatus` returns `SPAWNED` for a registered session.
+        /// IT-00344-01: `WorkStatus` returns `SPAWNED` for a registered
+        /// session.
         ///
         /// Verifies the end-to-end path:
         /// 1. Register a session in the session registry
@@ -7978,7 +7979,8 @@ mod tests {
             }
         }
 
-        /// IT-00344-03: `WorkStatus` returns `WorkNotFound` for unknown `work_id`.
+        /// IT-00344-03: `WorkStatus` returns `WorkNotFound` for unknown
+        /// `work_id`.
         #[test]
         fn test_work_status_returns_not_found() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -8098,7 +8100,8 @@ mod tests {
             assert_eq!(encoded[0], 15u8, "WorkStatus tag value should be 15");
         }
 
-        /// IT-00344-08: Full `ClaimWork` -> `SpawnEpisode` -> `WorkStatus` flow.
+        /// IT-00344-08: Full `ClaimWork` -> `SpawnEpisode` -> `WorkStatus`
+        /// flow.
         ///
         /// Exercises the complete lifecycle: claim work, spawn an episode
         /// (which registers a session in the shared registry), then query

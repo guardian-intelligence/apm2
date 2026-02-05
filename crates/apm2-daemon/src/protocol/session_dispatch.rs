@@ -3796,8 +3796,9 @@ mod tests {
         use crate::protocol::messages::WorkRole;
         use crate::session::SessionState;
 
-        /// IT-00344-SS-01: `SessionStatus` returns ACTIVE with full session data
-        /// when session registry is wired and session is registered.
+        /// IT-00344-SS-01: `SessionStatus` returns ACTIVE with full session
+        /// data when session registry is wired and session is
+        /// registered.
         #[test]
         fn test_session_status_returns_active_with_registry() {
             let minter = test_minter();
@@ -3844,8 +3845,9 @@ mod tests {
             }
         }
 
-        /// IT-00344-SS-02: `SessionStatus` returns ACTIVE with minimal data when
-        /// session registry is not wired (falls back to token-based status).
+        /// IT-00344-SS-02: `SessionStatus` returns ACTIVE with minimal data
+        /// when session registry is not wired (falls back to
+        /// token-based status).
         #[test]
         fn test_session_status_without_registry_falls_back_to_token() {
             let minter = test_minter();
