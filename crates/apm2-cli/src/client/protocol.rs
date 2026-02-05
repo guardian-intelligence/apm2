@@ -619,8 +619,9 @@ impl OperatorClient {
     ///
     /// # Returns
     ///
-    /// Consensus status including cluster health, current term, and leader info.
-    /// Returns `ConsensusNotConfigured` error if consensus subsystem is not active.
+    /// Consensus status including cluster health, current term, and leader
+    /// info. Returns `ConsensusNotConfigured` error if consensus subsystem
+    /// is not active.
     pub async fn consensus_status(
         &mut self,
         verbose: bool,
@@ -656,7 +657,8 @@ impl OperatorClient {
     /// # Returns
     ///
     /// List of validators with their status information.
-    /// Returns `ConsensusNotConfigured` error if consensus subsystem is not active.
+    /// Returns `ConsensusNotConfigured` error if consensus subsystem is not
+    /// active.
     pub async fn consensus_validators(
         &mut self,
         active_only: bool,
@@ -693,7 +695,8 @@ impl OperatorClient {
     /// # Returns
     ///
     /// List of detected Byzantine faults.
-    /// Returns `ConsensusNotConfigured` error if consensus subsystem is not active.
+    /// Returns `ConsensusNotConfigured` error if consensus subsystem is not
+    /// active.
     pub async fn consensus_byzantine_evidence(
         &mut self,
         fault_type: Option<&str>,
@@ -728,12 +731,14 @@ impl OperatorClient {
     ///
     /// # Arguments
     ///
-    /// * `period_secs` - Time period for metrics aggregation (0 = current snapshot)
+    /// * `period_secs` - Time period for metrics aggregation (0 = current
+    ///   snapshot)
     ///
     /// # Returns
     ///
     /// Consensus performance metrics.
-    /// Returns `ConsensusNotConfigured` error if consensus subsystem is not active.
+    /// Returns `ConsensusNotConfigured` error if consensus subsystem is not
+    /// active.
     pub async fn consensus_metrics(
         &mut self,
         period_secs: u64,
