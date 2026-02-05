@@ -1975,7 +1975,7 @@ mod tests {
         assert!(matches!(result, Err(EfficiencyError::StringTooLong { .. })));
     }
 
-    /// SEC-CTRL-FAC-0016: Test work_id length validation.
+    /// SEC-CTRL-FAC-0016: Test `work_id` length validation.
     #[test]
     fn test_work_id_length_validation() {
         let long_work_id = "x".repeat(MAX_WORK_ID_LENGTH + 1);
