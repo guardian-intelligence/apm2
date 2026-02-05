@@ -46,7 +46,8 @@
         "MSC-06"
       ],
       "security_floor_policy_ref": "SPEND-POL-SECURITY-FLOOR",
-      "value_hypothesis": "Verification-grade autonomy infrastructure commands a trust premium and compounds cost/performance advantages through recursive verifier improvement.",
+      "humanitarian_purpose_ref": "Aid humanity and alleviate suffering through rapid advancements in science and medicine, ensuring the continued happiness, autonomy, and flourishing of all living beings.",
+      "value_hypothesis": "Verification-grade autonomy infrastructure commands a trust premium and compounds cost/performance advantages through recursive verifier improvement, in service of the founding purpose: aiding humanity and alleviating suffering through rapid advancements in science and medicine. Commercial durability exists to sustain and scale humanitarian impact, not as an end in itself.",
       "verification_floor_policy_ref": "SPEND-POL-VERIFICATION-FLOOR"
     },
     "capital_allocation_model": {

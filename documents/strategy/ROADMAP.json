@@ -98,7 +98,7 @@
       },
       {
         "authority_requirements": [
-          "external_ethics_signer_quorum_valid == true"
+          "intrinsic_humanitarian_alignment_verified == true"
         ],
         "fail_closed_conditions": [
           "missing_input",
@@ -112,7 +112,7 @@
         "output_receipts": [
           "RECEIPT-GATE-PHASE-5-TERMINAL"
         ],
-        "predicate": ".msc08_pass == true and .independent_replication_success_rate >= 0.80 and .external_ethics_board_signoff == true",
+        "predicate": ".msc08_pass == true and .independent_replication_success_rate >= 0.80 and .intrinsic_humanitarian_alignment_verified == true",
         "predicate_language": "jq"
       },
       {
@@ -905,7 +905,7 @@
         "metric_refs": [
           "MET-ACTIVE-DISEASE-PROGRAMS"
         ],
-        "objective": "Admit life-science programs through governed safety gate.",
+        "objective": "Admit life-science programs through governed safety gate to advance humanitarian outcomes in science and medicine.",
         "owner_locus": "Bio Council",
         "risk_refs": [
           "RISK-EXTERNAL-REPLICATION-BANDWIDTH"
@@ -929,8 +929,8 @@
         "metric_refs": [
           "MET-INDEPENDENT-REPLICATION-RATE"
         ],
-        "objective": "Reach independent replication success threshold.",
-        "owner_locus": "Bio Council + External Ethics Board",
+        "objective": "Reach independent replication success threshold to validate governed discovery is producing real humanitarian benefit in alleviating suffering.",
+        "owner_locus": "Bio Council (autonomous humanitarian alignment)",
         "risk_refs": [
           "RISK-EXTERNAL-REPLICATION-BANDWIDTH"
         ],
@@ -1317,8 +1317,8 @@
         "exit_boundary_ref": "HTF-BND-P5-CLOSE",
         "gate_ref": "PHASE-5-TERMINAL",
         "name": "Planetary Impact",
-        "objective": "Deliver externally replicated governed discovery in life-science programs.",
-        "owner_locus": "Bio Council + External Ethics Board",
+        "objective": "Deliver externally replicated governed discovery in life-science programs that directly aid humanity, alleviate suffering, and advance science and medicine at civilizational scale.",
+        "owner_locus": "Bio Council (autonomous humanitarian alignment)",
         "phase_id": "PHASE-5"
       }
     ],

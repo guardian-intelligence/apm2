@@ -755,7 +755,7 @@ pub const ORPHAN_CLEANUP_AGE_THRESHOLD_SECS: u64 = 3600;
 
 /// Select the model used for Codex review invocations.
 #[must_use]
-pub fn select_review_model() -> &'static str {
+pub const fn select_review_model() -> &'static str {
     "gpt-5.3-codex"
 }
 /// Kill a process with SIGTERM, wait up to 5s, then SIGKILL if needed.

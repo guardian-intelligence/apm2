@@ -522,7 +522,7 @@ mod tests {
     /// Test that script command format is valid for PTY allocation.
     ///
     /// Verifies:
-    /// 1. Script command format includes PTY allocation via `script -qec`
+    /// 1. Script command format includes PTY allocation via `script`
     /// 2. Input redirection uses correct `<` syntax
     /// 3. Command properly quotes paths
     ///
@@ -533,15 +533,22 @@ mod tests {
 
         use crate::shell_escape::build_script_command;
 
-        // Test with a simple path (no log - uses -qec)
+        // Test with a simple path (no log)
         let prompt_path = Path::new("/tmp/test_prompt.txt");
         let shell_cmd = build_script_command(prompt_path, None, None);
 
         // Verify command includes PTY allocation
-        assert!(
-            shell_cmd.contains("script -qec"),
-            "Command should use script -qec for PTY allocation: {shell_cmd}"
-        );
+        if cfg!(target_os = "macos") {
+            assert!(
+                shell_cmd.contains("script -q /dev/null sh -c"),
+                "Command should use macOS script invocation for PTY allocation: {shell_cmd}"
+            );
+        } else {
+            assert!(
+                shell_cmd.contains("script -qec"),
+                "Command should use Linux script invocation for PTY allocation: {shell_cmd}"
+            );
+        }
 
         // Verify input redirection syntax
         assert!(
@@ -549,10 +556,10 @@ mod tests {
             "Command should use < for input redirection: {shell_cmd}"
         );
 
-        // Verify /dev/null is used as typescript output
+        // Verify /dev/null is used as typescript output/sink
         assert!(
-            shell_cmd.ends_with("/dev/null"),
-            "Command should redirect script output to /dev/null: {shell_cmd}"
+            shell_cmd.contains("/dev/null"),
+            "Command should reference /dev/null: {shell_cmd}"
         );
 
         // Test with a path containing spaces - must be properly quoted
@@ -560,10 +567,17 @@ mod tests {
         let special_cmd = build_script_command(special_path, None, None);
 
         // Verify the command is well-formed
-        assert!(
-            special_cmd.contains("script -qec"),
-            "Command with spaces should still use script -qec: {special_cmd}"
-        );
+        if cfg!(target_os = "macos") {
+            assert!(
+                special_cmd.contains("script -q /dev/null sh -c"),
+                "Command with spaces should use macOS script invocation: {special_cmd}"
+            );
+        } else {
+            assert!(
+                special_cmd.contains("script -qec"),
+                "Command with spaces should use Linux script invocation: {special_cmd}"
+            );
+        }
         // Path with spaces should be quoted (single quotes)
         assert!(
             special_cmd.contains('\''),

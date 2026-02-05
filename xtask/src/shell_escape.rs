@@ -93,11 +93,17 @@ fn escape_for_single_quote(s: &str) -> String {
 ///
 /// With log capture (for health monitoring):
 /// ```text
+/// # macOS:
+/// script -q '<log_path>' sh -c 'codex exec --model <model> --dangerously-bypass-approvals-and-sandbox < '\''<prompt_path>'\'''
+/// # Linux:
 /// script -q '<log_path>' -c 'codex exec --model <model> --dangerously-bypass-approvals-and-sandbox < '\''<prompt_path>'\'''
 /// ```
 ///
 /// Without log capture (synchronous reviews):
 /// ```text
+/// # macOS:
+/// script -q /dev/null sh -c 'codex exec --model <model> --dangerously-bypass-approvals-and-sandbox < '\''<prompt_path>'\'''
+/// # Linux:
 /// script -qec 'codex exec --model <model> --dangerously-bypass-approvals-and-sandbox < '\''<prompt_path>'\''' /dev/null
 /// ```
 ///
@@ -132,11 +138,23 @@ pub fn build_script_command(
     );
     let escaped_inner = escape_for_single_quote(&inner_cmd);
 
+    // macOS `script` uses: script -q file command [args...]
+    // Linux `script` uses: script -qec 'command' file
     log_path.map_or_else(
-        || format!("script -qec '{escaped_inner}' /dev/null"),
+        || {
+            if cfg!(target_os = "macos") {
+                format!("script -q /dev/null sh -c '{escaped_inner}'")
+            } else {
+                format!("script -qec '{escaped_inner}' /dev/null")
+            }
+        },
         |log| {
             let quoted_log = quote_path(log);
-            format!("script -q {quoted_log} -c '{escaped_inner}'")
+            if cfg!(target_os = "macos") {
+                format!("script -q {quoted_log} sh -c '{escaped_inner}'")
+            } else {
+                format!("script -q {quoted_log} -c '{escaped_inner}'")
+            }
         },
     )
 }
@@ -164,6 +182,9 @@ pub fn build_script_command(
 /// # Format
 ///
 /// ```text
+/// # macOS:
+/// script -q '<log_path>' sh -c 'codex exec --model <model> --dangerously-bypass-approvals-and-sandbox < '\''<prompt_path>'\'''
+/// # Linux:
 /// script -q '<log_path>' -c 'codex exec --model <model> --dangerously-bypass-approvals-and-sandbox < '\''<prompt_path>'\'''
 /// ```
 pub fn build_script_command_with_cleanup(
@@ -323,10 +344,10 @@ mod tests {
         let prompt = Path::new("/tmp/prompt.txt");
         let cmd = build_script_command(prompt, None, None);
 
-        // Verify command structure
+        // Verify command structure (platform-dependent)
         assert!(
-            cmd.contains("script -qec"),
-            "Command without log should use script -qec: {cmd}"
+            cmd.contains("script -q"),
+            "Command without log should use script -q: {cmd}"
         );
         assert!(
             cmd.contains("codex exec"),
@@ -337,8 +358,8 @@ mod tests {
             "Command should include non-interactive bypass flag: {cmd}"
         );
         assert!(
-            cmd.ends_with("/dev/null"),
-            "Command without log should redirect to /dev/null: {cmd}"
+            cmd.contains("/dev/null"),
+            "Command without log should reference /dev/null: {cmd}"
         );
         assert!(
             cmd.contains("< "),
@@ -358,12 +379,8 @@ mod tests {
             "Command with log should use script -q: {cmd}"
         );
         assert!(
-            !cmd.contains("-qec"),
-            "Command with log should not use -qec (uses -q ... -c): {cmd}"
-        );
-        assert!(
-            cmd.contains("-c '"),
-            "Command with log should use -c flag with single quotes: {cmd}"
+            cmd.contains("sh -c '") || cmd.contains("-c '"),
+            "Command with log should invoke shell with single quotes: {cmd}"
         );
         assert!(
             cmd.contains("codex exec"),
@@ -493,18 +510,28 @@ mod tests {
     fn test_command_format_matches_expected_pattern() {
         // Test that the generated commands match the documented patterns
 
-        // Without log: script -qec 'codex exec
-        // --dangerously-bypass-approvals-and-sandbox < '\''<prompt_path>'\''' /dev/null
+        // Without log:
+        //   - Linux: script -qec 'codex exec ...' /dev/null
+        //   - macOS: script -q /dev/null sh -c 'codex exec ...'
         let prompt = Path::new("/tmp/simple.txt");
         let cmd = build_script_command(prompt, None, None);
-        assert!(cmd.starts_with("script -qec"));
-        assert!(cmd.ends_with("/dev/null"));
+        if cfg!(target_os = "macos") {
+            assert!(cmd.starts_with("script -q /dev/null sh -c '"));
+        } else {
+            assert!(cmd.starts_with("script -qec"));
+            assert!(cmd.ends_with("/dev/null"));
+        }
 
-        // With log: script -q '<log_path>' -c 'codex exec
-        // --dangerously-bypass-approvals-and-sandbox < '\''<prompt_path>'\'''
+        // With log:
+        //   - Linux: script -q '<log_path>' -c 'codex exec ...'
+        //   - macOS: script -q '<log_path>' sh -c 'codex exec ...'
         let log = Path::new("/tmp/log.txt");
         let cmd = build_script_command(prompt, Some(log), None);
         assert!(cmd.starts_with("script -q"));
-        assert!(cmd.contains("-c 'codex exec"));
+        if cfg!(target_os = "macos") {
+            assert!(cmd.contains("sh -c 'codex exec"));
+        } else {
+            assert!(cmd.contains("-c 'codex exec"));
+        }
     }
 }
