@@ -597,8 +597,58 @@ async fn async_main(args: Args) -> Result<()> {
     let dispatcher_state: SharedDispatcherState = Arc::new(DispatcherState::with_persistence(
         state.session_registry().clone(),
         metrics_registry.clone(),
-        sqlite_conn,
+        sqlite_conn.clone(),
     ));
+
+    // TCK-00322: Start projection worker if ledger is configured.
+    // The projection worker:
+    // - Tails the ledger for ReviewReceiptRecorded events
+    // - Maintains work index (changeset -> work_id -> PR)
+    // - Projects review results to GitHub (status + comment)
+    let projection_worker_handle = if let Some(ref conn) = sqlite_conn {
+        use apm2_daemon::projection::{ProjectionWorker, ProjectionWorkerConfig};
+
+        let projection_conn = Arc::clone(conn);
+        let config = ProjectionWorkerConfig::new()
+            .with_poll_interval(std::time::Duration::from_secs(1))
+            .with_batch_size(100);
+
+        match ProjectionWorker::new(projection_conn, config) {
+            Ok(mut worker) => {
+                let shutdown_flag = worker.shutdown_handle();
+                let worker_state = state.clone();
+
+                info!("Starting projection worker");
+                let worker_task = tokio::spawn(async move {
+                    if let Err(e) = worker.run().await {
+                        error!("Projection worker error: {}", e);
+                    }
+                });
+
+                // Shutdown handler for projection worker
+                let shutdown_task = tokio::spawn(async move {
+                    // Wait for daemon shutdown signal
+                    loop {
+                        if worker_state.is_shutdown_requested() {
+                            info!("Signaling projection worker shutdown");
+                            shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                });
+
+                Some((worker_task, shutdown_task))
+            },
+            Err(e) => {
+                warn!("Failed to initialize projection worker: {}", e);
+                None
+            },
+        }
+    } else {
+        info!("Projection worker disabled (no ledger database configured)");
+        None
+    };
 
     // TCK-00279: Start ProtocolServer-only control plane
     // This is the ONLY control-plane listener. Legacy JSON IPC has been removed per
@@ -672,6 +722,19 @@ async fn async_main(args: Args) -> Result<()> {
                 error!("Metrics server task failed: {}", e);
             }
             info!("Metrics server exited");
+        }
+        // TCK-00322: Monitor projection worker if enabled
+        result = async {
+            if let Some((worker_task, _)) = projection_worker_handle {
+                worker_task.await
+            } else {
+                std::future::pending().await
+            }
+        } => {
+            if let Err(e) = result {
+                error!("Projection worker task failed: {}", e);
+            }
+            info!("Projection worker exited");
         }
     }
 

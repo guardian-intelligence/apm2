@@ -990,6 +990,102 @@ impl GitHubClient {
         debug!("GitHub commit status posted successfully");
         Ok(())
     }
+
+    /// Builds the GitHub API URL for posting a PR comment.
+    fn build_comment_url(&self, pr_number: u64) -> String {
+        format!(
+            "{}/repos/{}/{}/issues/{}/comments",
+            self.config.api_base_url.trim_end_matches('/'),
+            self.config.owner,
+            self.config.repo,
+            pr_number
+        )
+    }
+
+    /// Builds the JSON request body for a PR comment.
+    #[allow(clippy::unused_self)] // Kept for API consistency with build_status_body
+    fn build_comment_body(&self, body: &str) -> Result<Vec<u8>, ProjectionError> {
+        let json = serde_json::json!({
+            "body": body
+        });
+
+        serde_json::to_vec(&json).map_err(|e| ProjectionError::NetworkError(e.to_string()))
+    }
+
+    /// Posts a comment to a GitHub PR.
+    ///
+    /// `POST /repos/{owner}/{repo}/issues/{issue_number}/comments`
+    ///
+    /// # Security Controls
+    ///
+    /// - AD-MEM-001: Response body size limited to 64KB via `Limited`
+    /// - AD-NET-001: Request timeout via `tokio::time::timeout`
+    /// - AD-SEC-001: API token uses `SecretString` (via config)
+    ///
+    /// # TCK-00322: PR Comment Projection
+    ///
+    /// Per RFC-0019, the projection worker posts review comments to PRs.
+    /// This enables automated code review feedback from the FAC.
+    async fn post_pr_comment(
+        &self,
+        pr_number: u64,
+        body: &str,
+    ) -> Result<(), ProjectionError> {
+        use bytes::Bytes;
+        use http_body_util::Full;
+        use hyper_rustls::HttpsConnectorBuilder;
+        use hyper_util::client::legacy::Client;
+        use hyper_util::rt::TokioExecutor;
+
+        let url = self.build_comment_url(pr_number);
+        let body_bytes = self.build_comment_body(body)?;
+
+        // Build the HTTPS connector
+        // SECURITY: Use https_only() to prevent secret exfiltration via HTTP fallback.
+        let https = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_only()
+            .enable_http1()
+            .enable_http2()
+            .build();
+
+        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+
+        let request = self.build_request(&url, Full::new(Bytes::from(body_bytes)))?;
+
+        debug!(url = %url, pr_number = pr_number, "posting comment to GitHub PR");
+
+        // Send the request with timeout (AD-NET-001)
+        let response = tokio::time::timeout(self.config.request_timeout, client.request(request))
+            .await
+            .map_err(|_| {
+                ProjectionError::NetworkError(format!(
+                    "request timed out after {:?}",
+                    self.config.request_timeout
+                ))
+            })?
+            .map_err(|e: hyper_util::client::legacy::Error| {
+                ProjectionError::NetworkError(e.to_string())
+            })?;
+
+        let (parts, body) = response.into_parts();
+        let status_code = parts.status;
+
+        // Check for specific error conditions
+        Self::check_response_status(status_code, &parts.headers)?;
+
+        // Check for success (201 Created for new comments)
+        if !status_code.is_success() {
+            let message = Self::read_error_body(body).await;
+            return Err(ProjectionError::GitHubApiError {
+                message,
+                status_code: Some(status_code.as_u16()),
+            });
+        }
+
+        debug!(pr_number = pr_number, "GitHub PR comment posted successfully");
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -1663,6 +1759,99 @@ impl<T: TimeSource> GitHubProjectionAdapter<T> {
             receipt,
             freeze_triggered: false,
         })
+    }
+
+    // =========================================================================
+    // PR Comment Projection (TCK-00322)
+    // =========================================================================
+
+    /// Posts a comment to a GitHub PR.
+    ///
+    /// Per RFC-0019 (Workstream F), the projection worker posts review results
+    /// as comments to PRs. This provides visibility into FAC review outcomes.
+    ///
+    /// # Security
+    ///
+    /// - **Write-only**: Comments are posted based on ledger state, not GitHub
+    ///   reads
+    /// - **Idempotency**: Callers should track comment posting via ledger events
+    ///   to avoid duplicates
+    ///
+    /// # Arguments
+    ///
+    /// * `pr_number` - The PR number to post the comment to
+    /// * `body` - The comment body (Markdown supported)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError::GitHubApiError`] if the API call fails.
+    /// Returns [`ProjectionError::RateLimitExceeded`] if rate limited.
+    /// Returns [`ProjectionError::AuthenticationError`] if auth fails.
+    pub async fn post_comment(
+        &self,
+        pr_number: u64,
+        body: &str,
+    ) -> Result<(), ProjectionError> {
+        if self.mock_mode {
+            debug!(pr_number = pr_number, "mock mode: skipping comment post");
+            return Ok(());
+        }
+
+        self.client.post_pr_comment(pr_number, body).await
+    }
+
+    /// Formats a review result as a PR comment body.
+    ///
+    /// This method creates a standardized comment format for review results
+    /// that includes:
+    /// - Review status (pass/fail)
+    /// - Receipt ID for auditability
+    /// - Summary of findings (if any)
+    ///
+    /// # Arguments
+    ///
+    /// * `receipt_id` - The review receipt ID
+    /// * `status` - The projected status (Success/Failure/etc.)
+    /// * `summary` - Optional summary of review findings
+    ///
+    /// # Returns
+    ///
+    /// A Markdown-formatted comment body.
+    #[must_use]
+    pub fn format_review_comment(
+        receipt_id: &str,
+        status: ProjectedStatus,
+        summary: Option<&str>,
+    ) -> String {
+        use std::fmt::Write;
+
+        let status_icon = match status {
+            ProjectedStatus::Success => ":white_check_mark:",
+            ProjectedStatus::Failure => ":x:",
+            ProjectedStatus::Pending => ":hourglass:",
+            ProjectedStatus::Error => ":warning:",
+            ProjectedStatus::Cancelled => ":no_entry_sign:",
+        };
+
+        let mut comment = format!(
+            "## {} APM2 FAC Review: {}\n\n",
+            status_icon,
+            status.as_str().to_uppercase()
+        );
+
+        // Using write! instead of push_str(&format!()) to avoid extra allocation
+        let _ = write!(comment, "**Receipt ID:** `{receipt_id}`\n\n");
+
+        if let Some(summary_text) = summary {
+            comment.push_str("### Summary\n\n");
+            comment.push_str(summary_text);
+            comment.push_str("\n\n");
+        }
+
+        comment.push_str("---\n");
+        comment.push_str("*This comment was generated by the APM2 Forge Admission Cycle.*");
+
+        comment
     }
 
     /// Convenience method to detect tamper and handle it in one call.
