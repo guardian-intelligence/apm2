@@ -3575,15 +3575,7 @@
         ],
         "goal": "Every AGENTS.md begins by stating which part of the spine it implements and which laws it enforces.",
         "node_class": "NORMATIVE"
-      },
-      "doc_spine_order": [
-        "DOC-SPINE-01",
-        "DOC-SPINE-02",
-        "DOC-SPINE-03",
-        "DOC-SPINE-04",
-        "DOC-SPINE-05",
-        "DOC-SPINE-06"
-      ]
+      }
     },
     "law_alignment": {
       "laws": {
@@ -3700,25 +3692,7 @@
             "ABSTRACTION_BREAK"
           ]
         }
-      },
-      "law_order": [
-        "LAW-01",
-        "LAW-02",
-        "LAW-03",
-        "LAW-04",
-        "LAW-05",
-        "LAW-16",
-        "LAW-06",
-        "LAW-07",
-        "LAW-08",
-        "LAW-09",
-        "LAW-10",
-        "LAW-11",
-        "LAW-12",
-        "LAW-13",
-        "LAW-14",
-        "LAW-15"
-      ]
+      }
     },
     "glossary_alignment": {
       "canonical_terms": {
@@ -3828,56 +3802,6 @@
         },
         "Interface Variety": {
           "ref": "documents/theory/glossary/glossary.json",
-          "node_class": "BACKGROUND"
-        }
-      }
-    },
-    "references": {
-      "primary_documents": {
-        "theory": {
-          "ref": "documents/theory/AGENTS.md",
-          "node_class": "BACKGROUND"
-        },
-        "agent-native-software (holonic-agent-network)": {
-          "ref": "documents/theory/agent_native_architecture.json",
-          "node_class": "BACKGROUND"
-        },
-        "agent-native-software (industry textbook)": {
-          "ref": "documents/theory/agent_native_architecture.json",
-          "node_class": "BACKGROUND"
-        },
-        "defects textbook": {
-          "ref": "documents/theory/defects.json",
-          "node_class": "BACKGROUND"
-        },
-        "glossary": {
-          "ref": "documents/theory/glossary/glossary.json",
-          "node_class": "BACKGROUND"
-        }
-      },
-      "research_papers": {
-        "SWE-bench": {
-          "ref": "https://www.swebench.com/",
-          "node_class": "BACKGROUND"
-        },
-        "SWE-bench Verified (OpenAI)": {
-          "ref": "https://openai.com/index/introducing-swe-bench-verified/",
-          "node_class": "BACKGROUND"
-        },
-        "SWE-agent": {
-          "ref": "https://github.com/princeton-nlp/SWE-agent",
-          "node_class": "BACKGROUND"
-        },
-        "Reflexion (self-reflection agents)": {
-          "ref": "https://arxiv.org/abs/2303.11366",
-          "node_class": "BACKGROUND"
-        },
-        "Agentic Reasoning for LLMs (survey)": {
-          "ref": "https://arxiv.org/abs/2601.12538",
-          "node_class": "BACKGROUND"
-        },
-        "Hierarchical RL with explicit state abstractions": {
-          "ref": "https://arxiv.org/abs/2601.09858",
           "node_class": "BACKGROUND"
         }
       }
