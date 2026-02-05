@@ -35,6 +35,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -1223,7 +1224,11 @@ impl ToolHandler for ExecuteHandler {
         let timeout_ms = exec_args.timeout_ms.unwrap_or(30_000);
         let timeout = Duration::from_millis(timeout_ms);
 
-        // BLOCKER 2 FIX: Manual bounded pipe reading instead of wait_with_output()
+        // TCK-00338: Stall detection timeout configuration
+        let stall_timeout_ms = self.sandbox_config.stall_timeout_ms;
+        let stall_detection_enabled = stall_timeout_ms > 0;
+
+        // Manual bounded pipe reading instead of wait_with_output()
         // This prevents OOM from processes that emit gigabytes of output before
         // timeout. We read stdout and stderr concurrently with bounded buffers.
 
@@ -1244,7 +1249,24 @@ impl ToolHandler for ExecuteHandler {
         // other
         let per_stream_limit = MAX_TOOL_OUTPUT_SIZE / 2;
 
-        // Read stdout with bounded buffer
+        // TCK-00338: Shared state for stall detection - tracks last output time
+        // across both stdout and stderr readers using atomic operations.
+        // Note: truncation from u128 to u64 is safe here as millis since exec_start
+        // will never approach u64::MAX in any reasonable execution.
+        #[allow(clippy::cast_possible_truncation)]
+        let last_output_time =
+            std::sync::Arc::new(AtomicU64::new(exec_start.elapsed().as_millis() as u64));
+
+        // Helper to update last output time
+        // Note: truncation from u128 to u64 is safe - see comment above.
+        #[allow(clippy::cast_possible_truncation)]
+        let update_last_output = |last_time: &AtomicU64, start: Instant| {
+            let now_ms = start.elapsed().as_millis() as u64;
+            last_time.store(now_ms, Ordering::Release);
+        };
+
+        // Read stdout with bounded buffer and stall tracking
+        let last_output_stdout = last_output_time.clone();
         let stdout_future = async {
             let mut buf = Vec::new();
             let mut chunk = vec![0u8; 64 * 1024]; // 64KB chunks
@@ -1252,6 +1274,9 @@ impl ToolHandler for ExecuteHandler {
                 match stdout.read(&mut chunk).await {
                     Ok(0) | Err(_) => break, // EOF or read error
                     Ok(n) => {
+                        // TCK-00338: Update last output time on successful read
+                        update_last_output(&last_output_stdout, exec_start);
+
                         if buf.len() + n > per_stream_limit {
                             // Take only what fits
                             let remaining = per_stream_limit.saturating_sub(buf.len());
@@ -1265,7 +1290,8 @@ impl ToolHandler for ExecuteHandler {
             (buf, false)
         };
 
-        // Read stderr with bounded buffer
+        // Read stderr with bounded buffer and stall tracking
+        let last_output_stderr = last_output_time.clone();
         let stderr_future = async {
             let mut buf = Vec::new();
             let mut chunk = vec![0u8; 64 * 1024]; // 64KB chunks
@@ -1273,6 +1299,9 @@ impl ToolHandler for ExecuteHandler {
                 match stderr.read(&mut chunk).await {
                     Ok(0) | Err(_) => break, // EOF or read error
                     Ok(n) => {
+                        // TCK-00338: Update last output time on successful read
+                        update_last_output(&last_output_stderr, exec_start);
+
                         if buf.len() + n > per_stream_limit {
                             let remaining = per_stream_limit.saturating_sub(buf.len());
                             buf.extend_from_slice(&chunk[..remaining]);
@@ -1285,21 +1314,69 @@ impl ToolHandler for ExecuteHandler {
             (buf, false)
         };
 
-        // Wait for process with bounded output reading
+        // TCK-00338: Stall detection monitor task
+        // Periodically checks if the process has produced any output recently.
+        // If no output for stall_timeout_ms, signals that the process is stalled.
+        let last_output_monitor = last_output_time.clone();
+
+        let stall_monitor = async {
+            if !stall_detection_enabled {
+                // Stall detection disabled, never signal stall
+                std::future::pending::<()>().await;
+            }
+
+            let check_interval = Duration::from_millis(1000.min(stall_timeout_ms / 2).max(100));
+
+            loop {
+                tokio::time::sleep(check_interval).await;
+
+                // Note: truncation from u128 to u64 is safe - see comment above.
+                #[allow(clippy::cast_possible_truncation)]
+                let now_ms = exec_start.elapsed().as_millis() as u64;
+                let last_ms = last_output_monitor.load(Ordering::Acquire);
+
+                if now_ms.saturating_sub(last_ms) >= stall_timeout_ms {
+                    // Process has stalled - no output for stall_timeout_ms
+                    // Return to trigger the stall detection branch in select!
+                    return;
+                }
+            }
+        };
+
+        // Wait for process with bounded output reading and stall detection
         let read_result = tokio::time::timeout(timeout, async {
-            // Run all three concurrently: stdout read, stderr read, and process wait
-            let (stdout_result, stderr_result, wait_result) =
-                tokio::join!(stdout_future, stderr_future, child.wait());
+            // Run all four concurrently: stdout read, stderr read, process wait, stall
+            // monitor
+            tokio::select! {
+                biased;
 
-            let (stdout_buf, stdout_exceeded) = stdout_result;
-            let (stderr_buf, stderr_exceeded) = stderr_result;
-            let output_exceeded = stdout_exceeded || stderr_exceeded;
+                // Stall detected - terminate early
+                () = stall_monitor => {
+                    Err(ToolHandlerError::ExecutionFailed {
+                        message: format!(
+                            "process stalled: no output for {stall_timeout_ms}ms (SEC-CTRL-FAC-0016)"
+                        ),
+                    })
+                }
 
-            match wait_result {
-                Ok(status) => Ok((stdout_buf, stderr_buf, Some(status), output_exceeded)),
-                Err(e) => Err(ToolHandlerError::ExecutionFailed {
-                    message: format!("failed to wait for process: {e}"),
-                }),
+                // Normal completion path
+                result = async {
+                    let (stdout_result, stderr_result, wait_result) =
+                        tokio::join!(stdout_future, stderr_future, child.wait());
+
+                    let (stdout_buf, stdout_exceeded) = stdout_result;
+                    let (stderr_buf, stderr_exceeded) = stderr_result;
+                    let output_exceeded = stdout_exceeded || stderr_exceeded;
+
+                    match wait_result {
+                        Ok(status) => Ok((stdout_buf, stderr_buf, Some(status), output_exceeded)),
+                        Err(e) => Err(ToolHandlerError::ExecutionFailed {
+                            message: format!("failed to wait for process: {e}"),
+                        }),
+                    }
+                } => {
+                    result
+                }
             }
         })
         .await;
@@ -2950,9 +3027,92 @@ pub fn register_handlers_with_root(
     })?;
 
     // Register all handlers with the canonical workspace root
+    // NOTE: Uses permissive sandbox config for backwards compatibility.
+    // For production use with explicit shell allowlist, use
+    // `register_handlers_with_root_and_sandbox` instead.
     executor.register_handler(Box::new(ReadFileHandler::with_root(&canonical_root)))?;
     executor.register_handler(Box::new(WriteFileHandler::with_root(&canonical_root)))?;
     executor.register_handler(Box::new(ExecuteHandler::with_root(&canonical_root)))?;
+    executor.register_handler(Box::new(GitOperationHandler::with_root(&canonical_root)))?;
+    executor.register_handler(Box::new(ArtifactFetchHandler::new(cas)))?;
+    executor.register_handler(Box::new(ListFilesHandler::with_root(&canonical_root)))?;
+    executor.register_handler(Box::new(SearchHandler::with_root(&canonical_root)))?;
+    Ok(())
+}
+
+/// Registers all tool handlers with an executor using a specified workspace
+/// root and explicit sandbox configuration.
+///
+/// # Security (TCK-00338)
+///
+/// This is the recommended registration function for production use. It ensures
+/// that the `ExecuteHandler` uses an explicit `SandboxConfig` rather than
+/// defaulting to `SandboxConfig::permissive()`.
+///
+/// Unlike `register_handlers_with_root`, this function:
+/// - Accepts an explicit `SandboxConfig` for the execute handler
+/// - Enables fail-closed shell allowlist enforcement
+/// - Enables stall detection timeout
+///
+/// # Arguments
+///
+/// * `executor` - The tool executor to register handlers with
+/// * `cas` - Content-addressed store for artifact operations
+/// * `workspace_root` - The root directory for file/execute operations
+/// * `sandbox_config` - Explicit sandbox configuration for the execute handler
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::path::Path;
+/// use apm2_daemon::episode::executor::ToolExecutor;
+/// use apm2_daemon::episode::handlers::{register_handlers_with_root_and_sandbox, SandboxConfig};
+///
+/// let workspace = Path::new("/var/lib/apm2/workspaces/episode-123");
+/// let config = SandboxConfig::with_shell_allowlist(vec![
+///     "cargo *".to_string(),
+///     "npm *".to_string(),
+///     "git *".to_string(),
+/// ]);
+/// let mut executor = ToolExecutor::new(tracker, cas.clone());
+/// register_handlers_with_root_and_sandbox(&mut executor, cas, workspace, config)?;
+/// ```
+pub fn register_handlers_with_root_and_sandbox(
+    executor: &mut super::executor::ToolExecutor,
+    cas: std::sync::Arc<dyn ContentAddressedStore>,
+    workspace_root: &Path,
+    sandbox_config: SandboxConfig,
+) -> Result<(), super::executor::ExecutorError> {
+    // Validate workspace root exists and can be canonicalized (fail-closed)
+    // This catches misconfiguration early rather than at first tool execution
+    if !workspace_root.exists() {
+        return Err(super::executor::ExecutorError::ExecutionFailed {
+            message: format!(
+                "workspace root does not exist: {}",
+                workspace_root.display()
+            ),
+        });
+    }
+
+    // Canonicalize early to catch symlink issues at registration time
+    let canonical_root = std::fs::canonicalize(workspace_root).map_err(|e| {
+        super::executor::ExecutorError::ExecutionFailed {
+            message: format!(
+                "failed to canonicalize workspace root '{}': {}",
+                workspace_root.display(),
+                e
+            ),
+        }
+    })?;
+
+    // Register all handlers with the canonical workspace root
+    executor.register_handler(Box::new(ReadFileHandler::with_root(&canonical_root)))?;
+    executor.register_handler(Box::new(WriteFileHandler::with_root(&canonical_root)))?;
+    // Use explicit sandbox config for ExecuteHandler (TCK-00338: fail-closed)
+    executor.register_handler(Box::new(ExecuteHandler::with_root_and_sandbox(
+        &canonical_root,
+        sandbox_config,
+    )))?;
     executor.register_handler(Box::new(GitOperationHandler::with_root(&canonical_root)))?;
     executor.register_handler(Box::new(ArtifactFetchHandler::new(cas)))?;
     executor.register_handler(Box::new(ListFilesHandler::with_root(&canonical_root)))?;
@@ -4349,6 +4509,117 @@ mod tests {
             "Should accept valid workspace root: {:?}",
             result.err()
         );
+    }
+
+    // =========================================================================
+    // register_handlers_with_root_and_sandbox tests (TCK-00338)
+    // =========================================================================
+
+    #[test]
+    fn test_register_handlers_with_root_and_sandbox_validates_existence() {
+        use crate::episode::broker::StubContentAddressedStore;
+        use crate::episode::budget::EpisodeBudget;
+        use crate::episode::budget_tracker::BudgetTracker;
+        use crate::episode::executor::ToolExecutor;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let budget = EpisodeBudget::builder().tool_calls(100).build();
+        let tracker = Arc::new(BudgetTracker::from_envelope(budget));
+        let mut executor = ToolExecutor::new(tracker, cas.clone());
+
+        // Try to register with nonexistent workspace
+        let nonexistent = temp_dir.path().join("does_not_exist");
+        let config = SandboxConfig::default();
+        let result =
+            register_handlers_with_root_and_sandbox(&mut executor, cas, &nonexistent, config);
+
+        assert!(result.is_err(), "Should reject nonexistent workspace root");
+    }
+
+    #[test]
+    fn test_register_handlers_with_root_and_sandbox_works_with_valid_path() {
+        use crate::episode::broker::StubContentAddressedStore;
+        use crate::episode::budget::EpisodeBudget;
+        use crate::episode::budget_tracker::BudgetTracker;
+        use crate::episode::executor::ToolExecutor;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let budget = EpisodeBudget::builder().tool_calls(100).build();
+        let tracker = Arc::new(BudgetTracker::from_envelope(budget));
+        let mut executor = ToolExecutor::new(tracker, cas.clone());
+
+        // Register with valid workspace and explicit sandbox config
+        let config = SandboxConfig::with_shell_allowlist(vec!["echo *".to_string()]);
+        let result =
+            register_handlers_with_root_and_sandbox(&mut executor, cas, &workspace, config);
+
+        assert!(
+            result.is_ok(),
+            "Should accept valid workspace root with sandbox config: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_register_handlers_with_root_and_sandbox_uses_provided_config() {
+        use crate::episode::broker::StubContentAddressedStore;
+        use crate::episode::budget::EpisodeBudget;
+        use crate::episode::budget_tracker::BudgetTracker;
+        use crate::episode::executor::ToolExecutor;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let budget = EpisodeBudget::builder().tool_calls(100).build();
+        let tracker = Arc::new(BudgetTracker::from_envelope(budget));
+        let mut executor = ToolExecutor::new(tracker, cas.clone());
+
+        // Register with fail-closed config (empty allowlist)
+        let config = SandboxConfig::default(); // Fail-closed by default
+        let result =
+            register_handlers_with_root_and_sandbox(&mut executor, cas, &workspace, config);
+
+        assert!(
+            result.is_ok(),
+            "Should accept valid workspace root: {:?}",
+            result.err()
+        );
+
+        // The executor now has handlers registered with the provided config.
+        // The ExecuteHandler should have the fail-closed config (tested
+        // indirectly through the allowlist tests).
+    }
+
+    // =========================================================================
+    // Stall detection tests (TCK-00338)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_sandbox_config_stall_timeout_default() {
+        // Default config should have 60 second stall timeout
+        let config = SandboxConfig::default();
+        assert_eq!(config.stall_timeout_ms, 60_000);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_config_stall_timeout_disabled() {
+        // Should be able to disable stall detection
+        let config = SandboxConfig::default().with_stall_timeout_ms(0);
+        assert_eq!(config.stall_timeout_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_config_stall_timeout_custom() {
+        // Should be able to set custom stall timeout
+        let config = SandboxConfig::default().with_stall_timeout_ms(5_000);
+        assert_eq!(config.stall_timeout_ms, 5_000);
     }
 
     // =========================================================================
