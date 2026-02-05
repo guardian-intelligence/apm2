@@ -3167,7 +3167,8 @@ mod tests {
         // In validation mode (no CAS), store_view_commitment just computes the hash
         let expected_commitment = ViewCommitmentV1::new(
             work_id,
-            hex::encode(blake3::hash(work_id.as_bytes()).as_bytes()), // No git repo, so hash(work_id)
+            hex::encode(blake3::hash(work_id.as_bytes()).as_bytes()), /* No git repo, so
+                                                                       * hash(work_id) */
             policy_ref,
             explicit_ts,
         );

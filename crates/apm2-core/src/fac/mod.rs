@@ -257,4 +257,8 @@ pub use transcript_binding::{
 };
 pub mod view_commitment;
 // Re-export view commitment types
-pub use view_commitment::{VIEW_COMMITMENT_V1_SCHEMA, ViewCommitmentV1};
+pub use view_commitment::{
+    MAX_POLICY_REF_LENGTH as MAX_VIEW_COMMITMENT_POLICY_REF_LENGTH,
+    MAX_WORK_ID_LENGTH as MAX_VIEW_COMMITMENT_WORK_ID_LENGTH, VIEW_COMMITMENT_V1_SCHEMA,
+    ViewCommitmentError, ViewCommitmentV1, ViewCommitmentV1Builder,
+};
