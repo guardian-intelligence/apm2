@@ -3124,4 +3124,55 @@ mod tests {
         let result = validate_parent_path_symlinks(&valid_path, &canonical_root);
         assert!(result.is_ok(), "Valid path should succeed: {result:?}");
     }
+
+    /// MAJOR FIX #9: Test `apply_with_view_commitment` (TCK-00325)
+    #[test]
+    fn test_apply_with_view_commitment() {
+        use apm2_core::fac::{FileChange, GitObjectRef, HashAlgo};
+
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let workspace_root = temp_dir.path().to_path_buf();
+        let manager = WorkspaceManager::new(workspace_root);
+
+        let bundle = ChangeSetBundleV1::builder()
+            .changeset_id("cs-view-commit")
+            .base(GitObjectRef {
+                algo: HashAlgo::Sha1,
+                object_kind: "commit".to_string(),
+                object_id: "a".repeat(40),
+            })
+            .diff_hash([0x42; 32])
+            .file_manifest(vec![FileChange {
+                path: "src/lib.rs".to_string(),
+                change_kind: ChangeKind::Add,
+                old_path: None,
+            }])
+            .binary_detected(false)
+            .build()
+            .expect("valid bundle");
+
+        let work_id = "work-view-commit-001";
+        let policy_ref = "policy-ref-123";
+        let explicit_ts = 100_200_300_u64;
+
+        let result = manager
+            .apply_with_view_commitment(&bundle, work_id, policy_ref, Some(explicit_ts))
+            .expect("apply success");
+
+        // Verify result contains view commitment hash
+        assert!(result.view_commitment_hash.is_some());
+        assert_eq!(result.applied_at_ns, explicit_ts);
+
+        // Verify commitment computation is deterministic
+        // In validation mode (no CAS), store_view_commitment just computes the hash
+        let expected_commitment = ViewCommitmentV1::new(
+            work_id,
+            hex::encode(blake3::hash(work_id.as_bytes()).as_bytes()), // No git repo, so hash(work_id)
+            policy_ref,
+            explicit_ts,
+        );
+        let expected_hash = expected_commitment.compute_cas_hash();
+
+        assert_eq!(result.view_commitment_hash.unwrap(), expected_hash);
+    }
 }
