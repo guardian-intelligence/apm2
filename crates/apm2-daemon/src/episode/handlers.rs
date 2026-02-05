@@ -873,6 +873,102 @@ const ENV_BLOCKLIST_PATTERNS: &[&str] = &[
     "GPG_PRIVATE",
 ];
 
+// =============================================================================
+// TCK-00338: Shell Argument Escaping (SEC-CTRL-FAC-0016)
+// =============================================================================
+
+/// Characters that require shell escaping when appearing in arguments.
+/// These characters have special meaning in POSIX shells and could enable
+/// injection attacks if not properly escaped.
+const SHELL_SPECIAL_CHARS: &[char] = &[
+    ' ', '\t', '\n', '\r', // Whitespace (argument separators)
+    '"', '\'', '\\', // Quoting characters
+    '$', '`', // Variable/command expansion
+    '!', '*', '?', '[', ']', // Globbing and history
+    '(', ')', '{', '}', // Subshells and brace expansion
+    '<', '>', '|', '&', ';', // Redirection and control operators
+    '#', // Comments
+    '~', // Home directory expansion
+];
+
+/// Escapes a shell argument to prevent injection attacks.
+///
+/// # Security (TCK-00338)
+///
+/// This function ensures that arguments are properly escaped when building
+/// a command line string for allowlist matching. Without escaping, an argument
+/// containing spaces or special characters could be interpreted as multiple
+/// arguments or shell metacharacters.
+///
+/// For example, without escaping:
+/// - `["sh", "-c", "rm -rf /"]` becomes `sh -c rm -rf /`
+/// - With escaping: `sh '-c' 'rm -rf /'`
+///
+/// The escaping strategy uses single quotes for arguments containing special
+/// characters, with single quotes within the argument escaped as `'\''`.
+///
+/// # Arguments
+///
+/// * `arg` - The argument to escape
+///
+/// # Returns
+///
+/// The escaped argument suitable for shell command line representation.
+fn escape_shell_arg(arg: &str) -> String {
+    // If the argument is empty, represent it as ''
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+
+    // If the argument contains no special characters, return as-is
+    if !arg.chars().any(|c| SHELL_SPECIAL_CHARS.contains(&c)) {
+        return arg.to_string();
+    }
+
+    // Escape using single quotes, handling embedded single quotes
+    // The pattern 'arg' works for most cases, but single quotes within
+    // the argument must be escaped as '\'' (end quote, escaped quote, start quote)
+    let mut escaped = String::with_capacity(arg.len() + 2);
+    escaped.push('\'');
+    for c in arg.chars() {
+        if c == '\'' {
+            // End current quote, add escaped single quote, restart quote
+            escaped.push_str("'\\''");
+        } else {
+            escaped.push(c);
+        }
+    }
+    escaped.push('\'');
+    escaped
+}
+
+/// Builds a shell-safe command line string for allowlist matching.
+///
+/// # Security (TCK-00338)
+///
+/// This function constructs a command line representation where each argument
+/// is properly escaped to prevent injection attacks. The resulting string
+/// accurately represents what the command would look like if it were executed
+/// in a shell.
+///
+/// # Arguments
+///
+/// * `command` - The command/executable name
+/// * `args` - The arguments to the command
+///
+/// # Returns
+///
+/// A shell-safe command line string suitable for allowlist matching.
+fn build_escaped_command_line(command: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        escape_shell_arg(command)
+    } else {
+        let escaped_command = escape_shell_arg(command);
+        let escaped_args: Vec<String> = args.iter().map(|a| escape_shell_arg(a)).collect();
+        format!("{} {}", escaped_command, escaped_args.join(" "))
+    }
+}
+
 /// Configuration for sandboxed command execution (TCK-00338).
 ///
 /// This struct encapsulates security policies for the `ExecuteHandler`:
@@ -1052,16 +1148,38 @@ impl ExecuteHandler {
 
     /// Creates a new execute handler with a specific root directory.
     ///
-    /// # Security Note (TCK-00338)
+    /// # Security (TCK-00338)
     ///
-    /// This constructor uses a permissive sandbox config that allows all
-    /// commands. For production use, prefer `with_root_and_sandbox()` to
-    /// specify an explicit shell allowlist.
+    /// This constructor uses a fail-closed sandbox config (empty allowlist).
+    /// No commands will be allowed unless you explicitly configure the sandbox
+    /// using `with_root_and_sandbox()`.
+    ///
+    /// For production use, call `with_root_and_sandbox()` with an explicit
+    /// shell allowlist. For tests that need permissive mode, use
+    /// `with_root_permissive()`.
     #[must_use]
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            // Default to permissive for backwards compatibility
+            // TCK-00338: Fail-closed by default (no commands allowed)
+            sandbox_config: SandboxConfig::default(),
+        }
+    }
+
+    /// Creates a new execute handler with permissive sandbox config.
+    ///
+    /// # Security Warning (TCK-00338)
+    ///
+    /// This constructor allows ALL commands to execute. Only use in:
+    /// - Tests that need backwards-compatible permissive behavior
+    /// - Trusted environments where command filtering is done elsewhere
+    ///
+    /// For production use, prefer `with_root_and_sandbox()` with an explicit
+    /// shell allowlist.
+    #[must_use]
+    pub fn with_root_permissive(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
             sandbox_config: SandboxConfig::permissive(),
         }
     }
@@ -1128,12 +1246,11 @@ impl ToolHandler for ExecuteHandler {
         // TCK-00338: Shell Allowlist Validation (SEC-CTRL-FAC-0016)
         // =====================================================================
         // Build full command line for allowlist matching.
-        // This matches the command + all arguments as a single string.
-        let full_command_line = if exec_args.args.is_empty() {
-            exec_args.command.clone()
-        } else {
-            format!("{} {}", exec_args.command, exec_args.args.join(" "))
-        };
+        // Arguments are escaped to prevent injection attacks where special
+        // characters in arguments could be interpreted as shell metacharacters.
+        // For example, `sh -c "rm -rf /"` must be represented as `sh '-c' 'rm -rf /'`
+        // to prevent the space-separated arguments from being misinterpreted.
+        let full_command_line = build_escaped_command_line(&exec_args.command, &exec_args.args);
 
         if !self.sandbox_config.is_command_allowed(&full_command_line) {
             warn!(
@@ -3032,7 +3149,10 @@ pub fn register_handlers_with_root(
     // `register_handlers_with_root_and_sandbox` instead.
     executor.register_handler(Box::new(ReadFileHandler::with_root(&canonical_root)))?;
     executor.register_handler(Box::new(WriteFileHandler::with_root(&canonical_root)))?;
-    executor.register_handler(Box::new(ExecuteHandler::with_root(&canonical_root)))?;
+    // TCK-00338: This deprecated function uses permissive mode for backwards compat
+    executor.register_handler(Box::new(ExecuteHandler::with_root_permissive(
+        &canonical_root,
+    )))?;
     executor.register_handler(Box::new(GitOperationHandler::with_root(&canonical_root)))?;
     executor.register_handler(Box::new(ArtifactFetchHandler::new(cas)))?;
     executor.register_handler(Box::new(ListFilesHandler::with_root(&canonical_root)))?;
@@ -4703,7 +4823,8 @@ mod tests {
         let symlink = root.join("evil_cwd");
         std::os::unix::fs::symlink("/etc", &symlink).expect("create symlink");
 
-        let handler = ExecuteHandler::with_root(root);
+        // Use permissive mode for this test since we're testing TOCTOU, not allowlist
+        let handler = ExecuteHandler::with_root_permissive(root);
         let args = ToolArgs::Execute(ExecuteArgs {
             command: "ls".to_string(),
             args: vec![],
@@ -4902,6 +5023,123 @@ mod tests {
         assert!(config.is_command_allowed("git status"));
         assert!(!config.is_command_allowed("git push")); // Not in allowlist
         assert!(!config.is_command_allowed("rm -rf /"));
+    }
+
+    // =========================================================================
+    // TCK-00338: Shell Argument Escaping Tests (SEC-CTRL-FAC-0016)
+    // =========================================================================
+
+    #[test]
+    fn test_escape_shell_arg_simple() {
+        // Simple alphanumeric args should not be escaped
+        assert_eq!(escape_shell_arg("hello"), "hello");
+        assert_eq!(escape_shell_arg("build"), "build");
+        assert_eq!(escape_shell_arg("123"), "123");
+        assert_eq!(escape_shell_arg("-la"), "-la");
+        assert_eq!(escape_shell_arg("--release"), "--release");
+    }
+
+    #[test]
+    fn test_escape_shell_arg_empty() {
+        // Empty string should be quoted
+        assert_eq!(escape_shell_arg(""), "''");
+    }
+
+    #[test]
+    fn test_escape_shell_arg_spaces() {
+        // Arguments with spaces should be quoted
+        assert_eq!(escape_shell_arg("hello world"), "'hello world'");
+        assert_eq!(escape_shell_arg("rm -rf /"), "'rm -rf /'");
+    }
+
+    #[test]
+    fn test_escape_shell_arg_single_quotes() {
+        // Single quotes within the argument should be escaped
+        assert_eq!(escape_shell_arg("it's"), "'it'\\''s'");
+        assert_eq!(escape_shell_arg("don't do that"), "'don'\\''t do that'");
+    }
+
+    #[test]
+    fn test_escape_shell_arg_shell_metacharacters() {
+        // Shell metacharacters should trigger quoting
+        assert_eq!(escape_shell_arg("$HOME"), "'$HOME'");
+        assert_eq!(escape_shell_arg("`whoami`"), "'`whoami`'");
+        assert_eq!(escape_shell_arg("a|b"), "'a|b'");
+        assert_eq!(escape_shell_arg("a;b"), "'a;b'");
+        assert_eq!(escape_shell_arg("a&b"), "'a&b'");
+        assert_eq!(escape_shell_arg("a>b"), "'a>b'");
+        assert_eq!(escape_shell_arg("a<b"), "'a<b'");
+        assert_eq!(escape_shell_arg("*.txt"), "'*.txt'");
+        assert_eq!(escape_shell_arg("a?b"), "'a?b'");
+        assert_eq!(escape_shell_arg("[abc]"), "'[abc]'");
+    }
+
+    #[test]
+    fn test_build_escaped_command_line_no_args() {
+        // Command only - should escape if needed
+        assert_eq!(build_escaped_command_line("ls", &[]), "ls");
+        assert_eq!(
+            build_escaped_command_line("my command", &[]),
+            "'my command'"
+        );
+    }
+
+    #[test]
+    fn test_build_escaped_command_line_simple_args() {
+        // Simple args - no escaping needed
+        let args = vec!["build".to_string()];
+        assert_eq!(build_escaped_command_line("cargo", &args), "cargo build");
+
+        let args = vec!["test".to_string(), "--release".to_string()];
+        assert_eq!(
+            build_escaped_command_line("cargo", &args),
+            "cargo test --release"
+        );
+    }
+
+    #[test]
+    fn test_build_escaped_command_line_args_with_spaces() {
+        // Arguments containing spaces must be quoted
+        // Note: -c has no special chars, so it's not quoted
+        let args = vec!["-c".to_string(), "rm -rf /".to_string()];
+        assert_eq!(
+            build_escaped_command_line("sh", &args),
+            "sh -c 'rm -rf /'"
+        );
+    }
+
+    #[test]
+    fn test_build_escaped_command_line_injection_prevention() {
+        // This is the critical security test:
+        // An attacker might try to use `sh -c "malicious; command"` as a single
+        // argument Without proper escaping, this could be interpreted
+        // differently
+        let args = vec!["-c".to_string(), "echo hello; rm -rf /".to_string()];
+        let escaped = build_escaped_command_line("sh", &args);
+        // The semicolon should be inside quotes, preventing command injection
+        // Note: -c has no special chars, so it's not quoted, but the dangerous arg is
+        assert_eq!(escaped, "sh -c 'echo hello; rm -rf /'");
+        // The key security property: "echo hello; rm -rf /" is a single quoted arg,
+        // not multiple shell commands. This prevents the allowlist from being bypassed
+        // via shell metacharacter injection.
+    }
+
+    #[test]
+    fn test_build_escaped_command_line_allows_correct_matching() {
+        // Verify that allowlist patterns work correctly with escaped commands
+        let config = SandboxConfig::with_shell_allowlist(vec![
+            "echo *".to_string(),
+            "sh -c *".to_string(), // Matches "sh -c 'anything'"
+        ]);
+
+        // Simple echo should still work
+        let echo_cmd = build_escaped_command_line("echo", &["hello".to_string()]);
+        assert!(config.is_command_allowed(&echo_cmd));
+
+        // sh -c with quoted argument should work - the allowlist sees "sh -c 'echo hello'"
+        let sh_cmd =
+            build_escaped_command_line("sh", &["-c".to_string(), "echo hello".to_string()]);
+        assert!(config.is_command_allowed(&sh_cmd));
     }
 
     #[test]

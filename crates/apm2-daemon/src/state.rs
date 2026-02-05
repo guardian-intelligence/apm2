@@ -30,7 +30,7 @@ use crate::episode::capability::{InMemoryCasManifestLoader, StubManifestLoader};
 use crate::episode::executor::ContentAddressedStore;
 use crate::episode::handlers::{
     ArtifactFetchHandler, ExecuteHandler, GitOperationHandler, ListFilesHandler, ReadFileHandler,
-    SearchHandler, WriteFileHandler,
+    SandboxConfig, SearchHandler, WriteFileHandler,
 };
 use crate::episode::{
     CapabilityManifest, EpisodeRuntime, EpisodeRuntimeConfig, InMemorySessionRegistry,
@@ -332,8 +332,18 @@ impl DispatcherState {
                     Box::new(WriteFileHandler::with_root(root))
                 })
                 // ExecuteHandler - executes commands within workspace
+                // TCK-00338: Use fail-closed sandbox config by default.
+                // The ToolBroker's manifest system handles allowlist decisions,
+                // so we use default (empty allowlist = fail-closed) here.
+                // If the manifest grants Execute capability, it should also
+                // specify the shell_allowlist.
                 .with_rooted_handler_factory(|root| {
-                    Box::new(ExecuteHandler::with_root(root))
+                    // Production default: fail-closed (empty allowlist denies all)
+                    // Shell allowlist is managed by the ToolBroker via manifest.
+                    Box::new(ExecuteHandler::with_root_and_sandbox(
+                        root,
+                        SandboxConfig::default(),
+                    ))
                 })
                 // GitOperationHandler - git operations within workspace
                 .with_rooted_handler_factory(|root| {
@@ -489,8 +499,12 @@ impl DispatcherState {
                 Box::new(WriteFileHandler::with_root(root))
             })
             // ExecuteHandler - executes commands within workspace
+            // TCK-00338: Use fail-closed sandbox config by default.
             .with_rooted_handler_factory(|root| {
-                Box::new(ExecuteHandler::with_root(root))
+                Box::new(ExecuteHandler::with_root_and_sandbox(
+                    root,
+                    SandboxConfig::default(),
+                ))
             })
             // GitOperationHandler - git operations within workspace
             .with_rooted_handler_factory(|root| {
