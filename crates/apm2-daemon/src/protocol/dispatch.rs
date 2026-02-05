@@ -7872,10 +7872,10 @@ mod tests {
     // TCK-00344: WorkStatus Integration Tests
     // ========================================================================
 
-    /// IT-00344: WorkStatus handler tests.
+    /// IT-00344: `WorkStatus` handler tests.
     ///
-    /// These tests verify the WorkStatus endpoint can look up session and
-    /// work-claim state by work_id, exercising the full path through the
+    /// These tests verify the `WorkStatus` endpoint can look up session and
+    /// work-claim state by `work_id`, exercising the full path through the
     /// session registry (`find_session_by_work_id`) and work registry.
     mod work_status_handlers {
         use super::*;
@@ -7890,11 +7890,11 @@ mod tests {
             }))
         }
 
-        /// IT-00344-01: WorkStatus returns SPAWNED for a registered session.
+        /// IT-00344-01: `WorkStatus` returns SPAWNED for a registered session.
         ///
         /// Verifies the end-to-end path:
         /// 1. Register a session in the session registry
-        /// 2. Send a WorkStatus request with matching work_id
+        /// 2. Send a `WorkStatus` request with matching `work_id`
         /// 3. Receive a response with status "SPAWNED" and correct metadata
         #[test]
         fn test_work_status_returns_spawned_for_session() {
@@ -7935,7 +7935,7 @@ mod tests {
             }
         }
 
-        /// IT-00344-02: WorkStatus returns CLAIMED for work that has been
+        /// IT-00344-02: `WorkStatus` returns CLAIMED for work that has been
         /// claimed but not yet spawned.
         #[test]
         fn test_work_status_returns_claimed_for_work_claim() {
@@ -7978,7 +7978,7 @@ mod tests {
             }
         }
 
-        /// IT-00344-03: WorkStatus returns WorkNotFound for unknown work_id.
+        /// IT-00344-03: `WorkStatus` returns `WorkNotFound` for unknown `work_id`.
         #[test]
         fn test_work_status_returns_not_found() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -8007,7 +8007,7 @@ mod tests {
             }
         }
 
-        /// IT-00344-04: WorkStatus rejects empty work_id.
+        /// IT-00344-04: `WorkStatus` rejects empty `work_id`.
         #[test]
         fn test_work_status_rejects_empty_work_id() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -8031,7 +8031,7 @@ mod tests {
             }
         }
 
-        /// IT-00344-05: WorkStatus rejects oversized work_id (CTR-1603).
+        /// IT-00344-05: `WorkStatus` rejects oversized `work_id` (CTR-1603).
         #[test]
         fn test_work_status_rejects_oversized_work_id() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -8055,8 +8055,8 @@ mod tests {
             }
         }
 
-        /// IT-00344-06: WorkStatus is denied from session socket
-        /// (PERMISSION_DENIED).
+        /// IT-00344-06: `WorkStatus` is denied from session socket
+        /// (`PERMISSION_DENIED`).
         #[test]
         fn test_work_status_denied_from_session_socket() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -8083,7 +8083,7 @@ mod tests {
             }
         }
 
-        /// IT-00344-07: WorkStatus encoding uses correct tag (tag 15).
+        /// IT-00344-07: `WorkStatus` encoding uses correct tag (tag 15).
         #[test]
         fn test_work_status_encoding_tag() {
             let request = WorkStatusRequest {
@@ -8098,11 +8098,11 @@ mod tests {
             assert_eq!(encoded[0], 15u8, "WorkStatus tag value should be 15");
         }
 
-        /// IT-00344-08: Full ClaimWork -> SpawnEpisode -> WorkStatus flow.
+        /// IT-00344-08: Full `ClaimWork` -> `SpawnEpisode` -> `WorkStatus` flow.
         ///
         /// Exercises the complete lifecycle: claim work, spawn an episode
         /// (which registers a session in the shared registry), then query
-        /// WorkStatus to verify the session is visible.
+        /// `WorkStatus` to verify the session is visible.
         #[test]
         fn test_claim_spawn_then_work_status() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -8161,6 +8161,118 @@ mod tests {
                     );
                 },
                 other => panic!("Expected WorkStatus response, got: {other:?}"),
+            }
+        }
+    }
+
+    // ========================================================================
+    // TCK-00345: Consensus Query Handler Tests
+    // ========================================================================
+
+    /// IT-00345: Consensus query handler tests.
+    mod consensus_query_handlers {
+        use super::*;
+
+        #[test]
+        fn test_consensus_status_not_configured() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = ConsensusStatusRequest { verbose: false };
+            let frame = encode_consensus_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        ConsensusErrorCode::ConsensusNotConfigured as i32,
+                        "Expected ConsensusNotConfigured"
+                    );
+                },
+                other => panic!("Expected Error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_consensus_validators_not_configured() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = ConsensusValidatorsRequest { active_only: false };
+            let frame = encode_consensus_validators_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        ConsensusErrorCode::ConsensusNotConfigured as i32,
+                        "Expected ConsensusNotConfigured"
+                    );
+                },
+                other => panic!("Expected Error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_consensus_byzantine_evidence_not_configured() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = ConsensusByzantineEvidenceRequest {
+                fault_type: None,
+                limit: 100,
+            };
+            let frame = encode_consensus_byzantine_evidence_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        ConsensusErrorCode::ConsensusNotConfigured as i32,
+                        "Expected ConsensusNotConfigured"
+                    );
+                },
+                other => panic!("Expected Error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_consensus_metrics_not_configured() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = ConsensusMetricsRequest { period_secs: 60 };
+            let frame = encode_consensus_metrics_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        ConsensusErrorCode::ConsensusNotConfigured as i32,
+                        "Expected ConsensusNotConfigured"
+                    );
+                },
+                other => panic!("Expected Error, got {other:?}"),
             }
         }
     }
