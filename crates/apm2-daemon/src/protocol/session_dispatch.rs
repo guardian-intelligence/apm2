@@ -1638,9 +1638,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         payload: &[u8],
         ctx: &ConnectionContext,
     ) -> ProtocolResult<SessionResponse> {
-        let request = SessionStatusRequest::decode_bounded(payload, &self.decode_config)
-            .map_err(|e| ProtocolError::Serialization {
-                reason: format!("invalid SessionStatusRequest: {e}"),
+        let request =
+            SessionStatusRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid SessionStatusRequest: {e}"),
+                }
             })?;
 
         // INV-SESS-001: Validate session token
@@ -1661,7 +1663,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 // Calculate session duration
                 let duration_ms = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
+                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
                     .unwrap_or(0);
 
                 let response = SessionStatusResponse {

@@ -258,6 +258,8 @@ pub use messages::{
     RestartProcessResponse,
     SessionError,
     SessionErrorCode,
+    SessionStatusRequest,
+    SessionStatusResponse,
     ShutdownRequest,
     ShutdownResponse,
     SpawnEpisodeRequest,
@@ -279,8 +281,6 @@ pub use messages::{
     // TCK-00344: Status query messages
     WorkStatusRequest,
     WorkStatusResponse,
-    SessionStatusRequest,
-    SessionStatusResponse,
 };
 // CTR-PROTO-010: HEF Pulse ACL (RFC-0018, TCK-00302)
 #[allow(unused_imports)]

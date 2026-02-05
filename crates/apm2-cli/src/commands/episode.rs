@@ -863,8 +863,7 @@ fn run_session_status(
             if json_output {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&response)
-                        .unwrap_or_else(|_| "{}".to_string())
+                    serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
                 );
             } else {
                 println!("Session Status");

@@ -4059,10 +4059,7 @@ impl PrivilegedDispatcher {
         if request.work_id.len() > MAX_ID_LENGTH {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
-                format!(
-                    "work_id exceeds maximum length of {} bytes",
-                    MAX_ID_LENGTH
-                ),
+                format!("work_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
             ));
         }
 
@@ -4077,7 +4074,8 @@ impl PrivilegedDispatcher {
 
         // Query session registry for work status
         // Note: We search through sessions to find work associated with this work_id
-        // This is a basic implementation; a dedicated work registry would be more efficient
+        // This is a basic implementation; a dedicated work registry would be more
+        // efficient
         let session_state = self.find_session_by_work_id(&request.work_id);
 
         match session_state {
@@ -4089,7 +4087,7 @@ impl PrivilegedDispatcher {
                     actor_id: None, // Not tracked in session
                     role: Some(session.role),
                     session_id: Some(session.session_id),
-                    lease_id: None, // Lease is redacted in SessionState
+                    lease_id: None,   // Lease is redacted in SessionState
                     created_at_ns: 0, // Not tracked
                     claimed_at_ns: None,
                 };
@@ -4104,7 +4102,7 @@ impl PrivilegedDispatcher {
                         actor_id: Some(claim.actor_id.clone()),
                         role: Some(claim.role.into()),
                         session_id: None,
-                        lease_id: Some(claim.lease_id.clone()),
+                        lease_id: Some(claim.lease_id),
                         created_at_ns: 0,
                         claimed_at_ns: None, // WorkClaim doesn't track timestamp
                     };
@@ -4119,7 +4117,8 @@ impl PrivilegedDispatcher {
         }
     }
 
-    /// Finds a session by work_id.
+    /// Finds a session by `work_id`.
+    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
     fn find_session_by_work_id(&self, _work_id: &str) -> Option<SessionState> {
         // Note: This is an O(n) scan which is inefficient for large registries.
         // A production implementation would add an index by work_id to SessionRegistry.

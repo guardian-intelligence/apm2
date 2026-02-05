@@ -567,7 +567,8 @@ mod tests {
         );
     }
 
-    /// Tests that work status response includes all optional fields when present.
+    /// Tests that work status response includes all optional fields when
+    /// present.
     #[test]
     fn test_status_response_full_serialization() {
         let response = StatusResponse {
