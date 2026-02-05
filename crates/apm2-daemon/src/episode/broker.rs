@@ -103,6 +103,33 @@ pub enum BrokerError {
         /// Error message.
         message: String,
     },
+
+    /// Context pack not found in CAS (TCK-00326).
+    ///
+    /// Per RFC-0019, this triggers ReviewBlockedRecorded emission
+    /// with reason_code MISSING_ARTIFACT.
+    #[error("context pack not found in CAS: hash {hash}")]
+    ContextPackNotFound {
+        /// Hex-encoded hash of the missing context pack.
+        hash: String,
+    },
+
+    /// Context pack seal verification failed (TCK-00326).
+    ///
+    /// Per RFC-0019, this triggers ReviewBlockedRecorded emission
+    /// with reason_code INVALID_BUNDLE.
+    #[error("context pack seal invalid: {reason}")]
+    ContextPackSealInvalid {
+        /// Reason for seal verification failure.
+        reason: String,
+    },
+
+    /// Context pack deserialization failed (TCK-00326).
+    #[error("context pack deserialization failed: {reason}")]
+    ContextPackDeserializationFailed {
+        /// Reason for deserialization failure.
+        reason: String,
+    },
 }
 
 impl BrokerError {
@@ -117,6 +144,9 @@ impl BrokerError {
             Self::BudgetExceeded { .. } => "budget_exceeded",
             Self::ExecutionFailed { .. } => "execution_failed",
             Self::Internal { .. } => "internal",
+            Self::ContextPackNotFound { .. } => "context_pack_not_found",
+            Self::ContextPackSealInvalid { .. } => "context_pack_seal_invalid",
+            Self::ContextPackDeserializationFailed { .. } => "context_pack_deserialization_failed",
         }
     }
 
@@ -124,6 +154,21 @@ impl BrokerError {
     #[must_use]
     pub const fn is_retriable(&self) -> bool {
         matches!(self, Self::ExecutionFailed { .. })
+    }
+
+    /// Returns `true` if this error should trigger ReviewBlockedRecorded
+    /// (TCK-00326).
+    ///
+    /// Per RFC-0019, context pack errors should emit a ReviewBlockedRecorded
+    /// event to the ledger for audit and fail-closed behavior.
+    #[must_use]
+    pub const fn should_emit_review_blocked(&self) -> bool {
+        matches!(
+            self,
+            Self::ContextPackNotFound { .. }
+                | Self::ContextPackSealInvalid { .. }
+                | Self::ContextPackDeserializationFailed { .. }
+        )
     }
 }
 
@@ -1014,6 +1059,138 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         *guard = Some(Arc::new(manifest));
         debug!("broker initialized with context pack manifest");
         Ok(())
+    }
+
+    /// Initializes the broker's context firewall from a CAS-stored context pack
+    /// (TCK-00326).
+    ///
+    /// This method:
+    /// 1. Loads the sealed ContextPackManifest from CAS using its hash
+    /// 2. Verifies the seal integrity
+    /// 3. Initializes the context firewall for subsequent tool requests
+    ///
+    /// # Fail-Closed Behavior
+    ///
+    /// Per RFC-0019, this method fails closed on:
+    /// - Missing context pack: [`BrokerError::ContextPackNotFound`]
+    /// - Invalid seal: [`BrokerError::ContextPackSealInvalid`]
+    /// - Deserialization failure:
+    ///   [`BrokerError::ContextPackDeserializationFailed`]
+    ///
+    /// All of these errors should trigger ReviewBlockedRecorded emission
+    /// by the caller.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_pack_hash` - BLAKE3 hash of the sealed ContextPackManifest in
+    ///   CAS
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context pack cannot be loaded, deserialized,
+    /// or fails seal verification.
+    #[instrument(skip(self), fields(context_pack_hash = %hex::encode(&context_pack_hash[..8])))]
+    pub async fn initialize_context_from_hash(
+        &self,
+        context_pack_hash: &Hash,
+    ) -> Result<(), BrokerError> {
+        // Load from CAS
+        let content = self.cas.retrieve(context_pack_hash).ok_or_else(|| {
+            BrokerError::ContextPackNotFound {
+                hash: hex::encode(context_pack_hash),
+            }
+        })?;
+
+        // Deserialize
+        let mut manifest: ContextPackManifest = serde_json::from_slice(&content).map_err(|e| {
+            BrokerError::ContextPackDeserializationFailed {
+                reason: e.to_string(),
+            }
+        })?;
+
+        // Rebuild index after deserialization
+        manifest.rebuild_index();
+
+        // Verify seal integrity
+        manifest
+            .verify_seal()
+            .map_err(|e| BrokerError::ContextPackSealInvalid {
+                reason: e.to_string(),
+            })?;
+
+        // Initialize firewall with verified manifest
+        self.initialize_with_context_manifest(manifest).await?;
+
+        debug!(
+            context_pack_hash = %hex::encode(context_pack_hash),
+            "context firewall initialized from CAS"
+        );
+        Ok(())
+    }
+
+    /// Seals a `ContextPackManifest` and stores it in CAS (TCK-00326).
+    ///
+    /// This method:
+    /// 1. Verifies the manifest's seal
+    /// 2. Serializes it to canonical JSON
+    /// 3. Stores it in CAS
+    /// 4. Returns the CAS hash for reference
+    ///
+    /// # Authority Binding
+    ///
+    /// The returned hash should be embedded in episode envelopes and review
+    /// artifacts for authority binding per RFC-0019.
+    ///
+    /// # Arguments
+    ///
+    /// * `manifest` - The `ContextPackManifest` to seal and store
+    ///
+    /// # Returns
+    ///
+    /// The CAS hash of the stored manifest (which should match
+    /// `manifest.manifest_hash()`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if seal verification fails.
+    #[instrument(skip(self, manifest), fields(manifest_id = %manifest.manifest_id))]
+    pub fn seal_and_store_context_pack(
+        &self,
+        manifest: &ContextPackManifest,
+    ) -> Result<Hash, BrokerError> {
+        // Verify seal is valid
+        manifest
+            .verify_seal()
+            .map_err(|e| BrokerError::ContextPackSealInvalid {
+                reason: e.to_string(),
+            })?;
+
+        // Serialize to JSON (canonical through serde)
+        let content = serde_json::to_vec(manifest).map_err(|e| BrokerError::Internal {
+            message: format!("failed to serialize context pack: {e}"),
+        })?;
+
+        // Store in CAS
+        let hash = self.cas.store(&content);
+
+        debug!(
+            manifest_id = %manifest.manifest_id,
+            cas_hash = %hex::encode(&hash),
+            "context pack sealed and stored in CAS"
+        );
+
+        Ok(hash)
+    }
+
+    /// Returns the context pack hash if a context manifest is loaded.
+    ///
+    /// This is useful for embedding the hash in review artifacts and receipts.
+    pub async fn context_pack_hash(&self) -> Option<Hash> {
+        self.context_manifest
+            .read()
+            .await
+            .as_ref()
+            .map(|m| m.manifest_hash())
     }
 
     /// Returns `true` if the broker has been initialized.

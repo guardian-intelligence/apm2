@@ -36,6 +36,8 @@
 //!     [0x33; 32], // blocked_log_hash
 //!     [0x44; 32], // time_envelope_ref hash
 //!     "recorder-001".to_string(),
+//!     [0x55; 32], // capability_manifest_hash (TCK-00326)
+//!     [0x66; 32], // context_pack_hash (TCK-00326)
 //!     &signer,
 //! )
 //! .expect("valid event");
@@ -137,6 +139,10 @@ pub enum ReasonCode {
     /// review artifacts. Per SEC-CTRL-FAC-0015, review outcomes MUST bind to
     /// a verifiable view commitment. Missing this binding is a hard failure.
     MissingViewCommitment,
+    /// Context pack not found in CAS (TCK-00326).
+    ContextPackMissing,
+    /// Context pack seal verification failed (TCK-00326).
+    ContextPackInvalid,
 }
 
 impl std::fmt::Display for ReasonCode {
@@ -151,6 +157,8 @@ impl std::fmt::Display for ReasonCode {
             Self::PolicyDenied => write!(f, "POLICY_DENIED"),
             Self::ContextMiss => write!(f, "CONTEXT_MISS"),
             Self::MissingViewCommitment => write!(f, "MISSING_VIEW_COMMITMENT"),
+            Self::ContextPackMissing => write!(f, "CONTEXT_PACK_MISSING"),
+            Self::ContextPackInvalid => write!(f, "CONTEXT_PACK_INVALID"),
         }
     }
 }
@@ -169,6 +177,8 @@ impl std::str::FromStr for ReasonCode {
             "POLICY_DENIED" => Ok(Self::PolicyDenied),
             "CONTEXT_MISS" => Ok(Self::ContextMiss),
             "MISSING_VIEW_COMMITMENT" => Ok(Self::MissingViewCommitment),
+            "CONTEXT_PACK_MISSING" => Ok(Self::ContextPackMissing),
+            "CONTEXT_PACK_INVALID" => Ok(Self::ContextPackInvalid),
             _ => Err(ReviewBlockedError::InvalidReasonCode(s.to_string())),
         }
     }
@@ -184,6 +194,8 @@ impl ReasonCode {
     /// - 2 = `TOOL_FAILED`
     /// - etc.
     /// - 9 = `MISSING_VIEW_COMMITMENT` (TCK-00325)
+    /// - 10 = `CONTEXT_PACK_MISSING` (TCK-00326)
+    /// - 11 = `CONTEXT_PACK_INVALID` (TCK-00326)
     #[must_use]
     pub const fn to_code(self) -> u8 {
         match self {
@@ -196,6 +208,8 @@ impl ReasonCode {
             Self::PolicyDenied => 7,
             Self::ContextMiss => 8,
             Self::MissingViewCommitment => 9,
+            Self::ContextPackMissing => 10,
+            Self::ContextPackInvalid => 11,
         }
     }
 
@@ -215,6 +229,8 @@ impl ReasonCode {
             7 => Ok(Self::PolicyDenied),
             8 => Ok(Self::ContextMiss),
             9 => Ok(Self::MissingViewCommitment),
+            10 => Ok(Self::ContextPackMissing),
+            11 => Ok(Self::ContextPackInvalid),
             0 => Err(ReviewBlockedError::InvalidReasonCode(
                 "UNSPECIFIED (0) is not a valid reason code".to_string(),
             )),
@@ -267,6 +283,16 @@ pub struct ReviewBlockedRecorded {
     /// domain.
     #[serde(with = "serde_bytes")]
     pub recorder_signature: [u8; 64],
+    /// BLAKE3 hash of the `CapabilityManifest` in effect (32 bytes, TCK-00326).
+    /// Binds the blocked event to the authority under which the review was
+    /// attempted.
+    #[serde(with = "serde_bytes")]
+    pub capability_manifest_hash: [u8; 32],
+    /// BLAKE3 hash of the sealed `ContextPackManifest` in effect (32 bytes,
+    /// TCK-00326). Binds the blocked event to the context firewall
+    /// configuration.
+    #[serde(with = "serde_bytes")]
+    pub context_pack_hash: [u8; 32],
 }
 
 impl ReviewBlockedRecorded {
@@ -280,11 +306,16 @@ impl ReviewBlockedRecorded {
     /// * `blocked_log_hash` - CAS hash of blocked logs
     /// * `time_envelope_ref` - HTF time envelope reference hash
     /// * `recorder_actor_id` - ID of the recording actor
+    /// * `capability_manifest_hash` - Hash of the `CapabilityManifest` in
+    ///   effect
+    /// * `context_pack_hash` - Hash of the sealed `ContextPackManifest` in
+    ///   effect
     /// * `signer` - Signer to authorize the event
     ///
     /// # Errors
     ///
     /// Returns error if any string field exceeds `MAX_STRING_LENGTH`.
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         blocked_id: String,
         changeset_digest: [u8; 32],
@@ -292,6 +323,8 @@ impl ReviewBlockedRecorded {
         blocked_log_hash: [u8; 32],
         time_envelope_ref: [u8; 32],
         recorder_actor_id: String,
+        capability_manifest_hash: [u8; 32],
+        context_pack_hash: [u8; 32],
         signer: &Signer,
     ) -> Result<Self, ReviewBlockedError> {
         // Validate inputs
@@ -325,6 +358,8 @@ impl ReviewBlockedRecorded {
             time_envelope_ref,
             recorder_actor_id,
             recorder_signature: [0u8; 64],
+            capability_manifest_hash,
+            context_pack_hash,
         };
 
         // Sign
@@ -343,6 +378,7 @@ impl ReviewBlockedRecorded {
     /// # Errors
     ///
     /// Returns error if any string field exceeds maximum length.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_with_envelope(
         blocked_id: String,
         changeset_digest: [u8; 32],
@@ -350,6 +386,8 @@ impl ReviewBlockedRecorded {
         blocked_log_hash: [u8; 32],
         envelope_ref: &TimeEnvelopeRef,
         recorder_actor_id: String,
+        capability_manifest_hash: [u8; 32],
+        context_pack_hash: [u8; 32],
         signer: &Signer,
     ) -> Result<Self, ReviewBlockedError> {
         let time_envelope_ref: [u8; 32] = *envelope_ref.as_bytes();
@@ -360,6 +398,8 @@ impl ReviewBlockedRecorded {
             blocked_log_hash,
             time_envelope_ref,
             recorder_actor_id,
+            capability_manifest_hash,
+            context_pack_hash,
             signer,
         )
     }
@@ -373,6 +413,8 @@ impl ReviewBlockedRecorded {
     /// - `blocked_log_hash` (32 bytes)
     /// - `time_envelope_ref` (32 bytes)
     /// - `recorder_actor_id` (len + bytes)
+    /// - `capability_manifest_hash` (32 bytes, TCK-00326)
+    /// - `context_pack_hash` (32 bytes, TCK-00326)
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // All strings are bounded by MAX_STRING_LENGTH
     pub fn canonical_bytes(&self) -> Vec<u8> {
@@ -397,6 +439,12 @@ impl ReviewBlockedRecorded {
         // 6. recorder_actor_id
         bytes.extend_from_slice(&(self.recorder_actor_id.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.recorder_actor_id.as_bytes());
+
+        // 7. capability_manifest_hash (TCK-00326)
+        bytes.extend_from_slice(&self.capability_manifest_hash);
+
+        // 8. context_pack_hash (TCK-00326)
+        bytes.extend_from_slice(&self.context_pack_hash);
 
         bytes
     }
@@ -434,6 +482,8 @@ pub struct ReviewBlockedRecordedBuilder {
     blocked_log_hash: Option<[u8; 32]>,
     time_envelope_ref: Option<[u8; 32]>,
     recorder_actor_id: Option<String>,
+    capability_manifest_hash: Option<[u8; 32]>,
+    context_pack_hash: Option<[u8; 32]>,
 }
 
 #[allow(clippy::missing_const_for_fn)] // Builder methods take `mut self` and can't be const
@@ -493,6 +543,20 @@ impl ReviewBlockedRecordedBuilder {
         self
     }
 
+    /// Sets the capability manifest hash (TCK-00326).
+    #[must_use]
+    pub fn capability_manifest_hash(mut self, hash: [u8; 32]) -> Self {
+        self.capability_manifest_hash = Some(hash);
+        self
+    }
+
+    /// Sets the context pack hash (TCK-00326).
+    #[must_use]
+    pub fn context_pack_hash(mut self, hash: [u8; 32]) -> Self {
+        self.context_pack_hash = Some(hash);
+        self
+    }
+
     /// Builds the event and signs it.
     ///
     /// # Errors
@@ -520,6 +584,12 @@ impl ReviewBlockedRecordedBuilder {
         let recorder_actor_id = self
             .recorder_actor_id
             .ok_or(ReviewBlockedError::MissingField("recorder_actor_id"))?;
+        let capability_manifest_hash = self
+            .capability_manifest_hash
+            .ok_or(ReviewBlockedError::MissingField("capability_manifest_hash"))?;
+        let context_pack_hash = self
+            .context_pack_hash
+            .ok_or(ReviewBlockedError::MissingField("context_pack_hash"))?;
 
         ReviewBlockedRecorded::create(
             blocked_id,
@@ -528,6 +598,8 @@ impl ReviewBlockedRecordedBuilder {
             blocked_log_hash,
             time_envelope_ref,
             recorder_actor_id,
+            capability_manifest_hash,
+            context_pack_hash,
             signer,
         )
     }
@@ -592,6 +664,24 @@ impl TryFrom<ReviewBlockedRecordedProto> for ReviewBlockedRecorded {
                 ReviewBlockedError::InvalidData("reason_code must fit in u8".into())
             })?)?;
 
+        // TCK-00326: Parse capability_manifest_hash and context_pack_hash
+        // Default to zeros if empty (backward compatibility)
+        let capability_manifest_hash: [u8; 32] = if proto.capability_manifest_hash.is_empty() {
+            [0u8; 32]
+        } else {
+            proto.capability_manifest_hash.try_into().map_err(|_| {
+                ReviewBlockedError::InvalidData("capability_manifest_hash must be 32 bytes".into())
+            })?
+        };
+
+        let context_pack_hash: [u8; 32] = if proto.context_pack_hash.is_empty() {
+            [0u8; 32]
+        } else {
+            proto.context_pack_hash.try_into().map_err(|_| {
+                ReviewBlockedError::InvalidData("context_pack_hash must be 32 bytes".into())
+            })?
+        };
+
         Ok(Self {
             blocked_id: proto.blocked_id,
             changeset_digest,
@@ -600,6 +690,8 @@ impl TryFrom<ReviewBlockedRecordedProto> for ReviewBlockedRecorded {
             time_envelope_ref,
             recorder_actor_id: proto.recorder_actor_id,
             recorder_signature,
+            capability_manifest_hash,
+            context_pack_hash,
         })
     }
 }
@@ -619,6 +711,9 @@ impl From<ReviewBlockedRecorded> for ReviewBlockedRecordedProto {
             }),
             recorder_actor_id: event.recorder_actor_id,
             recorder_signature: event.recorder_signature.to_vec(),
+            // TCK-00326: Authority binding fields
+            capability_manifest_hash: event.capability_manifest_hash.to_vec(),
+            context_pack_hash: event.context_pack_hash.to_vec(),
         }
     }
 }
@@ -674,14 +769,14 @@ mod tests {
 
     #[test]
     fn test_reason_code_to_code_roundtrip() {
-        // Values 1-9 are valid (0 is UNSPECIFIED per protobuf)
-        for code in 1..=9u8 {
+        // Values 1-11 are valid (0 is UNSPECIFIED per protobuf, TCK-00325 added 9, TCK-00326 added 10-11)
+        for code in 1..=11u8 {
             let reason = ReasonCode::from_code(code).unwrap();
             assert_eq!(reason.to_code(), code);
         }
-        // 0 (UNSPECIFIED) and 10+ are invalid
+        // 0 (UNSPECIFIED) and 12+ are invalid
         assert!(ReasonCode::from_code(0).is_err());
-        assert!(ReasonCode::from_code(10).is_err());
+        assert!(ReasonCode::from_code(12).is_err());
     }
 
     #[test]
@@ -727,6 +822,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
+            [0x55; 32], // capability_manifest_hash (TCK-00326)
+            [0x66; 32], // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
@@ -745,6 +842,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
+            [0x55; 32], // capability_manifest_hash (TCK-00326)
+            [0x66; 32], // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
@@ -766,11 +865,15 @@ mod tests {
             .blocked_log_hash([0x22; 32])
             .time_envelope_ref([0x33; 32])
             .recorder_actor_id("recorder-002")
+            .capability_manifest_hash([0x55; 32]) // TCK-00326
+            .context_pack_hash([0x66; 32])        // TCK-00326
             .build_and_sign(&signer)
             .expect("valid event");
 
         assert_eq!(event.blocked_id, "blocked-002");
         assert_eq!(event.reason_code, ReasonCode::ToolFailed);
+        assert_eq!(event.capability_manifest_hash, [0x55; 32]);
+        assert_eq!(event.context_pack_hash, [0x66; 32]);
         assert!(event.verify_signature(&signer.verifying_key()).is_ok());
     }
 
@@ -785,6 +888,8 @@ mod tests {
             .blocked_log_hash([0x22; 32])
             .time_envelope_ref([0x33; 32])
             .recorder_actor_id("recorder-002")
+            .capability_manifest_hash([0x55; 32])
+            .context_pack_hash([0x66; 32])
             .build_and_sign(&signer);
         assert!(matches!(
             result,
@@ -798,10 +903,42 @@ mod tests {
             .blocked_log_hash([0x22; 32])
             .time_envelope_ref([0x33; 32])
             .recorder_actor_id("recorder-002")
+            .capability_manifest_hash([0x55; 32])
+            .context_pack_hash([0x66; 32])
             .build_and_sign(&signer);
         assert!(matches!(
             result,
             Err(ReviewBlockedError::MissingField("reason_code"))
+        ));
+
+        // Missing capability_manifest_hash (TCK-00326)
+        let result = ReviewBlockedRecordedBuilder::new()
+            .blocked_id("blocked-002")
+            .changeset_digest([0x11; 32])
+            .reason_code(ReasonCode::ToolFailed)
+            .blocked_log_hash([0x22; 32])
+            .time_envelope_ref([0x33; 32])
+            .recorder_actor_id("recorder-002")
+            .context_pack_hash([0x66; 32])
+            .build_and_sign(&signer);
+        assert!(matches!(
+            result,
+            Err(ReviewBlockedError::MissingField("capability_manifest_hash"))
+        ));
+
+        // Missing context_pack_hash (TCK-00326)
+        let result = ReviewBlockedRecordedBuilder::new()
+            .blocked_id("blocked-002")
+            .changeset_digest([0x11; 32])
+            .reason_code(ReasonCode::ToolFailed)
+            .blocked_log_hash([0x22; 32])
+            .time_envelope_ref([0x33; 32])
+            .recorder_actor_id("recorder-002")
+            .capability_manifest_hash([0x55; 32])
+            .build_and_sign(&signer);
+        assert!(matches!(
+            result,
+            Err(ReviewBlockedError::MissingField("context_pack_hash"))
         ));
     }
 
@@ -817,6 +954,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
+            [0x55; 32], // capability_manifest_hash (TCK-00326)
+            [0x66; 32], // context_pack_hash (TCK-00326)
             &signer,
         );
 
@@ -839,6 +978,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
+            [0x55; 32], // capability_manifest_hash (TCK-00326)
+            [0x66; 32], // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
@@ -850,6 +991,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
+            [0x55; 32], // capability_manifest_hash (TCK-00326)
+            [0x66; 32], // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
@@ -870,6 +1013,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
+            [0x55; 32], // capability_manifest_hash (TCK-00326)
+            [0x66; 32], // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
@@ -881,11 +1026,76 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
+            [0x55; 32], // capability_manifest_hash (TCK-00326)
+            [0x66; 32], // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
 
         // Different reason codes produce different canonical bytes
         assert_ne!(event1.canonical_bytes(), event2.canonical_bytes());
+    }
+
+    #[test]
+    fn test_context_pack_reason_codes() {
+        // TCK-00326: Test the new context pack reason codes
+        assert_eq!(
+            "CONTEXT_PACK_MISSING".parse::<ReasonCode>().unwrap(),
+            ReasonCode::ContextPackMissing
+        );
+        assert_eq!(
+            "CONTEXT_PACK_INVALID".parse::<ReasonCode>().unwrap(),
+            ReasonCode::ContextPackInvalid
+        );
+        assert_eq!(
+            ReasonCode::ContextPackMissing.to_string(),
+            "CONTEXT_PACK_MISSING"
+        );
+        assert_eq!(
+            ReasonCode::ContextPackInvalid.to_string(),
+            "CONTEXT_PACK_INVALID"
+        );
+        // TCK-00325 reserved code 9 for MissingViewCommitment, so ContextPack codes are 10-11
+        assert_eq!(ReasonCode::ContextPackMissing.to_code(), 10);
+        assert_eq!(ReasonCode::ContextPackInvalid.to_code(), 11);
+        // Context pack errors are not retryable
+        assert!(!ReasonCode::ContextPackMissing.is_retryable());
+        assert!(!ReasonCode::ContextPackInvalid.is_retryable());
+    }
+
+    #[test]
+    fn test_authority_binding_fields_in_signature() {
+        // TCK-00326: Verify that capability_manifest_hash and context_pack_hash
+        // are included in the signature
+        let signer = Signer::generate();
+        let event1 = ReviewBlockedRecorded::create(
+            "blocked-001".to_string(),
+            [0x42; 32],
+            ReasonCode::ApplyFailed,
+            [0x33; 32],
+            [0x44; 32],
+            "recorder-001".to_string(),
+            [0x55; 32], // capability_manifest_hash
+            [0x66; 32], // context_pack_hash
+            &signer,
+        )
+        .expect("valid event");
+
+        let event2 = ReviewBlockedRecorded::create(
+            "blocked-001".to_string(),
+            [0x42; 32],
+            ReasonCode::ApplyFailed,
+            [0x33; 32],
+            [0x44; 32],
+            "recorder-001".to_string(),
+            [0xAA; 32], // Different capability_manifest_hash
+            [0x66; 32], // Same context_pack_hash
+            &signer,
+        )
+        .expect("valid event");
+
+        // Different authority binding produces different canonical bytes and signature
+        assert_ne!(event1.canonical_bytes(), event2.canonical_bytes());
+        assert_ne!(event1.recorder_signature, event2.recorder_signature);
     }
 }
