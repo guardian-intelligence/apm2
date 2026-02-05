@@ -442,8 +442,9 @@ pub fn security_reviewer_role() -> RoleSpecV1 {
 pub fn test_flake_fixer_role() -> RoleSpecV1 {
     let tool_allowlist = ToolAllowlist::empty()
         .with_tool_and_budget("kernel.artifact.fetch", ToolBudget::read_only())
-        .with_tool_and_budget("kernel.fs.read", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.list", ToolBudget::read_only())
         .with_tool_and_budget("kernel.fs.search", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.read", ToolBudget::read_only())
         .with_tool_and_budget("kernel.fs.edit", ToolBudget::write())
         .with_tool_and_budget("kernel.fs.write", ToolBudget::write())
         .with_tool_and_budget("kernel.shell.exec", ToolBudget::shell_exec())
@@ -464,6 +465,14 @@ pub fn test_flake_fixer_role() -> RoleSpecV1 {
             "apm2.changeset_published.v1",
             true,
         ))
+        .required_output_schema(
+            RequiredOutputSchema::new("apm2.tool_execution_receipt.v1", false)
+                .with_description("Tool execution receipts for audit"),
+        )
+        .required_output_schema(
+            RequiredOutputSchema::new("apm2.summary_receipt.v1", false)
+                .with_description("Summary of implementation work"),
+        )
         .system_prompt_template(
             "You are a test flake fixer specialist. Your goal is to fix flaky tests.\n\n\
              1. Analyze the test failure log\n\
@@ -495,6 +504,8 @@ pub fn test_flake_fixer_role() -> RoleSpecV1 {
 pub fn rust_compile_error_fixer_role() -> RoleSpecV1 {
     let tool_allowlist = ToolAllowlist::empty()
         .with_tool_and_budget("kernel.artifact.fetch", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.list", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.search", ToolBudget::read_only())
         .with_tool_and_budget("kernel.fs.read", ToolBudget::read_only())
         .with_tool_and_budget("kernel.fs.edit", ToolBudget::write())
         .with_tool_and_budget("kernel.fs.write", ToolBudget::write())
@@ -513,6 +524,14 @@ pub fn rust_compile_error_fixer_role() -> RoleSpecV1 {
             "apm2.changeset_published.v1",
             true,
         ))
+        .required_output_schema(
+            RequiredOutputSchema::new("apm2.tool_execution_receipt.v1", false)
+                .with_description("Tool execution receipts for audit"),
+        )
+        .required_output_schema(
+            RequiredOutputSchema::new("apm2.summary_receipt.v1", false)
+                .with_description("Summary of implementation work"),
+        )
         .system_prompt_template(
             "You are a Rust compile error fixer specialist. Your goal is to make the code compile.\n\n\
              1. Analyze the cargo check output\n\
@@ -542,7 +561,10 @@ pub fn rust_compile_error_fixer_role() -> RoleSpecV1 {
 pub fn dependency_updater_role() -> RoleSpecV1 {
     let tool_allowlist = ToolAllowlist::empty()
         .with_tool_and_budget("kernel.artifact.fetch", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.list", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.search", ToolBudget::read_only())
         .with_tool_and_budget("kernel.fs.read", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.write", ToolBudget::write())
         .with_tool_and_budget("kernel.fs.edit", ToolBudget::write())
         .with_tool_and_budget("kernel.shell.exec", ToolBudget::shell_exec())
         .with_tool_and_budget("kernel.evidence.publish", ToolBudget::write())
@@ -559,6 +581,14 @@ pub fn dependency_updater_role() -> RoleSpecV1 {
             "apm2.changeset_published.v1",
             true,
         ))
+        .required_output_schema(
+            RequiredOutputSchema::new("apm2.tool_execution_receipt.v1", false)
+                .with_description("Tool execution receipts for audit"),
+        )
+        .required_output_schema(
+            RequiredOutputSchema::new("apm2.summary_receipt.v1", false)
+                .with_description("Summary of implementation work"),
+        )
         .system_prompt_template(
             "You are a dependency updater specialist. Your goal is to update dependencies safely.\n\n\
              1. Check for outdated dependencies\n\
