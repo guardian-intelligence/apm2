@@ -174,6 +174,11 @@ pub use dispatch::{
     encode_stop_process_request,
     generate_lease_id,
     generate_work_id,
+    // TCK-00345: Consensus query encoding helpers
+    encode_consensus_status_request,
+    encode_consensus_validators_request,
+    encode_consensus_byzantine_evidence_request,
+    encode_consensus_metrics_request,
 };
 #[allow(unused_imports)]
 pub use error::{
@@ -257,6 +262,19 @@ pub use messages::{
     UnsubscribePulseRequest,
     UnsubscribePulseResponse,
     WorkRole,
+    // CTR-PROTO-011: Consensus Query Endpoints (RFC-0014, TCK-00345)
+    ByzantineEvidenceEntry,
+    ConsensusByzantineEvidenceRequest,
+    ConsensusByzantineEvidenceResponse,
+    ConsensusError,
+    ConsensusErrorCode,
+    ConsensusMetricsRequest,
+    ConsensusMetricsResponse,
+    ConsensusStatusRequest,
+    ConsensusStatusResponse,
+    ConsensusValidatorsRequest,
+    ConsensusValidatorsResponse,
+    ValidatorInfo,
 };
 // CTR-PROTO-010: HEF Pulse ACL (RFC-0018, TCK-00302)
 #[allow(unused_imports)]
