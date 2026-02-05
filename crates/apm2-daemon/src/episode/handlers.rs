@@ -4736,6 +4736,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(unsafe_code)] // Required for env var manipulation in tests
     async fn test_execute_handler_env_scrubbing() {
         // Set a secret env var that should be scrubbed
         // SAFETY: This is a test running in isolation
