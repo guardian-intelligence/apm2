@@ -4733,9 +4733,16 @@ impl PrivilegedDispatcher {
 
     /// Converts a protobuf auth method enum value and secret bytes into a core
     /// `AuthMethod`.
-    fn proto_auth_to_core(auth_method: i32, secret: &[u8]) -> AuthMethod {
-        let secret_str = String::from_utf8_lossy(secret).to_string();
-        match ProtoAuthMethod::try_from(auth_method) {
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProtocolError::Serialization` if `secret` is not valid UTF-8.
+    fn proto_auth_to_core(auth_method: i32, secret: &[u8]) -> Result<AuthMethod, ProtocolError> {
+        let secret_str =
+            String::from_utf8(secret.to_vec()).map_err(|_| ProtocolError::Serialization {
+                reason: "credential_secret is not valid UTF-8".to_string(),
+            })?;
+        let auth = match ProtoAuthMethod::try_from(auth_method) {
             Ok(ProtoAuthMethod::Oauth) => AuthMethod::OAuth {
                 access_token: SecretString::from(secret_str),
                 refresh_token: None,
@@ -4751,7 +4758,8 @@ impl PrivilegedDispatcher {
             _ => AuthMethod::ApiKey {
                 key: SecretString::from(secret_str),
             },
-        }
+        };
+        Ok(auth)
     }
 
     /// Converts a core `AuthMethod` to a protobuf auth method enum value.
@@ -4909,7 +4917,13 @@ impl PrivilegedDispatcher {
 
         // Convert protobuf types to core types
         let provider = Self::proto_provider_to_core(request.provider);
-        let auth = Self::proto_auth_to_core(request.auth_method, &request.credential_secret);
+        let Ok(auth) = Self::proto_auth_to_core(request.auth_method, &request.credential_secret)
+        else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CredentialInvalidConfig,
+                "credential_secret is not valid UTF-8".to_string(),
+            ));
+        };
         let profile_id = ProfileId::new(&request.profile_id);
 
         // Build the core credential profile
