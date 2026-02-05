@@ -198,8 +198,7 @@ impl DispatcherState {
             Arc::new(SubscriptionRegistry::with_defaults());
 
         // TCK-00343: Create credential store for credential management
-        let credential_store =
-            Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
+        let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
 
         // TCK-00287 BLOCKER 1 & 2: Create privileged dispatcher with shared state
         let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
@@ -272,8 +271,7 @@ impl DispatcherState {
             Arc::new(SubscriptionRegistry::with_defaults());
 
         // TCK-00343: Create credential store for credential management
-        let credential_store =
-            Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
+        let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
 
         // TCK-00287 BLOCKER 1: Create privileged dispatcher with global session
         // registry
@@ -337,8 +335,7 @@ impl DispatcherState {
         let session_registry_for_session = Arc::clone(&session_registry);
 
         // TCK-00343: Create credential store for credential management
-        let credential_store =
-            Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
+        let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
 
         let privileged_dispatcher = if let Some(conn) = sqlite_conn {
             // Use real implementations
@@ -573,8 +570,7 @@ impl DispatcherState {
         let episode_runtime = Arc::new(episode_runtime);
 
         // TCK-00343: Create credential store for credential management
-        let credential_store =
-            Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
+        let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
 
         let privileged_dispatcher = PrivilegedDispatcher::with_dependencies(
             DecodeConfig::default(),
