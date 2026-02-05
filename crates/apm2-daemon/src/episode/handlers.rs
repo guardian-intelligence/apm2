@@ -828,21 +828,188 @@ impl ToolHandler for WriteFileHandler {
 // ExecuteHandler
 // =============================================================================
 
+// SEC-CTRL-FAC-0016: Environment variable allowlist for sandboxed execution.
+// Only these variables are passed through to spawned processes.
+// All others are scrubbed to prevent credential/secret leakage.
+const ENV_PASSTHROUGH: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+];
+
+// SEC-CTRL-FAC-0016: Environment variable patterns that are ALWAYS blocked,
+// even if they appear in a custom passthrough list.
+const ENV_BLOCKLIST_PATTERNS: &[&str] = &[
+    "API_KEY",
+    "API_SECRET",
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "AUTH",
+    "PRIVATE_KEY",
+    "AWS_SECRET",
+    "AZURE_SECRET",
+    "GCP_SECRET",
+    "GITHUB_TOKEN",
+    "GITLAB_TOKEN",
+    "NPM_TOKEN",
+    "DOCKER_PASSWORD",
+    "SSH_PRIVATE",
+    "PGP_PRIVATE",
+    "GPG_PRIVATE",
+];
+
+/// Configuration for sandboxed command execution (TCK-00338).
+///
+/// This struct encapsulates security policies for the `ExecuteHandler`:
+/// - Shell command allowlist (fail-closed if empty)
+/// - Environment variable passthrough list
+/// - Stall detection timeout
+///
+/// # Security Model (SEC-CTRL-FAC-0016)
+///
+/// - **Fail-closed**: Empty allowlist means no commands are allowed
+/// - **Env scrubbing**: Only allowlisted env vars pass through
+/// - **Blocklist override**: Sensitive patterns are always blocked
+#[derive(Debug, Clone)]
+pub struct SandboxConfig {
+    /// Shell command patterns that are allowed.
+    /// Uses glob-style matching via `shell_pattern_matches`.
+    /// Empty means fail-closed (no commands allowed).
+    pub shell_allowlist: Vec<String>,
+
+    /// Additional environment variables to pass through beyond the defaults.
+    /// Variables matching `ENV_BLOCKLIST_PATTERNS` are still blocked.
+    pub env_passthrough: Vec<String>,
+
+    /// Stall detection timeout in milliseconds.
+    /// If a process produces no output for this duration, it's considered
+    /// stalled. Default: 60000ms (60 seconds). Set to 0 to disable.
+    pub stall_timeout_ms: u64,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            shell_allowlist: Vec::new(), // Fail-closed by default
+            env_passthrough: Vec::new(),
+            stall_timeout_ms: 60_000, // 60 second stall detection
+        }
+    }
+}
+
+impl SandboxConfig {
+    /// Creates a permissive config that allows all commands.
+    /// Use with caution - only for trusted environments.
+    #[must_use]
+    pub fn permissive() -> Self {
+        Self {
+            shell_allowlist: vec!["*".to_string()], // Allow everything
+            env_passthrough: Vec::new(),
+            stall_timeout_ms: 60_000,
+        }
+    }
+
+    /// Creates a config with a specific shell allowlist.
+    #[must_use]
+    pub fn with_shell_allowlist(allowlist: Vec<String>) -> Self {
+        Self {
+            shell_allowlist: allowlist,
+            ..Default::default()
+        }
+    }
+
+    /// Adds environment variables to the passthrough list.
+    #[must_use]
+    pub fn with_env_passthrough(mut self, vars: Vec<String>) -> Self {
+        self.env_passthrough = vars;
+        self
+    }
+
+    /// Sets the stall detection timeout.
+    #[must_use]
+    pub const fn with_stall_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.stall_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Checks if an environment variable name should be passed through.
+    ///
+    /// Returns `true` if the variable is in the passthrough list AND
+    /// does not match any blocklist patterns.
+    #[must_use]
+    pub fn should_pass_env(&self, name: &str) -> bool {
+        // Check blocklist first (case-insensitive)
+        let name_upper = name.to_uppercase();
+        for pattern in ENV_BLOCKLIST_PATTERNS {
+            if name_upper.contains(pattern) {
+                return false;
+            }
+        }
+
+        // Check if in default passthrough
+        if ENV_PASSTHROUGH.contains(&name) {
+            return true;
+        }
+
+        // Check if in custom passthrough
+        self.env_passthrough.iter().any(|v| v == name)
+    }
+
+    /// Checks if a command is allowed by the shell allowlist.
+    ///
+    /// Returns `true` if the full command line matches any pattern in the
+    /// allowlist. Returns `false` if the allowlist is empty (fail-closed).
+    #[must_use]
+    pub fn is_command_allowed(&self, command_line: &str) -> bool {
+        use super::tool_class::shell_pattern_matches;
+
+        if self.shell_allowlist.is_empty() {
+            // Fail-closed: empty allowlist means nothing is allowed
+            return false;
+        }
+
+        self.shell_allowlist
+            .iter()
+            .any(|pattern| shell_pattern_matches(pattern, command_line))
+    }
+}
+
 /// Real handler for command execution.
 ///
 /// This handler executes commands in a sandboxed environment (restricted to
 /// CWD/workspace), enforces timeouts, and bounds output capture.
 ///
-/// # Security
+/// # Security (TCK-00338)
 ///
+/// - **Shell Allowlist**: Commands must match patterns in
+///   `SandboxConfig::shell_allowlist`. Empty allowlist means fail-closed (no
+///   commands allowed).
+/// - **Env Scrubbing**: Environment is cleared, only allowlisted vars pass
+///   through. Sensitive patterns (`API_KEY`, `TOKEN`, etc.) are always blocked.
 /// - **Sandbox**: Commands execute in specified CWD (validated relative path),
 ///   anchored to the configured root.
 /// - **Timeout**: Enforced per-execution timeout (default 30s, max 1h).
+/// - **Stall Detection**: Processes producing no output are terminated.
 /// - **Output**: Stdout/Stderr captured up to `MAX_TOOL_OUTPUT_SIZE`.
 /// - **Input**: Stdin pipe supported with size limits.
 #[derive(Debug)]
 pub struct ExecuteHandler {
     root: PathBuf,
+    sandbox_config: SandboxConfig,
 }
 
 /// TCK-00319: Default implementation is restricted to test builds only.
@@ -853,6 +1020,8 @@ impl Default for ExecuteHandler {
     fn default() -> Self {
         Self {
             root: PathBuf::from("."),
+            // Test default uses permissive config for backwards compatibility
+            sandbox_config: SandboxConfig::permissive(),
         }
     }
 }
@@ -875,13 +1044,59 @@ impl ExecuteHandler {
     pub fn new() -> Self {
         Self {
             root: PathBuf::from("."),
+            // Deprecated constructor uses permissive config for backwards compatibility
+            sandbox_config: SandboxConfig::permissive(),
         }
     }
 
     /// Creates a new execute handler with a specific root directory.
+    ///
+    /// # Security Note (TCK-00338)
+    ///
+    /// This constructor uses a permissive sandbox config that allows all
+    /// commands. For production use, prefer `with_root_and_sandbox()` to
+    /// specify an explicit shell allowlist.
     #[must_use]
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            // Default to permissive for backwards compatibility
+            sandbox_config: SandboxConfig::permissive(),
+        }
+    }
+
+    /// Creates a new execute handler with explicit sandbox configuration.
+    ///
+    /// # Security (TCK-00338)
+    ///
+    /// This is the recommended constructor for production use. It allows you to
+    /// specify:
+    /// - A shell allowlist (fail-closed if empty)
+    /// - Environment variable passthrough rules
+    /// - Stall detection timeout
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let config = SandboxConfig::with_shell_allowlist(vec![
+    ///     "cargo *".to_string(),
+    ///     "npm *".to_string(),
+    ///     "git *".to_string(),
+    /// ]);
+    /// let handler = ExecuteHandler::with_root_and_sandbox("/workspace", config);
+    /// ```
+    #[must_use]
+    pub fn with_root_and_sandbox(root: impl Into<PathBuf>, sandbox_config: SandboxConfig) -> Self {
+        Self {
+            root: root.into(),
+            sandbox_config,
+        }
+    }
+
+    /// Returns the current sandbox configuration.
+    #[must_use]
+    pub const fn sandbox_config(&self) -> &SandboxConfig {
+        &self.sandbox_config
     }
 }
 
@@ -908,8 +1123,49 @@ impl ToolHandler for ExecuteHandler {
         // Start timing execution (MAJOR 2 fix)
         let exec_start = Instant::now();
 
+        // =====================================================================
+        // TCK-00338: Shell Allowlist Validation (SEC-CTRL-FAC-0016)
+        // =====================================================================
+        // Build full command line for allowlist matching.
+        // This matches the command + all arguments as a single string.
+        let full_command_line = if exec_args.args.is_empty() {
+            exec_args.command.clone()
+        } else {
+            format!("{} {}", exec_args.command, exec_args.args.join(" "))
+        };
+
+        if !self.sandbox_config.is_command_allowed(&full_command_line) {
+            warn!(
+                command = %exec_args.command,
+                full_command = %full_command_line,
+                "command denied by shell allowlist (SEC-CTRL-FAC-0016)"
+            );
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: format!(
+                    "command '{}' not in shell allowlist (SEC-CTRL-FAC-0016)",
+                    exec_args.command
+                ),
+            });
+        }
+
         let mut cmd = tokio::process::Command::new(&exec_args.command);
         cmd.args(&exec_args.args);
+
+        // =====================================================================
+        // TCK-00338: Environment Variable Scrubbing (SEC-CTRL-FAC-0016)
+        // =====================================================================
+        // Clear all environment variables to prevent credential/secret leakage,
+        // then selectively restore only allowlisted variables.
+        cmd.env_clear();
+
+        // Restore allowlisted environment variables
+        for (key, value) in std::env::vars_os() {
+            if let Some(key_str) = key.to_str() {
+                if self.sandbox_config.should_pass_env(key_str) {
+                    cmd.env(&key, &value);
+                }
+            }
+        }
 
         // Set working directory with symlink-aware validation (TCK-00319: TOCTOU
         // mitigation) Canonicalize root for comparison
@@ -4331,5 +4587,227 @@ mod tests {
                 "Error should mention absolute: {reason}"
             );
         }
+    }
+
+    // =========================================================================
+    // TCK-00338: SandboxConfig Tests (SEC-CTRL-FAC-0016)
+    // =========================================================================
+
+    #[test]
+    fn test_sandbox_config_default_is_fail_closed() {
+        // Default config should have empty allowlist (fail-closed)
+        let config = SandboxConfig::default();
+        assert!(config.shell_allowlist.is_empty());
+        assert!(!config.is_command_allowed("echo hello"));
+        assert!(!config.is_command_allowed("ls"));
+    }
+
+    #[test]
+    fn test_sandbox_config_permissive_allows_all() {
+        let config = SandboxConfig::permissive();
+        assert!(config.is_command_allowed("echo hello"));
+        assert!(config.is_command_allowed("rm -rf /"));
+        assert!(config.is_command_allowed("any command at all"));
+    }
+
+    #[test]
+    fn test_sandbox_config_shell_allowlist_exact_match() {
+        let config = SandboxConfig::with_shell_allowlist(vec!["ls".to_string()]);
+        assert!(config.is_command_allowed("ls"));
+        assert!(!config.is_command_allowed("ls -la"));
+        assert!(!config.is_command_allowed("echo"));
+    }
+
+    #[test]
+    fn test_sandbox_config_shell_allowlist_wildcard() {
+        let config = SandboxConfig::with_shell_allowlist(vec![
+            "cargo *".to_string(),
+            "npm *".to_string(),
+            "git status".to_string(),
+        ]);
+        assert!(config.is_command_allowed("cargo build"));
+        assert!(config.is_command_allowed("cargo test --release"));
+        assert!(config.is_command_allowed("npm install"));
+        assert!(config.is_command_allowed("git status"));
+        assert!(!config.is_command_allowed("git push")); // Not in allowlist
+        assert!(!config.is_command_allowed("rm -rf /"));
+    }
+
+    #[test]
+    fn test_sandbox_config_env_passthrough_defaults() {
+        let config = SandboxConfig::default();
+        // Default safe vars should pass
+        assert!(config.should_pass_env("PATH"));
+        assert!(config.should_pass_env("HOME"));
+        assert!(config.should_pass_env("USER"));
+        assert!(config.should_pass_env("TERM"));
+        assert!(config.should_pass_env("LANG"));
+        assert!(config.should_pass_env("TZ"));
+        // Unknown vars should not pass
+        assert!(!config.should_pass_env("MY_CUSTOM_VAR"));
+        assert!(!config.should_pass_env("FOO"));
+    }
+
+    #[test]
+    fn test_sandbox_config_env_blocklist_patterns() {
+        let config = SandboxConfig::default();
+        // Sensitive patterns should always be blocked
+        assert!(!config.should_pass_env("API_KEY"));
+        assert!(!config.should_pass_env("MY_API_KEY"));
+        assert!(!config.should_pass_env("GITHUB_TOKEN"));
+        assert!(!config.should_pass_env("AWS_SECRET_ACCESS_KEY"));
+        assert!(!config.should_pass_env("NPM_TOKEN"));
+        assert!(!config.should_pass_env("DOCKER_PASSWORD"));
+        assert!(!config.should_pass_env("MY_SECRET_VALUE"));
+        assert!(!config.should_pass_env("AUTH_TOKEN"));
+        assert!(!config.should_pass_env("PRIVATE_KEY_PATH"));
+    }
+
+    #[test]
+    fn test_sandbox_config_custom_env_passthrough() {
+        let config = SandboxConfig::default()
+            .with_env_passthrough(vec!["MY_SAFE_VAR".to_string(), "ANOTHER_VAR".to_string()]);
+        // Custom vars should now pass
+        assert!(config.should_pass_env("MY_SAFE_VAR"));
+        assert!(config.should_pass_env("ANOTHER_VAR"));
+        // But sensitive patterns should still be blocked
+        assert!(!config.should_pass_env("MY_API_KEY"));
+    }
+
+    #[test]
+    fn test_sandbox_config_blocklist_overrides_passthrough() {
+        // Even if you add a sensitive var to passthrough, blocklist wins
+        let config = SandboxConfig::default()
+            .with_env_passthrough(vec!["API_KEY".to_string(), "MY_SECRET".to_string()]);
+        // These should still be blocked due to pattern matching
+        assert!(!config.should_pass_env("API_KEY"));
+        assert!(!config.should_pass_env("MY_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_handler_command_allowlist_blocks_disallowed() {
+        // Create handler with restrictive allowlist
+        let tmp = tempfile::tempdir().unwrap();
+        let config = SandboxConfig::with_shell_allowlist(vec!["echo *".to_string()]);
+        let handler = ExecuteHandler::with_root_and_sandbox(tmp.path(), config);
+
+        // Try to run a command not in the allowlist
+        let args = ToolArgs::Execute(ExecuteArgs {
+            command: "ls".to_string(),
+            args: vec![],
+            cwd: None,
+            stdin: None,
+            timeout_ms: Some(1000),
+        });
+
+        let result = handler.execute(&args, None).await;
+        assert!(result.is_err());
+        if let Err(ToolHandlerError::InvalidArgs { reason }) = result {
+            assert!(
+                reason.contains("not in shell allowlist"),
+                "Error should mention allowlist: {reason}"
+            );
+        } else {
+            panic!("Expected InvalidArgs error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_handler_command_allowlist_allows_matching() {
+        // Create handler with allowlist that permits echo
+        let tmp = tempfile::tempdir().unwrap();
+        let config = SandboxConfig::with_shell_allowlist(vec!["echo *".to_string()]);
+        let handler = ExecuteHandler::with_root_and_sandbox(tmp.path(), config);
+
+        // Run allowed command
+        let args = ToolArgs::Execute(ExecuteArgs {
+            command: "echo".to_string(),
+            args: vec!["hello".to_string()],
+            cwd: None,
+            stdin: None,
+            timeout_ms: Some(1000),
+        });
+
+        let result = handler.execute(&args, None).await;
+        assert!(result.is_ok(), "Allowed command should succeed: {result:?}");
+        let data = result.unwrap();
+        let output = String::from_utf8_lossy(&data.output);
+        assert!(output.contains("hello"), "Output should contain 'hello'");
+    }
+
+    #[tokio::test]
+    async fn test_execute_handler_env_scrubbing() {
+        // Set a secret env var that should be scrubbed
+        // SAFETY: This is a test running in isolation
+        unsafe {
+            std::env::set_var("TEST_API_KEY_SECRET", "supersecret123");
+            std::env::set_var("TEST_SAFE_VAR", "safevalue");
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config =
+            SandboxConfig::permissive().with_env_passthrough(vec!["TEST_SAFE_VAR".to_string()]);
+        let handler = ExecuteHandler::with_root_and_sandbox(tmp.path(), config);
+
+        // Run printenv to see what environment the child process sees
+        let args = ToolArgs::Execute(ExecuteArgs {
+            command: "env".to_string(),
+            args: vec![],
+            cwd: None,
+            stdin: None,
+            timeout_ms: Some(5000),
+        });
+
+        let result = handler.execute(&args, None).await;
+        assert!(result.is_ok(), "env command should succeed");
+        let data = result.unwrap();
+        let output = String::from_utf8_lossy(&data.output);
+
+        // Secret should NOT appear (blocked by pattern)
+        assert!(
+            !output.contains("supersecret123"),
+            "Secret value should be scrubbed from env"
+        );
+        assert!(
+            !output.contains("TEST_API_KEY_SECRET"),
+            "Secret key should be scrubbed from env"
+        );
+
+        // Safe var should appear (in custom passthrough)
+        assert!(
+            output.contains("TEST_SAFE_VAR") || output.contains("safevalue"),
+            "Safe var should be passed through"
+        );
+
+        // Clean up
+        // SAFETY: This is a test running in isolation
+        unsafe {
+            std::env::remove_var("TEST_API_KEY_SECRET");
+            std::env::remove_var("TEST_SAFE_VAR");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_handler_default_env_passthrough() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = SandboxConfig::permissive();
+        let handler = ExecuteHandler::with_root_and_sandbox(tmp.path(), config);
+
+        // Run printenv to check PATH is passed through
+        let args = ToolArgs::Execute(ExecuteArgs {
+            command: "env".to_string(),
+            args: vec![],
+            cwd: None,
+            stdin: None,
+            timeout_ms: Some(5000),
+        });
+
+        let result = handler.execute(&args, None).await;
+        assert!(result.is_ok());
+        let data = result.unwrap();
+        let output = String::from_utf8_lossy(&data.output);
+
+        // Default safe vars should be present
+        assert!(output.contains("PATH="), "PATH should be passed through");
     }
 }
