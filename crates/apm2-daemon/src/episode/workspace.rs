@@ -3093,8 +3093,8 @@ mod tests {
         assert!(result.is_ok(), "Valid path should succeed: {result:?}");
     }
 
-    /// BLOCKER 1 FIX: Test `commit_view` includes changeset_digest in
-    /// result_digest. This verifies the view commitment properly binds to
+    /// BLOCKER 1 FIX: Test `commit_view` includes `changeset_digest` in
+    /// `result_digest`. This verifies the view commitment properly binds to
     /// the applied changeset.
     #[test]
     fn test_commit_view_includes_changeset_digest() {
@@ -3130,7 +3130,7 @@ mod tests {
 
         let temp_dir = tempfile::TempDir::new().expect("create temp dir");
         let workspace_root = temp_dir.path().to_path_buf();
-        let test_cas = StubContentAddressedStore::default();
+        let test_cas = StubContentAddressedStore;
         let manager = WorkspaceManager::with_cas(workspace_root, Arc::new(test_cas));
 
         let commitment =
@@ -3144,7 +3144,7 @@ mod tests {
         assert_eq!(hash, commitment.compute_cas_hash());
     }
 
-    /// BLOCKER 3 FIX: Test that apply_with_view_commitment fails when CAS is
+    /// BLOCKER 3 FIX: Test that `apply_with_view_commitment` fails when CAS is
     /// unavailable
     #[test]
     fn test_apply_with_view_commitment_requires_cas() {
