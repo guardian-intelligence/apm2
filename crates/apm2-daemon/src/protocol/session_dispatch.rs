@@ -75,8 +75,9 @@ use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
     BoundedDecode, DecisionType, DecodeConfig, EmitEventRequest, EmitEventResponse,
     PatternRejection, PublishEvidenceRequest, PublishEvidenceResponse, RequestToolRequest,
-    RequestToolResponse, SessionError, SessionErrorCode, StreamLogsRequest, StreamLogsResponse,
-    StreamTelemetryRequest, StreamTelemetryResponse, SubscribePulseRequest, SubscribePulseResponse,
+    RequestToolResponse, SessionError, SessionErrorCode, SessionStatusRequest,
+    SessionStatusResponse, StreamLogsRequest, StreamLogsResponse, StreamTelemetryRequest,
+    StreamTelemetryResponse, SubscribePulseRequest, SubscribePulseResponse,
     UnsubscribePulseRequest, UnsubscribePulseResponse,
 };
 use super::pulse_acl::{
@@ -121,6 +122,8 @@ pub enum SessionMessageType {
     StreamTelemetry  = 4,
     /// `StreamLogs` request (IPC-SESS-005, TCK-00342)
     StreamLogs       = 5,
+    /// `SessionStatus` request (IPC-SESS-006, TCK-00344)
+    SessionStatus    = 6,
     // --- HEF Pulse Plane (CTR-PROTO-010, RFC-0018) ---
     /// `SubscribePulse` request (IPC-HEF-001)
     SubscribePulse   = 64,
@@ -140,6 +143,7 @@ impl SessionMessageType {
             3 => Some(Self::PublishEvidence),
             4 => Some(Self::StreamTelemetry),
             5 => Some(Self::StreamLogs),
+            6 => Some(Self::SessionStatus),
             // HEF tags (64-68)
             64 => Some(Self::SubscribePulse),
             66 => Some(Self::UnsubscribePulse),
@@ -174,6 +178,8 @@ pub enum SessionResponse {
     StreamTelemetry(StreamTelemetryResponse),
     /// Successful `StreamLogs` response (TCK-00342).
     StreamLogs(StreamLogsResponse),
+    /// Successful `SessionStatus` response (TCK-00344).
+    SessionStatus(SessionStatusResponse),
     /// Successful `SubscribePulse` response (TCK-00302).
     SubscribePulse(SubscribePulseResponse),
     /// Successful `UnsubscribePulse` response (TCK-00302).
@@ -240,6 +246,10 @@ impl SessionResponse {
             },
             Self::StreamLogs(resp) => {
                 buf.push(SessionMessageType::StreamLogs.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::SessionStatus(resp) => {
+                buf.push(SessionMessageType::SessionStatus.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::SubscribePulse(resp) => {
@@ -459,6 +469,11 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// Per TCK-00316, this is required to execute tools kernel-side and return
     /// durable result references.
     episode_runtime: Option<Arc<EpisodeRuntime>>,
+    /// Session registry for session status queries (TCK-00344).
+    ///
+    /// Per TCK-00344, the session registry is used to look up session state
+    /// for `SessionStatus` queries.
+    session_registry: Option<Arc<dyn crate::session::SessionRegistry>>,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -484,6 +499,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
             episode_runtime: None,
+            session_registry: None,
         }
     }
 
@@ -501,6 +517,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
             episode_runtime: None,
+            session_registry: None,
         }
     }
 }
@@ -523,6 +540,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
             episode_runtime: None,
+            session_registry: None,
         }
     }
 
@@ -545,6 +563,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
             episode_runtime: None,
+            session_registry: None,
         }
     }
 
@@ -583,6 +602,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
             episode_runtime: None,
+            session_registry: None,
         }
     }
 
@@ -640,6 +660,16 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     #[must_use]
     pub fn with_episode_runtime(mut self, runtime: Arc<EpisodeRuntime>) -> Self {
         self.episode_runtime = Some(runtime);
+        self
+    }
+
+    /// Sets the session registry for session status queries (TCK-00344).
+    #[must_use]
+    pub fn with_session_registry(
+        mut self,
+        registry: Arc<dyn crate::session::SessionRegistry>,
+    ) -> Self {
+        self.session_registry = Some(registry);
         self
     }
 
@@ -856,6 +886,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             SessionMessageType::StreamTelemetry => self.handle_stream_telemetry(payload, ctx),
             // TCK-00342: Process log streaming
             SessionMessageType::StreamLogs => self.handle_stream_logs(payload, ctx),
+            // TCK-00344: Session status query
+            SessionMessageType::SessionStatus => self.handle_session_status(payload, ctx),
             // HEF Pulse Plane (TCK-00302): Subscription handlers
             SessionMessageType::SubscribePulse => self.handle_subscribe_pulse(payload, ctx),
             SessionMessageType::UnsubscribePulse => self.handle_unsubscribe_pulse(payload, ctx),
@@ -1593,6 +1625,78 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         ))
     }
 
+    /// Handles `SessionStatus` requests (IPC-SESS-005, TCK-00344).
+    ///
+    /// Queries session-scoped status including state and telemetry summary.
+    ///
+    /// # Security
+    ///
+    /// Per INV-SESS-001: Session token is validated before returning status.
+    /// Only the session identified by the token can query its own status.
+    fn handle_session_status(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<SessionResponse> {
+        let request = SessionStatusRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid SessionStatusRequest: {e}"),
+            })?;
+
+        // INV-SESS-001: Validate session token
+        let token = match self.validate_token(&request.session_token) {
+            Ok(t) => t,
+            Err(resp) => return Ok(resp),
+        };
+
+        debug!(
+            session_id = %token.session_id,
+            peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+            "SessionStatus request received"
+        );
+
+        // Query session registry for session state
+        if let Some(session_registry) = &self.session_registry {
+            if let Some(session) = session_registry.get_session(&token.session_id) {
+                // Calculate session duration
+                let duration_ms = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+
+                let response = SessionStatusResponse {
+                    session_id: token.session_id.clone(),
+                    state: "ACTIVE".to_string(),
+                    work_id: session.work_id,
+                    role: session.role,
+                    episode_id: session.episode_id,
+                    tool_calls: 0,     // TODO: Track in session telemetry
+                    events_emitted: 0, // TODO: Track in session telemetry
+                    started_at_ns: 0,  // TODO: Track session start time
+                    duration_ms,
+                };
+
+                return Ok(SessionResponse::SessionStatus(response));
+            }
+        }
+
+        // Session not found in registry - return status based on token validity
+        // If we got here, the token is valid but session may not be in registry yet
+        let response = SessionStatusResponse {
+            session_id: token.session_id,
+            state: "ACTIVE".to_string(),
+            work_id: String::new(),
+            role: 0, // UNSPECIFIED
+            episode_id: None,
+            tool_calls: 0,
+            events_emitted: 0,
+            started_at_ns: 0,
+            duration_ms: 0,
+        };
+
+        Ok(SessionResponse::SessionStatus(response))
+    }
+
     // ========================================================================
     // Process Log Streaming (TCK-00342)
     // ========================================================================
@@ -2106,6 +2210,14 @@ pub fn encode_subscribe_pulse_request(request: &SubscribePulseRequest) -> Bytes 
 #[must_use]
 pub fn encode_unsubscribe_pulse_request(request: &UnsubscribePulseRequest) -> Bytes {
     let mut buf = vec![SessionMessageType::UnsubscribePulse.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `SessionStatus` request to bytes for sending (TCK-00344).
+#[must_use]
+pub fn encode_session_status_request(request: &SessionStatusRequest) -> Bytes {
+    let mut buf = vec![SessionMessageType::SessionStatus.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }

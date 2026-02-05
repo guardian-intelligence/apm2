@@ -52,7 +52,7 @@ use super::messages::{
     RestartProcessResponse, ShutdownRequest, ShutdownResponse, SpawnEpisodeRequest,
     SpawnEpisodeResponse, StartProcessRequest, StartProcessResponse, StopProcessRequest,
     StopProcessResponse, SubscribePulseRequest, SubscribePulseResponse, UnsubscribePulseRequest,
-    UnsubscribePulseResponse, WorkRole,
+    UnsubscribePulseResponse, WorkRole, WorkStatusRequest, WorkStatusResponse,
 };
 use super::pulse_acl::{
     AclDecision, AclError, PulseAclEvaluator, validate_client_sub_id, validate_subscription_id,
@@ -1836,6 +1836,8 @@ pub enum PrivilegedMessageType {
     ConsensusByzantineEvidence = 13,
     /// `ConsensusMetrics` request (IPC-PRIV-014)
     ConsensusMetrics    = 14,
+    /// `WorkStatus` request (IPC-PRIV-015, TCK-00344)
+    WorkStatus          = 15,
     // --- HEF Pulse Plane (CTR-PROTO-010, RFC-0018) ---
     /// `SubscribePulse` request (IPC-HEF-001)
     SubscribePulse      = 64,
@@ -1866,6 +1868,8 @@ impl PrivilegedMessageType {
             12 => Some(Self::ConsensusValidators),
             13 => Some(Self::ConsensusByzantineEvidence),
             14 => Some(Self::ConsensusMetrics),
+            // TCK-00344: Work status query
+            15 => Some(Self::WorkStatus),
             // HEF tags (64-68)
             64 => Some(Self::SubscribePulse),
             66 => Some(Self::UnsubscribePulse),
@@ -1911,6 +1915,8 @@ pub enum PrivilegedResponse {
     RestartProcess(RestartProcessResponse),
     /// Successful `ReloadProcess` response.
     ReloadProcess(ReloadProcessResponse),
+    /// Successful `WorkStatus` response (TCK-00344).
+    WorkStatus(WorkStatusResponse),
     /// Successful `SubscribePulse` response (TCK-00302).
     SubscribePulse(SubscribePulseResponse),
     /// Successful `UnsubscribePulse` response (TCK-00302).
@@ -1997,6 +2003,10 @@ impl PrivilegedResponse {
             },
             Self::ReloadProcess(resp) => {
                 buf.push(PrivilegedMessageType::ReloadProcess.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::WorkStatus(resp) => {
+                buf.push(PrivilegedMessageType::WorkStatus.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::SubscribePulse(resp) => {
@@ -2958,6 +2968,8 @@ impl PrivilegedDispatcher {
                 self.handle_consensus_byzantine_evidence(payload)
             },
             PrivilegedMessageType::ConsensusMetrics => self.handle_consensus_metrics(payload),
+            // TCK-00344: Work status query
+            PrivilegedMessageType::WorkStatus => self.handle_work_status(payload, ctx),
             // HEF Pulse Plane (TCK-00302): Operator subscription handlers
             PrivilegedMessageType::SubscribePulse => self.handle_subscribe_pulse(payload, ctx),
             PrivilegedMessageType::UnsubscribePulse => self.handle_unsubscribe_pulse(payload, ctx),
@@ -2987,6 +2999,8 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::ConsensusValidators => "ConsensusValidators",
                 PrivilegedMessageType::ConsensusByzantineEvidence => "ConsensusByzantineEvidence",
                 PrivilegedMessageType::ConsensusMetrics => "ConsensusMetrics",
+                // TCK-00344
+                PrivilegedMessageType::WorkStatus => "WorkStatus",
                 // HEF Pulse Plane (TCK-00300)
                 PrivilegedMessageType::SubscribePulse => "SubscribePulse",
                 PrivilegedMessageType::UnsubscribePulse => "UnsubscribePulse",
@@ -4019,6 +4033,105 @@ impl PrivilegedDispatcher {
         Ok(PrivilegedResponse::Shutdown(ShutdownResponse {
             message: "Shutdown acknowledged (stub)".to_string(),
         }))
+    }
+
+    /// Handles `WorkStatus` requests (IPC-PRIV-005, TCK-00344).
+    ///
+    /// Queries the status of a work item from the session registry.
+    ///
+    /// # Returns
+    ///
+    /// - Work status if found in session registry
+    /// - `WORK_NOT_FOUND` error if work ID is not found
+    fn handle_work_status(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request =
+            WorkStatusRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid WorkStatusRequest: {e}"),
+                }
+            })?;
+
+        // CTR-1603: Validate work_id length to prevent DoS
+        if request.work_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "work_id exceeds maximum length of {} bytes",
+                    MAX_ID_LENGTH
+                ),
+            ));
+        }
+
+        if request.work_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "work_id cannot be empty",
+            ));
+        }
+
+        debug!(work_id = %request.work_id, "Processing WorkStatus request");
+
+        // Query session registry for work status
+        // Note: We search through sessions to find work associated with this work_id
+        // This is a basic implementation; a dedicated work registry would be more efficient
+        let session_state = self.find_session_by_work_id(&request.work_id);
+
+        match session_state {
+            Some(session) => {
+                // Work found via session
+                let response = WorkStatusResponse {
+                    work_id: request.work_id,
+                    status: "SPAWNED".to_string(),
+                    actor_id: None, // Not tracked in session
+                    role: Some(session.role),
+                    session_id: Some(session.session_id),
+                    lease_id: None, // Lease is redacted in SessionState
+                    created_at_ns: 0, // Not tracked
+                    claimed_at_ns: None,
+                };
+                Ok(PrivilegedResponse::WorkStatus(response))
+            },
+            None => {
+                // Check work claims for claimed but not yet spawned work
+                if let Some(claim) = self.work_registry.get_claim(&request.work_id) {
+                    let response = WorkStatusResponse {
+                        work_id: request.work_id,
+                        status: "CLAIMED".to_string(),
+                        actor_id: Some(claim.actor_id.clone()),
+                        role: Some(claim.role.into()),
+                        session_id: None,
+                        lease_id: Some(claim.lease_id.clone()),
+                        created_at_ns: 0,
+                        claimed_at_ns: None, // WorkClaim doesn't track timestamp
+                    };
+                    Ok(PrivilegedResponse::WorkStatus(response))
+                } else {
+                    Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::WorkNotFound,
+                        format!("work item not found: {}", request.work_id),
+                    ))
+                }
+            },
+        }
+    }
+
+    /// Finds a session by work_id.
+    fn find_session_by_work_id(&self, _work_id: &str) -> Option<SessionState> {
+        // Note: This is an O(n) scan which is inefficient for large registries.
+        // A production implementation would add an index by work_id to SessionRegistry.
+        // For now, we check if there's a session that matches the work_id
+        // by looking at all active sessions.
+        //
+        // Since SessionRegistry trait doesn't expose iteration, and this is a
+        // status query (not performance critical), we return None and rely on
+        // the work claims registry instead.
+        //
+        // TODO(TCK-00344): Add `get_session_by_work_id` to SessionRegistry trait
+        None
     }
 
     // ========================================================================
@@ -5106,6 +5219,14 @@ pub fn encode_consensus_byzantine_evidence_request(
 #[must_use]
 pub fn encode_consensus_metrics_request(request: &ConsensusMetricsRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::ConsensusMetrics.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `WorkStatus` request to bytes for sending (TCK-00344).
+#[must_use]
+pub fn encode_work_status_request(request: &WorkStatusRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::WorkStatus.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }
