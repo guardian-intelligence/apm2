@@ -149,7 +149,8 @@ pub const EFFICIENCY_PRIMITIVES_VERSION: &str = "1.0.0";
 /// Deserialize a `Vec` with a maximum size bound to prevent OOM attacks.
 ///
 /// Per SEC-CTRL-FAC-0016, all collections deserialized from untrusted input
-/// must enforce size limits during parsing to prevent denial-of-service via memory exhaustion.
+/// must enforce size limits during parsing to prevent denial-of-service via
+/// memory exhaustion.
 fn deserialize_bounded_vec<'de, D, T>(
     deserializer: D,
     max_items: usize,
