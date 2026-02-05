@@ -30,12 +30,16 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use apm2_core::credentials::{
+    AuthMethod, CredentialProfile as CoreCredentialProfile, CredentialStore, ProfileId, Provider,
+};
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
 use apm2_core::fac::REVIEW_RECEIPT_RECORDED_PREFIX;
 use apm2_core::process::ProcessState;
 use bytes::Bytes;
 use prost::Message;
+use secrecy::SecretString;
 use subtle::ConstantTimeEq;
 use tracing::{debug, info, warn};
 
@@ -46,10 +50,11 @@ use super::messages::{
     ClaimWorkResponse, ConsensusByzantineEvidenceRequest, ConsensusByzantineEvidenceResponse,
     ConsensusErrorCode, ConsensusMetricsRequest, ConsensusMetricsResponse,
     ConsensusStatusRequest, ConsensusStatusResponse, ConsensusValidatorsRequest,
-    ConsensusValidatorsResponse, DecodeConfig, IssueCapabilityRequest, IssueCapabilityResponse,
-    ListCredentialsRequest, ListCredentialsResponse, ListProcessesRequest, ListProcessesResponse,
-    LoginCredentialRequest, LoginCredentialResponse, PatternRejection, PrivilegedError,
-    PrivilegedErrorCode, ProcessInfo, ProcessStateEnum, ProcessStatusRequest,
+    ConsensusValidatorsResponse, CredentialAuthMethod as ProtoAuthMethod,
+    CredentialProvider as ProtoProvider, DecodeConfig, IssueCapabilityRequest,
+    IssueCapabilityResponse, ListCredentialsRequest, ListCredentialsResponse, ListProcessesRequest,
+    ListProcessesResponse, LoginCredentialRequest, LoginCredentialResponse, PatternRejection,
+    PrivilegedError, PrivilegedErrorCode, ProcessInfo, ProcessStateEnum, ProcessStatusRequest,
     ProcessStatusResponse, RefreshCredentialRequest, RefreshCredentialResponse,
     ReloadProcessRequest, ReloadProcessResponse, RemoveCredentialRequest, RemoveCredentialResponse,
     RestartProcessRequest, RestartProcessResponse, ShutdownRequest, ShutdownResponse,
@@ -2482,6 +2487,16 @@ pub struct PrivilegedDispatcher {
     /// complete. For now, presence/absence controls whether the subsystem
     /// is considered "configured".
     consensus_state: Option<()>,
+
+    /// Credential store for secure credential persistence (TCK-00343).
+    ///
+    /// When present, credential management handlers (`ListCredentials`,
+    /// `AddCredential`, `RemoveCredential`, `RefreshCredential`,
+    /// `SwitchCredential`, `LoginCredential`) persist credentials to the
+    /// `CredentialStore` backed by the OS keyring. When `None`, handlers
+    /// return error responses indicating the credential store is not
+    /// configured.
+    credential_store: Option<Arc<CredentialStore>>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -2553,6 +2568,7 @@ impl PrivilegedDispatcher {
             // TCK-00345: Consensus state not configured in test mode
             node_id: "test-node".to_string(),
             consensus_state: None,
+            credential_store: None,
         }
     }
 
@@ -2607,6 +2623,7 @@ impl PrivilegedDispatcher {
             // TCK-00345: Consensus state not configured in test mode
             node_id: "test-node".to_string(),
             consensus_state: None,
+            credential_store: None,
         }
     }
 
@@ -2680,6 +2697,7 @@ impl PrivilegedDispatcher {
             // TCK-00345: Consensus state not configured by default
             node_id: "node-001".to_string(),
             consensus_state: None,
+            credential_store: None,
         }
     }
 
@@ -2730,6 +2748,7 @@ impl PrivilegedDispatcher {
             // TCK-00345: Consensus state not configured by default
             node_id: "node-001".to_string(),
             consensus_state: None,
+            credential_store: None,
         }
     }
 
@@ -2742,6 +2761,19 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn with_daemon_state(mut self, state: SharedState) -> Self {
         self.daemon_state = Some(state);
+        self
+    }
+
+    /// Sets the credential store for credential management (TCK-00343).
+    ///
+    /// When set, credential management handlers (`ListCredentials`,
+    /// `AddCredential`, `RemoveCredential`, `RefreshCredential`,
+    /// `SwitchCredential`) persist credentials via the `CredentialStore`
+    /// backed by the OS keyring. When not set, handlers return error
+    /// responses indicating the credential store is not configured.
+    #[must_use]
+    pub fn with_credential_store(mut self, store: Arc<CredentialStore>) -> Self {
+        self.credential_store = Some(store);
         self
     }
 
@@ -4679,6 +4711,96 @@ impl PrivilegedDispatcher {
     // Credential Management Handlers (CTR-PROTO-011, TCK-00343)
     // =========================================================================
 
+    /// Converts a protobuf `CredentialProvider` enum to a core `Provider`.
+    fn proto_provider_to_core(proto: i32) -> Provider {
+        match ProtoProvider::try_from(proto) {
+            Ok(ProtoProvider::Anthropic) => Provider::Claude,
+            Ok(ProtoProvider::Openai) => Provider::OpenAI,
+            // Github, ApiKey, Unspecified, and unknown values all map to Custom
+            _ => Provider::Custom,
+        }
+    }
+
+    /// Converts a core `Provider` to a protobuf `CredentialProvider` enum.
+    const fn core_provider_to_proto(provider: Provider) -> i32 {
+        match provider {
+            Provider::Claude => ProtoProvider::Anthropic as i32,
+            Provider::OpenAI => ProtoProvider::Openai as i32,
+            // Gemini and Custom both map to the generic ApiKey provider
+            Provider::Gemini | Provider::Custom => ProtoProvider::ApiKey as i32,
+        }
+    }
+
+    /// Converts a protobuf auth method enum value and secret bytes into a core
+    /// `AuthMethod`.
+    fn proto_auth_to_core(auth_method: i32, secret: &[u8]) -> AuthMethod {
+        let secret_str = String::from_utf8_lossy(secret).to_string();
+        match ProtoAuthMethod::try_from(auth_method) {
+            Ok(ProtoAuthMethod::Oauth) => AuthMethod::OAuth {
+                access_token: SecretString::from(secret_str),
+                refresh_token: None,
+                expires_at: None,
+                scopes: vec![],
+            },
+            Ok(ProtoAuthMethod::Ssh) => AuthMethod::SessionToken {
+                token: SecretString::from(secret_str),
+                cookie_jar: None,
+                expires_at: None,
+            },
+            // Pat, ApiKey, Unspecified, and unknown values all map to ApiKey
+            _ => AuthMethod::ApiKey {
+                key: SecretString::from(secret_str),
+            },
+        }
+    }
+
+    /// Converts a core `AuthMethod` to a protobuf auth method enum value.
+    const fn core_auth_method_to_proto(auth: &AuthMethod) -> i32 {
+        match auth {
+            AuthMethod::OAuth { .. } => ProtoAuthMethod::Oauth as i32,
+            AuthMethod::ApiKey { .. } => ProtoAuthMethod::ApiKey as i32,
+            AuthMethod::SessionToken { .. } => ProtoAuthMethod::Pat as i32,
+        }
+    }
+
+    /// Converts a core `CredentialProfile` to a protobuf `CredentialProfile`
+    /// message (without secrets).
+    fn core_profile_to_proto(
+        profile: &CoreCredentialProfile,
+        display_name: &str,
+    ) -> super::messages::CredentialProfile {
+        let expires_at = match &profile.auth {
+            AuthMethod::OAuth { expires_at, .. } | AuthMethod::SessionToken { expires_at, .. } => {
+                expires_at
+                    .map(|dt| dt.timestamp().try_into().unwrap_or(0u64))
+                    .unwrap_or(0)
+            },
+            AuthMethod::ApiKey { .. } => 0,
+        };
+
+        super::messages::CredentialProfile {
+            profile_id: profile.id.as_str().to_string(),
+            provider: Self::core_provider_to_proto(profile.provider),
+            auth_method: Self::core_auth_method_to_proto(&profile.auth),
+            created_at: profile.created_at.timestamp().try_into().unwrap_or(0u64),
+            expires_at,
+            is_active: !profile.is_expired(),
+            display_name: display_name.to_string(),
+        }
+    }
+
+    /// Returns a reference to the credential store, or an error response if
+    /// the store is not configured.
+    #[allow(clippy::result_large_err)] // Error variant is PrivilegedResponse, matching dispatch pattern
+    fn require_credential_store(&self) -> Result<&CredentialStore, PrivilegedResponse> {
+        self.credential_store.as_deref().ok_or_else(|| {
+            PrivilegedResponse::error(
+                PrivilegedErrorCode::CredentialInvalidConfig,
+                "credential store not configured on daemon",
+            )
+        })
+    }
+
     /// Handles `ListCredentials` requests (IPC-PRIV-021).
     ///
     /// Lists all credential profiles. Secrets are never included in responses.
@@ -4687,19 +4809,59 @@ impl PrivilegedDispatcher {
         payload: &[u8],
         _ctx: &ConnectionContext,
     ) -> ProtocolResult<PrivilegedResponse> {
-        let _request = ListCredentialsRequest::decode_bounded(payload, &self.decode_config)
+        let request = ListCredentialsRequest::decode_bounded(payload, &self.decode_config)
             .map_err(|e| ProtocolError::Serialization {
                 reason: format!("invalid ListCredentialsRequest: {e}"),
             })?;
 
-        // TODO(TCK-00343): Wire to actual credential storage
-        // For now, return empty list to enable protocol path testing
-        debug!("ListCredentials handler invoked (stub returning empty list)");
+        debug!("ListCredentials handler invoked");
+
+        let store = match self.require_credential_store() {
+            Ok(s) => s,
+            Err(resp) => return Ok(resp),
+        };
+
+        let profile_ids = match store.list() {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!(error = %e, "failed to list credential profiles");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CredentialInvalidConfig,
+                    format!("failed to list credentials: {e}"),
+                ));
+            },
+        };
+
+        let mut profiles = Vec::new();
+        for pid in &profile_ids {
+            match store.get(pid) {
+                Ok(profile) => {
+                    // Apply provider filter if specified
+                    if let Some(filter) = request.provider_filter {
+                        let profile_provider = Self::core_provider_to_proto(profile.provider);
+                        if profile_provider != filter {
+                            continue;
+                        }
+                    }
+                    let display_name = profile.label.clone().unwrap_or_default();
+                    profiles.push(Self::core_profile_to_proto(&profile, &display_name));
+                },
+                Err(e) => {
+                    debug!(
+                        profile_id = %pid,
+                        error = %e,
+                        "skipping profile that could not be loaded"
+                    );
+                },
+            }
+        }
+
+        let total_count: u32 = profiles.len().try_into().unwrap_or(u32::MAX);
 
         Ok(PrivilegedResponse::ListCredentials(
             ListCredentialsResponse {
-                profiles: vec![],
-                total_count: 0,
+                profiles,
+                total_count,
             },
         ))
     }
@@ -4737,26 +4899,47 @@ impl PrivilegedDispatcher {
             profile_id = %request.profile_id,
             provider = request.provider,
             auth_method = request.auth_method,
-            "AddCredential handler invoked (stub)"
+            "AddCredential handler invoked"
         );
 
-        // TODO(TCK-00343): Wire to actual credential storage via keychain.rs
-        // For now, return success with profile metadata
-        let profile = super::messages::CredentialProfile {
-            profile_id: request.profile_id,
-            provider: request.provider,
-            auth_method: request.auth_method,
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            expires_at: request.expires_at,
-            is_active: true,
-            display_name: request.display_name,
+        let store = match self.require_credential_store() {
+            Ok(s) => s,
+            Err(resp) => return Ok(resp),
         };
 
+        // Convert protobuf types to core types
+        let provider = Self::proto_provider_to_core(request.provider);
+        let auth = Self::proto_auth_to_core(request.auth_method, &request.credential_secret);
+        let profile_id = ProfileId::new(&request.profile_id);
+
+        // Build the core credential profile
+        let mut core_profile = CoreCredentialProfile::new(profile_id, provider, auth);
+        if !request.display_name.is_empty() {
+            core_profile = core_profile.with_label(&request.display_name);
+        }
+
+        // Store the credential
+        if let Err(e) = store.store(core_profile.clone()) {
+            warn!(
+                profile_id = %request.profile_id,
+                error = %e,
+                "failed to store credential"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CredentialInvalidConfig,
+                format!("failed to store credential: {e}"),
+            ));
+        }
+
+        info!(
+            profile_id = %request.profile_id,
+            "credential profile stored successfully"
+        );
+
+        let proto_profile = Self::core_profile_to_proto(&core_profile, &request.display_name);
+
         Ok(PrivilegedResponse::AddCredential(AddCredentialResponse {
-            profile: Some(profile),
+            profile: Some(proto_profile),
         }))
     }
 
@@ -4775,19 +4958,66 @@ impl PrivilegedDispatcher {
 
         debug!(
             profile_id = %request.profile_id,
-            "RemoveCredential handler invoked (stub)"
+            "RemoveCredential handler invoked"
         );
 
-        // TODO(TCK-00343): Wire to actual credential storage via keychain.rs
-        // For now, return success
-        Ok(PrivilegedResponse::RemoveCredential(
-            RemoveCredentialResponse { removed: true },
-        ))
+        let store = match self.require_credential_store() {
+            Ok(s) => s,
+            Err(resp) => return Ok(resp),
+        };
+
+        let profile_id = ProfileId::new(&request.profile_id);
+
+        // Check if profile exists before removal
+        let exists = match store.exists(&profile_id) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(
+                    profile_id = %request.profile_id,
+                    error = %e,
+                    "failed to check credential existence"
+                );
+                return Ok(PrivilegedResponse::RemoveCredential(
+                    RemoveCredentialResponse { removed: false },
+                ));
+            },
+        };
+
+        if !exists {
+            return Ok(PrivilegedResponse::RemoveCredential(
+                RemoveCredentialResponse { removed: false },
+            ));
+        }
+
+        match store.remove(&profile_id) {
+            Ok(()) => {
+                info!(
+                    profile_id = %request.profile_id,
+                    "credential profile removed successfully"
+                );
+                Ok(PrivilegedResponse::RemoveCredential(
+                    RemoveCredentialResponse { removed: true },
+                ))
+            },
+            Err(e) => {
+                warn!(
+                    profile_id = %request.profile_id,
+                    error = %e,
+                    "failed to remove credential"
+                );
+                Ok(PrivilegedResponse::RemoveCredential(
+                    RemoveCredentialResponse { removed: false },
+                ))
+            },
+        }
     }
 
     /// Handles `RefreshCredential` requests (IPC-PRIV-024).
     ///
     /// Refreshes an OAuth credential by requesting a new token.
+    /// Note: Automated OAuth refresh requires an external token endpoint,
+    /// which is out of scope for TCK-00343. This handler verifies the
+    /// profile exists in the store and returns an appropriate error.
     fn handle_refresh_credential(
         &self,
         payload: &[u8],
@@ -4800,20 +5030,51 @@ impl PrivilegedDispatcher {
 
         debug!(
             profile_id = %request.profile_id,
-            "RefreshCredential handler invoked (stub)"
+            "RefreshCredential handler invoked"
         );
 
-        // TODO(TCK-00343): Wire to actual OAuth refresh via keychain.rs
-        // For now, return error indicating refresh not yet implemented
-        Ok(PrivilegedResponse::error(
-            PrivilegedErrorCode::CredentialRefreshNotSupported,
-            "credential refresh not yet implemented",
-        ))
+        let store = match self.require_credential_store() {
+            Ok(s) => s,
+            Err(resp) => return Ok(resp),
+        };
+
+        let profile_id = ProfileId::new(&request.profile_id);
+
+        // Verify the profile exists before attempting refresh
+        match store.get(&profile_id) {
+            Ok(profile) => {
+                // Check that the credential is an OAuth type (only OAuth supports
+                // refresh)
+                if !matches!(profile.auth, AuthMethod::OAuth { .. }) {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CredentialRefreshNotSupported,
+                        format!(
+                            "profile '{}' uses {} auth, which does not support refresh",
+                            request.profile_id,
+                            profile.auth.method_type()
+                        ),
+                    ));
+                }
+
+                // OAuth token refresh requires an external token endpoint, which
+                // is out of scope for TCK-00343. Return an informative error.
+                Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CredentialRefreshNotSupported,
+                    "OAuth token refresh requires an external token endpoint (not yet implemented)",
+                ))
+            },
+            Err(e) => Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CredentialInvalidConfig,
+                format!("credential profile not found: {e}"),
+            )),
+        }
     }
 
     /// Handles `SwitchCredential` requests (IPC-PRIV-025).
     ///
-    /// Switches the active credential for a process.
+    /// Switches the active credential for a process. Validates that the
+    /// target profile exists in the credential store before reporting
+    /// success.
     fn handle_switch_credential(
         &self,
         payload: &[u8],
@@ -4827,22 +5088,65 @@ impl PrivilegedDispatcher {
         debug!(
             process_name = %request.process_name,
             profile_id = %request.profile_id,
-            "SwitchCredential handler invoked (stub)"
+            "SwitchCredential handler invoked"
         );
 
-        // TODO(TCK-00343): Wire to actual credential switching
-        // For now, return success
-        Ok(PrivilegedResponse::SwitchCredential(
-            SwitchCredentialResponse {
-                previous_profile_id: String::new(),
-                success: true,
+        let store = match self.require_credential_store() {
+            Ok(s) => s,
+            Err(resp) => return Ok(resp),
+        };
+
+        let profile_id = ProfileId::new(&request.profile_id);
+
+        // Verify the target profile exists before switching
+        match store.exists(&profile_id) {
+            Ok(true) => {
+                info!(
+                    process_name = %request.process_name,
+                    profile_id = %request.profile_id,
+                    "credential switch validated"
+                );
+
+                // Note: Actual process credential binding is managed at the
+                // process supervision layer. This handler validates that the
+                // target profile exists. The previous_profile_id is empty
+                // because per-process credential binding tracking is managed
+                // by the supervisor (TCK-FUTURE).
+                Ok(PrivilegedResponse::SwitchCredential(
+                    SwitchCredentialResponse {
+                        previous_profile_id: String::new(),
+                        success: true,
+                    },
+                ))
             },
-        ))
+            Ok(false) => Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CredentialInvalidConfig,
+                format!("credential profile not found: {}", request.profile_id),
+            )),
+            Err(e) => {
+                warn!(
+                    profile_id = %request.profile_id,
+                    error = %e,
+                    "failed to check credential existence"
+                );
+                Ok(PrivilegedResponse::SwitchCredential(
+                    SwitchCredentialResponse {
+                        previous_profile_id: String::new(),
+                        success: false,
+                    },
+                ))
+            },
+        }
     }
 
     /// Handles `LoginCredential` requests (IPC-PRIV-026).
     ///
-    /// Initiates an interactive login for a provider.
+    /// Initiates an interactive login for a provider. For OAuth flows, this
+    /// would generate an authorization URL. For API key flows, the key is
+    /// provided directly in a subsequent `AddCredential` call.
+    ///
+    /// Note: Full interactive OAuth flow is out of scope for TCK-00343.
+    /// This handler returns a stub response indicating the flow type.
     fn handle_login_credential(
         &self,
         payload: &[u8],
@@ -4856,11 +5160,12 @@ impl PrivilegedDispatcher {
         debug!(
             provider = request.provider,
             profile_id = ?request.profile_id,
-            "LoginCredential handler invoked (stub)"
+            "LoginCredential handler invoked"
         );
 
-        // TODO(TCK-00343): Wire to actual OAuth flow
-        // For now, return a stub response indicating login not yet implemented
+        // LoginCredential is an interactive flow that requires browser-based
+        // OAuth or terminal prompts. For TCK-00343, the credential store is
+        // wired but interactive login flows remain as future work.
         let profile_id = request
             .profile_id
             .unwrap_or_else(|| format!("auto-{}", uuid::Uuid::new_v4()));
@@ -4868,7 +5173,7 @@ impl PrivilegedDispatcher {
         let profile = super::messages::CredentialProfile {
             profile_id,
             provider: request.provider,
-            auth_method: super::messages::CredentialAuthMethod::Oauth.into(),
+            auth_method: ProtoAuthMethod::Oauth as i32,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
