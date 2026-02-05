@@ -534,11 +534,11 @@ fn run_coordinate_inner(
         )));
     }
 
-    // Determine workspace root (default to current directory)
-    let workspace_root = args.workspace_root.clone().unwrap_or_else(|| {
-        std::env::current_dir()
-            .map_or_else(|_| ".".to_string(), |p| p.to_string_lossy().to_string())
-    });
+    // Determine and validate workspace root (default to current directory).
+    // Security: canonicalize to resolve symlinks and relative paths, then
+    // verify it is an absolute path that exists and is not a sensitive
+    // system directory.
+    let workspace_root = validate_workspace_root(args.workspace_root.as_deref())?;
 
     // Create budget
     let budget = CoordinationBudget::new(
@@ -693,6 +693,30 @@ const SESSION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// Maximum time to wait for session termination before treating as failure.
 const SESSION_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Conservative token estimation rate: tokens per second of wall-clock time.
+///
+/// When the daemon does not report actual token consumption, we estimate
+/// conservatively based on elapsed wall time. This rate (10 tokens/sec)
+/// is deliberately over-estimated to ensure budget enforcement errs on the
+/// side of caution. A real session may consume fewer tokens, but we must
+/// never report zero (which would bypass budget limits entirely).
+const CONSERVATIVE_TOKENS_PER_SECOND: u64 = 10;
+
+/// Minimum token cost per session, regardless of elapsed time.
+///
+/// Even if a session terminates almost instantly, we charge at least this
+/// many tokens to prevent zero-cost exploitation of budget limits.
+const MIN_TOKENS_PER_SESSION: u64 = 100;
+
+/// Sensitive system directories that must not be used as workspace roots.
+///
+/// These paths are blocked to prevent accidental or malicious operations
+/// against critical system directories.
+const BLOCKED_WORKSPACE_ROOTS: &[&str] = &[
+    "/", "/etc", "/usr", "/bin", "/sbin", "/boot", "/dev", "/proc", "/sys", "/var", "/lib",
+    "/lib64", "/root",
+];
+
 /// Runs the coordination loop with daemon integration.
 ///
 /// # TCK-00346: This is the core daemon integration logic.
@@ -829,7 +853,9 @@ async fn run_coordination_loop(
                 if !quiet {
                     eprintln!("Episode spawn failed: {e}");
                 }
-                (SessionOutcome::Failure, 0u64)
+                // Spawn itself failed - charge minimum tokens to prevent
+                // zero-cost budget bypass from repeated spawn failures.
+                (SessionOutcome::Failure, MIN_TOKENS_PER_SESSION)
             },
         };
 
@@ -861,14 +887,24 @@ async fn run_coordination_loop(
 
 /// Observes session termination by polling via the session socket.
 ///
-/// Attempts to connect to the session socket and emit a status-check event.
-/// If the session socket is available, polls until the session terminates or
-/// the observation timeout is reached. Returns the observed outcome and
-/// actual token consumption.
+/// **Security: Fail-Closed Design**
 ///
-/// If the session socket is unavailable (daemon doesn't expose it yet),
-/// falls back to recording the session as completed with 0 tokens consumed
-/// (honest reporting of unknown consumption, not a fabricated value).
+/// This function follows fail-closed principles throughout:
+/// - If the session socket is unavailable, the session is recorded as FAILED
+///   (we cannot verify outcome, so we assume failure).
+/// - If the session becomes unreachable (heartbeat rejected), the session is
+///   recorded as FAILED (unexpected disconnection is not a clean completion).
+/// - If observation times out, the session is recorded as FAILED.
+/// - Only an explicit clean-completion signal from the daemon would warrant
+///   recording SUCCESS. Since the daemon does not yet provide such a signal,
+///   all termination paths currently record FAILURE.
+///
+/// **Token Estimation**
+///
+/// Since the daemon does not yet report actual token consumption, we use a
+/// conservative wall-time-based estimate: `max(elapsed_secs * RATE,
+/// MIN_TOKENS_PER_SESSION)`. This ensures budget tracking never reports zero
+/// tokens (which would bypass budget limits).
 async fn observe_session_termination(
     session_socket: &Path,
     session_token: &str,
@@ -878,6 +914,8 @@ async fn observe_session_termination(
 ) -> (SessionOutcome, u64) {
     use crate::client::protocol::SessionClient;
 
+    let observation_start = std::time::Instant::now();
+
     // Attempt to connect to session socket for observation
     let session_client = SessionClient::connect(session_socket).await;
 
@@ -885,10 +923,15 @@ async fn observe_session_termination(
         Ok(mut client) => {
             // Poll for session termination by emitting heartbeat events.
             // The daemon returns errors once the session has terminated,
-            // which we use as a signal that the session is complete.
-            let start = std::time::Instant::now();
+            // which we use as a signal that the session is no longer active.
+            //
+            // SECURITY: A heartbeat rejection means the session became
+            // unreachable. This could be a clean exit, a crash, or an OOM
+            // kill. Without an explicit success signal from the daemon, we
+            // MUST treat this as failure (fail-closed).
+            let mut clean_exit = false;
 
-            while start.elapsed() < SESSION_OBSERVATION_TIMEOUT {
+            while observation_start.elapsed() < SESSION_OBSERVATION_TIMEOUT {
                 tokio::time::sleep(SESSION_POLL_INTERVAL).await;
 
                 // Emit a coordination heartbeat event to check session liveness.
@@ -909,52 +952,76 @@ async fn observe_session_termination(
                         if !quiet {
                             eprintln!(
                                 "Session {session_id} still active ({:.1}s elapsed)",
-                                start.elapsed().as_secs_f64()
+                                observation_start.elapsed().as_secs_f64()
                             );
                         }
                     },
                     Err(_e) => {
-                        // Session has terminated (daemon rejected the event).
-                        // The session completed normally since we had a
-                        // successful connection to the session socket.
+                        // Session became unreachable (daemon rejected heartbeat).
+                        // This could be clean exit, crash, or OOM kill.
+                        // FAIL-CLOSED: Without an explicit success signal from
+                        // the daemon, we record as Failure. Only a future
+                        // daemon API providing a "session completed successfully"
+                        // status query would justify recording Success here.
                         if !quiet {
                             eprintln!(
-                                "Session {session_id} terminated ({:.1}s elapsed)",
-                                start.elapsed().as_secs_f64()
+                                "Session {session_id} became unreachable ({:.1}s elapsed); \
+                                 recording as FAILURE (no explicit success signal)",
+                                observation_start.elapsed().as_secs_f64()
                             );
                         }
-                        // Token consumption is 0 because the daemon does not yet
-                        // report actual token usage in the session termination
-                        // signal. This is honest reporting; we record what we
-                        // can observe.
-                        return (SessionOutcome::Success, 0);
+                        clean_exit = false;
+                        break;
                     },
                 }
             }
 
-            // Observation timeout reached: session did not terminate within budget
-            if !quiet {
-                eprintln!(
-                    "Session {session_id} observation timed out after {}s",
-                    SESSION_OBSERVATION_TIMEOUT.as_secs()
-                );
+            // Compute conservative token estimate based on observation duration
+            let estimated_tokens =
+                estimate_token_consumption(observation_start.elapsed().as_secs());
+
+            if clean_exit {
+                // Reserved for future: explicit daemon success signal path
+                (SessionOutcome::Success, estimated_tokens)
+            } else {
+                // FAIL-CLOSED: timeout or unexpected disconnect -> Failure
+                if !quiet && observation_start.elapsed() >= SESSION_OBSERVATION_TIMEOUT {
+                    eprintln!(
+                        "Session {session_id} observation timed out after {}s; \
+                         recording as FAILURE",
+                        SESSION_OBSERVATION_TIMEOUT.as_secs()
+                    );
+                }
+                (SessionOutcome::Failure, estimated_tokens)
             }
-            (SessionOutcome::Failure, 0)
         },
         Err(_e) => {
-            // Session socket unavailable. This can happen if the daemon
-            // doesn't expose the session socket or the path is wrong.
-            // Record as Success with 0 tokens consumed (honest: we spawned
-            // the session but cannot observe its completion).
+            // FAIL-CLOSED: Session socket unavailable means we cannot observe
+            // the session outcome. We must assume failure because we have no
+            // evidence of success. Recording Success here would be fail-open.
             if !quiet {
                 eprintln!(
                     "Session socket unavailable; recording session \
-                     {session_id} as spawned with 0 observed tokens"
+                     {session_id} as FAILURE (cannot observe outcome)"
                 );
             }
-            (SessionOutcome::Success, 0)
+            // Use minimum token cost since we don't know how long the session
+            // ran, but must not report zero.
+            let estimated_tokens =
+                estimate_token_consumption(observation_start.elapsed().as_secs());
+            (SessionOutcome::Failure, estimated_tokens)
         },
     }
+}
+
+/// Estimates token consumption based on elapsed wall-clock seconds.
+///
+/// Uses a conservative rate to ensure budget tracking never underestimates.
+/// Returns at least [`MIN_TOKENS_PER_SESSION`] tokens regardless of duration,
+/// preventing zero-cost sessions that would bypass budget limits.
+fn estimate_token_consumption(elapsed_secs: u64) -> u64 {
+    let time_based = elapsed_secs.saturating_mul(CONSERVATIVE_TOKENS_PER_SECOND);
+    time_based.max(MIN_TOKENS_PER_SESSION)
 }
 
 /// Maps a protocol client error to a CLI error.
@@ -974,6 +1041,70 @@ fn map_protocol_error_to_cli(error: &ProtocolClientError) -> CoordinateCliError 
         },
         other => CoordinateCliError::DaemonError(format!("Protocol error: {other}")),
     }
+}
+
+/// Validates and canonicalizes the workspace root path.
+///
+/// # Security (SEC: `workspace_root` injection prevention)
+///
+/// This function ensures the workspace root is safe before passing it to the
+/// daemon:
+/// 1. **Canonicalization**: Resolves symlinks, `..`, and relative paths via
+///    `std::fs::canonicalize`. This prevents symlink-based escapes and path
+///    traversal.
+/// 2. **Absolute path check**: The canonicalized path must be absolute.
+/// 3. **Existence check**: The path must exist and be a directory.
+/// 4. **Sensitive directory blocklist**: Rejects paths that are sensitive
+///    system directories (e.g., `/`, `/etc`, `/usr`).
+///
+/// If `workspace_root` is `None`, defaults to the current working directory
+/// (also canonicalized and validated).
+fn validate_workspace_root(workspace_root: Option<&str>) -> Result<String, CoordinateCliError> {
+    let raw_path = match workspace_root {
+        Some(p) => std::path::PathBuf::from(p),
+        None => std::env::current_dir().map_err(|e| {
+            CoordinateCliError::InvalidArgs(format!(
+                "cannot determine current directory for workspace_root: {e}"
+            ))
+        })?,
+    };
+
+    // Canonicalize: resolves symlinks, "..", and relative components
+    let canonical = std::fs::canonicalize(&raw_path).map_err(|e| {
+        CoordinateCliError::InvalidArgs(format!(
+            "workspace_root '{}' cannot be resolved: {e}",
+            raw_path.display()
+        ))
+    })?;
+
+    // Must be absolute (canonicalize guarantees this, but verify defensively)
+    if !canonical.is_absolute() {
+        return Err(CoordinateCliError::InvalidArgs(format!(
+            "workspace_root '{}' is not an absolute path after canonicalization",
+            canonical.display()
+        )));
+    }
+
+    // Must be a directory
+    if !canonical.is_dir() {
+        return Err(CoordinateCliError::InvalidArgs(format!(
+            "workspace_root '{}' is not a directory",
+            canonical.display()
+        )));
+    }
+
+    // Check against sensitive system directory blocklist
+    let canonical_str = canonical.to_string_lossy();
+    for blocked in BLOCKED_WORKSPACE_ROOTS {
+        if canonical_str == *blocked {
+            return Err(CoordinateCliError::InvalidArgs(format!(
+                "workspace_root '{}' is a sensitive system directory and cannot be used",
+                canonical.display()
+            )));
+        }
+    }
+
+    Ok(canonical_str.into_owned())
 }
 
 /// Parses work IDs from command line arguments.
@@ -1998,5 +2129,141 @@ mod tests {
             restored.budget_ceiling.max_tokens,
             receipt.budget_ceiling.max_tokens
         );
+    }
+
+    // =========================================================================
+    // TCK-00346 Security Hardening Tests
+    // =========================================================================
+
+    /// TCK-00346: Token estimation never returns zero.
+    ///
+    /// BLOCKER 2 fix: Verify that `estimate_token_consumption` always returns
+    /// at least `MIN_TOKENS_PER_SESSION`, even for zero elapsed time.
+    #[test]
+    fn tck_00346_token_estimation_never_zero() {
+        // Zero seconds should return minimum
+        assert_eq!(estimate_token_consumption(0), MIN_TOKENS_PER_SESSION);
+        assert!(estimate_token_consumption(0) > 0);
+
+        // Short duration should return minimum
+        assert_eq!(estimate_token_consumption(1), MIN_TOKENS_PER_SESSION);
+
+        // Longer duration should be time-based (and > minimum)
+        let long_duration = estimate_token_consumption(60);
+        assert_eq!(long_duration, 60 * CONSERVATIVE_TOKENS_PER_SECOND);
+        assert!(long_duration > MIN_TOKENS_PER_SESSION);
+
+        // Very long duration should not overflow
+        let huge = estimate_token_consumption(u64::MAX);
+        assert!(huge > 0);
+    }
+
+    /// TCK-00346: Token estimation uses conservative rate.
+    ///
+    /// BLOCKER 2 fix: Verify the estimation constants are reasonable.
+    #[test]
+    fn tck_00346_token_estimation_constants() {
+        // Conservative rate must be positive
+        const { assert!(CONSERVATIVE_TOKENS_PER_SECOND > 0) };
+        // Minimum must be positive
+        const { assert!(MIN_TOKENS_PER_SESSION > 0) };
+        // Minimum should be at least a few seconds worth
+        const { assert!(MIN_TOKENS_PER_SESSION >= CONSERVATIVE_TOKENS_PER_SECOND) };
+    }
+
+    /// TCK-00346: Workspace root validation rejects sensitive paths.
+    ///
+    /// MAJOR fix: Verify that system-critical directories are blocked.
+    #[test]
+    fn tck_00346_workspace_root_rejects_root() {
+        let result = validate_workspace_root(Some("/"));
+        assert!(result.is_err());
+        if let Err(CoordinateCliError::InvalidArgs(msg)) = result {
+            assert!(
+                msg.contains("sensitive system directory"),
+                "Expected sensitive directory error, got: {msg}"
+            );
+        }
+    }
+
+    /// TCK-00346: Workspace root validation rejects /etc.
+    #[test]
+    fn tck_00346_workspace_root_rejects_etc() {
+        let result = validate_workspace_root(Some("/etc"));
+        assert!(result.is_err());
+        if let Err(CoordinateCliError::InvalidArgs(msg)) = result {
+            assert!(
+                msg.contains("sensitive system directory"),
+                "Expected sensitive directory error, got: {msg}"
+            );
+        }
+    }
+
+    /// TCK-00346: Workspace root validation rejects non-existent paths.
+    #[test]
+    fn tck_00346_workspace_root_rejects_nonexistent() {
+        let result = validate_workspace_root(Some("/nonexistent/path/that/does/not/exist"));
+        assert!(result.is_err());
+        if let Err(CoordinateCliError::InvalidArgs(msg)) = result {
+            assert!(
+                msg.contains("cannot be resolved"),
+                "Expected resolution error, got: {msg}"
+            );
+        }
+    }
+
+    /// TCK-00346: Workspace root validation accepts valid directories.
+    #[test]
+    fn tck_00346_workspace_root_accepts_valid() {
+        // /tmp should be a valid workspace root
+        let result = validate_workspace_root(Some("/tmp"));
+        assert!(result.is_ok(), "Expected /tmp to be valid: {result:?}");
+        let path = result.unwrap();
+        // Should be absolute and canonical
+        assert!(path.starts_with('/'));
+    }
+
+    /// TCK-00346: Workspace root defaults to cwd when None.
+    #[test]
+    fn tck_00346_workspace_root_defaults_to_cwd() {
+        let result = validate_workspace_root(None);
+        assert!(result.is_ok(), "Expected cwd to be valid: {result:?}");
+        let path = result.unwrap();
+        // Should be absolute
+        assert!(path.starts_with('/'));
+    }
+
+    /// TCK-00346: Workspace root rejects files (not directories).
+    #[test]
+    fn tck_00346_workspace_root_rejects_files() {
+        use std::io::Write;
+
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        write!(&temp_file, "not a directory").ok();
+
+        let result = validate_workspace_root(Some(temp_file.path().to_str().unwrap()));
+        assert!(result.is_err());
+        if let Err(CoordinateCliError::InvalidArgs(msg)) = result {
+            assert!(
+                msg.contains("not a directory"),
+                "Expected directory error, got: {msg}"
+            );
+        }
+    }
+
+    /// TCK-00346: Blocked workspace root list includes critical paths.
+    #[test]
+    fn tck_00346_blocked_workspace_roots_comprehensive() {
+        // Verify all expected paths are in the blocklist
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/etc"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/usr"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/bin"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/sbin"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/boot"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/dev"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/proc"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/sys"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/var"));
     }
 }
