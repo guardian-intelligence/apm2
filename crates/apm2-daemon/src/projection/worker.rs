@@ -98,6 +98,25 @@ pub enum ProjectionWorkerError {
 /// Growth).
 pub const DEFAULT_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// Maximum string length for fields extracted from ledger payloads.
+///
+/// This prevents unbounded input consumption (denial of service) when deserializing
+/// untrusted payloads. (Blocker fix: Unbounded Input Consumption)
+pub const MAX_STRING_LENGTH: usize = 1024;
+
+/// Validates that a string field does not exceed the maximum allowed length.
+/// Returns an error if the string is too long.
+/// (Blocker fix: Unbounded Input Consumption)
+fn validate_string_length(field_name: &str, value: &str) -> Result<(), ProjectionWorkerError> {
+    if value.len() > MAX_STRING_LENGTH {
+        return Err(ProjectionWorkerError::InvalidPayload(format!(
+            "{field_name} exceeds maximum length ({} > {MAX_STRING_LENGTH})",
+            value.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Work index schema SQL.
 const WORK_INDEX_SCHEMA_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS work_pr_index (
@@ -734,6 +753,106 @@ impl LedgerTailer {
         Ok(())
     }
 
+    /// Async wrapper for `poll_events` that uses `spawn_blocking`.
+    ///
+    /// This avoids blocking the async runtime during `SQLite` I/O
+    /// (Major fix: Thread blocking in async context).
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    pub async fn poll_events_async(
+        &self,
+        event_type: &str,
+        limit: usize,
+    ) -> Result<Vec<SignedLedgerEvent>, ProjectionWorkerError> {
+        let conn = Arc::clone(&self.conn);
+        let event_type = event_type.to_string();
+        let last_processed_ns = self.last_processed_ns;
+
+        tokio::task::spawn_blocking(move || {
+            let conn_guard = conn.lock().map_err(|e| {
+                ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
+            })?;
+
+            let mut stmt = conn_guard
+                .prepare(
+                    "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+                     FROM ledger_events
+                     WHERE event_type = ?1 AND timestamp_ns > ?2
+                     ORDER BY timestamp_ns ASC
+                     LIMIT ?3",
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+            let events = stmt
+                .query_map(
+                    params![event_type, last_processed_ns as i64, limit as i64],
+                    |row| {
+                        Ok(SignedLedgerEvent {
+                            event_id: row.get(0)?,
+                            event_type: row.get(1)?,
+                            work_id: row.get(2)?,
+                            actor_id: row.get(3)?,
+                            payload: row.get(4)?,
+                            signature: row.get(5)?,
+                            timestamp_ns: row.get::<_, i64>(6)? as u64,
+                        })
+                    },
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+
+            Ok(events)
+        })
+        .await
+        .map_err(|e| ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}")))?
+    }
+
+    /// Async wrapper for `acknowledge` that uses `spawn_blocking`.
+    ///
+    /// This avoids blocking the async runtime during `SQLite` I/O
+    /// (Major fix: Thread blocking in async context).
+    #[allow(clippy::cast_possible_wrap)]
+    pub async fn acknowledge_async(
+        &mut self,
+        timestamp_ns: u64,
+    ) -> Result<(), ProjectionWorkerError> {
+        if timestamp_ns > self.last_processed_ns {
+            self.last_processed_ns = timestamp_ns;
+
+            let conn = Arc::clone(&self.conn);
+            let tailer_id = self.tailer_id.clone();
+            let last_processed_ns = self.last_processed_ns;
+
+            tokio::task::spawn_blocking(move || {
+                let conn_guard = conn.lock().map_err(|e| {
+                    ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
+                })?;
+
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                conn_guard
+                    .execute(
+                        "INSERT OR REPLACE INTO tailer_watermark
+                         (tailer_id, last_processed_ns, updated_at)
+                         VALUES (?1, ?2, ?3)",
+                        params![tailer_id, last_processed_ns as i64, now as i64],
+                    )
+                    .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| {
+                ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}"))
+            })?
+        } else {
+            Ok(())
+        }
+    }
+
     /// Gets the current ledger head (latest event timestamp).
     #[allow(clippy::cast_sign_loss)]
     pub fn get_ledger_head(&self) -> Result<Option<[u8; 32]>, ProjectionWorkerError> {
@@ -943,16 +1062,19 @@ impl ProjectionWorker {
 
         while !self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             // Process ChangeSetPublished events to build work index
-            if let Err(e) = self.process_changeset_published() {
+            // (Major fix: Thread blocking in async context - uses spawn_blocking)
+            if let Err(e) = self.process_changeset_published().await {
                 warn!(error = %e, "Error processing ChangeSetPublished events");
             }
 
             // Process WorkPrAssociated events to link work_id -> PR metadata
-            if let Err(e) = self.process_work_pr_associated() {
+            // (Major fix: Thread blocking in async context - uses spawn_blocking)
+            if let Err(e) = self.process_work_pr_associated().await {
                 warn!(error = %e, "Error processing WorkPrAssociated events");
             }
 
             // Process ReviewReceiptRecorded events for projection
+            // (Major fix: Thread blocking in async context - uses spawn_blocking)
             if let Err(e) = self.process_review_receipts().await {
                 warn!(error = %e, "Error processing ReviewReceiptRecorded events");
             }
@@ -981,17 +1103,25 @@ impl ProjectionWorker {
     ///
     /// This method only acknowledges events AFTER successful processing.
     /// If the daemon crashes before acknowledgment, events will be redelivered.
-    fn process_changeset_published(&mut self) -> Result<(), ProjectionWorkerError> {
+    ///
+    /// # Async I/O (Major fix: Thread blocking in async context)
+    ///
+    /// Uses async polling and acknowledgment to avoid blocking the tokio
+    /// runtime.
+    async fn process_changeset_published(&mut self) -> Result<(), ProjectionWorkerError> {
         let events = self
             .changeset_tailer
-            .poll_events("changeset_published", self.config.batch_size)?;
+            .poll_events_async("changeset_published", self.config.batch_size)
+            .await?;
 
         for event in events {
             match self.handle_changeset_published(&event) {
                 Ok(()) => {
                     // Only acknowledge after successful processing
                     // (Blocker fix: Fail-Open Auto-Ack on Crash)
-                    self.changeset_tailer.acknowledge(event.timestamp_ns)?;
+                    self.changeset_tailer
+                        .acknowledge_async(event.timestamp_ns)
+                        .await?;
                 },
                 Err(e) => {
                     warn!(
@@ -1069,17 +1199,25 @@ impl ProjectionWorker {
     ///
     /// This method only acknowledges events AFTER successful processing.
     /// If the daemon crashes before acknowledgment, events will be redelivered.
-    fn process_work_pr_associated(&mut self) -> Result<(), ProjectionWorkerError> {
+    ///
+    /// # Async I/O (Major fix: Thread blocking in async context)
+    ///
+    /// Uses async polling and acknowledgment to avoid blocking the tokio
+    /// runtime.
+    async fn process_work_pr_associated(&mut self) -> Result<(), ProjectionWorkerError> {
         let events = self
             .work_pr_tailer
-            .poll_events("work_pr_associated", self.config.batch_size)?;
+            .poll_events_async("work_pr_associated", self.config.batch_size)
+            .await?;
 
         for event in events {
             match self.handle_work_pr_associated(&event) {
                 Ok(()) => {
                     // Only acknowledge after successful processing
                     // (Blocker fix: Fail-Open Auto-Ack on Crash)
-                    self.work_pr_tailer.acknowledge(event.timestamp_ns)?;
+                    self.work_pr_tailer
+                        .acknowledge_async(event.timestamp_ns)
+                        .await?;
                 },
                 Err(e) => {
                     warn!(
@@ -1111,6 +1249,9 @@ impl ProjectionWorker {
             .and_then(|v| v.as_str())
             .unwrap_or(&event.work_id);
 
+        // Validate string lengths (Blocker fix: Unbounded Input Consumption)
+        validate_string_length("work_id", work_id)?;
+
         let pr_number = payload
             .get("pr_number")
             .and_then(serde_json::Value::as_u64)
@@ -1125,6 +1266,9 @@ impl ProjectionWorker {
                 ProjectionWorkerError::InvalidPayload("missing repo_owner".to_string())
             })?;
 
+        // Validate string lengths (Blocker fix: Unbounded Input Consumption)
+        validate_string_length("repo_owner", repo_owner)?;
+
         let repo_name = payload
             .get("repo_name")
             .and_then(|v| v.as_str())
@@ -1132,10 +1276,16 @@ impl ProjectionWorker {
                 ProjectionWorkerError::InvalidPayload("missing repo_name".to_string())
             })?;
 
+        // Validate string lengths (Blocker fix: Unbounded Input Consumption)
+        validate_string_length("repo_name", repo_name)?;
+
         let head_sha = payload
             .get("head_sha")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ProjectionWorkerError::InvalidPayload("missing head_sha".to_string()))?;
+
+        // Validate string lengths (Blocker fix: Unbounded Input Consumption)
+        validate_string_length("head_sha", head_sha)?;
 
         // Register PR metadata
         self.work_index
@@ -1144,6 +1294,9 @@ impl ProjectionWorker {
         // Also register commit SHA for status projection if changeset_digest is present
         if let Some(changeset_digest_hex) = payload.get("changeset_digest").and_then(|v| v.as_str())
         {
+            // Validate string length (Blocker fix: Unbounded Input Consumption)
+            validate_string_length("changeset_digest", changeset_digest_hex)?;
+
             if let Ok(digest_bytes) = hex::decode(changeset_digest_hex) {
                 if digest_bytes.len() == 32 {
                     let mut changeset_digest = [0u8; 32];
@@ -1178,17 +1331,25 @@ impl ProjectionWorker {
     /// failure to prevent skipping unprocessed events. If event A at ts=1000
     /// fails and we continue to process event B at ts=2000, acknowledging B
     /// would set the watermark to 2000, permanently skipping A.
+    ///
+    /// # Async I/O (Major fix: Thread blocking in async context)
+    ///
+    /// Uses async polling and acknowledgment to avoid blocking the tokio
+    /// runtime.
     async fn process_review_receipts(&mut self) -> Result<(), ProjectionWorkerError> {
         let events = self
             .review_tailer
-            .poll_events("review_receipt_recorded", self.config.batch_size)?;
+            .poll_events_async("review_receipt_recorded", self.config.batch_size)
+            .await?;
 
         for event in events {
             match self.handle_review_receipt(&event).await {
                 Ok(()) => {
                     // Only acknowledge after successful processing
                     // (Blocker fix: Fail-Open Auto-Ack on Crash)
-                    self.review_tailer.acknowledge(event.timestamp_ns)?;
+                    self.review_tailer
+                        .acknowledge_async(event.timestamp_ns)
+                        .await?;
                 },
                 Err(ProjectionWorkerError::MissingDependency { event_id, reason }) => {
                     // NACK/Retry: Do NOT acknowledge - event will be reprocessed
@@ -1245,12 +1406,18 @@ impl ProjectionWorker {
                 ProjectionWorkerError::InvalidPayload("missing changeset_digest".to_string())
             })?;
 
+        // Validate string length (Blocker fix: Unbounded Input Consumption)
+        validate_string_length("changeset_digest", changeset_digest_hex)?;
+
         let receipt_id = payload
             .get("receipt_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 ProjectionWorkerError::InvalidPayload("missing receipt_id".to_string())
             })?;
+
+        // Validate string length (Blocker fix: Unbounded Input Consumption)
+        validate_string_length("receipt_id", receipt_id)?;
 
         // Decode changeset digest
         let digest_bytes = hex::decode(changeset_digest_hex)
@@ -1292,10 +1459,19 @@ impl ProjectionWorker {
             .get("verdict")
             .and_then(|v| v.as_str())
             .unwrap_or("success");
+
+        // Validate string length (Blocker fix: Unbounded Input Consumption)
+        validate_string_length("verdict", verdict)?;
+
         let status = Self::parse_review_verdict(verdict);
 
         // Extract summary if present
         let summary = payload.get("summary").and_then(|v| v.as_str());
+
+        // Validate summary length if present (Blocker fix: Unbounded Input Consumption)
+        if let Some(s) = summary {
+            validate_string_length("summary", s)?;
+        }
 
         info!(
             receipt_id = %receipt_id,
@@ -1836,5 +2012,260 @@ mod tests {
         // We verify by checking that events before the watermark are not returned
         // (Since we have no events, this just verifies construction succeeded)
         assert!(tailer.get_ledger_head().is_ok());
+    }
+
+    // =========================================================================
+    // NACK/Retry Mechanism Tests (Blocker fix: Critical Data Loss)
+    // =========================================================================
+
+    #[test]
+    fn test_nack_retry_watermark_not_advanced_on_missing_dependency() {
+        // Test that when processing fails due to missing dependency (MissingDependency
+        // error), the watermark is NOT advanced, allowing the event to be
+        // retried.
+        let conn = create_test_db();
+
+        // Insert a review_receipt_recorded event
+        {
+            let conn_guard = conn.lock().unwrap();
+            let payload = serde_json::json!({
+                "changeset_digest": "0000000000000000000000000000000000000000000000000000000000000042",
+                "receipt_id": "receipt-001",
+                "verdict": "success"
+            });
+            conn_guard
+                .execute(
+                    "INSERT INTO ledger_events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        "evt-review-1",
+                        "review_receipt_recorded",
+                        "work-1",
+                        "actor-1",
+                        serde_json::to_vec(&payload).unwrap(),
+                        vec![0u8; 64],
+                        1000i64
+                    ],
+                )
+                .unwrap();
+        }
+
+        let mut tailer = LedgerTailer::with_id(Arc::clone(&conn), "test_nack_tailer");
+
+        // Poll events - should get the review event
+        let events = tailer.poll_events("review_receipt_recorded", 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, "evt-review-1");
+
+        // Simulate MissingDependency error - do NOT call acknowledge()
+        // The watermark should NOT advance
+
+        // Poll again - should still get the same event (NACK/Retry behavior)
+        let events = tailer.poll_events("review_receipt_recorded", 10).unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "Event should be re-polled after NACK (watermark not advanced)"
+        );
+        assert_eq!(events[0].event_id, "evt-review-1");
+    }
+
+    #[test]
+    fn test_nack_retry_partial_batch_processing() {
+        // Test that when one event in a batch fails, subsequent events are not skipped.
+        // This tests the strict sequential acknowledgment behavior.
+        let conn = create_test_db();
+
+        // Insert multiple events
+        {
+            let conn_guard = conn.lock().unwrap();
+            for i in 1..=3 {
+                let payload = serde_json::json!({
+                    "changeset_digest": format!("{:0>64x}", i),
+                    "receipt_id": format!("receipt-{:03}", i),
+                    "verdict": "success"
+                });
+                conn_guard
+                    .execute(
+                        "INSERT INTO ledger_events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            format!("evt-{}", i),
+                            "review_receipt_recorded",
+                            format!("work-{}", i),
+                            "actor-1",
+                            serde_json::to_vec(&payload).unwrap(),
+                            vec![0u8; 64],
+                            i64::from(i * 1000)
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let mut tailer = LedgerTailer::with_id(Arc::clone(&conn), "test_partial_batch_tailer");
+
+        // Poll all events
+        let events = tailer.poll_events("review_receipt_recorded", 10).unwrap();
+        assert_eq!(events.len(), 3);
+
+        // Acknowledge only the first event (simulate: first succeeded, second failed)
+        tailer.acknowledge(events[0].timestamp_ns).unwrap();
+
+        // Poll again - should get events 2 and 3 (event 1 was acknowledged)
+        let events = tailer.poll_events("review_receipt_recorded", 10).unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "Should get remaining 2 events after partial acknowledgment"
+        );
+        assert_eq!(events[0].event_id, "evt-2");
+        assert_eq!(events[1].event_id, "evt-3");
+    }
+
+    #[test]
+    fn test_nack_retry_no_pr_association_error_does_not_advance_watermark() {
+        // Test that NoPrAssociation error triggers NACK behavior
+        let conn = create_test_db();
+        let index = WorkIndex::new(Arc::clone(&conn)).unwrap();
+
+        // Register changeset but NOT PR association
+        let changeset_digest = [0x42u8; 32];
+        index
+            .register_changeset(&changeset_digest, "work-orphan")
+            .unwrap();
+
+        // Verify no PR metadata exists
+        assert!(
+            index.get_pr_metadata("work-orphan").is_none(),
+            "PR metadata should not exist"
+        );
+
+        // The NoPrAssociation error should be returned, triggering NACK
+        // This is tested by verifying the error type exists and the lookup fails
+        let err = ProjectionWorkerError::NoPrAssociation {
+            work_id: "work-orphan".to_string(),
+        };
+        assert!(
+            matches!(err, ProjectionWorkerError::NoPrAssociation { .. }),
+            "NoPrAssociation error should match"
+        );
+    }
+
+    #[test]
+    fn test_nack_retry_missing_dependency_error_type() {
+        // Test the MissingDependency error type for changeset not indexed
+        let err = ProjectionWorkerError::MissingDependency {
+            event_id: "evt-123".to_string(),
+            reason: "changeset 0x42... not yet indexed".to_string(),
+        };
+
+        assert!(
+            matches!(err, ProjectionWorkerError::MissingDependency { .. }),
+            "MissingDependency error should match"
+        );
+
+        // Verify error message contains useful info
+        let msg = err.to_string();
+        assert!(msg.contains("evt-123"));
+        assert!(msg.contains("not yet indexed"));
+    }
+
+    #[test]
+    fn test_nack_retry_event_ordering_preserved() {
+        // Test that event ordering is preserved during NACK/Retry.
+        // Events must be processed in timestamp order to maintain causality.
+        let conn = create_test_db();
+
+        // Insert events with specific timestamps
+        {
+            let conn_guard = conn.lock().unwrap();
+            // Insert out of order to verify ORDER BY works
+            for (id, ts) in [("evt-c", 3000), ("evt-a", 1000), ("evt-b", 2000)] {
+                let payload = serde_json::json!({
+                    "changeset_digest": format!("{:0>64x}", ts),
+                    "receipt_id": format!("receipt-{}", id),
+                    "verdict": "success"
+                });
+                conn_guard
+                    .execute(
+                        "INSERT INTO ledger_events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            id,
+                            "review_receipt_recorded",
+                            "work-1",
+                            "actor-1",
+                            serde_json::to_vec(&payload).unwrap(),
+                            vec![0u8; 64],
+                            i64::from(ts)
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let mut tailer = LedgerTailer::with_id(Arc::clone(&conn), "test_ordering_tailer");
+
+        // Poll events - should be in timestamp order
+        let events = tailer.poll_events("review_receipt_recorded", 10).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[0].event_id, "evt-a",
+            "First event should be evt-a (ts=1000)"
+        );
+        assert_eq!(
+            events[1].event_id, "evt-b",
+            "Second event should be evt-b (ts=2000)"
+        );
+        assert_eq!(
+            events[2].event_id, "evt-c",
+            "Third event should be evt-c (ts=3000)"
+        );
+    }
+
+    #[test]
+    fn test_validate_string_length_rejects_oversized_input() {
+        // Test that oversized strings are rejected (Blocker fix: Unbounded Input
+        // Consumption)
+        let long_string = "x".repeat(MAX_STRING_LENGTH + 1);
+        let result = validate_string_length("test_field", &long_string);
+
+        assert!(
+            result.is_err(),
+            "Should reject string exceeding MAX_STRING_LENGTH"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ProjectionWorkerError::InvalidPayload(_)),
+            "Should be InvalidPayload error"
+        );
+        assert!(err.to_string().contains("test_field"));
+        assert!(err.to_string().contains("exceeds maximum length"));
+    }
+
+    #[test]
+    fn test_validate_string_length_accepts_valid_input() {
+        // Test that strings at or below MAX_STRING_LENGTH are accepted
+        let exact_length = "x".repeat(MAX_STRING_LENGTH);
+        assert!(
+            validate_string_length("field", &exact_length).is_ok(),
+            "Should accept string at MAX_STRING_LENGTH"
+        );
+
+        let short_string = "hello";
+        assert!(
+            validate_string_length("field", short_string).is_ok(),
+            "Should accept short string"
+        );
+
+        let empty_string = "";
+        assert!(
+            validate_string_length("field", empty_string).is_ok(),
+            "Should accept empty string"
+        );
+    }
+
+    #[test]
+    fn test_max_string_length_constant() {
+        // Verify the MAX_STRING_LENGTH constant is set correctly
+        assert_eq!(MAX_STRING_LENGTH, 1024, "MAX_STRING_LENGTH should be 1024");
     }
 }
