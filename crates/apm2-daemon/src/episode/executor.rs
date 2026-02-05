@@ -1551,8 +1551,7 @@ mod tests {
         assert!(
             cache.is_empty(),
             "Cache should be cleared on state-modifying tool failure \
-            (was {} entries before Execute)",
-            cache_size_before
+            (was {cache_size_before} entries before Execute)",
         );
     }
 
