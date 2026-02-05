@@ -311,7 +311,8 @@ pub fn run_consensus(cmd: &ConsensusCommand, socket_path: &Path) -> u8 {
 /// Execute the status command.
 ///
 /// Queries the daemon via UDS for consensus status information.
-/// Returns `CONSENSUS_NOT_CONFIGURED` error if consensus subsystem is not active.
+/// Returns `CONSENSUS_NOT_CONFIGURED` error if consensus subsystem is not
+/// active.
 fn run_status(args: &StatusArgs, json_output: bool, socket_path: &Path) -> u8 {
     // Build async runtime
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -418,7 +419,8 @@ fn run_status(args: &StatusArgs, json_output: bool, socket_path: &Path) -> u8 {
 /// Execute the validators command.
 ///
 /// Queries the daemon via UDS for validator list.
-/// Returns `CONSENSUS_NOT_CONFIGURED` error if consensus subsystem is not active.
+/// Returns `CONSENSUS_NOT_CONFIGURED` error if consensus subsystem is not
+/// active.
 fn run_validators(args: &ValidatorsArgs, json_output: bool, socket_path: &Path) -> u8 {
     // Build async runtime
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -507,7 +509,8 @@ fn run_validators(args: &ValidatorsArgs, json_output: bool, socket_path: &Path) 
 /// Execute the byzantine-evidence list command.
 ///
 /// Queries the daemon via UDS for Byzantine fault evidence.
-/// Returns `CONSENSUS_NOT_CONFIGURED` error if consensus subsystem is not active.
+/// Returns `CONSENSUS_NOT_CONFIGURED` error if consensus subsystem is not
+/// active.
 fn run_byzantine_list(args: &ByzantineListArgs, json_output: bool, socket_path: &Path) -> u8 {
     // Build async runtime
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -525,7 +528,8 @@ fn run_byzantine_list(args: &ByzantineListArgs, json_output: bool, socket_path: 
         },
     };
 
-    // Use effective_limit to cap at MAX_BYZANTINE_EVIDENCE_ENTRIES (max 1000, fits u32)
+    // Use effective_limit to cap at MAX_BYZANTINE_EVIDENCE_ENTRIES (max 1000, fits
+    // u32)
     #[allow(clippy::cast_possible_truncation)]
     let limit = args.effective_limit() as u32;
 
@@ -595,7 +599,8 @@ fn run_byzantine_list(args: &ByzantineListArgs, json_output: bool, socket_path: 
 /// Execute the metrics command.
 ///
 /// Queries the daemon via UDS for consensus metrics.
-/// Returns `CONSENSUS_NOT_CONFIGURED` error if consensus subsystem is not active.
+/// Returns `CONSENSUS_NOT_CONFIGURED` error if consensus subsystem is not
+/// active.
 fn run_metrics(args: &MetricsArgs, json_output: bool, socket_path: &Path) -> u8 {
     // Build async runtime
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -697,14 +702,12 @@ fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> 
 /// errors with a specific exit code and message.
 fn handle_protocol_error(err: &ProtocolClientError, json_output: bool) -> u8 {
     match err {
-        ProtocolClientError::DaemonNotRunning => {
-            output_error(
-                json_output,
-                "daemon_not_running",
-                "daemon is not running",
-                exit_codes::ERROR,
-            )
-        },
+        ProtocolClientError::DaemonNotRunning => output_error(
+            json_output,
+            "daemon_not_running",
+            "daemon is not running",
+            exit_codes::ERROR,
+        ),
         ProtocolClientError::DaemonError { code, message } => {
             // Map ConsensusNotConfigured to a specific error code
             if code.contains("ConsensusNotConfigured") || code.contains("CONSENSUS_NOT_CONFIGURED")
@@ -719,14 +722,12 @@ fn handle_protocol_error(err: &ProtocolClientError, json_output: bool) -> u8 {
                 output_error(json_output, code, message, exit_codes::ERROR)
             }
         },
-        ProtocolClientError::Timeout => {
-            output_error(
-                json_output,
-                "timeout",
-                "operation timed out",
-                exit_codes::ERROR,
-            )
-        },
+        ProtocolClientError::Timeout => output_error(
+            json_output,
+            "timeout",
+            "operation timed out",
+            exit_codes::ERROR,
+        ),
         _ => output_error(
             json_output,
             "protocol_error",

@@ -42,17 +42,17 @@ use tracing::{debug, info, warn};
 use super::credentials::PeerCredentials;
 use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
-    BoundedDecode, ClaimWorkRequest, ClaimWorkResponse,
-    ConsensusByzantineEvidenceRequest, ConsensusByzantineEvidenceResponse, ConsensusErrorCode,
-    ConsensusMetricsRequest, ConsensusMetricsResponse, ConsensusStatusRequest,
-    ConsensusStatusResponse, ConsensusValidatorsRequest, ConsensusValidatorsResponse,
-    DecodeConfig, IssueCapabilityRequest, IssueCapabilityResponse, ListProcessesRequest,
-    ListProcessesResponse, PatternRejection, PrivilegedError, PrivilegedErrorCode, ProcessInfo,
-    ProcessStateEnum, ProcessStatusRequest, ProcessStatusResponse, ReloadProcessRequest,
-    ReloadProcessResponse, RestartProcessRequest, RestartProcessResponse, ShutdownRequest,
-    ShutdownResponse, SpawnEpisodeRequest, SpawnEpisodeResponse, StartProcessRequest,
-    StartProcessResponse, StopProcessRequest, StopProcessResponse, SubscribePulseRequest,
-    SubscribePulseResponse, UnsubscribePulseRequest, UnsubscribePulseResponse, WorkRole,
+    BoundedDecode, ClaimWorkRequest, ClaimWorkResponse, ConsensusByzantineEvidenceRequest,
+    ConsensusByzantineEvidenceResponse, ConsensusErrorCode, ConsensusMetricsRequest,
+    ConsensusMetricsResponse, ConsensusStatusRequest, ConsensusStatusResponse,
+    ConsensusValidatorsRequest, ConsensusValidatorsResponse, DecodeConfig, IssueCapabilityRequest,
+    IssueCapabilityResponse, ListProcessesRequest, ListProcessesResponse, PatternRejection,
+    PrivilegedError, PrivilegedErrorCode, ProcessInfo, ProcessStateEnum, ProcessStatusRequest,
+    ProcessStatusResponse, ReloadProcessRequest, ReloadProcessResponse, RestartProcessRequest,
+    RestartProcessResponse, ShutdownRequest, ShutdownResponse, SpawnEpisodeRequest,
+    SpawnEpisodeResponse, StartProcessRequest, StartProcessResponse, StopProcessRequest,
+    StopProcessResponse, SubscribePulseRequest, SubscribePulseResponse, UnsubscribePulseRequest,
+    UnsubscribePulseResponse, WorkRole,
 };
 use super::pulse_acl::{
     AclDecision, AclError, PulseAclEvaluator, validate_client_sub_id, validate_subscription_id,
@@ -1807,42 +1807,42 @@ impl ConnectionContext {
 #[repr(u8)]
 pub enum PrivilegedMessageType {
     /// `ClaimWork` request (IPC-PRIV-001)
-    ClaimWork        = 1,
+    ClaimWork           = 1,
     /// `SpawnEpisode` request (IPC-PRIV-002)
-    SpawnEpisode     = 2,
+    SpawnEpisode        = 2,
     /// `IssueCapability` request (IPC-PRIV-003)
-    IssueCapability  = 3,
+    IssueCapability     = 3,
     /// Shutdown request (IPC-PRIV-004)
-    Shutdown         = 4,
+    Shutdown            = 4,
     // --- Process Management (CTR-PROTO-011, TCK-00342) ---
     /// `ListProcesses` request (IPC-PRIV-005)
-    ListProcesses    = 5,
+    ListProcesses       = 5,
     /// `ProcessStatus` request (IPC-PRIV-006)
-    ProcessStatus    = 6,
+    ProcessStatus       = 6,
     /// `StartProcess` request (IPC-PRIV-007)
-    StartProcess     = 7,
+    StartProcess        = 7,
     /// `StopProcess` request (IPC-PRIV-008)
-    StopProcess      = 8,
+    StopProcess         = 8,
     /// `RestartProcess` request (IPC-PRIV-009)
-    RestartProcess   = 9,
+    RestartProcess      = 9,
     /// `ReloadProcess` request (IPC-PRIV-010)
-    ReloadProcess    = 10,
+    ReloadProcess       = 10,
     // --- Consensus Query Endpoints (CTR-PROTO-011, RFC-0014, TCK-00345) ---
     /// `ConsensusStatus` request (IPC-PRIV-011)
-    ConsensusStatus  = 11,
+    ConsensusStatus     = 11,
     /// `ConsensusValidators` request (IPC-PRIV-012)
     ConsensusValidators = 12,
     /// `ConsensusByzantineEvidence` request (IPC-PRIV-013)
     ConsensusByzantineEvidence = 13,
     /// `ConsensusMetrics` request (IPC-PRIV-014)
-    ConsensusMetrics = 14,
+    ConsensusMetrics    = 14,
     // --- HEF Pulse Plane (CTR-PROTO-010, RFC-0018) ---
     /// `SubscribePulse` request (IPC-HEF-001)
-    SubscribePulse   = 64,
+    SubscribePulse      = 64,
     /// `UnsubscribePulse` request (IPC-HEF-002)
-    UnsubscribePulse = 66,
+    UnsubscribePulse    = 66,
     /// `PulseEvent` notification (server->client, IPC-HEF-003)
-    PulseEvent       = 68,
+    PulseEvent          = 68,
 }
 
 impl PrivilegedMessageType {
@@ -4507,18 +4507,16 @@ impl PrivilegedDispatcher {
     /// Returns current consensus cluster status. If the consensus subsystem
     /// is not configured (single-node mode), returns `CONSENSUS_NOT_CONFIGURED`
     /// error instead of mock data.
-    fn handle_consensus_status(
-        &self,
-        payload: &[u8],
-    ) -> ProtocolResult<PrivilegedResponse> {
-        let request =
-            ConsensusStatusRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
-                ProtocolError::Serialization {
-                    reason: format!("invalid ConsensusStatusRequest: {e}"),
-                }
+    fn handle_consensus_status(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
+        let request = ConsensusStatusRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid ConsensusStatusRequest: {e}"),
             })?;
 
-        debug!(verbose = request.verbose, "ConsensusStatus request received");
+        debug!(
+            verbose = request.verbose,
+            "ConsensusStatus request received"
+        );
 
         // Check if consensus subsystem is configured
         // For now, return "not configured" since consensus state integration
@@ -4558,10 +4556,7 @@ impl PrivilegedDispatcher {
     ///
     /// Returns list of validators in the consensus cluster. If the consensus
     /// subsystem is not configured, returns `CONSENSUS_NOT_CONFIGURED` error.
-    fn handle_consensus_validators(
-        &self,
-        payload: &[u8],
-    ) -> ProtocolResult<PrivilegedResponse> {
+    fn handle_consensus_validators(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
         let request = ConsensusValidatorsRequest::decode_bounded(payload, &self.decode_config)
             .map_err(|e| ProtocolError::Serialization {
                 reason: format!("invalid ConsensusValidatorsRequest: {e}"),
@@ -4638,15 +4633,10 @@ impl PrivilegedDispatcher {
     ///
     /// Returns consensus metrics summary. If the consensus subsystem
     /// is not configured, returns `CONSENSUS_NOT_CONFIGURED` error.
-    fn handle_consensus_metrics(
-        &self,
-        payload: &[u8],
-    ) -> ProtocolResult<PrivilegedResponse> {
-        let request =
-            ConsensusMetricsRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
-                ProtocolError::Serialization {
-                    reason: format!("invalid ConsensusMetricsRequest: {e}"),
-                }
+    fn handle_consensus_metrics(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
+        let request = ConsensusMetricsRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid ConsensusMetricsRequest: {e}"),
             })?;
 
         debug!(
