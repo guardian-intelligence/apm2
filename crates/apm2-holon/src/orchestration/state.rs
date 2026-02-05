@@ -150,11 +150,11 @@ impl TerminationReason {
 
     /// Creates a Blocked termination with a reason code.
     #[must_use]
-    pub fn blocked(reason_code: BlockedReasonCode) -> Self {
+    pub const fn blocked(reason_code: BlockedReasonCode) -> Self {
         Self::Blocked(reason_code)
     }
 
-    /// Creates a BudgetExhausted termination.
+    /// Creates a `BudgetExhausted` termination.
     #[must_use]
     pub fn budget_exhausted(resource: impl Into<String>, consumed: u64, limit: u64) -> Self {
         Self::BudgetExhausted {
@@ -164,7 +164,7 @@ impl TerminationReason {
         }
     }
 
-    /// Creates an OperatorStop termination.
+    /// Creates an `OperatorStop` termination.
     #[must_use]
     pub fn operator_stop(reason: impl Into<String>) -> Self {
         Self::OperatorStop {
@@ -173,7 +173,7 @@ impl TerminationReason {
         }
     }
 
-    /// Creates an OperatorStop termination with operator ID.
+    /// Creates an `OperatorStop` termination with operator ID.
     #[must_use]
     pub fn operator_stop_with_id(
         reason: impl Into<String>,
@@ -185,7 +185,7 @@ impl TerminationReason {
         }
     }
 
-    /// Creates a MaxIterationsReached termination.
+    /// Creates a `MaxIterationsReached` termination.
     #[must_use]
     pub const fn max_iterations_reached(iterations: u64) -> Self {
         Self::MaxIterationsReached { iterations }
@@ -311,7 +311,7 @@ impl OrchestrationConfig {
     #[must_use]
     pub fn with_max_iterations(mut self, max: u64) -> Self {
         assert!(
-            max >= MIN_ITERATIONS && max <= MAX_ITERATIONS_LIMIT,
+            (MIN_ITERATIONS..=MAX_ITERATIONS_LIMIT).contains(&max),
             "max_iterations must be between {MIN_ITERATIONS} and {MAX_ITERATIONS_LIMIT}"
         );
         self.max_iterations = max;
@@ -628,7 +628,7 @@ impl OrchestrationStateV1 {
 
     /// Returns `true` if the orchestration succeeded (Pass).
     #[must_use]
-    pub fn is_success(&self) -> bool {
+    pub const fn is_success(&self) -> bool {
         matches!(&self.termination_reason, Some(TerminationReason::Pass))
     }
 
@@ -653,7 +653,7 @@ impl OrchestrationStateV1 {
     }
 
     /// Sets the start timestamp.
-    pub fn set_started_at_ns(&mut self, timestamp_ns: u64) {
+    pub const fn set_started_at_ns(&mut self, timestamp_ns: u64) {
         self.started_at_ns = timestamp_ns;
     }
 
@@ -732,7 +732,7 @@ impl OrchestrationStateV1 {
     ///
     /// This is useful for passing to episode execution.
     #[must_use]
-    pub fn as_budget(&self) -> Budget {
+    pub const fn as_budget(&self) -> Budget {
         Budget::new(
             self.remaining_iterations(),
             u64::MAX, // tool calls not tracked at orchestration level
@@ -784,7 +784,7 @@ impl OrchestrationDriver {
     ///
     /// # Errors
     ///
-    /// Returns `HolonError::InvalidInput` if work_id validation fails.
+    /// Returns `HolonError::InvalidInput` if `work_id` validation fails.
     pub fn create_state(
         &self,
         work_id: &str,
@@ -854,7 +854,7 @@ impl OrchestrationDriver {
                     let expected_iteration = s.iteration_count + 1;
                     if completed.iteration_number() != expected_iteration {
                         return Err(HolonError::invalid_state(
-                            format!("iteration {}", expected_iteration),
+                            format!("iteration {expected_iteration}"),
                             format!("iteration {}", completed.iteration_number()),
                         ));
                     }

@@ -11,9 +11,15 @@ use super::state::TerminationReason;
 use crate::error::HolonError;
 use crate::ledger::validate_id;
 
-/// Maximum length for role strings (reserved for future validation).
-#[allow(dead_code)]
+/// Maximum length for role strings.
 pub const MAX_ROLE_LENGTH: usize = 256;
+
+/// Maximum length for reason/error/description strings.
+pub const MAX_REASON_LENGTH: usize = 1024;
+
+/// Maximum number of entries in vector fields (e.g., `blocked_by`,
+/// `reviewer_episode_ids`).
+pub const MAX_VECTOR_ENTRIES: usize = 100;
 
 /// Outcome of a single iteration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

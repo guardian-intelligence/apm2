@@ -16,20 +16,21 @@
 //! The orchestrator terminates under these conditions:
 //! - **Pass**: All reviews pass without blocking findings
 //! - **Blocked**: A reviewer signals the work cannot proceed
-//! - **BudgetExhausted**: Resource limits exceeded (iterations, tokens, time)
-//! - **OperatorStop**: External signal requests termination
+//! - **`BudgetExhausted`**: Resource limits exceeded (iterations, tokens, time)
+//! - **`OperatorStop`**: External signal requests termination
 //!
 //! ## Ledger Events
 //!
 //! The orchestrator emits three event types:
-//! - [`OrchestrationStarted`]: Emitted when orchestration begins for a work_id
+//! - [`OrchestrationStarted`]: Emitted when orchestration begins for a
+//!   `work_id`
 //! - [`IterationCompleted`]: Emitted after each revision cycle completes
 //! - [`OrchestrationTerminated`]: Emitted when orchestration terminates
 //!
 //! ## Crash Recovery
 //!
 //! On restart, the orchestrator:
-//! 1. Scans ledger for the most recent `OrchestrationStarted` for the work_id
+//! 1. Scans ledger for the most recent `OrchestrationStarted` for the `work_id`
 //! 2. Counts `IterationCompleted` events to determine current iteration
 //! 3. Checks for `OrchestrationTerminated` to detect already-completed work
 //! 4. Resumes from the reconstructed state
