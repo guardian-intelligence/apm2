@@ -85,13 +85,22 @@ impl SqliteLedgerEventEmitter {
         // database constraint provides the authoritative uniqueness
         // guarantee that cannot be bypassed by race conditions.
         //
-        // NOTE: We do NOT add a unique index on `gate_lease_issued` events
-        // because their `work_id` column stores the logical `work_id`
-        // (not `lease_id`), and multiple leases (parent + sublease) can
-        // legitimately share the same `work_id`. The `SubleaseIssued`
-        // uniqueness constraint is sufficient because it fires first in
-        // the delegation flow (emit happens before `register_full_lease`),
-        // so any race-condition duplicate is caught at the event level.
+        // NOTE: For `gate_lease_issued` events, the `work_id` column stores
+        // the logical work ID (not `lease_id`), and multiple leases can share
+        // the same `work_id`. We use a unique index on the `json_extract`ed
+        // `$.lease_id` from the payload to enforce at-most-once semantics per
+        // `lease_id` for full-lease persistence. This prevents concurrent
+        // `register_full_lease` calls from creating duplicate lease anchors.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_full_lease_id \
+             ON ledger_events(json_extract(CAST(payload AS TEXT), '$.lease_id')) \
+             WHERE event_type = 'gate_lease_issued' \
+             AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL",
+            [],
+        )?;
+        // For `SubleaseIssued` events, `work_id` = `sublease_id`, so a partial
+        // unique index on `(event_type, work_id)` provides the authoritative
+        // uniqueness guarantee for event emission.
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_sublease_issued \
              ON ledger_events(event_type, work_id) \

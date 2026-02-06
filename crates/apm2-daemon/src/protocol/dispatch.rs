@@ -8067,20 +8067,28 @@ impl PrivilegedDispatcher {
 
         // ---- Phase 2b: Sublease ID uniqueness check (admission before mutation) ----
         //
-        // SECURITY (v9 Finding 1 — Defense-in-Depth Uniqueness):
+        // SECURITY (v10 — Defense-in-Depth Uniqueness):
         //
         // This application-level check provides the idempotent fast-path for
         // duplicate sublease requests. However, since `dispatch()` takes
         // `&self` (not `&mut self`), concurrent dispatch of two requests
         // with the same `sublease_id` could theoretically race past this
-        // check. The authoritative uniqueness guarantee is enforced at the
-        // database level via a partial unique index on `(event_type,
-        // work_id)` for `SubleaseIssued` events (see
-        // `SqliteLedgerEventEmitter::init_schema`). For these events,
-        // `work_id` = `sublease_id`, so the index enforces at-most-once
-        // semantics per sublease. If a duplicate does race past the
-        // application check, `emit_session_event` will fail with a UNIQUE
-        // constraint violation and the handler will fail-closed.
+        // check. Two database-level constraints enforce authoritative
+        // uniqueness (see `SqliteLedgerEventEmitter::init_schema`):
+        //
+        // 1. `idx_unique_full_lease_id`: Partial unique index on `json_extract(payload,
+        //    '$.lease_id')` for `gate_lease_issued` events with `full_lease`. This
+        //    prevents duplicate lease persistence via `register_full_lease`.
+        //
+        // 2. `idx_unique_sublease_issued`: Partial unique index on `(event_type,
+        //    work_id)` for `SubleaseIssued` events. For these events, `work_id` =
+        //    `sublease_id`, so the index enforces at-most-once event emission per
+        //    sublease.
+        //
+        // If a duplicate races past the application check, either
+        // `register_full_lease` or `emit_session_event` will fail with a
+        // UNIQUE constraint violation, and the handler will fail-closed or
+        // resolve via the idempotent duplicate path.
         if let Some(existing) = self.lease_validator.get_gate_lease(&request.sublease_id) {
             // Idempotent return: if the existing sublease has identical
             // parameters, return it. Otherwise reject as a conflict.
@@ -8615,15 +8623,13 @@ impl PrivilegedDispatcher {
                 //
                 // Even though the lease is persisted (authoritative state),
                 // we MUST fail-closed here because:
-                // 1. The proto contract defines `event_id` as a required
-                //    ledger event identity for `SubleaseIssued`.
-                // 2. A retry will hit the idempotent `register_full_lease`
-                //    duplicate path, which will find the existing lease and
-                //    attempt to look up the event. If the event still cannot
-                //    be emitted, the retry will also fail-closed.
-                // 3. The persisted lease anchor ensures no authority is lost;
-                //    the caller simply needs to retry when the event emitter
-                //    recovers.
+                // 1. The proto contract defines `event_id` as a required ledger event identity
+                //    for `SubleaseIssued`.
+                // 2. A retry will hit the idempotent `register_full_lease` duplicate path,
+                //    which will find the existing lease and attempt to look up the event. If
+                //    the event still cannot be emitted, the retry will also fail-closed.
+                // 3. The persisted lease anchor ensures no authority is lost; the caller simply
+                //    needs to retry when the event emitter recovers.
                 warn!(
                     sublease_id = %sublease.lease_id,
                     error = %e,
