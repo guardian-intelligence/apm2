@@ -48,9 +48,11 @@ pub const MANIFEST_FULL_VECTOR: GoldenVector = GoldenVector {
     // version "0.9.0" and zero build hash. It MUST be updated when routes
     // are added, removed, or their semantics change.
     //
-    // Updated: semantics changed — shutdown and credential management routes
-    // reclassified from authoritative to advisory per RFC-0020 section 1.3.
-    expected_hash: "c54630b38a1b503c77930f840955993813df3c9e36a400a68e9846ceb42a639d",
+    // Updated: shutdown and credential management routes reclassified from
+    // advisory to authoritative with receipt_required per RFC-0020 section 1.3
+    // (they perform real side effects). SubscribePulse and UnsubscribePulse
+    // added to SessionMessageType::all_request_variants() (deduplicated).
+    expected_hash: "b315f429e8287dd4e20f840ab7b1a14163ef7c37a3d67c1e3de1872ccc53539c",
 };
 
 /// Golden vector: minimal manifest with a single route.

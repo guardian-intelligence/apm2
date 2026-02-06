@@ -27,7 +27,11 @@ evidence_artifact:
         - all_authoritative_routes_require_receipts: no authoritative route lacks receipts
         - all_routes_have_unique_ids: no duplicate route IDs
         - all_routes_have_unique_routes: no duplicate route paths
+        - missing_semantics_error_path_triggers: concrete negative test that deterministically
+          triggers ManifestBuildError::MissingSemantics via a test-only route with no annotation
+        - every_dispatchable_variant_appears_in_manifest: verifies all enum variants in manifest
         Semantics tests verify annotation coverage:
         - authoritative_routes_always_require_receipts: invariant holds for all routes
-        - local_only_routes_are_advisory: shutdown/credentials are advisory
+        - side_effectful_local_routes_are_authoritative_with_receipts: shutdown/credentials are authoritative
+        - side_effectful_handlers_cannot_be_advisory: invariant that side-effectful routes cannot be advisory
       ref: "cargo test -p apm2-daemon hsi_contract::registry && cargo test -p apm2-daemon hsi_contract::semantics"

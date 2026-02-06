@@ -175,6 +175,8 @@ impl SessionMessageType {
             Self::StreamTelemetry,
             Self::StreamLogs,
             Self::SessionStatus,
+            Self::SubscribePulse,
+            Self::UnsubscribePulse,
         ]
     }
 

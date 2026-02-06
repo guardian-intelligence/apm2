@@ -52,24 +52,29 @@ const ADVISORY: HsiRouteSemantics = HsiRouteSemantics {
     receipt_required: false,
 };
 
-/// Advisory + best-effort idempotency semantics (no receipts).
+/// Authoritative + best-effort idempotency + receipt-required semantics
+/// for side-effectful local operations.
 ///
-/// Used for local-only operations (daemon shutdown, credential management)
-/// that are not authoritative and do not require receipts.
-const ADVISORY_BESTEFFORT: HsiRouteSemantics = HsiRouteSemantics {
-    authoritative: false,
+/// Used for daemon shutdown and credential mutation operations that perform
+/// real side effects (shutdown flag flip, credential store mutation). These
+/// MUST be authoritative with receipts per RFC-0020 section 1.3, since they
+/// produce observable state changes requiring accountability.
+const AUTH_BESTEFFORT_RECEIPT_LOCAL: HsiRouteSemantics = HsiRouteSemantics {
+    authoritative: true,
     idempotency: IdempotencyRequirement::BestEffort,
-    receipt_required: false,
+    receipt_required: true,
 };
 
-/// Advisory + idempotency-required semantics (no receipts).
+/// Authoritative + idempotency-required + receipt-required semantics
+/// for side-effectful local operations with idempotent semantics.
 ///
-/// Used for local credential storage operations (add is idempotent by key)
-/// that are not authoritative and do not require receipts.
-const ADVISORY_IDEMPOTENT: HsiRouteSemantics = HsiRouteSemantics {
-    authoritative: false,
+/// Used for credential add operations (idempotent by key) that still
+/// mutate the credential store and therefore require receipts for
+/// accountability per RFC-0020 section 1.3.
+const AUTH_IDEMPOTENT_RECEIPT_LOCAL: HsiRouteSemantics = HsiRouteSemantics {
+    authoritative: true,
     idempotency: IdempotencyRequirement::Required,
-    receipt_required: false,
+    receipt_required: true,
 };
 
 /// Returns the semantics annotation for a given route string.
@@ -115,22 +120,24 @@ pub fn annotate_route(route: &str) -> Option<HsiRouteSemantics> {
         },
 
         // =================================================================
-        // Advisory + best-effort idempotency (no receipts)
-        // Local-only operations (daemon shutdown, credential management).
-        // These are NOT authoritative: they do not produce world effects
-        // that require proof-carrying receipts.
+        // Authoritative + best-effort idempotency + receipt-required
+        // Side-effectful local operations (daemon shutdown, credential
+        // mutations). These perform real state changes (shutdown flag flip,
+        // credential store mutation) and MUST be authoritative with receipts
+        // per RFC-0020 section 1.3.
         // =================================================================
         "hsi.daemon.shutdown"
         | "hsi.credential.remove"
         | "hsi.credential.refresh"
         | "hsi.credential.switch"
-        | "hsi.credential.login" => Some(ADVISORY_BESTEFFORT),
+        | "hsi.credential.login" => Some(AUTH_BESTEFFORT_RECEIPT_LOCAL),
 
         // =================================================================
-        // Advisory + idempotent (no receipts)
-        // Local credential storage (add is idempotent by key).
+        // Authoritative + idempotent + receipt-required
+        // Credential add is idempotent by key but still mutates the
+        // credential store, requiring receipts for accountability.
         // =================================================================
-        "hsi.credential.add" => Some(ADVISORY_IDEMPOTENT),
+        "hsi.credential.add" => Some(AUTH_IDEMPOTENT_RECEIPT_LOCAL),
 
         // =================================================================
         // Advisory (read-only) endpoints
@@ -258,10 +265,11 @@ mod tests {
     }
 
     #[test]
-    fn local_only_routes_are_advisory() {
-        // Shutdown and credential management are local-only and must be
-        // classified as advisory (not authoritative) per RFC-0020 section 1.3.
-        let local_routes = [
+    fn side_effectful_local_routes_are_authoritative_with_receipts() {
+        // Shutdown and credential mutation routes perform real side effects
+        // (shutdown flag flip, credential store mutation). Per RFC-0020
+        // section 1.3, they MUST be authoritative with receipt_required.
+        let side_effectful_routes = [
             "hsi.daemon.shutdown",
             "hsi.credential.add",
             "hsi.credential.remove",
@@ -269,15 +277,60 @@ mod tests {
             "hsi.credential.switch",
             "hsi.credential.login",
         ];
-        for route in &local_routes {
+        for route in &side_effectful_routes {
             let sem = annotate_route(route).unwrap();
             assert!(
-                !sem.authoritative,
-                "local-only route {route} must be advisory, not authoritative"
+                sem.authoritative,
+                "side-effectful route {route} must be authoritative"
             );
             assert!(
-                !sem.receipt_required,
-                "advisory local-only route {route} must not require receipts"
+                sem.receipt_required,
+                "side-effectful route {route} must require receipts"
+            );
+        }
+    }
+
+    /// Invariant: all side-effectful handlers (those that mutate state or
+    /// perform real external effects) MUST NOT be classified as advisory.
+    /// Advisory classification is reserved for read-only/query routes only.
+    #[test]
+    fn side_effectful_handlers_cannot_be_advisory() {
+        // Exhaustive list of routes that perform real side effects.
+        // If a new side-effectful route is added, it MUST be added here.
+        let side_effectful_routes = [
+            // Core state-mutating operations
+            "hsi.work.claim",
+            "hsi.episode.spawn",
+            "hsi.capability.issue",
+            "hsi.process.start",
+            "hsi.review.ingest_receipt",
+            "hsi.changeset.publish",
+            "hsi.tool.request",
+            "hsi.event.emit",
+            "hsi.evidence.publish",
+            // Lifecycle operations
+            "hsi.process.stop",
+            "hsi.process.restart",
+            "hsi.process.reload",
+            "hsi.session.end",
+            // Side-effectful local operations
+            "hsi.daemon.shutdown",
+            "hsi.credential.add",
+            "hsi.credential.remove",
+            "hsi.credential.refresh",
+            "hsi.credential.switch",
+            "hsi.credential.login",
+        ];
+        for route in &side_effectful_routes {
+            let sem = annotate_route(route)
+                .unwrap_or_else(|| panic!("side-effectful route {route} must have annotation"));
+            assert!(
+                sem.authoritative,
+                "side-effectful route {route} must be authoritative, not advisory"
+            );
+            assert!(
+                sem.receipt_required,
+                "side-effectful route {route} must require receipts"
             );
         }
     }

@@ -348,6 +348,35 @@ impl HsiContractManifestV1 {
     /// - Route count exceeds u32 capacity
     /// - Any string field exceeds u32 length capacity
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestValidationError> {
+        // Enforce resource bounds BEFORE any serialization (fail-closed).
+        // These checks mirror validate() but are mandatory here so that
+        // canonical_bytes() and content_hash() cannot bypass bounds checks.
+        if self.routes.len() > MAX_ROUTES {
+            return Err(ManifestValidationError::RouteCountOverflow {
+                count: self.routes.len(),
+            });
+        }
+        for (i, entry) in self.routes.iter().enumerate() {
+            if entry.route.len() > MAX_ROUTE_LEN {
+                return Err(ManifestValidationError::StringLengthOverflow {
+                    field: format!("routes[{i}].route"),
+                    length: entry.route.len(),
+                });
+            }
+            if entry.request_schema.len() > MAX_SCHEMA_ID_LEN {
+                return Err(ManifestValidationError::StringLengthOverflow {
+                    field: format!("routes[{i}].request_schema"),
+                    length: entry.request_schema.len(),
+                });
+            }
+            if entry.response_schema.len() > MAX_SCHEMA_ID_LEN {
+                return Err(ManifestValidationError::StringLengthOverflow {
+                    field: format!("routes[{i}].response_schema"),
+                    length: entry.response_schema.len(),
+                });
+            }
+        }
+
         // Validate sort invariant
         for i in 1..self.routes.len() {
             if self.routes[i - 1].route > self.routes[i].route {
@@ -630,6 +659,128 @@ mod tests {
             ManifestValidationError::RoutesNotSorted { .. } => {},
             other => panic!("expected RoutesNotSorted, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn canonical_bytes_fails_on_over_limit_route_count() {
+        let mut m = make_test_manifest();
+        // Add routes until we exceed MAX_ROUTES
+        for i in 0..=MAX_ROUTES {
+            m.routes.push(HsiRouteEntry {
+                id: format!("OVER_{i}"),
+                route: format!("hsi.over.route_{i:05}"),
+                stability: StabilityClass::Experimental,
+                request_schema: "apm2.over_request.v1".to_string(),
+                response_schema: "apm2.over_response.v1".to_string(),
+                semantics: HsiRouteSemantics {
+                    authoritative: false,
+                    idempotency: IdempotencyRequirement::NotRequired,
+                    receipt_required: false,
+                },
+            });
+        }
+        assert!(m.routes.len() > MAX_ROUTES);
+        let result = m.canonical_bytes();
+        assert!(
+            result.is_err(),
+            "canonical_bytes must fail when route count exceeds MAX_ROUTES"
+        );
+        match result.unwrap_err() {
+            ManifestValidationError::RouteCountOverflow { count } => {
+                assert!(count > MAX_ROUTES);
+            },
+            other => panic!("expected RouteCountOverflow, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonical_bytes_fails_on_over_length_route_string() {
+        let mut m = make_test_manifest();
+        let long_route = "x".repeat(MAX_ROUTE_LEN + 1);
+        m.routes.push(HsiRouteEntry {
+            id: "OVERLONG".to_string(),
+            route: long_route,
+            stability: StabilityClass::Experimental,
+            request_schema: "apm2.test.v1".to_string(),
+            response_schema: "apm2.test.v1".to_string(),
+            semantics: HsiRouteSemantics {
+                authoritative: false,
+                idempotency: IdempotencyRequirement::NotRequired,
+                receipt_required: false,
+            },
+        });
+        let result = m.canonical_bytes();
+        assert!(
+            result.is_err(),
+            "canonical_bytes must fail when route string exceeds MAX_ROUTE_LEN"
+        );
+        match result.unwrap_err() {
+            ManifestValidationError::StringLengthOverflow { field, length } => {
+                assert!(
+                    field.contains("route"),
+                    "error field should reference 'route', got: {field}"
+                );
+                assert!(length > MAX_ROUTE_LEN);
+            },
+            other => panic!("expected StringLengthOverflow, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonical_bytes_fails_on_over_length_schema_string() {
+        let mut m = make_test_manifest();
+        let long_schema = "s".repeat(MAX_SCHEMA_ID_LEN + 1);
+        m.routes.push(HsiRouteEntry {
+            id: "OVERLONG_SCHEMA".to_string(),
+            route: "hsi.zzz.overlong_schema".to_string(),
+            stability: StabilityClass::Experimental,
+            request_schema: long_schema,
+            response_schema: "apm2.test.v1".to_string(),
+            semantics: HsiRouteSemantics {
+                authoritative: false,
+                idempotency: IdempotencyRequirement::NotRequired,
+                receipt_required: false,
+            },
+        });
+        let result = m.canonical_bytes();
+        assert!(
+            result.is_err(),
+            "canonical_bytes must fail when schema string exceeds MAX_SCHEMA_ID_LEN"
+        );
+        match result.unwrap_err() {
+            ManifestValidationError::StringLengthOverflow { field, length } => {
+                assert!(
+                    field.contains("request_schema"),
+                    "error field should reference 'request_schema', got: {field}"
+                );
+                assert!(length > MAX_SCHEMA_ID_LEN);
+            },
+            other => panic!("expected StringLengthOverflow, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_hash_fails_on_over_limit_routes() {
+        let mut m = make_test_manifest();
+        for i in 0..=MAX_ROUTES {
+            m.routes.push(HsiRouteEntry {
+                id: format!("HASH_OVER_{i}"),
+                route: format!("hsi.hash.over_{i:05}"),
+                stability: StabilityClass::Experimental,
+                request_schema: "apm2.test.v1".to_string(),
+                response_schema: "apm2.test.v1".to_string(),
+                semantics: HsiRouteSemantics {
+                    authoritative: false,
+                    idempotency: IdempotencyRequirement::NotRequired,
+                    receipt_required: false,
+                },
+            });
+        }
+        let result = m.content_hash();
+        assert!(
+            result.is_err(),
+            "content_hash must not bypass bounds checks"
+        );
     }
 
     fn make_test_manifest() -> HsiContractManifestV1 {
