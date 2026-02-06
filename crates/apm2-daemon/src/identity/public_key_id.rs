@@ -9,10 +9,10 @@
 //! +------------------+----------------------------+
 //! ```
 //!
-//! # Text Form
+//! # Text Form (RFC-0020 section 1.7.5b)
 //!
 //! ```text
-//! pk1:<base32lower_no_pad(algorithm_tag || key_hash)>
+//! pkid:v1:ed25519:blake3:<64-lowercase-hex>
 //! ```
 //!
 //! # Algorithm Tags
@@ -26,17 +26,17 @@
 //! # Contract References
 //!
 //! - RFC-0020 section 1.7.2: Canonical key identifiers
+//! - RFC-0020 section 1.7.5b: ABNF canonical text forms
 //! - REQ-0007: Canonical key identifier formats
 
 use std::fmt;
 
 use super::{
-    BINARY_LEN, HASH_LEN, KeyIdError, decode_base32_payload, encode_base32_payload,
-    validate_text_common,
+    BINARY_LEN, HASH_LEN, KeyIdError, decode_hex_payload, encode_hex_payload, validate_text_common,
 };
 
-/// Prefix for `PublicKeyIdV1` text form.
-const PREFIX: &str = "pk1:";
+/// Prefix for `PublicKeyIdV1` text form (RFC-0020 canonical grammar).
+const PREFIX: &str = "pkid:v1:ed25519:blake3:";
 
 /// Domain separation string for BLAKE3 key hashing.
 const DOMAIN_SEPARATION: &[u8] = b"apm2:pkid:v1\0";
@@ -104,6 +104,7 @@ impl fmt::Display for AlgorithmTag {
 ///
 /// // Round-trip through text form
 /// let text = id.to_text();
+/// assert!(text.starts_with("pkid:v1:ed25519:blake3:"));
 /// let parsed = PublicKeyIdV1::parse_text(&text).unwrap();
 /// assert_eq!(id, parsed);
 ///
@@ -139,18 +140,20 @@ impl PublicKeyIdV1 {
 
     /// Parse a `PublicKeyIdV1` from its canonical text form.
     ///
+    /// The canonical text form is:
+    /// `pkid:v1:ed25519:blake3:<64-lowercase-hex>`
+    ///
     /// Enforces:
-    /// - Correct `pk1:` prefix
-    /// - Strict lowercase base32 without padding
-    /// - No whitespace, no mixed case
+    /// - Correct `pkid:v1:ed25519:blake3:` prefix
+    /// - Strict lowercase hex encoding (0-9, a-f)
+    /// - No whitespace, no mixed case, no percent-encoding
     /// - Known algorithm tag (fail-closed)
-    /// - Exactly 33 decoded bytes
+    /// - Exactly 64 hex characters (32 bytes)
     pub fn parse_text(input: &str) -> Result<Self, KeyIdError> {
         validate_text_common(input)?;
 
-        // Check prefix — use `str::get` for char-boundary-safe extraction to
-        // avoid panics on malformed/multi-byte Unicode input.
-        let payload = input.strip_prefix(PREFIX).ok_or_else(|| {
+        // Check prefix
+        let hex_payload = input.strip_prefix(PREFIX).ok_or_else(|| {
             let got = input
                 .get(..PREFIX.len())
                 .map_or_else(|| input.to_string(), str::to_string);
@@ -160,19 +163,14 @@ impl PublicKeyIdV1 {
             }
         })?;
 
-        // Decode base32 payload
-        let decoded = decode_base32_payload(payload)?;
+        // Decode hex payload (validates length = 64, lowercase only)
+        let hash = decode_hex_payload(hex_payload)?;
 
-        // Validate length
-        if decoded.len() != BINARY_LEN {
-            return Err(KeyIdError::BinaryLengthMismatch { got: decoded.len() });
-        }
-
-        // Validate algorithm tag (fail-closed)
-        let _algorithm = AlgorithmTag::from_byte(decoded[0])?;
-
+        // Build binary form: tag 0x01 (Ed25519, the only algorithm in this
+        // prefix) + 32-byte hash
         let mut binary = [0u8; BINARY_LEN];
-        binary.copy_from_slice(&decoded);
+        binary[0] = AlgorithmTag::Ed25519.to_byte();
+        binary[1..].copy_from_slice(&hash);
         Ok(Self { binary })
     }
 
@@ -192,11 +190,12 @@ impl PublicKeyIdV1 {
         Ok(Self { binary })
     }
 
-    /// Return the canonical text form: `pk1:<base32lower_no_pad>`.
+    /// Return the canonical text form: `pkid:v1:ed25519:blake3:<64-hex>`.
     pub fn to_text(&self) -> String {
-        let mut result = String::with_capacity(PREFIX.len() + 53);
+        let hash: &[u8; HASH_LEN] = self.key_hash();
+        let mut result = String::with_capacity(PREFIX.len() + 64);
         result.push_str(PREFIX);
-        result.push_str(&encode_base32_payload(&self.binary));
+        result.push_str(&encode_hex_payload(hash));
         result
     }
 
@@ -284,10 +283,36 @@ mod tests {
     }
 
     #[test]
+    fn text_format_matches_rfc() {
+        let id = make_test_id();
+        let text = id.to_text();
+        assert!(
+            text.starts_with("pkid:v1:ed25519:blake3:"),
+            "text form must start with RFC-0020 prefix, got: {text}"
+        );
+        // Prefix (23) + 64 hex = 87 total
+        assert_eq!(
+            text.len(),
+            87,
+            "text form must be exactly 88 characters, got: {}",
+            text.len()
+        );
+    }
+
+    #[test]
     fn rejects_wrong_prefix() {
         let id = make_test_id();
-        let text = id.to_text().replacen("pk1:", "ks1:", 1);
+        let text = id.to_text().replacen("pkid:", "kset:", 1);
         let err = PublicKeyIdV1::parse_text(&text).unwrap_err();
+        assert!(matches!(err, KeyIdError::WrongPrefix { .. }));
+    }
+
+    #[test]
+    fn rejects_old_prefix() {
+        // Old "pk1:" format must be rejected
+        let err =
+            PublicKeyIdV1::parse_text("pk1:ahtv5ga73ykn7cu45wlc6gwhlpiqvtd5kypkya765o7jebqtpp7u2")
+                .unwrap_err();
         assert!(matches!(err, KeyIdError::WrongPrefix { .. }));
     }
 
@@ -303,18 +328,16 @@ mod tests {
     fn rejects_mixed_case() {
         let id = make_test_id();
         let text = id.to_text();
-        // Capitalize the first lowercase letter in the payload
-        let mixed: String = text
-            .char_indices()
-            .map(|(i, c)| {
-                // Capitalize the character right after "pk1:" (index 4)
-                if i == 4 && c.is_ascii_lowercase() {
-                    c.to_ascii_uppercase()
-                } else {
-                    c
-                }
-            })
-            .collect();
+        // Capitalize a hex character in the payload
+        let mut chars: Vec<char> = text.chars().collect();
+        // Find first lowercase hex char after prefix
+        for ch in &mut chars[PREFIX.len()..] {
+            if ch.is_ascii_lowercase() {
+                *ch = ch.to_ascii_uppercase();
+                break;
+            }
+        }
+        let mixed: String = chars.into_iter().collect();
         let err = PublicKeyIdV1::parse_text(&mixed).unwrap_err();
         assert_eq!(err, KeyIdError::ContainsUppercase);
     }
@@ -351,13 +374,10 @@ mod tests {
 
     #[test]
     fn rejects_truncated() {
-        let err = PublicKeyIdV1::parse_text("pk1:ab").unwrap_err();
-        // Truncated input may fail at base32 decode (incomplete group) or
-        // at binary length validation; either is correct fail-closed behavior.
+        let err = PublicKeyIdV1::parse_text("pkid:v1:ed25519:blake3:ab").unwrap_err();
         assert!(
-            matches!(err, KeyIdError::BinaryLengthMismatch { .. })
-                || matches!(err, KeyIdError::Base32DecodeError { .. }),
-            "expected BinaryLengthMismatch or Base32DecodeError, got {err:?}"
+            matches!(err, KeyIdError::HexLengthMismatch { .. }),
+            "expected HexLengthMismatch, got {err:?}"
         );
     }
 
@@ -402,9 +422,9 @@ mod tests {
         let id = make_test_id();
         let display = format!("{id}");
         let debug = format!("{id:?}");
-        assert!(display.starts_with("pk1:"));
+        assert!(display.starts_with("pkid:v1:ed25519:blake3:"));
         assert!(debug.contains("PublicKeyIdV1"));
-        assert!(debug.contains("pk1:"));
+        assert!(debug.contains("pkid:v1:ed25519:blake3:"));
     }
 
     #[test]
@@ -451,27 +471,36 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_base32_chars() {
-        // '0' is not valid base32 (valid: a-z, 2-7)
-        let err =
-            PublicKeyIdV1::parse_text("pk1:00000000000000000000000000000000000000000000000000000");
+    fn rejects_invalid_hex_chars() {
+        // 'g' is not valid lowercase hex
+        let bad = format!("pkid:v1:ed25519:blake3:{}", "g".repeat(64));
+        let err = PublicKeyIdV1::parse_text(&bad);
         assert!(err.is_err());
     }
 
     #[test]
-    fn rejects_non_canonical_base32_with_digit_one() {
-        // '1' is not in the base32 alphabet
-        let err =
-            PublicKeyIdV1::parse_text("pk1:1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        assert!(err.is_err());
+    fn rejects_percent_encoded() {
+        let err = PublicKeyIdV1::parse_text(
+            "pkid%3av1%3aed25519%3ablake3%3a0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap_err();
+        assert_eq!(err, KeyIdError::ContainsPercentEncoding);
+    }
+
+    #[test]
+    fn rejects_non_ascii_unicode() {
+        // Fullwidth colon U+FF1A
+        let err = PublicKeyIdV1::parse_text(
+            "pkid\u{FF1A}v1:ed25519:blake3:0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap_err();
+        assert_eq!(err, KeyIdError::ContainsNonAscii);
     }
 
     /// Regression test: multi-byte Unicode at the prefix boundary must return
     /// `Err`, never panic via byte-index slicing on a non-char boundary.
     #[test]
     fn unicode_prefix_boundary_does_not_panic() {
-        // U+00E9 (e-acute) is 2 bytes in UTF-8; placing it so that byte index
-        // 4 (PREFIX.len()) falls inside the multi-byte sequence.
         let inputs = [
             "\u{00E9}\u{00E9}xx",               // 2-byte chars at positions 0..4
             "\u{1F600}garbage",                 // 4-byte emoji at position 0

@@ -3,7 +3,7 @@
 //! This module implements [`PublicKeyIdV1`] and [`KeySetIdV1`], the canonical
 //! binary and text forms for self-certifying cryptographic key identifiers.
 //!
-//! # V1 Canonical Text Form Grammar
+//! # V1 Canonical Text Form Grammar (RFC-0020 section 1.7.5b)
 //!
 //! The following grammar defines the **v1 canonical text form** for key
 //! identifiers. This is the authoritative grammar for this implementation;
@@ -11,28 +11,28 @@
 //! preserving backward compatibility.
 //!
 //! ```text
-//! identifier       ::= public_key_id | keyset_id
-//! public_key_id    ::= "pk1:" payload
-//! keyset_id        ::= "ks1:" payload
-//! payload          ::= base32lower_char{53}
-//! base32lower_char ::= [a-z2-7]
+//! identifier    ::= public_key_id | keyset_id
+//! public_key_id ::= "pkid:v1:ed25519:blake3:" hash64
+//! keyset_id     ::= "kset:v1:blake3:" hash64
+//! hash64        ::= 64 * HEXLOWER          ; 64 lowercase hex characters
+//! HEXLOWER      ::= [0-9a-f]
 //! ```
 //!
-//! The decoded payload (33 bytes) is structured as:
+//! The binary form (33 bytes) is structured as:
 //!
 //! ```text
-//! decoded_payload  ::= tag_byte hash_bytes
-//! tag_byte         ::= OCTET              ; 1 byte, must be a known tag value
-//! hash_bytes       ::= 32*OCTET           ; 32-byte BLAKE3 digest
+//! binary_form  ::= tag_byte hash_bytes
+//! tag_byte     ::= OCTET              ; 1 byte, must be a known tag value
+//! hash_bytes   ::= 32*OCTET           ; 32-byte BLAKE3 digest
 //! ```
 //!
 //! ## Tag Byte Values
 //!
-//! | Prefix | Tag  | Meaning           |
-//! |--------|------|-------------------|
-//! | `pk1:` | 0x01 | Ed25519           |
-//! | `ks1:` | 0x01 | Multisig (n-of-n) |
-//! | `ks1:` | 0x02 | Threshold (k-of-n)|
+//! | Text prefix              | Tag  | Meaning           |
+//! |--------------------------|------|-------------------|
+//! | `pkid:v1:ed25519:blake3` | 0x01 | Ed25519           |
+//! | `kset:v1:blake3`         | 0x01 | Multisig (n-of-n) |
+//! | `kset:v1:blake3`         | 0x02 | Threshold (k-of-n)|
 //!
 //! Unknown tag values MUST be rejected (fail-closed per REQ-0007).
 //!
@@ -44,24 +44,28 @@
 //! blake3("apm2:pkid:v1\0" + algorithm_name + "\n" + key_bytes)
 //! ```
 //!
-//! **`KeySetIdV1` hash:**
+//! **`KeySetIdV1` hash (full descriptor):**
 //!
 //! ```text
-//! blake3("apm2:keyset_id:v1\0" + set_mode_name + "\n" + sorted_member_binaries)
+//! blake3("apm2:keyset_id:v1\0" + canonical_bytes(KeySetDescriptorV1))
 //! ```
 //!
-//! The set mode name is included in the `KeySetIdV1` hash so that distinct
-//! quorum policies (Multisig vs Threshold) over the same member set produce
-//! distinct identifiers.
+//! Where `canonical_bytes(KeySetDescriptorV1)` is:
+//! ```text
+//! key_algorithm + "\n" + mode_name + "\n" + threshold_k (4-byte LE) + "\n"
+//!   + sorted_member_binaries
+//!   + [optional: "\n" + weights as 8-byte LE values]
+//! ```
 //!
-//! - Base32 encoding: RFC 4648 lowercase alphabet, no padding (`a-z2-7`)
+//! - Lowercase hex encoding (0-9, a-f), exactly 64 characters for 32 bytes
 //!
 //! # Security Invariants
 //!
 //! - **Fail-closed parsing**: unknown algorithm/set tags are rejected, never
 //!   defaulted.
-//! - **Strict canonical form**: mixed case, whitespace, padding characters, and
-//!   non-canonical base32 are all rejected.
+//! - **Strict canonical form**: mixed case, whitespace, padding characters,
+//!   percent-encoded forms, and Unicode normalization variants are all
+//!   rejected.
 //! - **Bounded length**: text forms are bounded to [`MAX_TEXT_LEN`] characters.
 //! - **Lossless round-trip**: binary-to-text-to-binary produces identical
 //!   bytes.
@@ -70,6 +74,7 @@
 //!
 //! - RFC-0020 section 1.7.2: `PublicKeyIdV1` canonical key identifiers
 //! - RFC-0020 section 1.7.2a: `KeySetIdV1` quorum/threshold verifier identity
+//! - RFC-0020 section 1.7.5b: ABNF for canonical text forms
 //! - REQ-0007: Canonical key identifier formats
 //! - EVID-0007: Canonical key identifier conformance evidence
 //! - EVID-0303: Rollout phase S0.75 evidence
@@ -85,11 +90,11 @@ use thiserror::Error;
 
 /// Maximum length of any canonical text form (bytes).
 ///
-/// Both `pk1:` (4 bytes) and `ks1:` (4 bytes) prefixes + base32-encoded
-/// 33 bytes (ceil(33*8/5) = 53 characters) = 57 characters total.
-/// We set the bound to 64 to allow modest future growth while still
+/// `pkid:v1:ed25519:blake3:` (24 bytes) + 64 hex chars = 88 characters.
+/// `kset:v1:blake3:` (16 bytes) + 64 hex chars = 80 characters.
+/// We set the bound to 96 to allow modest future growth while still
 /// preventing unbounded input.
-pub const MAX_TEXT_LEN: usize = 64;
+pub const MAX_TEXT_LEN: usize = 96;
 
 /// Size of the hash portion of a key identifier (BLAKE3 output).
 pub const HASH_LEN: usize = 32;
@@ -119,7 +124,7 @@ pub enum KeyIdError {
     #[error("input contains interior whitespace")]
     ContainsInteriorWhitespace,
 
-    /// Wrong prefix for the expected type (e.g. `ks1:` when `pk1:` expected).
+    /// Wrong prefix for the expected type (e.g. `kset:` when `pkid:` expected).
     #[error("wrong prefix: expected \"{expected}\", got \"{got}\"")]
     WrongPrefix {
         /// Expected prefix.
@@ -136,9 +141,9 @@ pub enum KeyIdError {
     #[error("input contains base32 padding characters")]
     ContainsPadding,
 
-    /// Base32 decoding failed.
-    #[error("base32 decode error: {reason}")]
-    Base32DecodeError {
+    /// Hex decoding failed.
+    #[error("hex decode error: {reason}")]
+    HexDecodeError {
         /// Description of the decode failure.
         reason: String,
     },
@@ -171,22 +176,50 @@ pub enum KeyIdError {
         tag: u8,
     },
 
-    /// Input contains characters outside the base32 lowercase alphabet.
-    #[error("input contains invalid base32 characters")]
-    InvalidBase32Characters,
+    /// Input contains characters outside the hex lowercase alphabet.
+    #[error("input contains invalid hex characters")]
+    InvalidHexCharacters,
+
+    /// Input contains percent-encoded characters (rejected per REQ-0007).
+    #[error("input contains percent-encoded characters")]
+    ContainsPercentEncoding,
+
+    /// Input contains non-ASCII characters (rejected per REQ-0007).
+    #[error("input contains non-ASCII characters")]
+    ContainsNonAscii,
+
+    /// Hex payload has wrong length (expected exactly 64 hex characters).
+    #[error("hex payload length mismatch: expected 64, got {got}")]
+    HexLengthMismatch {
+        /// Actual hex payload length.
+        got: usize,
+    },
 }
 
 /// Validate common text-form invariants before type-specific parsing.
 ///
 /// Checks:
 /// 1. Non-empty
-/// 2. No leading/trailing whitespace
-/// 3. No interior whitespace
-/// 4. Bounded length
-/// 5. No uppercase letters (strict lowercase)
+/// 2. ASCII-only (rejects Unicode normalization variants)
+/// 3. No percent-encoding tricks
+/// 4. No leading/trailing whitespace
+/// 5. No interior whitespace
+/// 6. Bounded length
+/// 7. No uppercase letters (strict lowercase)
 fn validate_text_common(input: &str) -> Result<(), KeyIdError> {
     if input.is_empty() {
         return Err(KeyIdError::EmptyInput);
+    }
+
+    // Reject non-ASCII (catches Unicode normalization variants, fullwidth
+    // colons U+FF1A, combining characters, etc.)
+    if !input.is_ascii() {
+        return Err(KeyIdError::ContainsNonAscii);
+    }
+
+    // Reject percent-encoded forms (e.g. `pkid%3av1%3a...`)
+    if input.contains('%') {
+        return Err(KeyIdError::ContainsPercentEncoding);
     }
 
     // Check leading/trailing whitespace
@@ -209,7 +242,7 @@ fn validate_text_common(input: &str) -> Result<(), KeyIdError> {
         return Err(KeyIdError::ContainsUppercase);
     }
 
-    // Reject padding characters
+    // Reject padding characters (legacy base32 compat check)
     if input.contains('=') {
         return Err(KeyIdError::ContainsPadding);
     }
@@ -217,36 +250,35 @@ fn validate_text_common(input: &str) -> Result<(), KeyIdError> {
     Ok(())
 }
 
-/// Decode the base32-encoded payload after the prefix.
+/// Decode a 64-character lowercase hex payload into 32 bytes.
 ///
-/// Uses RFC 4648 base32 lowercase without padding.
-fn decode_base32_payload(encoded: &str) -> Result<Vec<u8>, KeyIdError> {
-    // Validate characters are in the base32 lowercase alphabet (a-z, 2-7)
-    for ch in encoded.chars() {
-        if !matches!(ch, 'a'..='z' | '2'..='7') {
-            return Err(KeyIdError::InvalidBase32Characters);
+/// Validates that the payload is exactly 64 characters and contains only
+/// lowercase hex digits (0-9, a-f). Returns the decoded 32-byte hash.
+fn decode_hex_payload(hex_str: &str) -> Result<[u8; HASH_LEN], KeyIdError> {
+    // Validate length
+    if hex_str.len() != 64 {
+        return Err(KeyIdError::HexLengthMismatch { got: hex_str.len() });
+    }
+
+    // Validate characters are strictly lowercase hex (0-9, a-f)
+    for ch in hex_str.chars() {
+        if !matches!(ch, '0'..='9' | 'a'..='f') {
+            return Err(KeyIdError::InvalidHexCharacters);
         }
     }
 
-    // Use data_encoding's BASE32_NOPAD with lowercase
-    // data_encoding expects uppercase; we'll use the lowercase hex variant
-    // Actually, data_encoding has BASE32_NOPAD which is uppercase.
-    // We need to convert to uppercase for decoding, but ONLY after we've
-    // already verified the input is strictly lowercase (enforced above).
-    let upper: String = encoded.to_ascii_uppercase();
-    data_encoding::BASE32_NOPAD
-        .decode(upper.as_bytes())
-        .map_err(|e| KeyIdError::Base32DecodeError {
-            reason: e.to_string(),
-        })
+    let decoded = hex::decode(hex_str).map_err(|e| KeyIdError::HexDecodeError {
+        reason: e.to_string(),
+    })?;
+
+    let mut result = [0u8; HASH_LEN];
+    result.copy_from_slice(&decoded);
+    Ok(result)
 }
 
-/// Encode binary data to base32 lowercase without padding.
-fn encode_base32_payload(data: &[u8]) -> String {
-    // data_encoding::BASE32_NOPAD produces uppercase; convert to lowercase
-    data_encoding::BASE32_NOPAD
-        .encode(data)
-        .to_ascii_lowercase()
+/// Encode 32 bytes as 64 lowercase hex characters.
+fn encode_hex_payload(data: &[u8; HASH_LEN]) -> String {
+    hex::encode(data)
 }
 
 #[cfg(test)]
@@ -261,7 +293,7 @@ mod tests {
     #[test]
     fn validate_text_rejects_leading_whitespace() {
         assert_eq!(
-            validate_text_common(" pk1:abc"),
+            validate_text_common(" pkid:v1:ed25519:blake3:abc"),
             Err(KeyIdError::ContainsWhitespace)
         );
     }
@@ -269,7 +301,7 @@ mod tests {
     #[test]
     fn validate_text_rejects_trailing_whitespace() {
         assert_eq!(
-            validate_text_common("pk1:abc "),
+            validate_text_common("pkid:v1:ed25519:blake3:abc "),
             Err(KeyIdError::ContainsWhitespace)
         );
     }
@@ -277,7 +309,7 @@ mod tests {
     #[test]
     fn validate_text_rejects_interior_whitespace() {
         assert_eq!(
-            validate_text_common("pk1:a\tb"),
+            validate_text_common("pkid:v1:\ted25519:blake3:abc"),
             Err(KeyIdError::ContainsInteriorWhitespace)
         );
     }
@@ -296,7 +328,7 @@ mod tests {
     #[test]
     fn validate_text_rejects_uppercase() {
         assert_eq!(
-            validate_text_common("PK1:abc"),
+            validate_text_common("PKID:V1:ED25519:BLAKE3:abc"),
             Err(KeyIdError::ContainsUppercase)
         );
     }
@@ -304,21 +336,55 @@ mod tests {
     #[test]
     fn validate_text_rejects_padding() {
         assert_eq!(
-            validate_text_common("pk1:abc="),
+            validate_text_common("pkid:v1:ed25519:blake3:abc="),
             Err(KeyIdError::ContainsPadding)
         );
     }
 
     #[test]
-    fn validate_text_accepts_valid() {
-        assert!(validate_text_common("pk1:abcdefg234567").is_ok());
+    fn validate_text_rejects_percent_encoding() {
+        assert_eq!(
+            validate_text_common("pkid%3av1%3aed25519%3ablake3%3aabc"),
+            Err(KeyIdError::ContainsPercentEncoding)
+        );
     }
 
     #[test]
-    fn base32_round_trip() {
-        let data = [0x01u8; 33];
-        let encoded = encode_base32_payload(&data);
-        let decoded = decode_base32_payload(&encoded).unwrap();
-        assert_eq!(&decoded, &data);
+    fn validate_text_rejects_non_ascii() {
+        // Fullwidth colon U+FF1A
+        assert_eq!(
+            validate_text_common("pkid\u{FF1A}v1:ed25519:blake3:abc"),
+            Err(KeyIdError::ContainsNonAscii)
+        );
+    }
+
+    #[test]
+    fn validate_text_accepts_valid() {
+        assert!(validate_text_common("pkid:v1:ed25519:blake3:abcdef0123456789").is_ok());
+    }
+
+    #[test]
+    fn hex_round_trip() {
+        let data = [0x01u8; 32];
+        let encoded = encode_hex_payload(&data);
+        let decoded = decode_hex_payload(&encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn hex_decode_rejects_uppercase() {
+        let upper = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
+        assert!(matches!(
+            decode_hex_payload(upper),
+            Err(KeyIdError::InvalidHexCharacters)
+        ));
+    }
+
+    #[test]
+    fn hex_decode_rejects_wrong_length() {
+        assert!(matches!(
+            decode_hex_payload("abcd"),
+            Err(KeyIdError::HexLengthMismatch { got: 4 })
+        ));
     }
 }

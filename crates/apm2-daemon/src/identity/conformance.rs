@@ -22,6 +22,14 @@
 //! 3. **Invalid text vectors**: inputs that MUST be rejected by conforming
 //!    parsers
 //!
+//! # Text Form Grammar (RFC-0020 section 1.7.5b)
+//!
+//! ```text
+//! public_key_id ::= "pkid:v1:ed25519:blake3:" hash64
+//! keyset_id     ::= "kset:v1:blake3:" hash64
+//! hash64        ::= 64 * HEXLOWER
+//! ```
+//!
 //! # Contract References
 //!
 //! - REQ-0007: Canonical key identifier formats
@@ -43,7 +51,7 @@ pub struct ValidPublicKeyIdVector {
     pub algorithm: AlgorithmTag,
     /// Raw 33-byte binary form (hex-encoded for readability).
     pub binary_hex: &'static str,
-    /// Canonical text form.
+    /// Canonical text form (`pkid:v1:ed25519:blake3:<64-hex>`).
     pub text: &'static str,
 }
 
@@ -56,7 +64,7 @@ pub struct ValidKeySetIdVector {
     pub set_tag: SetTag,
     /// Raw 33-byte binary form (hex-encoded for readability).
     pub binary_hex: &'static str,
-    /// Canonical text form.
+    /// Canonical text form (`kset:v1:blake3:<64-hex>`).
     pub text: &'static str,
 }
 
@@ -99,14 +107,18 @@ pub enum ExpectedError {
     Padding,
     /// Wrong prefix for the target type.
     WrongPrefix,
-    /// Truncated payload (too few base32 characters).
+    /// Truncated payload (too few hex characters).
     Truncated,
-    /// Invalid base32 characters.
-    InvalidBase32,
+    /// Invalid hex characters.
+    InvalidHex,
     /// Unknown algorithm/set tag.
     UnknownTag,
-    /// Extended payload (too many base32 characters).
+    /// Extended payload (too many hex characters).
     Extended,
+    /// Percent-encoded characters.
+    PercentEncoded,
+    /// Non-ASCII / Unicode normalization variant.
+    NonAscii,
 }
 
 // ============================================================================
@@ -122,6 +134,8 @@ pub enum ExpectedError {
 ///   - `ed25519_ascending`:  Ed25519, `key_bytes` = `[0, 1, 2, ..., 31]`
 ///   - `ed25519_descending`: Ed25519, `key_bytes` = `[31, 30, ..., 0]`
 ///
+/// Text form: `pkid:v1:ed25519:blake3:<64-lowercase-hex>`
+///
 /// They are now checked in as static constants. Any change to the
 /// derivation algorithm will cause these tests to fail, which is the
 /// intended regression-detection behavior.
@@ -131,31 +145,31 @@ pub fn valid_public_key_id_vectors() -> Vec<ValidPublicKeyIdVector> {
             name: "ed25519_zeros",
             algorithm: AlgorithmTag::Ed25519,
             binary_hex: "01e75e981fde14df8a9ced962f1ac75bd10acc7d561eac03feebbe9206137bff4d",
-            text: "pk1:ahtv5ga73ykn7cu45wlc6gwhlpiqvtd5kypkya765o7jebqtpp7u2",
+            text: "pkid:v1:ed25519:blake3:e75e981fde14df8a9ced962f1ac75bd10acc7d561eac03feebbe9206137bff4d",
         },
         ValidPublicKeyIdVector {
             name: "ed25519_ones",
             algorithm: AlgorithmTag::Ed25519,
             binary_hex: "01cbdd01abdad3a310a236bdd30c66844bdbb5d6900e31f3c755e22a8a56b00b04",
-            text: "pk1:ahf52anl3lj2gefcg265gddgqrf5xnowsahdd46hkxrcvcswwafqi",
+            text: "pkid:v1:ed25519:blake3:cbdd01abdad3a310a236bdd30c66844bdbb5d6900e31f3c755e22a8a56b00b04",
         },
         ValidPublicKeyIdVector {
             name: "ed25519_ff",
             algorithm: AlgorithmTag::Ed25519,
             binary_hex: "01914b4ecc450789be90462cec21b1012da35085b5a08efebc136632dc7bf6719c",
-            text: "pk1:agiuwtwmiudytpuqiywoyinraew2guefwwqi57v4cntdfxd36zyzy",
+            text: "pkid:v1:ed25519:blake3:914b4ecc450789be90462cec21b1012da35085b5a08efebc136632dc7bf6719c",
         },
         ValidPublicKeyIdVector {
             name: "ed25519_ascending",
             algorithm: AlgorithmTag::Ed25519,
             binary_hex: "013a3b4abb8571e625ff5ac950526527eba0b6f1d8110e97fd70a7c7d08fb2cc3a",
-            text: "pk1:ae5dwsv3qvy6mjp7llevautfe7v2bnxr3aiq5f75oct4puepwlgdu",
+            text: "pkid:v1:ed25519:blake3:3a3b4abb8571e625ff5ac950526527eba0b6f1d8110e97fd70a7c7d08fb2cc3a",
         },
         ValidPublicKeyIdVector {
             name: "ed25519_descending",
             algorithm: AlgorithmTag::Ed25519,
             binary_hex: "01a02d40fc8cb608ad2a6d798607543625c3a041cc61e30e2be5ab0675387aadbc",
-            text: "pk1:agqc2qh4rs3arljknv4ymb2ugys4hicbzrq6gdrl4wvqm5jypkw3y",
+            text: "pkid:v1:ed25519:blake3:a02d40fc8cb608ad2a6d798607543625c3a041cc61e30e2be5ab0675387aadbc",
         },
     ]
 }
@@ -166,38 +180,42 @@ pub fn valid_public_key_id_vectors() -> Vec<ValidPublicKeyIdVector> {
 
 /// Frozen valid `KeySetIdV1` conformance vectors.
 ///
-/// These values were derived once from known member key material:
+/// These values were derived once from known member key material using the
+/// full descriptor format per RFC-0020:
 ///   - `key_a` = Ed25519 from `[0xAA; 32]`
 ///   - `key_b` = Ed25519 from `[0xBB; 32]`
 ///   - `key_c` = Ed25519 from `[0xCC; 32]`
 ///
-/// The set mode name is included in the hash derivation, so Multisig
-/// and Threshold over the same member set produce distinct identifiers.
+/// The descriptor includes `key_algorithm`, `mode`, `threshold_k`, sorted
+/// members, and optional weights. Different descriptor fields produce
+/// distinct identifiers even for the same member set.
+///
+/// Text form: `kset:v1:blake3:<64-lowercase-hex>`
 pub fn valid_keyset_id_vectors() -> Vec<ValidKeySetIdVector> {
     vec![
         ValidKeySetIdVector {
             name: "multisig_two_members",
             set_tag: SetTag::Multisig,
-            binary_hex: "01962408fc4d20e712ff46cefd94d796e033230be13f9ba45df933f1813ff51586",
-            text: "ks1:aglcich4juqooex7i3hp3fgxs3qdgiyl4e7zxjc57ez7daj76ukym",
+            binary_hex: "01c9f5e8de481c1e63066d0a4531af41be075bbba759b1f7e741ef4a64f0a95ec8",
+            text: "kset:v1:blake3:c9f5e8de481c1e63066d0a4531af41be075bbba759b1f7e741ef4a64f0a95ec8",
         },
         ValidKeySetIdVector {
             name: "multisig_three_members",
             set_tag: SetTag::Multisig,
-            binary_hex: "012f4db2b2b947cb467d988f0cf43dd7386135767bb284f2d9f7e9d94252b3e2a9",
-            text: "ks1:aexu3mvsxfd4wrt5tchqz5b5244gcnlwpozij4wz67u5sqsswprks",
+            binary_hex: "01715dfa2421c3140985c33abd94f77c9f367ebffb711317b3b3c58391bd7f5bf9",
+            text: "kset:v1:blake3:715dfa2421c3140985c33abd94f77c9f367ebffb711317b3b3c58391bd7f5bf9",
         },
         ValidKeySetIdVector {
             name: "threshold_two_members",
             set_tag: SetTag::Threshold,
-            binary_hex: "02e4c09e4ce1f56bab3b021aff69e682bd8450eede585cf820c1708c219b941463",
-            text: "ks1:alsmbhsm4h2wxkz3ainp62pgqk6yiuho3zmfz6bayfyiyim3sqkgg",
+            binary_hex: "022afc4549f84212a64bfb0264281a800880222a7d9db3415289f4b6bbfb83c067",
+            text: "kset:v1:blake3:2afc4549f84212a64bfb0264281a800880222a7d9db3415289f4b6bbfb83c067",
         },
         ValidKeySetIdVector {
             name: "threshold_three_members",
             set_tag: SetTag::Threshold,
-            binary_hex: "02d629f27d4a7e69868f00447925a889e860d0aa8d6adbb71c56218b426aa5f106",
-            text: "ks1:allct4t5jj7gtbupabchsjnirhugbufkrvvnxny4kyqywqtkuxyqm",
+            binary_hex: "02ab69d122b0b8165d758073d4f37165db6d82165f7411c17028aaeaa97a79a3c0",
+            text: "kset:v1:blake3:ab69d122b0b8165d758073d4f37165db6d82165f7411c17028aaeaa97a79a3c0",
         },
     ]
 }
@@ -209,6 +227,8 @@ pub fn valid_keyset_id_vectors() -> Vec<ValidKeySetIdVector> {
 /// Return invalid text vectors that conforming parsers MUST reject.
 ///
 /// Each vector specifies the target type and the expected error category.
+/// Includes vectors for percent-encoding and Unicode normalization rejection
+/// per REQ-0007.
 pub fn invalid_text_vectors() -> Vec<InvalidTextVector> {
     vec![
         // === Empty / Whitespace ===
@@ -225,148 +245,192 @@ pub fn invalid_text_vectors() -> Vec<InvalidTextVector> {
             expected_error: ExpectedError::Whitespace,
         },
         InvalidTextVector {
-            name: "leading_space",
-            input: " pk1:aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai",
+            name: "leading_space_pk",
+            input: " pkid:v1:ed25519:blake3:0000000000000000000000000000000000000000000000000000000000000000",
             target_type: TargetType::PublicKeyId,
             expected_error: ExpectedError::Whitespace,
         },
         InvalidTextVector {
-            name: "trailing_space",
-            input: "pk1:aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai ",
+            name: "trailing_space_pk",
+            input: "pkid:v1:ed25519:blake3:0000000000000000000000000000000000000000000000000000000000000000 ",
             target_type: TargetType::PublicKeyId,
             expected_error: ExpectedError::Whitespace,
         },
         InvalidTextVector {
-            name: "interior_space",
-            input: "pk1:aeaqcaib aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai",
+            name: "interior_space_pk",
+            input: "pkid:v1:ed25519: blake3:0000000000000000000000000000000000000000000000000000000000000000",
             target_type: TargetType::PublicKeyId,
             expected_error: ExpectedError::InteriorWhitespace,
         },
         InvalidTextVector {
-            name: "interior_tab",
-            input: "pk1:aeaq\tcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai",
+            name: "interior_tab_pk",
+            input: "pkid:v1:\ted25519:blake3:0000000000000000000000000000000000000000000000000000000000000000",
             target_type: TargetType::PublicKeyId,
             expected_error: ExpectedError::InteriorWhitespace,
         },
         // === Uppercase / Mixed Case ===
         InvalidTextVector {
             name: "all_uppercase_pk",
-            input: "PK1:AEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAI",
+            input: "PKID:V1:ED25519:BLAKE3:0000000000000000000000000000000000000000000000000000000000000000",
             target_type: TargetType::PublicKeyId,
             expected_error: ExpectedError::Uppercase,
         },
         InvalidTextVector {
-            name: "mixed_case_prefix",
-            input: "Pk1:aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai",
+            name: "mixed_case_prefix_pk",
+            input: "Pkid:v1:ed25519:blake3:0000000000000000000000000000000000000000000000000000000000000000",
             target_type: TargetType::PublicKeyId,
             expected_error: ExpectedError::Uppercase,
         },
         InvalidTextVector {
-            name: "mixed_case_payload",
-            input: "pk1:AeaqcaibaeaqcaibAeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai",
+            name: "mixed_case_payload_pk",
+            input: "pkid:v1:ed25519:blake3:000000000000000000000000000000000000000000000000000000000000000A",
             target_type: TargetType::PublicKeyId,
             expected_error: ExpectedError::Uppercase,
         },
         InvalidTextVector {
             name: "all_uppercase_ks",
-            input: "KS1:AEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAI",
+            input: "KSET:V1:BLAKE3:0000000000000000000000000000000000000000000000000000000000000000",
             target_type: TargetType::KeySetId,
             expected_error: ExpectedError::Uppercase,
         },
         // === Padding ===
         InvalidTextVector {
-            name: "base32_padding",
-            input: "pk1:aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai=",
-            target_type: TargetType::PublicKeyId,
-            expected_error: ExpectedError::Padding,
-        },
-        InvalidTextVector {
-            name: "base32_double_padding",
-            input: "pk1:aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq==",
+            name: "padding_char_pk",
+            input: "pkid:v1:ed25519:blake3:0000000000000000000000000000000000000000000000000000000000000000=",
             target_type: TargetType::PublicKeyId,
             expected_error: ExpectedError::Padding,
         },
         // === Wrong Prefix ===
         InvalidTextVector {
             name: "ks_prefix_for_pk",
-            input: "ks1:aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai",
+            input: "kset:v1:blake3:0000000000000000000000000000000000000000000000000000000000000000",
             target_type: TargetType::PublicKeyId,
             expected_error: ExpectedError::WrongPrefix,
         },
         InvalidTextVector {
             name: "pk_prefix_for_ks",
-            input: "pk1:aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai",
+            input: "pkid:v1:ed25519:blake3:0000000000000000000000000000000000000000000000000000000000000000",
             target_type: TargetType::KeySetId,
             expected_error: ExpectedError::WrongPrefix,
         },
         InvalidTextVector {
-            name: "no_prefix",
-            input: "aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaib",
+            name: "no_prefix_pk",
+            input: "0000000000000000000000000000000000000000000000000000000000000000",
             target_type: TargetType::PublicKeyId,
             expected_error: ExpectedError::WrongPrefix,
         },
         InvalidTextVector {
-            name: "unknown_prefix",
-            input: "xx1:aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai",
+            name: "unknown_prefix_pk",
+            input: "xxid:v1:ed25519:blake3:0000000000000000000000000000000000000000000000000000000000000000",
             target_type: TargetType::PublicKeyId,
+            expected_error: ExpectedError::WrongPrefix,
+        },
+        InvalidTextVector {
+            name: "old_pk1_prefix",
+            input: "pk1:aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai",
+            target_type: TargetType::PublicKeyId,
+            expected_error: ExpectedError::WrongPrefix,
+        },
+        InvalidTextVector {
+            name: "old_ks1_prefix",
+            input: "ks1:aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai",
+            target_type: TargetType::KeySetId,
             expected_error: ExpectedError::WrongPrefix,
         },
         // === Truncated ===
         InvalidTextVector {
             name: "truncated_pk",
-            input: "pk1:aeaq",
+            input: "pkid:v1:ed25519:blake3:abcd",
             target_type: TargetType::PublicKeyId,
             expected_error: ExpectedError::Truncated,
         },
         InvalidTextVector {
             name: "truncated_ks",
-            input: "ks1:aeaq",
+            input: "kset:v1:blake3:abcd",
             target_type: TargetType::KeySetId,
             expected_error: ExpectedError::Truncated,
         },
         InvalidTextVector {
             name: "prefix_only_pk",
-            input: "pk1:",
+            input: "pkid:v1:ed25519:blake3:",
             target_type: TargetType::PublicKeyId,
             expected_error: ExpectedError::Truncated,
         },
-        // === Invalid Base32 Characters ===
+        // === Invalid Hex Characters ===
         InvalidTextVector {
-            name: "digit_zero_in_base32",
-            input: "pk1:0eaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai",
+            name: "letter_g_in_hex_pk",
+            input: "pkid:v1:ed25519:blake3:g000000000000000000000000000000000000000000000000000000000000000",
             target_type: TargetType::PublicKeyId,
-            expected_error: ExpectedError::InvalidBase32,
+            expected_error: ExpectedError::InvalidHex,
         },
         InvalidTextVector {
-            name: "digit_one_in_base32",
-            input: "pk1:1eaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai",
+            name: "letter_z_in_hex_pk",
+            input: "pkid:v1:ed25519:blake3:z000000000000000000000000000000000000000000000000000000000000000",
             target_type: TargetType::PublicKeyId,
-            expected_error: ExpectedError::InvalidBase32,
+            expected_error: ExpectedError::InvalidHex,
         },
         InvalidTextVector {
-            name: "digit_eight_in_base32",
-            input: "pk1:8eaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai",
+            name: "special_char_in_hex_pk",
+            input: "pkid:v1:ed25519:blake3:+000000000000000000000000000000000000000000000000000000000000000",
             target_type: TargetType::PublicKeyId,
-            expected_error: ExpectedError::InvalidBase32,
-        },
-        InvalidTextVector {
-            name: "digit_nine_in_base32",
-            input: "pk1:9eaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai",
-            target_type: TargetType::PublicKeyId,
-            expected_error: ExpectedError::InvalidBase32,
-        },
-        InvalidTextVector {
-            name: "special_char_in_base32",
-            input: "pk1:aeaq+aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcai",
-            target_type: TargetType::PublicKeyId,
-            expected_error: ExpectedError::InvalidBase32,
+            expected_error: ExpectedError::InvalidHex,
         },
         // === Too Long ===
         InvalidTextVector {
             name: "too_long_pk",
-            input: "pk1:aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaib",
+            input: "pkid:v1:ed25519:blake3:00000000000000000000000000000000000000000000000000000000000000000000000000000000",
             target_type: TargetType::PublicKeyId,
             expected_error: ExpectedError::TooLong,
+        },
+        // === Percent-Encoding Rejection (REQ-0007) ===
+        InvalidTextVector {
+            name: "percent_encoded_pk_colons",
+            input: "pkid%3av1%3aed25519%3ablake3%3a0000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::PublicKeyId,
+            expected_error: ExpectedError::PercentEncoded,
+        },
+        InvalidTextVector {
+            name: "percent_encoded_ks_colons",
+            input: "kset%3av1%3ablake3%3a0000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::KeySetId,
+            expected_error: ExpectedError::PercentEncoded,
+        },
+        InvalidTextVector {
+            name: "percent_encoded_partial_pk",
+            input: "pkid:v1:ed25519:blake3:%300000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::PublicKeyId,
+            expected_error: ExpectedError::PercentEncoded,
+        },
+        // === Unicode Normalization Rejection (REQ-0007) ===
+        InvalidTextVector {
+            name: "fullwidth_colon_pk",
+            input: "pkid\u{FF1A}v1:ed25519:blake3:0000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::PublicKeyId,
+            expected_error: ExpectedError::NonAscii,
+        },
+        InvalidTextVector {
+            name: "fullwidth_colon_ks",
+            input: "kset\u{FF1A}v1:blake3:0000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::KeySetId,
+            expected_error: ExpectedError::NonAscii,
+        },
+        InvalidTextVector {
+            name: "nfc_combining_accent_pk",
+            input: "pkid:v1:e\u{0301}d25519:blake3:0000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::PublicKeyId,
+            expected_error: ExpectedError::NonAscii,
+        },
+        InvalidTextVector {
+            name: "nfkc_fullwidth_k_ks",
+            input: "\u{FF4B}set:v1:blake3:0000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::KeySetId,
+            expected_error: ExpectedError::NonAscii,
+        },
+        InvalidTextVector {
+            name: "nfd_combining_diaeresis_pk",
+            input: "pkid:v1:ed25519:blake3:00000000000000000000000000000000000000000000000000000000000000\u{0308}0",
+            target_type: TargetType::PublicKeyId,
+            expected_error: ExpectedError::NonAscii,
         },
     ]
 }
@@ -507,20 +571,22 @@ pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
             },
         ));
 
+        // For KeySetIdV1, text form does not encode the set tag, so compare
+        // only merkle roots between text-parsed and binary-parsed values.
         let from_text = text_result.unwrap();
         let from_binary = binary_result.unwrap();
-        let agree = from_text == from_binary;
+        let agree = from_text.merkle_root() == from_binary.merkle_root();
         results.push((
             vector.name,
             agree,
             if agree {
-                "text/binary agree".to_string()
+                "text/binary merkle roots agree".to_string()
             } else {
-                "text/binary DISAGREE".to_string()
+                "text/binary merkle roots DISAGREE".to_string()
             },
         ));
 
-        let re_encoded = from_text.to_text();
+        let re_encoded = from_binary.to_text();
         let re_pass = re_encoded == vector.text;
         results.push((
             vector.name,
@@ -532,14 +598,15 @@ pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
             },
         ));
 
-        let tag_pass = from_text.set_tag() == vector.set_tag;
+        // Verify set tag from binary parse
+        let tag_pass = from_binary.set_tag() == vector.set_tag;
         results.push((
             vector.name,
             tag_pass,
             if tag_pass {
                 "set tag OK".to_string()
             } else {
-                format!("set tag mismatch: got {:?}", from_text.set_tag())
+                format!("set tag mismatch: got {:?}", from_binary.set_tag())
             },
         ));
     }
@@ -564,19 +631,25 @@ pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
                 ExpectedError::Padding => matches!(e, KeyIdError::ContainsPadding),
                 ExpectedError::WrongPrefix => matches!(e, KeyIdError::WrongPrefix { .. }),
                 ExpectedError::Truncated => {
-                    matches!(e, KeyIdError::BinaryLengthMismatch { .. })
-                        || matches!(e, KeyIdError::Base32DecodeError { .. })
+                    matches!(e, KeyIdError::HexLengthMismatch { .. })
+                        || matches!(e, KeyIdError::HexDecodeError { .. })
                 },
-                ExpectedError::InvalidBase32 => {
-                    matches!(e, KeyIdError::InvalidBase32Characters)
+                ExpectedError::InvalidHex => {
+                    matches!(e, KeyIdError::InvalidHexCharacters)
                 },
                 ExpectedError::UnknownTag => {
                     matches!(e, KeyIdError::UnknownAlgorithmTag { .. })
                         || matches!(e, KeyIdError::UnknownSetTag { .. })
                 },
                 ExpectedError::Extended => {
-                    matches!(e, KeyIdError::BinaryLengthMismatch { .. })
+                    matches!(e, KeyIdError::HexLengthMismatch { .. })
                         || matches!(e, KeyIdError::TextTooLong { .. })
+                },
+                ExpectedError::PercentEncoded => {
+                    matches!(e, KeyIdError::ContainsPercentEncoding)
+                },
+                ExpectedError::NonAscii => {
+                    matches!(e, KeyIdError::ContainsNonAscii)
                 },
             }
         } else {
@@ -628,8 +701,11 @@ mod tests {
 
         // Binding assertion: total vector count must be specific non-zero
         // value (prevents silent test-count regression).
-        // 5 PK vectors x 5 checks + 4 KS vectors x 5 checks + 25 invalid = 70
-        assert_eq!(total, 70, "expected exactly 70 conformance vector checks");
+        // 5 PK vectors x 5 checks + 4 KS vectors x 5 checks + 32 invalid = 77
+        assert_eq!(
+            total, 77,
+            "expected exactly 77 conformance vector checks, got {total}"
+        );
     }
 
     /// Verify valid `PublicKeyIdV1` vectors produce non-zero distinct
@@ -681,8 +757,8 @@ mod tests {
         let vectors = invalid_text_vectors();
         assert_eq!(
             vectors.len(),
-            25,
-            "expected exactly 25 invalid text vectors"
+            32,
+            "expected exactly 32 invalid text vectors"
         );
     }
 
@@ -734,41 +810,52 @@ mod tests {
     }
 
     /// Parser differential: runtime-derived `KeySetIdV1` values must match
-    /// the frozen fixture hex/text values.
+    /// the frozen fixture hex/text values. Uses the full descriptor format
+    /// with `key_algorithm`, `threshold_k`, and optional weights.
     #[test]
+    #[allow(clippy::type_complexity)]
     fn ks_derivation_matches_frozen_fixtures() {
         let key_a = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
         let key_b = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xBB; 32]);
         let key_c = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xCC; 32]);
 
-        let derivations: Vec<(&str, SetTag, Vec<PublicKeyIdV1>)> = vec![
+        let derivations: Vec<(&str, SetTag, u32, Vec<PublicKeyIdV1>, Option<&[u64]>)> = vec![
             (
                 "multisig_two_members",
                 SetTag::Multisig,
+                2,
                 vec![key_a.clone(), key_b.clone()],
+                None,
             ),
             (
                 "multisig_three_members",
                 SetTag::Multisig,
+                3,
                 vec![key_a.clone(), key_b.clone(), key_c.clone()],
+                None,
             ),
             (
                 "threshold_two_members",
                 SetTag::Threshold,
+                1,
                 vec![key_a.clone(), key_b.clone()],
+                None,
             ),
             (
                 "threshold_three_members",
                 SetTag::Threshold,
+                2,
                 vec![key_a, key_b, key_c],
+                None,
             ),
         ];
 
         let fixtures = valid_keyset_id_vectors();
         assert_eq!(derivations.len(), fixtures.len());
 
-        for (i, (name, tag, members)) in derivations.iter().enumerate() {
-            let derived = KeySetIdV1::from_members(*tag, members);
+        for (i, (name, tag, threshold_k, members, weights)) in derivations.iter().enumerate() {
+            let derived =
+                KeySetIdV1::from_descriptor("ed25519", *tag, *threshold_k, members, *weights);
             let fixture = &fixtures[i];
             assert_eq!(
                 fixture.name, *name,
@@ -803,7 +890,7 @@ mod tests {
     }
 
     /// Parser differential: `KeySetIdV1::parse_text` and `from_binary`
-    /// agree on all frozen fixture vectors.
+    /// agree on merkle roots for all frozen fixture vectors.
     #[test]
     fn ks_parser_differential_valid() {
         for vector in valid_keyset_id_vectors() {
@@ -812,9 +899,11 @@ mod tests {
             let from_binary =
                 KeySetIdV1::from_binary(&binary_bytes).expect("valid vector must parse");
 
+            // Text form does not encode set tag, compare merkle roots
             assert_eq!(
-                from_text, from_binary,
-                "text/binary parser differential for {}",
+                from_text.merkle_root(),
+                from_binary.merkle_root(),
+                "text/binary merkle root differential for {}",
                 vector.name
             );
         }
@@ -857,6 +946,7 @@ mod tests {
     }
 
     /// Binary -> text -> binary round-trip for all valid `KeySetIdV1` vectors.
+    /// Note: text form does not encode set tag, so we compare merkle roots.
     #[test]
     fn ks_binary_text_binary_round_trip() {
         for vector in valid_keyset_id_vectors() {
@@ -865,11 +955,82 @@ mod tests {
             let text = id.to_text();
             let reparsed = KeySetIdV1::parse_text(&text).expect("re-parse must succeed");
             assert_eq!(
-                id.to_binary(),
-                reparsed.to_binary(),
+                id.merkle_root(),
+                reparsed.merkle_root(),
                 "round-trip failure for {}",
                 vector.name
             );
         }
+    }
+
+    /// Verify that different `threshold_k` values produce different IDs
+    /// for the same member set.
+    #[test]
+    fn different_threshold_k_produces_different_keyset_ids() {
+        let key_a = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
+        let key_b = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xBB; 32]);
+        let key_c = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xCC; 32]);
+
+        let id_1of3 = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            1,
+            &[key_a.clone(), key_b.clone(), key_c.clone()],
+            None,
+        );
+        let id_2of3 = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            2,
+            &[key_a, key_b, key_c],
+            None,
+        );
+
+        assert_ne!(
+            id_1of3.merkle_root(),
+            id_2of3.merkle_root(),
+            "different threshold_k must produce different merkle roots"
+        );
+    }
+
+    /// Verify that different weights produce different IDs for the same
+    /// member set and threshold.
+    #[test]
+    fn different_weights_produces_different_keyset_ids() {
+        let key_a = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
+        let key_b = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xBB; 32]);
+
+        let id_no_w = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            1,
+            &[key_a.clone(), key_b.clone()],
+            None,
+        );
+        let id_w12 = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            1,
+            &[key_a.clone(), key_b.clone()],
+            Some(&[1, 2]),
+        );
+        let id_w34 = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            1,
+            &[key_a, key_b],
+            Some(&[3, 4]),
+        );
+
+        assert_ne!(
+            id_no_w.merkle_root(),
+            id_w12.merkle_root(),
+            "no-weights vs weights=[1,2] must differ"
+        );
+        assert_ne!(
+            id_w12.merkle_root(),
+            id_w34.merkle_root(),
+            "weights=[1,2] vs weights=[3,4] must differ"
+        );
     }
 }
