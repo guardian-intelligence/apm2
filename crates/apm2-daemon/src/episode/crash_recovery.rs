@@ -20,12 +20,14 @@
 //! successful recovery. A second startup with the same state file will not
 //! double-emit events because the sessions are gone from the state file.
 //!
-//! # Fail-Safety
+//! # Fail-Closed Integrity
 //!
-//! Recovery failure does not prevent daemon startup. On error (including
-//! timeout), the session registry is **preserved** so unrecovered sessions
-//! can be retried on the next startup. Only successful recovery clears the
-//! registry.
+//! Per Security Review v5 BLOCKER 1, recovery failures are startup-fatal.
+//! If recovery emits ledger events but then fails to clear the recovered
+//! sessions from the registry, the next startup would re-emit those events
+//! (duplicate revocation). On error, the session registry is **preserved**
+//! so unrecovered sessions can be retried, but the daemon does NOT proceed
+//! to accept connections.
 //!
 //! When session collection is truncated (exceeds `MAX_RECOVERY_SESSIONS`),
 //! only the recovered subset is cleared from the registry. Remaining

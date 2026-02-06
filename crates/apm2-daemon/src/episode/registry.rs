@@ -1577,6 +1577,18 @@ pub enum PersistentRegistryError {
         /// The maximum allowed size.
         max: u64,
     },
+
+    /// State file contains duplicate session IDs, indicating data corruption.
+    ///
+    /// Per Security Review v5 MAJOR 1, duplicate session IDs must be treated
+    /// as corruption rather than silently keeping the first entry. Duplicate
+    /// IDs in the state file indicate either file corruption or a bug in
+    /// the persist logic that must not be masked.
+    #[error("Corrupted state file: duplicate session ID {session_id:?}")]
+    CorruptedDuplicateSessionId {
+        /// The duplicated session ID.
+        session_id: String,
+    },
 }
 
 /// Persistent session registry for crash recovery.
@@ -1672,11 +1684,23 @@ impl PersistentSessionRegistry {
 
             // Load sessions into in-memory registry
             // SEC-001: PersistableSessionState converts to SessionState with empty lease_id
+            //
+            // Security Review v5 MAJOR 1: Detect duplicate session IDs as
+            // corruption rather than silently keeping the first entry. Use a
+            // HashSet to track IDs seen so far and fail on duplicates.
+            let mut seen_ids = std::collections::HashSet::with_capacity(state_file.sessions.len());
             for persistable_session in state_file.sessions {
                 active_ids.insert(persistable_session.session_id.clone());
                 let session = SessionState::from(persistable_session);
-                // Ignore duplicate errors during recovery (shouldn't happen with valid file)
-                let _ = registry.inner.register_session(session);
+                if !seen_ids.insert(session.session_id.clone()) {
+                    return Err(PersistentRegistryError::CorruptedDuplicateSessionId {
+                        session_id: session.session_id,
+                    });
+                }
+                registry
+                    .inner
+                    .register_session(session)
+                    .map_err(PersistentRegistryError::from)?;
             }
 
             // TCK-00385 BLOCKER 2: Reload terminated entries.
@@ -2582,6 +2606,162 @@ mod session_registry_tests {
         // Should succeed with empty registry when file doesn't exist
         let registry = PersistentSessionRegistry::load_from_file(&path).unwrap();
         assert_eq!(registry.session_count(), 0);
+    }
+
+    // =========================================================================
+    // Corruption Tests: Duplicate Session IDs (Security Review v5 MAJOR 1)
+    // =========================================================================
+
+    /// Security Review v5 MAJOR 1: Duplicate session IDs in a state file must
+    /// be treated as corruption and fail the load, not silently keep the first.
+    #[test]
+    fn test_duplicate_session_ids_detected_as_corruption() {
+        use std::io::Write;
+
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        // Write a state file with duplicate session IDs
+        let corrupt_json = serde_json::json!({
+            "version": 1,
+            "sessions": [
+                {
+                    "session_id": "sess-dup",
+                    "work_id": "work-1",
+                    "role": 1,
+                    "ephemeral_handle": "handle-1",
+                    "policy_resolved_ref": "policy-ref",
+                    "capability_manifest_hash": [],
+                    "episode_id": null
+                },
+                {
+                    "session_id": "sess-dup",
+                    "work_id": "work-2",
+                    "role": 1,
+                    "ephemeral_handle": "handle-2",
+                    "policy_resolved_ref": "policy-ref",
+                    "capability_manifest_hash": [],
+                    "episode_id": null
+                }
+            ]
+        });
+        temp_file
+            .write_all(corrupt_json.to_string().as_bytes())
+            .unwrap();
+        temp_file.flush().unwrap();
+
+        let path = temp_file.path();
+        let result = PersistentSessionRegistry::load_from_file(path);
+        assert!(result.is_err(), "load_from_file must fail on duplicate IDs");
+
+        match result.unwrap_err() {
+            PersistentRegistryError::CorruptedDuplicateSessionId { session_id } => {
+                assert_eq!(session_id, "sess-dup");
+            },
+            other => panic!("Expected CorruptedDuplicateSessionId error, got: {other:?}"),
+        }
+    }
+
+    /// Unique session IDs in a state file must load successfully (no false
+    /// positive from duplicate detection).
+    #[test]
+    fn test_unique_session_ids_load_successfully() {
+        use std::io::Write;
+
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        let valid_json = serde_json::json!({
+            "version": 1,
+            "sessions": [
+                {
+                    "session_id": "sess-1",
+                    "work_id": "work-1",
+                    "role": 1,
+                    "ephemeral_handle": "handle-1",
+                    "policy_resolved_ref": "policy-ref",
+                    "capability_manifest_hash": [],
+                    "episode_id": null
+                },
+                {
+                    "session_id": "sess-2",
+                    "work_id": "work-2",
+                    "role": 1,
+                    "ephemeral_handle": "handle-2",
+                    "policy_resolved_ref": "policy-ref",
+                    "capability_manifest_hash": [],
+                    "episode_id": null
+                }
+            ]
+        });
+        temp_file
+            .write_all(valid_json.to_string().as_bytes())
+            .unwrap();
+        temp_file.flush().unwrap();
+
+        let path = temp_file.path();
+        let registry = PersistentSessionRegistry::load_from_file(path)
+            .expect("unique session IDs must load successfully");
+        assert_eq!(registry.session_count(), 2);
+    }
+
+    /// Multiple duplicate pairs in a state file: detection should catch the
+    /// first duplicate encountered.
+    #[test]
+    fn test_multiple_duplicate_pairs_detected() {
+        use std::io::Write;
+
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        let corrupt_json = serde_json::json!({
+            "version": 1,
+            "sessions": [
+                {
+                    "session_id": "sess-A",
+                    "work_id": "work-1",
+                    "role": 1,
+                    "ephemeral_handle": "h1",
+                    "policy_resolved_ref": "p",
+                    "capability_manifest_hash": [],
+                    "episode_id": null
+                },
+                {
+                    "session_id": "sess-B",
+                    "work_id": "work-2",
+                    "role": 1,
+                    "ephemeral_handle": "h2",
+                    "policy_resolved_ref": "p",
+                    "capability_manifest_hash": [],
+                    "episode_id": null
+                },
+                {
+                    "session_id": "sess-A",
+                    "work_id": "work-3",
+                    "role": 1,
+                    "ephemeral_handle": "h3",
+                    "policy_resolved_ref": "p",
+                    "capability_manifest_hash": [],
+                    "episode_id": null
+                }
+            ]
+        });
+        temp_file
+            .write_all(corrupt_json.to_string().as_bytes())
+            .unwrap();
+        temp_file.flush().unwrap();
+
+        let result = PersistentSessionRegistry::load_from_file(temp_file.path());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PersistentRegistryError::CorruptedDuplicateSessionId { session_id } => {
+                assert_eq!(session_id, "sess-A", "Should detect the first duplicate");
+            },
+            other => panic!("Expected CorruptedDuplicateSessionId, got: {other:?}"),
+        }
     }
 }
 

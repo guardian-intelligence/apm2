@@ -7,7 +7,8 @@
 //!
 //! (a) `lease_revoked` ledger rows are emitted for each stale session
 //! (b) `work_claims` cleanup occurs (stale claims are deleted)
-//! (c) daemon continues when recovery returns error (fail-open for startup)
+//! (c) recovery errors are properly propagated (fail-closed per Security
+//!     Review v5 BLOCKER 1)
 //!
 //! # Verification Commands
 //!
@@ -117,28 +118,28 @@ fn count_work_claims(conn: &Arc<Mutex<Connection>>) -> i64 {
 }
 
 /// Simulates the daemon startup recovery path as implemented in
-/// `perform_crash_recovery` (main.rs lines 1067-1231). This function
-/// replicates the exact sequencing:
+/// `perform_crash_recovery` (main.rs). This function replicates the exact
+/// sequencing:
 ///
 /// 1. Load persisted sessions via `collect_sessions`
 /// 2. Create emitter + HTF clock
 /// 3. Call `recover_stale_sessions`
 /// 4. On `Ok`: clear succeeded sessions from registry
 /// 5. On `Timeout`/`PartialRecovery`: clear only succeeded subset
-/// 6. On other `Err`: preserve registry for retry (continue startup)
+/// 6. On other `Err`: preserve registry for retry
 ///
-/// Returns `true` if recovery completed (the daemon would continue startup),
-/// or `false` if something catastrophic happened (which should never occur
-/// since `perform_crash_recovery` always continues startup).
+/// Per Security Review v5 BLOCKER 1, all recovery errors (including clearing
+/// failures) are now startup-fatal. This helper returns `Ok(())` on success
+/// or propagates the error.
 fn simulate_startup_recovery(
     session_registry: &Arc<dyn SessionRegistry>,
     sqlite_conn: &Arc<Mutex<Connection>>,
     timeout: Duration,
-) -> bool {
+) -> Result<(), Box<dyn std::error::Error>> {
     let collected = collect_sessions(session_registry);
 
     if collected.sessions.is_empty() {
-        return true; // Nothing to recover
+        return Ok(()); // Nothing to recover
     }
 
     let emitter = make_emitter(sqlite_conn);
@@ -155,36 +156,36 @@ fn simulate_startup_recovery(
     match result {
         Ok(outcome) => {
             // Mirror main.rs: clear succeeded sessions from registry
-            let _ = clear_session_registry(
+            clear_session_registry(
                 session_registry,
                 &collected,
                 Some(&outcome.succeeded_session_ids),
-            );
-            true
+            )?;
+            Ok(())
         },
         Err(CrashRecoveryError::Timeout { outcome, .. }) => {
             // Mirror main.rs: checkpoint succeeded subset
             if !outcome.succeeded_session_ids.is_empty() {
-                let _ = clear_session_registry(
+                clear_session_registry(
                     session_registry,
                     &collected,
                     Some(&outcome.succeeded_session_ids),
-                );
+                )?;
             }
-            true // Daemon continues on timeout
+            Ok(())
         },
         Err(CrashRecoveryError::PartialRecovery { outcome, .. }) => {
             // Mirror main.rs: clear only succeeded sessions
-            let _ = clear_session_registry(
+            clear_session_registry(
                 session_registry,
                 &collected,
                 Some(&outcome.succeeded_session_ids),
-            );
-            true // Daemon continues on partial recovery
+            )?;
+            Ok(())
         },
-        Err(_) => {
-            // Mirror main.rs: registry NOT cleared, daemon continues
-            true // Daemon continues even on error
+        Err(e) => {
+            // Mirror main.rs: registry NOT cleared, error propagated
+            Err(Box::new(e))
         },
     }
 }
@@ -235,9 +236,8 @@ fn tck_00387_startup_recovery_emits_lease_revoked_events() {
     let sqlite_conn = setup_sqlite();
 
     // Phase 3: Execute startup recovery path
-    let continued =
-        simulate_startup_recovery(&session_registry, &sqlite_conn, Duration::from_secs(5));
-    assert!(continued, "Daemon must continue after recovery");
+    simulate_startup_recovery(&session_registry, &sqlite_conn, Duration::from_secs(5))
+        .expect("Recovery must succeed");
 
     // Phase 4: Assert (a) -- lease_revoked ledger rows emitted
     let lease_revoked_count = count_ledger_events(&sqlite_conn, "lease_revoked");
@@ -310,9 +310,8 @@ fn tck_00387_startup_recovery_cleans_up_work_claims() {
     let session_registry: Arc<dyn SessionRegistry> = Arc::new(loaded_registry);
 
     // Phase 3: Execute startup recovery path
-    let continued =
-        simulate_startup_recovery(&session_registry, &sqlite_conn, Duration::from_secs(5));
-    assert!(continued, "Daemon must continue after recovery");
+    simulate_startup_recovery(&session_registry, &sqlite_conn, Duration::from_secs(5))
+        .expect("Recovery must succeed");
 
     // Phase 4: Assert (b) -- work_claims cleaned up
     assert_eq!(
@@ -330,18 +329,19 @@ fn tck_00387_startup_recovery_cleans_up_work_claims() {
 }
 
 // ============================================================================
-// IT-00387-03: Daemon continues when recovery returns error
+// IT-00387-03: Recovery errors are properly propagated (fail-closed)
 // ============================================================================
 
-/// Verifies `DoD` claim (c): daemon continues when recovery returns error.
+/// Verifies `DoD` claim (c): recovery errors are propagated, not swallowed.
 ///
+/// Per Security Review v5 BLOCKER 1, recovery failures are startup-fatal.
 /// This test:
 /// 1. Creates a persisted state file with sessions
 /// 2. Uses a poisoned `SQLite` connection to force recovery failure
-/// 3. Verifies the startup path still returns success (daemon continues)
+/// 3. Verifies the recovery returns an error (not silently continues)
 /// 4. Verifies the session registry is preserved for retry on next startup
 #[test]
-fn tck_00387_startup_recovery_continues_on_error() {
+fn tck_00387_startup_recovery_propagates_errors() {
     let temp_dir = TempDir::new().unwrap();
     let state_path = temp_dir.path().join("state.json");
 
@@ -375,8 +375,7 @@ fn tck_00387_startup_recovery_continues_on_error() {
 
     // Phase 4: Attempt recovery with poisoned connection. The emitter will
     // fail because it tries to lock the poisoned mutex. We call
-    // recover_stale_sessions directly to observe the error, then verify the
-    // daemon startup pattern handles it correctly.
+    // recover_stale_sessions directly to observe the error.
     let collected = collect_sessions(&session_registry);
     assert_eq!(collected.sessions.len(), 2);
 
@@ -395,8 +394,9 @@ fn tck_00387_startup_recovery_continues_on_error() {
         "Recovery should fail with poisoned connection"
     );
 
-    // Phase 5: Verify daemon startup pattern -- error is logged, startup
-    // continues, registry is preserved.
+    // Phase 5: Verify error is a PartialRecovery with all sessions failed.
+    // Per Security Review v5 BLOCKER 1, these errors are startup-fatal
+    // (propagated via ? in main.rs, not swallowed with warn!).
     match result {
         Err(CrashRecoveryError::PartialRecovery {
             failed_count,
@@ -407,8 +407,8 @@ fn tck_00387_startup_recovery_continues_on_error() {
             assert_eq!(total_count, 2);
             assert!(outcome.succeeded_session_ids.is_empty());
 
-            // Daemon startup pattern: clear only succeeded sessions (none).
-            // Registry is preserved for retry on next startup.
+            // The startup code would propagate this error. Verify the
+            // registry is preserved (no sessions cleared) for retry.
             clear_session_registry(
                 &session_registry,
                 &collected,
@@ -417,7 +417,7 @@ fn tck_00387_startup_recovery_continues_on_error() {
             .expect("clearing empty set should succeed");
         },
         Err(_other) => {
-            // Other error types: registry NOT cleared (daemon continues)
+            // Other error types: registry NOT cleared, error propagated
         },
         Ok(_) => panic!("Expected error with poisoned connection"),
     }
@@ -485,9 +485,8 @@ fn tck_00387_startup_full_cycle_with_persisted_state() {
     );
     let session_registry: Arc<dyn SessionRegistry> = Arc::new(loaded_registry);
 
-    let continued =
-        simulate_startup_recovery(&session_registry, &sqlite_conn, Duration::from_secs(5));
-    assert!(continued, "Daemon run #2 must continue after recovery");
+    simulate_startup_recovery(&session_registry, &sqlite_conn, Duration::from_secs(5))
+        .expect("Daemon run #2 recovery must succeed");
 
     // Verify DoD (a): lease_revoked events emitted
     assert_eq!(
@@ -529,9 +528,8 @@ fn tck_00387_startup_full_cycle_with_persisted_state() {
     );
 
     // No new events should be emitted on the third run
-    let continued_v3 =
-        simulate_startup_recovery(&session_registry_v3, &sqlite_conn, Duration::from_secs(5));
-    assert!(continued_v3, "Daemon run #3 must continue");
+    simulate_startup_recovery(&session_registry_v3, &sqlite_conn, Duration::from_secs(5))
+        .expect("Daemon run #3 recovery must succeed");
 
     // Still only 3 events from run #2 (no double-emit)
     assert_eq!(
@@ -545,10 +543,11 @@ fn tck_00387_startup_full_cycle_with_persisted_state() {
 // IT-00387-05: Recovery with timeout still allows daemon to continue
 // ============================================================================
 
-/// Verifies that a recovery timeout does not prevent daemon startup.
-/// The daemon must continue even if recovery times out.
+/// Verifies that a recovery timeout with partial progress is handled
+/// correctly: succeeded sessions are checkpointed, and the timeout error
+/// does not propagate (timeouts are expected during large recoveries).
 #[test]
-fn tck_00387_startup_recovery_continues_on_timeout() {
+fn tck_00387_startup_recovery_handles_timeout() {
     let temp_dir = TempDir::new().unwrap();
     let state_path = temp_dir.path().join("state.json");
 
@@ -570,11 +569,8 @@ fn tck_00387_startup_recovery_continues_on_timeout() {
     let session_registry: Arc<dyn SessionRegistry> = Arc::new(loaded_registry);
     let sqlite_conn = setup_sqlite();
 
-    // Use 0ms timeout to force immediate timeout
-    let continued =
-        simulate_startup_recovery(&session_registry, &sqlite_conn, Duration::from_millis(0));
-    assert!(
-        continued,
-        "DoD (c): Daemon must continue even when recovery times out"
-    );
+    // Use 0ms timeout to force immediate timeout.
+    // Timeout is handled (succeeded subset checkpointed), so Ok is returned.
+    simulate_startup_recovery(&session_registry, &sqlite_conn, Duration::from_millis(0))
+        .expect("Timeout with checkpoint should succeed");
 }
