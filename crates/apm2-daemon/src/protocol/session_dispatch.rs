@@ -475,6 +475,13 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// Per TCK-00344, the session registry is used to look up session state
     /// for `SessionStatus` queries.
     session_registry: Option<Arc<dyn crate::session::SessionRegistry>>,
+    /// Session telemetry store for tracking tool calls, events emitted,
+    /// and session start time (TCK-00384).
+    ///
+    /// Per TCK-00384, this store tracks per-session counters using atomic
+    /// operations. It is separate from the session registry because
+    /// `SessionState` must remain `Clone + Serialize + Deserialize`.
+    telemetry_store: Option<Arc<crate::session::SessionTelemetryStore>>,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -501,6 +508,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             subscription_registry: None,
             episode_runtime: None,
             session_registry: None,
+            telemetry_store: None,
         }
     }
 
@@ -519,6 +527,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             subscription_registry: None,
             episode_runtime: None,
             session_registry: None,
+            telemetry_store: None,
         }
     }
 }
@@ -542,6 +551,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             subscription_registry: None,
             episode_runtime: None,
             session_registry: None,
+            telemetry_store: None,
         }
     }
 
@@ -565,6 +575,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             subscription_registry: None,
             episode_runtime: None,
             session_registry: None,
+            telemetry_store: None,
         }
     }
 
@@ -604,6 +615,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             subscription_registry: None,
             episode_runtime: None,
             session_registry: None,
+            telemetry_store: None,
         }
     }
 
@@ -671,6 +683,17 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         registry: Arc<dyn crate::session::SessionRegistry>,
     ) -> Self {
         self.session_registry = Some(registry);
+        self
+    }
+
+    /// Sets the session telemetry store for tracking tool calls, events
+    /// emitted, and session start time (TCK-00384).
+    #[must_use]
+    pub fn with_telemetry_store(
+        mut self,
+        store: Arc<crate::session::SessionTelemetryStore>,
+    ) -> Self {
+        self.telemetry_store = Some(store);
         self
     }
 
@@ -1084,7 +1107,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 handle.block_on(async { broker.request(&broker_request, timestamp_ns, None).await })
             });
 
-            return self.handle_broker_decision(
+            let response = self.handle_broker_decision(
                 decision,
                 &token.session_id,
                 tool_class,
@@ -1092,6 +1115,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 timestamp_ns,
                 &episode_id,
             );
+
+            // TCK-00384: Increment tool_calls counter on successful dispatch.
+            // We count Allow and DedupeCacheHit as successful tool calls.
+            if let Ok(SessionResponse::RequestTool(ref resp)) = response {
+                if resp.decision == i32::from(DecisionType::Allow) {
+                    if let Some(ref store) = self.telemetry_store {
+                        if let Some(telemetry) = store.get(&token.session_id) {
+                            telemetry.increment_tool_calls();
+                        }
+                    }
+                }
+            }
+
+            return response;
         }
 
         // INV-TCK-00290-001: Neither broker nor manifest store configured - fail closed
@@ -1483,6 +1520,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             now_ns,
         ) {
             Ok(signed_event) => {
+                // TCK-00384: Increment events_emitted counter on successful
+                // ledger persistence.
+                if let Some(ref store) = self.telemetry_store {
+                    if let Some(telemetry) = store.get(&token.session_id) {
+                        telemetry.increment_events_emitted();
+                    }
+                }
+
                 info!(
                     session_id = %token.session_id,
                     event_id = %signed_event.event_id,
@@ -1695,15 +1740,35 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             "SessionStatus request received"
         );
 
+        // TCK-00384: Look up telemetry counters for this session
+        let telemetry = self
+            .telemetry_store
+            .as_ref()
+            .and_then(|store| store.snapshot(&token.session_id));
+
         // Query session registry for session state
         if let Some(session_registry) = &self.session_registry {
             // First check for active session
             if let Some(session) = session_registry.get_session(&token.session_id) {
-                // Calculate session duration
-                let duration_ms = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-                    .unwrap_or(0);
+                // TCK-00384: Compute duration_ms as (now - started_at_ns) / 1_000_000
+                // instead of raw epoch milliseconds.
+                let (tool_calls, events_emitted, started_at_ns, duration_ms) =
+                    telemetry.as_ref().map_or((0u32, 0u32, 0u64, 0u64), |snap| {
+                        let now_ns = SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .map(|d| {
+                                #[allow(clippy::cast_possible_truncation)]
+                                let ns = d.as_nanos() as u64;
+                                ns
+                            })
+                            .unwrap_or(0);
+                        let duration_ms = now_ns.saturating_sub(snap.started_at_ns) / 1_000_000;
+                        // Proto fields for tool_calls/events_emitted are u32;
+                        // saturate at u32::MAX to avoid truncation panics.
+                        let tc = u32::try_from(snap.tool_calls).unwrap_or(u32::MAX);
+                        let ee = u32::try_from(snap.events_emitted).unwrap_or(u32::MAX);
+                        (tc, ee, snap.started_at_ns, duration_ms)
+                    });
 
                 let response = SessionStatusResponse {
                     session_id: token.session_id.clone(),
@@ -1711,9 +1776,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     work_id: session.work_id,
                     role: session.role,
                     episode_id: session.episode_id,
-                    tool_calls: 0,     // TODO: Track in session telemetry
-                    events_emitted: 0, // TODO: Track in session telemetry
-                    started_at_ns: 0,  // TODO: Track session start time
+                    tool_calls,
+                    events_emitted,
+                    started_at_ns,
                     duration_ms,
                     // TCK-00385: No termination info for active sessions
                     termination_reason: None,
@@ -3872,7 +3937,7 @@ mod tests {
         use super::*;
         use crate::episode::InMemorySessionRegistry;
         use crate::protocol::messages::WorkRole;
-        use crate::session::SessionState;
+        use crate::session::{SessionState, SessionTelemetryStore};
 
         /// IT-00344-SS-01: `SessionStatus` returns ACTIVE with full session
         /// data when session registry is wired and session is
@@ -3900,8 +3965,22 @@ mod tests {
                 .register_session(session)
                 .expect("session registration should succeed");
 
-            // Create dispatcher with session registry wired
-            let dispatcher = SessionDispatcher::new(minter.clone()).with_session_registry(registry);
+            // TCK-00384: Wire telemetry store with a real start time
+            let telemetry_store = Arc::new(SessionTelemetryStore::new());
+            let started_at_ns = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let ns = d.as_nanos() as u64;
+                    ns
+                })
+                .unwrap_or(0);
+            telemetry_store.register("session-001", started_at_ns);
+
+            // Create dispatcher with session registry and telemetry store wired
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_session_registry(registry)
+                .with_telemetry_store(telemetry_store);
 
             let token = test_token(&minter);
             let request = SessionStatusRequest {
@@ -3917,7 +3996,13 @@ mod tests {
                     assert_eq!(resp.work_id, "W-SS-001");
                     assert_eq!(resp.role, i32::from(WorkRole::Implementer));
                     assert_eq!(resp.episode_id, Some("E-SS-001".to_string()));
-                    assert!(resp.duration_ms > 0, "duration_ms should be non-zero");
+                    assert!(resp.started_at_ns > 0, "started_at_ns should be non-zero");
+                    // duration_ms should be a small delta (not raw epoch time)
+                    assert!(
+                        resp.duration_ms < 60_000,
+                        "duration_ms should be session duration, not epoch time; got {}",
+                        resp.duration_ms
+                    );
                 },
                 other => panic!("Expected SessionStatus response, got: {other:?}"),
             }
@@ -4019,6 +4104,197 @@ mod tests {
                 "SessionStatus tag should be 6"
             );
             assert_eq!(encoded[0], 6u8, "SessionStatus tag value should be 6");
+        }
+
+        // ====================================================================
+        // TCK-00384: Session Telemetry Integration Tests
+        // ====================================================================
+
+        /// IT-00384-01: `SessionStatus` returns real telemetry counters
+        /// when telemetry store is wired and counters are incremented.
+        #[test]
+        fn test_session_status_returns_real_telemetry_counters() {
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+
+            let registry: Arc<dyn crate::session::SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+
+            let session = SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-TEL-001".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-TEL-001".to_string(),
+                ephemeral_handle: "handle-tel-001".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: Some("E-TEL-001".to_string()),
+            };
+            registry
+                .register_session(session)
+                .expect("session registration should succeed");
+
+            // Wire telemetry store and simulate counter increments
+            let telemetry_store = Arc::new(SessionTelemetryStore::new());
+            let started_at_ns = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let ns = d.as_nanos() as u64;
+                    ns
+                })
+                .unwrap_or(0);
+            telemetry_store.register("session-001", started_at_ns);
+
+            // Simulate tool calls and event emissions
+            {
+                let t = telemetry_store.get("session-001").unwrap();
+                t.increment_tool_calls();
+                t.increment_tool_calls();
+                t.increment_tool_calls();
+                t.increment_events_emitted();
+                t.increment_events_emitted();
+            }
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_session_registry(registry)
+                .with_telemetry_store(telemetry_store);
+
+            let token = test_token(&minter);
+            let request = SessionStatusRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+            };
+            let frame = encode_session_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::SessionStatus(resp) => {
+                    assert_eq!(resp.tool_calls, 3, "tool_calls should be 3");
+                    assert_eq!(resp.events_emitted, 2, "events_emitted should be 2");
+                    assert!(resp.started_at_ns > 0, "started_at_ns should be non-zero");
+                    // duration_ms should be session duration (small), not epoch
+                    assert!(
+                        resp.duration_ms < 60_000,
+                        "duration_ms should be session duration (< 1 min), got {}",
+                        resp.duration_ms
+                    );
+                },
+                other => panic!("Expected SessionStatus response, got: {other:?}"),
+            }
+        }
+
+        /// IT-00384-02: `SessionStatus` returns zeros when telemetry store
+        /// is not wired (backward compatibility).
+        #[test]
+        fn test_session_status_returns_zeros_without_telemetry() {
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+
+            let registry: Arc<dyn crate::session::SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+
+            let session = SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-TEL-002".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-TEL-002".to_string(),
+                ephemeral_handle: "handle-tel-002".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: None,
+            };
+            registry
+                .register_session(session)
+                .expect("session registration should succeed");
+
+            // No telemetry store wired
+            let dispatcher = SessionDispatcher::new(minter.clone()).with_session_registry(registry);
+
+            let token = test_token(&minter);
+            let request = SessionStatusRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+            };
+            let frame = encode_session_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::SessionStatus(resp) => {
+                    assert_eq!(resp.tool_calls, 0);
+                    assert_eq!(resp.events_emitted, 0);
+                    assert_eq!(resp.started_at_ns, 0);
+                    assert_eq!(resp.duration_ms, 0);
+                },
+                other => panic!("Expected SessionStatus response, got: {other:?}"),
+            }
+        }
+
+        /// IT-00384-03: `duration_ms` reflects actual session duration,
+        /// not raw epoch time.
+        #[test]
+        fn test_session_status_duration_is_session_relative() {
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+
+            let registry: Arc<dyn crate::session::SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+
+            let session = SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-TEL-003".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-TEL-003".to_string(),
+                ephemeral_handle: "handle-tel-003".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: None,
+            };
+            registry
+                .register_session(session)
+                .expect("session registration should succeed");
+
+            // Register telemetry with a start time 100ms in the past
+            let telemetry_store = Arc::new(SessionTelemetryStore::new());
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let ns = d.as_nanos() as u64;
+                    ns
+                })
+                .unwrap_or(0);
+            // Set started_at_ns to 100ms ago
+            let started_100ms_ago = now_ns.saturating_sub(100_000_000);
+            telemetry_store.register("session-001", started_100ms_ago);
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_session_registry(registry)
+                .with_telemetry_store(telemetry_store);
+
+            let token = test_token(&minter);
+            let request = SessionStatusRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+            };
+            let frame = encode_session_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::SessionStatus(resp) => {
+                    // Duration should be approximately 100ms (allow generous
+                    // margin for test timing)
+                    assert!(
+                        resp.duration_ms >= 50 && resp.duration_ms < 5_000,
+                        "duration_ms should be ~100ms (session-relative), got {}",
+                        resp.duration_ms
+                    );
+                    // Critically, it must NOT be raw epoch time (~1.77 trillion)
+                    assert!(
+                        resp.duration_ms < 1_000_000,
+                        "duration_ms must not be raw epoch time; got {}",
+                        resp.duration_ms
+                    );
+                },
+                other => panic!("Expected SessionStatus response, got: {other:?}"),
+            }
         }
     }
 

@@ -2497,6 +2497,14 @@ pub struct PrivilegedDispatcher {
     /// return error responses indicating the credential store is not
     /// configured.
     credential_store: Option<Arc<CredentialStore>>,
+
+    /// Session telemetry store for tracking tool calls, events emitted,
+    /// and session start time (TCK-00384).
+    ///
+    /// When present, `SpawnEpisode` registers telemetry for new sessions
+    /// with `started_at_ns` set to the current wall time. The store is
+    /// shared with `SessionDispatcher` for counter updates and queries.
+    telemetry_store: Option<Arc<crate::session::SessionTelemetryStore>>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -2569,6 +2577,7 @@ impl PrivilegedDispatcher {
             node_id: "test-node".to_string(),
             consensus_state: None,
             credential_store: None,
+            telemetry_store: None,
         }
     }
 
@@ -2624,6 +2633,7 @@ impl PrivilegedDispatcher {
             node_id: "test-node".to_string(),
             consensus_state: None,
             credential_store: None,
+            telemetry_store: None,
         }
     }
 
@@ -2698,6 +2708,7 @@ impl PrivilegedDispatcher {
             node_id: "node-001".to_string(),
             consensus_state: None,
             credential_store: None,
+            telemetry_store: None,
         }
     }
 
@@ -2749,6 +2760,7 @@ impl PrivilegedDispatcher {
             node_id: "node-001".to_string(),
             consensus_state: None,
             credential_store: None,
+            telemetry_store: None,
         }
     }
 
@@ -2774,6 +2786,21 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn with_credential_store(mut self, store: Arc<CredentialStore>) -> Self {
         self.credential_store = Some(store);
+        self
+    }
+
+    /// Sets the session telemetry store for tracking tool calls, events
+    /// emitted, and session start time (TCK-00384).
+    ///
+    /// When set, `SpawnEpisode` registers telemetry for new sessions. The
+    /// store should be shared with `SessionDispatcher` for counter
+    /// updates and queries.
+    #[must_use]
+    pub fn with_telemetry_store(
+        mut self,
+        store: Arc<crate::session::SessionTelemetryStore>,
+    ) -> Self {
+        self.telemetry_store = Some(store);
         self
     }
 
@@ -3720,6 +3747,19 @@ impl PrivilegedDispatcher {
                 PrivilegedErrorCode::CapabilityRequestRejected,
                 format!("session registration failed: {e}"),
             ));
+        }
+
+        // TCK-00384: Register session telemetry with started_at_ns
+        if let Some(ref store) = self.telemetry_store {
+            let started_at_ns = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let ns = d.as_nanos() as u64;
+                    ns
+                })
+                .unwrap_or(0);
+            store.register(&session_id, started_at_ns);
         }
 
         debug!(
