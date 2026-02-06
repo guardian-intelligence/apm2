@@ -82,6 +82,14 @@ pub struct StopAuthority {
     emergency_stop: AtomicBool,
     /// Whether a governance stop has been issued by the policy engine.
     governance_stop: AtomicBool,
+    /// Whether the governance stop state is uncertain (service unreachable
+    /// or response stale beyond freshness threshold).
+    ///
+    /// TCK-00351 MAJOR 1 v2 FIX: When this flag is set, the
+    /// [`StopConditionEvaluator::evaluate_with_uncertainty`] returns
+    /// [`StopStatus::Uncertain`], which triggers deadline-based fail-closed
+    /// denial.
+    governance_uncertain: AtomicBool,
 }
 
 impl StopAuthority {
@@ -91,6 +99,7 @@ impl StopAuthority {
         Self {
             emergency_stop: AtomicBool::new(false),
             governance_stop: AtomicBool::new(false),
+            governance_uncertain: AtomicBool::new(false),
         }
     }
 
@@ -106,6 +115,12 @@ impl StopAuthority {
         self.governance_stop.load(Ordering::Acquire)
     }
 
+    /// Returns whether the governance stop state is uncertain.
+    #[must_use]
+    pub fn governance_uncertain(&self) -> bool {
+        self.governance_uncertain.load(Ordering::Acquire)
+    }
+
     /// Sets the emergency stop flag.
     pub fn set_emergency_stop(&self, active: bool) {
         self.emergency_stop.store(active, Ordering::Release);
@@ -114,6 +129,15 @@ impl StopAuthority {
     /// Sets the governance stop flag.
     pub fn set_governance_stop(&self, active: bool) {
         self.governance_stop.store(active, Ordering::Release);
+    }
+
+    /// Sets the governance-uncertain flag.
+    ///
+    /// When `true`, the evaluator treats governance stop state as uncertain
+    /// and the gate applies deadline-based fail-closed logic.
+    pub fn set_governance_uncertain(&self, uncertain: bool) {
+        self.governance_uncertain
+            .store(uncertain, Ordering::Release);
     }
 }
 
@@ -374,6 +398,57 @@ impl StopConditionEvaluator {
 
         StopStatus::Clear
     }
+
+    /// Evaluates stop conditions with governance-uncertainty awareness.
+    ///
+    /// This is the extended variant of [`evaluate`](Self::evaluate) that
+    /// accepts a `governance_uncertain` flag.  When the governance service
+    /// is unreachable or its response is stale beyond the freshness
+    /// threshold, the caller sets `governance_uncertain = true` and the
+    /// evaluator returns [`StopStatus::Uncertain`], which the gate
+    /// resolves via the deadline logic (deny if elapsed > deadline).
+    ///
+    /// # Arguments
+    ///
+    /// * `conditions`            - Stop conditions from the episode envelope.
+    /// * `current_episode_count` - Number of episodes already executed.
+    /// * `emergency_stop_active` - Whether an emergency stop is in effect.
+    /// * `governance_stop_active`- Whether a governance stop is in effect.
+    /// * `governance_uncertain`  - Whether the governance stop state is
+    ///   uncertain (service unreachable / stale).
+    #[must_use]
+    pub fn evaluate_with_uncertainty(
+        &self,
+        conditions: &StopConditions,
+        current_episode_count: u64,
+        emergency_stop_active: bool,
+        governance_stop_active: bool,
+        governance_uncertain: bool,
+    ) -> StopStatus {
+        // Delegate to the base evaluator first -- it handles the
+        // deterministic conditions (emergency, governance-active, max
+        // episodes, escalation).
+        let base = self.evaluate(
+            conditions,
+            current_episode_count,
+            emergency_stop_active,
+            governance_stop_active,
+        );
+
+        // If the base evaluation already returned a definitive status
+        // (Active or Clear-but-governance-is-uncertain), handle accordingly.
+        if !base.is_clear() {
+            return base;
+        }
+
+        // If governance status is uncertain, return Uncertain so the gate
+        // can apply the deadline-based fail-closed logic.
+        if governance_uncertain {
+            return StopStatus::Uncertain;
+        }
+
+        base
+    }
 }
 
 impl Default for StopConditionEvaluator {
@@ -463,28 +538,39 @@ impl PreActuationGate {
         }
     }
 
-    /// Creates a production gate that fails closed on missing budget.
+    /// Creates a production gate with stop-authority wired and optional budget.
     ///
-    /// TCK-00351 BLOCKER 2 FIX: This constructor sets `require_budget`
-    /// to `true`, so the gate denies tool requests when no budget
-    /// tracker is configured.  This prevents the `default_gate()` from
-    /// silently allowing all requests to bypass budget enforcement.
+    /// # Budget Enforcement
+    ///
+    /// When `budget_tracker` is `Some`, the gate enforces budget limits and
+    /// denies if exhausted (fail-closed).  When `budget_tracker` is `None`,
+    /// the gate does NOT deny on missing budget -- session-level budget
+    /// enforcement is deferred to `EpisodeRuntime` which tracks per-episode
+    /// budgets.  This avoids a self-DoS where ALL tool requests are denied
+    /// because the session-level gate has no tracker.
+    ///
+    /// To require a budget tracker at this level (e.g., when per-session
+    /// budgets are implemented), call `.with_require_budget(true)` after
+    /// construction.
     ///
     /// # Arguments
     ///
     /// * `stop_authority` - Authoritative runtime stop state.
-    /// * `budget_tracker` - Budget tracker; `None` will cause fail-closed
-    ///   denial for all tool requests.
+    /// * `budget_tracker` - Budget tracker; `None` defers budget checks to
+    ///   `EpisodeRuntime`.
     #[must_use]
     pub const fn production_gate(
         stop_authority: Arc<StopAuthority>,
         budget_tracker: Option<Arc<BudgetTracker>>,
     ) -> Self {
+        // require_budget is false when no tracker is provided so the gate
+        // does not self-DoS.  When a real tracker IS provided, we still
+        // enforce it via the evaluate_budget path (tracker.is_exhausted()).
         Self {
             evaluator: StopConditionEvaluator::new(),
             budget_tracker,
             stop_authority: Some(stop_authority),
-            require_budget: true,
+            require_budget: false,
         }
     }
 
@@ -550,20 +636,27 @@ impl PreActuationGate {
     ) -> Result<PreActuationReceipt, PreActuationDenial> {
         // TCK-00351 BLOCKER 1 FIX: Read from authoritative stop state
         // when available, instead of trusting caller-supplied values.
-        let (emer_stop, gov_stop) = self.stop_authority.as_ref().map_or(
-            (emergency_stop_active, governance_stop_active),
+        let (emer_stop, gov_stop, gov_uncertain) = self.stop_authority.as_ref().map_or(
+            (emergency_stop_active, governance_stop_active, false),
             |authority| {
                 (
                     authority.emergency_stop_active(),
                     authority.governance_stop_active(),
+                    authority.governance_uncertain(),
                 )
             },
         );
 
         // --- Step 1: Evaluate stop conditions ---
-        let stop_status =
-            self.evaluator
-                .evaluate(conditions, current_episode_count, emer_stop, gov_stop);
+        // TCK-00351 MAJOR 1 v2 FIX: Use evaluate_with_uncertainty so
+        // the Uncertain path is reachable when governance is uncertain.
+        let stop_status = self.evaluator.evaluate_with_uncertainty(
+            conditions,
+            current_episode_count,
+            emer_stop,
+            gov_stop,
+            gov_uncertain,
+        );
 
         match stop_status {
             StopStatus::Active { class } => {
@@ -812,6 +905,13 @@ impl fmt::Display for ReplayViolation {
 impl std::error::Error for ReplayViolation {}
 
 /// Verifies that replay traces satisfy pre-actuation ordering invariants.
+///
+/// # Evidence Binding
+///
+/// This verifier is bound to **EVID-0305**: Pre-actuation ordering proof.
+/// It is invoked during evidence validation to confirm that every tool
+/// actuation in a replayed trace was preceded by a valid pre-actuation
+/// receipt.
 ///
 /// # Invariants
 ///
@@ -1583,10 +1683,29 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_production_gate_no_tracker_denies() {
-        // Production gate with require_budget=true and no tracker should deny.
+    fn test_production_gate_no_tracker_allows() {
+        // TCK-00351 BLOCKER 1 v2 FIX: Production gate with no budget
+        // tracker should ALLOW (budget deferred to EpisodeRuntime) to
+        // avoid self-DoS where ALL tool requests are denied.
         let authority = Arc::new(StopAuthority::new());
         let gate = PreActuationGate::production_gate(authority, None);
+
+        let conditions = StopConditions::default();
+        let result = gate.check(&conditions, 0, false, false, 0, 1000);
+        assert!(
+            result.is_ok(),
+            "production gate without tracker should allow"
+        );
+        let receipt = result.unwrap();
+        assert!(receipt.is_cleared());
+    }
+
+    #[test]
+    fn test_production_gate_with_require_budget_and_no_tracker_denies() {
+        // Explicit require_budget=true on production gate should deny
+        // when no tracker is configured (opt-in per-session budget).
+        let authority = Arc::new(StopAuthority::new());
+        let gate = PreActuationGate::production_gate(authority, None).with_require_budget(true);
 
         let conditions = StopConditions::default();
         let result = gate.check(&conditions, 0, false, false, 0, 1000);
@@ -1694,5 +1813,203 @@ mod tests {
             },
             other => panic!("unexpected denial: {other}"),
         }
+    }
+
+    // =========================================================================
+    // TCK-00351 MAJOR 1 v2 FIX: Governance-uncertainty & deadline tests
+    // =========================================================================
+
+    #[test]
+    fn test_evaluator_returns_uncertain_when_governance_uncertain() {
+        let evaluator = StopConditionEvaluator::new();
+        let conditions = StopConditions::default();
+        let status = evaluator.evaluate_with_uncertainty(&conditions, 0, false, false, true);
+        assert_eq!(status, StopStatus::Uncertain);
+    }
+
+    #[test]
+    fn test_evaluator_active_takes_priority_over_uncertain() {
+        let evaluator = StopConditionEvaluator::new();
+        let conditions = StopConditions::default();
+        // Emergency stop is active AND governance uncertain -- Active wins.
+        let status = evaluator.evaluate_with_uncertainty(&conditions, 0, true, false, true);
+        assert_eq!(
+            status,
+            StopStatus::Active {
+                class: StopClass::EmergencyStop,
+            }
+        );
+    }
+
+    #[test]
+    fn test_gate_uncertain_deadline_crossing_denies() {
+        // TCK-00351 MAJOR 1 v2 FIX: When governance is uncertain and
+        // elapsed_ms exceeds the deadline, the gate MUST deny with
+        // StopUncertain.
+        let authority = Arc::new(StopAuthority::new());
+        authority.set_governance_uncertain(true);
+
+        let deadline_ms = 5_000;
+        let evaluator = StopConditionEvaluator::with_uncertainty_deadline_ms(deadline_ms);
+        let gate =
+            PreActuationGate::new(evaluator, None).with_stop_authority(Arc::clone(&authority));
+
+        let conditions = StopConditions::default();
+        // elapsed_ms == deadline => deny
+        let result = gate.check(&conditions, 0, false, false, deadline_ms, 1000);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PreActuationDenial::StopUncertain => {},
+            other => panic!("expected StopUncertain, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_gate_uncertain_within_deadline_allows() {
+        // Within deadline, uncertain status is optimistic (allow).
+        let authority = Arc::new(StopAuthority::new());
+        authority.set_governance_uncertain(true);
+
+        let deadline_ms = 30_000;
+        let evaluator = StopConditionEvaluator::with_uncertainty_deadline_ms(deadline_ms);
+        let gate =
+            PreActuationGate::new(evaluator, None).with_stop_authority(Arc::clone(&authority));
+
+        let conditions = StopConditions::default();
+        // elapsed_ms < deadline => allow
+        let result = gate.check(&conditions, 0, false, false, 1_000, 2000);
+        assert!(result.is_ok());
+    }
+
+    // =========================================================================
+    // TCK-00351 MAJOR 2 v2 FIX: StopAuthority runtime mutation test
+    // =========================================================================
+
+    #[test]
+    fn test_stop_authority_flip_immediately_denies() {
+        // Verify that flipping stop flags on a shared StopAuthority is
+        // immediately visible to the gate (no stale cache).
+        let authority = Arc::new(StopAuthority::new());
+        let gate = PreActuationGate::production_gate(Arc::clone(&authority), None);
+
+        let conditions = StopConditions::default();
+
+        // Initially clear
+        let result = gate.check(&conditions, 0, false, false, 0, 1000);
+        assert!(result.is_ok(), "should allow before stop");
+
+        // Operator flips emergency stop
+        authority.set_emergency_stop(true);
+
+        let result = gate.check(&conditions, 0, false, false, 0, 2000);
+        assert!(result.is_err(), "should deny after emergency stop");
+        match result.unwrap_err() {
+            PreActuationDenial::StopActive { class } => {
+                assert_eq!(class, StopClass::EmergencyStop);
+            },
+            other => panic!("expected EmergencyStop, got: {other}"),
+        }
+
+        // Operator clears emergency stop
+        authority.set_emergency_stop(false);
+
+        let result = gate.check(&conditions, 0, false, false, 0, 3000);
+        assert!(result.is_ok(), "should allow after stop cleared");
+    }
+
+    #[test]
+    fn test_stop_authority_governance_uncertain_flag() {
+        let authority = StopAuthority::new();
+        assert!(!authority.governance_uncertain());
+        authority.set_governance_uncertain(true);
+        assert!(authority.governance_uncertain());
+        authority.set_governance_uncertain(false);
+        assert!(!authority.governance_uncertain());
+    }
+
+    // =========================================================================
+    // TCK-00351 MAJOR 3 v2 FIX: ReplayVerifier integration test (EVID-0305)
+    // =========================================================================
+
+    /// Integration-style test exercising `ReplayVerifier::verify` on a
+    /// production-like trace: gate check => actuation for two tool calls.
+    ///
+    /// # Evidence Binding
+    ///
+    /// This test is bound to **EVID-0305**: Pre-actuation ordering proof
+    /// verifier evidence.
+    #[test]
+    fn test_replay_verifier_production_flow_evid_0305() {
+        // Simulate a production flow: gate check -> tool actuation.
+        let authority = Arc::new(StopAuthority::new());
+        let gate = PreActuationGate::production_gate(Arc::clone(&authority), None);
+        let conditions = StopConditions::default();
+
+        // First tool request: gate check at ts=100
+        let receipt1 = gate
+            .check(&conditions, 0, false, false, 0, 100)
+            .expect("gate should clear");
+        assert!(receipt1.stop_checked);
+        assert!(receipt1.budget_checked);
+
+        // Second tool request: gate check at ts=300
+        let receipt2 = gate
+            .check(&conditions, 0, false, false, 0, 300)
+            .expect("gate should clear");
+
+        // Build trace as the runtime would
+        let trace = vec![
+            ReplayEntry {
+                timestamp_ns: receipt1.timestamp_ns,
+                kind: ReplayEntryKind::PreActuationCheck {
+                    stop_checked: receipt1.stop_checked,
+                    budget_checked: receipt1.budget_checked,
+                },
+            },
+            ReplayEntry {
+                timestamp_ns: 200, // actuation at ts=200
+                kind: ReplayEntryKind::ToolActuation {
+                    tool_class: "file_read".to_string(),
+                    request_id: "REQ-001".to_string(),
+                },
+            },
+            ReplayEntry {
+                timestamp_ns: receipt2.timestamp_ns,
+                kind: ReplayEntryKind::PreActuationCheck {
+                    stop_checked: receipt2.stop_checked,
+                    budget_checked: receipt2.budget_checked,
+                },
+            },
+            ReplayEntry {
+                timestamp_ns: 400, // actuation at ts=400
+                kind: ReplayEntryKind::ToolActuation {
+                    tool_class: "shell_exec".to_string(),
+                    request_id: "REQ-002".to_string(),
+                },
+            },
+        ];
+
+        // Verify passes
+        ReplayVerifier::verify(&trace).expect("production flow trace should verify (EVID-0305)");
+    }
+
+    /// Negative integration test: actuation without gate check must fail
+    /// replay verification (EVID-0305).
+    #[test]
+    fn test_replay_verifier_rejects_ungated_actuation_evid_0305() {
+        // Trace with actuation but no preceding check
+        let trace = vec![ReplayEntry {
+            timestamp_ns: 100,
+            kind: ReplayEntryKind::ToolActuation {
+                tool_class: "file_write".to_string(),
+                request_id: "REQ-UNGATED".to_string(),
+            },
+        }];
+
+        let err = ReplayVerifier::verify(&trace).unwrap_err();
+        assert!(
+            matches!(err, ReplayViolation::MissingPreActuationCheck { .. }),
+            "ungated actuation must be caught by verifier (EVID-0305)"
+        );
     }
 }

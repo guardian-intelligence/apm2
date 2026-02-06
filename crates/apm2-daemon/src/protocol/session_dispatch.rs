@@ -1311,6 +1311,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // This check MUST precede broker dispatch.  If the gate denies,
         // we return immediately without reaching the broker (fail-closed).
         //
+        // TCK-00351 BLOCKER 2 v2 FIX: When broker/runtime are configured
+        // the pre-actuation gate is MANDATORY.  If absent, hard-deny the
+        // request instead of silently setting proof fields to false and
+        // allowing execution to proceed.
+        //
         // TCK-00351 BLOCKER 1 FIX: Read real stop state from stop_authority
         // instead of hardcoded false.
         // TCK-00351 MAJOR 1 FIX: Store the receipt and propagate its fields
@@ -1341,12 +1346,21 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             // primary enforcement mechanisms at the session dispatch layer.
             let conditions = crate::episode::StopConditions::default();
 
+            // TCK-00351 MAJOR 1 FIX: Pass real elapsed time from session
+            // telemetry store instead of hardcoded 0.  This makes the
+            // stop-uncertainty deadline reachable.
+            let elapsed_ms = self
+                .telemetry_store
+                .as_ref()
+                .and_then(|store| store.get(&token.session_id))
+                .map_or(0, |telemetry| telemetry.elapsed_ms());
+
             match gate.check(
                 &conditions,
                 0, // current_episode_count
                 emergency_stop,
                 governance_stop,
-                0, // elapsed_ms
+                elapsed_ms,
                 precheck_ts,
             ) {
                 Ok(receipt) => {
@@ -1374,6 +1388,19 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     ));
                 },
             }
+        } else if self.broker.is_some() {
+            // TCK-00351 BLOCKER 2 v2 FIX: Broker is configured but gate
+            // is missing.  This is a configuration error; hard-deny rather
+            // than allowing execution without pre-actuation proof.
+            error!(
+                session_id = %token.session_id,
+                tool_id = %request.tool_id,
+                "Pre-actuation gate missing but broker configured (fail-closed)"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                "pre-actuation gate not configured (fail-closed)".to_string(),
+            ));
         } else {
             None
         };
@@ -4071,6 +4098,7 @@ mod tests {
     mod tool_execution {
         use super::*;
         use crate::episode::{ToolBroker, ToolBrokerConfig, ToolClass};
+        use crate::htf::ClockConfig;
 
         /// TCK-00316: Verify fail-closed behavior when broker is configured but
         /// holonic clock is missing.
@@ -4078,8 +4106,13 @@ mod tests {
         /// Per SEC-CTRL-FAC-0015, the dispatcher must fail-closed when required
         /// infrastructure (clock, runtime) is missing. This test verifies the
         /// clock check happens before broker request.
+        ///
+        /// TCK-00351 BLOCKER 2 v2 FIX: Broker now requires a gate; this test
+        /// wires a default gate so the clock check is the first failure point.
         #[test]
         fn test_request_tool_fails_closed_without_clock() {
+            use crate::episode::preactuation::{PreActuationGate, StopAuthority};
+
             let minter = test_minter();
             let store = Arc::new(InMemoryManifestStore::new());
 
@@ -4090,9 +4123,14 @@ mod tests {
             // Create broker with default config
             let broker = Arc::new(ToolBroker::new(ToolBrokerConfig::default()));
 
-            // Create dispatcher WITH broker but WITHOUT clock
-            let dispatcher =
-                SessionDispatcher::with_manifest_store(minter.clone(), store).with_broker(broker);
+            // Wire a gate (required since BLOCKER 2 fix) but no clock
+            let authority = Arc::new(StopAuthority::new());
+            let gate = Arc::new(PreActuationGate::production_gate(authority, None));
+
+            // Create dispatcher WITH broker and gate but WITHOUT clock
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store)
+                .with_broker(broker)
+                .with_preactuation_gate(gate);
 
             let token = test_token(&minter);
             let ctx = make_session_ctx();
@@ -4107,6 +4145,8 @@ mod tests {
             let frame = encode_request_tool_request(&request);
 
             // Should return protocol error for missing clock (fail-closed)
+            // The gate check calls get_htf_timestamp() which fails
+            // because no clock is configured.
             let result = dispatcher.dispatch(&frame, &ctx);
             match result {
                 Err(ProtocolError::Serialization { reason }) => {
@@ -4163,6 +4203,60 @@ mod tests {
                     );
                 },
                 other => panic!("Expected Error response, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00351 BLOCKER 2 v2 FIX: Broker configured without
+        /// pre-actuation gate must be denied (fail-closed).
+        ///
+        /// This regression test verifies that when a broker is configured
+        /// but the pre-actuation gate is missing, `RequestTool` is
+        /// hard-denied instead of proceeding without proof fields.
+        #[test]
+        fn test_request_tool_denied_broker_without_gate() {
+            let minter = test_minter();
+            let store = Arc::new(InMemoryManifestStore::new());
+
+            let manifest = tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Read]);
+            store.register("session-001", manifest);
+
+            let broker = Arc::new(ToolBroker::new(ToolBrokerConfig::default()));
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None)
+                    .expect("default ClockConfig should succeed"),
+            );
+
+            // Create dispatcher WITH broker and clock but WITHOUT gate
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store)
+                .with_broker(broker)
+                .with_clock(clock);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "read".to_string(),
+                arguments: vec![],
+                dedupe_key: "test-dedupe-no-gate".to_string(),
+            };
+            let frame = encode_request_tool_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Expected TOOL_NOT_ALLOWED for missing gate"
+                    );
+                    assert!(
+                        err.message.contains("pre-actuation gate not configured"),
+                        "Error should mention missing gate: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for broker-without-gate, got: {other:?}"),
             }
         }
     }
@@ -4927,6 +5021,15 @@ mod tests {
                     .expect("telemetry registration should succeed");
 
                 // --- Build dispatcher with all production dependencies ---
+                // TCK-00351 BLOCKER 2 v2 FIX: Gate is mandatory when broker
+                // is configured.
+                let stop_authority = Arc::new(crate::episode::preactuation::StopAuthority::new());
+                let preactuation_gate = Arc::new(
+                    crate::episode::preactuation::PreActuationGate::production_gate(
+                        Arc::clone(&stop_authority),
+                        None,
+                    ),
+                );
                 let dispatcher =
                     SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
                         .with_broker(broker)
@@ -4934,7 +5037,9 @@ mod tests {
                         .with_ledger(ledger)
                         .with_episode_runtime(episode_runtime)
                         .with_session_registry(Arc::clone(&registry))
-                        .with_telemetry_store(Arc::clone(&telemetry_store));
+                        .with_telemetry_store(Arc::clone(&telemetry_store))
+                        .with_preactuation_gate(preactuation_gate)
+                        .with_stop_authority(stop_authority);
 
                 // Mint token with the episode-derived session_id
                 let spawn_time = std::time::SystemTime::now();

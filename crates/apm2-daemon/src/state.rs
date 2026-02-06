@@ -153,6 +153,13 @@ pub struct DispatcherState {
     /// It verifies policy hash, executes squash merge via GitHub API,
     /// creates a signed `MergeReceipt`, and transitions work to Completed.
     merge_executor: Option<Arc<MergeExecutor>>,
+
+    /// Shared stop authority for runtime mutation (TCK-00351 MAJOR 2 FIX).
+    ///
+    /// Stored as `Arc` so operator/governance control-plane paths can
+    /// mutate stop flags at runtime (e.g., set emergency stop) and the
+    /// pre-actuation gate immediately sees the change.
+    stop_authority: Option<Arc<crate::episode::preactuation::StopAuthority>>,
 }
 
 impl DispatcherState {
@@ -259,6 +266,7 @@ impl DispatcherState {
             session_dispatcher,
             gate_orchestrator: None,
             merge_executor: None,
+            stop_authority: None,
         }
     }
 
@@ -343,6 +351,7 @@ impl DispatcherState {
             session_dispatcher,
             gate_orchestrator: None,
             merge_executor: None,
+            stop_authority: None,
         }
     }
 
@@ -514,13 +523,16 @@ impl DispatcherState {
                 .with_session_registry(session_registry_for_session)
                 .with_telemetry_store(telemetry_store)
                 .with_preactuation_gate(preactuation_gate)
-                .with_stop_authority(stop_authority);
+                .with_stop_authority(Arc::clone(&stop_authority));
 
         Self {
             privileged_dispatcher,
             session_dispatcher,
             gate_orchestrator: None,
             merge_executor: None,
+            // TCK-00351 MAJOR 2 FIX: Store shared stop authority for
+            // runtime mutation by operator/governance control plane.
+            stop_authority: Some(stop_authority),
         }
     }
 
@@ -748,13 +760,16 @@ impl DispatcherState {
                 .with_episode_runtime(episode_runtime)
                 .with_telemetry_store(telemetry_store)
                 .with_preactuation_gate(preactuation_gate)
-                .with_stop_authority(stop_authority);
+                .with_stop_authority(Arc::clone(&stop_authority));
 
         Ok(Self {
             privileged_dispatcher,
             session_dispatcher,
             gate_orchestrator: None,
             merge_executor: None,
+            // TCK-00351 MAJOR 2 FIX: Store shared stop authority for
+            // runtime mutation by operator/governance control plane.
+            stop_authority: Some(stop_authority),
         })
     }
 
@@ -864,6 +879,22 @@ impl DispatcherState {
     #[must_use]
     pub fn event_emitter(&self) -> &Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> {
         self.privileged_dispatcher.event_emitter()
+    }
+
+    /// Returns the shared stop authority for runtime mutation (TCK-00351
+    /// MAJOR 2 FIX).
+    ///
+    /// Operator/governance control-plane paths use this to flip stop flags
+    /// at runtime.  Changes are immediately visible to the pre-actuation
+    /// gate because the `Arc` is shared.
+    ///
+    /// Returns `None` for non-production dispatchers that were created
+    /// without a pre-actuation gate.
+    #[must_use]
+    pub const fn stop_authority(
+        &self,
+    ) -> Option<&Arc<crate::episode::preactuation::StopAuthority>> {
+        self.stop_authority.as_ref()
     }
 }
 
