@@ -1070,6 +1070,22 @@ impl SessionRegistry for InMemorySessionRegistry {
 
         Some((entry.session.clone(), entry.info.clone()))
     }
+
+    fn update_episode_id(
+        &self,
+        session_id: &str,
+        episode_id: String,
+    ) -> Result<(), SessionRegistryError> {
+        let mut state = self.state.write().expect("lock poisoned");
+        if let Some(session) = state.by_id.get_mut(session_id) {
+            session.episode_id = Some(episode_id);
+            Ok(())
+        } else {
+            Err(SessionRegistryError::RegistrationFailed {
+                message: format!("session not found for episode_id update: {session_id}"),
+            })
+        }
+    }
 }
 
 impl InMemorySessionRegistry {
@@ -2254,6 +2270,18 @@ impl SessionRegistry for PersistentSessionRegistry {
         session_id: &str,
     ) -> Option<(SessionState, SessionTerminationInfo)> {
         SessionRegistry::get_terminated_session(&self.inner, session_id)
+    }
+
+    fn update_episode_id(
+        &self,
+        session_id: &str,
+        episode_id: String,
+    ) -> Result<(), SessionRegistryError> {
+        self.inner.update_episode_id(session_id, episode_id)?;
+        self.persist()
+            .map_err(|e| SessionRegistryError::RegistrationFailed {
+                message: format!("persistence failed after episode_id update: {e}"),
+            })
     }
 
     /// Returns all sessions for crash recovery (TCK-00387).
