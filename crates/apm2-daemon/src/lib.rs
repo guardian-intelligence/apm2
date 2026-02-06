@@ -27,6 +27,8 @@
 //!
 //! - [`episode`]: Episode runtime for bounded execution management
 //! - [`evidence`]: Flight recording and evidence retention
+//! - [`gate`]: Gate execution orchestrator for autonomous gate lifecycle
+//!   (TCK-00388)
 //! - [`htf`]: Holonic Time Framework clock service and envelope stamping
 //! - [`metrics`]: Prometheus metrics for daemon health observability
 //!   (REQ-DCP-0012)
@@ -38,6 +40,7 @@
 pub mod cas;
 pub mod episode;
 pub mod evidence;
+pub mod gate;
 pub mod governance;
 pub mod htf;
 pub mod ledger;
