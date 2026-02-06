@@ -1,3 +1,7 @@
+// Allow large stack arrays in tests: HashMap monomorphization triggers spanless
+// false positives that cannot be scoped to specific modules (TCK-00388).
+#![cfg_attr(test, allow(clippy::large_stack_arrays))]
+
 //! apm2-daemon - AI CLI Process Manager Daemon Library
 //!
 //! This library provides the core daemon functionality for managing AI CLI

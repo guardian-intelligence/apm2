@@ -43,5 +43,5 @@ mod orchestrator;
 pub use orchestrator::{
     DEFAULT_GATE_TIMEOUT_MS, GateOrchestrator, GateOrchestratorConfig, GateOrchestratorError,
     GateOrchestratorEvent, GateOutcome, GateStatus, GateType, MAX_CONCURRENT_ORCHESTRATIONS,
-    MAX_GATE_TYPES, MAX_WORK_ID_LENGTH, SessionTerminatedInfo,
+    MAX_GATE_TYPES, MAX_WORK_ID_LENGTH, SessionTerminatedInfo, create_timeout_receipt,
 };

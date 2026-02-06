@@ -12,6 +12,14 @@
 //! - **Fail-closed**: Gate timeout produces FAIL verdict, blocking merge.
 //! - **Domain separation**: All leases use `GATE_LEASE_ISSUED:` prefix.
 //! - **Changeset binding**: Lease `changeset_digest` matches session data.
+//! - **Receipt authenticity**: Gate receipt signatures are verified against the
+//!   executor's verifying key before state transitions.
+//!
+//! # Event Model
+//!
+//! Events are returned per-invocation from each method rather than buffered
+//! in shared state. This avoids concurrent drain issues where parallel
+//! invocations could steal or drop events from a global buffer.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -471,8 +479,15 @@ impl Default for GateOrchestratorConfig {
 ///
 /// - Policy resolution MUST precede all lease issuance (ordering invariant)
 /// - Gate leases use domain-separated Ed25519 signatures
+/// - Receipt signatures are verified against executor verifying key
 /// - Timeout produces fail-closed FAIL verdict
 /// - Changeset digest in leases matches session data
+///
+/// # Event Model (BLOCKER 3 fix)
+///
+/// Events are returned per-invocation from each method rather than buffered
+/// in shared state. This avoids concurrent drain issues where parallel
+/// invocations could steal or drop events from a global buffer.
 ///
 /// # Thread Safety
 ///
@@ -482,8 +497,6 @@ pub struct GateOrchestrator {
     config: GateOrchestratorConfig,
     /// Active orchestrations indexed by `work_id`.
     orchestrations: RwLock<HashMap<String, OrchestrationEntry>>,
-    /// Event buffer for emitted events.
-    events: RwLock<Vec<GateOrchestratorEvent>>,
     /// Signer for gate leases and policy resolutions.
     signer: Arc<Signer>,
 }
@@ -495,7 +508,6 @@ impl GateOrchestrator {
         Self {
             config,
             orchestrations: RwLock::new(HashMap::new()),
-            events: RwLock::new(Vec::new()),
             signer,
         }
     }
@@ -511,12 +523,13 @@ impl GateOrchestrator {
         self.orchestrations.read().await.len()
     }
 
-    /// Drains all buffered events.
+    /// Returns the verifying key for receipt signature verification.
     ///
-    /// Returns the events in emission order. The internal buffer is cleared.
-    pub async fn drain_events(&self) -> Vec<GateOrchestratorEvent> {
-        let mut events = self.events.write().await;
-        std::mem::take(&mut *events)
+    /// This is the public key corresponding to the orchestrator's signer,
+    /// used to verify gate receipt signatures from executors.
+    #[must_use]
+    pub fn verifying_key(&self) -> apm2_core::crypto::VerifyingKey {
+        self.signer.verifying_key()
     }
 
     /// Handles a `session_terminated` event by starting gate orchestration.
@@ -524,17 +537,28 @@ impl GateOrchestrator {
     /// This is the primary entry point for the gate lifecycle. When a session
     /// terminates with associated work, this method:
     ///
-    /// 1. Validates input and checks resource limits
-    /// 2. Resolves policy for the changeset (emits
-    ///    `PolicyResolvedForChangeSet`)
+    /// 1. Validates input
+    /// 2. Resolves policy for the changeset
     /// 3. Issues gate leases for each required gate type
-    /// 4. Records the orchestration for executor spawning
+    /// 4. Performs admission check (duplicate + capacity) and inserts
+    ///    atomically
+    /// 5. Returns events only after successful insertion (BLOCKER 2 fix)
     ///
     /// # Ordering Invariant
     ///
-    /// The `PolicyResolvedForChangeSet` event is ALWAYS emitted before any
-    /// `GateLeaseIssued` event. This is enforced by the sequential execution
-    /// within this method.
+    /// The `PolicyResolved` event is ALWAYS emitted before any
+    /// `GateLeaseIssued` event in the returned event list.
+    ///
+    /// # BLOCKER 2 Fix: Events after admission
+    ///
+    /// Events are staged locally and returned only after the admission check
+    /// (duplicate detection + capacity check) succeeds and the orchestration
+    /// is inserted. On error, no events escape.
+    ///
+    /// # BLOCKER 3 Fix: Per-invocation events
+    ///
+    /// Events are returned from this method rather than buffered in shared
+    /// state. This prevents concurrent invocations from stealing events.
     ///
     /// # Errors
     ///
@@ -546,7 +570,7 @@ impl GateOrchestrator {
     pub async fn handle_session_terminated(
         &self,
         info: SessionTerminatedInfo,
-    ) -> Result<Vec<GateType>, GateOrchestratorError> {
+    ) -> Result<(Vec<GateType>, Vec<GateOrchestratorEvent>), GateOrchestratorError> {
         // Validate work_id
         if info.work_id.is_empty() {
             return Err(GateOrchestratorError::EmptyWorkId);
@@ -572,20 +596,6 @@ impl GateOrchestrator {
         let policy_resolution = self.resolve_policy(&info, now_ms)?;
         let policy_hash = policy_resolution.resolved_policy_hash();
 
-        info!(
-            work_id = %info.work_id,
-            policy_hash = %hex::encode(policy_hash),
-            "Policy resolved for changeset"
-        );
-
-        // Emit PolicyResolved event
-        self.emit_event(GateOrchestratorEvent::PolicyResolved {
-            work_id: info.work_id.clone(),
-            policy_hash,
-            timestamp_ms: now_ms,
-        })
-        .await;
-
         // Step 2: Issue gate leases for each required gate type.
         // This MUST happen AFTER policy resolution (ordering invariant).
         let mut gates = HashMap::new();
@@ -594,35 +604,16 @@ impl GateOrchestrator {
 
         for &gate_type in &self.config.gate_types {
             let lease = self.issue_gate_lease(&info, gate_type, &policy_hash, now_ms)?;
-
             let lease_id = lease.lease_id.clone();
-            let executor_actor_id = lease.executor_actor_id.clone();
-
-            debug!(
-                work_id = %info.work_id,
-                gate_type = %gate_type,
-                lease_id = %lease_id,
-                "Gate lease issued"
-            );
-
-            // Emit GateLeaseIssued event
-            self.emit_event(GateOrchestratorEvent::GateLeaseIssued {
-                work_id: info.work_id.clone(),
-                gate_type,
-                lease_id: lease_id.clone(),
-                executor_actor_id,
-                timestamp_ms: now_ms,
-            })
-            .await;
-
             gates.insert(gate_type, GateStatus::LeaseIssued { lease_id });
             leases.insert(gate_type, lease);
             issued_gate_types.push(gate_type);
         }
 
-        // Step 3: Atomic check+insert under a single write lock.
-        // This prevents TOCTOU races where concurrent calls could exceed
-        // max_concurrent_orchestrations or bypass duplicate detection.
+        // Step 3 (BLOCKER 2 FIX): Admission check+insert FIRST, under a
+        // single write lock. Events are staged locally and committed only
+        // after this succeeds. On error, no events are emitted and no
+        // orchestration is inserted.
         {
             let mut orchestrations = self.orchestrations.write().await;
             if orchestrations.len() >= self.config.max_concurrent_orchestrations {
@@ -639,10 +630,10 @@ impl GateOrchestrator {
                 },
                 Entry::Vacant(vacant) => {
                     vacant.insert(OrchestrationEntry {
-                        _session_info: info,
+                        _session_info: info.clone(),
                         policy_resolution,
                         gates,
-                        leases,
+                        leases: leases.clone(),
                         receipts: HashMap::new(),
                         _started_at_ms: now_ms,
                     });
@@ -650,13 +641,51 @@ impl GateOrchestrator {
             }
         }
 
-        Ok(issued_gate_types)
+        // Step 4 (BLOCKER 3 FIX): Stage events locally per-invocation and
+        // return them. No global buffer is used.
+        let mut events = Vec::with_capacity(1 + issued_gate_types.len());
+
+        // PolicyResolved is ALWAYS first (ordering invariant).
+        events.push(GateOrchestratorEvent::PolicyResolved {
+            work_id: info.work_id.clone(),
+            policy_hash,
+            timestamp_ms: now_ms,
+        });
+
+        info!(
+            work_id = %info.work_id,
+            policy_hash = %hex::encode(policy_hash),
+            "Policy resolved for changeset"
+        );
+
+        for &gate_type in &issued_gate_types {
+            let lease = &leases[&gate_type];
+            let lease_id = lease.lease_id.clone();
+            let executor_actor_id = lease.executor_actor_id.clone();
+
+            debug!(
+                work_id = %info.work_id,
+                gate_type = %gate_type,
+                lease_id = %lease_id,
+                "Gate lease issued"
+            );
+
+            events.push(GateOrchestratorEvent::GateLeaseIssued {
+                work_id: info.work_id.clone(),
+                gate_type,
+                lease_id,
+                executor_actor_id,
+                timestamp_ms: now_ms,
+            });
+        }
+
+        Ok((issued_gate_types, events))
     }
 
     /// Records that a gate executor episode has been spawned.
     ///
     /// This updates the gate status from `LeaseIssued` to `Running` and
-    /// emits a `GateExecutorSpawned` event.
+    /// returns a `GateExecutorSpawned` event.
     ///
     /// # State Machine
     ///
@@ -673,7 +702,7 @@ impl GateOrchestrator {
         work_id: &str,
         gate_type: GateType,
         episode_id: &str,
-    ) -> Result<(), GateOrchestratorError> {
+    ) -> Result<Vec<GateOrchestratorEvent>, GateOrchestratorError> {
         let now_ms = current_time_ms();
 
         {
@@ -715,15 +744,6 @@ impl GateOrchestrator {
             }
         }
 
-        self.emit_event(GateOrchestratorEvent::GateExecutorSpawned {
-            work_id: work_id.to_string(),
-            gate_type,
-            episode_id: episode_id.to_string(),
-            adapter_profile_id: gate_type.adapter_profile_id().to_string(),
-            timestamp_ms: now_ms,
-        })
-        .await;
-
         info!(
             work_id = %work_id,
             gate_type = %gate_type,
@@ -731,13 +751,19 @@ impl GateOrchestrator {
             "Gate executor spawned"
         );
 
-        Ok(())
+        Ok(vec![GateOrchestratorEvent::GateExecutorSpawned {
+            work_id: work_id.to_string(),
+            gate_type,
+            episode_id: episode_id.to_string(),
+            adapter_profile_id: gate_type.adapter_profile_id().to_string(),
+            timestamp_ms: now_ms,
+        }])
     }
 
     /// Records a gate receipt from a completed gate executor.
     ///
-    /// This updates the gate status to `Completed` and emits a
-    /// `GateReceiptCollected` event. If all gates are complete, emits
+    /// This updates the gate status to `Completed` and returns a
+    /// `GateReceiptCollected` event. If all gates are complete, also returns
     /// an `AllGatesCompleted` event.
     ///
     /// # Binding Validation
@@ -745,6 +771,13 @@ impl GateOrchestrator {
     /// The receipt's `lease_id` and `gate_id` MUST match the issued lease for
     /// this gate type. The receipt's `changeset_digest` and `executor_actor_id`
     /// must also match. This prevents receipt substitution attacks.
+    ///
+    /// # Signature Verification (BLOCKER 4 fix)
+    ///
+    /// The receipt's `receipt_signature` is verified against the executor's
+    /// verifying key before any state transition. This ensures receipt
+    /// authenticity and prevents forged receipts from advancing the state
+    /// machine.
     ///
     /// # Verdict Derivation
     ///
@@ -770,6 +803,7 @@ impl GateOrchestrator {
     ///
     /// Returns error if:
     /// - The orchestration or gate is not found
+    /// - The receipt signature is invalid (BLOCKER 4)
     /// - The receipt's
     ///   `lease_id`/`gate_id`/`changeset_digest`/`executor_actor_id` do not
     ///   match the issued lease
@@ -780,9 +814,20 @@ impl GateOrchestrator {
         gate_type: GateType,
         receipt: GateReceipt,
         passed: bool,
-    ) -> Result<Option<Vec<GateOutcome>>, GateOrchestratorError> {
+    ) -> Result<(Option<Vec<GateOutcome>>, Vec<GateOrchestratorEvent>), GateOrchestratorError> {
         let now_ms = current_time_ms();
         let receipt_id = receipt.receipt_id.clone();
+
+        // BLOCKER 4 FIX: Verify receipt signature against executor verifying
+        // key BEFORE any state transition. The orchestrator's signer is the
+        // authority that signs leases and receipts, so we verify against its
+        // public key.
+        receipt
+            .validate_signature(&self.signer.verifying_key())
+            .map_err(|e| GateOrchestratorError::ReceiptBindingMismatch {
+                work_id: work_id.to_string(),
+                reason: format!("receipt signature verification failed: {e}"),
+            })?;
 
         {
             let mut orchestrations = self.orchestrations.write().await;
@@ -799,7 +844,7 @@ impl GateOrchestrator {
                 }
             })?;
 
-            // BLOCKER 2: Validate receipt binding against the issued lease.
+            // Validate receipt binding against the issued lease.
             let lease = entry.leases.get(&gate_type).ok_or_else(|| {
                 GateOrchestratorError::GateNotFound {
                     work_id: work_id.to_string(),
@@ -841,7 +886,7 @@ impl GateOrchestrator {
                 });
             }
 
-            // MAJOR 2: Enforce explicit state machine transitions.
+            // Enforce explicit state machine transitions.
             // Only non-terminal states (LeaseIssued, Running) can transition
             // to Completed. Terminal states are rejected.
             match gate_status {
@@ -870,14 +915,13 @@ impl GateOrchestrator {
             entry.receipts.insert(gate_type, receipt);
         }
 
-        self.emit_event(GateOrchestratorEvent::GateReceiptCollected {
+        let mut events = vec![GateOrchestratorEvent::GateReceiptCollected {
             work_id: work_id.to_string(),
             gate_type,
             receipt_id,
             passed,
             timestamp_ms: now_ms,
-        })
-        .await;
+        }];
 
         info!(
             work_id = %work_id,
@@ -887,10 +931,14 @@ impl GateOrchestrator {
         );
 
         // Check if all gates are complete
-        self.check_all_gates_complete(work_id, now_ms).await
+        let outcomes = self
+            .check_all_gates_complete(work_id, now_ms, &mut events)
+            .await?;
+
+        Ok((outcomes, events))
     }
 
-    /// Handles gate timeout by emitting a FAIL verdict (fail-closed).
+    /// Handles gate timeout by producing a FAIL verdict (fail-closed).
     ///
     /// # Security: Fail-Closed Semantics
     ///
@@ -911,8 +959,9 @@ impl GateOrchestrator {
         &self,
         work_id: &str,
         gate_type: GateType,
-    ) -> Result<Option<Vec<GateOutcome>>, GateOrchestratorError> {
+    ) -> Result<(Option<Vec<GateOutcome>>, Vec<GateOrchestratorEvent>), GateOrchestratorError> {
         let now_ms = current_time_ms();
+        let lease_id;
 
         {
             let mut orchestrations = self.orchestrations.write().await;
@@ -931,9 +980,11 @@ impl GateOrchestrator {
 
             // Enforce state machine: only non-terminal -> TimedOut is valid.
             match gate_status {
-                GateStatus::LeaseIssued { lease_id } | GateStatus::Running { lease_id, .. } => {
+                GateStatus::LeaseIssued { lease_id: lid }
+                | GateStatus::Running { lease_id: lid, .. } => {
+                    lease_id = lid.clone();
                     *gate_status = GateStatus::TimedOut {
-                        lease_id: lease_id.clone(),
+                        lease_id: lid.clone(),
                     };
                 },
                 other => {
@@ -954,35 +1005,25 @@ impl GateOrchestrator {
             }
         }
 
-        // Emit timeout event
-        let lease_id = {
-            let orchestrations = self.orchestrations.read().await;
-            orchestrations
-                .get(work_id)
-                .and_then(|e| e.gates.get(&gate_type))
-                .map(|s| match s {
-                    GateStatus::TimedOut { lease_id } => lease_id.clone(),
-                    _ => String::new(),
-                })
-                .unwrap_or_default()
-        };
-
-        self.emit_event(GateOrchestratorEvent::GateTimedOut {
-            work_id: work_id.to_string(),
-            gate_type,
-            lease_id,
-            timestamp_ms: now_ms,
-        })
-        .await;
-
         warn!(
             work_id = %work_id,
             gate_type = %gate_type,
             "Gate timed out - fail-closed FAIL verdict"
         );
 
+        let mut events = vec![GateOrchestratorEvent::GateTimedOut {
+            work_id: work_id.to_string(),
+            gate_type,
+            lease_id,
+            timestamp_ms: now_ms,
+        }];
+
         // Check if all gates are complete
-        self.check_all_gates_complete(work_id, now_ms).await
+        let outcomes = self
+            .check_all_gates_complete(work_id, now_ms, &mut events)
+            .await?;
+
+        Ok((outcomes, events))
     }
 
     /// Checks all active orchestrations for expired gates.
@@ -1053,7 +1094,7 @@ impl GateOrchestrator {
     ///
     /// 1. Starts gate orchestration via `handle_session_terminated`
     /// 2. Checks for timed-out gates and processes them
-    /// 3. Returns the emitted events for ledger persistence
+    /// 3. Returns all emitted events for ledger persistence
     ///
     /// The daemon runtime should call this method when it receives a
     /// `SessionTerminated` event from the ledger. The full ledger
@@ -1087,8 +1128,8 @@ impl GateOrchestrator {
     ) -> Result<(Vec<GateType>, Vec<GateOrchestratorEvent>), GateOrchestratorError> {
         let work_id = info.work_id.clone();
 
-        // Step 1: Start gate orchestration.
-        let gate_types = self.handle_session_terminated(info).await?;
+        // Step 1: Start gate orchestration (returns per-invocation events).
+        let (gate_types, mut events) = self.handle_session_terminated(info).await?;
 
         // Step 2: Check for any immediately timed-out gates (e.g., zero timeout).
         let timed_out = self.check_timeouts().await;
@@ -1096,12 +1137,11 @@ impl GateOrchestrator {
             if tid == work_id {
                 // Best-effort: ignore errors from timeout handling since the
                 // orchestration is already set up.
-                let _ = self.handle_gate_timeout(&tid, gt).await;
+                if let Ok((_outcomes, timeout_events)) = self.handle_gate_timeout(&tid, gt).await {
+                    events.extend(timeout_events);
+                }
             }
         }
-
-        // Step 3: Drain all events emitted during this cycle.
-        let events = self.drain_events().await;
 
         info!(
             work_id = %work_id,
@@ -1191,11 +1231,13 @@ impl GateOrchestrator {
         })
     }
 
-    /// Checks if all gates are complete and emits `AllGatesCompleted` if so.
+    /// Checks if all gates are complete and appends `AllGatesCompleted` to
+    /// the provided event list if so.
     async fn check_all_gates_complete(
         &self,
         work_id: &str,
         now_ms: u64,
+        events: &mut Vec<GateOrchestratorEvent>,
     ) -> Result<Option<Vec<GateOutcome>>, GateOrchestratorError> {
         let orchestrations = self.orchestrations.read().await;
         let entry = orchestrations.get(work_id).ok_or_else(|| {
@@ -1243,16 +1285,15 @@ impl GateOrchestrator {
             outcomes.push(outcome);
         }
 
-        // Drop read lock before writing events
+        // Drop read lock before appending events
         drop(orchestrations);
 
-        self.emit_event(GateOrchestratorEvent::AllGatesCompleted {
+        events.push(GateOrchestratorEvent::AllGatesCompleted {
             work_id: work_id.to_string(),
             all_passed,
             outcomes: outcomes.clone(),
             timestamp_ms: now_ms,
-        })
-        .await;
+        });
 
         info!(
             work_id = %work_id,
@@ -1262,12 +1303,6 @@ impl GateOrchestrator {
         );
 
         Ok(Some(outcomes))
-    }
-
-    /// Emits an orchestrator event to the internal buffer.
-    async fn emit_event(&self, event: GateOrchestratorEvent) {
-        let mut events = self.events.write().await;
-        events.push(event);
     }
 }
 
@@ -1364,7 +1399,7 @@ mod tests {
         let orch = test_orchestrator();
         let info = test_session_info("work-001");
 
-        let gate_types = orch.handle_session_terminated(info).await.unwrap();
+        let (gate_types, _events) = orch.handle_session_terminated(info).await.unwrap();
 
         assert_eq!(gate_types.len(), 3);
         assert!(gate_types.contains(&GateType::Aat));
@@ -1378,9 +1413,8 @@ mod tests {
         let orch = test_orchestrator();
         let info = test_session_info("work-002");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        let (_gate_types, events) = orch.handle_session_terminated(info).await.unwrap();
 
-        let events = orch.drain_events().await;
         // First event must be PolicyResolved
         assert!(matches!(
             events[0],
@@ -1460,9 +1494,15 @@ mod tests {
 
         orch.handle_session_terminated(info).await.unwrap();
 
-        orch.record_executor_spawned("work-005", GateType::Quality, "ep-001")
+        let events = orch
+            .record_executor_spawned("work-005", GateType::Quality, "ep-001")
             .await
             .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            GateOrchestratorEvent::GateExecutorSpawned { .. }
+        ));
 
         let status = orch
             .gate_status("work-005", GateType::Quality)
@@ -1494,13 +1534,19 @@ mod tests {
             .evidence_bundle_hash([0xCC; 32])
             .build_and_sign(&signer);
 
-        let result = orch
+        let (result, events) = orch
             .record_gate_receipt("work-006", GateType::Quality, receipt, true)
             .await
             .unwrap();
 
         // Not all gates complete yet
         assert!(result.is_none());
+        // Should have GateReceiptCollected event
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GateOrchestratorEvent::GateReceiptCollected { .. }))
+        );
 
         let status = orch
             .gate_status("work-006", GateType::Quality)
@@ -1534,7 +1580,7 @@ mod tests {
             .evidence_bundle_hash([0xCC; 32])
             .build_and_sign(&signer);
 
-            let result = orch
+            let (result, _events) = orch
                 .record_gate_receipt("work-007", gate_type, receipt, true)
                 .await
                 .unwrap();
@@ -1559,13 +1605,19 @@ mod tests {
 
         orch.handle_session_terminated(info).await.unwrap();
 
-        let result = orch
+        let (result, events) = orch
             .handle_gate_timeout("work-008", GateType::Aat)
             .await
             .unwrap();
 
         // Not all gates done
         assert!(result.is_none());
+        // Should have GateTimedOut event
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GateOrchestratorEvent::GateTimedOut { .. }))
+        );
 
         let status = orch.gate_status("work-008", GateType::Aat).await.unwrap();
         assert!(matches!(status, GateStatus::TimedOut { .. }));
@@ -1622,7 +1674,7 @@ mod tests {
             .unwrap();
 
         // Timeout security gate -> should trigger AllGatesCompleted
-        let result = orch
+        let (result, _events) = orch
             .handle_gate_timeout("work-009", GateType::Security)
             .await
             .unwrap();
@@ -1905,22 +1957,20 @@ mod tests {
     }
 
     // =========================================================================
-    // Event Drain Tests
+    // Per-Invocation Event Tests (BLOCKER 3)
     // =========================================================================
 
     #[tokio::test]
-    async fn test_drain_events_clears_buffer() {
+    async fn test_events_returned_per_invocation() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-drain");
+        let info = test_session_info("work-per-inv");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        let (_gate_types, events) = orch.handle_session_terminated(info).await.unwrap();
 
-        let events = orch.drain_events().await;
+        // Events are returned from the call, not buffered
         assert!(!events.is_empty());
-
-        // Second drain should be empty
-        let events2 = orch.drain_events().await;
-        assert!(events2.is_empty());
+        // 1 PolicyResolved + 3 GateLeaseIssued = 4 events
+        assert_eq!(events.len(), 4);
     }
 
     #[tokio::test]
@@ -1928,11 +1978,55 @@ mod tests {
         let orch = test_orchestrator();
         let info = test_session_info("work-events");
 
-        orch.handle_session_terminated(info).await.unwrap();
-
-        let events = orch.drain_events().await;
+        let (_gate_types, events) = orch.handle_session_terminated(info).await.unwrap();
         // 1 PolicyResolved + 3 GateLeaseIssued = 4 events
         assert_eq!(events.len(), 4);
+    }
+
+    // =========================================================================
+    // BLOCKER 2: Events not emitted on admission failure
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_no_events_on_duplicate_orchestration() {
+        let orch = test_orchestrator();
+        let info1 = test_session_info("work-no-events-dup");
+        let info2 = test_session_info("work-no-events-dup");
+
+        // First succeeds
+        let (_gate_types, events1) = orch.handle_session_terminated(info1).await.unwrap();
+        assert!(!events1.is_empty());
+
+        // Second fails with DuplicateOrchestration - no events should be returned
+        let err = orch.handle_session_terminated(info2).await.unwrap_err();
+        assert!(matches!(
+            err,
+            GateOrchestratorError::DuplicateOrchestration { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_no_events_on_max_orchestrations_exceeded() {
+        let config = GateOrchestratorConfig {
+            max_concurrent_orchestrations: 1,
+            ..Default::default()
+        };
+        let orch = GateOrchestrator::new(config, test_signer());
+
+        // First succeeds
+        orch.handle_session_terminated(test_session_info("work-max-a"))
+            .await
+            .unwrap();
+
+        // Second fails - no events should be returned
+        let err = orch
+            .handle_session_terminated(test_session_info("work-max-b"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GateOrchestratorError::MaxOrchestrationsExceeded { .. }
+        ));
     }
 
     // =========================================================================
@@ -2018,7 +2112,80 @@ mod tests {
     }
 
     // =========================================================================
-    // BLOCKER 2: Receipt Binding Validation Tests
+    // BLOCKER 4: Receipt Signature Verification Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_receipt_with_wrong_signer_rejected() {
+        let signer = test_signer();
+        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
+        let info = test_session_info("work-sig-1");
+
+        orch.handle_session_terminated(info).await.unwrap();
+
+        let lease = orch
+            .gate_lease("work-sig-1", GateType::Quality)
+            .await
+            .unwrap();
+
+        // Sign with a DIFFERENT signer (wrong key)
+        let wrong_signer = Signer::generate();
+        let receipt = GateReceiptBuilder::new("receipt-bad-sig", "gate-quality", &lease.lease_id)
+            .changeset_digest([0x42; 32])
+            .executor_actor_id(&lease.executor_actor_id)
+            .receipt_version(1)
+            .payload_kind("quality")
+            .payload_schema_version(1)
+            .payload_hash([0xBB; 32])
+            .evidence_bundle_hash([0xCC; 32])
+            .build_and_sign(&wrong_signer);
+
+        let err = orch
+            .record_gate_receipt("work-sig-1", GateType::Quality, receipt, true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GateOrchestratorError::ReceiptBindingMismatch { ref reason, .. } if reason.contains("signature")),
+            "Expected signature verification failure, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_receipt_with_correct_signer_accepted() {
+        let signer = test_signer();
+        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
+        let info = test_session_info("work-sig-2");
+
+        orch.handle_session_terminated(info).await.unwrap();
+
+        let lease = orch
+            .gate_lease("work-sig-2", GateType::Quality)
+            .await
+            .unwrap();
+
+        // Sign with the correct signer
+        let receipt = GateReceiptBuilder::new("receipt-good-sig", "gate-quality", &lease.lease_id)
+            .changeset_digest([0x42; 32])
+            .executor_actor_id(&lease.executor_actor_id)
+            .receipt_version(1)
+            .payload_kind("quality")
+            .payload_schema_version(1)
+            .payload_hash([0xBB; 32])
+            .evidence_bundle_hash([0xCC; 32])
+            .build_and_sign(&signer);
+
+        let (result, events) = orch
+            .record_gate_receipt("work-sig-2", GateType::Quality, receipt, true)
+            .await
+            .unwrap();
+
+        // Should succeed
+        assert!(result.is_none()); // Not all gates complete
+        assert!(!events.is_empty());
+    }
+
+    // =========================================================================
+    // Receipt Binding Validation Tests
     // =========================================================================
 
     #[tokio::test]
@@ -2158,7 +2325,7 @@ mod tests {
     }
 
     // =========================================================================
-    // BLOCKER 3: Verdict Derivation Tests
+    // Verdict Derivation Tests
     // =========================================================================
 
     #[tokio::test]
@@ -2187,7 +2354,7 @@ mod tests {
             .build_and_sign(&signer);
 
             let passed = gate_type != GateType::Quality; // Quality fails
-            let result = orch
+            let (result, _events) = orch
                 .record_gate_receipt("work-fail", gate_type, receipt, passed)
                 .await
                 .unwrap();
@@ -2226,7 +2393,7 @@ mod tests {
     }
 
     // =========================================================================
-    // MAJOR 2: State Transition Tests
+    // State Transition Tests
     // =========================================================================
 
     #[tokio::test]
