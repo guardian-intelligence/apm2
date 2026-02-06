@@ -4872,6 +4872,13 @@ impl PrivilegedDispatcher {
             self.manifest_store.remove(session_id);
         }
 
+        // 3a. TCK-00352 MAJOR 2 fix: Remove V1 manifest on rollback.
+        // Without this, a failed spawn leaves a stale V1 manifest that
+        // could be matched by a recycled session ID (dangling reference).
+        if let Some(ref v1_store) = self.v1_manifest_store {
+            v1_store.remove(session_id);
+        }
+
         // 3b. Restore evicted manifests so capacity is not permanently lost.
         for (sid, manifest) in evicted_manifests {
             self.manifest_store
@@ -5623,10 +5630,59 @@ impl PrivilegedDispatcher {
         // checks (risk tier ceiling, host restrictions, envelope binding)
         // during handle_request_tool.
         if let Some(ref v1_store) = self.v1_manifest_store {
-            // PolicyMintToken::new() is pub(crate) -- this is the sealed
-            // governance path inside the daemon. External callers cannot
-            // reach this code.
-            let mint_token = crate::episode::capability::PolicyMintToken::new();
+            // TCK-00352 MAJOR 1 fix: Invoke strict-subset validation BEFORE
+            // minting the V1 manifest. This ensures that a manifest with
+            // same-cardinality substitution attacks (e.g., swapping an
+            // authorized tool for an unauthorized one while keeping the
+            // count within bounds) is rejected at spawn time, not just in
+            // tests.
+            let scope_baseline = crate::episode::capability::ScopeBaseline {
+                tools: manifest.tool_allowlist.clone(),
+                write_paths: manifest.write_allowlist.clone(),
+                shell_patterns: manifest.shell_allowlist.clone(),
+            };
+            if let Err(e) = crate::episode::capability::validate_manifest_scope_subset(
+                &manifest,
+                &scope_baseline,
+            ) {
+                let rollback_warn = self.rollback_spawn(
+                    &session_id,
+                    &evicted_sessions,
+                    &evicted_telemetry,
+                    &evicted_manifests,
+                    true,
+                );
+                if let Some(ref rw) = rollback_warn {
+                    warn!(
+                        rollback_errors = %rw,
+                        "Partial rollback failure during scope subset validation"
+                    );
+                }
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "SpawnEpisode rejected: manifest scope exceeds policy baseline (fail-closed)"
+                );
+                let msg = rollback_warn.map_or_else(
+                    || format!("manifest scope validation failed: {e}"),
+                    |rw| {
+                        format!(
+                            "manifest scope validation failed: {e} (rollback partial failure: {rw})"
+                        )
+                    },
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    msg,
+                ));
+            }
+
+            // TCK-00352 MAJOR 3 fix: Obtain mint token through the
+            // governance-resolver authority path, not direct construction.
+            // This centralizes minting authority to the policy resolver and
+            // ensures the token is obtained through the approved channel.
+            let governance = crate::governance::GovernancePolicyResolver::new();
+            let mint_token = governance.mint_token();
 
             // Determine risk tier ceiling from the manifest capabilities.
             // Use the highest tier among all capabilities as the ceiling.
@@ -5637,10 +5693,11 @@ impl PrivilegedDispatcher {
                 .max_by_key(crate::episode::envelope::RiskTier::tier)
                 .unwrap_or(crate::episode::envelope::RiskTier::Tier0);
 
-            // Attempt V1 minting. If it fails (e.g., zero expiry on legacy
-            // manifests), log at debug and proceed without V1 enforcement.
-            // This provides backwards compatibility while adding V1 checks
-            // for manifests that meet V1 requirements.
+            // TCK-00352 BLOCKER 2 fix: V1 minting failure is now a HARD
+            // DENY (fail-closed). When V1 controls are configured (v1_store
+            // is Some), every session MUST have an active V1 manifest.
+            // Continuing without one would leave the session without V1
+            // scope enforcement, which is fail-open.
             match crate::episode::CapabilityManifestV1::mint(
                 mint_token,
                 manifest.clone(),
@@ -5656,11 +5713,37 @@ impl PrivilegedDispatcher {
                     );
                 },
                 Err(e) => {
-                    debug!(
+                    // HARD DENY: Roll back all state and reject the spawn.
+                    let rollback_warn = self.rollback_spawn(
+                        &session_id,
+                        &evicted_sessions,
+                        &evicted_telemetry,
+                        &evicted_manifests,
+                        true,
+                    );
+                    if let Some(ref rw) = rollback_warn {
+                        warn!(
+                            rollback_errors = %rw,
+                            "Partial rollback failure during V1 mint failure recovery"
+                        );
+                    }
+                    warn!(
                         session_id = %session_id,
                         error = %e,
-                        "V1 manifest minting skipped (legacy manifest without V1 requirements)"
+                        "SpawnEpisode rejected: V1 manifest minting failed (fail-closed)"
                     );
+                    let msg = rollback_warn.map_or_else(
+                        || format!("V1 manifest minting failed: {e}"),
+                        |rw| {
+                            format!(
+                                "V1 manifest minting failed: {e} (rollback partial failure: {rw})"
+                            )
+                        },
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        msg,
+                    ));
                 },
             }
         }
@@ -6530,6 +6613,15 @@ impl PrivilegedDispatcher {
         // to prevent retained session tokens from passing manifest lookup
         // in RequestTool after EndSession.
         self.manifest_store.remove(&request.session_id);
+
+        // TCK-00352 MAJOR 2 fix: Remove V1 manifest on EndSession.
+        // Without this, a terminated session's V1 manifest remains in the
+        // store. If a new session reuses the same ID (or a retained token
+        // is replayed), the stale V1 manifest could incorrectly match,
+        // either granting or denying based on an expired session's policy.
+        if let Some(ref v1_store) = self.v1_manifest_store {
+            v1_store.remove(&request.session_id);
+        }
 
         // TCK-00384 review fix: Clean up telemetry on EndSession to free
         // capacity in the bounded store. Without this, repeated

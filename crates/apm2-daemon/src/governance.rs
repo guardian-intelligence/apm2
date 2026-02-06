@@ -66,7 +66,6 @@ impl GovernancePolicyResolver {
     /// external crates and requester surfaces cannot obtain a mint token.
     /// Minting is restricted to the sealed governance path inside the daemon.
     #[must_use]
-    #[allow(dead_code)] // Used in tests and reserved for future governance holon integration
     #[allow(clippy::unused_self)] // Takes &self to enforce resolver-only access pattern
     pub(crate) const fn mint_token(&self) -> PolicyMintToken {
         PolicyMintToken::new()

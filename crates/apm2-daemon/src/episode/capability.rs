@@ -862,18 +862,26 @@ impl CapabilityManifest {
         capability_manifest_hash: &[u8; 32],
         tool_allowlist: Vec<ToolClass>,
     ) -> Self {
+        // TCK-00352 BLOCKER 2 fix: V1 minting requires non-zero expiry.
+        // Default to 24 hours from now for stub/fallback manifests so
+        // that V1 enforcement is active. Without this, stub manifests
+        // cause V1 minting to fail, leaving sessions without V1 scope
+        // enforcement (fail-open).
+        const DEFAULT_MANIFEST_TTL_SECS: u64 = 86400; // 24 hours
+
         let manifest_id = format!("M-{}", hex::encode(&capability_manifest_hash[..8]));
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_secs();
+        let expires_at = now + DEFAULT_MANIFEST_TTL_SECS;
 
         Self {
             manifest_id,
             capabilities: Vec::new(),
             delegator_id: "daemon".to_string(),
             created_at: now,
-            expires_at: 0, // No expiration
+            expires_at,
             tool_allowlist,
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
@@ -2502,8 +2510,14 @@ impl PolicyMintToken {
     ///
     /// # Security
     ///
-    /// This is `pub(crate)` to restrict minting authority to daemon internals.
-    /// The policy resolver is the only legitimate caller.
+    /// This constructor is `pub(crate)` to restrict minting authority to
+    /// daemon internals. **Production code MUST NOT call this directly.**
+    /// Instead, use [`GovernancePolicyResolver::mint_token()`] to obtain a
+    /// token through the authorized governance channel. Direct construction
+    /// is reserved for the `GovernancePolicyResolver` implementation and
+    /// test code within this module.
+    ///
+    /// [`GovernancePolicyResolver::mint_token()`]: crate::governance::GovernancePolicyResolver::mint_token
     #[must_use]
     pub(crate) const fn new() -> Self {
         Self { _private: () }
