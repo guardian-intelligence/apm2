@@ -30,7 +30,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use apm2_core::crypto::{Signer, VerifyingKey};
 use apm2_core::fac::{
     AatLeaseExtension, GateLease, GateLeaseBuilder, GateReceipt, GateReceiptBuilder,
-    PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
+    PolicyInheritanceValidator, PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -449,6 +449,19 @@ pub enum GateOrchestratorError {
         work_id: String,
         /// The stale timestamp.
         terminated_at_ms: u64,
+    },
+
+    /// Sublease validation failed during delegated lease issuance (TCK-00340).
+    ///
+    /// A newly issued gate lease failed strict-subset validation against its
+    /// parent lease. This prevents scope escalation via gate switching or
+    /// policy drift.
+    #[error("sublease validation failed for work_id {work_id}: {reason}")]
+    SubleaseValidationFailed {
+        /// The work ID.
+        work_id: String,
+        /// Validation failure reason.
+        reason: String,
     },
 }
 
@@ -1739,6 +1752,38 @@ impl GateOrchestrator {
             GateOrchestratorError::LeaseIssuanceFailed {
                 work_id: info.work_id.clone(),
                 gate_id: gate_type.as_gate_id().to_string(),
+                reason: e.to_string(),
+            }
+        })
+    }
+
+    /// Validates that a sublease is a strict subset of a parent lease.
+    ///
+    /// This is the production wiring point for
+    /// [`PolicyInheritanceValidator::validate_sublease`]. Call this method
+    /// when delegating authority from a parent holon's lease to a child
+    /// holon's sublease. If validation fails, the delegation MUST
+    /// be rejected (fail-closed).
+    ///
+    /// # Security
+    ///
+    /// - **Gate-scope enforcement**: The sublease's `gate_id` must match the
+    ///   parent's `gate_id` (prevents gate-switching bypass).
+    /// - **Strict subset**: All fields (`work_id`, `changeset_digest`,
+    ///   `policy_hash`, time bounds, AAT extension fields) must be equal or
+    ///   narrower.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GateOrchestratorError::SubleaseValidationFailed`] on any
+    /// violation.
+    pub fn validate_sublease_delegation(
+        parent: &GateLease,
+        sublease: &GateLease,
+    ) -> Result<(), GateOrchestratorError> {
+        PolicyInheritanceValidator::validate_sublease(parent, sublease).map_err(|e| {
+            GateOrchestratorError::SubleaseValidationFailed {
+                work_id: parent.work_id.clone(),
                 reason: e.to_string(),
             }
         })
@@ -3995,5 +4040,102 @@ mod tests {
                 .is_none(),
             "Gate status should be None after orchestration reclamation"
         );
+    }
+
+    // =========================================================================
+    // TCK-00340: Sublease delegation validation tests (production wiring)
+    // =========================================================================
+
+    #[test]
+    fn test_validate_sublease_delegation_valid() {
+        let signer = Signer::generate();
+
+        let parent = GateLeaseBuilder::new("parent-001", "work-001", "gate-quality")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_000_000)
+            .expires_at(2_000_000)
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:100")
+            .build_and_sign(&signer);
+
+        let sublease = GateLeaseBuilder::new("sub-001", "work-001", "gate-quality")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("sub-executor")
+            .issued_at(1_100_000)
+            .expires_at(1_900_000)
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("sub-issuer")
+            .time_envelope_ref("htf:tick:200")
+            .build_and_sign(&signer);
+
+        assert!(
+            GateOrchestrator::validate_sublease_delegation(&parent, &sublease).is_ok(),
+            "valid sublease delegation should pass"
+        );
+    }
+
+    #[test]
+    fn test_validate_sublease_delegation_gate_id_mismatch_rejected() {
+        let signer = Signer::generate();
+
+        let parent = GateLeaseBuilder::new("parent-001", "work-001", "gate-quality")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_000_000)
+            .expires_at(2_000_000)
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:100")
+            .build_and_sign(&signer);
+
+        // Different gate_id — must be rejected
+        let sublease = GateLeaseBuilder::new("sub-001", "work-001", "gate-security")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("sub-executor")
+            .issued_at(1_100_000)
+            .expires_at(1_900_000)
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("sub-issuer")
+            .time_envelope_ref("htf:tick:200")
+            .build_and_sign(&signer);
+
+        let result = GateOrchestrator::validate_sublease_delegation(&parent, &sublease);
+        assert!(result.is_err(), "gate_id mismatch must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("sublease validation failed"),
+            "error should mention sublease validation: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_sublease_delegation_time_overflow_rejected() {
+        let signer = Signer::generate();
+
+        let parent = GateLeaseBuilder::new("parent-001", "work-001", "gate-quality")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_000_000)
+            .expires_at(2_000_000)
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:100")
+            .build_and_sign(&signer);
+
+        // Sublease expires after parent — strict-subset violation
+        let sublease = GateLeaseBuilder::new("sub-001", "work-001", "gate-quality")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("sub-executor")
+            .issued_at(1_100_000)
+            .expires_at(3_000_000) // EXCEEDS parent expires_at
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("sub-issuer")
+            .time_envelope_ref("htf:tick:200")
+            .build_and_sign(&signer);
+
+        let result = GateOrchestrator::validate_sublease_delegation(&parent, &sublease);
+        assert!(result.is_err(), "time overflow must be rejected");
     }
 }

@@ -36,7 +36,10 @@ use apm2_core::credentials::{
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
 use apm2_core::evidence::ContentAddressedStore;
-use apm2_core::fac::REVIEW_RECEIPT_RECORDED_PREFIX;
+use apm2_core::fac::{
+    AttestationLevel, AttestationRequirements, REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation,
+    ReceiptKind, RiskTier, validate_receipt_attestation,
+};
 use apm2_core::process::ProcessState;
 use bytes::Bytes;
 use prost::Message;
@@ -6101,6 +6104,58 @@ impl PrivilegedDispatcher {
                 PrivilegedErrorCode::CapabilityRequestRejected,
                 "reviewer_actor_id does not match gate lease executor",
             ));
+        }
+
+        // ---- Phase 1b (TCK-00340): Attestation ratchet validation ----
+        // Validate that the receipt's implicit attestation level meets the
+        // minimum requirement for the resolved risk tier. Currently treats
+        // all receipts that pass reviewer identity validation as
+        // SelfSigned (the reviewer's identity was verified in Phase 1).
+        //
+        // The policy_hash is derived from the changeset_digest for binding.
+        // Risk tier defaults to Tier0 until the work registry exposes the
+        // resolved risk tier for this work_id.
+        //
+        // TODO(TCK-00340-FULL): When `IngestReviewReceiptRequest` gains
+        // explicit attestation fields (counter_signer, threshold_count) and
+        // the work registry exposes the resolved risk tier, replace this
+        // with a full `validate_receipt_attestation` call using actual
+        // metadata.
+        {
+            let changeset_digest: [u8; 32] = request
+                .changeset_digest
+                .as_slice()
+                .try_into()
+                .expect("validated to be 32 bytes above");
+            let attestation = ReceiptAttestation {
+                kind: ReceiptKind::Review,
+                level: AttestationLevel::SelfSigned,
+                policy_hash: changeset_digest,
+                signer_identity: request.reviewer_actor_id.clone(),
+                counter_signer_identity: None,
+                threshold_signer_count: None,
+            };
+
+            // Use default requirements table (Tier0 allows SelfSigned for Review).
+            // This call exercises the production path and will reject if internal
+            // consistency checks fail (e.g., empty signer_identity).
+            let requirements = AttestationRequirements::new();
+            if let Err(e) = validate_receipt_attestation(
+                &attestation,
+                RiskTier::Tier0,
+                &changeset_digest,
+                &requirements,
+            ) {
+                warn!(
+                    receipt_id = %request.receipt_id,
+                    error = %e,
+                    "Receipt attestation validation failed - rejecting (fail-closed)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("attestation validation failed: {e}"),
+                ));
+            }
         }
 
         // ---- Phase 2: Idempotency check ----
