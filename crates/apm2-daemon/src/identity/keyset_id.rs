@@ -65,6 +65,20 @@ const PREFIX: &str = "kset:v1:blake3:";
 /// Domain separation string for BLAKE3 keyset hashing.
 const DOMAIN_SEPARATION: &[u8] = b"apm2:keyset_id:v1\0";
 
+/// Maximum number of members allowed in a keyset descriptor.
+///
+/// This bounds allocations during canonicalization (sorting, hashing) and
+/// prevents adversarial descriptors from forcing unbounded memory use.
+/// 256 is generous for any practical multisig/threshold scheme.
+const MAX_KEYSET_MEMBERS: usize = 256;
+
+/// Maximum byte length of the `key_algorithm` token.
+///
+/// Algorithm names are already validated as exact canonical matches (e.g.
+/// `"ed25519"`), but this cap provides defense-in-depth against oversized
+/// inputs reaching the allocation/hash path.
+const MAX_ALGORITHM_TOKEN_LEN: usize = 32;
+
 /// Sentinel value for "set tag unknown" (text-parsed IDs).
 const UNKNOWN_SET_TAG_SENTINEL: u8 = 0x00;
 
@@ -188,8 +202,11 @@ impl KeySetIdV1 {
     /// # Validation
     ///
     /// Returns `Err(KeyIdError::InvalidDescriptor)` if:
+    /// - `key_algorithm` exceeds `MAX_ALGORITHM_TOKEN_LEN` (32) bytes
     /// - `key_algorithm` is not the canonical lowercase `"ed25519"`
+    /// - `members.len()` exceeds `MAX_KEYSET_MEMBERS` (256)
     /// - `members` is empty
+    /// - `members` contains duplicate keys (violates set semantics)
     /// - For `Multisig`: `threshold_k != members.len()`
     /// - For `Threshold`: `threshold_k < 1` or `threshold_k > members.len()`
     /// - `weights` is `Some` but its length differs from `members.len()`
@@ -213,11 +230,31 @@ impl KeySetIdV1 {
         members: &[PublicKeyIdV1],
         weights: Option<&[u64]>,
     ) -> Result<Self, KeyIdError> {
+        // Enforce algorithm token length cap before any further processing.
+        if key_algorithm.len() > MAX_ALGORITHM_TOKEN_LEN {
+            return Err(KeyIdError::InvalidDescriptor {
+                reason: format!(
+                    "key_algorithm token length {} exceeds maximum of {MAX_ALGORITHM_TOKEN_LEN}",
+                    key_algorithm.len()
+                ),
+            });
+        }
+
         let canonical_algorithm = AlgorithmTag::Ed25519.name();
         if key_algorithm != canonical_algorithm {
             return Err(KeyIdError::InvalidDescriptor {
                 reason: format!(
                     "key_algorithm must be canonical \"{canonical_algorithm}\", got \"{key_algorithm}\""
+                ),
+            });
+        }
+
+        // Enforce member count cap before allocations/sort.
+        if members.len() > MAX_KEYSET_MEMBERS {
+            return Err(KeyIdError::InvalidDescriptor {
+                reason: format!(
+                    "members.len() ({}) exceeds maximum of {MAX_KEYSET_MEMBERS}",
+                    members.len()
                 ),
             });
         }
@@ -284,6 +321,15 @@ impl KeySetIdV1 {
             indices.iter().map(|&i| member_binaries[i]).collect();
         let sorted_weights: Option<Vec<u64>> =
             weights.map(|w| indices.iter().map(|&i| w[i]).collect());
+
+        // Reject duplicate member keys. After sorting, duplicates are
+        // consecutive, so a single pass over adjacent pairs suffices.
+        // This enforces set semantics: each signer must be unique.
+        if sorted_binaries.windows(2).any(|w| w[0] == w[1]) {
+            return Err(KeyIdError::InvalidDescriptor {
+                reason: "duplicate member keys".into(),
+            });
+        }
 
         let mut hasher = blake3::Hasher::new();
         hasher.update(DOMAIN_SEPARATION);
@@ -943,6 +989,155 @@ mod tests {
                 result.is_err(),
                 "expected Err for malformed Unicode input {input:?}, got Ok"
             );
+        }
+    }
+
+    // --- Duplicate member rejection tests ---
+
+    /// Regression: exact same key appearing twice in multisig must be rejected.
+    #[test]
+    fn rejects_duplicate_member_keys_multisig() {
+        let key = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
+        let err =
+            KeySetIdV1::from_descriptor("ed25519", SetTag::Multisig, 2, &[key.clone(), key], None)
+                .unwrap_err();
+        match err {
+            KeyIdError::InvalidDescriptor { reason } => {
+                assert!(
+                    reason.contains("duplicate member keys"),
+                    "expected 'duplicate member keys' in reason, got: {reason}"
+                );
+            },
+            other => panic!("expected InvalidDescriptor, got {other:?}"),
+        }
+    }
+
+    /// Regression: same key appearing twice in a weighted threshold descriptor
+    /// must be rejected even when weights differ.
+    #[test]
+    fn rejects_duplicate_member_keys_weighted_threshold() {
+        let key = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xBB; 32]);
+        let err = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            1,
+            &[key.clone(), key],
+            Some(&[10, 20]),
+        )
+        .unwrap_err();
+        match err {
+            KeyIdError::InvalidDescriptor { reason } => {
+                assert!(
+                    reason.contains("duplicate member keys"),
+                    "expected 'duplicate member keys' in reason, got: {reason}"
+                );
+            },
+            other => panic!("expected InvalidDescriptor, got {other:?}"),
+        }
+    }
+
+    /// Unique keys must still be accepted (positive control for duplicate
+    /// check).
+    #[test]
+    fn accepts_unique_member_keys() {
+        let key1 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
+        let key2 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xBB; 32]);
+        let result =
+            KeySetIdV1::from_descriptor("ed25519", SetTag::Multisig, 2, &[key1, key2], None);
+        assert!(
+            result.is_ok(),
+            "unique member keys must be accepted, got: {result:?}"
+        );
+    }
+
+    // --- Descriptor size cap tests ---
+
+    /// Helper: create a unique key from a `usize` index by encoding it in
+    /// the first 4 bytes of the key material (little-endian).
+    fn key_from_index(i: usize) -> PublicKeyIdV1 {
+        let mut key_bytes = [0u8; 32];
+        let le = u32::try_from(i).expect("test index fits u32").to_le_bytes();
+        key_bytes[..4].copy_from_slice(&le);
+        PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &key_bytes)
+    }
+
+    /// Member count exceeding `MAX_KEYSET_MEMBERS` must be rejected.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn rejects_members_exceeding_max_cap() {
+        let count = MAX_KEYSET_MEMBERS + 1;
+        let members: Vec<PublicKeyIdV1> = (0..count).map(key_from_index).collect();
+        assert!(
+            members.len() > MAX_KEYSET_MEMBERS,
+            "test precondition: need > {MAX_KEYSET_MEMBERS} members"
+        );
+        let n = u32::try_from(members.len()).unwrap();
+        let err = KeySetIdV1::from_descriptor("ed25519", SetTag::Multisig, n, &members, None)
+            .unwrap_err();
+        match err {
+            KeyIdError::InvalidDescriptor { reason } => {
+                assert!(
+                    reason.contains("exceeds maximum"),
+                    "expected 'exceeds maximum' in reason, got: {reason}"
+                );
+            },
+            other => panic!("expected InvalidDescriptor, got {other:?}"),
+        }
+    }
+
+    /// Exactly `MAX_KEYSET_MEMBERS` members must still be accepted.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn accepts_members_at_max_cap() {
+        let members: Vec<PublicKeyIdV1> = (0..MAX_KEYSET_MEMBERS).map(key_from_index).collect();
+        assert_eq!(members.len(), MAX_KEYSET_MEMBERS);
+        let n = u32::try_from(members.len()).unwrap();
+        let result = KeySetIdV1::from_descriptor("ed25519", SetTag::Multisig, n, &members, None);
+        assert!(
+            result.is_ok(),
+            "exactly {MAX_KEYSET_MEMBERS} unique members must be accepted, got: {result:?}"
+        );
+    }
+
+    /// Algorithm token exceeding `MAX_ALGORITHM_TOKEN_LEN` must be rejected
+    /// before reaching the canonical algorithm check.
+    #[test]
+    fn rejects_algorithm_token_exceeding_max_len() {
+        let key = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
+        let long_alg = "a".repeat(MAX_ALGORITHM_TOKEN_LEN + 1);
+        let err =
+            KeySetIdV1::from_descriptor(&long_alg, SetTag::Threshold, 1, &[key], None).unwrap_err();
+        match err {
+            KeyIdError::InvalidDescriptor { reason } => {
+                assert!(
+                    reason.contains("exceeds maximum"),
+                    "expected 'exceeds maximum' in reason, got: {reason}"
+                );
+            },
+            other => panic!("expected InvalidDescriptor, got {other:?}"),
+        }
+    }
+
+    /// Algorithm token at exactly `MAX_ALGORITHM_TOKEN_LEN` must still be
+    /// checked against the canonical algorithm (and rejected as non-canonical,
+    /// not as too-long).
+    #[test]
+    fn algorithm_token_at_max_len_still_checked_canonical() {
+        let key = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
+        // 32 chars is within cap but not "ed25519"
+        let at_max = "a".repeat(MAX_ALGORITHM_TOKEN_LEN);
+        let err =
+            KeySetIdV1::from_descriptor(&at_max, SetTag::Threshold, 1, &[key], None).unwrap_err();
+        match err {
+            KeyIdError::InvalidDescriptor { reason } => {
+                assert!(
+                    reason.contains("key_algorithm must be canonical"),
+                    "expected canonical algorithm error, got: {reason}"
+                );
+            },
+            other => {
+                panic!("expected InvalidDescriptor for non-canonical algorithm, got {other:?}")
+            },
         }
     }
 }
