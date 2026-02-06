@@ -1848,7 +1848,7 @@ impl LeaseValidator for SqliteLeaseValidator {
     /// persistence where each ledger row carries a valid daemon-issued
     /// signature over the canonical event bytes. This would allow external
     /// auditors to verify event integrity without trusting the daemon process.
-    fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) {
+    fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) -> Result<(), String> {
         // Store the full lease as a gate_lease_issued event with the complete
         // lease object embedded in the payload for later retrieval.
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
@@ -1860,26 +1860,33 @@ impl LeaseValidator for SqliteLeaseValidator {
             "executor_actor_id": lease.executor_actor_id,
             "full_lease": lease
         });
-        let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+        let payload_bytes = serde_json::to_vec(&payload)
+            .map_err(|e| format!("failed to serialize lease payload: {e}"))?;
 
-        if let Ok(conn) = self.conn.lock() {
-            // NOTE: The zero-filled signature is intentional — see trust model
-            // documentation above. The real cryptographic proof lives inside
-            // `full_lease.issuer_signature`.
-            let _ = conn.execute(
-                "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    event_id,
-                    "gate_lease_issued",
-                    lease.work_id,
-                    "system",
-                    payload_bytes,
-                    vec![0u8; 64],
-                    i64::try_from(lease.issued_at).unwrap_or(0)
-                ],
-            );
-        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| format!("failed to acquire ledger lock: {e}"))?;
+
+        // NOTE: The zero-filled signature is intentional — see trust model
+        // documentation above. The real cryptographic proof lives inside
+        // `full_lease.issuer_signature`.
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                event_id,
+                "gate_lease_issued",
+                lease.work_id,
+                "system",
+                payload_bytes,
+                vec![0u8; 64],
+                i64::try_from(lease.issued_at).unwrap_or(0)
+            ],
+        )
+        .map_err(|e| format!("failed to insert lease event: {e}"))?;
+
+        Ok(())
     }
 }
 
@@ -2275,7 +2282,9 @@ mod tests {
             .time_envelope_ref("htf:tick:100")
             .build_and_sign(&signer);
 
-        validator.register_full_lease(&lease);
+        validator
+            .register_full_lease(&lease)
+            .expect("register_full_lease should succeed in test");
 
         let retrieved = validator.get_gate_lease("test-lease-001");
         assert!(

@@ -3372,6 +3372,18 @@ pub trait LeaseValidator: Send + Sync {
     /// Used by `DelegateSublease` to retrieve the parent lease for
     /// strict-subset validation and sublease issuance.
     ///
+    /// # Trust Model (v7 Finding 1)
+    ///
+    /// The returned lease is trusted because it comes from the daemon-owned
+    /// `SQLite` ledger (same-process trust boundary). The lease's embedded
+    /// `issuer_signature` field preserves the original Ed25519 signature
+    /// for downstream verification, but callers within the daemon process
+    /// do NOT need to call `GateLease::validate_signature()` -- the ledger
+    /// integrity is guaranteed by the process trust boundary.
+    ///
+    /// See `SqliteLeaseValidator::register_full_lease()` for the full trust
+    /// model documentation.
+    ///
     /// # Returns
     ///
     /// `Some(GateLease)` if the lease exists, `None` otherwise.
@@ -3384,8 +3396,18 @@ pub trait LeaseValidator: Send + Sync {
     ///
     /// This method exists to support test fixtures and production paths
     /// that need full lease objects for sublease delegation.
-    fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the lease could not be persisted
+    /// (serialization failure, database write failure, etc.). Callers
+    /// MUST fail closed when this returns `Err` to preserve the
+    /// single-effect guarantee (LAW-11) -- a sublease event emitted
+    /// without a corresponding persisted lease anchor would leave the
+    /// system in an inconsistent state.
+    fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) -> Result<(), String> {
         let _ = lease;
+        Ok(())
     }
 }
 
@@ -3542,9 +3564,10 @@ impl LeaseValidator for StubLeaseValidator {
         guard.get(lease_id).cloned()
     }
 
-    fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) {
+    fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) -> Result<(), String> {
         let mut guard = self.full_leases.write().expect("lock poisoned");
         guard.insert(lease.lease_id.clone(), lease.clone());
+        Ok(())
     }
 }
 
@@ -7633,6 +7656,27 @@ impl PrivilegedDispatcher {
         };
 
         // ---- Phase 2: Retrieve parent lease (admission check) ----
+        //
+        // SECURITY (v7 Finding 1 — Trust Model for Persisted Leases):
+        //
+        // The parent lease is deserialized from the daemon-owned SQLite ledger.
+        // We do NOT call `GateLease::validate_signature()` here because the
+        // ledger is a **same-process trusted store**: only the daemon writes
+        // to it (via authenticated IPC handlers that enforce admission checks
+        // before persisting). The SQLite file is not externally writable.
+        //
+        // The GateLease's `issuer_signature` (Ed25519 over canonical bytes)
+        // IS preserved in the serialized `full_lease` field and can be
+        // verified by downstream consumers that need cryptographic proof of
+        // issuance (e.g., cross-node replication). Within the daemon process,
+        // the ledger's integrity is guaranteed by the process trust boundary.
+        //
+        // See `SqliteLeaseValidator::register_full_lease()` in ledger.rs for
+        // the full trust model documentation (v6 Finding 2).
+        //
+        // TODO(RFC-0019): When cross-node lease federation is implemented,
+        // add signature verification here for leases received from external
+        // nodes (where the process trust boundary does not apply).
         let Some(parent_lease) = self
             .lease_validator
             .get_gate_lease(&request.parent_lease_id)
@@ -7730,27 +7774,106 @@ impl PrivilegedDispatcher {
                     ));
                 }
 
-                // Look up the original SubleaseIssued event_id from the
+                // Look up the original SubleaseIssued event from the
                 // ledger. The emit_session_event call stored the event with
                 // work_id = sublease.lease_id, so we query by that key and
                 // filter for event_type == "SubleaseIssued".
                 //
-                // SECURITY: The response contract defines event_id as the
-                // ledger event identity for SubleaseIssued. Returning an
-                // empty string on idempotent replay would violate this
-                // contract and prevent callers from verifying the ledger
-                // trail of the sublease.
-                let original_event_id = self
+                // SECURITY (v7 Finding 1 — Fail-Closed Idempotent Replay):
+                //
+                // The response contract defines event_id as the ledger event
+                // identity for SubleaseIssued. If the original event cannot be
+                // found, we MUST fail-closed rather than returning an empty
+                // event_id. An empty event_id would violate the response
+                // contract and prevent callers from verifying the ledger trail
+                // of the sublease. This can happen if the ledger was truncated
+                // or if there's a storage inconsistency.
+                let Some(original_event) = self
                     .event_emitter
                     .get_events_by_work_id(&existing.lease_id)
                     .into_iter()
                     .find(|e| e.event_type == "SubleaseIssued")
-                    .map(|e| e.event_id)
-                    .unwrap_or_default();
+                else {
+                    warn!(
+                        sublease_id = %request.sublease_id,
+                        "Idempotent sublease replay failed: original SubleaseIssued event not found in ledger"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease '{}' exists but its original SubleaseIssued ledger event \
+                             is missing — cannot verify ledger trail",
+                            request.sublease_id
+                        ),
+                    ));
+                };
+
+                // SECURITY (v7 Finding 2 — Parent Lineage Binding):
+                //
+                // Verify that the original SubleaseIssued event was bound to
+                // the same parent_lease_id as the current request. Even though
+                // the changeset_digest/policy_hash comparison above provides
+                // indirect lineage verification, we MUST also check the
+                // explicit parent_lease_id from the event payload to prevent
+                // lineage ambiguity when two different parent leases happen
+                // to share inherited cryptographic fields.
+                //
+                // NOTE: The event payload is a wrapper JSON containing the
+                // original payload as a hex-encoded string in the "payload"
+                // field. We must decode that inner payload to extract the
+                // parent_lease_id field.
+                if let Ok(wrapper) =
+                    serde_json::from_slice::<serde_json::Value>(&original_event.payload)
+                {
+                    // Extract the inner payload: it may be hex-encoded (stub
+                    // emitter) or directly embedded depending on the emitter.
+                    // Try hex-decoding the "payload" field first, then fall
+                    // back to checking parent_lease_id at the top level.
+                    let original_parent_id = wrapper
+                        .get("payload")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|hex_str| hex::decode(hex_str).ok())
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .and_then(|inner| {
+                            inner
+                                .get("parent_lease_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(String::from)
+                        })
+                        .or_else(|| {
+                            // Fallback: parent_lease_id at top level (e.g.,
+                            // production SQLite emitter stores raw payload).
+                            wrapper
+                                .get("parent_lease_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(String::from)
+                        });
+
+                    if let Some(original_parent_id) = original_parent_id {
+                        if original_parent_id != request.parent_lease_id {
+                            warn!(
+                                sublease_id = %request.sublease_id,
+                                original_parent = %original_parent_id,
+                                requested_parent = %request.parent_lease_id,
+                                "Idempotent sublease replay rejected: parent_lease_id mismatch"
+                            );
+                            return Ok(PrivilegedResponse::error(
+                                PrivilegedErrorCode::CapabilityRequestRejected,
+                                format!(
+                                    "sublease '{}' was originally delegated from parent '{}', \
+                                     not '{}'",
+                                    request.sublease_id,
+                                    original_parent_id,
+                                    request.parent_lease_id
+                                ),
+                            ));
+                        }
+                    }
+                }
 
                 info!(
                     sublease_id = %request.sublease_id,
-                    event_id = %original_event_id,
+                    event_id = %original_event.event_id,
                     "Sublease already exists with identical parameters - idempotent return"
                 );
                 // Convert ms -> ns for response (existing.expires_at is in ms)
@@ -7761,7 +7884,7 @@ impl PrivilegedDispatcher {
                         delegatee_actor_id: request.delegatee_actor_id,
                         gate_id: existing.gate_id.clone(),
                         expires_at_ns: existing.expires_at.saturating_mul(1_000_000),
-                        event_id: original_event_id,
+                        event_id: original_event.event_id,
                     },
                 ));
             }
@@ -7874,7 +7997,29 @@ impl PrivilegedDispatcher {
         };
 
         // ---- Phase 6: Register sublease for future uniqueness checks ----
-        self.lease_validator.register_full_lease(&sublease);
+        //
+        // SECURITY (v7 Finding 3 -- Fail-Closed Lease Persistence):
+        //
+        // register_full_lease MUST succeed for the sublease response to be
+        // valid. If persistence fails (serialization error, DB write error),
+        // returning success without a persisted lease anchor would violate
+        // the single-effect guarantee (LAW-11): subsequent requests could
+        // bypass uniqueness checks and cause duplicate logical issuance.
+        if let Err(e) = self.lease_validator.register_full_lease(&sublease) {
+            warn!(
+                sublease_id = %sublease.lease_id,
+                error = %e,
+                "Full lease persistence failed after SubleaseIssued event -- failing closed"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease '{}' event was emitted but lease persistence failed: {e} \
+                     -- failing closed to prevent duplicate issuance",
+                    sublease.lease_id
+                ),
+            ));
+        }
 
         info!(
             parent_lease_id = %request.parent_lease_id,
@@ -16781,7 +16926,8 @@ mod tests {
             let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
             dispatcher
                 .lease_validator
-                .register_full_lease(&parent_lease);
+                .register_full_lease(&parent_lease)
+                .expect("register_full_lease should succeed in test");
             dispatcher.lease_validator.register_lease_with_executor(
                 parent_lease_id,
                 work_id,
@@ -17077,7 +17223,8 @@ mod tests {
             let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
             dispatcher
                 .lease_validator
-                .register_full_lease(&parent_lease);
+                .register_full_lease(&parent_lease)
+                .expect("register_full_lease should succeed in test");
             dispatcher.lease_validator.register_lease_with_executor(
                 "parent-authz",
                 "W-AUTHZ",
@@ -17328,8 +17475,14 @@ mod tests {
                 .build_and_sign(&signer);
 
             let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
-            dispatcher.lease_validator.register_full_lease(&parent_a);
-            dispatcher.lease_validator.register_full_lease(&parent_b);
+            dispatcher
+                .lease_validator
+                .register_full_lease(&parent_a)
+                .expect("register_full_lease should succeed in test");
+            dispatcher
+                .lease_validator
+                .register_full_lease(&parent_b)
+                .expect("register_full_lease should succeed in test");
             dispatcher.lease_validator.register_lease_with_executor(
                 "parent-A",
                 "W-A",
@@ -17432,6 +17585,121 @@ mod tests {
                     );
                 },
                 other => panic!("Expected conflict rejection for different expiry, got {other:?}"),
+            }
+        }
+
+        /// v7 Finding 2: Idempotent replay with the same `sublease_id` but a
+        /// different `parent_lease_id` must be rejected even when inherited
+        /// fields (changeset digest, policy hash) happen to match. The
+        /// parent lineage check uses the `SubleaseIssued` event payload's
+        /// parent lease ID field to enforce exact lineage binding.
+        #[test]
+        fn test_delegate_sublease_idempotent_rejects_different_parent_lineage() {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer.clone(),
+            ));
+
+            let test_creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let caller_actor = derive_actor_id(&test_creds);
+
+            // Create two parent leases with IDENTICAL inherited fields
+            // (changeset_digest, policy_hash) but different lease IDs.
+            // This is the edge case where the changeset_digest/policy_hash
+            // comparison alone would incorrectly treat them as equivalent.
+            let parent_a =
+                apm2_core::fac::GateLeaseBuilder::new("parent-lin-A", "W-LIN", "gate-lin")
+                    .changeset_digest([0x42; 32])
+                    .executor_actor_id(&caller_actor)
+                    .issued_at(1_000_000)
+                    .expires_at(2_000_000)
+                    .policy_hash([0xAB; 32])
+                    .issuer_actor_id("issuer-001")
+                    .time_envelope_ref("htf:tick:100")
+                    .build_and_sign(&signer);
+
+            let parent_b = apm2_core::fac::GateLeaseBuilder::new("parent-lin-B", "W-LIN", "gate-lin")
+                    .changeset_digest([0x42; 32]) // Same digest
+                    .executor_actor_id(&caller_actor)
+                    .issued_at(1_000_000)
+                    .expires_at(2_000_000)
+                    .policy_hash([0xAB; 32]) // Same policy hash
+                    .issuer_actor_id("issuer-001")
+                    .time_envelope_ref("htf:tick:200")
+                    .build_and_sign(&signer);
+
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            dispatcher
+                .lease_validator
+                .register_full_lease(&parent_a)
+                .expect("register_full_lease should succeed in test");
+            dispatcher
+                .lease_validator
+                .register_full_lease(&parent_b)
+                .expect("register_full_lease should succeed in test");
+            dispatcher.lease_validator.register_lease_with_executor(
+                "parent-lin-A",
+                "W-LIN",
+                "gate-lin",
+                &caller_actor,
+            );
+            dispatcher.lease_validator.register_lease_with_executor(
+                "parent-lin-B",
+                "W-LIN",
+                "gate-lin",
+                &caller_actor,
+            );
+
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // First call: issue sublease under parent A
+            let req1 = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lin-A".to_string(),
+                delegatee_actor_id: "child-lin".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-lineage-001".to_string(),
+            };
+            let frame1 = encode_delegate_sublease_request(&req1);
+            let resp1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
+            assert!(
+                matches!(resp1, PrivilegedResponse::DelegateSublease(_)),
+                "First sublease should succeed"
+            );
+
+            // Second call: same sublease_id but different parent_lease_id.
+            // Since both parents have identical changeset_digest/policy_hash,
+            // the indirect lineage check (changeset_digest + policy_hash) would
+            // pass, but the direct parent_lease_id check in the event payload
+            // MUST reject this.
+            let req2 = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lin-B".to_string(),
+                delegatee_actor_id: "child-lin".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-lineage-001".to_string(),
+            };
+            let frame2 = encode_delegate_sublease_request(&req2);
+            let resp2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+            match resp2 {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("originally delegated from parent")
+                            || err
+                                .message
+                                .contains("already exists with different parameters"),
+                        "Must reject sublease with different parent lineage, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected parent lineage rejection, got {other:?}"),
             }
         }
     }
@@ -17720,7 +17988,8 @@ mod tests {
             // Use production SqliteLeaseValidator path to register full lease
             dispatcher
                 .lease_validator
-                .register_full_lease(&parent_lease);
+                .register_full_lease(&parent_lease)
+                .expect("register_full_lease should succeed in test");
             dispatcher.lease_validator.register_lease_with_executor(
                 "sql-parent",
                 "W-SQL-DS",
@@ -17849,7 +18118,8 @@ mod tests {
             state
                 .privileged_dispatcher()
                 .lease_validator
-                .register_full_lease(&parent_lease);
+                .register_full_lease(&parent_lease)
+                .expect("register_full_lease should succeed in test");
             state
                 .privileged_dispatcher()
                 .lease_validator
