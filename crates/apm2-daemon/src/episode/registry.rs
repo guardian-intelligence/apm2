@@ -931,6 +931,13 @@ impl SessionRegistry for InMemorySessionRegistry {
     fn register_session(&self, session: SessionState) -> Result<(), SessionRegistryError> {
         let mut state = self.state.write().expect("lock poisoned");
 
+        // TCK-00385 MINOR 1: Centralize TTL cleanup on all write paths.
+        // Lazily clean up expired terminated entries during registration
+        // (not only during mark_terminated) to prevent stale entries from
+        // accumulating when no sessions are being terminated.
+        let now = Instant::now();
+        state.terminated.retain(|_, entry| entry.expires_at > now);
+
         if state.by_id.contains_key(&session.session_id) {
             return Err(SessionRegistryError::DuplicateSessionId {
                 session_id: session.session_id,
@@ -1442,6 +1449,23 @@ impl From<PersistableSessionState> for SessionState {
     }
 }
 
+/// Serializable representation of a terminated session entry (TCK-00385 BLOCKER
+/// 2).
+///
+/// This struct pairs a terminated session's state with its termination info
+/// and a TTL (remaining seconds) so that terminated entries survive daemon
+/// restarts.  On reload, the TTL is clamped to [`TERMINATED_SESSION_TTL_SECS`]
+/// to prevent stale entries from lingering indefinitely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistableTerminatedEntry {
+    /// The session state at time of termination.
+    session: PersistableSessionState,
+    /// Termination details.
+    info: SessionTerminationInfo,
+    /// Remaining TTL in seconds at the time of serialization.
+    ttl_remaining_secs: u64,
+}
+
 /// Serializable state file format for persistent session registry.
 ///
 /// Per TCK-00266 and DD-005, the state file is JSON for human readability
@@ -1452,12 +1476,18 @@ impl From<PersistableSessionState> for SessionState {
 /// This file uses [`PersistableSessionState`] which excludes the `lease_id`
 /// bearer token to prevent credential leakage to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct PersistentStateFile {
     /// Version of the state file format for future compatibility.
     version: u32,
     /// Active sessions persisted to disk (without credentials).
     sessions: Vec<PersistableSessionState>,
+    /// Terminated sessions preserved for TTL-based queries (TCK-00385 BLOCKER
+    /// 2).
+    ///
+    /// Defaults to empty for backward compatibility with v1 state files that
+    /// lack this field.
+    #[serde(default)]
+    terminated: Vec<PersistableTerminatedEntry>,
 }
 
 impl Default for PersistentStateFile {
@@ -1465,6 +1495,7 @@ impl Default for PersistentStateFile {
         Self {
             version: 1,
             sessions: Vec::new(),
+            terminated: Vec::new(),
         }
     }
 }
@@ -1600,6 +1631,32 @@ impl PersistentSessionRegistry {
                 // Ignore duplicate errors during recovery (shouldn't happen with valid file)
                 let _ = registry.inner.register_session(session);
             }
+
+            // TCK-00385 BLOCKER 2: Reload terminated entries with clamped TTL.
+            // This ensures terminated sessions retain their TERMINATED status
+            // across daemon restarts instead of disappearing (which would make
+            // SessionStatus return "not found" for recently terminated sessions).
+            if !state_file.terminated.is_empty() {
+                let now = Instant::now();
+                let mut inner_state = registry.inner.state.write().expect("lock poisoned");
+                for persisted_entry in state_file.terminated {
+                    // Clamp TTL to MAX to prevent stale entries from lingering
+                    let ttl = persisted_entry
+                        .ttl_remaining_secs
+                        .min(TERMINATED_SESSION_TTL_SECS);
+                    if ttl == 0 {
+                        continue; // Already expired, skip
+                    }
+                    let entry = TerminatedEntry {
+                        info: persisted_entry.info,
+                        session: SessionState::from(persisted_entry.session),
+                        expires_at: now + Duration::from_secs(ttl),
+                    };
+                    inner_state
+                        .terminated
+                        .insert(entry.session.session_id.clone(), entry);
+                }
+            }
         }
 
         Ok(registry)
@@ -1625,6 +1682,22 @@ impl PersistentSessionRegistry {
         let state = self.inner.state.read().expect("lock poisoned");
 
         // SEC-001: Convert to PersistableSessionState to exclude lease_id
+        // TCK-00385 BLOCKER 2: Also serialize terminated entries with remaining TTL
+        let now = Instant::now();
+        let terminated: Vec<PersistableTerminatedEntry> = state
+            .terminated
+            .iter()
+            .filter(|(_, entry)| entry.expires_at > now)
+            .map(|(_, entry)| {
+                let remaining = entry.expires_at.duration_since(now).as_secs();
+                PersistableTerminatedEntry {
+                    session: PersistableSessionState::from(&entry.session),
+                    info: entry.info.clone(),
+                    ttl_remaining_secs: remaining,
+                }
+            })
+            .collect();
+
         let state_file = PersistentStateFile {
             version: 1,
             sessions: state
@@ -1632,6 +1705,7 @@ impl PersistentSessionRegistry {
                 .values()
                 .map(PersistableSessionState::from)
                 .collect(),
+            terminated,
         };
 
         // Serialize to JSON with pretty printing for human readability
@@ -2878,6 +2952,192 @@ mod tck_00385_security_fixes {
         assert_eq!(
             retrieved.session_id, "real-session-id",
             "Stored info should have the normalized session_id"
+        );
+    }
+
+    // =========================================================================
+    // BLOCKER 2: Terminated state persisted across restart
+    // =========================================================================
+
+    /// BLOCKER 2: After `mark_terminated()`, a crash-recovery reload must
+    /// preserve the TERMINATED status. The session must NOT reappear as
+    /// active, and `get_termination_info` must return the stored info.
+    #[test]
+    fn persistent_terminated_state_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminated_persist.json");
+
+        // Step 1: Register and terminate a session
+        {
+            let registry = PersistentSessionRegistry::new(&path);
+            let session = make_session("term-persist-1", "handle-tp-1");
+            registry.register_session(session).unwrap();
+
+            let info =
+                SessionTerminationInfo::new("term-persist-1", "crash", "FAILURE").with_exit_code(1);
+            assert!(
+                registry.mark_terminated("term-persist-1", info).unwrap(),
+                "mark_terminated should succeed"
+            );
+
+            // Verify in-memory terminated state before crash
+            assert!(
+                registry.get_session("term-persist-1").is_none(),
+                "Session should NOT be in active set"
+            );
+            assert!(
+                registry.get_termination_info("term-persist-1").is_some(),
+                "Termination info should be available"
+            );
+        }
+
+        // Step 2: Simulate daemon restart by loading from persisted file
+        {
+            let recovered =
+                PersistentSessionRegistry::load_from_file(&path).expect("should load from file");
+
+            // Session should NOT reappear as active
+            assert!(
+                recovered.get_session("term-persist-1").is_none(),
+                "Terminated session must NOT resurrect as active after restart"
+            );
+
+            // Termination info should be preserved
+            let info = recovered
+                .get_termination_info("term-persist-1")
+                .expect("Termination info must survive restart");
+            assert_eq!(info.rationale_code, "crash");
+            assert_eq!(info.exit_classification, "FAILURE");
+            assert_eq!(info.exit_code, Some(1));
+
+            // get_terminated_session should also work
+            let (session, term_info) = recovered
+                .get_terminated_session("term-persist-1")
+                .expect("Terminated session entry must survive restart");
+            assert_eq!(session.session_id, "term-persist-1");
+            assert_eq!(session.work_id, "work-term-persist-1");
+            assert_eq!(term_info.rationale_code, "crash");
+        }
+    }
+
+    /// BLOCKER 2: Multiple sessions -- only terminated ones appear in the
+    /// terminated store after reload; active sessions remain active.
+    #[test]
+    fn persistent_terminated_coexists_with_active_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coexist.json");
+
+        {
+            let registry = PersistentSessionRegistry::new(&path);
+            registry
+                .register_session(make_session("active-1", "h-a1"))
+                .unwrap();
+            registry
+                .register_session(make_session("term-1", "h-t1"))
+                .unwrap();
+            registry
+                .register_session(make_session("active-2", "h-a2"))
+                .unwrap();
+
+            let info = SessionTerminationInfo::new("term-1", "normal", "SUCCESS");
+            registry.mark_terminated("term-1", info).unwrap();
+        }
+
+        {
+            let recovered = PersistentSessionRegistry::load_from_file(&path).expect("should load");
+
+            assert!(
+                recovered.get_session("active-1").is_some(),
+                "active-1 should survive"
+            );
+            assert!(
+                recovered.get_session("active-2").is_some(),
+                "active-2 should survive"
+            );
+            assert!(
+                recovered.get_session("term-1").is_none(),
+                "term-1 should NOT be active"
+            );
+            assert!(
+                recovered.get_termination_info("term-1").is_some(),
+                "term-1 termination info should be present"
+            );
+        }
+    }
+
+    /// BLOCKER 2: Expired terminated entries (TTL = 0) are skipped on reload.
+    #[test]
+    fn persistent_terminated_expired_entries_skipped_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("expired.json");
+
+        // Manually write a state file with a terminated entry that has TTL = 0
+        let state_file = PersistentStateFile {
+            version: 1,
+            sessions: vec![],
+            terminated: vec![PersistableTerminatedEntry {
+                session: PersistableSessionState {
+                    session_id: "expired-1".to_string(),
+                    work_id: "work-expired-1".to_string(),
+                    role: 1,
+                    ephemeral_handle: "h-exp".to_string(),
+                    policy_resolved_ref: String::new(),
+                    capability_manifest_hash: vec![],
+                    episode_id: None,
+                },
+                info: SessionTerminationInfo::new("expired-1", "timeout", "FAILURE"),
+                ttl_remaining_secs: 0,
+            }],
+        };
+        let json = serde_json::to_string_pretty(&state_file).unwrap();
+        std::fs::write(&path, json).unwrap();
+
+        let recovered = PersistentSessionRegistry::load_from_file(&path).expect("should load");
+
+        assert!(
+            recovered.get_termination_info("expired-1").is_none(),
+            "Expired terminated entry (TTL=0) should be skipped on reload"
+        );
+    }
+
+    // =========================================================================
+    // MINOR 1: TTL cleanup runs on register_session
+    // =========================================================================
+
+    /// MINOR 1: Expired terminated entries are cleaned up during
+    /// `register_session`, not only during `mark_terminated`.
+    #[test]
+    fn register_session_cleans_expired_terminated_entries() {
+        let registry = InMemorySessionRegistry::new();
+
+        // Register and terminate a session
+        let session = make_session("ttl-test-1", "handle-ttl-1");
+        registry.register_session(session).unwrap();
+        let info = SessionTerminationInfo::new("ttl-test-1", "normal", "SUCCESS");
+        registry.mark_terminated("ttl-test-1", info).unwrap();
+
+        // Verify terminated entry exists
+        assert_eq!(registry.terminated_count(), 1);
+
+        // Manually set the entry's expires_at to the past by manipulating
+        // the inner state. This simulates time passing.
+        {
+            let mut state = registry.state.write().expect("lock poisoned");
+            if let Some(entry) = state.terminated.get_mut("ttl-test-1") {
+                // Set to past by subtracting more than TTL
+                entry.expires_at = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+            }
+        }
+
+        // Now register a new session -- this should trigger TTL cleanup
+        let session2 = make_session("new-session", "handle-new");
+        registry.register_session(session2).unwrap();
+
+        // The expired entry should have been cleaned up
+        let state = registry.state.read().expect("lock poisoned");
+        assert!(
+            state.terminated.is_empty(),
+            "Expired terminated entry should be cleaned up during register_session"
         );
     }
 }

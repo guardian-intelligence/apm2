@@ -1306,6 +1306,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
                 // MAJOR 2: Wire session end-of-life to mark_terminated()
                 // so production sessions transition to TERMINATED state.
+                // TCK-00385 MAJOR 1: Propagate mark_terminated errors (fail-closed).
+                // Per session/mod.rs:159, persistence failures are fatal.
                 if let Some(session_registry) = &self.session_registry {
                     // MINOR fix: Normalize info.session_id to the authoritative
                     // session_id.  The broker may populate this field with
@@ -1321,6 +1323,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             error = %e,
                             "Failed to persist session termination state (fail-closed)"
                         );
+                        // Fail-closed: return error immediately without continuing
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorInternal,
+                            format!("session termination persistence failed: {e} ({request_id})"),
+                        ));
                     }
                 }
 

@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use apm2_core::htf::{ClockProfile, TimeEnvelope, TimeEnvelopeRef};
 use tokio::sync::RwLock;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use super::budget::EpisodeBudget;
 use super::budget_tracker::BudgetTracker;
@@ -1370,14 +1370,22 @@ impl EpisodeRuntime {
                 info = info.with_exit_code(code);
             }
 
-            if let Err(e) = registry.mark_terminated(sess_id, info) {
-                warn!(
+            // TCK-00385 MAJOR 1: Propagate mark_terminated errors (fail-closed).
+            // Per session/mod.rs:159, persistence failures are fatal for the
+            // session lifecycle.
+            registry.mark_terminated(sess_id, info).map_err(|e| {
+                error!(
                     episode_id = %episode_id,
                     session_id = %sess_id,
                     error = %e,
                     "Failed to mark session terminated from episode stop (fail-closed)"
                 );
-            }
+                EpisodeError::SessionTerminationFailed {
+                    episode_id: episode_id.as_str().to_string(),
+                    session_id: sess_id.clone(),
+                    message: e.to_string(),
+                }
+            })?;
         }
 
         // Emit event (INV-ER002)
@@ -1494,17 +1502,23 @@ impl EpisodeRuntime {
         }
 
         // TCK-00385 BLOCKER fix: Wire quarantine to session termination.
+        // TCK-00385 MAJOR 1: Propagate mark_terminated errors (fail-closed).
         if let (Some(registry), Some(sess_id)) = (&self.session_registry, &session_id_for_registry)
         {
             let info = SessionTerminationInfo::new(sess_id, "quarantined", "FAILURE");
-            if let Err(e) = registry.mark_terminated(sess_id, info) {
-                warn!(
+            registry.mark_terminated(sess_id, info).map_err(|e| {
+                error!(
                     episode_id = %episode_id,
                     session_id = %sess_id,
                     error = %e,
                     "Failed to mark session terminated from episode quarantine (fail-closed)"
                 );
-            }
+                EpisodeError::SessionTerminationFailed {
+                    episode_id: episode_id.as_str().to_string(),
+                    session_id: sess_id.clone(),
+                    message: e.to_string(),
+                }
+            })?;
         }
 
         // Emit event (INV-ER002)
@@ -3407,5 +3421,127 @@ mod tests {
         assert_eq!(term_info.rationale_code, "crash");
         assert_eq!(term_info.exit_classification, "FAILURE");
         assert_eq!(term_info.exit_code, Some(137));
+    }
+
+    // =========================================================================
+    // TCK-00385 MAJOR 1: Fail-closed error propagation
+    // =========================================================================
+
+    /// A session registry that always fails on `mark_terminated`.
+    /// Used to test that `stop()`/`quarantine()` propagate persistence errors.
+    struct FailingSessionRegistry;
+
+    impl SessionRegistry for FailingSessionRegistry {
+        fn register_session(
+            &self,
+            _session: crate::session::SessionState,
+        ) -> Result<(), crate::session::SessionRegistryError> {
+            Ok(())
+        }
+        fn get_session(&self, _session_id: &str) -> Option<crate::session::SessionState> {
+            None
+        }
+        fn get_session_by_handle(&self, _handle: &str) -> Option<crate::session::SessionState> {
+            None
+        }
+        fn get_session_by_work_id(&self, _work_id: &str) -> Option<crate::session::SessionState> {
+            None
+        }
+        fn mark_terminated(
+            &self,
+            _session_id: &str,
+            _info: SessionTerminationInfo,
+        ) -> Result<bool, crate::session::SessionRegistryError> {
+            Err(crate::session::SessionRegistryError::RegistrationFailed {
+                message: "simulated persistence failure".to_string(),
+            })
+        }
+        fn get_termination_info(&self, _session_id: &str) -> Option<SessionTerminationInfo> {
+            None
+        }
+        fn get_terminated_session(
+            &self,
+            _session_id: &str,
+        ) -> Option<(crate::session::SessionState, SessionTerminationInfo)> {
+            None
+        }
+    }
+
+    /// TCK-00385 MAJOR 1: `stop()` returns `SessionTerminationFailed` when
+    /// `mark_terminated` fails, enforcing the fail-closed contract.
+    #[tokio::test]
+    async fn tck_00385_stop_propagates_mark_terminated_error() {
+        let registry: Arc<dyn SessionRegistry> = Arc::new(FailingSessionRegistry);
+        let runtime = EpisodeRuntime::new(test_config()).with_session_registry(registry);
+
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        let handle = runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        // We need a session_id to exist in the Running state for the registry
+        // to be called. The runtime extracts session_id from the Running state.
+        let _session_id = handle.session_id().to_string();
+
+        let result = runtime
+            .stop(
+                &episode_id,
+                TerminationClass::Success,
+                test_timestamp() + 2000,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "stop() should propagate mark_terminated error"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "session_termination_failed",
+            "Error should be SessionTerminationFailed, got: {err}"
+        );
+    }
+
+    /// TCK-00385 MAJOR 1: `quarantine()` returns `SessionTerminationFailed`
+    /// when `mark_terminated` fails, enforcing the fail-closed contract.
+    #[tokio::test]
+    async fn tck_00385_quarantine_propagates_mark_terminated_error() {
+        let registry: Arc<dyn SessionRegistry> = Arc::new(FailingSessionRegistry);
+        let runtime = EpisodeRuntime::new(test_config()).with_session_registry(registry);
+
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        let result = runtime
+            .quarantine(
+                &episode_id,
+                QuarantineReason::new("TEST", "test quarantine"),
+                test_timestamp() + 2000,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "quarantine() should propagate mark_terminated error"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "session_termination_failed",
+            "Error should be SessionTerminationFailed, got: {err}"
+        );
     }
 }
