@@ -19,15 +19,16 @@
 //!     |       +-- semantics: HsiRouteSemantics
 //!     |               +-- authoritative, idempotency
 //!     |               +-- receipt_required
-//!     +-- canonical_bytes() -> Vec<u8>
-//!     +-- content_hash()   -> String (blake3:<hex>)
+//!     +-- canonical_bytes() -> Result<Vec<u8>, ManifestValidationError>
+//!     +-- content_hash()   -> Result<String, ManifestValidationError>
 //! ```
 //!
 //! # Determinism Requirement (REQ-0001)
 //!
 //! - Identical code + build inputs produce identical `cli_contract_hash`
 //! - Any semantic change produces a different hash
-//! - Missing route semantics annotations fail the build (compile-time)
+//! - Missing route semantics annotations fail the build at runtime via
+//!   `build_manifest()` returning `Err(ManifestBuildError::MissingSemantics)`
 //!
 //! # Contract References
 //!
@@ -47,6 +48,6 @@ pub mod golden_vectors;
 
 pub use manifest::{
     CliVersion, HsiContractManifestV1, HsiRouteEntry, HsiRouteSemantics, IdempotencyRequirement,
-    StabilityClass,
+    ManifestValidationError, StabilityClass,
 };
 pub use registry::build_manifest;

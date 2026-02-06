@@ -48,6 +48,54 @@ pub const MAX_ROUTE_LEN: usize = 256;
 /// Maximum length of a schema ID string.
 pub const MAX_SCHEMA_ID_LEN: usize = 256;
 
+/// Error returned when manifest canonicalization fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestValidationError {
+    /// Routes are not sorted lexicographically by `route` field.
+    RoutesNotSorted {
+        /// The route that appears out of order.
+        before: String,
+        /// The route that should have appeared before `before`.
+        after: String,
+    },
+    /// Route count exceeds u32 capacity.
+    RouteCountOverflow {
+        /// The actual route count.
+        count: usize,
+    },
+    /// A string field exceeds u32 length capacity.
+    StringLengthOverflow {
+        /// Description of which field overflowed.
+        field: String,
+        /// The actual length.
+        length: usize,
+    },
+}
+
+impl std::fmt::Display for ManifestValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RoutesNotSorted { before, after } => {
+                write!(
+                    f,
+                    "routes must be sorted by route field; found '{before}' before '{after}'"
+                )
+            },
+            Self::RouteCountOverflow { count } => {
+                write!(f, "route count {count} exceeds u32 capacity")
+            },
+            Self::StringLengthOverflow { field, length } => {
+                write!(
+                    f,
+                    "string field '{field}' length {length} exceeds u32 capacity"
+                )
+            },
+        }
+    }
+}
+
+impl std::error::Error for ManifestValidationError {}
+
 /// Stability classification for an HSI route.
 ///
 /// Per RFC-0020 section 3.1, routes are classified as experimental, stable,
@@ -188,12 +236,16 @@ impl CliVersion {
     ///
     /// Format: `[semver_len:u32_le][semver_bytes][build_hash_len:
     /// u32_le][build_hash_bytes]`
-    #[must_use]
-    pub fn canonical_bytes(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns `ManifestValidationError::StringLengthOverflow` if either
+    /// field exceeds u32 length capacity.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestValidationError> {
         let mut buf = Vec::new();
-        encode_string(&mut buf, &self.semver);
-        encode_string(&mut buf, &self.build_hash);
-        buf
+        encode_string(&mut buf, &self.semver, "cli_version.semver")?;
+        encode_string(&mut buf, &self.build_hash, "cli_version.build_hash")?;
+        Ok(buf)
     }
 }
 
@@ -229,16 +281,24 @@ impl HsiRouteEntry {
     /// [response_schema_len:u32_le][response_schema_bytes]
     /// [semantics_bytes (3 bytes)]
     /// ```
-    #[must_use]
-    pub fn canonical_bytes(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns `ManifestValidationError::StringLengthOverflow` if any
+    /// string field exceeds u32 length capacity.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestValidationError> {
         let mut buf = Vec::new();
-        encode_string(&mut buf, &self.id);
-        encode_string(&mut buf, &self.route);
+        encode_string(&mut buf, &self.id, "route_entry.id")?;
+        encode_string(&mut buf, &self.route, "route_entry.route")?;
         buf.push(self.stability.discriminant());
-        encode_string(&mut buf, &self.request_schema);
-        encode_string(&mut buf, &self.response_schema);
+        encode_string(&mut buf, &self.request_schema, "route_entry.request_schema")?;
+        encode_string(
+            &mut buf,
+            &self.response_schema,
+            "route_entry.response_schema",
+        )?;
         buf.extend_from_slice(&self.semantics.canonical_bytes());
-        buf
+        Ok(buf)
     }
 }
 
@@ -281,45 +341,46 @@ impl HsiContractManifestV1 {
     /// 3. Route count is encoded as u32 LE
     /// 4. Routes are sorted by `route` field and encoded sequentially
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if routes are not sorted (this is a programming error;
-    /// `build_manifest` always sorts routes).
-    #[must_use]
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        // Assert sort invariant
+    /// Returns `ManifestValidationError` if:
+    /// - Routes are not sorted by `route` field
+    /// - Route count exceeds u32 capacity
+    /// - Any string field exceeds u32 length capacity
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestValidationError> {
+        // Validate sort invariant
         for i in 1..self.routes.len() {
-            assert!(
-                self.routes[i - 1].route <= self.routes[i].route,
-                "routes must be sorted by route field; found '{}' before '{}'",
-                self.routes[i - 1].route,
-                self.routes[i].route,
-            );
+            if self.routes[i - 1].route > self.routes[i].route {
+                return Err(ManifestValidationError::RoutesNotSorted {
+                    before: self.routes[i - 1].route.clone(),
+                    after: self.routes[i].route.clone(),
+                });
+            }
         }
 
         let mut buf = Vec::new();
 
         // Schema and version
-        encode_string(&mut buf, &self.schema);
-        encode_string(&mut buf, &self.schema_version);
+        encode_string(&mut buf, &self.schema, "schema")?;
+        encode_string(&mut buf, &self.schema_version, "schema_version")?;
 
         // CLI version
-        let cli_bytes = self.cli_version.canonical_bytes();
+        let cli_bytes = self.cli_version.canonical_bytes()?;
         buf.extend_from_slice(&cli_bytes);
 
         // Route count + entries
-        let count: u32 = self
-            .routes
-            .len()
-            .try_into()
-            .expect("route count exceeds u32");
+        let count: u32 = self.routes.len().try_into().map_err(|_| {
+            ManifestValidationError::RouteCountOverflow {
+                count: self.routes.len(),
+            }
+        })?;
         buf.extend_from_slice(&count.to_le_bytes());
         for entry in &self.routes {
-            let entry_bytes = entry.canonical_bytes();
+            let entry_bytes = entry.canonical_bytes()?;
             buf.extend_from_slice(&entry_bytes);
         }
 
-        buf
+        Ok(buf)
     }
 
     /// Computes the domain-separated content hash (BLAKE3).
@@ -328,24 +389,30 @@ impl HsiContractManifestV1 {
     /// `hash("apm2:apm2.hsi_contract.v1:1.0.0\n" + canonical_bytes)`
     ///
     /// Returns the hash in text form: `blake3:<64-hex>`
-    #[must_use]
-    pub fn content_hash(&self) -> String {
-        let canonical = self.canonical_bytes();
+    ///
+    /// # Errors
+    ///
+    /// Returns `ManifestValidationError` if canonicalization fails.
+    pub fn content_hash(&self) -> Result<String, ManifestValidationError> {
+        let canonical = self.canonical_bytes()?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(DOMAIN_PREFIX.as_bytes());
         hasher.update(&canonical);
         let hash = hasher.finalize();
-        format!("blake3:{}", hash.to_hex())
+        Ok(format!("blake3:{}", hash.to_hex()))
     }
 
     /// Returns the raw 32-byte BLAKE3 hash (domain-separated).
-    #[must_use]
-    pub fn content_hash_bytes(&self) -> [u8; 32] {
-        let canonical = self.canonical_bytes();
+    ///
+    /// # Errors
+    ///
+    /// Returns `ManifestValidationError` if canonicalization fails.
+    pub fn content_hash_bytes(&self) -> Result<[u8; 32], ManifestValidationError> {
+        let canonical = self.canonical_bytes()?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(DOMAIN_PREFIX.as_bytes());
         hasher.update(&canonical);
-        *hasher.finalize().as_bytes()
+        Ok(*hasher.finalize().as_bytes())
     }
 
     /// Validates that the manifest is well-formed.
@@ -411,10 +478,26 @@ impl HsiContractManifestV1 {
 /// Encodes a string as length-prefixed UTF-8 bytes.
 ///
 /// Format: `[len:u32_le][utf8_bytes]`
-fn encode_string(buf: &mut Vec<u8>, s: &str) {
-    let len: u32 = s.len().try_into().expect("string length exceeds u32");
+///
+/// # Errors
+///
+/// Returns `ManifestValidationError::StringLengthOverflow` if the string
+/// length exceeds u32 capacity.
+fn encode_string(
+    buf: &mut Vec<u8>,
+    s: &str,
+    field_name: &str,
+) -> Result<(), ManifestValidationError> {
+    let len: u32 =
+        s.len()
+            .try_into()
+            .map_err(|_| ManifestValidationError::StringLengthOverflow {
+                field: field_name.to_string(),
+                length: s.len(),
+            })?;
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(s.as_bytes());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -474,8 +557,8 @@ mod tests {
     fn encode_string_determinism() {
         let mut buf1 = Vec::new();
         let mut buf2 = Vec::new();
-        encode_string(&mut buf1, "hello");
-        encode_string(&mut buf2, "hello");
+        encode_string(&mut buf1, "hello", "test").expect("encode 1");
+        encode_string(&mut buf2, "hello", "test").expect("encode 2");
         assert_eq!(buf1, buf2);
         // 4 bytes length (5 as u32 LE) + 5 bytes "hello"
         assert_eq!(buf1.len(), 9);
@@ -487,17 +570,22 @@ mod tests {
     fn manifest_canonical_bytes_determinism() {
         let m1 = make_test_manifest();
         let m2 = make_test_manifest();
-        assert_eq!(m1.canonical_bytes(), m2.canonical_bytes());
+        assert_eq!(
+            m1.canonical_bytes().expect("bytes 1"),
+            m2.canonical_bytes().expect("bytes 2"),
+        );
     }
 
     #[test]
     fn manifest_content_hash_determinism() {
         let m1 = make_test_manifest();
         let m2 = make_test_manifest();
-        assert_eq!(m1.content_hash(), m2.content_hash());
-        assert!(m1.content_hash().starts_with("blake3:"));
+        let h1 = m1.content_hash().expect("hash 1");
+        let h2 = m2.content_hash().expect("hash 2");
+        assert_eq!(h1, h2);
+        assert!(h1.starts_with("blake3:"));
         // Hash is 64 hex chars after "blake3:"
-        assert_eq!(m1.content_hash().len(), 7 + 64);
+        assert_eq!(h1.len(), 7 + 64);
     }
 
     #[test]
@@ -505,7 +593,10 @@ mod tests {
         let m1 = make_test_manifest();
         let mut m2 = make_test_manifest();
         m2.routes[0].semantics.authoritative = !m2.routes[0].semantics.authoritative;
-        assert_ne!(m1.content_hash(), m2.content_hash());
+        assert_ne!(
+            m1.content_hash().expect("hash 1"),
+            m2.content_hash().expect("hash 2"),
+        );
     }
 
     #[test]
@@ -524,6 +615,21 @@ mod tests {
             errors.iter().any(|e| e.contains("not sorted")),
             "expected sort error, got: {errors:?}"
         );
+    }
+
+    #[test]
+    fn canonical_bytes_fails_on_unsorted_routes() {
+        let mut m = make_test_manifest();
+        m.routes.reverse();
+        let result = m.canonical_bytes();
+        assert!(
+            result.is_err(),
+            "canonical_bytes must fail on unsorted routes"
+        );
+        match result.unwrap_err() {
+            ManifestValidationError::RoutesNotSorted { .. } => {},
+            other => panic!("expected RoutesNotSorted, got: {other:?}"),
+        }
     }
 
     fn make_test_manifest() -> HsiContractManifestV1 {

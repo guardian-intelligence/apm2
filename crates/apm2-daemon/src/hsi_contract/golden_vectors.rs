@@ -47,7 +47,10 @@ pub const MANIFEST_FULL_VECTOR: GoldenVector = GoldenVector {
     // This hash is computed from the full dispatch registry with test CLI
     // version "0.9.0" and zero build hash. It MUST be updated when routes
     // are added, removed, or their semantics change.
-    expected_hash: "5fd32e6d97f638e963c49871e1e0bab50cc7a7f4ddb1c968ecdac96af1d49194",
+    //
+    // Updated: semantics changed — shutdown and credential management routes
+    // reclassified from authoritative to advisory per RFC-0020 section 1.3.
+    expected_hash: "c54630b38a1b503c77930f840955993813df3c9e36a400a68e9846ceb42a639d",
 };
 
 /// Golden vector: minimal manifest with a single route.
@@ -109,14 +112,18 @@ mod tests {
     fn golden_vector_discovery() {
         let full_manifest =
             build_manifest(test_cli_version()).expect("manifest build must succeed");
-        let full_hash = full_manifest.content_hash();
+        let full_hash = full_manifest
+            .content_hash()
+            .expect("content hash must succeed");
         let full_hex = &full_hash[7..]; // strip "blake3:" prefix
         eprintln!("=== GOLDEN VECTOR DISCOVERY ===");
         eprintln!("Full manifest hash:    {full_hex}");
         eprintln!("Full manifest routes:  {}", full_manifest.routes.len());
 
         let min_manifest = minimal_manifest();
-        let min_hash = min_manifest.content_hash();
+        let min_hash = min_manifest
+            .content_hash()
+            .expect("content hash must succeed");
         let min_hex = &min_hash[7..];
         eprintln!("Minimal manifest hash: {min_hex}");
     }
@@ -126,13 +133,13 @@ mod tests {
         let m1 = build_manifest(test_cli_version()).expect("build 1");
         let m2 = build_manifest(test_cli_version()).expect("build 2");
         assert_eq!(
-            m1.content_hash(),
-            m2.content_hash(),
+            m1.content_hash().expect("hash 1"),
+            m2.content_hash().expect("hash 2"),
             "manifest hash must be deterministic across builds"
         );
         assert_eq!(
-            m1.canonical_bytes(),
-            m2.canonical_bytes(),
+            m1.canonical_bytes().expect("bytes 1"),
+            m2.canonical_bytes().expect("bytes 2"),
             "canonical bytes must be deterministic across builds"
         );
     }
@@ -140,11 +147,11 @@ mod tests {
     #[test]
     fn full_manifest_golden_hash() {
         let manifest = build_manifest(test_cli_version()).expect("manifest build must succeed");
-        let hash = manifest.content_hash();
+        let hash = manifest.content_hash().expect("content hash must succeed");
         let hex = &hash[7..]; // strip "blake3:"
         assert_eq!(
             hex, MANIFEST_FULL_VECTOR.expected_hash,
-            "full manifest golden hash mismatch — did the dispatch registry change? \
+            "full manifest golden hash mismatch -- did the dispatch registry change? \
              Update MANIFEST_FULL_VECTOR.expected_hash if the change is intentional."
         );
     }
@@ -152,11 +159,11 @@ mod tests {
     #[test]
     fn minimal_manifest_golden_hash() {
         let manifest = minimal_manifest();
-        let hash = manifest.content_hash();
+        let hash = manifest.content_hash().expect("content hash must succeed");
         let hex = &hash[7..];
         assert_eq!(
             hex, MANIFEST_MINIMAL_VECTOR.expected_hash,
-            "minimal manifest golden hash mismatch — did the encoding format change? \
+            "minimal manifest golden hash mismatch -- did the encoding format change? \
              Update MANIFEST_MINIMAL_VECTOR.expected_hash if the change is intentional."
         );
     }
@@ -164,7 +171,9 @@ mod tests {
     #[test]
     fn canonical_bytes_are_nonempty() {
         let manifest = build_manifest(test_cli_version()).expect("manifest build must succeed");
-        let bytes = manifest.canonical_bytes();
+        let bytes = manifest
+            .canonical_bytes()
+            .expect("canonical bytes must succeed");
         assert!(
             bytes.len() > 100,
             "canonical bytes too short: {} bytes",
@@ -175,7 +184,7 @@ mod tests {
     #[test]
     fn content_hash_is_valid_blake3() {
         let manifest = build_manifest(test_cli_version()).expect("manifest build must succeed");
-        let hash = manifest.content_hash();
+        let hash = manifest.content_hash().expect("content hash must succeed");
         assert!(hash.starts_with("blake3:"), "hash must start with blake3:");
         let hex = &hash[7..];
         assert_eq!(hex.len(), 64, "BLAKE3 hex must be 64 chars");
@@ -188,8 +197,10 @@ mod tests {
     #[test]
     fn content_hash_bytes_matches_text() {
         let manifest = build_manifest(test_cli_version()).expect("manifest build must succeed");
-        let hash_text = manifest.content_hash();
-        let hash_bytes = manifest.content_hash_bytes();
+        let hash_text = manifest.content_hash().expect("text hash must succeed");
+        let hash_bytes = manifest
+            .content_hash_bytes()
+            .expect("bytes hash must succeed");
         let hex_from_bytes = hex::encode(hash_bytes);
         assert_eq!(
             &hash_text[7..],

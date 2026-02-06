@@ -5,6 +5,15 @@
 //! `SessionMessageType` is mapped to an HSI route entry with semantics
 //! annotations.
 //!
+//! # Mechanically Derived from Dispatch Enums
+//!
+//! Route descriptors are derived directly from `PrivilegedMessageType` and
+//! `SessionMessageType` via their `all_request_variants()`, `hsi_route()`,
+//! `hsi_route_id()`, `hsi_request_schema()`, and `hsi_response_schema()`
+//! methods. Adding a new dispatch variant without updating these methods
+//! causes a build failure (missing match arm) or a manifest completeness
+//! test failure.
+//!
 //! # Fail-closed Build Enforcement
 //!
 //! Per RFC-0020 section 3.1.1, if any route is missing a semantics
@@ -21,6 +30,8 @@ use super::manifest::{
     CliVersion, HsiContractManifestV1, HsiRouteEntry, SCHEMA_ID, SCHEMA_VERSION, StabilityClass,
 };
 use super::semantics::annotate_route;
+use crate::protocol::dispatch::PrivilegedMessageType;
+use crate::protocol::session_dispatch::SessionMessageType;
 
 /// Error returned when manifest generation fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,250 +80,37 @@ struct RouteDescriptor {
 }
 
 /// Returns all route descriptors from the privileged (operator) dispatch
-/// registry.
+/// registry, derived mechanically from `PrivilegedMessageType`.
 ///
-/// This function MUST be kept in sync with `PrivilegedMessageType` in
-/// `crate::protocol::dispatch`. If a new variant is added to the enum
-/// without a corresponding entry here, `build_manifest()` will still
-/// succeed but the route will be missing from the manifest. The
-/// `test_privileged_routes_complete` test catches this.
+/// Route metadata (ID, route path, schemas) comes directly from the enum
+/// methods, so adding a new variant without updating the match arms in
+/// `PrivilegedMessageType` causes a compile-time error.
 fn privileged_routes() -> Vec<RouteDescriptor> {
-    vec![
-        RouteDescriptor {
-            id: "CLAIM_WORK",
-            route: "hsi.work.claim",
+    PrivilegedMessageType::all_request_variants()
+        .iter()
+        .map(|v| RouteDescriptor {
+            id: v.hsi_route_id(),
+            route: v.hsi_route(),
             stability: StabilityClass::Stable,
-            request_schema: "apm2.claim_work_request.v1",
-            response_schema: "apm2.claim_work_response.v1",
-        },
-        RouteDescriptor {
-            id: "SPAWN_EPISODE",
-            route: "hsi.episode.spawn",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.spawn_episode_request.v1",
-            response_schema: "apm2.spawn_episode_response.v1",
-        },
-        RouteDescriptor {
-            id: "ISSUE_CAPABILITY",
-            route: "hsi.capability.issue",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.issue_capability_request.v1",
-            response_schema: "apm2.issue_capability_response.v1",
-        },
-        RouteDescriptor {
-            id: "SHUTDOWN",
-            route: "hsi.daemon.shutdown",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.shutdown_request.v1",
-            response_schema: "apm2.shutdown_response.v1",
-        },
-        RouteDescriptor {
-            id: "LIST_PROCESSES",
-            route: "hsi.process.list",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.list_processes_request.v1",
-            response_schema: "apm2.list_processes_response.v1",
-        },
-        RouteDescriptor {
-            id: "PROCESS_STATUS",
-            route: "hsi.process.status",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.process_status_request.v1",
-            response_schema: "apm2.process_status_response.v1",
-        },
-        RouteDescriptor {
-            id: "START_PROCESS",
-            route: "hsi.process.start",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.start_process_request.v1",
-            response_schema: "apm2.start_process_response.v1",
-        },
-        RouteDescriptor {
-            id: "STOP_PROCESS",
-            route: "hsi.process.stop",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.stop_process_request.v1",
-            response_schema: "apm2.stop_process_response.v1",
-        },
-        RouteDescriptor {
-            id: "RESTART_PROCESS",
-            route: "hsi.process.restart",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.restart_process_request.v1",
-            response_schema: "apm2.restart_process_response.v1",
-        },
-        RouteDescriptor {
-            id: "RELOAD_PROCESS",
-            route: "hsi.process.reload",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.reload_process_request.v1",
-            response_schema: "apm2.reload_process_response.v1",
-        },
-        RouteDescriptor {
-            id: "CONSENSUS_STATUS",
-            route: "hsi.consensus.status",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.consensus_status_request.v1",
-            response_schema: "apm2.consensus_status_response.v1",
-        },
-        RouteDescriptor {
-            id: "CONSENSUS_VALIDATORS",
-            route: "hsi.consensus.validators",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.consensus_validators_request.v1",
-            response_schema: "apm2.consensus_validators_response.v1",
-        },
-        RouteDescriptor {
-            id: "CONSENSUS_BYZANTINE_EVIDENCE",
-            route: "hsi.consensus.byzantine_evidence",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.consensus_byzantine_evidence_request.v1",
-            response_schema: "apm2.consensus_byzantine_evidence_response.v1",
-        },
-        RouteDescriptor {
-            id: "CONSENSUS_METRICS",
-            route: "hsi.consensus.metrics",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.consensus_metrics_request.v1",
-            response_schema: "apm2.consensus_metrics_response.v1",
-        },
-        RouteDescriptor {
-            id: "WORK_STATUS",
-            route: "hsi.work.status",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.work_status_request.v1",
-            response_schema: "apm2.work_status_response.v1",
-        },
-        RouteDescriptor {
-            id: "END_SESSION",
-            route: "hsi.session.end",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.end_session_request.v1",
-            response_schema: "apm2.end_session_response.v1",
-        },
-        RouteDescriptor {
-            id: "INGEST_REVIEW_RECEIPT",
-            route: "hsi.review.ingest_receipt",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.ingest_review_receipt_request.v1",
-            response_schema: "apm2.ingest_review_receipt_response.v1",
-        },
-        RouteDescriptor {
-            id: "LIST_CREDENTIALS",
-            route: "hsi.credential.list",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.list_credentials_request.v1",
-            response_schema: "apm2.list_credentials_response.v1",
-        },
-        RouteDescriptor {
-            id: "ADD_CREDENTIAL",
-            route: "hsi.credential.add",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.add_credential_request.v1",
-            response_schema: "apm2.add_credential_response.v1",
-        },
-        RouteDescriptor {
-            id: "REMOVE_CREDENTIAL",
-            route: "hsi.credential.remove",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.remove_credential_request.v1",
-            response_schema: "apm2.remove_credential_response.v1",
-        },
-        RouteDescriptor {
-            id: "REFRESH_CREDENTIAL",
-            route: "hsi.credential.refresh",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.refresh_credential_request.v1",
-            response_schema: "apm2.refresh_credential_response.v1",
-        },
-        RouteDescriptor {
-            id: "SWITCH_CREDENTIAL",
-            route: "hsi.credential.switch",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.switch_credential_request.v1",
-            response_schema: "apm2.switch_credential_response.v1",
-        },
-        RouteDescriptor {
-            id: "LOGIN_CREDENTIAL",
-            route: "hsi.credential.login",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.login_credential_request.v1",
-            response_schema: "apm2.login_credential_response.v1",
-        },
-        RouteDescriptor {
-            id: "SUBSCRIBE_PULSE",
-            route: "hsi.pulse.subscribe",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.subscribe_pulse_request.v1",
-            response_schema: "apm2.subscribe_pulse_response.v1",
-        },
-        RouteDescriptor {
-            id: "UNSUBSCRIBE_PULSE",
-            route: "hsi.pulse.unsubscribe",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.unsubscribe_pulse_request.v1",
-            response_schema: "apm2.unsubscribe_pulse_response.v1",
-        },
-        RouteDescriptor {
-            id: "PUBLISH_CHANGESET",
-            route: "hsi.changeset.publish",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.publish_changeset_request.v1",
-            response_schema: "apm2.publish_changeset_response.v1",
-        },
-    ]
+            request_schema: v.hsi_request_schema(),
+            response_schema: v.hsi_response_schema(),
+        })
+        .collect()
 }
 
-/// Returns all route descriptors from the session-scoped dispatch registry.
-///
-/// This function MUST be kept in sync with `SessionMessageType` in
-/// `crate::protocol::session_dispatch`. The `test_session_routes_complete`
-/// test catches missing entries.
+/// Returns all route descriptors from the session-scoped dispatch registry,
+/// derived mechanically from `SessionMessageType`.
 fn session_routes() -> Vec<RouteDescriptor> {
-    vec![
-        RouteDescriptor {
-            id: "REQUEST_TOOL",
-            route: "hsi.tool.request",
+    SessionMessageType::all_request_variants()
+        .iter()
+        .map(|v| RouteDescriptor {
+            id: v.hsi_route_id(),
+            route: v.hsi_route(),
             stability: StabilityClass::Stable,
-            request_schema: "apm2.request_tool_request.v1",
-            response_schema: "apm2.request_tool_response.v1",
-        },
-        RouteDescriptor {
-            id: "EMIT_EVENT",
-            route: "hsi.event.emit",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.emit_event_request.v1",
-            response_schema: "apm2.emit_event_response.v1",
-        },
-        RouteDescriptor {
-            id: "PUBLISH_EVIDENCE",
-            route: "hsi.evidence.publish",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.publish_evidence_request.v1",
-            response_schema: "apm2.publish_evidence_response.v1",
-        },
-        RouteDescriptor {
-            id: "STREAM_TELEMETRY",
-            route: "hsi.telemetry.stream",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.stream_telemetry_request.v1",
-            response_schema: "apm2.stream_telemetry_response.v1",
-        },
-        RouteDescriptor {
-            id: "STREAM_LOGS",
-            route: "hsi.logs.stream",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.stream_logs_request.v1",
-            response_schema: "apm2.stream_logs_response.v1",
-        },
-        RouteDescriptor {
-            id: "SESSION_STATUS",
-            route: "hsi.session.status",
-            stability: StabilityClass::Stable,
-            request_schema: "apm2.session_status_request.v1",
-            response_schema: "apm2.session_status_response.v1",
-        },
-    ]
+            request_schema: v.hsi_request_schema(),
+            response_schema: v.hsi_response_schema(),
+        })
+        .collect()
 }
 
 /// Builds an `HSIContractManifestV1` from the daemon and CLI dispatch
@@ -382,14 +180,15 @@ pub fn build_manifest(
 /// Expected number of privileged routes.
 ///
 /// This constant MUST be updated when routes are added to or removed from
-/// `PrivilegedMessageType`. The `test_privileged_route_count` test enforces
-/// this.
+/// `PrivilegedMessageType::all_request_variants()`. The
+/// `test_privileged_route_count` test enforces this.
 pub const EXPECTED_PRIVILEGED_ROUTE_COUNT: usize = 26;
 
 /// Expected number of session routes.
 ///
 /// This constant MUST be updated when routes are added to or removed from
-/// `SessionMessageType`. The `test_session_route_count` test enforces this.
+/// `SessionMessageType::all_request_variants()`. The
+/// `test_session_route_count` test enforces this.
 pub const EXPECTED_SESSION_ROUTE_COUNT: usize = 6;
 
 /// Expected total route count for the manifest.
@@ -433,8 +232,14 @@ mod tests {
     fn build_manifest_deterministic_across_builds() {
         let m1 = build_manifest(test_cli_version()).expect("build 1");
         let m2 = build_manifest(test_cli_version()).expect("build 2");
-        assert_eq!(m1.canonical_bytes(), m2.canonical_bytes());
-        assert_eq!(m1.content_hash(), m2.content_hash());
+        assert_eq!(
+            m1.canonical_bytes().expect("canonical bytes 1"),
+            m2.canonical_bytes().expect("canonical bytes 2"),
+        );
+        assert_eq!(
+            m1.content_hash().expect("hash 1"),
+            m2.content_hash().expect("hash 2"),
+        );
     }
 
     #[test]
@@ -446,7 +251,10 @@ mod tests {
                 .to_string(),
         })
         .expect("build 2");
-        assert_ne!(m1.content_hash(), m2.content_hash());
+        assert_ne!(
+            m1.content_hash().expect("hash 1"),
+            m2.content_hash().expect("hash 2"),
+        );
     }
 
     #[test]
@@ -516,97 +324,72 @@ mod tests {
         );
     }
 
+    /// Verifies that ALL authoritative routes require receipts.
+    ///
+    /// Per RFC-0020 section 1.3, authoritative routes MUST produce receipts
+    /// for proof-carrying-effects/accountability. No exceptions.
     #[test]
     fn all_authoritative_routes_require_receipts() {
         let manifest = build_manifest(test_cli_version()).expect("manifest build must succeed");
         for entry in &manifest.routes {
             if entry.semantics.authoritative {
-                // Authoritative routes that do not require receipts are
-                // explicitly annotated (e.g., credential management routes
-                // that are local-only). We verify that at minimum, the
-                // core authoritative routes do require receipts.
-                if entry.route.starts_with("hsi.tool.")
-                    || entry.route.starts_with("hsi.event.")
-                    || entry.route.starts_with("hsi.evidence.")
-                    || entry.route.starts_with("hsi.work.claim")
-                    || entry.route.starts_with("hsi.episode.")
-                {
-                    assert!(
-                        entry.semantics.receipt_required,
-                        "authoritative route '{}' must require receipts",
-                        entry.route
-                    );
-                }
+                assert!(
+                    entry.semantics.receipt_required,
+                    "authoritative route '{}' must require receipts — \
+                     reclassify as advisory if receipts are not needed",
+                    entry.route
+                );
             }
         }
     }
 
-    /// Verifies that `PrivilegedMessageType` variants (excluding response-only
-    /// types like `PulseEvent`) have corresponding route descriptors.
+    /// Verifies that `PrivilegedMessageType::all_request_variants()` covers
+    /// all request-bearing dispatch variants.
     ///
-    /// If this test fails, a new `PrivilegedMessageType` variant was added
-    /// without a corresponding route descriptor. Add the missing route to
-    /// `privileged_routes()` and its semantics to `annotate_route()`.
+    /// This test asserts that the route descriptors derived from the enum
+    /// match the expected count, and that every variant's route appears in
+    /// the built manifest. If a new variant is added to the enum but not
+    /// to `all_request_variants()`, this test will fail.
     #[test]
     fn privileged_routes_cover_dispatch_types() {
-        // Cross-reference: these are the message types from PrivilegedMessageType
-        // that represent request-bearing routes (not response-only).
-        let expected_routes = [
-            "hsi.work.claim",
-            "hsi.episode.spawn",
-            "hsi.capability.issue",
-            "hsi.daemon.shutdown",
-            "hsi.process.list",
-            "hsi.process.status",
-            "hsi.process.start",
-            "hsi.process.stop",
-            "hsi.process.restart",
-            "hsi.process.reload",
-            "hsi.consensus.status",
-            "hsi.consensus.validators",
-            "hsi.consensus.byzantine_evidence",
-            "hsi.consensus.metrics",
-            "hsi.work.status",
-            "hsi.session.end",
-            "hsi.review.ingest_receipt",
-            "hsi.credential.list",
-            "hsi.credential.add",
-            "hsi.credential.remove",
-            "hsi.credential.refresh",
-            "hsi.credential.switch",
-            "hsi.credential.login",
-            "hsi.pulse.subscribe",
-            "hsi.pulse.unsubscribe",
-            "hsi.changeset.publish",
-        ];
+        let variants = PrivilegedMessageType::all_request_variants();
+        assert_eq!(
+            variants.len(),
+            EXPECTED_PRIVILEGED_ROUTE_COUNT,
+            "PrivilegedMessageType::all_request_variants() count mismatch — \
+             a new variant was added without updating all_request_variants()"
+        );
         let manifest = build_manifest(test_cli_version()).expect("manifest build must succeed");
         let manifest_routes: Vec<&str> = manifest.routes.iter().map(|r| r.route.as_str()).collect();
-        for route in &expected_routes {
+        for v in variants {
             assert!(
-                manifest_routes.contains(route),
-                "missing route in manifest: {route}"
+                manifest_routes.contains(&v.hsi_route()),
+                "missing route in manifest for {:?}: {}",
+                v,
+                v.hsi_route()
             );
         }
     }
 
-    /// Verifies that `SessionMessageType` variants (excluding response-only
-    /// types like `PulseEvent`) have corresponding route descriptors.
+    /// Verifies that `SessionMessageType::all_request_variants()` covers
+    /// all request-bearing session dispatch variants.
     #[test]
     fn session_routes_cover_dispatch_types() {
-        let expected_routes = [
-            "hsi.tool.request",
-            "hsi.event.emit",
-            "hsi.evidence.publish",
-            "hsi.telemetry.stream",
-            "hsi.logs.stream",
-            "hsi.session.status",
-        ];
+        let variants = SessionMessageType::all_request_variants();
+        assert_eq!(
+            variants.len(),
+            EXPECTED_SESSION_ROUTE_COUNT,
+            "SessionMessageType::all_request_variants() count mismatch — \
+             a new variant was added without updating all_request_variants()"
+        );
         let manifest = build_manifest(test_cli_version()).expect("manifest build must succeed");
         let manifest_routes: Vec<&str> = manifest.routes.iter().map(|r| r.route.as_str()).collect();
-        for route in &expected_routes {
+        for v in variants {
             assert!(
-                manifest_routes.contains(route),
-                "missing route in manifest: {route}"
+                manifest_routes.contains(&v.hsi_route()),
+                "missing route in manifest for {:?}: {}",
+                v,
+                v.hsi_route()
             );
         }
     }

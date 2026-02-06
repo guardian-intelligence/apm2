@@ -5,17 +5,24 @@
 //! a semantics annotation describing whether it is authoritative vs advisory,
 //! its idempotency requirement, and its receipt obligation.
 //!
+//! # Authoritative Routes and Receipts
+//!
+//! Per RFC-0020 section 1.3, ALL authoritative routes MUST require receipts
+//! for proof-carrying-effects/accountability. Routes that do not need
+//! receipts (e.g., local-only operations) MUST be classified as advisory.
+//!
 //! # Fail-closed Build Enforcement
 //!
 //! The `annotate_route` function returns `Option<HsiRouteSemantics>`. When
 //! building the manifest via `build_manifest()`, any route missing a semantics
 //! annotation causes the build to fail. This is enforced at manifest
-//! construction time (not just compile time) so that new routes added to the
-//! dispatcher without annotations are caught immediately.
+//! construction time so that new routes added to the dispatcher without
+//! annotations are caught immediately.
 //!
 //! # Contract References
 //!
 //! - RFC-0020 section 3.1: Missing annotations MUST fail the build
+//! - RFC-0020 section 1.3: Authoritative routes MUST produce receipts
 //! - REQ-0001: `Missing route semantics annotation fails CI/build`
 
 use super::manifest::{HsiRouteSemantics, IdempotencyRequirement};
@@ -38,28 +45,30 @@ const AUTH_BESTEFFORT_RECEIPT: HsiRouteSemantics = HsiRouteSemantics {
     receipt_required: true,
 };
 
-/// Authoritative + best-effort idempotency + no receipt.
-///
-/// Used for local-only operations (shutdown, credential management).
-const AUTH_BESTEFFORT_NO_RECEIPT: HsiRouteSemantics = HsiRouteSemantics {
-    authoritative: true,
-    idempotency: IdempotencyRequirement::BestEffort,
-    receipt_required: false,
-};
-
-/// Authoritative + idempotency-required + no receipt.
-///
-/// Used for local credential storage operations.
-const AUTH_IDEMPOTENT_NO_RECEIPT: HsiRouteSemantics = HsiRouteSemantics {
-    authoritative: true,
-    idempotency: IdempotencyRequirement::Required,
-    receipt_required: false,
-};
-
 /// Advisory (read-only) semantics: no idempotency, no receipts.
 const ADVISORY: HsiRouteSemantics = HsiRouteSemantics {
     authoritative: false,
     idempotency: IdempotencyRequirement::NotRequired,
+    receipt_required: false,
+};
+
+/// Advisory + best-effort idempotency semantics (no receipts).
+///
+/// Used for local-only operations (daemon shutdown, credential management)
+/// that are not authoritative and do not require receipts.
+const ADVISORY_BESTEFFORT: HsiRouteSemantics = HsiRouteSemantics {
+    authoritative: false,
+    idempotency: IdempotencyRequirement::BestEffort,
+    receipt_required: false,
+};
+
+/// Advisory + idempotency-required semantics (no receipts).
+///
+/// Used for local credential storage operations (add is idempotent by key)
+/// that are not authoritative and do not require receipts.
+const ADVISORY_IDEMPOTENT: HsiRouteSemantics = HsiRouteSemantics {
+    authoritative: false,
+    idempotency: IdempotencyRequirement::Required,
     receipt_required: false,
 };
 
@@ -69,6 +78,12 @@ const ADVISORY: HsiRouteSemantics = HsiRouteSemantics {
 /// Adding a new route to the dispatcher without adding a corresponding
 /// annotation will cause `build_manifest()` to return an error, which
 /// fails the build per RFC-0020 section 3.1.1.
+///
+/// # Authoritative and Receipts Invariant
+///
+/// Per RFC-0020 section 1.3, all authoritative routes MUST have
+/// `receipt_required: true`. Routes that do not need receipts (e.g.,
+/// local-only credential management) are classified as advisory.
 ///
 /// # Fail-closed
 ///
@@ -100,20 +115,22 @@ pub fn annotate_route(route: &str) -> Option<HsiRouteSemantics> {
         },
 
         // =================================================================
-        // Authoritative + best-effort idempotency + no receipt
+        // Advisory + best-effort idempotency (no receipts)
         // Local-only operations (daemon shutdown, credential management).
+        // These are NOT authoritative: they do not produce world effects
+        // that require proof-carrying receipts.
         // =================================================================
         "hsi.daemon.shutdown"
         | "hsi.credential.remove"
         | "hsi.credential.refresh"
         | "hsi.credential.switch"
-        | "hsi.credential.login" => Some(AUTH_BESTEFFORT_NO_RECEIPT),
+        | "hsi.credential.login" => Some(ADVISORY_BESTEFFORT),
 
         // =================================================================
-        // Authoritative + idempotent + no receipt
+        // Advisory + idempotent (no receipts)
         // Local credential storage (add is idempotent by key).
         // =================================================================
-        "hsi.credential.add" => Some(AUTH_IDEMPOTENT_NO_RECEIPT),
+        "hsi.credential.add" => Some(ADVISORY_IDEMPOTENT),
 
         // =================================================================
         // Advisory (read-only) endpoints
@@ -172,22 +189,51 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_routes_require_receipts() {
-        let authoritative_routes = [
+    fn authoritative_routes_always_require_receipts() {
+        // Exhaustively verify ALL annotated routes: if authoritative, must
+        // require receipts.
+        let all_routes = [
             "hsi.work.claim",
             "hsi.episode.spawn",
             "hsi.capability.issue",
+            "hsi.process.start",
+            "hsi.review.ingest_receipt",
+            "hsi.changeset.publish",
             "hsi.tool.request",
             "hsi.event.emit",
             "hsi.evidence.publish",
+            "hsi.process.stop",
+            "hsi.process.restart",
+            "hsi.process.reload",
+            "hsi.session.end",
+            "hsi.daemon.shutdown",
+            "hsi.credential.remove",
+            "hsi.credential.refresh",
+            "hsi.credential.switch",
+            "hsi.credential.login",
+            "hsi.credential.add",
+            "hsi.process.list",
+            "hsi.process.status",
+            "hsi.consensus.status",
+            "hsi.consensus.validators",
+            "hsi.consensus.byzantine_evidence",
+            "hsi.consensus.metrics",
+            "hsi.work.status",
+            "hsi.credential.list",
+            "hsi.pulse.subscribe",
+            "hsi.pulse.unsubscribe",
+            "hsi.telemetry.stream",
+            "hsi.logs.stream",
+            "hsi.session.status",
         ];
-        for route in &authoritative_routes {
+        for route in &all_routes {
             let sem = annotate_route(route).unwrap();
-            assert!(sem.authoritative, "route {route} must be authoritative");
-            assert!(
-                sem.receipt_required,
-                "authoritative route {route} must require receipts"
-            );
+            if sem.authoritative {
+                assert!(
+                    sem.receipt_required,
+                    "authoritative route {route} must require receipts"
+                );
+            }
         }
     }
 
@@ -207,6 +253,31 @@ mod tests {
             assert!(
                 !sem.receipt_required,
                 "advisory route {route} must not require receipts"
+            );
+        }
+    }
+
+    #[test]
+    fn local_only_routes_are_advisory() {
+        // Shutdown and credential management are local-only and must be
+        // classified as advisory (not authoritative) per RFC-0020 section 1.3.
+        let local_routes = [
+            "hsi.daemon.shutdown",
+            "hsi.credential.add",
+            "hsi.credential.remove",
+            "hsi.credential.refresh",
+            "hsi.credential.switch",
+            "hsi.credential.login",
+        ];
+        for route in &local_routes {
+            let sem = annotate_route(route).unwrap();
+            assert!(
+                !sem.authoritative,
+                "local-only route {route} must be advisory, not authoritative"
+            );
+            assert!(
+                !sem.receipt_required,
+                "advisory local-only route {route} must not require receipts"
             );
         }
     }
