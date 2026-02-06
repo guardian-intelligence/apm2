@@ -653,6 +653,14 @@ pub const SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_
 /// multi-GB ID strings.
 pub const MAX_ID_LENGTH: usize = 256;
 
+/// Maximum allowed length for the `reason` field in `EndSessionRequest`.
+///
+/// Per SEC-SCP-FAC-0020: Caller-controlled text is written into signed ledger
+/// payloads. Unbounded reason strings enable denial-of-service via OOM and
+/// bloated ledger entries. This limit constrains the reason to a reasonable
+/// diagnostic string.
+pub const MAX_REASON_LENGTH: usize = 1024;
+
 /// Maximum number of events stored in `StubLedgerEventEmitter`.
 ///
 /// Per CTR-1303: In-memory stores must have `max_entries` limit with O(1)
@@ -4733,13 +4741,24 @@ impl PrivilegedDispatcher {
     /// - Session must exist in the session registry
     /// - Actor ID is derived from peer credentials (not user input)
     /// - `SessionTerminated` event is signed and persisted atomically
-    /// - Fail-closed: returns error if timestamp generation or event emission
-    ///   fails
-    /// - Session is removed from registry POST-COMMIT (after ledger + runtime
-    ///   succeed), ensuring the session is restored on failure
+    /// - Fail-closed: returns error if timestamp generation, runtime stop, or
+    ///   event emission fails
+    /// - Session is removed from registry POST-COMMIT (after runtime stop +
+    ///   ledger succeed), ensuring the session is re-findable for retry on
+    ///   failure
     /// - `WorkTransitioned` emission failure is propagated (fail-closed)
     /// - Exit code derived from typed `TerminationOutcome` enum (not string
     ///   matching)
+    /// - Reason field bounded by `MAX_REASON_LENGTH` to prevent OOM/bloated
+    ///   ledger entries
+    ///
+    /// # Ordering (Security BLOCKER 2 / Quality BLOCKER 1)
+    ///
+    /// 1. Read session state (no removal)
+    /// 2. Stop runtime via `stop_with_session_context` (fail-closed)
+    /// 3. Derive exit code from typed `TerminationOutcome` enum
+    /// 4. Emit ledger events (`SessionTerminated`, `WorkTransitioned`)
+    /// 5. Remove session from registry (POST-COMMIT)
     fn handle_end_session(
         &self,
         payload: &[u8],
@@ -4776,9 +4795,22 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // Look up session WITHOUT removing it yet (POST-COMMIT removal).
-        // The session is only removed after all fallible ledger/runtime
-        // operations succeed, preventing orphan removal on downstream failure.
+        // SEC-SCP-FAC-0020 / Security MAJOR 1: Enforce maximum length on
+        // reason to prevent OOM and bloated signed ledger payloads.
+        if request.reason.len() > MAX_REASON_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "reason exceeds maximum length of {MAX_REASON_LENGTH} bytes (got {})",
+                    request.reason.len()
+                ),
+            ));
+        }
+
+        // ---- Phase 1: Read session state (no removal) ----
+        // Look up session WITHOUT removing it. The session is only removed
+        // after all fallible operations succeed (POST-COMMIT), ensuring the
+        // session is re-findable for retry if any step fails.
         let Some(session) = self.session_registry.get_session(&request.session_id) else {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
@@ -4823,6 +4855,57 @@ impl PrivilegedDispatcher {
             },
         };
 
+        // ---- Phase 2: Stop runtime BEFORE emitting ledger events ----
+        // Security BLOCKER 2 / Quality BLOCKER 1: Runtime must be stopped
+        // BEFORE writing success/completion facts to the ledger. If the
+        // runtime stop fails, we fail closed without writing incorrect
+        // success facts. Uses `stop_with_session_context` per Quality
+        // MAJOR 1 to ensure the episode transitions to Terminated and
+        // emits `episode.stopped`.
+        if let Some(ref episode_id_str) = session.episode_id {
+            if let Ok(episode_id_parsed) = EpisodeId::new(episode_id_str.clone()) {
+                let termination_class = if exit_code == 0 {
+                    TerminationClass::Success
+                } else {
+                    TerminationClass::Failure
+                };
+                let stop_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let rt = &self.episode_runtime;
+                    tokio::task::block_in_place(|| {
+                        handle.block_on(rt.stop_with_session_context(
+                            &episode_id_parsed,
+                            termination_class,
+                            timestamp_ns,
+                            &request.session_id,
+                            &session.work_id,
+                            &actor_id,
+                        ))
+                    })
+                } else {
+                    // No tokio runtime available; fail closed rather than
+                    // skipping the runtime stop.
+                    warn!("No tokio runtime handle available for runtime stop - failing closed");
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        "runtime stop failed: no async runtime available",
+                    ));
+                };
+
+                if let Err(e) = stop_result {
+                    warn!(
+                        error = %e,
+                        episode_id = %episode_id_str,
+                        "Runtime stop failed - failing closed without writing success facts"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("runtime stop failed: {e}"),
+                    ));
+                }
+            }
+        }
+
+        // ---- Phase 3: Emit ledger events (after successful runtime stop) ----
         let termination_reason = if request.reason.is_empty() {
             "session_ended_via_ipc"
         } else {
@@ -4831,6 +4914,7 @@ impl PrivilegedDispatcher {
 
         // TCK-00395: Emit SessionTerminated event to ledger.
         // This is the authoritative path for recording session termination.
+        // Only emitted AFTER runtime stop succeeds (Security BLOCKER 2).
         if let Err(e) = self.event_emitter.emit_session_terminated(
             &request.session_id,
             &session.work_id,
@@ -4873,47 +4957,11 @@ impl PrivilegedDispatcher {
             }
         }
 
-        // TCK-00395 BLOCKER 1 + Quality v3 MAJOR 7: Wire
-        // `stop_with_session_context` for episode-backed sessions.
-        // This ensures the episode runtime transitions to Terminated,
-        // emits the episode.stopped event, AND emits SessionTerminated
-        // via the runtime's ledger emitter (production callback path).
-        //
-        // Security BLOCKER 1: Uses `block_in_place` + `block_on` instead
-        // of bare `block_on` to avoid panicking from within an async
-        // worker thread.
-        if let Some(ref episode_id_str) = session.episode_id {
-            if let Ok(episode_id_parsed) = EpisodeId::new(episode_id_str.clone()) {
-                let termination_class = if exit_code == 0 {
-                    TerminationClass::Success
-                } else {
-                    TerminationClass::Failure
-                };
-                // Best-effort runtime stop: the session is already terminated
-                // in the ledger. If the runtime stop fails (e.g., episode
-                // already terminated), we log but don't fail the response.
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let rt = self.episode_runtime.clone();
-                    let sid = request.session_id.clone();
-                    let wid = session.work_id.clone();
-                    let _ = tokio::task::block_in_place(|| {
-                        handle.block_on(rt.stop_with_session_context(
-                            &episode_id_parsed,
-                            termination_class,
-                            timestamp_ns,
-                            &sid,
-                            &wid,
-                            &actor_id,
-                        ))
-                    });
-                }
-            }
-        }
-
-        // POST-COMMIT: Remove session from registry only after ALL fallible
-        // ledger and runtime operations have succeeded. This prevents the
-        // session from being orphaned (removed but not recorded) if a
-        // downstream step fails.
+        // ---- Phase 4: POST-COMMIT session removal ----
+        // Remove session from registry only after ALL fallible operations
+        // (runtime stop + ledger emission) have succeeded. This prevents
+        // the session from being orphaned if a downstream step fails
+        // (Security BLOCKER 1 / Quality BLOCKER 2).
         if let Err(e) = self.session_registry.remove_session(&request.session_id) {
             warn!(
                 error = %e,
@@ -10561,6 +10609,131 @@ mod tests {
                     );
                 },
                 other => panic!("Expected error on repeated EndSession, got: {other:?}"),
+            }
+        }
+
+        /// Security MAJOR 1: `EndSession` rejects reason strings that exceed
+        /// `MAX_REASON_LENGTH`. Prevents OOM and bloated signed ledger
+        /// payloads.
+        #[test]
+        fn end_session_rejects_oversized_reason() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // ClaimWork + SpawnEpisode to get a valid session
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id,
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+            let session_id = match spawn_response {
+                PrivilegedResponse::SpawnEpisode(ref resp) => resp.session_id.clone(),
+                _ => panic!("Expected SpawnEpisode response"),
+            };
+
+            // EndSession with oversized reason (MAX_REASON_LENGTH + 1)
+            let oversized_reason = "x".repeat(MAX_REASON_LENGTH + 1);
+            let end_request = EndSessionRequest {
+                session_id: session_id.clone(),
+                reason: oversized_reason,
+                outcome: TerminationOutcome::Success as i32,
+            };
+            let end_frame = encode_end_session_request(&end_request);
+            let response = dispatcher.dispatch(&end_frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("reason exceeds maximum length"),
+                        "Expected reason length error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for oversized reason, got: {other:?}"),
+            }
+
+            // Verify session is NOT removed (request was rejected)
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session(&session_id)
+                    .is_some(),
+                "Session MUST be preserved when reason validation fails"
+            );
+        }
+
+        /// Security MAJOR 1: `EndSession` accepts reason at exactly
+        /// `MAX_REASON_LENGTH` bytes (boundary).
+        #[test]
+        fn end_session_accepts_reason_at_max_length() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id,
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+            let session_id = match spawn_response {
+                PrivilegedResponse::SpawnEpisode(ref resp) => resp.session_id.clone(),
+                _ => panic!("Expected SpawnEpisode response"),
+            };
+
+            // EndSession with reason at exactly MAX_REASON_LENGTH
+            let max_reason = "r".repeat(MAX_REASON_LENGTH);
+            let end_request = EndSessionRequest {
+                session_id: session_id.clone(),
+                reason: max_reason,
+                outcome: TerminationOutcome::Failure as i32,
+            };
+            let end_frame = encode_end_session_request(&end_request);
+            let response = dispatcher.dispatch(&end_frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::EndSession(resp) => {
+                    assert_eq!(resp.session_id, session_id);
+                },
+                other => {
+                    panic!("Expected EndSession response for max-length reason, got: {other:?}")
+                },
             }
         }
 
