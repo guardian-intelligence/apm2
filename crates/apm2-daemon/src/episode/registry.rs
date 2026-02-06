@@ -1978,10 +1978,8 @@ impl PersistentSessionRegistry {
         let state = self.inner.state.read().expect("lock poisoned");
 
         // Build state file excluding the sessions to be removed
-        let ids_to_remove: std::collections::HashSet<&str> = session_ids_to_remove
-            .iter()
-            .map(String::as_str)
-            .collect();
+        let ids_to_remove: std::collections::HashSet<&str> =
+            session_ids_to_remove.iter().map(String::as_str).collect();
 
         let state_file = PersistentStateFile {
             version: 1,
@@ -2156,10 +2154,11 @@ impl SessionRegistry for PersistentSessionRegistry {
         // Persist the projected state (with sessions removed) FIRST.
         // We read the current in-memory state, compute what it would look
         // like after removal, persist that, then actually remove in-memory.
-        self.persist_without_sessions(session_ids)
-            .map_err(|e| SessionRegistryError::RegistrationFailed {
+        self.persist_without_sessions(session_ids).map_err(|e| {
+            SessionRegistryError::RegistrationFailed {
                 message: format!("Failed to persist after partial clear: {e}"),
-            })?;
+            }
+        })?;
 
         // Persist succeeded -- now safe to clear in-memory state.
         for id in session_ids {

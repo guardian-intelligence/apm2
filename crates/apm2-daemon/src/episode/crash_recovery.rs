@@ -196,9 +196,9 @@ pub fn collect_sessions(registry: &Arc<dyn SessionRegistry>) -> CollectedSession
 /// For each stale session:
 /// 1. Emits a `LEASE_REVOKED` event to the ledger (if emitter is available)
 /// 2. Deletes the work claim from the `work_claims` table (if `SQLite` conn is
-///    available) so the work becomes re-claimable. Per security review v4
-///    MAJOR 1, work claim cleanup is causally gated on successful ledger
-///    emission -- if ledger emission fails, the work claim is NOT released.
+///    available) so the work becomes re-claimable. Per security review v4 MAJOR
+///    1, work claim cleanup is causally gated on successful ledger emission --
+///    if ledger emission fails, the work claim is NOT released.
 ///
 /// # Arguments
 ///
@@ -474,12 +474,11 @@ fn emit_lease_revoked_event(
 ) -> Result<String, CrashRecoveryError> {
     // Security Review v4 BLOCKER 2: All timestamps come from the shared HTF
     // clock. No SystemTime fallback -- fail-closed if HTF is unavailable.
-    let timestamp_ns = htf_clock
-        .now_hlc()
-        .map(|hlc| hlc.wall_ns)
-        .map_err(|e| CrashRecoveryError::TimestampFailed {
+    let timestamp_ns = htf_clock.now_hlc().map(|hlc| hlc.wall_ns).map_err(|e| {
+        CrashRecoveryError::TimestampFailed {
             message: format!("HTF clock error for session {}: {e}", session.session_id),
-        })?;
+        }
+    })?;
 
     // Build the LEASE_REVOKED payload
     let payload = serde_json::json!({

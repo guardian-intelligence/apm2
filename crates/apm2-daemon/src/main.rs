@@ -1364,13 +1364,13 @@ async fn perform_crash_recovery(
     // recovery timestamps. Per RFC-0016, all ledger event timestamps must come
     // from the HolonicClock. If clock creation fails, recovery must fail-closed
     // rather than falling back to SystemTime.
-    let htf_clock = apm2_daemon::htf::HolonicClock::new(
-        apm2_daemon::htf::ClockConfig::default(),
-        None,
-    )
-    .map_err(|e| anyhow::anyhow!(
-        "Failed to create HTF clock for crash recovery (fail-closed per RFC-0016): {e}"
-    ))?;
+    let htf_clock =
+        apm2_daemon::htf::HolonicClock::new(apm2_daemon::htf::ClockConfig::default(), None)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create HTF clock for crash recovery (fail-closed per RFC-0016): {e}"
+                )
+            })?;
 
     // TCK-00387: Perform crash recovery -- emit LEASE_REVOKED events and clean
     // up work claims for each stale session.
@@ -1402,10 +1402,12 @@ async fn perform_crash_recovery(
                 &collected,
                 Some(&outcome.succeeded_session_ids),
             )
-            .map_err(|e| anyhow::anyhow!(
-                "Registry clear/persist failed after successful recovery \
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Registry clear/persist failed after successful recovery \
                  (fail-closed to prevent repeated side-effects): {e}"
-            ))?;
+                )
+            })?;
         },
         Err(apm2_daemon::episode::crash_recovery::CrashRecoveryError::Timeout {
             elapsed_ms,
@@ -1428,10 +1430,12 @@ async fn perform_crash_recovery(
                     &collected,
                     Some(&outcome.succeeded_session_ids),
                 )
-                .map_err(|e| anyhow::anyhow!(
-                    "Registry clear/persist failed after timeout partial recovery \
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Registry clear/persist failed after timeout partial recovery \
                      (fail-closed to prevent repeated side-effects): {e}"
-                ))?;
+                    )
+                })?;
             }
         },
         Err(apm2_daemon::episode::crash_recovery::CrashRecoveryError::PartialRecovery {
@@ -1455,10 +1459,12 @@ async fn perform_crash_recovery(
                 &collected,
                 Some(&outcome.succeeded_session_ids),
             )
-            .map_err(|e| anyhow::anyhow!(
-                "Registry clear/persist failed after partial recovery \
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Registry clear/persist failed after partial recovery \
                  (fail-closed to prevent repeated side-effects): {e}"
-            ))?;
+                )
+            })?;
         },
         Err(e) => {
             // Registry is NOT cleared on error -- unrecovered sessions are
