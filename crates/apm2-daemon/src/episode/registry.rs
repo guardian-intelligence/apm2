@@ -762,13 +762,32 @@ mod tests {
 use std::collections::VecDeque;
 use std::sync::RwLock;
 
-use crate::session::{SessionRegistry, SessionRegistryError, SessionState};
+use crate::session::{SessionRegistry, SessionRegistryError, SessionState, SessionTerminationInfo};
 
 /// Maximum number of sessions tracked in the session registry.
 ///
 /// Per CTR-1303: In-memory stores must have `max_entries` limit to prevent
 /// denial-of-service via memory exhaustion.
 pub const MAX_SESSIONS: usize = 10_000;
+
+/// TTL for terminated session entries in seconds (TCK-00385).
+///
+/// Terminated sessions are preserved in the registry for this duration
+/// so that `SessionStatus` queries return useful termination details
+/// instead of "session not found". After this TTL, entries are cleaned up
+/// to prevent unbounded memory growth.
+pub const TERMINATED_SESSION_TTL_SECS: u64 = 300; // 5 minutes
+
+/// A terminated session entry preserved for TTL-based cleanup (TCK-00385).
+#[derive(Debug, Clone)]
+struct TerminatedEntry {
+    /// The termination details.
+    info: SessionTerminationInfo,
+    /// The session state at time of termination (for status queries).
+    session: SessionState,
+    /// Monotonic expiry instant (for TTL cleanup).
+    expires_at: Instant,
+}
 
 /// Internal state for the session registry.
 ///
@@ -782,6 +801,10 @@ struct RegistryState {
     by_id: HashMap<String, SessionState>,
     /// Session ID lookup by ephemeral handle.
     by_handle: HashMap<String, String>,
+    /// Terminated session entries preserved for TTL-based queries (TCK-00385).
+    ///
+    /// Keyed by session ID. Entries are cleaned up when their TTL expires.
+    terminated: HashMap<String, TerminatedEntry>,
 }
 
 /// In-memory session registry for tracking active sessions.
@@ -791,6 +814,14 @@ struct RegistryState {
 /// This registry enforces a maximum of [`MAX_SESSIONS`] entries to prevent
 /// memory exhaustion. When the limit is reached, the oldest entry (by insertion
 /// order) is evicted to make room for the new session.
+///
+/// # TCK-00385: Termination Tracking
+///
+/// When a session terminates, its entry is moved to a separate
+/// terminated-entries map with a TTL of [`TERMINATED_SESSION_TTL_SECS`].
+/// Subsequent `SessionStatus` queries for that session return TERMINATED state
+/// with exit details. Expired entries are lazily cleaned up on each write
+/// operation.
 ///
 /// # Thread Safety
 ///
@@ -854,6 +885,56 @@ impl SessionRegistry for InMemorySessionRegistry {
         let state = self.state.read().expect("lock poisoned");
         state.by_id.values().find(|s| s.work_id == work_id).cloned()
     }
+
+    fn mark_terminated(&self, session_id: &str, info: SessionTerminationInfo) -> bool {
+        let mut state = self.state.write().expect("lock poisoned");
+
+        // Lazily clean up expired terminated entries on write
+        let now = Instant::now();
+        state.terminated.retain(|_, entry| entry.expires_at > now);
+
+        // Move the session from active to terminated
+        if let Some(session) = state.by_id.remove(session_id) {
+            state.by_handle.remove(&session.ephemeral_handle);
+            state.queue.retain(|id| id != session_id);
+
+            let entry = TerminatedEntry {
+                info,
+                session,
+                expires_at: now + Duration::from_secs(TERMINATED_SESSION_TTL_SECS),
+            };
+            state.terminated.insert(session_id.to_string(), entry);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn get_termination_info(&self, session_id: &str) -> Option<SessionTerminationInfo> {
+        let state = self.state.read().expect("lock poisoned");
+        let entry = state.terminated.get(session_id)?;
+
+        // Check TTL -- return None if expired (lazy cleanup happens on writes)
+        if Instant::now() > entry.expires_at {
+            return None;
+        }
+
+        Some(entry.info.clone())
+    }
+
+    fn get_terminated_session(
+        &self,
+        session_id: &str,
+    ) -> Option<(SessionState, SessionTerminationInfo)> {
+        let state = self.state.read().expect("lock poisoned");
+        let entry = state.terminated.get(session_id)?;
+
+        if Instant::now() > entry.expires_at {
+            return None;
+        }
+
+        Some((entry.session.clone(), entry.info.clone()))
+    }
 }
 
 impl InMemorySessionRegistry {
@@ -901,6 +982,18 @@ impl InMemorySessionRegistry {
     /// Returns true if there are no active sessions.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Returns the number of terminated sessions still in the TTL window
+    /// (TCK-00385).
+    pub fn terminated_count(&self) -> usize {
+        let state = self.state.read().expect("lock poisoned");
+        let now = Instant::now();
+        state
+            .terminated
+            .values()
+            .filter(|e| e.expires_at > now)
+            .count()
     }
 }
 
@@ -1530,6 +1623,21 @@ impl SessionRegistry for PersistentSessionRegistry {
 
     fn get_session_by_work_id(&self, work_id: &str) -> Option<SessionState> {
         self.inner.get_session_by_work_id(work_id)
+    }
+
+    fn mark_terminated(&self, session_id: &str, info: SessionTerminationInfo) -> bool {
+        self.inner.mark_terminated(session_id, info)
+    }
+
+    fn get_termination_info(&self, session_id: &str) -> Option<SessionTerminationInfo> {
+        self.inner.get_termination_info(session_id)
+    }
+
+    fn get_terminated_session(
+        &self,
+        session_id: &str,
+    ) -> Option<(SessionState, SessionTerminationInfo)> {
+        SessionRegistry::get_terminated_session(&self.inner, session_id)
     }
 }
 

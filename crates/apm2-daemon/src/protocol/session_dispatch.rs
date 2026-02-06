@@ -1625,9 +1625,19 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         ))
     }
 
-    /// Handles `SessionStatus` requests (IPC-SESS-005, TCK-00344).
+    /// Handles `SessionStatus` requests (IPC-SESS-005, TCK-00344,
+    /// TCK-00385).
     ///
-    /// Queries session-scoped status including state and telemetry summary.
+    /// Queries session-scoped status including state, telemetry summary,
+    /// and termination details (when applicable).
+    ///
+    /// # TCK-00385: Termination Signal
+    ///
+    /// When a session has been terminated, this handler returns
+    /// `state = "TERMINATED"` with `termination_reason`, `exit_code`,
+    /// `terminated_at_ns`, and `actual_tokens_consumed` fields populated
+    /// from the preserved termination info. Terminated entries are kept
+    /// for a TTL window after termination.
     ///
     /// # Security
     ///
@@ -1659,6 +1669,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
         // Query session registry for session state
         if let Some(session_registry) = &self.session_registry {
+            // First check for active session
             if let Some(session) = session_registry.get_session(&token.session_id) {
                 // Calculate session duration
                 let duration_ms = SystemTime::now()
@@ -1676,6 +1687,35 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     events_emitted: 0, // TODO: Track in session telemetry
                     started_at_ns: 0,  // TODO: Track session start time
                     duration_ms,
+                    // TCK-00385: No termination info for active sessions
+                    termination_reason: None,
+                    exit_code: None,
+                    terminated_at_ns: None,
+                    actual_tokens_consumed: None,
+                };
+
+                return Ok(SessionResponse::SessionStatus(response));
+            }
+
+            // TCK-00385: Check for terminated session
+            if let Some((session, term_info)) =
+                session_registry.get_terminated_session(&token.session_id)
+            {
+                let response = SessionStatusResponse {
+                    session_id: token.session_id.clone(),
+                    state: "TERMINATED".to_string(),
+                    work_id: session.work_id,
+                    role: session.role,
+                    episode_id: session.episode_id,
+                    tool_calls: 0,
+                    events_emitted: 0,
+                    started_at_ns: 0,
+                    duration_ms: 0,
+                    // TCK-00385: Populate termination details
+                    termination_reason: Some(term_info.rationale_code),
+                    exit_code: term_info.exit_code,
+                    terminated_at_ns: Some(term_info.terminated_at_ns),
+                    actual_tokens_consumed: term_info.actual_tokens_consumed,
                 };
 
                 return Ok(SessionResponse::SessionStatus(response));
@@ -1694,6 +1734,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             events_emitted: 0,
             started_at_ns: 0,
             duration_ms: 0,
+            termination_reason: None,
+            exit_code: None,
+            terminated_at_ns: None,
+            actual_tokens_consumed: None,
         };
 
         Ok(SessionResponse::SessionStatus(response))
@@ -3941,6 +3985,360 @@ mod tests {
                 "SessionStatus tag should be 6"
             );
             assert_eq!(encoded[0], 6u8, "SessionStatus tag value should be 6");
+        }
+    }
+
+    // ========================================================================
+    // TCK-00385: Session Termination Signal Tests
+    // ========================================================================
+
+    /// IT-00385: `SessionStatus` returns TERMINATED state with termination
+    /// details for terminated sessions.
+    mod session_termination_signal {
+        use super::*;
+        use crate::episode::InMemorySessionRegistry;
+        use crate::episode::decision::SessionTerminationInfo;
+        use crate::protocol::messages::WorkRole;
+        use crate::session::{SessionRegistry, SessionState};
+
+        /// IT-00385-01: `SessionStatus` returns ACTIVE for active session
+        /// (no regression from TCK-00344).
+        #[test]
+        fn test_active_session_returns_active_state() {
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+
+            let registry: Arc<dyn crate::session::SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+
+            let session = SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-385-001".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-385-001".to_string(),
+                ephemeral_handle: "handle-385-001".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: Some("E-385-001".to_string()),
+            };
+            registry
+                .register_session(session)
+                .expect("session registration should succeed");
+
+            let dispatcher = SessionDispatcher::new(minter.clone()).with_session_registry(registry);
+
+            let token = test_token(&minter);
+            let request = SessionStatusRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+            };
+            let frame = encode_session_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::SessionStatus(resp) => {
+                    assert_eq!(resp.session_id, "session-001");
+                    assert_eq!(resp.state, "ACTIVE");
+                    assert_eq!(resp.work_id, "W-385-001");
+                    // TCK-00385: Termination fields should be None for active
+                    // sessions
+                    assert!(
+                        resp.termination_reason.is_none(),
+                        "Active session should not have termination_reason"
+                    );
+                    assert!(
+                        resp.exit_code.is_none(),
+                        "Active session should not have exit_code"
+                    );
+                    assert!(
+                        resp.terminated_at_ns.is_none(),
+                        "Active session should not have terminated_at_ns"
+                    );
+                    assert!(
+                        resp.actual_tokens_consumed.is_none(),
+                        "Active session should not have actual_tokens_consumed"
+                    );
+                },
+                other => panic!("Expected SessionStatus response, got: {other:?}"),
+            }
+        }
+
+        /// IT-00385-02: `SessionStatus` returns TERMINATED with termination
+        /// details for terminated sessions.
+        #[test]
+        fn test_terminated_session_returns_terminated_state() {
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+
+            // Register a session
+            let session = SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-385-002".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-385-002".to_string(),
+                ephemeral_handle: "handle-385-002".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: Some("E-385-002".to_string()),
+            };
+            registry
+                .register_session(session)
+                .expect("session registration should succeed");
+
+            // Mark the session as terminated
+            let term_info = SessionTerminationInfo::new("session-001", "normal", "SUCCESS")
+                .with_exit_code(0)
+                .with_tokens_consumed(42_000);
+
+            assert!(
+                registry.mark_terminated("session-001", term_info),
+                "mark_terminated should return true for existing session"
+            );
+
+            let dyn_registry: Arc<dyn crate::session::SessionRegistry> = registry;
+            let dispatcher =
+                SessionDispatcher::new(minter.clone()).with_session_registry(dyn_registry);
+
+            let token = test_token(&minter);
+            let request = SessionStatusRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+            };
+            let frame = encode_session_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::SessionStatus(resp) => {
+                    assert_eq!(resp.session_id, "session-001");
+                    assert_eq!(resp.state, "TERMINATED");
+                    assert_eq!(resp.work_id, "W-385-002");
+                    assert_eq!(resp.role, i32::from(WorkRole::Implementer));
+                    assert_eq!(resp.episode_id, Some("E-385-002".to_string()));
+                    // TCK-00385: Termination details should be populated
+                    assert_eq!(resp.termination_reason, Some("normal".to_string()),);
+                    assert_eq!(resp.exit_code, Some(0));
+                    assert!(
+                        resp.terminated_at_ns.is_some(),
+                        "terminated_at_ns should be set"
+                    );
+                    assert!(
+                        resp.terminated_at_ns.unwrap() > 0,
+                        "terminated_at_ns should be non-zero"
+                    );
+                    assert_eq!(resp.actual_tokens_consumed, Some(42_000),);
+                },
+                other => panic!("Expected SessionStatus response, got: {other:?}"),
+            }
+        }
+
+        /// IT-00385-03: `SessionStatus` returns TERMINATED with crash
+        /// reason and non-zero exit code.
+        #[test]
+        fn test_terminated_session_with_crash_reason() {
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+
+            let session = SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-385-003".to_string(),
+                role: WorkRole::Reviewer.into(),
+                lease_id: "L-385-003".to_string(),
+                ephemeral_handle: "handle-385-003".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: None,
+            };
+            registry
+                .register_session(session)
+                .expect("session registration should succeed");
+
+            let term_info =
+                SessionTerminationInfo::new("session-001", "crash", "FAILURE").with_exit_code(137); // Killed by SIGKILL
+
+            assert!(registry.mark_terminated("session-001", term_info));
+
+            let dyn_registry: Arc<dyn crate::session::SessionRegistry> = registry;
+            let dispatcher =
+                SessionDispatcher::new(minter.clone()).with_session_registry(dyn_registry);
+
+            let token = test_token(&minter);
+            let request = SessionStatusRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+            };
+            let frame = encode_session_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::SessionStatus(resp) => {
+                    assert_eq!(resp.state, "TERMINATED");
+                    assert_eq!(resp.termination_reason, Some("crash".to_string()),);
+                    assert_eq!(resp.exit_code, Some(137));
+                    assert!(
+                        resp.actual_tokens_consumed.is_none(),
+                        "Tokens should be None when not provided"
+                    );
+                },
+                other => panic!("Expected SessionStatus response, got: {other:?}"),
+            }
+        }
+
+        /// IT-00385-04: `mark_terminated` returns false for non-existent
+        /// session.
+        #[test]
+        fn test_mark_terminated_nonexistent_session() {
+            let registry = InMemorySessionRegistry::new();
+
+            let term_info = SessionTerminationInfo::new("nonexistent", "normal", "SUCCESS");
+
+            assert!(
+                !registry.mark_terminated("nonexistent", term_info),
+                "mark_terminated should return false for non-existent session"
+            );
+        }
+
+        /// IT-00385-05: Active session query does not return terminated
+        /// sessions (session is removed from active map).
+        #[test]
+        fn test_terminated_session_removed_from_active() {
+            let registry = InMemorySessionRegistry::new();
+
+            let session = SessionState {
+                session_id: "sess-term".to_string(),
+                work_id: "W-TERM".to_string(),
+                role: 1,
+                ephemeral_handle: "handle-term".to_string(),
+                lease_id: "lease-term".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: None,
+            };
+            registry
+                .register_session(session)
+                .expect("registration should succeed");
+
+            assert!(registry.get_session("sess-term").is_some());
+
+            let term_info = SessionTerminationInfo::new("sess-term", "normal", "SUCCESS");
+            assert!(registry.mark_terminated("sess-term", term_info));
+
+            // Session should no longer be in active set
+            assert!(
+                registry.get_session("sess-term").is_none(),
+                "Terminated session should not be returned by get_session"
+            );
+
+            // But should be in terminated set
+            assert!(
+                registry.get_termination_info("sess-term").is_some(),
+                "Termination info should be available"
+            );
+
+            // And get_terminated_session should return both
+            let result = <InMemorySessionRegistry as crate::session::SessionRegistry>::get_terminated_session(&registry, "sess-term");
+            assert!(result.is_some());
+            let (sess, info) = result.unwrap();
+            assert_eq!(sess.work_id, "W-TERM");
+            assert_eq!(info.rationale_code, "normal");
+        }
+
+        /// IT-00385-06: Terminated session count is tracked.
+        #[test]
+        fn test_terminated_count() {
+            let registry = InMemorySessionRegistry::new();
+
+            assert_eq!(registry.terminated_count(), 0);
+
+            // Register and terminate two sessions
+            let session1 = SessionState {
+                session_id: "s1".to_string(),
+                work_id: "w1".to_string(),
+                role: 1,
+                ephemeral_handle: "h1".to_string(),
+                lease_id: "l1".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: None,
+            };
+            let session2 = SessionState {
+                session_id: "s2".to_string(),
+                work_id: "w2".to_string(),
+                role: 1,
+                ephemeral_handle: "h2".to_string(),
+                lease_id: "l2".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: None,
+            };
+
+            registry.register_session(session1).unwrap();
+            registry.register_session(session2).unwrap();
+
+            registry.mark_terminated("s1", SessionTerminationInfo::new("s1", "normal", "SUCCESS"));
+            registry.mark_terminated(
+                "s2",
+                SessionTerminationInfo::new("s2", "timeout", "FAILURE"),
+            );
+
+            assert_eq!(registry.terminated_count(), 2);
+            assert_eq!(registry.len(), 0, "No active sessions should remain");
+        }
+
+        /// IT-00385-07: `SessionTerminationInfo` builder methods work
+        /// correctly.
+        #[test]
+        fn test_termination_info_builder() {
+            let info = SessionTerminationInfo::new("sess-42", "budget_exhausted", "FAILURE")
+                .with_exit_code(1)
+                .with_tokens_consumed(100_000);
+
+            assert_eq!(info.session_id, "sess-42");
+            assert_eq!(info.rationale_code, "budget_exhausted");
+            assert_eq!(info.exit_classification, "FAILURE");
+            assert_eq!(info.exit_code, Some(1));
+            assert!(info.terminated_at_ns > 0);
+            assert_eq!(info.actual_tokens_consumed, Some(100_000));
+        }
+
+        /// IT-00385-08: `SessionTerminationInfo::new` without builders has
+        /// None for optional fields.
+        #[test]
+        fn test_termination_info_defaults() {
+            let info = SessionTerminationInfo::new("sess-0", "normal", "SUCCESS");
+
+            assert_eq!(info.exit_code, None);
+            assert!(info.terminated_at_ns > 0, "timestamp should be set");
+            assert_eq!(info.actual_tokens_consumed, None);
+        }
+
+        /// IT-00385-09: Handle lookup is cleaned up after termination.
+        #[test]
+        fn test_handle_cleaned_up_after_termination() {
+            let registry = InMemorySessionRegistry::new();
+
+            let session = SessionState {
+                session_id: "sess-h".to_string(),
+                work_id: "w-h".to_string(),
+                role: 1,
+                ephemeral_handle: "handle-h".to_string(),
+                lease_id: "l-h".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: None,
+            };
+            registry.register_session(session).unwrap();
+
+            assert!(registry.get_session_by_handle("handle-h").is_some());
+
+            let term_info = SessionTerminationInfo::new("sess-h", "normal", "SUCCESS");
+            registry.mark_terminated("sess-h", term_info);
+
+            // Handle should no longer resolve to an active session
+            assert!(
+                registry.get_session_by_handle("handle-h").is_none(),
+                "Handle should not resolve after termination"
+            );
         }
     }
 }
