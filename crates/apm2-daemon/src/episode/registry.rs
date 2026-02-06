@@ -1937,6 +1937,7 @@ impl PersistentSessionRegistry {
         let state_file = PersistentStateFile {
             version: 1,
             sessions: Vec::new(),
+            terminated: Vec::new(),
         };
 
         let json = serde_json::to_string_pretty(&state_file)?;
@@ -2005,6 +2006,27 @@ impl PersistentSessionRegistry {
         let ids_to_remove: std::collections::HashSet<&str> =
             session_ids_to_remove.iter().map(String::as_str).collect();
 
+        // Preserve terminated entries (same logic as persist())
+        let now_mono = Instant::now();
+        let now_wall = wall_clock_secs();
+        let terminated: Vec<PersistableTerminatedEntry> = state
+            .terminated
+            .iter()
+            .filter(|(_, entry)| entry.expires_at > now_mono)
+            .map(|(_, entry)| {
+                let remaining = entry.expires_at.duration_since(now_mono).as_secs();
+                let expires_at_epoch = now_wall.saturating_add(remaining);
+                let issued_at_epoch = expires_at_epoch.saturating_sub(TERMINATED_SESSION_TTL_SECS);
+                PersistableTerminatedEntry {
+                    session: PersistableSessionState::from(&entry.session),
+                    info: entry.info.clone(),
+                    issued_at_epoch_secs: issued_at_epoch,
+                    expires_at_epoch_secs: expires_at_epoch,
+                    ttl_remaining_secs: remaining,
+                }
+            })
+            .collect();
+
         let state_file = PersistentStateFile {
             version: 1,
             sessions: state
@@ -2013,6 +2035,7 @@ impl PersistentSessionRegistry {
                 .filter(|(id, _)| !ids_to_remove.contains(id.as_str()))
                 .map(|(_, v)| PersistableSessionState::from(v))
                 .collect(),
+            terminated,
         };
         drop(state);
 
