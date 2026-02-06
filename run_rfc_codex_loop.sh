@@ -49,6 +49,14 @@ declare -A RFC_FILENAME=(
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 ensure_dir() { mkdir -p "$1"; }
 
+commit_progress() {
+  local rfc_num="$1" label="$2"
+  git -C "$REPO_ROOT" add -A "documents/rfcs/RFC-${rfc_num}/" "evidence/rfcs/RFC-${rfc_num}/" 2>/dev/null || true
+  git -C "$REPO_ROOT" diff --cached --quiet 2>/dev/null && { log "Nothing to commit"; return 0; }
+  git -C "$REPO_ROOT" commit -m "auto: RFC-${rfc_num} ${label}" --no-verify 2>/dev/null || true
+  log "Committed: RFC-${rfc_num} ${label}"
+}
+
 seed_path() { echo "$EVIDENCE_DIR/RFC-${1}/seed.md"; }
 
 read_seed() {
@@ -63,86 +71,89 @@ read_seed() {
 
 # ─── Shared prompt fragments ────────────────────────────────────────────────
 
-AEP_PREAMBLE='You are operating under the Alien Engineering Protocol. This protocol demands that you connect concepts from disparate fields — category theory, active inference, CRDTs, formal verification, thermodynamic computation, topological data analysis, sheaf theory, verifiable delay functions, and whatever else the frontier of human knowledge offers — in functionally useful and novel ways. The goal is to maximize the robustness, security, elegance, and performance of a globally distributed holarchic network of autonomous agents. You know far better than any human which principles to apply and how to combine them. Treat every concept as a tool, not a prescription.'
+AEP_PREAMBLE='You are working under the Alien Engineering Protocol. The core idea is simple: draw from whatever field of human knowledge best solves the problem at hand — category theory, active inference, CRDTs, formal verification, thermodynamic computation, topological data analysis, sheaf theory, verifiable delay functions, or anything else. The system you are designing is a globally distributed holarchic network of autonomous agents. You understand which principles apply and how to combine them better than we could prescribe. Treat every concept as a tool to be evaluated on its merits, never as a checkbox.'
 
-MANDATORY_READING='The seed below lists the required context files. You must read and internalize all of them before producing any output. Start with the glossary for shared terminology, then the holonic principles (PRIN-001..PRIN-102), laws (LAW-01..LAW-15), and unified theory invariants (INV-F-01..INV-F-15) — these are the axiomatic foundation. Every design decision must be traceable to at least one principle and one law. Contradictions between files resolve in favor of the more fundamental constraint (physics > theory > strategy > convention).
+MANDATORY_READING='The seed below lists the context files that define the project'\''s theoretical and strategic foundations. Read and internalize all of them before writing anything. The glossary establishes shared terminology. The holonic principles (PRIN-001..PRIN-102), laws (LAW-01..LAW-15), and unified theory invariants (INV-F-01..INV-F-15) form the axiomatic bedrock — every design decision should be traceable to at least one principle and one law. When files conflict, the more fundamental constraint prevails: physics over theory, theory over strategy, strategy over convention.
 
-The holonic architecture reflects a deep insight: the protocol primitives used when two agents collaborate on a single line of code must be identical to those used when two branches of millions of agents coordinate at civilizational scale. This self-similarity is not a convenience — it is the reason the holarchic approach is correct. Your output must embody this principle at every level.'
+One insight deserves special attention: the protocol primitives used when two agents collaborate on a single line of code are identical to those used when two branches of millions of agents coordinate at civilizational scale. This self-similarity across scale is the defining property of the holarchic approach, and the document you produce should embody it naturally.'
 
-CROSS_RFC_DEPS='Applied under AEP governance: containment > verification > liveness.
+CROSS_RFC_DEPS='The system'\''s RFCs follow a strict dependency chain rooted in a dominance order: containment before verification, verification before liveness.
 
-The RFCs ship in dependency order:
-- RFC-0022 (Principal Sovereignty) — ships first, containment-tier
-- RFC-0023 (Instruction Lifecycle) — depends on principal seal from 0022
-- RFC-0024 (Resource Provisioning) — depends on sovereignty + instructions
-- RFC-0025 (Service Operation) — depends on provisioning + instructions + sovereignty
-- RFC-0026 (Self-Modification) — depends on all four preceding RFCs'
+- RFC-0022 (Principal Sovereignty) ships first as the containment-tier foundation.
+- RFC-0023 (Instruction Lifecycle) depends on the principal seal introduced in 0022.
+- RFC-0024 (Resource Provisioning) depends on sovereignty and instructions.
+- RFC-0025 (Service Operation) depends on provisioning, instructions, and sovereignty.
+- RFC-0026 (Self-Modification) depends on all four preceding RFCs.
 
-GUARDRAILS='- Existing normative constraints in RFC-0020 are a hard floor: fail-closed enforcement, proof-carrying effects, digest-first operation, canonicalization, bounded decoding, and strict delegation narrowing must be preserved or strengthened.
-- Every new concept must be operationalized into mechanically checkable artifacts: schema fields, proof obligations, bounded complexity/byte targets, and rollout gates.
-- Ambition without mechanism is insufficient: proposals must include concrete protocol objects, invariants, adversarial/negative tests, and rollout/rollback gates.
-- Security reasoning must cover prompt-injection resilience, confidentiality/integrity labeling, replay/staleness handling, Byzantine peers, and revocation correctness.'
+Your document should be consistent with this dependency structure, referencing sibling RFCs where appropriate but never depending on something that has not yet been defined.'
 
-SUCCESS_CRITERIA='- Define verification at O(log n) or better for 10^12 holons where applicable.
-- Maintain semantic equivalence across 10+ levels of holonic nesting (bisimulation for N <= 12).
-- Be compatible with or strengthen BFT (RFC-0014) with <1% overhead.
-- Be compatible with or strengthen the Holonic Time Fabric (RFC-0016).
-- Match or exceed the quality bar of RFC-0020 and RFC-0021.
-- Maintain the security bar (see documents/security/).'
+GUARDRAILS='A few hard constraints to respect:
+- The normative guarantees in RFC-0020 are a floor, not a ceiling: fail-closed enforcement, proof-carrying effects, digest-first operation, canonicalization, bounded decoding, and strict delegation narrowing. Preserve or strengthen them.
+- Every new concept needs to be operationalized into mechanically checkable artifacts — schema fields, proof obligations, bounded complexity targets, rollout gates. Ideas without mechanisms are interesting but insufficient.
+- Security reasoning should cover prompt-injection resilience, confidentiality and integrity labeling, replay and staleness handling, Byzantine peers, and revocation correctness.'
+
+SUCCESS_CRITERIA='When evaluating your own output, consider whether it:
+- Defines verification at O(log n) or better for systems scaling to 10^12 holons, where applicable.
+- Maintains semantic equivalence across 10+ levels of holonic nesting (bisimulation for N <= 12).
+- Is compatible with or strengthens BFT consensus (RFC-0014) at less than 1% overhead.
+- Is compatible with or strengthens the Holonic Time Fabric (RFC-0016).
+- Meets or exceeds the depth and rigor of RFC-0020 and RFC-0021.
+- Maintains the security posture documented in documents/security/.'
 
 # ─── Prompt Builders ─────────────────────────────────────────────────────────
 
 build_init_prompt() {
   local rfc_num="$1"
-  local title="${RFC_TITLE[$rfc_num]}"
   local seed
   seed="$(read_seed "$rfc_num")"
 
   cat <<PROMPT
-# Alien Engineering Protocol — RFC-${rfc_num}: ${title}
+# Alien Engineering Protocol
 
 ${AEP_PREAMBLE}
 
-Your task: create RFC-${rfc_num} — ${title}. Internally generate multiple parallel candidate designs that explore different theoretical framings, then synthesize a master design that represents the best of each as a novel, groundbreakingly advanced protocol for autonomous agentic software at civilizational scale.
+## What we need from you
 
-## Foundational context — mandatory reading
+We need a complete, publication-ready RFC for the APM2 holarchic agent system. The seed material below describes the problem we are trying to solve, the design space we have explored so far, and a wishlist of properties we would like the solution to have. It includes starter protocol objects, objectives, a threat model, theory bindings, and a rollout sketch.
+
+All of this is raw material for your thinking, not a specification to implement. The names, the structure, the framing — all of it is yours to reshape. If you see a better way to decompose the problem, a more elegant set of protocol objects, a tighter threat model, or a different rollout order, follow your judgment. The only things that are non-negotiable are the foundational constraints from the theory files and the dependency relationships between RFCs.
+
+Think deeply about the problem before you begin writing. Consider multiple approaches. Discard the ones that don't hold up. What survives your own scrutiny is what we want to read.
+
+## Foundational context
 
 ${MANDATORY_READING}
 
-Use RFC-0020 (Holonic Substrate Interface) and RFC-0021 (Holonic Venture Proving Interface) as structural and quality references. Match or exceed their depth, rigor, and mechanization.
+RFC-0020 (Holonic Substrate Interface) and RFC-0021 (Holonic Venture Proving Interface) are the best existing examples of the depth and rigor we expect. Read them as structural references.
 
-## RFC seed
-
-The following seed contains everything specific to this RFC: the problem statement, required context files, innovation vectors, machine-checkable objectives, seed protocol objects, trust model, theory bindings, and rollout plan. These are starting points — synthesize them into a complete, frontier-quality RFC. Refine, extend, restructure, or replace anything that your analysis reveals as insufficient.
+## Seed material
 
 ${seed}
 
-## Cross-RFC dependency context
+## Dependency context
 
 ${CROSS_RFC_DEPS}
 
-## Success criteria
+## Quality bar
 
 ${SUCCESS_CRITERIA}
 
-## Guardrails
+## Hard constraints
 
 ${GUARDRAILS}
 
-## Acceptable tradeoffs
+## Practical notes
 
-- Single OS/runtime target (currently Ubuntu). Agent-only software — no consumer UI. We control the full stack.
-- We can modify existing unified theory documents — discard what doesn't work and create whatever is necessary.
-- Daemon-enforced semantics and trust-boundary contracts must remain internally consistent; any intentional break requires explicit versioning and migration path.
-- PQC is out of scope.
+- The target is Ubuntu-only, agent software with no consumer UI. We control the full stack.
+- Existing unified theory documents can be modified — discard what does not work and create what is necessary.
+- Daemon-enforced semantics and trust-boundary contracts must remain internally consistent; any intentional break requires explicit versioning and a migration path.
+- Post-quantum cryptography is out of scope for now.
 
-## Execution
+## Output
 
-- Phase 1: Read all required context. Identify gaps. Propose theoretical frameworks to yourself.
-- Phase 2: Synthesize into a unified approach honoring holonic self-similarity, the dominance order, and every applicable principle and law.
-- Phase 3: Produce the complete RFC as a single Markdown document with protocol objects, trust boundaries, governance gates, rollout plan, and acceptance criteria.
+Produce a single, complete Markdown document. Choose a title that precisely captures what this RFC defines. Include protocol objects with full field definitions, trust boundaries, governance gates, a phased rollout plan, and acceptance criteria. Do not leave sections as stubs or summaries — every section should be thorough enough to implement from.
 
-Allocate maximum reasoning depth. Do not summarize prematurely. Draw from the absolute frontier of research on autonomous agents, distributed systems, formal methods, and computational physics. Spare no technical detail.
+Take as much space as the subject demands. Depth and completeness matter far more than brevity.
 PROMPT
 }
 
@@ -152,57 +163,61 @@ build_analysis_prompt() {
   local total_passes="$3"
   local rfc_path="$4"
   local prev_validation="$5"
-  local title="${RFC_TITLE[$rfc_num]}"
   local filename="${RFC_FILENAME[$rfc_num]}"
   local seed
   seed="$(read_seed "$rfc_num")"
 
   cat <<PROMPT
-# Alien Engineering Protocol — Analysis Pass ${pass_num}/${total_passes}
-# RFC-${rfc_num}: ${title}
+# Alien Engineering Protocol — Final Review
 
 ${AEP_PREAMBLE}
 
-Your task in this phase is analysis only: read the current RFC draft, the foundational theory, and the seed, then produce a precise set of line-by-line diffs with detailed rationale for each change. You do not produce the updated RFC — a separate session will apply your diffs. Your output is the analysis artifact.
+## Your role
 
-## Foundational context — mandatory reading
+You are performing the final technical review of an RFC before it ships. The document at the path below is a near-complete draft. Your job is to find everything that is missing, underspecified, inconsistent, or insufficiently grounded — and to produce precise diffs that bring it to publication quality.
+
+You are producing an analysis document only. A colleague will read your analysis and apply the changes. Be precise enough that they can do so mechanically.
+
+## Foundational context
 
 ${MANDATORY_READING}
 
-## Current RFC draft
+## The RFC under review
 
-Read the current draft from this file path:
+Read the current draft from this path:
 - ${rfc_path}
 
-## RFC seed (objectives, protocol objects, threat model, theory bindings)
+## Original problem statement and design intent
 
-Use this seed as ground truth for what the RFC must achieve. If the current draft is missing any objective, protocol object, trust boundary, or theory binding below, propose changes to add them.
+The seed below describes the problem this RFC was designed to solve, the properties we wanted, and the starter material the original author worked from. Use it to evaluate whether the draft fully addresses the problem. Anything in the seed that is not adequately reflected in the draft is a gap worth closing.
 
 ${seed}
 
-## Previous pass validation results
+## Automated check results
+
+The following are results from automated structural checks. Failures indicate missing content.
 
 ${prev_validation}
 
-## Guardrails
+## Hard constraints
 
 ${GUARDRAILS}
 
-## Your output: analysis artifact
+## What good changes look like
 
-Produce a series of proposed changes to the RFC. The document should grow with each pass — diffs should primarily add new content (deeper analysis, missing protocol objects, additional threat coverage, stronger theory bindings, new verification artifacts) rather than merely rephrase existing text.
+Your changes should primarily add substance — deeper analysis, missing protocol objects, additional threat coverage, stronger theory bindings, new verification artifacts. Rephrasing existing text without adding information is not useful. The document should get more thorough as a result of your review, not just differently worded.
 
-Format each change as:
+Format each proposed change as:
 
 ### Change N: [brief title]
 
-**Rationale**: Your detailed reasoning — what frontier concepts inform it, which holonic principles/laws/invariants it serves.
+**Rationale**: What is missing or wrong, and why the proposed change fixes it. Reference specific principles, laws, or invariants where relevant.
 
-**Constraints preserved/strengthened**: Which constraints from RFC-0020, theory, or strategy this upholds.
+**Constraints preserved**: Which guarantees from RFC-0020, the theory, or the strategy this upholds or strengthens.
 
-**Threat modes addressed**: What failure/attack modes this prevents, and fail-closed behavior under ambiguity.
+**Threat coverage**: What failure or attack modes this addresses.
 
-**Verification evidence**: What tests, proofs, benchmarks, or canary gates validate this change.
+**Verification**: How this change can be validated — tests, proofs, benchmarks, or gates.
 
 \`\`\`diff
 --- a/documents/rfcs/RFC-${rfc_num}/${filename}
@@ -212,9 +227,7 @@ Format each change as:
 +new line
 \`\`\`
 
-After all changes, include a gap assessment: what remains to be strengthened in subsequent passes.
-
-Allocate maximum reasoning depth. Propose your best revisions.
+After all changes, include a brief assessment of any remaining gaps.
 PROMPT
 }
 
@@ -223,7 +236,6 @@ build_apply_prompt() {
   local pass_num="$2"
   local rfc_path="$3"
   local analysis_path="$4"
-  local title="${RFC_TITLE[$rfc_num]}"
 
   local analysis_content=""
   if [[ -f "$analysis_path" ]]; then
@@ -231,22 +243,20 @@ build_apply_prompt() {
   fi
 
   cat <<PROMPT
-# Apply Pass ${pass_num} — RFC-${rfc_num}: ${title}
+A technical reviewer has analyzed an RFC and produced a set of changes with rationale and diffs. Your job is to apply those changes to produce the final, complete document.
 
-Take the analysis artifact below and apply its diffs to the current RFC draft to produce an updated, complete RFC document.
+1. Read the current RFC from: ${rfc_path}
+2. Apply every proposed change below. Where the surrounding context has shifted slightly, apply the intent faithfully rather than failing on exact line matching.
+3. Preserve all existing content unless a diff explicitly removes it. The document should grow, not shrink.
+4. Produce the complete RFC as a single Markdown document — every section, every protocol object, every table. Not a summary, not a partial document.
 
-1. Read the current RFC draft from: ${rfc_path}
-2. Apply every proposed diff below. Where context has shifted, apply the intent faithfully.
-3. The document should grow — preserve all existing content unless a diff explicitly removes it.
-4. Produce the complete, updated RFC as a single Markdown document. Not a summary. Not a partial document.
-
-## Analysis artifact
+## Reviewer analysis
 
 ${analysis_content}
 
 ## Output
 
-Produce the complete updated RFC-${rfc_num} as a single Markdown document starting with the RFC title header. Include every section, every protocol object, every table.
+The complete, updated RFC as a single Markdown document.
 PROMPT
 }
 
@@ -277,16 +287,16 @@ validate_rfc() {
 
   run_check "protocol_objects"    "Protocol Objects"
   run_check "trust_boundaries"    "Trust Boundar"
-  run_check "governance_gates"    "Governance.*Gate\|Gate Portfolio"
-  run_check "rollout_plan"        "Rollout Plan\|Implementation [Mm]ilestones"
-  run_check "fail_closed"         "fail-closed\|fail.closed"
+  run_check "governance_gates"    "(Governance.*Gate|Gate Portfolio)"
+  run_check "rollout_plan"        "(Rollout Plan|Implementation [Mm]ilestones)"
+  run_check "fail_closed"         "(fail-closed|fail.closed)"
   run_check "htf_time_authority"  "HTF"
   run_check "jq_predicates"       "jq -e"
-  run_check "dominance_order"     "dominance.*order\|Dominance.*Order\|containment.*verification.*liveness"
-  run_check "theory_bindings"     "LAW-\|INV-F-\|PRIN-"
-  run_check "scale_envelope"      "10.*12\|trillion\|scale.*envelope\|Scale.*Envelope"
-  run_check "acceptance_bar"      "Acceptance\|acceptance"
-  run_check "ticket_decomposition" "Ticket Decomposition\|TCK-\|implementation.*milestone"
+  run_check "dominance_order"     "(dominance.*order|Dominance.*Order|containment.*verification.*liveness)"
+  run_check "theory_bindings"     "(LAW-|INV-F-|PRIN-)"
+  run_check "scale_envelope"      "(10.*12|trillion|[Ss]cale.*[Ee]nvelope)"
+  run_check "acceptance_bar"      "[Aa]cceptance"
+  run_check "ticket_decomposition" "(Ticket Decomposition|TCK-|implementation.*milestone)"
 
   local checks_json
   checks_json="$(printf '%s\n' "${checks[@]}" | jq -s '.')"
@@ -322,19 +332,27 @@ invoke_codex() {
 
   log "Invoking Codex (prompt: ${#prompt} chars)..."
 
-  local prompt_file
+  local prompt_file log_file
   prompt_file="$(mktemp)"
+  log_file="${output_file%.md}.log"
   echo "$prompt" > "$prompt_file"
 
-  CODEX_HEADLESS=1 NO_COLOR=1 "$CODEX_CMD" exec \
-    "$(cat "$prompt_file")" \
-    --approval never \
-    > "$output_file" 2>&1 || {
-    log "WARNING: Codex returned non-zero exit code"
+  "$CODEX_CMD" exec \
+    -m "${CODEX_MODEL:-gpt-5.3-codex}" \
+    --dangerously-bypass-approvals-and-sandbox \
+    -o "$output_file" \
+    - < "$prompt_file" > "$log_file" 2>&1 || {
+    log "WARNING: Codex returned non-zero exit code (see $log_file)"
   }
 
   rm -f "$prompt_file"
-  log "Codex output: $output_file ($(wc -c < "$output_file") bytes)"
+
+  if [[ -f "$output_file" ]]; then
+    log "Codex output: $output_file ($(wc -c < "$output_file") bytes)"
+  else
+    log "WARNING: No output file produced — copying log as fallback"
+    cp "$log_file" "$output_file"
+  fi
 }
 
 # ─── Apply output ────────────────────────────────────────────────────────────
@@ -344,30 +362,19 @@ apply_output() {
   local codex_output="$2"
   local pass_dir="$3"
 
-  if rg -q "no.changes.needed\|no.changes.required\|no.further.changes" "$codex_output" 2>/dev/null; then
+  if rg -q "(no.changes.needed|no.changes.required|no.further.changes)" "$codex_output" 2>/dev/null; then
     log "No changes needed — preserving current draft"
     cp "$rfc_path" "${pass_dir}/output.md"
     return 0
   fi
 
-  if head -5 "$codex_output" | rg -q "^# RFC-" 2>/dev/null; then
+  if head -5 "$codex_output" | rg -q "^# RFC-|^# [A-Z]" 2>/dev/null; then
     log "Codex produced complete RFC — replacing draft"
     cp "$codex_output" "$rfc_path"
     cp "$codex_output" "${pass_dir}/output.md"
   else
+    log "Output does not start with RFC header — preserving as-is"
     cp "$codex_output" "${pass_dir}/output.md"
-    local patch_file="${pass_dir}/changes.patch"
-    sed -n '/^```diff$/,/^```$/p' "$codex_output" | sed '/^```/d' > "$patch_file" || true
-    if [[ -s "$patch_file" ]]; then
-      log "Attempting to apply extracted diffs..."
-      if patch -p1 --forward --no-backup-if-mismatch < "$patch_file" 2>/dev/null; then
-        log "Diffs applied successfully"
-      else
-        log "WARNING: Patch failed — manual review needed (saved: ${patch_file})"
-      fi
-    else
-      log "No extractable diffs found"
-    fi
   fi
 }
 
@@ -403,6 +410,7 @@ process_rfc() {
     if [[ "$dry_run" != "true" ]]; then
       apply_output "$rfc_path" "${pass0_dir}/raw_output.md" "$pass0_dir"
       validate_rfc "$rfc_num" "$rfc_path" "${pass0_dir}/validation.json" || true
+      commit_progress "$rfc_num" "pass 0 — initial draft"
     fi
   else
     log "Skipping init (--skip-init or draft exists)"
@@ -442,12 +450,10 @@ process_rfc() {
     if [[ "$dry_run" != "true" ]]; then
       apply_output "$rfc_path" "${pass_dir}/raw_output.md" "$pass_dir"
 
-      [[ -f "${evidence_base}/prev_draft.md" ]] && \
-        diff -u "${evidence_base}/prev_draft.md" "$rfc_path" > "${pass_dir}/diff.patch" 2>/dev/null || true
-
       validate_rfc "$rfc_num" "$rfc_path" "${pass_dir}/validation.json" || true
+      commit_progress "$rfc_num" "pass ${pass} — review and apply"
 
-      if rg -q "no.changes.needed\|no.changes.required\|no.further.changes" "$analysis_output" 2>/dev/null; then
+      if rg -q "(no.changes.needed|no.changes.required|no.further.changes)" "$analysis_output" 2>/dev/null; then
         log "Analysis reports no further changes — stopping early"
         break
       fi
