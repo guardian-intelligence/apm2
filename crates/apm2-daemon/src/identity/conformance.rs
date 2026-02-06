@@ -571,18 +571,23 @@ pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
             },
         ));
 
-        // For KeySetIdV1, text form does not encode the set tag, so compare
-        // only merkle roots between text-parsed and binary-parsed values.
         let from_text = text_result.unwrap();
         let from_binary = binary_result.unwrap();
-        let agree = from_text.merkle_root() == from_binary.merkle_root();
+        let text_round_trip = KeySetIdV1::parse_text(&from_text.to_text())
+            .is_ok_and(|reparsed| reparsed == from_text);
+        let binary_round_trip = KeySetIdV1::from_binary(from_binary.as_bytes())
+            .is_ok_and(|reparsed| reparsed == from_binary);
+        let round_trip_ok = text_round_trip && binary_round_trip;
         results.push((
             vector.name,
-            agree,
-            if agree {
-                "text/binary merkle roots agree".to_string()
+            round_trip_ok,
+            if round_trip_ok {
+                "text-origin and binary-origin round-trips OK".to_string()
             } else {
-                "text/binary merkle roots DISAGREE".to_string()
+                format!(
+                    "round-trip failed: text_origin_ok={text_round_trip}, \
+                     binary_origin_ok={binary_round_trip}"
+                )
             },
         ));
 
@@ -890,8 +895,8 @@ mod tests {
         }
     }
 
-    /// Parser differential: `KeySetIdV1::parse_text` and `from_binary`
-    /// agree on merkle roots for all frozen fixture vectors.
+    /// Parser differential: both origin-specific round-trips are lossless for
+    /// all frozen `KeySetIdV1` fixture vectors.
     #[test]
     fn ks_parser_differential_valid() {
         for vector in valid_keyset_id_vectors() {
@@ -900,11 +905,26 @@ mod tests {
             let from_binary =
                 KeySetIdV1::from_binary(&binary_bytes).expect("valid vector must parse");
 
-            // Text form does not encode set tag, compare merkle roots
+            let text_reparsed = KeySetIdV1::parse_text(&from_text.to_text())
+                .expect("text-origin re-parse must succeed");
             assert_eq!(
-                from_text.merkle_root(),
-                from_binary.merkle_root(),
-                "text/binary merkle root differential for {}",
+                from_text, text_reparsed,
+                "text-origin round-trip failure for {}",
+                vector.name
+            );
+
+            let binary_reparsed = KeySetIdV1::from_binary(from_binary.as_bytes())
+                .expect("binary-origin re-parse must succeed");
+            assert_eq!(
+                from_binary, binary_reparsed,
+                "binary-origin round-trip failure for {}",
+                vector.name
+            );
+
+            assert_eq!(
+                from_text.to_text(),
+                from_binary.to_text(),
+                "canonical text mismatch for {}",
                 vector.name
             );
         }
@@ -946,19 +966,26 @@ mod tests {
         }
     }
 
-    /// Binary -> text -> binary round-trip for all valid `KeySetIdV1` vectors.
-    /// Note: text form does not encode set tag, so we compare merkle roots.
+    /// Origin-specific round-trips for all valid `KeySetIdV1` vectors.
     #[test]
     fn ks_binary_text_binary_round_trip() {
         for vector in valid_keyset_id_vectors() {
             let binary_bytes = hex::decode(vector.binary_hex).expect("valid hex");
-            let id = KeySetIdV1::from_binary(&binary_bytes).expect("valid binary");
-            let text = id.to_text();
-            let reparsed = KeySetIdV1::parse_text(&text).expect("re-parse must succeed");
+            let binary_origin = KeySetIdV1::from_binary(&binary_bytes).expect("valid binary");
+            let binary_reparsed = KeySetIdV1::from_binary(binary_origin.as_bytes())
+                .expect("binary-origin re-parse must succeed");
             assert_eq!(
-                id.merkle_root(),
-                reparsed.merkle_root(),
-                "round-trip failure for {}",
+                binary_origin, binary_reparsed,
+                "binary-origin round-trip failure for {}",
+                vector.name
+            );
+
+            let text_origin = KeySetIdV1::parse_text(vector.text).expect("valid text");
+            let text_reparsed = KeySetIdV1::parse_text(&text_origin.to_text())
+                .expect("text-origin re-parse must succeed");
+            assert_eq!(
+                text_origin, text_reparsed,
+                "text-origin round-trip failure for {}",
                 vector.name
             );
         }

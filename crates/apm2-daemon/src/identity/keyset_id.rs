@@ -55,8 +55,8 @@
 use std::fmt;
 
 use super::{
-    BINARY_LEN, HASH_LEN, KeyIdError, PublicKeyIdV1, decode_hex_payload, encode_hex_payload,
-    validate_text_common,
+    AlgorithmTag, BINARY_LEN, HASH_LEN, KeyIdError, PublicKeyIdV1, decode_hex_payload,
+    encode_hex_payload, validate_text_common,
 };
 
 /// Prefix for `KeySetIdV1` text form (RFC-0020 canonical grammar).
@@ -64,6 +64,9 @@ const PREFIX: &str = "kset:v1:blake3:";
 
 /// Domain separation string for BLAKE3 keyset hashing.
 const DOMAIN_SEPARATION: &[u8] = b"apm2:keyset_id:v1\0";
+
+/// Sentinel value for "set tag unknown" (text-parsed IDs).
+const UNKNOWN_SET_TAG_SENTINEL: u8 = 0x00;
 
 /// Known key-set mode tags.
 ///
@@ -185,6 +188,7 @@ impl KeySetIdV1 {
     /// # Validation
     ///
     /// Returns `Err(KeyIdError::InvalidDescriptor)` if:
+    /// - `key_algorithm` is not the canonical lowercase `"ed25519"`
     /// - `members` is empty
     /// - For `Multisig`: `threshold_k != members.len()`
     /// - For `Threshold`: `threshold_k < 1` or `threshold_k > members.len()`
@@ -209,6 +213,15 @@ impl KeySetIdV1 {
         members: &[PublicKeyIdV1],
         weights: Option<&[u64]>,
     ) -> Result<Self, KeyIdError> {
+        let canonical_algorithm = AlgorithmTag::Ed25519.name();
+        if key_algorithm != canonical_algorithm {
+            return Err(KeyIdError::InvalidDescriptor {
+                reason: format!(
+                    "key_algorithm must be canonical \"{canonical_algorithm}\", got \"{key_algorithm}\""
+                ),
+            });
+        }
+
         // Validate: members must be non-empty
         if members.is_empty() {
             return Err(KeyIdError::InvalidDescriptor {
@@ -338,28 +351,44 @@ impl KeySetIdV1 {
         // Decode hex payload (validates length = 64, lowercase only)
         let hash = decode_hex_payload(hex_payload)?;
 
-        // The text form does not encode the set tag. Store tag byte 0x00
+        // The text form does not encode the set tag. Store a sentinel
         // (not a valid SetTag) so that set_tag() returns None.
         let mut binary = [0u8; BINARY_LEN];
-        // binary[0] is already 0x00 — sentinel for "tag unknown"
+        binary[0] = UNKNOWN_SET_TAG_SENTINEL;
         binary[1..].copy_from_slice(&hash);
         Ok(Self { binary })
     }
 
-    /// Construct from raw binary form (1-byte tag + 32-byte merkle root).
+    /// Construct from binary form.
     ///
-    /// Validates the set tag (fail-closed) and exact length.
+    /// Accepted encodings:
+    /// - 33 bytes: `set_tag (1 byte) + merkle_root (32 bytes)`
+    /// - 32 bytes: `merkle_root` only (tag unknown; stored with sentinel)
+    ///
+    /// For 33-byte inputs, set tags must be known (`0x01`, `0x02`) except for
+    /// the reserved sentinel `0x00`, which represents "tag unknown" and is
+    /// used by text-parsed IDs.
     pub fn from_binary(bytes: &[u8]) -> Result<Self, KeyIdError> {
-        if bytes.len() != BINARY_LEN {
-            return Err(KeyIdError::InvalidBinaryLength { got: bytes.len() });
+        match bytes.len() {
+            HASH_LEN => {
+                let mut binary = [0u8; BINARY_LEN];
+                binary[0] = UNKNOWN_SET_TAG_SENTINEL;
+                binary[1..].copy_from_slice(bytes);
+                Ok(Self { binary })
+            },
+            BINARY_LEN => {
+                let tag = bytes[0];
+                if tag != UNKNOWN_SET_TAG_SENTINEL {
+                    // Validate known set tags (fail-closed for unknown non-sentinel values).
+                    let _set_tag = SetTag::from_byte(tag)?;
+                }
+
+                let mut binary = [0u8; BINARY_LEN];
+                binary.copy_from_slice(bytes);
+                Ok(Self { binary })
+            },
+            _ => Err(KeyIdError::InvalidBinaryLength { got: bytes.len() }),
         }
-
-        // Validate set tag (fail-closed)
-        let _set_tag = SetTag::from_byte(bytes[0])?;
-
-        let mut binary = [0u8; BINARY_LEN];
-        binary.copy_from_slice(bytes);
-        Ok(Self { binary })
     }
 
     /// Return the canonical text form: `kset:v1:blake3:<64-hex>`.
@@ -401,7 +430,8 @@ impl KeySetIdV1 {
             .expect("binary is exactly 33 bytes")
     }
 
-    /// Return a reference to the full binary form.
+    /// Return a reference to the internal binary form (`tag_or_sentinel +
+    /// hash`).
     pub const fn as_bytes(&self) -> &[u8; BINARY_LEN] {
         &self.binary
     }
@@ -443,11 +473,9 @@ mod tests {
 
     #[test]
     fn text_round_trip() {
-        let id = make_test_keyset();
-        let text = id.to_text();
-        // Text form does not encode set_tag, so we compare merkle roots
-        let parsed = KeySetIdV1::parse_text(&text).unwrap();
-        assert_eq!(id.merkle_root(), parsed.merkle_root());
+        let text_origin = KeySetIdV1::parse_text(&make_test_keyset().to_text()).unwrap();
+        let reparsed = KeySetIdV1::parse_text(&text_origin.to_text()).unwrap();
+        assert_eq!(text_origin, reparsed);
     }
 
     #[test]
@@ -460,12 +488,18 @@ mod tests {
 
     #[test]
     fn text_then_binary_round_trip() {
-        let id = make_test_keyset();
-        let binary = id.to_binary();
-        let from_bin = KeySetIdV1::from_binary(&binary).unwrap();
-        let text = from_bin.to_text();
-        let reparsed = KeySetIdV1::parse_text(&text).unwrap();
-        assert_eq!(from_bin.merkle_root(), reparsed.merkle_root());
+        let text_origin = KeySetIdV1::parse_text(&make_test_keyset().to_text()).unwrap();
+        let reparsed = KeySetIdV1::from_binary(text_origin.as_bytes()).unwrap();
+        assert_eq!(text_origin, reparsed);
+    }
+
+    #[test]
+    fn from_binary_accepts_hash_only_form() {
+        let tagged = make_test_keyset();
+        let from_hash_only = KeySetIdV1::from_binary(tagged.merkle_root()).unwrap();
+        let expected = KeySetIdV1::parse_text(&tagged.to_text()).unwrap();
+        assert_eq!(from_hash_only, expected);
+        assert_eq!(from_hash_only.set_tag(), None);
     }
 
     #[test]
@@ -850,6 +884,28 @@ mod tests {
         assert!(
             matches!(err, KeyIdError::InvalidDescriptor { .. }),
             "expected InvalidDescriptor for weights/members mismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_canonical_algorithm_camel_case() {
+        let key1 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
+        let err = KeySetIdV1::from_descriptor("Ed25519", SetTag::Threshold, 1, &[key1], None)
+            .unwrap_err();
+        assert!(
+            matches!(err, KeyIdError::InvalidDescriptor { .. }),
+            "expected InvalidDescriptor for non-canonical algorithm, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_canonical_algorithm_uppercase() {
+        let key1 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
+        let err = KeySetIdV1::from_descriptor("ED25519", SetTag::Threshold, 1, &[key1], None)
+            .unwrap_err();
+        assert!(
+            matches!(err, KeyIdError::InvalidDescriptor { .. }),
+            "expected InvalidDescriptor for non-canonical algorithm, got {err:?}"
         );
     }
 
