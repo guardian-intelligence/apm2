@@ -193,7 +193,16 @@ pub trait SessionRegistry: Send + Sync {
     /// This is called by `EndSession` to ensure terminated sessions are
     /// removed from the registry, preventing repeated termination and
     /// stale session state.
-    fn remove_session(&self, session_id: &str) -> Option<SessionState>;
+    ///
+    /// # Errors
+    ///
+    /// Returns `SessionRegistryError` if persistence fails (fail-closed).
+    /// The in-memory removal may have already occurred; callers must treat
+    /// this as a hard failure.
+    fn remove_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionState>, SessionRegistryError>;
 }
 
 /// Error type for session registry operations.

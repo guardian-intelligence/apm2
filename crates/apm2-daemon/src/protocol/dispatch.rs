@@ -60,7 +60,7 @@ use super::messages::{
     RestartProcessRequest, RestartProcessResponse, ShutdownRequest, ShutdownResponse,
     SpawnEpisodeRequest, SpawnEpisodeResponse, StartProcessRequest, StartProcessResponse,
     StopProcessRequest, StopProcessResponse, SubscribePulseRequest, SubscribePulseResponse,
-    SwitchCredentialRequest, SwitchCredentialResponse, UnsubscribePulseRequest,
+    SwitchCredentialRequest, SwitchCredentialResponse, TerminationOutcome, UnsubscribePulseRequest,
     UnsubscribePulseResponse, WorkRole, WorkStatusRequest, WorkStatusResponse,
 };
 use super::pulse_acl::{
@@ -4735,9 +4735,11 @@ impl PrivilegedDispatcher {
     /// - `SessionTerminated` event is signed and persisted atomically
     /// - Fail-closed: returns error if timestamp generation or event emission
     ///   fails
-    /// - Session is removed from registry on success, making repeated calls
-    ///   idempotent (they return "session not found")
+    /// - Session is removed from registry POST-COMMIT (after ledger + runtime
+    ///   succeed), ensuring the session is restored on failure
     /// - `WorkTransitioned` emission failure is propagated (fail-closed)
+    /// - Exit code derived from typed `TerminationOutcome` enum (not string
+    ///   matching)
     fn handle_end_session(
         &self,
         payload: &[u8],
@@ -4753,6 +4755,7 @@ impl PrivilegedDispatcher {
         info!(
             session_id = %request.session_id,
             reason = %request.reason,
+            outcome = %request.outcome,
             peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
             "EndSession request received"
         );
@@ -4773,10 +4776,10 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // TCK-00395 MAJOR 1: Atomically remove session from registry.
-        // This ensures repeated EndSession calls are rejected with
-        // "session not found" instead of allowing duplicate termination.
-        let Some(session) = self.session_registry.remove_session(&request.session_id) else {
+        // Look up session WITHOUT removing it yet (POST-COMMIT removal).
+        // The session is only removed after all fallible ledger/runtime
+        // operations succeed, preventing orphan removal on downstream failure.
+        let Some(session) = self.session_registry.get_session(&request.session_id) else {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
                 format!("session not found: {}", request.session_id),
@@ -4800,9 +4803,25 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // Determine exit code from reason: 0 for success, 1 for failure
-        let is_failure = request.reason != "completed_normally" && request.reason != "success";
-        let exit_code = i32::from(is_failure);
+        // TCK-00395 Quality v3 MAJOR: Use typed TerminationOutcome enum to
+        // determine exit code instead of free-form string matching.
+        // When `outcome` is set (non-zero), it takes precedence over the
+        // legacy `reason` string. Unspecified (0) falls back to string
+        // matching for backward compatibility.
+        let exit_code = match TerminationOutcome::try_from(request.outcome) {
+            Ok(TerminationOutcome::Success) => 0,
+            Ok(
+                TerminationOutcome::Failure
+                | TerminationOutcome::Cancelled
+                | TerminationOutcome::Timeout,
+            ) => 1,
+            // Unspecified or unknown: fall back to legacy string matching
+            _ => {
+                let is_failure =
+                    request.reason != "completed_normally" && request.reason != "success";
+                i32::from(is_failure)
+            },
+        };
 
         let termination_reason = if request.reason.is_empty() {
             "session_ended_via_ipc"
@@ -4854,9 +4873,15 @@ impl PrivilegedDispatcher {
             }
         }
 
-        // TCK-00395 BLOCKER 1: Wire runtime episode stop for
-        // episode-backed sessions. This ensures the episode runtime
-        // transitions to Terminated and emits the episode.stopped event.
+        // TCK-00395 BLOCKER 1 + Quality v3 MAJOR 7: Wire
+        // `stop_with_session_context` for episode-backed sessions.
+        // This ensures the episode runtime transitions to Terminated,
+        // emits the episode.stopped event, AND emits SessionTerminated
+        // via the runtime's ledger emitter (production callback path).
+        //
+        // Security BLOCKER 1: Uses `block_in_place` + `block_on` instead
+        // of bare `block_on` to avoid panicking from within an async
+        // worker thread.
         if let Some(ref episode_id_str) = session.episode_id {
             if let Ok(episode_id_parsed) = EpisodeId::new(episode_id_str.clone()) {
                 let termination_class = if exit_code == 0 {
@@ -4867,13 +4892,38 @@ impl PrivilegedDispatcher {
                 // Best-effort runtime stop: the session is already terminated
                 // in the ledger. If the runtime stop fails (e.g., episode
                 // already terminated), we log but don't fail the response.
-                let rt = self.episode_runtime.clone();
-                let ts = timestamp_ns;
-                // Use tokio runtime handle to call async from sync context
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let _ = handle.block_on(rt.stop(&episode_id_parsed, termination_class, ts));
+                    let rt = self.episode_runtime.clone();
+                    let sid = request.session_id.clone();
+                    let wid = session.work_id.clone();
+                    let _ = tokio::task::block_in_place(|| {
+                        handle.block_on(rt.stop_with_session_context(
+                            &episode_id_parsed,
+                            termination_class,
+                            timestamp_ns,
+                            &sid,
+                            &wid,
+                            &actor_id,
+                        ))
+                    });
                 }
             }
+        }
+
+        // POST-COMMIT: Remove session from registry only after ALL fallible
+        // ledger and runtime operations have succeeded. This prevents the
+        // session from being orphaned (removed but not recorded) if a
+        // downstream step fails.
+        if let Err(e) = self.session_registry.remove_session(&request.session_id) {
+            warn!(
+                error = %e,
+                session_id = %request.session_id,
+                "Session removal persistence failed after successful ledger commit"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("session removal persistence failed: {e}"),
+            ));
         }
 
         debug!(
@@ -10015,6 +10065,7 @@ mod tests {
             let end_request = EndSessionRequest {
                 session_id: session_id.clone(),
                 reason: "completed_normally".to_string(),
+                outcome: TerminationOutcome::Success as i32,
             };
             let end_frame = encode_end_session_request(&end_request);
             let end_response = dispatcher.dispatch(&end_frame, &ctx).unwrap();
@@ -10090,6 +10141,7 @@ mod tests {
             let end_request = EndSessionRequest {
                 session_id,
                 reason: "completed_normally".to_string(),
+                outcome: TerminationOutcome::Success as i32,
             };
             let end_frame = encode_end_session_request(&end_request);
             dispatcher.dispatch(&end_frame, &ctx).unwrap();
@@ -10132,6 +10184,7 @@ mod tests {
             let end_request = EndSessionRequest {
                 session_id: "NONEXISTENT-SESSION".to_string(),
                 reason: "test".to_string(),
+                outcome: TerminationOutcome::Failure as i32,
             };
             let end_frame = encode_end_session_request(&end_request);
             let response = dispatcher.dispatch(&end_frame, &ctx).unwrap();
@@ -10476,6 +10529,7 @@ mod tests {
             let end_request = EndSessionRequest {
                 session_id: session_id.clone(),
                 reason: "completed_normally".to_string(),
+                outcome: TerminationOutcome::Success as i32,
             };
             let end_frame = encode_end_session_request(&end_request);
             let response = dispatcher.dispatch(&end_frame, &ctx).unwrap();
@@ -10725,8 +10779,9 @@ mod tests {
             // EndSession with success reason should fail because
             // WorkTransitioned emission fails (fail-closed)
             let end_request = EndSessionRequest {
-                session_id,
+                session_id: session_id.clone(),
                 reason: "completed_normally".to_string(),
+                outcome: TerminationOutcome::Success as i32,
             };
             let end_frame = encode_end_session_request(&end_request);
             let response = dispatcher.dispatch(&end_frame, &ctx).unwrap();
@@ -10740,6 +10795,145 @@ mod tests {
                 },
                 other => panic!("Expected error response for failed transition, got: {other:?}"),
             }
+
+            // Security BLOCKER 2: Verify session is NOT removed from registry
+            // when a downstream ledger step fails (POST-COMMIT removal).
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session(&session_id)
+                    .is_some(),
+                "Session MUST be preserved in registry when ledger step fails"
+            );
+        }
+
+        /// Quality v3 MAJOR: Typed `TerminationOutcome` enum determines
+        /// exit code instead of free-form reason string matching.
+        #[test]
+        fn end_session_typed_outcome_determines_exit_code() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // Helper: claim + spawn and return (work_id, session_id)
+            let setup = |d: &PrivilegedDispatcher| {
+                let claim_request = ClaimWorkRequest {
+                    actor_id: "test-actor".to_string(),
+                    role: WorkRole::Implementer.into(),
+                    credential_signature: vec![1, 2, 3],
+                    nonce: vec![4, 5, 6],
+                };
+                let claim_frame = encode_claim_work_request(&claim_request);
+                let claim_response = d.dispatch(&claim_frame, &ctx).unwrap();
+                let (work_id, lease_id) = match claim_response {
+                    PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                    _ => panic!("Expected ClaimWork response"),
+                };
+                let spawn_request = SpawnEpisodeRequest {
+                    workspace_root: test_workspace_root(),
+                    work_id: work_id.clone(),
+                    role: WorkRole::Implementer.into(),
+                    lease_id: Some(lease_id),
+                };
+                let spawn_frame = encode_spawn_episode_request(&spawn_request);
+                let spawn_response = d.dispatch(&spawn_frame, &ctx).unwrap();
+                let session_id = match spawn_response {
+                    PrivilegedResponse::SpawnEpisode(ref resp) => resp.session_id.clone(),
+                    _ => panic!("Expected SpawnEpisode response"),
+                };
+                (work_id, session_id)
+            };
+
+            // Test 1: TerminationOutcome::Success -> exit_code 0,
+            //         WorkTransitioned(Completed) emitted.
+            let (work_id, session_id) = setup(&dispatcher);
+            let end_request = EndSessionRequest {
+                session_id,
+                reason: "some_reason".to_string(), // reason is irrelevant when outcome is set
+                outcome: TerminationOutcome::Success as i32,
+            };
+            let end_frame = encode_end_session_request(&end_request);
+            dispatcher.dispatch(&end_frame, &ctx).unwrap();
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let terminated: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == "session_terminated")
+                .collect();
+            assert_eq!(terminated.len(), 1);
+            let payload: serde_json::Value =
+                serde_json::from_slice(&terminated[0].payload).unwrap();
+            assert_eq!(payload["exit_code"], 0, "Success outcome -> exit_code 0");
+            // Should also have WorkTransitioned to Completed
+            assert!(
+                events.iter().any(|e| {
+                    e.event_type == "work_transitioned" && {
+                        let p: serde_json::Value = serde_json::from_slice(&e.payload).unwrap();
+                        p["to_state"] == "Completed"
+                    }
+                }),
+                "Success outcome should emit WorkTransitioned(Completed)"
+            );
+
+            // Test 2: TerminationOutcome::Failure -> exit_code 1,
+            //         NO WorkTransitioned(Completed).
+            let (work_id2, session_id2) = setup(&dispatcher);
+            let end_request2 = EndSessionRequest {
+                session_id: session_id2,
+                reason: "completed_normally".to_string(), /* Even with "success" reason, outcome
+                                                           * overrides */
+                outcome: TerminationOutcome::Failure as i32,
+            };
+            let end_frame2 = encode_end_session_request(&end_request2);
+            dispatcher.dispatch(&end_frame2, &ctx).unwrap();
+            let events2 = dispatcher.event_emitter.get_events_by_work_id(&work_id2);
+            let terminated2: Vec<_> = events2
+                .iter()
+                .filter(|e| e.event_type == "session_terminated")
+                .collect();
+            assert_eq!(terminated2.len(), 1);
+            let payload2: serde_json::Value =
+                serde_json::from_slice(&terminated2[0].payload).unwrap();
+            assert_eq!(payload2["exit_code"], 1, "Failure outcome -> exit_code 1");
+            // Should NOT have WorkTransitioned to Completed
+            let completed_count = events2
+                .iter()
+                .filter(|e| {
+                    e.event_type == "work_transitioned" && {
+                        let p: serde_json::Value = serde_json::from_slice(&e.payload).unwrap();
+                        p["to_state"] == "Completed"
+                    }
+                })
+                .count();
+            assert_eq!(
+                completed_count, 0,
+                "Failure outcome should NOT emit WorkTransitioned(Completed)"
+            );
+
+            // Test 3: TerminationOutcome::Unspecified (0) falls back to
+            //         legacy string matching (backward compat).
+            let (work_id3, session_id3) = setup(&dispatcher);
+            let end_request3 = EndSessionRequest {
+                session_id: session_id3,
+                reason: "completed_normally".to_string(),
+                outcome: TerminationOutcome::Unspecified as i32,
+            };
+            let end_frame3 = encode_end_session_request(&end_request3);
+            dispatcher.dispatch(&end_frame3, &ctx).unwrap();
+            let events3 = dispatcher.event_emitter.get_events_by_work_id(&work_id3);
+            let terminated3: Vec<_> = events3
+                .iter()
+                .filter(|e| e.event_type == "session_terminated")
+                .collect();
+            assert_eq!(terminated3.len(), 1);
+            let payload3: serde_json::Value =
+                serde_json::from_slice(&terminated3[0].payload).unwrap();
+            assert_eq!(
+                payload3["exit_code"], 0,
+                "Unspecified outcome with 'completed_normally' reason -> exit_code 0 (legacy)"
+            );
         }
 
         /// BLOCKER 1: `stop_with_session_context` emits `SessionTerminated`
@@ -10841,6 +11035,7 @@ mod tests {
             let end_request = EndSessionRequest {
                 session_id: session_id.clone(),
                 reason: "completed_normally".to_string(),
+                outcome: TerminationOutcome::Success as i32,
             };
             let end_frame = encode_end_session_request(&end_request);
             let response = dispatcher.dispatch(&end_frame, &ctx).unwrap();

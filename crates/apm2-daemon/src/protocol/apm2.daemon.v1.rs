@@ -447,6 +447,10 @@ pub struct EndSessionRequest {
     /// Human-readable reason for termination.
     #[prost(string, tag = "2")]
     pub reason: ::prost::alloc::string::String,
+    /// Typed termination outcome (TCK-00395 Quality v3 MAJOR).
+    /// When set, this takes precedence over string-based reason matching.
+    #[prost(enumeration = "TerminationOutcome", tag = "3")]
+    pub outcome: i32,
 }
 /// Response confirming session termination.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1758,6 +1762,48 @@ impl WorkRole {
             "GATE_EXECUTOR" => Some(Self::GateExecutor),
             "REVIEWER" => Some(Self::Reviewer),
             "COORDINATOR" => Some(Self::Coordinator),
+            _ => None,
+        }
+    }
+}
+/// Typed termination outcome for EndSession (TCK-00395 Quality v3 MAJOR).
+/// Replaces free-form string matching for success/failure inference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TerminationOutcome {
+    /// Unspecified outcome (treated as failure for safety).
+    Unspecified = 0,
+    /// Session completed successfully (exit_code = 0).
+    Success = 1,
+    /// Session failed (exit_code = 1).
+    Failure = 2,
+    /// Session was cancelled by the operator.
+    Cancelled = 3,
+    /// Session timed out.
+    Timeout = 4,
+}
+impl TerminationOutcome {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TERMINATION_OUTCOME_UNSPECIFIED",
+            Self::Success => "TERMINATION_OUTCOME_SUCCESS",
+            Self::Failure => "TERMINATION_OUTCOME_FAILURE",
+            Self::Cancelled => "TERMINATION_OUTCOME_CANCELLED",
+            Self::Timeout => "TERMINATION_OUTCOME_TIMEOUT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TERMINATION_OUTCOME_UNSPECIFIED" => Some(Self::Unspecified),
+            "TERMINATION_OUTCOME_SUCCESS" => Some(Self::Success),
+            "TERMINATION_OUTCOME_FAILURE" => Some(Self::Failure),
+            "TERMINATION_OUTCOME_CANCELLED" => Some(Self::Cancelled),
+            "TERMINATION_OUTCOME_TIMEOUT" => Some(Self::Timeout),
             _ => None,
         }
     }

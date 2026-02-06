@@ -20,7 +20,7 @@ use apm2_core::events::{DefectRecorded, Validate};
 use apm2_core::fac::REVIEW_RECEIPT_RECORDED_PREFIX;
 use ed25519_dalek::Signer;
 use rusqlite::{Connection, OptionalExtension, params};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::protocol::dispatch::{
     DEFECT_RECORDED_DOMAIN_PREFIX, EPISODE_EVENT_DOMAIN_PREFIX, LeaseValidationError,
@@ -1052,11 +1052,21 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             });
         }
 
-        // Commit the transaction
-        conn.execute("COMMIT", [])
-            .map_err(|e| LedgerEventError::PersistenceFailed {
-                message: format!("transaction commit failed: {e}"),
-            })?;
+        // Commit the transaction. On commit failure, attempt explicit
+        // ROLLBACK to restore consistent state (TCK-00395 Security v3 MAJOR).
+        if let Err(commit_err) = conn.execute("COMMIT", []) {
+            warn!(error = %commit_err, "COMMIT failed for WorkClaimed transaction - attempting ROLLBACK");
+            if let Err(rollback_err) = conn.execute("ROLLBACK", []) {
+                return Err(LedgerEventError::PersistenceFailed {
+                    message: format!(
+                        "COMMIT failed ({commit_err}) and ROLLBACK also failed ({rollback_err}) - database may be inconsistent"
+                    ),
+                });
+            }
+            return Err(LedgerEventError::PersistenceFailed {
+                message: format!("transaction commit failed (rolled back): {commit_err}"),
+            });
+        }
 
         info!(
             event_id = %claimed_event_id,
@@ -1202,11 +1212,21 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             });
         }
 
-        // Commit the transaction
-        conn.execute("COMMIT", [])
-            .map_err(|e| LedgerEventError::PersistenceFailed {
-                message: format!("transaction commit failed: {e}"),
-            })?;
+        // Commit the transaction. On commit failure, attempt explicit
+        // ROLLBACK to restore consistent state (TCK-00395 Security v3 MAJOR).
+        if let Err(commit_err) = conn.execute("COMMIT", []) {
+            warn!(error = %commit_err, "COMMIT failed for SessionStarted transaction - attempting ROLLBACK");
+            if let Err(rollback_err) = conn.execute("ROLLBACK", []) {
+                return Err(LedgerEventError::PersistenceFailed {
+                    message: format!(
+                        "COMMIT failed ({commit_err}) and ROLLBACK also failed ({rollback_err}) - database may be inconsistent"
+                    ),
+                });
+            }
+            return Err(LedgerEventError::PersistenceFailed {
+                message: format!("transaction commit failed (rolled back): {commit_err}"),
+            });
+        }
 
         info!(
             event_id = %session_event_id,
