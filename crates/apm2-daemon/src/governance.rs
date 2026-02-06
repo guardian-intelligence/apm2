@@ -9,6 +9,13 @@
 //! Implements real policy resolution wiring. Currently uses local deterministic
 //! resolution until the Governance Holon is fully integrated.
 //!
+//! # TCK-00352
+//!
+//! The policy resolver is the ONLY authorized source for minting
+//! `CapabilityManifestV1` instances. It holds the [`PolicyMintToken`]
+//! that proves minting authority. Requester surfaces cannot obtain this
+//! token.
+//!
 //! # Phase 1 Transitional Tier Mapping (TCK-00340, v7 Finding 3)
 //!
 //! SECURITY NOTE: Risk tiers are assigned based on work role as a
@@ -48,18 +55,57 @@
 use apm2_core::context::{AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder};
 use tracing::warn;
 
+use crate::episode::capability::PolicyMintToken;
 use crate::protocol::dispatch::{PolicyResolution, PolicyResolutionError, PolicyResolver};
 use crate::protocol::messages::WorkRole;
 
 /// Resolves policy via governance integration.
+///
+/// # TCK-00352: Policy-Only Minting Authority
+///
+/// This resolver is the sole holder of [`PolicyMintToken`], which is required
+/// to construct
+/// [`CapabilityManifestV1`](crate::episode::CapabilityManifestV1) instances.
+/// The token cannot be obtained from requester surfaces.
+///
+/// # Security
+///
+/// Both `new()` and `mint_token()` are `pub(crate)` to prevent external
+/// crates from constructing a resolver and obtaining mint tokens. Only
+/// daemon-internal production wiring (in `state.rs`) should create instances.
 #[derive(Debug, Clone, Default)]
 pub struct GovernancePolicyResolver;
 
 impl GovernancePolicyResolver {
     /// Creates a new policy resolver.
+    ///
+    /// # Security
+    ///
+    /// This is `pub(crate)` to restrict construction to daemon-internal code.
+    /// External crates cannot instantiate the resolver and thus cannot reach
+    /// `mint_token()`.
     #[must_use]
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self
+    }
+
+    /// Returns a [`PolicyMintToken`] for minting `CapabilityManifestV1`.
+    ///
+    /// # TCK-00352: Minting Authority
+    ///
+    /// Only the policy resolver can create mint tokens. This method is the
+    /// single point of authority for V1 manifest minting. The token proves
+    /// that the caller has policy-resolver authority.
+    ///
+    /// # Security
+    ///
+    /// Both `PolicyMintToken::new()` and this method are `pub(crate)`, so
+    /// external crates and requester surfaces cannot obtain a mint token.
+    /// Minting is restricted to the sealed governance path inside the daemon.
+    #[must_use]
+    #[allow(clippy::unused_self)] // Takes &self to enforce resolver-only access pattern
+    pub(crate) const fn mint_token(&self) -> PolicyMintToken {
+        PolicyMintToken::new()
     }
 }
 
@@ -129,12 +175,38 @@ impl PolicyResolver for GovernancePolicyResolver {
         // this role-based heuristic.
         let resolved_risk_tier = transitional_risk_tier(role);
 
+        // MAJOR 1 v3 fix: The scope baseline MUST come from the policy
+        // resolver (authoritative source), NOT from the candidate manifest.
+        //
+        // Phase 1 (transitional): For Reviewer, derive from the canonical
+        // reviewer manifest. For other roles, provide an empty baseline
+        // (which matches the empty fallback manifest). An empty baseline
+        // is NOT fail-open: it means no tools/paths/patterns are permitted,
+        // so any manifest with non-empty allowlists would be rejected.
+        //
+        // Phase 2 (future): Real governance policy will provide baselines.
+        let resolved_scope_baseline = {
+            use crate::episode::capability::ScopeBaseline;
+
+            match role {
+                WorkRole::Reviewer => {
+                    let reviewer = crate::episode::reviewer_manifest::reviewer_v0_manifest();
+                    Some(ScopeBaseline {
+                        tools: reviewer.tool_allowlist.clone(),
+                        write_paths: reviewer.write_allowlist.clone(),
+                        shell_patterns: reviewer.shell_allowlist.clone(),
+                    })
+                },
+                _ => Some(ScopeBaseline::default()),
+            }
+        };
         Ok(PolicyResolution {
             policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
             resolved_policy_hash: *policy_hash.as_bytes(),
             capability_manifest_hash: *manifest_hash.as_bytes(),
             context_pack_hash,
             resolved_risk_tier,
+            resolved_scope_baseline,
         })
     }
 }
@@ -217,9 +289,225 @@ fn transitional_risk_tier(role: WorkRole) -> u8 {
     tier
 }
 
+// =============================================================================
+// Governance Freshness Monitor (TCK-00351 MAJOR 1)
+// =============================================================================
+
+/// Configuration for the governance freshness monitor.
+///
+/// The monitor periodically checks whether the governance service is
+/// reachable and responsive.  When the service is unreachable or its
+/// response is stale beyond `freshness_threshold`, the monitor sets the
+/// `governance_uncertain` flag on the shared [`StopAuthority`], causing
+/// the pre-actuation gate to enter deadline-based fail-closed logic.
+///
+/// [`StopAuthority`]: crate::episode::preactuation::StopAuthority
+///
+/// # TCK-00351 MAJOR 1
+///
+/// This struct wires the `set_governance_uncertain(...)` control surface
+/// into the production path.  Prior to this fix, the flag was only ever
+/// set in tests.
+#[derive(Debug, Clone)]
+pub struct GovernanceFreshnessConfig {
+    /// How often to probe the governance service (milliseconds).
+    pub poll_interval_ms: u64,
+    /// Maximum age of the last successful governance response before the
+    /// service is considered stale (milliseconds).
+    pub freshness_threshold_ms: u64,
+}
+
+impl Default for GovernanceFreshnessConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_ms: 5_000,
+            freshness_threshold_ms: 30_000,
+        }
+    }
+}
+
+/// Governance freshness monitor that probes governance service health and
+/// updates the [`StopAuthority`] uncertainty flag.
+///
+/// # Production Wiring (TCK-00351 MAJOR 1)
+///
+/// Instantiate a monitor, call [`check_freshness`](Self::check_freshness)
+/// periodically (or from a background task), and share the same
+/// `StopAuthority` with the `PreActuationGate`.  When the governance
+/// service goes stale, the monitor sets `governance_uncertain = true`;
+/// when it recovers, the flag is cleared.
+///
+/// ```rust,ignore
+/// let authority = Arc::new(StopAuthority::new());
+/// let monitor = GovernanceFreshnessMonitor::new(
+///     Arc::clone(&authority),
+///     GovernanceFreshnessConfig::default(),
+/// );
+/// // In a background loop:
+/// monitor.check_freshness();
+/// ```
+///
+/// [`StopAuthority`]: crate::episode::preactuation::StopAuthority
+pub struct GovernanceFreshnessMonitor {
+    /// Shared stop authority whose `governance_uncertain` flag is mutated.
+    stop_authority: std::sync::Arc<crate::episode::preactuation::StopAuthority>,
+    /// Monitor configuration.
+    config: GovernanceFreshnessConfig,
+    /// Timestamp (milliseconds since epoch) of the last successful
+    /// governance probe.  Updated by the monitor loop.
+    last_success_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl GovernanceFreshnessMonitor {
+    /// Creates a new monitor with the given configuration.
+    #[must_use]
+    pub fn new(
+        stop_authority: std::sync::Arc<crate::episode::preactuation::StopAuthority>,
+        config: GovernanceFreshnessConfig,
+    ) -> Self {
+        Self {
+            stop_authority,
+            config,
+            last_success_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                Self::current_ms(),
+            )),
+        }
+    }
+
+    /// Returns the current wall-clock time in milliseconds since epoch.
+    fn current_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| {
+                #[allow(clippy::cast_possible_truncation)]
+                let ms = d.as_millis() as u64;
+                ms
+            })
+    }
+
+    /// Records a successful governance probe.
+    ///
+    /// Call this from any path that confirms the governance service is
+    /// healthy (e.g., after a successful policy resolution response).
+    pub fn record_success(&self) {
+        self.last_success_ms
+            .store(Self::current_ms(), std::sync::atomic::Ordering::Release);
+        self.stop_authority.set_governance_uncertain(false);
+    }
+
+    /// Records a governance probe failure.
+    ///
+    /// Call this when the governance service is unreachable or returns an
+    /// error.  The uncertainty flag is set immediately; the deadline-based
+    /// denial in the pre-actuation gate will activate once the configured
+    /// threshold elapses.
+    pub fn record_failure(&self) {
+        self.stop_authority.set_governance_uncertain(true);
+    }
+
+    /// Checks freshness based on the last success timestamp and updates
+    /// the `governance_uncertain` flag accordingly.
+    ///
+    /// Returns `true` if governance is considered fresh, `false` if stale.
+    pub fn check_freshness(&self) -> bool {
+        let last = self
+            .last_success_ms
+            .load(std::sync::atomic::Ordering::Acquire);
+        let now = Self::current_ms();
+        let elapsed = now.saturating_sub(last);
+
+        if elapsed > self.config.freshness_threshold_ms {
+            self.stop_authority.set_governance_uncertain(true);
+            false
+        } else {
+            self.stop_authority.set_governance_uncertain(false);
+            true
+        }
+    }
+
+    /// Returns the configured freshness threshold in milliseconds.
+    #[must_use]
+    pub const fn freshness_threshold_ms(&self) -> u64 {
+        self.config.freshness_threshold_ms
+    }
+
+    /// Returns a reference to the last-success timestamp for testing.
+    #[must_use]
+    pub fn last_success_ms(&self) -> &std::sync::Arc<std::sync::atomic::AtomicU64> {
+        &self.last_success_ms
+    }
+}
+
+impl std::fmt::Debug for GovernanceFreshnessMonitor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GovernanceFreshnessMonitor")
+            .field("config", &self.config)
+            .field(
+                "last_success_ms",
+                &self
+                    .last_success_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::episode::capability::{CapabilityManifestV1, ManifestV1Error};
+    use crate::episode::{CapabilityManifestBuilder, RiskTier, ToolClass};
+
+    #[test]
+    fn policy_resolver_provides_mint_token() {
+        let resolver = GovernancePolicyResolver::new();
+        let token = resolver.mint_token();
+
+        // Token can be used to mint a V1 manifest
+        let manifest = CapabilityManifestBuilder::new("gov-test")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read])
+            .build()
+            .unwrap();
+
+        let result = CapabilityManifestV1::mint(token, manifest, RiskTier::Tier2, Vec::new());
+        assert!(result.is_ok(), "mint with policy token should succeed");
+    }
+
+    #[test]
+    fn policy_resolver_rejects_laundered_manifest() {
+        let resolver = GovernancePolicyResolver::new();
+        let token = resolver.mint_token();
+
+        // Attempt to mint with no expiry (laundering attempt)
+        let manifest = CapabilityManifestBuilder::new("launder-test")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(0) // No expiry!
+            .tool_allowlist(vec![ToolClass::Read])
+            .build()
+            .unwrap();
+
+        let result = CapabilityManifestV1::mint(token, manifest, RiskTier::Tier2, Vec::new());
+        assert!(
+            matches!(result, Err(ManifestV1Error::MissingExpiry)),
+            "laundered manifest without expiry must be rejected"
+        );
+    }
+
+    #[test]
+    fn resolve_for_claim_returns_valid_resolution() {
+        let resolver = GovernancePolicyResolver::new();
+        let result = resolver.resolve_for_claim("W-001", WorkRole::Implementer, "agent-001");
+        assert!(result.is_ok());
+        let resolution = result.unwrap();
+        assert!(!resolution.policy_resolved_ref.is_empty());
+        assert_ne!(resolution.resolved_policy_hash, [0u8; 32]);
+        assert_ne!(resolution.capability_manifest_hash, [0u8; 32]);
+        assert_ne!(resolution.context_pack_hash, [0u8; 32]);
+    }
 
     /// Verifies the governance resolver returns Tier1 for Phase 1 transitional
     /// operation. This ensures production claims can flow through

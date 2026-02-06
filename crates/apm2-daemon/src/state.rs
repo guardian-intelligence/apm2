@@ -46,9 +46,11 @@ use crate::metrics::SharedMetricsRegistry;
 use crate::protocol::dispatch::PrivilegedDispatcher;
 use crate::protocol::messages::DecodeConfig;
 use crate::protocol::resource_governance::{SharedSubscriptionRegistry, SubscriptionRegistry};
-use crate::protocol::session_dispatch::{InMemoryManifestStore, ManifestStore, SessionDispatcher};
+use crate::protocol::session_dispatch::{
+    InMemoryManifestStore, ManifestStore, SessionDispatcher, V1ManifestStore,
+};
 use crate::protocol::session_token::TokenMinter;
-use crate::session::{SessionRegistry, SessionTelemetryStore};
+use crate::session::{SessionRegistry, SessionStopConditionsStore, SessionTelemetryStore};
 
 // ============================================================================
 // TCK-00343: Credential Store Service Name
@@ -394,6 +396,9 @@ impl DispatcherState {
         // TCK-00343: Create credential store for credential management
         let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
 
+        // TCK-00352: Create shared V1 manifest store for scope enforcement
+        let v1_manifest_store = Arc::new(V1ManifestStore::new());
+
         let privileged_dispatcher = if let Some(conn) = sqlite_conn {
             // Use real implementations
             // Security Review v5 MAJOR 2: Reuse the daemon-lifecycle signing key
@@ -473,6 +478,8 @@ impl DispatcherState {
                 Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
                 Arc::clone(&subscription_registry),
             )
+            // TCK-00352: Wire V1 manifest store into production path
+            .with_v1_manifest_store(Arc::clone(&v1_manifest_store))
         } else {
             // Use stubs
             let clock = Arc::new(
@@ -498,10 +505,16 @@ impl DispatcherState {
         // TCK-00384: Create shared telemetry store for session counters
         let telemetry_store = Arc::new(SessionTelemetryStore::new());
 
+        // TCK-00351 v4: Create shared stop conditions store for per-session
+        // stop limits (max_episodes, escalation_predicate).
+        let stop_conditions_store = Arc::new(SessionStopConditionsStore::new());
+
         // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
         // registration
-        let privileged_dispatcher =
-            privileged_dispatcher.with_telemetry_store(Arc::clone(&telemetry_store));
+        // TCK-00351 v4: Wire stop conditions store into privileged dispatcher
+        let privileged_dispatcher = privileged_dispatcher
+            .with_telemetry_store(Arc::clone(&telemetry_store))
+            .with_stop_conditions_store(Arc::clone(&stop_conditions_store));
 
         // TCK-00351 BLOCKER 1 & 2 FIX: Create production pre-actuation gate
         // with real StopAuthority and fail-closed budget enforcement.
@@ -516,14 +529,17 @@ impl DispatcherState {
         // TCK-00303: Share subscription registry for HEF resource governance
         // TCK-00344: Wire session registry for SessionStatus queries
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
-        // TCK-00351: Wire pre-actuation gate and stop authority
+        // TCK-00351: Wire pre-actuation gate, stop authority, and stop conditions store
+        // TCK-00352: Wire V1 manifest store for scope enforcement
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
                 .with_telemetry_store(telemetry_store)
                 .with_preactuation_gate(preactuation_gate)
-                .with_stop_authority(Arc::clone(&stop_authority));
+                .with_stop_authority(Arc::clone(&stop_authority))
+                .with_stop_conditions_store(stop_conditions_store)
+                .with_v1_manifest_store(v1_manifest_store);
 
         Self {
             privileged_dispatcher,
@@ -702,6 +718,9 @@ impl DispatcherState {
         // TCK-00343: Create credential store for credential management
         let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
 
+        // TCK-00352: Create shared V1 manifest store for scope enforcement
+        let v1_manifest_store = Arc::new(V1ManifestStore::new());
+
         let privileged_dispatcher = PrivilegedDispatcher::with_dependencies(
             DecodeConfig::default(),
             policy_resolver,
@@ -717,7 +736,9 @@ impl DispatcherState {
             Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
             Arc::clone(&subscription_registry),
         )
-        .with_credential_store(credential_store);
+        .with_credential_store(credential_store)
+        // TCK-00352: Wire V1 manifest store into production path
+        .with_v1_manifest_store(Arc::clone(&v1_manifest_store));
 
         let privileged_dispatcher = if let Some(ref metrics) = metrics_registry {
             privileged_dispatcher.with_metrics(Arc::clone(metrics))
@@ -728,10 +749,16 @@ impl DispatcherState {
         // TCK-00384: Create shared telemetry store for session counters
         let telemetry_store = Arc::new(SessionTelemetryStore::new());
 
+        // TCK-00351 v4: Create shared stop conditions store for per-session
+        // stop limits (max_episodes, escalation_predicate).
+        let stop_conditions_store = Arc::new(SessionStopConditionsStore::new());
+
         // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
         // registration
-        let privileged_dispatcher =
-            privileged_dispatcher.with_telemetry_store(Arc::clone(&telemetry_store));
+        // TCK-00351 v4: Wire stop conditions store into privileged dispatcher
+        let privileged_dispatcher = privileged_dispatcher
+            .with_telemetry_store(Arc::clone(&telemetry_store))
+            .with_stop_conditions_store(Arc::clone(&stop_conditions_store));
 
         // TCK-00351 BLOCKER 1 & 2 FIX: Create production pre-actuation gate
         // with real StopAuthority and fail-closed budget enforcement.
@@ -748,7 +775,8 @@ impl DispatcherState {
         // TCK-00316: Wire SessionDispatcher with all production dependencies
         // TCK-00344: Wire session registry for SessionStatus queries
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
-        // TCK-00351: Wire pre-actuation gate, stop authority for stop/budget proof
+        // TCK-00351: Wire pre-actuation gate, stop authority, stop conditions store
+        // TCK-00352: Wire V1 manifest store for scope enforcement
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
@@ -760,7 +788,9 @@ impl DispatcherState {
                 .with_episode_runtime(episode_runtime)
                 .with_telemetry_store(telemetry_store)
                 .with_preactuation_gate(preactuation_gate)
-                .with_stop_authority(Arc::clone(&stop_authority));
+                .with_stop_authority(Arc::clone(&stop_authority))
+                .with_stop_conditions_store(stop_conditions_store)
+                .with_v1_manifest_store(v1_manifest_store);
 
         Ok(Self {
             privileged_dispatcher,
