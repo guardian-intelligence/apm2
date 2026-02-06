@@ -1018,9 +1018,24 @@ async fn async_main(args: Args) -> Result<()> {
         }
     }
 
-    // Graceful shutdown
+    // Graceful shutdown with 30-second timeout (TCK-00392).
+    //
+    // The timeout ensures the daemon does not hang indefinitely if a process
+    // refuses to stop. After the timeout, remaining cleanup (socket removal,
+    // PID file removal) proceeds regardless.
     info!("Shutting down daemon...");
-    shutdown_all_processes(&state).await;
+    let shutdown_timeout = Duration::from_secs(30);
+    match tokio::time::timeout(shutdown_timeout, shutdown_all_processes(&state)).await {
+        Ok(()) => {
+            info!("All processes stopped within graceful shutdown window");
+        },
+        Err(_) => {
+            warn!(
+                timeout_secs = 30,
+                "Graceful shutdown timed out — proceeding with cleanup"
+            );
+        },
+    }
 
     // Cleanup sockets (SocketManager handles this in Drop, but explicit cleanup is
     // safer)
