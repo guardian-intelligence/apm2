@@ -183,6 +183,17 @@ pub trait SessionRegistry: Send + Sync {
         &self,
         session_id: &str,
     ) -> Option<(SessionState, SessionTerminationInfo)>;
+
+    /// Removes a session by ID (TCK-00395).
+    ///
+    /// Returns the removed session state if found, or `None` if no session
+    /// with the given ID exists. After removal, the session is no longer
+    /// observable via `get_session` or `get_session_by_handle`.
+    ///
+    /// This is called by `EndSession` to ensure terminated sessions are
+    /// removed from the registry, preventing repeated termination and
+    /// stale session state.
+    fn remove_session(&self, session_id: &str) -> Option<SessionState>;
 }
 
 /// Error type for session registry operations.

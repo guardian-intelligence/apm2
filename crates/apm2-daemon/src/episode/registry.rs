@@ -1047,6 +1047,18 @@ impl SessionRegistry for InMemorySessionRegistry {
 
         Some((entry.session.clone(), entry.info.clone()))
     }
+
+    fn remove_session(&self, session_id: &str) -> Option<SessionState> {
+        let mut state = self.state.write().expect("lock poisoned");
+
+        if let Some(session) = state.by_id.remove(session_id) {
+            state.by_handle.remove(&session.ephemeral_handle);
+            state.queue.retain(|id| id != session_id);
+            Some(session)
+        } else {
+            None
+        }
+    }
 }
 
 impl InMemorySessionRegistry {
@@ -1057,22 +1069,6 @@ impl InMemorySessionRegistry {
     pub fn all_sessions(&self) -> Vec<SessionState> {
         let state = self.state.read().expect("lock poisoned");
         state.by_id.values().cloned().collect()
-    }
-
-    /// Removes a session by ID.
-    ///
-    /// Used during crash recovery to clean up sessions after sending
-    /// `LEASE_REVOKED` signals.
-    pub fn remove_session(&self, session_id: &str) -> Option<SessionState> {
-        let mut state = self.state.write().expect("lock poisoned");
-
-        if let Some(session) = state.by_id.remove(session_id) {
-            state.by_handle.remove(&session.ephemeral_handle);
-            state.queue.retain(|id| id != session_id);
-            Some(session)
-        } else {
-            None
-        }
     }
 
     /// Clears all sessions.
@@ -1903,6 +1899,7 @@ impl SessionRegistry for PersistentSessionRegistry {
         self.inner.get_session_by_work_id(work_id)
     }
 
+<<<<<<< HEAD
     fn mark_terminated(
         &self,
         session_id: &str,
@@ -1951,6 +1948,21 @@ impl SessionRegistry for PersistentSessionRegistry {
         session_id: &str,
     ) -> Option<(SessionState, SessionTerminationInfo)> {
         SessionRegistry::get_terminated_session(&self.inner, session_id)
+    }
+
+    fn remove_session(&self, session_id: &str) -> Option<SessionState> {
+        let removed = self.inner.remove_session(session_id);
+        if removed.is_some() {
+            // Best-effort persist; session is already removed from memory
+            if let Err(e) = self.persist() {
+                tracing::warn!(
+                    error = %e,
+                    session_id = %session_id,
+                    "Failed to persist state after session removal"
+                );
+            }
+        }
+        removed
     }
 }
 
