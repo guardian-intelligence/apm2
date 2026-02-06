@@ -1636,35 +1636,29 @@ impl LeaseValidator for SqliteLeaseValidator {
     fn get_lease_executor_actor_id(&self, lease_id: &str) -> Option<String> {
         let conn = self.conn.lock().ok()?;
 
-        // Query gate_lease_issued events and find the executor_actor_id.
-        // The payload is a JSON blob that may contain executor_actor_id.
+        // TCK-00340 Security MAJOR: Use targeted WHERE clause with
+        // json_extract instead of O(N) full table scan with per-row JSON
+        // parse. Filters by event_type and lease_id in SQL, with ORDER BY
+        // rowid DESC LIMIT 1 for deterministic latest-row selection.
+        //
+        // NOTE: payload is stored as BLOB, so we CAST to TEXT for
+        // json_extract to work on the binary JSON data.
         let mut stmt = conn
             .prepare(
-                "SELECT payload FROM ledger_events WHERE event_type = 'gate_lease_issued' ORDER BY rowid",
+                "SELECT payload FROM ledger_events \
+                 WHERE event_type = 'gate_lease_issued' \
+                 AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+                 ORDER BY rowid DESC LIMIT 1",
             )
             .ok()?;
 
-        let rows = stmt
-            .query_map([], |row| {
-                let payload: Vec<u8> = row.get(0)?;
-                Ok(payload)
-            })
-            .ok()?;
+        let payload_bytes: Vec<u8> = stmt.query_row(params![lease_id], |row| row.get(0)).ok()?;
 
-        for payload_bytes in rows.flatten() {
-            if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) {
-                if let Some(l) = payload.get("lease_id").and_then(|v| v.as_str()) {
-                    if l == lease_id {
-                        return payload
-                            .get("executor_actor_id")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-                    }
-                }
-            }
-        }
-
-        None
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+        payload
+            .get("executor_actor_id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
     }
 
     fn register_lease(&self, lease_id: &str, work_id: &str, gate_id: &str) {
@@ -1711,83 +1705,62 @@ impl LeaseValidator for SqliteLeaseValidator {
     fn get_lease_work_id(&self, lease_id: &str) -> Option<String> {
         let conn = self.conn.lock().ok()?;
 
-        // Query gate_lease_issued events and extract the work_id for the
-        // matching lease. Uses the work_id index for efficient lookup and
-        // rowid tiebreaker for deterministic ordering.
+        // TCK-00340 Quality BLOCKER 1: Use targeted WHERE clause with
+        // json_extract instead of O(N) full table scan with per-row JSON
+        // parse. Filters by event_type first (reduces scan scope), then
+        // uses json_extract for indexed field filtering, with ORDER BY
+        // rowid DESC LIMIT 1 for deterministic latest-row selection.
+        //
+        // NOTE: payload is stored as BLOB, so we CAST to TEXT for
+        // json_extract to work on the binary JSON data.
         let mut stmt = conn
             .prepare(
-                "SELECT work_id, payload FROM ledger_events \
+                "SELECT work_id FROM ledger_events \
                  WHERE event_type = 'gate_lease_issued' \
-                 ORDER BY rowid",
+                 AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+                 ORDER BY rowid DESC LIMIT 1",
             )
             .ok()?;
 
-        let rows = stmt
-            .query_map([], |row| {
-                let work_id: String = row.get(0)?;
-                let payload: Vec<u8> = row.get(1)?;
-                Ok((work_id, payload))
-            })
-            .ok()?;
-
-        for row in rows.flatten() {
-            let (work_id, payload_bytes) = row;
-            if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) {
-                if let Some(l) = payload.get("lease_id").and_then(|v| v.as_str()) {
-                    if l == lease_id {
-                        return Some(work_id);
-                    }
-                }
-            }
-        }
-
-        None
+        stmt.query_row(params![lease_id], |row| row.get(0)).ok()
     }
 
     fn get_gate_lease(&self, lease_id: &str) -> Option<apm2_core::fac::GateLease> {
         let conn = self.conn.lock().ok()?;
 
-        // Query gate_lease_issued events and reconstruct a GateLease for the
-        // matching lease_id. Uses rowid tiebreaker for deterministic ordering.
-        let mut stmt = conn
-            .prepare(
-                "SELECT work_id, payload FROM ledger_events \
-                 WHERE event_type = 'gate_lease_issued' \
-                 ORDER BY rowid",
-            )
-            .ok()?;
+        // TCK-00340 Quality BLOCKER 2 / Security MAJOR: Use targeted WHERE
+        // clause with json_extract instead of O(N) full table scan with
+        // per-row JSON parse. Filters by event_type, lease_id, AND
+        // full_lease presence in SQL via json_extract on CAST(payload AS
+        // TEXT), with ORDER BY rowid DESC LIMIT 1 for deterministic
+        // latest-row selection.
+        //
+        // NOTE: payload is stored as BLOB (Vec<u8> from serde_json::to_vec),
+        // so we CAST to TEXT for json_extract compatibility.
+        //
+        // The full_lease IS NOT NULL guard ensures we only match events
+        // that actually embed the full GateLease struct, skipping any
+        // events that share the same lease_id but lack the full_lease
+        // field (e.g. executor-only registration events).
+        let result: Result<Vec<u8>, _> = conn.query_row(
+            "SELECT payload FROM ledger_events \
+             WHERE event_type = 'gate_lease_issued' \
+             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+             AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL \
+             ORDER BY rowid DESC LIMIT 1",
+            params![lease_id],
+            |row| row.get(0),
+        );
 
-        let rows = stmt
-            .query_map([], |row| {
-                let work_id: String = row.get(0)?;
-                let payload: Vec<u8> = row.get(1)?;
-                Ok((work_id, payload))
-            })
-            .ok()?;
+        let Ok(payload_bytes) = result else {
+            return None;
+        };
 
-        for row in rows.flatten() {
-            let (_work_id, payload_bytes) = row;
-            if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) {
-                if let Some(l) = payload.get("lease_id").and_then(|v| v.as_str()) {
-                    if l == lease_id {
-                        // Try to deserialize from the stored full_lease JSON
-                        // if available, otherwise reconstruct from fields.
-                        if let Some(full_lease) = payload.get("full_lease") {
-                            if let Ok(lease) = serde_json::from_value::<apm2_core::fac::GateLease>(
-                                full_lease.clone(),
-                            ) {
-                                return Some(lease);
-                            }
-                        }
-                        // Cannot reconstruct a full GateLease from partial
-                        // event data (signature, policy_hash, etc. are missing).
-                        return None;
-                    }
-                }
-            }
-        }
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
 
-        None
+        // Try to deserialize from the stored full_lease JSON if available.
+        let full_lease = payload.get("full_lease")?;
+        serde_json::from_value::<apm2_core::fac::GateLease>(full_lease.clone()).ok()
     }
 
     fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) {
@@ -2178,5 +2151,69 @@ mod tests {
             2_000,
         );
         assert!(result2.is_err(), "Should fail when table is dropped");
+    }
+
+    /// TCK-00340: Verify `SqliteLeaseValidator::get_gate_lease` retrieves
+    /// a full `GateLease` stored via `register_full_lease`.
+    #[test]
+    fn sqlite_lease_validator_get_gate_lease_roundtrip() {
+        use crate::protocol::dispatch::LeaseValidator;
+
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        // Use Arc<dyn LeaseValidator> to match how the dispatcher uses it
+        let validator: Arc<dyn LeaseValidator> =
+            Arc::new(SqliteLeaseValidator::new(Arc::clone(&conn)));
+
+        let signer = apm2_core::crypto::Signer::generate();
+        let lease = apm2_core::fac::GateLeaseBuilder::new("test-lease-001", "W-RT-001", "gate-rt")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("exec-rt")
+            .issued_at(1_000_000)
+            .expires_at(2_000_000)
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("issuer-rt")
+            .time_envelope_ref("htf:tick:100")
+            .build_and_sign(&signer);
+
+        validator.register_full_lease(&lease);
+
+        let retrieved = validator.get_gate_lease("test-lease-001");
+        assert!(
+            retrieved.is_some(),
+            "get_gate_lease must return the stored lease"
+        );
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.lease_id, "test-lease-001");
+        assert_eq!(retrieved.work_id, "W-RT-001");
+        assert_eq!(retrieved.gate_id, "gate-rt");
+        assert_eq!(retrieved.executor_actor_id, "exec-rt");
+    }
+
+    /// TCK-00340: Verify `SqliteLeaseValidator::get_lease_work_id` returns
+    /// the correct `work_id` for a stored lease.
+    #[test]
+    fn sqlite_lease_validator_get_lease_work_id() {
+        use crate::protocol::dispatch::LeaseValidator;
+
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let validator = SqliteLeaseValidator::new(Arc::clone(&conn));
+
+        validator.register_lease_with_executor(
+            "work-lease-001",
+            "W-WID-001",
+            "gate-wid",
+            "exec-wid",
+        );
+
+        let work_id = validator.get_lease_work_id("work-lease-001");
+        assert_eq!(
+            work_id.as_deref(),
+            Some("W-WID-001"),
+            "get_lease_work_id must return the stored work_id"
+        );
     }
 }

@@ -2739,6 +2739,7 @@ impl PrivilegedMessageType {
             Self::SubscribePulse,
             Self::UnsubscribePulse,
             Self::PublishChangeSet,
+            Self::DelegateSublease,
         ]
     }
 
@@ -2781,7 +2782,8 @@ impl PrivilegedMessageType {
             | Self::LoginCredential
             | Self::SubscribePulse
             | Self::UnsubscribePulse
-            | Self::PublishChangeSet => true,
+            | Self::PublishChangeSet
+            | Self::DelegateSublease => true,
             // Server-to-client notification only — not a client request.
             Self::PulseEvent => false,
         }
@@ -2821,6 +2823,7 @@ impl PrivilegedMessageType {
             Self::SubscribePulse => "hsi.pulse.subscribe",
             Self::UnsubscribePulse => "hsi.pulse.unsubscribe",
             Self::PublishChangeSet => "hsi.changeset.publish",
+            Self::DelegateSublease => "hsi.sublease.delegate",
             Self::PulseEvent => "hsi.pulse.event",
         }
     }
@@ -2855,6 +2858,7 @@ impl PrivilegedMessageType {
             Self::SubscribePulse => "SUBSCRIBE_PULSE",
             Self::UnsubscribePulse => "UNSUBSCRIBE_PULSE",
             Self::PublishChangeSet => "PUBLISH_CHANGESET",
+            Self::DelegateSublease => "DELEGATE_SUBLEASE",
             Self::PulseEvent => "PULSE_EVENT",
         }
     }
@@ -2889,6 +2893,7 @@ impl PrivilegedMessageType {
             Self::SubscribePulse => "apm2.subscribe_pulse_request.v1",
             Self::UnsubscribePulse => "apm2.unsubscribe_pulse_request.v1",
             Self::PublishChangeSet => "apm2.publish_changeset_request.v1",
+            Self::DelegateSublease => "apm2.delegate_sublease_request.v1",
             Self::PulseEvent => "apm2.pulse_event_request.v1",
         }
     }
@@ -2923,6 +2928,7 @@ impl PrivilegedMessageType {
             Self::SubscribePulse => "apm2.subscribe_pulse_response.v1",
             Self::UnsubscribePulse => "apm2.unsubscribe_pulse_response.v1",
             Self::PublishChangeSet => "apm2.publish_changeset_response.v1",
+            Self::DelegateSublease => "apm2.delegate_sublease_response.v1",
             Self::PulseEvent => "apm2.pulse_event_response.v1",
         }
     }
@@ -7439,7 +7445,7 @@ impl PrivilegedDispatcher {
     fn handle_delegate_sublease(
         &self,
         payload: &[u8],
-        _ctx: &ConnectionContext,
+        ctx: &ConnectionContext,
     ) -> ProtocolResult<PrivilegedResponse> {
         let request = DelegateSubleaseRequest::decode_bounded(payload, &self.decode_config)
             .map_err(|e| ProtocolError::Serialization {
@@ -7454,7 +7460,21 @@ impl PrivilegedDispatcher {
             "DelegateSublease request received"
         );
 
-        // ---- Phase 0: Validate required fields (admission checks) ----
+        // ---- Phase 0a: Caller authorization (fail-closed) ----
+        //
+        // SECURITY: Verify the caller is authorized to delegate from the
+        // parent lease. The caller's identity (derived from peer credentials)
+        // must match the parent lease's `executor_actor_id` — only the
+        // lease holder can delegate subleases from their lease.
+        let Some(peer_creds) = ctx.peer_credentials() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                "peer credentials required for sublease delegation",
+            ));
+        };
+        let caller_actor_id = derive_actor_id(peer_creds);
+
+        // ---- Phase 0b: Validate required fields (admission checks) ----
 
         if request.parent_lease_id.is_empty() {
             return Ok(PrivilegedResponse::error(
@@ -7520,6 +7540,32 @@ impl PrivilegedDispatcher {
                 format!("parent gate lease not found: {}", request.parent_lease_id),
             ));
         };
+
+        // ---- Phase 2a: Caller authorization against parent lease ----
+        //
+        // SECURITY: The caller must be the executor authorized by the parent
+        // lease, OR the issuer of the parent lease. Only the lease holder
+        // (executor) or the lease issuer should be able to delegate subleases.
+        // This prevents confused-deputy / capability laundering attacks where
+        // an unauthorized caller delegates from another entity's lease.
+        if parent_lease.executor_actor_id != caller_actor_id
+            && parent_lease.issuer_actor_id != caller_actor_id
+        {
+            warn!(
+                parent_lease_id = %request.parent_lease_id,
+                caller = %caller_actor_id,
+                executor = %parent_lease.executor_actor_id,
+                issuer = %parent_lease.issuer_actor_id,
+                "Caller not authorized to delegate from parent lease"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                format!(
+                    "caller is not authorized to delegate from lease '{}'",
+                    request.parent_lease_id
+                ),
+            ));
+        }
 
         // ---- Phase 2b: Sublease ID uniqueness check (admission before mutation) ----
         //
@@ -16377,11 +16423,15 @@ mod tests {
 
         /// Helper: build a dispatcher with a gate orchestrator and a registered
         /// parent lease for sublease delegation tests.
+        ///
+        /// The parent lease's `executor_actor_id` is set to match the caller's
+        /// derived actor ID (from uid=1000, gid=1000) so that the caller
+        /// authorization check in `handle_delegate_sublease` passes.
         fn setup_dispatcher_with_orchestrator(
             parent_lease_id: &str,
             work_id: &str,
             gate_id: &str,
-            executor_actor_id: &str,
+            _executor_actor_id: &str,
         ) -> (
             PrivilegedDispatcher,
             ConnectionContext,
@@ -16393,10 +16443,19 @@ mod tests {
                 signer.clone(),
             ));
 
+            // Derive the actor ID from the test peer credentials (uid=1000,
+            // gid=1000) so the caller authorization check passes.
+            let test_creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let caller_actor = derive_actor_id(&test_creds);
+
             let parent_lease =
                 apm2_core::fac::GateLeaseBuilder::new(parent_lease_id, work_id, gate_id)
                     .changeset_digest([0x42; 32])
-                    .executor_actor_id(executor_actor_id)
+                    .executor_actor_id(&caller_actor)
                     .issued_at(1_000_000)
                     .expires_at(2_000_000)
                     .policy_hash([0xAB; 32])
@@ -16412,7 +16471,7 @@ mod tests {
                 parent_lease_id,
                 work_id,
                 gate_id,
-                executor_actor_id,
+                &caller_actor,
             );
 
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
@@ -16673,6 +16732,108 @@ mod tests {
             }
         }
 
+        /// Security BLOCKER: Unauthorized caller (different actor ID) must be
+        /// explicitly rejected when attempting to delegate from a parent lease
+        /// they do not own.
+        #[test]
+        fn test_delegate_sublease_unauthorized_caller_rejected() {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer.clone(),
+            ));
+
+            // Register parent lease with executor_actor_id that does NOT
+            // match the caller (uid=1000, gid=1000).
+            let parent_lease =
+                apm2_core::fac::GateLeaseBuilder::new("parent-authz", "W-AUTHZ", "gate-authz")
+                    .changeset_digest([0x42; 32])
+                    .executor_actor_id("totally-different-actor")
+                    .issued_at(1_000_000)
+                    .expires_at(2_000_000)
+                    .policy_hash([0xAB; 32])
+                    .issuer_actor_id("also-different-issuer")
+                    .time_envelope_ref("htf:tick:100")
+                    .build_and_sign(&signer);
+
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            dispatcher
+                .lease_validator
+                .register_full_lease(&parent_lease);
+            dispatcher.lease_validator.register_lease_with_executor(
+                "parent-authz",
+                "W-AUTHZ",
+                "gate-authz",
+                "totally-different-actor",
+            );
+
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-authz".to_string(),
+                delegatee_actor_id: "child-001".to_string(),
+                requested_expiry_ns: 1_900_000,
+                sublease_id: "sublease-authz".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("not authorized to delegate"),
+                        "Unauthorized caller must get explicit rejection: {}",
+                        err.message
+                    );
+                    assert_eq!(
+                        err.code,
+                        i32::from(PrivilegedErrorCode::PermissionDenied),
+                        "Error code should be PermissionDenied"
+                    );
+                },
+                other => panic!("Expected PermissionDenied for unauthorized caller, got {other:?}"),
+            }
+        }
+
+        /// Security BLOCKER: Caller with no peer credentials must be rejected
+        /// (fail-closed).
+        #[test]
+        fn test_delegate_sublease_no_peer_credentials_rejected() {
+            let (dispatcher, _ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-no-creds",
+                "W-NC",
+                "gate-quality",
+                "executor-001",
+            );
+
+            // Context with NO peer credentials
+            let ctx = ConnectionContext::privileged(None);
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-no-creds".to_string(),
+                delegatee_actor_id: "child-001".to_string(),
+                requested_expiry_ns: 1_900_000,
+                sublease_id: "sublease-no-creds".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("peer credentials required"),
+                        "Missing creds must fail closed: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected rejection for missing peer creds, got {other:?}"),
+            }
+        }
+
         #[test]
         fn test_delegate_sublease_message_type_tag() {
             assert_eq!(PrivilegedMessageType::DelegateSublease.tag(), 72);
@@ -16786,10 +16947,19 @@ mod tests {
                 signer.clone(),
             ));
 
+            // Derive the actor ID from the test peer credentials so the
+            // caller authorization check passes for both parent leases.
+            let test_creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let caller_actor = derive_actor_id(&test_creds);
+
             // Create parent lease in gate "gate-A"
             let parent_a = apm2_core::fac::GateLeaseBuilder::new("parent-A", "W-A", "gate-A")
                 .changeset_digest([0x42; 32])
-                .executor_actor_id("exec-A")
+                .executor_actor_id(&caller_actor)
                 .issued_at(1_000_000)
                 .expires_at(2_000_000)
                 .policy_hash([0xAB; 32])
@@ -16800,7 +16970,7 @@ mod tests {
             // Create parent lease in gate "gate-B" (different parameters)
             let parent_b = apm2_core::fac::GateLeaseBuilder::new("parent-B", "W-B", "gate-B")
                 .changeset_digest([0x42; 32])
-                .executor_actor_id("exec-B")
+                .executor_actor_id(&caller_actor)
                 .issued_at(1_000_000)
                 .expires_at(2_000_000)
                 .policy_hash([0xAB; 32])
@@ -16811,12 +16981,18 @@ mod tests {
             let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
             dispatcher.lease_validator.register_full_lease(&parent_a);
             dispatcher.lease_validator.register_full_lease(&parent_b);
-            dispatcher
-                .lease_validator
-                .register_lease_with_executor("parent-A", "W-A", "gate-A", "exec-A");
-            dispatcher
-                .lease_validator
-                .register_lease_with_executor("parent-B", "W-B", "gate-B", "exec-B");
+            dispatcher.lease_validator.register_lease_with_executor(
+                "parent-A",
+                "W-A",
+                "gate-A",
+                &caller_actor,
+            );
+            dispatcher.lease_validator.register_lease_with_executor(
+                "parent-B",
+                "W-B",
+                "gate-B",
+                &caller_actor,
+            );
 
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
@@ -17107,10 +17283,18 @@ mod tests {
                 Arc::clone(&signer),
             ));
 
+            // Derive the actor ID from the test peer credentials (uid=1000,
+            // gid=1000) so the caller authorization check passes.
+            let caller_actor = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
             let parent_lease =
                 apm2_core::fac::GateLeaseBuilder::new("sql-parent", "W-SQL-DS", "gate-sql-ds")
                     .changeset_digest([0x42; 32])
-                    .executor_actor_id("executor-sql")
+                    .executor_actor_id(&caller_actor)
                     .issued_at(1_000_000)
                     .expires_at(2_000_000)
                     .policy_hash([0xAB; 32])
@@ -17126,7 +17310,7 @@ mod tests {
                 "sql-parent",
                 "W-SQL-DS",
                 "gate-sql-ds",
-                "executor-sql",
+                &caller_actor,
             );
 
             // Wire orchestrator after construction (mimics DispatcherState flow)
@@ -17191,6 +17375,178 @@ mod tests {
                     );
                 },
                 other => panic!("Expected parent-not-found rejection, got {other:?}"),
+            }
+        }
+
+        /// Quality MAJOR: Integration test using `DispatcherState` production
+        /// wiring to exercise `DelegateSublease` and `IngestReviewReceipt`
+        /// through the production composition path. This proves that
+        /// `DispatcherState` properly wires `gate_orchestrator` into the
+        /// privileged dispatcher.
+        #[test]
+        fn test_dispatcher_state_delegate_sublease_production_wiring() {
+            use crate::state::DispatcherState;
+
+            let conn = Connection::open_in_memory().unwrap();
+            SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+            SqliteWorkRegistry::init_schema(&conn).unwrap();
+            let conn = Arc::new(Mutex::new(conn));
+
+            let session_registry: Arc<dyn SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+
+            // Construct via production DispatcherState path
+            let state = DispatcherState::with_persistence(
+                session_registry,
+                None, // no metrics
+                Some(Arc::clone(&conn)),
+                None, // generate fresh signing key
+            );
+
+            // Wire gate orchestrator via production path
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                Arc::clone(&signer),
+            ));
+            let state = state.with_gate_orchestrator(orch);
+
+            // Derive caller actor from test peer credentials
+            let test_creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let caller_actor = derive_actor_id(&test_creds);
+
+            // Register parent lease in the sqlite-backed dispatcher
+            let parent_lease =
+                apm2_core::fac::GateLeaseBuilder::new("ds-parent-prod", "W-PROD-001", "gate-prod")
+                    .changeset_digest([0x42; 32])
+                    .executor_actor_id(&caller_actor)
+                    .issued_at(1_000_000)
+                    .expires_at(2_000_000)
+                    .policy_hash([0xAB; 32])
+                    .issuer_actor_id("issuer-prod")
+                    .time_envelope_ref("htf:tick:100")
+                    .build_and_sign(&signer);
+
+            state
+                .privileged_dispatcher()
+                .lease_validator
+                .register_full_lease(&parent_lease);
+            state
+                .privileged_dispatcher()
+                .lease_validator
+                .register_lease_with_executor(
+                    "ds-parent-prod",
+                    "W-PROD-001",
+                    "gate-prod",
+                    &caller_actor,
+                );
+
+            let ctx = ConnectionContext::privileged(Some(test_creds));
+
+            // Exercise DelegateSublease through production-wired dispatcher
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "ds-parent-prod".to_string(),
+                delegatee_actor_id: "child-prod-exec".to_string(),
+                requested_expiry_ns: 1_900_000,
+                sublease_id: "sublease-prod-001".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = state
+                .privileged_dispatcher()
+                .dispatch(&frame, &ctx)
+                .unwrap();
+            match response {
+                PrivilegedResponse::DelegateSublease(resp) => {
+                    assert_eq!(resp.sublease_id, "sublease-prod-001");
+                    assert_eq!(resp.gate_id, "gate-prod");
+                    assert_eq!(resp.delegatee_actor_id, "child-prod-exec");
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "Event ID must be non-empty in production wiring path"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "DelegateSublease must succeed via DispatcherState wiring, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected DelegateSublease via production path, got {other:?}"),
+            }
+
+            // Also exercise IngestReviewReceipt through production wiring
+            // to verify get_lease_work_id works with SqliteLeaseValidator
+            state
+                .privileged_dispatcher()
+                .lease_validator
+                .register_lease_with_executor(
+                    "review-lease-prod",
+                    "W-REVIEW-001",
+                    "gate-review",
+                    "reviewer-prod",
+                );
+
+            let claim = WorkClaim {
+                work_id: "W-REVIEW-001".to_string(),
+                lease_id: "review-lease-prod".to_string(),
+                actor_id: "reviewer-prod".to_string(),
+                role: WorkRole::Reviewer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "PolicyResolvedForChangeSet:W-REVIEW-001".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0, // Tier0
+                },
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+            };
+            state
+                .privileged_dispatcher()
+                .work_registry
+                .register_claim(claim)
+                .unwrap();
+
+            let review_request = IngestReviewReceiptRequest {
+                lease_id: "review-lease-prod".to_string(),
+                receipt_id: "RR-PROD-001".to_string(),
+                reviewer_actor_id: "reviewer-prod".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let review_frame = encode_ingest_review_receipt_request(&review_request);
+
+            let review_response = state
+                .privileged_dispatcher()
+                .dispatch(&review_frame, &ctx)
+                .unwrap();
+            match review_response {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(resp.receipt_id, "RR-PROD-001");
+                    assert_eq!(
+                        resp.event_type, "ReviewReceiptRecorded",
+                        "Tier0 SelfSigned must pass through DispatcherState production path"
+                    );
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "Event ID must be non-empty on production path success"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "IngestReviewReceipt must succeed via DispatcherState wiring, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected IngestReviewReceipt via production path, got {other:?}"),
             }
         }
     }
