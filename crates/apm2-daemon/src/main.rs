@@ -2106,34 +2106,6 @@ async fn handle_dual_socket_connection(
     };
     ctx.set_contract_binding(contract_binding.clone());
 
-    // TCK-00348: Persist connection-level contract binding as an additional
-    // audit trail event. The authoritative record is in SessionStarted
-    // (via emit_spawn_lifecycle), but we also persist at connection time
-    // for belt-and-suspenders audit. Fail-closed: persistence failure
-    // terminates the connection.
-    {
-        let emitter = dispatcher_state.event_emitter();
-        let connection_id_for_binding = ctx.connection_id().to_string();
-        #[allow(clippy::cast_possible_truncation)]
-        let timestamp_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        if let Err(e) = emitter.emit_contract_binding_recorded(
-            &connection_id_for_binding,
-            &contract_binding,
-            timestamp_ns,
-        ) {
-            error!(
-                error = %e,
-                "Failed to persist contract binding event - closing connection (fail-closed)"
-            );
-            return Err(anyhow::anyhow!(
-                "contract binding persistence failed (fail-closed): {e}"
-            ));
-        }
-    }
-
     // TCK-00287 Item 1 & 2: Use shared dispatchers from DispatcherState.
     // These dispatchers persist across connections and use stable secrets.
     let privileged_dispatcher = dispatcher_state.privileged_dispatcher();

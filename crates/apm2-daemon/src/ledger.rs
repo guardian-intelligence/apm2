@@ -266,6 +266,11 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
                 "risk_tier".to_string(),
                 serde_json::to_value(binding.risk_tier).expect("RiskTier serializes"),
             );
+            obj.insert(
+                "client_canonicalizers".to_string(),
+                serde_json::to_value(&binding.client_canonicalizers)
+                    .expect("CanonicalizerInfo serializes"),
+            );
         }
 
         // TCK-00289 BLOCKER 2: Use JCS (RFC 8785) canonicalization for signing.
@@ -1285,6 +1290,11 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
                 "risk_tier".to_string(),
                 serde_json::to_value(binding.risk_tier).expect("RiskTier serializes"),
             );
+            obj.insert(
+                "client_canonicalizers".to_string(),
+                serde_json::to_value(&binding.client_canonicalizers)
+                    .expect("CanonicalizerInfo serializes"),
+            );
         }
         let session_payload_json = session_payload.to_string();
         let session_canonical = canonicalize_json(&session_payload_json).map_err(|e| {
@@ -1495,89 +1505,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         );
 
         Ok(signed_event)
-    }
-
-    /// TCK-00348 BLOCKER 1: Persist contract binding metadata to `SQLite`.
-    ///
-    /// Overrides the default no-op to durably persist `SessionContractBinding`
-    /// alongside the `SessionStarted` event. This ensures audit trail of
-    /// which contract hash was active when each session was admitted.
-    fn emit_contract_binding_recorded(
-        &self,
-        session_id: &str,
-        binding: &crate::hsi_contract::SessionContractBinding,
-        timestamp_ns: u64,
-    ) -> Result<(), LedgerEventError> {
-        const DOMAIN_PREFIX: &[u8] = b"apm2.event.contract_binding_recorded:";
-
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-
-        let payload = serde_json::json!({
-            "event_type": "contract_binding_recorded",
-            "session_id": session_id,
-            "cli_contract_hash": binding.cli_contract_hash,
-            "server_contract_hash": binding.server_contract_hash,
-            "mismatch_waived": binding.mismatch_waived,
-            "risk_tier": binding.risk_tier,
-            "client_canonicalizers": binding.client_canonicalizers,
-            "timestamp_ns": timestamp_ns,
-        });
-
-        let payload_json = payload.to_string();
-        let canonical_payload =
-            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("JCS canonicalization failed: {e}"),
-            })?;
-        let payload_bytes = canonical_payload.as_bytes().to_vec();
-
-        let mut canonical_bytes = Vec::with_capacity(DOMAIN_PREFIX.len() + payload_bytes.len());
-        canonical_bytes.extend_from_slice(DOMAIN_PREFIX);
-        canonical_bytes.extend_from_slice(&payload_bytes);
-
-        let signature = self.signing_key.sign(&canonical_bytes);
-
-        let signed_event = SignedLedgerEvent {
-            event_id: event_id.clone(),
-            event_type: "contract_binding_recorded".to_string(),
-            work_id: session_id.to_string(),
-            actor_id: "daemon".to_string(),
-            payload: payload_bytes.clone(),
-            signature: signature.to_bytes().to_vec(),
-            timestamp_ns,
-        };
-
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| LedgerEventError::PersistenceFailed {
-                message: "connection lock poisoned".to_string(),
-            })?;
-
-        conn.execute(
-            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                signed_event.event_id,
-                signed_event.event_type,
-                signed_event.work_id,
-                signed_event.actor_id,
-                signed_event.payload,
-                signed_event.signature,
-                signed_event.timestamp_ns
-            ],
-        ).map_err(|e| LedgerEventError::PersistenceFailed {
-            message: format!("sqlite insert failed: {e}"),
-        })?;
-
-        info!(
-            event_id = %event_id,
-            session_id = %session_id,
-            mismatch_waived = %binding.mismatch_waived,
-            risk_tier = %binding.risk_tier,
-            "Persisted ContractBindingRecorded event"
-        );
-
-        Ok(())
     }
 }
 
@@ -2203,13 +2130,13 @@ mod tests {
     }
 
     // ====================================================================
-    // TCK-00348: Contract binding persistence tests
+    // TCK-00348: Contract binding canonicalizer metadata tests
     // ====================================================================
 
-    /// TCK-00348 BLOCKER 1: `emit_contract_binding_recorded` persists to
-    /// `SQLite` and can be retrieved via `get_events_by_work_id`.
+    /// TCK-00348: `emit_session_started` includes canonicalizer metadata
+    /// in the persisted payload when a contract binding is provided.
     #[test]
-    fn emit_contract_binding_recorded_sqlite() {
+    fn emit_session_started_includes_canonicalizer_metadata() {
         use crate::hsi_contract::RiskTier;
         use crate::hsi_contract::handshake_binding::{CanonicalizerInfo, SessionContractBinding};
 
@@ -2226,28 +2153,99 @@ mod tests {
             risk_tier: RiskTier::Tier1,
         };
 
-        let result =
-            emitter.emit_contract_binding_recorded("SESS-BINDING-001", &binding, 1_000_000_000);
-        assert!(
-            result.is_ok(),
-            "emit_contract_binding_recorded should succeed"
+        let result = emitter.emit_session_started(
+            "SESS-CANON-001",
+            "W-CANON-001",
+            "L-001",
+            "uid:1000",
+            1_000_000_000,
+            Some(&binding),
         );
+        assert!(result.is_ok(), "emit_session_started should succeed");
 
-        // Verify the event was persisted (session_id is used as work_id)
-        let events = emitter.get_events_by_work_id("SESS-BINDING-001");
-        assert_eq!(
-            events.len(),
-            1,
-            "Expected 1 contract_binding_recorded event"
-        );
-        assert_eq!(events[0].event_type, "contract_binding_recorded");
-        assert_eq!(events[0].actor_id, "daemon");
+        let signed_event = result.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&signed_event.payload).unwrap();
 
-        // Verify payload contains binding data
-        let payload: serde_json::Value = serde_json::from_slice(&events[0].payload).unwrap();
+        // Verify contract binding fields present
         assert_eq!(payload["cli_contract_hash"], "blake3:client_abc");
         assert_eq!(payload["server_contract_hash"], "blake3:server_xyz");
         assert_eq!(payload["mismatch_waived"], true);
-        assert_eq!(payload["session_id"], "SESS-BINDING-001");
+
+        // Verify canonicalizer metadata is present
+        let canonicalizers = payload["client_canonicalizers"]
+            .as_array()
+            .expect("client_canonicalizers should be an array");
+        assert_eq!(canonicalizers.len(), 1, "Expected 1 canonicalizer entry");
+        assert_eq!(canonicalizers[0]["id"], "apm2.canonical.v1");
+        assert_eq!(canonicalizers[0]["version"], 1);
+    }
+
+    /// TCK-00348: `emit_spawn_lifecycle` includes canonicalizer metadata
+    /// in the persisted `SessionStarted` payload.
+    #[test]
+    fn emit_spawn_lifecycle_includes_canonicalizer_metadata() {
+        use crate::hsi_contract::RiskTier;
+        use crate::hsi_contract::handshake_binding::{CanonicalizerInfo, SessionContractBinding};
+
+        let emitter = test_emitter();
+
+        // Set up a claimed work item via emit_claim_lifecycle
+        let claim = WorkClaim {
+            work_id: "W-CANON-002".to_string(),
+            lease_id: "L-002".to_string(),
+            actor_id: "uid:1000".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+        };
+        emitter
+            .emit_claim_lifecycle(&claim, "uid:1000", 1_000_000_000)
+            .unwrap();
+
+        let binding = SessionContractBinding {
+            cli_contract_hash: "blake3:client_def".to_string(),
+            server_contract_hash: "blake3:server_ghi".to_string(),
+            client_canonicalizers: vec![
+                CanonicalizerInfo {
+                    id: "apm2.canonical.v1".to_string(),
+                    version: 1,
+                },
+                CanonicalizerInfo {
+                    id: "apm2.canonical.jcs".to_string(),
+                    version: 2,
+                },
+            ],
+            mismatch_waived: false,
+            risk_tier: RiskTier::Tier2,
+        };
+
+        let result = emitter.emit_spawn_lifecycle(
+            "SESS-CANON-002",
+            "W-CANON-002",
+            "L-002",
+            "uid:1000",
+            2_000_000_000,
+            Some(&binding),
+        );
+        assert!(result.is_ok(), "emit_spawn_lifecycle should succeed");
+
+        let signed_event = result.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&signed_event.payload).unwrap();
+
+        // Verify contract binding fields present
+        assert_eq!(payload["cli_contract_hash"], "blake3:client_def");
+        assert_eq!(payload["server_contract_hash"], "blake3:server_ghi");
+        assert_eq!(payload["mismatch_waived"], false);
+
+        // Verify canonicalizer metadata is present with both entries
+        let canonicalizers = payload["client_canonicalizers"]
+            .as_array()
+            .expect("client_canonicalizers should be an array");
+        assert_eq!(canonicalizers.len(), 2, "Expected 2 canonicalizer entries");
+        assert_eq!(canonicalizers[0]["id"], "apm2.canonical.v1");
+        assert_eq!(canonicalizers[0]["version"], 1);
+        assert_eq!(canonicalizers[1]["id"], "apm2.canonical.jcs");
+        assert_eq!(canonicalizers[1]["version"], 2);
     }
 }
