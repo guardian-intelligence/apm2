@@ -1375,6 +1375,19 @@ fn current_timestamp_ns() -> u64 {
         .unwrap_or(0)
 }
 
+/// Returns the current wall-clock time as seconds since Unix epoch.
+///
+/// Used by the persistent registry to serialize absolute expiry timestamps
+/// (SEC-MAJOR-1).
+fn wall_clock_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 // =============================================================================
 // Persistent Session Registry (TCK-00266)
 // =============================================================================
@@ -1453,16 +1466,41 @@ impl From<PersistableSessionState> for SessionState {
 /// 2).
 ///
 /// This struct pairs a terminated session's state with its termination info
-/// and a TTL (remaining seconds) so that terminated entries survive daemon
-/// restarts.  On reload, the TTL is clamped to [`TERMINATED_SESSION_TTL_SECS`]
-/// to prevent stale entries from lingering indefinitely.
+/// and absolute wall-clock timestamps so that terminated entries survive daemon
+/// restarts without downtime extending the effective TTL.
+///
+/// # SEC-MAJOR-1: Absolute Expiry
+///
+/// We persist the absolute wall-clock expiry timestamp
+/// (`expires_at_epoch_secs`) and the issuance timestamp
+/// (`issued_at_epoch_secs`) rather than a relative remaining-seconds value. On
+/// reload the expiry is enforced strictly against the current wall clock, so
+/// any downtime between persist and reload is correctly accounted for and
+/// expired entries are compacted on startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistableTerminatedEntry {
     /// The session state at time of termination.
     session: PersistableSessionState,
     /// Termination details.
     info: SessionTerminationInfo,
-    /// Remaining TTL in seconds at the time of serialization.
+    /// Wall-clock epoch seconds when this entry was created (for auditing).
+    ///
+    /// Defaults to 0 for backward compatibility with pre-migration state files.
+    #[serde(default)]
+    issued_at_epoch_secs: u64,
+    /// Wall-clock epoch seconds when this entry expires.
+    ///
+    /// On reload, entries whose `expires_at_epoch_secs` is in the past are
+    /// discarded. Defaults to 0 so that legacy state files fall back to the
+    /// `ttl_remaining_secs` field.
+    #[serde(default)]
+    expires_at_epoch_secs: u64,
+    /// Legacy field: remaining TTL in seconds at the time of serialization.
+    ///
+    /// Kept for backward compatibility with state files written before the
+    /// absolute-expiry migration. Ignored when `expires_at_epoch_secs` is
+    /// present and non-zero.
+    #[serde(default)]
     ttl_remaining_secs: u64,
 }
 
@@ -1475,7 +1513,11 @@ struct PersistableTerminatedEntry {
 ///
 /// This file uses [`PersistableSessionState`] which excludes the `lease_id`
 /// bearer token to prevent credential leakage to disk.
+/// SEC-MAJOR-2: `deny_unknown_fields` re-applied so that malformed or
+/// tampered state files are rejected on load rather than silently dropping
+/// unrecognized keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistentStateFile {
     /// Version of the state file format for future compatibility.
     version: u32,
@@ -1624,37 +1666,64 @@ impl PersistentSessionRegistry {
                 });
             }
 
+            // SEC-MAJOR-2: Collect active session IDs for collision detection.
+            let mut active_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+
             // Load sessions into in-memory registry
             // SEC-001: PersistableSessionState converts to SessionState with empty lease_id
             for persistable_session in state_file.sessions {
+                active_ids.insert(persistable_session.session_id.clone());
                 let session = SessionState::from(persistable_session);
                 // Ignore duplicate errors during recovery (shouldn't happen with valid file)
                 let _ = registry.inner.register_session(session);
             }
 
-            // TCK-00385 BLOCKER 2: Reload terminated entries with clamped TTL.
-            // This ensures terminated sessions retain their TERMINATED status
-            // across daemon restarts instead of disappearing (which would make
-            // SessionStatus return "not found" for recently terminated sessions).
+            // TCK-00385 BLOCKER 2: Reload terminated entries.
+            // SEC-MAJOR-1: Use absolute wall-clock expiry timestamps.
+            // Entries whose absolute expiry is in the past are compacted on
+            // startup rather than being loaded.  For backward compatibility
+            // with state files that lack `expires_at_epoch_secs`, we fall
+            // back to the legacy `ttl_remaining_secs` field (clamped).
             if !state_file.terminated.is_empty() {
-                let now = Instant::now();
+                let now_mono = Instant::now();
+                let now_wall = wall_clock_secs();
                 let mut inner_state = registry.inner.state.write().expect("lock poisoned");
                 for persisted_entry in state_file.terminated {
-                    // Clamp TTL to MAX to prevent stale entries from lingering
-                    let ttl = persisted_entry
-                        .ttl_remaining_secs
-                        .min(TERMINATED_SESSION_TTL_SECS);
-                    if ttl == 0 {
-                        continue; // Already expired, skip
+                    let session_id = persisted_entry.session.session_id.clone();
+
+                    // SEC-MAJOR-2: Reject entries that collide with active
+                    // sessions. A session cannot be both active and terminated.
+                    if active_ids.contains(&session_id) {
+                        continue;
                     }
+
+                    // Determine remaining TTL from absolute expiry or legacy field.
+                    let remaining_secs = if persisted_entry.expires_at_epoch_secs > 0 {
+                        // Absolute expiry: compute remaining against wall clock.
+                        persisted_entry
+                            .expires_at_epoch_secs
+                            .saturating_sub(now_wall)
+                    } else {
+                        // Legacy fallback: use relative TTL, clamped.
+                        persisted_entry
+                            .ttl_remaining_secs
+                            .min(TERMINATED_SESSION_TTL_SECS)
+                    };
+
+                    if remaining_secs == 0 {
+                        continue; // Expired, compact on startup
+                    }
+
+                    // Clamp to maximum TTL to prevent stale entries from lingering
+                    let clamped = remaining_secs.min(TERMINATED_SESSION_TTL_SECS);
+
                     let entry = TerminatedEntry {
                         info: persisted_entry.info,
                         session: SessionState::from(persisted_entry.session),
-                        expires_at: now + Duration::from_secs(ttl),
+                        expires_at: now_mono + Duration::from_secs(clamped),
                     };
-                    inner_state
-                        .terminated
-                        .insert(entry.session.session_id.clone(), entry);
+                    inner_state.terminated.insert(session_id, entry);
                 }
             }
         }
@@ -1682,17 +1751,29 @@ impl PersistentSessionRegistry {
         let state = self.inner.state.read().expect("lock poisoned");
 
         // SEC-001: Convert to PersistableSessionState to exclude lease_id
-        // TCK-00385 BLOCKER 2: Also serialize terminated entries with remaining TTL
-        let now = Instant::now();
+        // TCK-00385 BLOCKER 2: Also serialize terminated entries
+        // SEC-MAJOR-1: Use absolute wall-clock expiry timestamps so downtime
+        // does not silently extend terminated-entry lifetimes.
+        let now_mono = Instant::now();
+        let now_wall = wall_clock_secs();
         let terminated: Vec<PersistableTerminatedEntry> = state
             .terminated
             .iter()
-            .filter(|(_, entry)| entry.expires_at > now)
+            .filter(|(_, entry)| entry.expires_at > now_mono)
             .map(|(_, entry)| {
-                let remaining = entry.expires_at.duration_since(now).as_secs();
+                // Convert monotonic remaining duration into an absolute
+                // wall-clock expiry.
+                let remaining = entry.expires_at.duration_since(now_mono).as_secs();
+                let expires_at_epoch = now_wall.saturating_add(remaining);
+                // issued_at = expires_at - TTL (approximate; the original
+                // issuance timestamp is not stored in TerminatedEntry, but
+                // we can derive it from the TTL constant).
+                let issued_at_epoch = expires_at_epoch.saturating_sub(TERMINATED_SESSION_TTL_SECS);
                 PersistableTerminatedEntry {
                     session: PersistableSessionState::from(&entry.session),
                     info: entry.info.clone(),
+                    issued_at_epoch_secs: issued_at_epoch,
+                    expires_at_epoch_secs: expires_at_epoch,
                     ttl_remaining_secs: remaining,
                 }
             })
@@ -1809,17 +1890,35 @@ impl SessionRegistry for PersistentSessionRegistry {
         session_id: &str,
         info: SessionTerminationInfo,
     ) -> Result<bool, SessionRegistryError> {
+        // SEC-BLOCKER: Idempotent termination under partial failure.
+        //
+        // We move the session from active to terminated in memory, then
+        // attempt to persist. If persistence fails we rollback the in-memory
+        // state (move the session back to active) so that on restart we do
+        // not have a stale ACTIVE entry on disk while in-memory state says
+        // TERMINATED.  The caller can retry the same session_id and the
+        // operation remains idempotent.
         let found = self.inner.mark_terminated(session_id, info)?;
 
-        // BLOCKER 2 / MAJOR fix: Persist termination state to disk so that a
-        // crash after mark_terminated() does not resurrect the session as
-        // active.  Fail-closed: if persistence fails, propagate the error to
-        // the caller instead of silently returning success.
         if found {
-            self.persist()
-                .map_err(|e| SessionRegistryError::RegistrationFailed {
-                    message: format!("Failed to persist termination state: {e}"),
-                })?;
+            if let Err(persist_err) = self.persist() {
+                // Rollback: put the session back in the active set.
+                // We retrieve it from the terminated map and re-register.
+                let mut state = self.inner.state.write().expect("lock poisoned");
+                if let Some(entry) = state.terminated.remove(session_id) {
+                    let session = entry.session;
+                    let sid = session.session_id.clone();
+                    let handle = session.ephemeral_handle.clone();
+                    state.queue.push_back(sid.clone());
+                    state.by_handle.insert(handle, sid.clone());
+                    state.by_id.insert(sid, session);
+                }
+                drop(state);
+
+                return Err(SessionRegistryError::RegistrationFailed {
+                    message: format!("Failed to persist termination state: {persist_err}"),
+                });
+            }
         }
 
         Ok(found)
@@ -3071,7 +3170,8 @@ mod tck_00385_security_fixes {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("expired.json");
 
-        // Manually write a state file with a terminated entry that has TTL = 0
+        // Manually write a state file with a terminated entry that has already
+        // expired (absolute expiry in the past).
         let state_file = PersistentStateFile {
             version: 1,
             sessions: vec![],
@@ -3086,6 +3186,9 @@ mod tck_00385_security_fixes {
                     episode_id: None,
                 },
                 info: SessionTerminationInfo::new("expired-1", "timeout", "FAILURE"),
+                issued_at_epoch_secs: 1_000_000,
+                // Expiry in the distant past
+                expires_at_epoch_secs: 1_000_001,
                 ttl_remaining_secs: 0,
             }],
         };
@@ -3138,6 +3241,275 @@ mod tck_00385_security_fixes {
         assert!(
             state.terminated.is_empty(),
             "Expired terminated entry should be cleaned up during register_session"
+        );
+    }
+
+    // =========================================================================
+    // SEC-BLOCKER: Idempotent mark_terminated with rollback on persist failure
+    // =========================================================================
+
+    /// SEC-BLOCKER regression: On persist failure the in-memory state is rolled
+    /// back so the session stays ACTIVE. On retry with recovered storage the
+    /// same session can be terminated successfully, and after a simulated
+    /// restart no stale ACTIVE entry is resurrected.
+    #[test]
+    fn mark_terminated_rollback_on_persist_failure_then_retry() {
+        // Phase 1: Use an impossible path so persistence fails.
+        let bad_path = "/proc/nonexistent_dir/impossible_file.json";
+        let registry = PersistentSessionRegistry::new(bad_path);
+
+        // Seed a session directly into in-memory state (persistence will fail).
+        let session = make_session("rollback-1", "handle-rb-1");
+        registry
+            .inner
+            .register_session(session)
+            .expect("in-memory register should succeed");
+
+        // Attempt to terminate -- persist will fail.
+        let info = SessionTerminationInfo::new("rollback-1", "crash", "FAILURE");
+        let err = registry.mark_terminated("rollback-1", info);
+        assert!(
+            err.is_err(),
+            "mark_terminated should fail when persist fails"
+        );
+
+        // The session MUST still be in the ACTIVE set (rollback).
+        assert!(
+            registry.get_session("rollback-1").is_some(),
+            "Session must be rolled back to ACTIVE on persist failure"
+        );
+
+        // The session MUST NOT be in the terminated set.
+        assert!(
+            registry.get_termination_info("rollback-1").is_none(),
+            "Session must not appear in terminated set after rollback"
+        );
+
+        // Phase 2: Switch to a writable path and retry the same session.
+        let dir = tempfile::tempdir().unwrap();
+        let good_path = dir.path().join("recovered.json");
+        let registry2 = PersistentSessionRegistry::new(&good_path);
+        registry2
+            .inner
+            .register_session(make_session("rollback-1", "handle-rb-1"))
+            .expect("in-memory register should succeed");
+
+        let info2 = SessionTerminationInfo::new("rollback-1", "crash", "FAILURE");
+        assert!(
+            registry2
+                .mark_terminated("rollback-1", info2)
+                .expect("should succeed with working storage"),
+            "mark_terminated should succeed on retry"
+        );
+
+        // Phase 3: Simulate restart -- no stale ACTIVE resurrection.
+        let recovered = PersistentSessionRegistry::load_from_file(&good_path).expect("should load");
+        assert!(
+            recovered.get_session("rollback-1").is_none(),
+            "Terminated session must NOT resurrect as ACTIVE after restart"
+        );
+        assert!(
+            recovered.get_termination_info("rollback-1").is_some(),
+            "Termination info must survive restart"
+        );
+    }
+
+    // =========================================================================
+    // SEC-MAJOR-1: Absolute TTL expiry -- downtime does not extend lifetime
+    // =========================================================================
+
+    /// SEC-MAJOR-1: Absolute expiry is enforced on load. If the wall-clock
+    /// expiry is in the past, the entry is compacted on startup even if the
+    /// legacy `ttl_remaining_secs` is non-zero.
+    #[test]
+    fn absolute_expiry_compacted_on_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abs_expiry.json");
+
+        let past_epoch = wall_clock_secs().saturating_sub(100);
+        let state_file = PersistentStateFile {
+            version: 1,
+            sessions: vec![],
+            terminated: vec![PersistableTerminatedEntry {
+                session: PersistableSessionState {
+                    session_id: "abs-exp-1".to_string(),
+                    work_id: "work-abs-exp-1".to_string(),
+                    role: 1,
+                    ephemeral_handle: "h-ae".to_string(),
+                    policy_resolved_ref: String::new(),
+                    capability_manifest_hash: vec![],
+                    episode_id: None,
+                },
+                info: SessionTerminationInfo::new("abs-exp-1", "normal", "SUCCESS"),
+                issued_at_epoch_secs: past_epoch.saturating_sub(300),
+                expires_at_epoch_secs: past_epoch,
+                // Legacy field says 300 -- should be ignored because
+                // absolute expiry takes precedence.
+                ttl_remaining_secs: 300,
+            }],
+        };
+        let json = serde_json::to_string_pretty(&state_file).unwrap();
+        std::fs::write(&path, json).unwrap();
+
+        let recovered = PersistentSessionRegistry::load_from_file(&path).expect("should load");
+        assert!(
+            recovered.get_termination_info("abs-exp-1").is_none(),
+            "Entry with past absolute expiry must be compacted on startup"
+        );
+    }
+
+    /// SEC-MAJOR-1: Entries with valid absolute expiry are loaded correctly.
+    #[test]
+    fn absolute_expiry_valid_entry_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abs_valid.json");
+
+        let future_epoch = wall_clock_secs() + 200;
+        let state_file = PersistentStateFile {
+            version: 1,
+            sessions: vec![],
+            terminated: vec![PersistableTerminatedEntry {
+                session: PersistableSessionState {
+                    session_id: "abs-valid-1".to_string(),
+                    work_id: "work-abs-valid-1".to_string(),
+                    role: 1,
+                    ephemeral_handle: "h-av".to_string(),
+                    policy_resolved_ref: String::new(),
+                    capability_manifest_hash: vec![],
+                    episode_id: None,
+                },
+                info: SessionTerminationInfo::new("abs-valid-1", "normal", "SUCCESS"),
+                issued_at_epoch_secs: future_epoch.saturating_sub(300),
+                expires_at_epoch_secs: future_epoch,
+                ttl_remaining_secs: 200,
+            }],
+        };
+        let json = serde_json::to_string_pretty(&state_file).unwrap();
+        std::fs::write(&path, json).unwrap();
+
+        let recovered = PersistentSessionRegistry::load_from_file(&path).expect("should load");
+        assert!(
+            recovered.get_termination_info("abs-valid-1").is_some(),
+            "Entry with future absolute expiry must be loaded"
+        );
+    }
+
+    /// SEC-MAJOR-1: Legacy state files (no `expires_at_epoch_secs`) fall back
+    /// to `ttl_remaining_secs`.
+    #[test]
+    fn legacy_ttl_fallback_when_no_absolute_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.json");
+
+        // Manually construct JSON without expires_at_epoch_secs and
+        // issued_at_epoch_secs, simulating a pre-migration state file.
+        let json = r#"{
+            "version": 1,
+            "sessions": [],
+            "terminated": [{
+                "session": {
+                    "session_id": "legacy-1",
+                    "work_id": "work-legacy-1",
+                    "role": 1,
+                    "ephemeral_handle": "h-legacy",
+                    "policy_resolved_ref": "",
+                    "capability_manifest_hash": [],
+                    "episode_id": null
+                },
+                "info": {
+                    "session_id": "legacy-1",
+                    "rationale_code": "normal",
+                    "exit_classification": "SUCCESS",
+                    "exit_code": null,
+                    "terminated_at_ns": 0,
+                    "actual_tokens_consumed": null
+                },
+                "ttl_remaining_secs": 200
+            }]
+        }"#;
+        std::fs::write(&path, json).unwrap();
+
+        let recovered = PersistentSessionRegistry::load_from_file(&path).expect("should load");
+        assert!(
+            recovered.get_termination_info("legacy-1").is_some(),
+            "Legacy entry with ttl_remaining_secs > 0 should be loaded via fallback"
+        );
+    }
+
+    // =========================================================================
+    // SEC-MAJOR-2: deny_unknown_fields and collision detection
+    // =========================================================================
+
+    /// SEC-MAJOR-2: State files with unknown fields are rejected.
+    #[test]
+    fn deny_unknown_fields_rejects_extra_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unknown_field.json");
+
+        let json = r#"{
+            "version": 1,
+            "sessions": [],
+            "terminated": [],
+            "evil_extra_field": true
+        }"#;
+        std::fs::write(&path, json).unwrap();
+
+        let result = PersistentSessionRegistry::load_from_file(&path);
+        assert!(
+            result.is_err(),
+            "State file with unknown fields must be rejected"
+        );
+    }
+
+    /// SEC-MAJOR-2: `session_id` collision between active and terminated sets
+    /// is resolved by dropping the terminated entry.
+    #[test]
+    fn collision_detection_active_wins_over_terminated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collision.json");
+
+        let future_epoch = wall_clock_secs() + 200;
+        let state_file = PersistentStateFile {
+            version: 1,
+            sessions: vec![PersistableSessionState {
+                session_id: "collide-1".to_string(),
+                work_id: "work-collide-1".to_string(),
+                role: 1,
+                ephemeral_handle: "h-c1".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: None,
+            }],
+            terminated: vec![PersistableTerminatedEntry {
+                session: PersistableSessionState {
+                    session_id: "collide-1".to_string(),
+                    work_id: "work-collide-1-term".to_string(),
+                    role: 1,
+                    ephemeral_handle: "h-c1-term".to_string(),
+                    policy_resolved_ref: String::new(),
+                    capability_manifest_hash: vec![],
+                    episode_id: None,
+                },
+                info: SessionTerminationInfo::new("collide-1", "crash", "FAILURE"),
+                issued_at_epoch_secs: future_epoch.saturating_sub(300),
+                expires_at_epoch_secs: future_epoch,
+                ttl_remaining_secs: 200,
+            }],
+        };
+        let json = serde_json::to_string_pretty(&state_file).unwrap();
+        std::fs::write(&path, json).unwrap();
+
+        let recovered = PersistentSessionRegistry::load_from_file(&path).expect("should load");
+
+        // Active entry wins.
+        assert!(
+            recovered.get_session("collide-1").is_some(),
+            "Active session should be preserved"
+        );
+        // Terminated entry with colliding ID is dropped.
+        assert!(
+            recovered.get_termination_info("collide-1").is_none(),
+            "Terminated entry colliding with active must be dropped"
         );
     }
 }
