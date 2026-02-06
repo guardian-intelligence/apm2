@@ -755,4 +755,122 @@ mod tests {
         let err = "unknown".parse::<HolonPurpose>().unwrap_err();
         assert!(matches!(err, KeyIdError::InvalidDescriptor { .. }));
     }
+
+    // =========================================================================
+    // CAS round-trip tests (REQ-0008 AC#3)
+    // =========================================================================
+
+    #[test]
+    fn holon_genesis_canonical_bytes_round_trip_in_durable_cas() {
+        use tempfile::TempDir;
+
+        use crate::cas::{DurableCas, DurableCasConfig};
+
+        let temp_dir = TempDir::new().unwrap();
+        let cas_path = temp_dir.path().join("cas");
+        let cas = DurableCas::new(DurableCasConfig::new(&cas_path)).unwrap();
+
+        let genesis = make_holon_genesis();
+        let canonical = genesis.canonical_bytes();
+
+        let first_store = cas.store(&canonical).unwrap();
+        assert!(first_store.is_new, "first store must persist new content");
+        assert_eq!(first_store.size, canonical.len());
+        assert!(cas.exists(&first_store.hash));
+
+        let retrieved = cas.retrieve(&first_store.hash).unwrap();
+        assert_eq!(retrieved, canonical);
+
+        let second_store = cas.store(&canonical).unwrap();
+        assert!(!second_store.is_new, "second store must deduplicate");
+        assert_eq!(second_store.hash, first_store.hash);
+    }
+
+    /// Store `HolonGenesisV1` canonical bytes into CAS and retrieve by content
+    /// hash, verifying the hash/content round-trip invariant.
+    #[test]
+    fn holon_genesis_cas_round_trip_via_memory_cas() {
+        use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+
+        let cas = MemoryCas::new();
+        let genesis = make_holon_genesis();
+        let canonical = genesis.canonical_bytes();
+
+        // Store canonical bytes into CAS.
+        let store_result = cas.store(&canonical).unwrap();
+        assert!(store_result.is_new, "first store must be new");
+        assert_eq!(store_result.size, canonical.len());
+
+        // Retrieve by content hash and verify content equality.
+        let retrieved = cas.retrieve(&store_result.hash).unwrap();
+        assert_eq!(
+            retrieved, canonical,
+            "retrieved bytes must equal original canonical bytes"
+        );
+
+        // Re-hash retrieved content and compare to stored hash.
+        let rehash = apm2_core::crypto::EventHasher::hash_content(&retrieved);
+        assert_eq!(
+            rehash, store_result.hash,
+            "re-hashing retrieved content must produce the same hash"
+        );
+    }
+
+    /// Verify that storing the same genesis canonical bytes is idempotent
+    /// (deduplication) and different genesis artifacts produce different
+    /// hashes.
+    #[test]
+    fn holon_genesis_cas_deduplication_and_collision_resistance() {
+        use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+
+        let cas = MemoryCas::new();
+        let genesis = make_holon_genesis();
+        let canonical = genesis.canonical_bytes();
+
+        let r1 = cas.store(&canonical).unwrap();
+        let r2 = cas.store(&canonical).unwrap();
+        assert!(!r2.is_new, "duplicate store must be deduplicated");
+        assert_eq!(r1.hash, r2.hash);
+
+        // Different genesis (different key bytes) must yield a different CAS hash.
+        let key_bytes_alt = make_public_key_bytes(0xEE);
+        let key_id_alt = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &key_bytes_alt);
+        let genesis2 = HolonGenesisV1::new(
+            make_cell_id(0x11, "cell.example.internal"),
+            key_id_alt,
+            key_bytes_alt,
+            Some(HolonPurpose::Relay),
+            None,
+        )
+        .unwrap();
+        let r3 = cas.store(&genesis2.canonical_bytes()).unwrap();
+        assert_ne!(
+            r1.hash, r3.hash,
+            "different genesis must produce different CAS hashes"
+        );
+    }
+
+    /// Verify that a `HolonIdV1` derived from genesis and the genesis canonical
+    /// bytes can both be stored and retrieved independently in CAS.
+    #[test]
+    fn holon_id_and_genesis_cas_independent_storage() {
+        use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+
+        let cas = MemoryCas::new();
+        let genesis = make_holon_genesis();
+        let holon_id = HolonIdV1::from_genesis(&genesis);
+
+        let genesis_result = cas.store(&genesis.canonical_bytes()).unwrap();
+        let id_result = cas.store(&holon_id.to_binary()).unwrap();
+
+        // Both must be retrievable independently.
+        let genesis_bytes = cas.retrieve(&genesis_result.hash).unwrap();
+        let id_bytes = cas.retrieve(&id_result.hash).unwrap();
+
+        assert_eq!(genesis_bytes, genesis.canonical_bytes());
+        assert_eq!(id_bytes, holon_id.to_binary().as_slice());
+
+        // Hashes must differ (genesis artifact != holon id binary).
+        assert_ne!(genesis_result.hash, id_result.hash);
+    }
 }

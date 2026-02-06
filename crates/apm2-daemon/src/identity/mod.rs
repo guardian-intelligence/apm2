@@ -101,6 +101,8 @@
 //! - RFC-0020 section 1.7.5b: ABNF for canonical text forms
 //! - REQ-0007: Canonical key identifier formats
 //! - EVID-0007: Canonical key identifier conformance evidence
+//! - REQ-0008: Genesis artifacts are hash-addressed in CAS
+//! - EVID-0008: Genesis artifact CAS conformance evidence
 //! - EVID-0303: Rollout phase S0.75 evidence
 
 mod cell_id;
