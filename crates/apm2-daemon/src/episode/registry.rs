@@ -1875,6 +1875,20 @@ impl PersistentSessionRegistry {
         let state = self.inner.state.read().expect("lock poisoned");
         state.by_id.values().cloned().collect()
     }
+
+    /// Clears all sessions from the in-memory registry and persists the empty
+    /// state to disk (TCK-00387).
+    ///
+    /// This makes crash recovery idempotent: after clearing, a second startup
+    /// will load an empty state file and find no sessions to recover.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PersistentRegistryError` if persisting the cleared state fails.
+    pub fn clear_and_persist(&self) -> Result<(), PersistentRegistryError> {
+        self.inner.clear();
+        self.persist()
+    }
 }
 
 impl SessionRegistry for PersistentSessionRegistry {
@@ -1951,6 +1965,25 @@ impl SessionRegistry for PersistentSessionRegistry {
         session_id: &str,
     ) -> Option<(SessionState, SessionTerminationInfo)> {
         SessionRegistry::get_terminated_session(&self.inner, session_id)
+    }
+
+    /// Returns all sessions for crash recovery (TCK-00387).
+    ///
+    /// Unlike the default (empty) implementation, the persistent registry
+    /// returns sessions that were loaded from the state file.
+    fn all_sessions_for_recovery(&self) -> Vec<SessionState> {
+        self.all_sessions()
+    }
+
+    /// Clears all sessions and persists the empty state (TCK-00387).
+    ///
+    /// This makes crash recovery idempotent: after clearing, a second
+    /// startup will see no sessions to recover.
+    fn clear_all_sessions(&self) -> Result<(), SessionRegistryError> {
+        self.clear_and_persist()
+            .map_err(|e| SessionRegistryError::RegistrationFailed {
+                message: format!("Failed to clear and persist: {e}"),
+            })
     }
 }
 

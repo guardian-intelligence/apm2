@@ -845,10 +845,28 @@ async fn async_main(args: Args) -> Result<()> {
     // Write PID file
     write_pid_file(&daemon_config.pid_path)?;
 
-    // TCK-00267: Crash recovery on startup
-    // Before accepting new connections, recover any sessions from persistent state
-    // and send LEASE_REVOKED signals to invalidate their leases.
-    if let Err(e) = perform_crash_recovery(&state).await {
+    // Initialize persistent ledger if configured (TCK-00289)
+    // TCK-00387: Moved BEFORE crash recovery so that LEASE_REVOKED events can
+    // be emitted to the ledger during recovery.
+    let sqlite_conn = if let Some(path) = &daemon_config.ledger_db_path {
+        info!("Opening ledger database at {:?}", path);
+        let conn = Connection::open(path).context("failed to open ledger database")?;
+
+        // Initialize schemas
+        SqliteLedgerEventEmitter::init_schema(&conn)
+            .context("failed to init ledger events schema")?;
+        SqliteWorkRegistry::init_schema(&conn).context("failed to init work claims schema")?;
+
+        Some(Arc::new(Mutex::new(conn)))
+    } else {
+        None
+    };
+
+    // TCK-00387: Crash recovery on startup
+    // Before accepting new connections, recover any sessions from persistent state,
+    // emit LEASE_REVOKED events to the ledger, clean up stale work claims, and
+    // clear the persistent session registry.
+    if let Err(e) = perform_crash_recovery(&state, sqlite_conn.as_ref()).await {
         warn!("Crash recovery failed: {e}");
         // Continue startup even if recovery fails - the daemon should still be
         // usable
@@ -878,21 +896,6 @@ async fn async_main(args: Args) -> Result<()> {
         let inner = state.read().await;
         info!("Managing {} processes", inner.supervisor.process_count());
     }
-
-    // Initialize persistent ledger if configured (TCK-00289)
-    let sqlite_conn = if let Some(path) = &daemon_config.ledger_db_path {
-        info!("Opening ledger database at {:?}", path);
-        let conn = Connection::open(path).context("failed to open ledger database")?;
-
-        // Initialize schemas
-        SqliteLedgerEventEmitter::init_schema(&conn)
-            .context("failed to init ledger events schema")?;
-        SqliteWorkRegistry::init_schema(&conn).context("failed to init work claims schema")?;
-
-        Some(Arc::new(Mutex::new(conn)))
-    } else {
-        None
-    };
 
     // TCK-00287: Create shared dispatcher state at daemon startup.
     // Per security review:
@@ -1282,31 +1285,40 @@ async fn async_main(args: Args) -> Result<()> {
     Ok(())
 }
 
-/// Perform crash recovery on daemon startup (TCK-00267).
+/// Perform crash recovery on daemon startup (TCK-00387).
 ///
 /// This function:
-/// 1. Loads any persistent session state from the previous daemon instance
-/// 2. Sends `LEASE_REVOKED` signals to all recovered sessions
-/// 3. Cleans up orphaned processes
-/// 4. Ensures recovery completes within 5 seconds
+/// 1. Loads persistent session state from the `DaemonStateHandle`'s session
+///    registry (populated from the state file during
+///    `new_with_persistent_sessions`)
+/// 2. For each recovered session, emits a `LEASE_REVOKED` event to the ledger
+/// 3. For each recovered session with active work claims, deletes the claim so
+///    the work becomes re-claimable
+/// 4. Cleans up stale socket/PID state from previous daemon instance
+/// 5. Clears the persistent session registry after successful recovery
+/// 6. Logs recovery actions for operational visibility
 ///
 /// # Arguments
 ///
-/// * `state` - The daemon shared state (currently unused, but will be used for
-///   session registry access when persistence is implemented)
+/// * `state` - The daemon shared state containing the session registry
+/// * `sqlite_conn` - Optional `SQLite` connection for emitting ledger events.
+///   If `None`, lease revocation events will be logged but not persisted.
 ///
 /// # Returns
 ///
 /// `Ok(())` if recovery succeeded or was not needed,
 /// `Err(_)` if recovery failed (daemon should still start).
 #[allow(
-    clippy::unused_async,           // Will be async when session persistence is implemented
+    clippy::unused_async,           // Called from async context, kept async for future use
     clippy::cast_possible_truncation // Recovery timeout is always < 5s, well within u32
 )]
-async fn perform_crash_recovery(_state: &SharedState) -> Result<()> {
+async fn perform_crash_recovery(
+    state: &SharedState,
+    sqlite_conn: Option<&Arc<Mutex<Connection>>>,
+) -> Result<()> {
     use std::time::Instant;
 
-    use apm2_daemon::episode::registry::{DEFAULT_RECOVERY_TIMEOUT_MS, RecoveryManager};
+    use apm2_daemon::episode::registry::DEFAULT_RECOVERY_TIMEOUT_MS;
 
     let start = Instant::now();
     info!(
@@ -1314,39 +1326,69 @@ async fn perform_crash_recovery(_state: &SharedState) -> Result<()> {
         "Starting crash recovery"
     );
 
-    // Create the recovery manager with default timeout (5 seconds)
-    let recovery_manager = RecoveryManager::new();
+    let timeout = Duration::from_millis(u64::from(DEFAULT_RECOVERY_TIMEOUT_MS));
 
-    // TODO: When session persistence is implemented, this will:
-    // 1. Load persistent session state from disk/database
-    // 2. Populate a session registry with recovered sessions
-    // 3. Call recovery_manager.recover_sessions() with the registry
-    //
-    // For now, with in-memory only sessions, there's nothing to recover
-    // after a daemon restart - all sessions are lost when the daemon exits.
-    //
-    // The recovery manager infrastructure is in place for future use when
-    // persistent session state is implemented.
+    // TCK-00387: Load persisted sessions from the DaemonStateHandle's session
+    // registry. The PersistentSessionRegistry was populated from the state file
+    // during `DaemonStateHandle::new_with_persistent_sessions`.
+    let session_registry = state.session_registry();
+    let sessions = apm2_daemon::episode::crash_recovery::collect_sessions(session_registry);
 
-    // If there were sessions to recover, we would do:
-    // let result = recovery_manager.recover_sessions(&session_registry, |signal| {
-    //     // Send the LEASE_REVOKED signal to the session
-    //     // This would typically be done via IPC or a notification mechanism
-    //     Ok(())
-    // })?;
-    //
-    // info!(
-    //     sessions_recovered = result.sessions_recovered,
-    //     lease_revoked_signals_sent = result.lease_revoked_signals_sent,
-    //     orphaned_processes_cleaned = result.orphaned_processes_cleaned,
-    //     recovery_time_ms = result.recovery_time_ms,
-    //     "Crash recovery completed"
-    // );
+    if sessions.is_empty() {
+        let elapsed_ms = start.elapsed().as_millis() as u32;
+        info!(
+            elapsed_ms = elapsed_ms,
+            sessions_recovered = 0,
+            "Crash recovery completed (no persistent sessions to recover)"
+        );
+        return Ok(());
+    }
+
+    info!(
+        stale_sessions = sessions.len(),
+        "Found stale sessions from previous daemon instance"
+    );
+
+    // TCK-00387: Create a ledger event emitter for emitting LEASE_REVOKED events.
+    // If no SQLite connection is available, we log but do not persist events.
+    let emitter = sqlite_conn.map(|conn| {
+        use rand::rngs::OsRng;
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key)
+    });
+
+    // TCK-00387: Perform crash recovery -- emit LEASE_REVOKED events and clean
+    // up work claims for each stale session.
+    let result = apm2_daemon::episode::crash_recovery::recover_stale_sessions(
+        &sessions,
+        emitter.as_ref(),
+        sqlite_conn,
+        timeout,
+    );
+
+    match result {
+        Ok(outcome) => {
+            info!(
+                sessions_recovered = outcome.sessions_recovered,
+                lease_revoked_events_emitted = outcome.lease_revoked_events_emitted,
+                work_claims_released = outcome.work_claims_released,
+                recovery_time_ms = outcome.recovery_time_ms,
+                "Crash recovery completed"
+            );
+        },
+        Err(e) => {
+            warn!("Crash recovery encountered errors: {e}");
+            // Continue -- partial recovery is better than none
+        },
+    }
+
+    // TCK-00387: Clear the persistent session registry after recovery.
+    // This is idempotent -- a second startup with the same state file will not
+    // double-emit events because the sessions are cleared.
+    apm2_daemon::episode::crash_recovery::clear_session_registry(session_registry);
 
     let elapsed_ms = start.elapsed().as_millis() as u32;
-
-    // Verify we completed within the timeout
-    let timeout_ms = recovery_manager.timeout().as_millis() as u32;
+    let timeout_ms = timeout.as_millis() as u32;
     if elapsed_ms > timeout_ms {
         warn!(
             elapsed_ms = elapsed_ms,
@@ -1355,12 +1397,6 @@ async fn perform_crash_recovery(_state: &SharedState) -> Result<()> {
         );
         anyhow::bail!("crash recovery timeout exceeded");
     }
-
-    info!(
-        elapsed_ms = elapsed_ms,
-        sessions_recovered = 0,
-        "Crash recovery completed (no persistent sessions to recover)"
-    );
 
     Ok(())
 }

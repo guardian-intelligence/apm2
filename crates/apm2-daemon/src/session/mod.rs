@@ -183,6 +183,28 @@ pub trait SessionRegistry: Send + Sync {
         &self,
         session_id: &str,
     ) -> Option<(SessionState, SessionTerminationInfo)>;
+
+    /// Returns all active sessions for crash recovery (TCK-00387).
+    ///
+    /// Default implementation returns an empty vec (suitable for in-memory
+    /// registries that don't persist across restarts).
+    fn all_sessions_for_recovery(&self) -> Vec<SessionState> {
+        Vec::new()
+    }
+
+    /// Clears all sessions and persists the empty state (TCK-00387).
+    ///
+    /// Used after crash recovery to make recovery idempotent. A second
+    /// startup with the same state file will see no sessions to recover.
+    ///
+    /// Default implementation is a no-op (suitable for in-memory registries).
+    ///
+    /// # Errors
+    ///
+    /// Returns `SessionRegistryError` if persistence fails.
+    fn clear_all_sessions(&self) -> Result<(), SessionRegistryError> {
+        Ok(())
+    }
 }
 
 /// Error type for session registry operations.
