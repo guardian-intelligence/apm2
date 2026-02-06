@@ -4626,7 +4626,8 @@ mod tests {
                 .with_cas(cas)
         }
 
-        /// TCK-00395 Security BLOCKER 1: `EmitEvent` is denied after `EndSession`.
+        /// TCK-00395 Security BLOCKER 1: `EmitEvent` is denied after
+        /// `EndSession`.
         ///
         /// A retained HMAC token must not be able to write events to the
         /// ledger after the session has been terminated.
