@@ -3901,6 +3901,84 @@ impl PrivilegedDispatcher {
         }
     }
 
+    /// Unified post-start rollback: stops a running episode and then rolls
+    /// back the session, telemetry, and manifest stores.
+    ///
+    /// This helper exists to eliminate duplication across the three post-start
+    /// failure paths in `handle_spawn_episode` (`update_episode_id` failure,
+    /// peer-credentials missing, and `emit_spawn_lifecycle` failure). Every
+    /// post-start error path MUST call this to prevent leaking a running
+    /// runtime episode.
+    ///
+    /// The episode is stopped with `TerminationClass::Crashed` because the
+    /// failure occurred after the episode was already started — the episode
+    /// never ran to completion, so `Crashed` is the correct classification.
+    ///
+    /// # Arguments
+    ///
+    /// * `episode_id_opt` — The episode that was started (if any). When `None`
+    ///   (e.g. in unit-test mode), only the store rollback is performed.
+    /// * `session_id` — Session ID to remove from stores.
+    /// * `evicted_sessions` — Sessions evicted during registration, to be
+    ///   restored.
+    /// * `evicted_telemetry` — Telemetry captured from evicted sessions, to be
+    ///   restored.
+    /// * `evicted_manifests` — Manifests captured from evicted sessions, to be
+    ///   restored.
+    /// * `timestamp_ns` — HTF timestamp for the episode stop event.
+    /// * `context` — Human-readable label for log messages identifying the
+    ///   failure site (e.g. "peer credentials failure").
+    #[allow(clippy::too_many_arguments)]
+    fn rollback_spawn_with_episode_stop(
+        &self,
+        episode_id_opt: Option<&EpisodeId>,
+        session_id: &str,
+        evicted_sessions: &[SessionState],
+        evicted_telemetry: &[(String, std::sync::Arc<crate::session::SessionTelemetry>)],
+        evicted_manifests: &[(String, std::sync::Arc<crate::episode::CapabilityManifest>)],
+        timestamp_ns: u64,
+        context: &str,
+    ) -> Option<String> {
+        // Step 1: Stop the already-started episode to prevent leak.
+        if let Some(episode_id) = episode_id_opt {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let rt = &self.episode_runtime;
+                let stop_err = tokio::task::block_in_place(|| {
+                    handle.block_on(rt.stop(
+                        episode_id,
+                        crate::episode::TerminationClass::Crashed,
+                        timestamp_ns,
+                    ))
+                });
+                if let Err(stop_e) = stop_err {
+                    warn!(
+                        error = %stop_e,
+                        episode_id = %episode_id,
+                        context = %context,
+                        "Rollback: failed to stop episode after post-start failure"
+                    );
+                }
+            }
+        }
+
+        // Step 2: Rollback session, telemetry, and manifest stores.
+        let rollback_warn = self.rollback_spawn(
+            session_id,
+            evicted_sessions,
+            evicted_telemetry,
+            evicted_manifests,
+            true,
+        );
+        if let Some(ref rw) = rollback_warn {
+            warn!(
+                rollback_errors = %rw,
+                context = %context,
+                "Partial rollback failure during post-start error recovery"
+            );
+        }
+        rollback_warn
+    }
+
     /// Handles `SpawnEpisode` requests (IPC-PRIV-002).
     ///
     /// # Security Contract (TCK-00257)
@@ -4718,41 +4796,17 @@ impl PrivilegedDispatcher {
                     "Failed to write episode_id back to session registry - failing closed"
                 );
 
-                // TCK-00384 review fix: Stop the already-started episode
-                // before rolling back.  Without this, the runtime episode
-                // continues running after the client receives a spawn
-                // failure, violating fail-closed semantics.
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let rt = &self.episode_runtime;
-                    let stop_err = tokio::task::block_in_place(|| {
-                        handle.block_on(rt.stop(
-                            episode_id,
-                            crate::episode::TerminationClass::Cancelled,
-                            timestamp_ns,
-                        ))
-                    });
-                    if let Err(stop_e) = stop_err {
-                        warn!(
-                            error = %stop_e,
-                            episode_id = %episode_id,
-                            "Rollback: failed to stop episode after update_episode_id failure"
-                        );
-                    }
-                }
-
-                // TCK-00384 review fix: Rollback session, telemetry, and
-                // manifest to prevent leaked resources when
-                // update_episode_id persistence fails.
-                let rollback_warn = self.rollback_spawn(
+                // TCK-00384 review fix: unified post-start rollback stops
+                // the episode and cleans up session/telemetry/manifest.
+                let rollback_warn = self.rollback_spawn_with_episode_stop(
+                    episode_id_opt.as_ref(),
                     &session_id,
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
-                    true,
+                    timestamp_ns,
+                    "update_episode_id failure",
                 );
-                if let Some(ref rw) = rollback_warn {
-                    warn!(rollback_errors = %rw, "Partial rollback failure during update_episode_id error recovery");
-                }
                 let msg = rollback_warn.map_or_else(
                     || format!("session episode_id update failed: {e}"),
                     |rw| {
@@ -4783,36 +4837,17 @@ impl PrivilegedDispatcher {
         // this failure path.  The original `?` operator would exit without
         // stopping the episode, leaking a running runtime episode.
         let Some(peer_creds) = ctx.peer_credentials() else {
-            // Stop the already-started episode to prevent leak.
-            if let Some(ref episode_id) = episode_id_opt {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let rt = &self.episode_runtime;
-                    let stop_err = tokio::task::block_in_place(|| {
-                        handle.block_on(rt.stop(
-                            episode_id,
-                            crate::episode::TerminationClass::Cancelled,
-                            timestamp_ns,
-                        ))
-                    });
-                    if let Err(stop_e) = stop_err {
-                        warn!(
-                            error = %stop_e,
-                            episode_id = %episode_id,
-                            "Rollback: failed to stop episode after peer credentials failure"
-                        );
-                    }
-                }
-            }
-            let rollback_warn = self.rollback_spawn(
+            // TCK-00384 review fix: unified post-start rollback stops the
+            // episode and cleans up session/telemetry/manifest.
+            let rollback_warn = self.rollback_spawn_with_episode_stop(
+                episode_id_opt.as_ref(),
                 &session_id,
                 &evicted_sessions,
                 &evicted_telemetry,
                 &evicted_manifests,
-                true,
+                timestamp_ns,
+                "peer credentials failure",
             );
-            if let Some(ref rw) = rollback_warn {
-                warn!(rollback_errors = %rw, "Partial rollback failure during peer credentials error recovery");
-            }
             let msg = rollback_warn.map_or_else(
                 || "peer credentials required for episode spawn".to_string(),
                 |rw| format!("peer credentials required for episode spawn (rollback partial failure: {rw})"),
@@ -4834,41 +4869,17 @@ impl PrivilegedDispatcher {
             &actor_id,
             timestamp_ns,
         ) {
-            // TCK-00384 review fix: Stop the already-started episode before
-            // rolling back.  Without this, the runtime episode continues
-            // running after the client receives a spawn failure.
-            if let Some(ref episode_id) = episode_id_opt {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let rt = &self.episode_runtime;
-                    let stop_err = tokio::task::block_in_place(|| {
-                        handle.block_on(rt.stop(
-                            episode_id,
-                            crate::episode::TerminationClass::Cancelled,
-                            timestamp_ns,
-                        ))
-                    });
-                    if let Err(stop_e) = stop_err {
-                        warn!(
-                            error = %stop_e,
-                            episode_id = %episode_id,
-                            "Rollback: failed to stop episode after event emission failure"
-                        );
-                    }
-                }
-            }
-            // TCK-00384 security fix: rollback session, telemetry, and
-            // manifest on event emission failure.  Restore evicted
-            // sessions + telemetry so capacity is not permanently lost.
-            let rollback_warn = self.rollback_spawn(
+            // TCK-00384 review fix: unified post-start rollback stops the
+            // episode and cleans up session/telemetry/manifest.
+            let rollback_warn = self.rollback_spawn_with_episode_stop(
+                episode_id_opt.as_ref(),
                 &session_id,
                 &evicted_sessions,
                 &evicted_telemetry,
                 &evicted_manifests,
-                true,
+                timestamp_ns,
+                "event emission failure",
             );
-            if let Some(ref rw) = rollback_warn {
-                warn!(rollback_errors = %rw, "Partial rollback failure during event emission error recovery");
-            }
             warn!(error = %e, "SessionStarted event emission failed");
             let msg = rollback_warn.map_or_else(
                 || format!("event emission failed: {e}"),
@@ -11425,6 +11436,216 @@ mod tests {
                 store.len(),
                 0,
                 "Telemetry must be cleaned up after peer credentials failure rollback"
+            );
+        }
+
+        /// TCK-00384 review MAJOR 1: Regression test for the unified
+        /// `rollback_spawn_with_episode_stop` helper.
+        ///
+        /// Verifies that the helper correctly rolls back session, telemetry,
+        /// and manifest stores even when no episode exists (the `None` path
+        /// in unit tests without a Tokio runtime).  This exercises the
+        /// store-cleanup portion of the unified rollback and proves it is
+        /// functionally equivalent to the previous separate calls.
+        #[test]
+        fn test_unified_rollback_helper_cleans_up_all_stores() {
+            use crate::episode::CapabilityManifest;
+            use crate::episode::registry::InMemorySessionRegistry;
+            use crate::protocol::session_dispatch::ManifestStore;
+            use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            let store = Arc::new(SessionTelemetryStore::new());
+
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_session_registry(
+                    Arc::clone(&registry) as Arc<dyn SessionRegistry + Send + Sync>
+                )
+                .with_telemetry_store(Arc::clone(&store));
+            let manifest_store = Arc::clone(dispatcher.manifest_store());
+
+            // Register a session with telemetry and manifest
+            let session = SessionState {
+                session_id: "S-UNIFIED-001".to_string(),
+                work_id: "W-UNIFIED".to_string(),
+                role: 1,
+                ephemeral_handle: "H-UNIFIED".to_string(),
+                lease_id: "L-UNIFIED".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![0u8; 32],
+                episode_id: None,
+            };
+            registry.register_session(session).unwrap();
+            store.register("S-UNIFIED-001", 42).unwrap();
+            let manifest = CapabilityManifest::from_hash_with_default_allowlist(&[0u8; 32]);
+            manifest_store.register("S-UNIFIED-001", manifest);
+
+            // Verify all stores have the entry
+            assert!(registry.get_session("S-UNIFIED-001").is_some());
+            assert!(store.get("S-UNIFIED-001").is_some());
+            assert!(manifest_store.get_manifest("S-UNIFIED-001").is_some());
+
+            // Call unified rollback with episode_id = None (test mode)
+            let no_evicted_sessions: Vec<SessionState> = Vec::new();
+            let no_evicted_telemetry: Vec<(String, Arc<crate::session::SessionTelemetry>)> =
+                Vec::new();
+            let no_evicted_manifests: Vec<(String, Arc<crate::episode::CapabilityManifest>)> =
+                Vec::new();
+
+            let result = dispatcher.rollback_spawn_with_episode_stop(
+                None,
+                "S-UNIFIED-001",
+                &no_evicted_sessions,
+                &no_evicted_telemetry,
+                &no_evicted_manifests,
+                999_000,
+                "test context",
+            );
+            assert!(
+                result.is_none(),
+                "Unified rollback should succeed: {result:?}"
+            );
+
+            // Verify all stores are cleaned up
+            assert!(
+                registry.get_session("S-UNIFIED-001").is_none(),
+                "Session must be removed by unified rollback"
+            );
+            assert!(
+                store.get("S-UNIFIED-001").is_none(),
+                "Telemetry must be removed by unified rollback"
+            );
+            assert!(
+                manifest_store.get_manifest("S-UNIFIED-001").is_none(),
+                "Manifest must be removed by unified rollback"
+            );
+        }
+
+        /// TCK-00384 review MAJOR 1: Regression test verifying the unified
+        /// rollback helper restores evicted entries during post-start
+        /// failure recovery.
+        ///
+        /// Fills the registry to capacity, registers one more (evicting the
+        /// oldest), then calls `rollback_spawn_with_episode_stop` and
+        /// verifies the evicted session, telemetry, AND manifest are all
+        /// restored.
+        #[test]
+        fn test_unified_rollback_restores_evicted_entries() {
+            use crate::episode::CapabilityManifest;
+            use crate::episode::registry::{InMemorySessionRegistry, MAX_SESSIONS};
+            use crate::protocol::session_dispatch::ManifestStore;
+            use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            let store = Arc::new(SessionTelemetryStore::new());
+
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_session_registry(
+                    Arc::clone(&registry) as Arc<dyn SessionRegistry + Send + Sync>
+                )
+                .with_telemetry_store(Arc::clone(&store));
+            let manifest_store = Arc::clone(dispatcher.manifest_store());
+
+            // Fill to capacity with sessions, telemetry, and manifests
+            for i in 0..MAX_SESSIONS {
+                let sid = format!("S-{i}");
+                let session = SessionState {
+                    session_id: sid.clone(),
+                    work_id: format!("W-{i}"),
+                    role: 1,
+                    ephemeral_handle: format!("H-{i}"),
+                    lease_id: format!("L-{i}"),
+                    policy_resolved_ref: String::new(),
+                    capability_manifest_hash: vec![0u8; 32],
+                    episode_id: None,
+                };
+                registry.register_session(session).unwrap();
+                store.register(&sid, i as u64).unwrap();
+                let manifest = CapabilityManifest::from_hash_with_default_allowlist(&[0u8; 32]);
+                manifest_store.register(&sid, manifest);
+            }
+
+            // Register one more, evicting S-0
+            let new_session = SessionState {
+                session_id: "S-NEW".to_string(),
+                work_id: "W-NEW".to_string(),
+                role: 1,
+                ephemeral_handle: "H-NEW".to_string(),
+                lease_id: "L-NEW".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![0u8; 32],
+                episode_id: None,
+            };
+            let evicted = registry.register_session(new_session).unwrap();
+            assert_eq!(evicted.len(), 1);
+            assert_eq!(evicted[0].session_id, "S-0");
+
+            // Capture evicted telemetry and manifests (as dispatch.rs does)
+            let evicted_telemetry: Vec<_> = evicted
+                .iter()
+                .filter_map(|s| {
+                    store
+                        .remove_and_return(&s.session_id)
+                        .map(|t| (s.session_id.clone(), t))
+                })
+                .collect();
+            let evicted_manifests: Vec<_> = evicted
+                .iter()
+                .filter_map(|s| {
+                    manifest_store
+                        .remove_and_return(&s.session_id)
+                        .map(|m| (s.session_id.clone(), m))
+                })
+                .collect();
+            assert_eq!(evicted_telemetry.len(), 1);
+            assert_eq!(evicted_manifests.len(), 1);
+
+            // Register telemetry and manifest for the new session
+            store.register("S-NEW", 999).unwrap();
+            let new_manifest = CapabilityManifest::from_hash_with_default_allowlist(&[1u8; 32]);
+            manifest_store.register("S-NEW", new_manifest);
+
+            // Call unified rollback (simulating post-start failure)
+            let result = dispatcher.rollback_spawn_with_episode_stop(
+                None,
+                "S-NEW",
+                &evicted,
+                &evicted_telemetry,
+                &evicted_manifests,
+                999_000,
+                "test eviction restore",
+            );
+            assert!(
+                result.is_none(),
+                "Unified rollback should succeed: {result:?}"
+            );
+
+            // The new session must be gone
+            assert!(
+                registry.get_session("S-NEW").is_none(),
+                "Failed new session must not exist after rollback"
+            );
+            assert!(
+                store.get("S-NEW").is_none(),
+                "Failed new session telemetry must not exist after rollback"
+            );
+            assert!(
+                manifest_store.get_manifest("S-NEW").is_none(),
+                "Failed new session manifest must not exist after rollback"
+            );
+
+            // The evicted session must be restored
+            assert!(
+                registry.get_session("S-0").is_some(),
+                "Evicted session must be restored by unified rollback"
+            );
+            assert!(
+                store.get("S-0").is_some(),
+                "Evicted telemetry must be restored by unified rollback"
+            );
+            assert!(
+                manifest_store.get_manifest("S-0").is_some(),
+                "Evicted manifest must be restored by unified rollback"
             );
         }
     }
