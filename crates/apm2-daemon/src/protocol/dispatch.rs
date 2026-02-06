@@ -6499,22 +6499,27 @@ impl PrivilegedDispatcher {
                     (RiskTier::Tier4, changeset_digest)
                 };
 
-            // For non-Tier0 work: this endpoint only provides SelfSigned
-            // attestation. Higher tiers require CounterSigned or
-            // ThresholdSigned which this endpoint cannot produce — reject
-            // immediately (fail-closed).
-            if risk_tier != RiskTier::Tier0 {
+            // SECURITY (v5 Finding 4): Instead of hard-rejecting all non-Tier0
+            // requests, consult the ratchet table first. The ratchet table
+            // explicitly allows Tier1 with SelfSigned attestation. Only reject
+            // if the tier's required attestation level exceeds what this
+            // endpoint can provide (SelfSigned). This restores Tier1 throughput
+            // while maintaining fail-closed semantics for higher tiers.
+            let requirements = AttestationRequirements::new();
+            let required_level = requirements.required_level(ReceiptKind::Review, risk_tier);
+            if !AttestationLevel::SelfSigned.satisfies(required_level) {
                 warn!(
                     receipt_id = %request.receipt_id,
                     risk_tier = ?risk_tier,
-                    "Non-Tier0 work item submitted to review receipt endpoint — \
-                     rejecting (fail-closed, requires stronger attestation)"
+                    required_level = %required_level,
+                    "Risk tier requires attestation stronger than SelfSigned — \
+                     rejecting (fail-closed)"
                 );
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
                     format!(
-                        "review receipt endpoint only supports Tier0 work items; \
-                         got {risk_tier:?} which requires stronger attestation"
+                        "review receipt endpoint provides SelfSigned attestation; \
+                         {risk_tier:?} requires {required_level} which this endpoint cannot produce"
                     ),
                 ));
             }
@@ -6532,7 +6537,6 @@ impl PrivilegedDispatcher {
             // policy hash from the work item's policy resolution (not the
             // raw changeset_digest). This binds the attestation to the
             // governance-resolved policy state.
-            let requirements = AttestationRequirements::new();
             if let Err(e) = validate_receipt_attestation(
                 &attestation,
                 risk_tier,
@@ -7583,17 +7587,42 @@ impl PrivilegedDispatcher {
                 && existing.gate_id == parent_lease.gate_id
                 && delegatee_matches
             {
+                // SECURITY (v5 Finding 1): Revalidate the existing sublease
+                // against the PROVIDED parent lease. A stale sublease issued
+                // under a previous parent boundary must not be returned if it
+                // violates the current parent's constraints (time bounds,
+                // policy hash, changeset digest, AAT extension).
+                if let Err(e) = crate::gate::GateOrchestrator::validate_sublease_delegation(
+                    &parent_lease,
+                    &existing,
+                ) {
+                    warn!(
+                        sublease_id = %request.sublease_id,
+                        parent_lease_id = %request.parent_lease_id,
+                        error = %e,
+                        "Idempotent sublease failed revalidation against current parent lease"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "existing sublease '{}' is incompatible with parent lease '{}': {e}",
+                            request.sublease_id, request.parent_lease_id
+                        ),
+                    ));
+                }
+
                 info!(
                     sublease_id = %request.sublease_id,
                     "Sublease already exists with identical parameters - idempotent return"
                 );
+                // Convert ms -> ns for response (existing.expires_at is in ms)
                 return Ok(PrivilegedResponse::DelegateSublease(
                     DelegateSubleaseResponse {
                         sublease_id: existing.lease_id.clone(),
                         parent_lease_id: request.parent_lease_id,
                         delegatee_actor_id: request.delegatee_actor_id,
                         gate_id: existing.gate_id.clone(),
-                        expires_at_ns: existing.expires_at,
+                        expires_at_ns: existing.expires_at.saturating_mul(1_000_000),
                         event_id: String::new(), // No new event for idempotent return
                     },
                 ));
@@ -7640,12 +7669,21 @@ impl PrivilegedDispatcher {
         };
 
         // ---- Phase 4: Issue sublease via orchestrator (validates strict-subset) ----
+        //
+        // SECURITY (v5 Finding 2): Convert nanosecond values from the proto
+        // wire format to milliseconds at the handler boundary. GateLease uses
+        // milliseconds internally (issued_at, expires_at), but the proto
+        // fields are `requested_expiry_ns` / `expires_at_ns`. Passing raw
+        // nanosecond values through would cause temporal comparison mismatches
+        // against parent lease bounds (which are in milliseconds).
+        let expiry_millis = request.requested_expiry_ns / 1_000_000;
+        let issued_at_millis = timestamp_ns / 1_000_000;
         let sublease = match gate_orchestrator.issue_delegated_sublease(
             &parent_lease,
             &request.sublease_id,
             &request.delegatee_actor_id,
-            timestamp_ns,
-            request.requested_expiry_ns,
+            issued_at_millis,
+            expiry_millis,
         ) {
             Ok(lease) => lease,
             Err(e) => {
@@ -7662,9 +7700,16 @@ impl PrivilegedDispatcher {
         };
 
         // ---- Phase 5: Emit SubleaseIssued event ----
+        //
+        // SECURITY (v5 Finding 3): The event's actor_id MUST be the
+        // authenticated caller (from peer credentials), NOT the
+        // caller-controlled `delegatee_actor_id`. The delegatee is included
+        // as a separate field in the event payload so the audit trail records
+        // BOTH who performed the delegation and who received the sublease.
         let event_payload = serde_json::json!({
             "parent_lease_id": request.parent_lease_id,
             "sublease_id": sublease.lease_id,
+            "delegator_actor_id": caller_actor_id,
             "delegatee_actor_id": request.delegatee_actor_id,
             "gate_id": sublease.gate_id,
             "work_id": sublease.work_id,
@@ -7677,7 +7722,7 @@ impl PrivilegedDispatcher {
             &sublease.lease_id,
             "SubleaseIssued",
             &event_payload_bytes,
-            &request.delegatee_actor_id,
+            &caller_actor_id,
             timestamp_ns,
         ) {
             Ok(evt) => evt,
@@ -7701,13 +7746,14 @@ impl PrivilegedDispatcher {
             "Sublease delegation completed successfully"
         );
 
+        // Convert ms -> ns for the proto response wire format.
         Ok(PrivilegedResponse::DelegateSublease(
             DelegateSubleaseResponse {
                 sublease_id: sublease.lease_id,
                 parent_lease_id: request.parent_lease_id,
                 delegatee_actor_id: request.delegatee_actor_id,
                 gate_id: sublease.gate_id,
-                expires_at_ns: sublease.expires_at,
+                expires_at_ns: sublease.expires_at.saturating_mul(1_000_000),
                 event_id: signed_event.event_id,
             },
         ))
@@ -16224,8 +16270,8 @@ mod tests {
             match response {
                 PrivilegedResponse::Error(err) => {
                     assert!(
-                        err.message.contains("only supports Tier0"),
-                        "Tier2 SelfSigned must be rejected with Tier0-only message, got: {}",
+                        err.message.contains("SelfSigned") || err.message.contains("requires"),
+                        "Tier2 SelfSigned must be rejected, got: {}",
                         err.message
                     );
                     assert!(
@@ -16268,8 +16314,8 @@ mod tests {
             match response {
                 PrivilegedResponse::Error(err) => {
                     assert!(
-                        err.message.contains("only supports Tier0"),
-                        "Tier4 SelfSigned must be rejected with Tier0-only message, got: {}",
+                        err.message.contains("SelfSigned") || err.message.contains("requires"),
+                        "Tier4 SelfSigned must be rejected, got: {}",
                         err.message
                     );
                     assert!(
@@ -16366,7 +16412,8 @@ mod tests {
             match response {
                 PrivilegedResponse::Error(err) => {
                     assert!(
-                        err.message.contains("only supports Tier0")
+                        err.message.contains("SelfSigned")
+                            || err.message.contains("requires")
                             || err.message.contains("Tier4"),
                         "Unresolvable risk tier must fail-closed (Tier4 rejection), got: {}",
                         err.message
@@ -16379,9 +16426,10 @@ mod tests {
         }
 
         #[test]
-        fn test_ingest_review_receipt_tier1_rejected() {
-            // Tier1 requires at least CounterSigned for review receipts.
-            // SelfSigned is insufficient — must be rejected.
+        fn test_ingest_review_receipt_tier1_self_signed_accepted() {
+            // v5 Finding 4: Tier1 requires SelfSigned for review receipts per
+            // the ratchet table. This endpoint provides SelfSigned attestation,
+            // so Tier1 requests MUST be accepted (not hard-rejected).
             let (dispatcher, ctx) = setup_dispatcher_with_lease_and_tier(
                 "lease-t1-001",
                 "W-T1-001",
@@ -16404,15 +16452,25 @@ mod tests {
 
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
             match response {
-                PrivilegedResponse::Error(err) => {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(
+                        resp.receipt_id, "RR-T1-001",
+                        "Tier1 SelfSigned must be accepted per ratchet table"
+                    );
+                    assert_eq!(resp.event_type, "ReviewReceiptRecorded");
                     assert!(
-                        err.message.contains("only supports Tier0"),
-                        "Tier1 SelfSigned must be rejected, got: {}",
+                        !resp.event_id.is_empty(),
+                        "Event ID must be non-empty for accepted Tier1 receipt"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "Tier1 SelfSigned must be accepted per ratchet table, got error: {}",
                         err.message
                     );
                 },
                 other => {
-                    panic!("Expected rejection for Tier1 SelfSigned attestation, got {other:?}")
+                    panic!("Expected IngestReviewReceipt for Tier1 SelfSigned, got {other:?}")
                 },
             }
         }
@@ -16494,7 +16552,7 @@ mod tests {
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "parent-lease-001".to_string(),
                 delegatee_actor_id: "child-executor-001".to_string(),
-                requested_expiry_ns: 1_900_000,
+                requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-001".to_string(),
             };
             let frame = encode_delegate_sublease_request(&request);
@@ -16506,7 +16564,9 @@ mod tests {
                     assert_eq!(resp.parent_lease_id, "parent-lease-001");
                     assert_eq!(resp.delegatee_actor_id, "child-executor-001");
                     assert_eq!(resp.gate_id, "gate-quality");
-                    assert_eq!(resp.expires_at_ns, 1_900_000);
+                    // v5 Finding 2: expires_at_ns in response is in nanoseconds
+                    // (converted from internal ms representation).
+                    assert_eq!(resp.expires_at_ns, 1_900_000_000_000);
                     assert!(!resp.event_id.is_empty(), "event_id must be non-empty");
                 },
                 PrivilegedResponse::Error(err) => {
@@ -16537,7 +16597,7 @@ mod tests {
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "nonexistent-lease".to_string(),
                 delegatee_actor_id: "child-executor-001".to_string(),
-                requested_expiry_ns: 1_900_000,
+                requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-002".to_string(),
             };
             let frame = encode_delegate_sublease_request(&request);
@@ -16574,7 +16634,8 @@ mod tests {
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "parent-lease-exp".to_string(),
                 delegatee_actor_id: "child-executor-001".to_string(),
-                requested_expiry_ns: 3_000_000, // Exceeds parent's expires_at
+                requested_expiry_ns: 3_000_000_000_000, /* Exceeds parent's expires_at (3_000_000
+                                                         * ms) */
                 sublease_id: "sublease-overflow".to_string(),
             };
             let frame = encode_delegate_sublease_request(&request);
@@ -16609,7 +16670,7 @@ mod tests {
             let request = DelegateSubleaseRequest {
                 parent_lease_id: String::new(),
                 delegatee_actor_id: "child-executor-001".to_string(),
-                requested_expiry_ns: 1_900_000,
+                requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-003".to_string(),
             };
             let frame = encode_delegate_sublease_request(&request);
@@ -16644,7 +16705,7 @@ mod tests {
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "parent-lease-001".to_string(),
                 delegatee_actor_id: String::new(),
-                requested_expiry_ns: 1_900_000,
+                requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-004".to_string(),
             };
             let frame = encode_delegate_sublease_request(&request);
@@ -16675,7 +16736,7 @@ mod tests {
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "parent-lease-001".to_string(),
                 delegatee_actor_id: "child-001".to_string(),
-                requested_expiry_ns: 1_900_000,
+                requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-005".to_string(),
             };
             let frame = encode_delegate_sublease_request(&request);
@@ -16714,7 +16775,7 @@ mod tests {
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "parent-lease-np".to_string(),
                 delegatee_actor_id: "child-001".to_string(),
-                requested_expiry_ns: 1_900_000,
+                requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-006".to_string(),
             };
             let frame = encode_delegate_sublease_request(&request);
@@ -16776,7 +16837,7 @@ mod tests {
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "parent-authz".to_string(),
                 delegatee_actor_id: "child-001".to_string(),
-                requested_expiry_ns: 1_900_000,
+                requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-authz".to_string(),
             };
             let frame = encode_delegate_sublease_request(&request);
@@ -16816,7 +16877,7 @@ mod tests {
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "parent-no-creds".to_string(),
                 delegatee_actor_id: "child-001".to_string(),
-                requested_expiry_ns: 1_900_000,
+                requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-no-creds".to_string(),
             };
             let frame = encode_delegate_sublease_request(&request);
@@ -16874,10 +16935,18 @@ mod tests {
                 "executor-001",
             );
 
+            // Derive the expected caller actor_id (same credentials as
+            // setup_dispatcher_with_orchestrator uses: uid=1000, gid=1000).
+            let expected_caller_actor = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "parent-lease-evt".to_string(),
                 delegatee_actor_id: "child-executor-evt".to_string(),
-                requested_expiry_ns: 1_900_000,
+                requested_expiry_ns: 1_900_000_000_000, // ns
                 sublease_id: "sublease-evt-001".to_string(),
             };
             let frame = encode_delegate_sublease_request(&request);
@@ -16896,7 +16965,16 @@ mod tests {
             );
             let event = stored_event.unwrap();
             assert_eq!(event.event_type, "SubleaseIssued");
-            assert_eq!(event.actor_id, "child-executor-evt");
+            // v5 Finding 3: actor_id must be the authenticated CALLER, not the
+            // caller-controlled delegatee_actor_id.
+            assert_eq!(
+                event.actor_id, expected_caller_actor,
+                "SubleaseIssued event must record authenticated caller, not delegatee"
+            );
+            assert_ne!(
+                event.actor_id, "child-executor-evt",
+                "actor_id must NOT be the delegatee"
+            );
             assert!(event.timestamp_ns > 0, "Timestamp must be non-zero (HTF)");
         }
 
@@ -16912,7 +16990,7 @@ mod tests {
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "parent-lease-dup".to_string(),
                 delegatee_actor_id: "child-executor-dup".to_string(),
-                requested_expiry_ns: 1_900_000,
+                requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-dup-001".to_string(),
             };
             let frame = encode_delegate_sublease_request(&request);
@@ -17004,7 +17082,7 @@ mod tests {
             let req1 = DelegateSubleaseRequest {
                 parent_lease_id: "parent-A".to_string(),
                 delegatee_actor_id: "child-001".to_string(),
-                requested_expiry_ns: 1_900_000,
+                requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "shared-sublease-id".to_string(),
             };
             let frame1 = encode_delegate_sublease_request(&req1);
@@ -17019,7 +17097,7 @@ mod tests {
             let req2 = DelegateSubleaseRequest {
                 parent_lease_id: "parent-B".to_string(),
                 delegatee_actor_id: "child-002".to_string(),
-                requested_expiry_ns: 1_900_000,
+                requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "shared-sublease-id".to_string(),
             };
             let frame2 = encode_delegate_sublease_request(&req2);
@@ -17262,7 +17340,9 @@ mod tests {
             match response {
                 PrivilegedResponse::Error(err) => {
                     assert!(
-                        err.message.contains("only supports Tier0"),
+                        err.message.contains("SelfSigned")
+                            || err.message.contains("requires")
+                            || err.message.contains("attestation"),
                         "Tier2 SelfSigned must be rejected on sqlite path, got: {}",
                         err.message
                     );
@@ -17319,7 +17399,7 @@ mod tests {
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "sql-parent".to_string(),
                 delegatee_actor_id: "child-sql-exec".to_string(),
-                requested_expiry_ns: 1_900_000,
+                requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-sql-001".to_string(),
             };
             let frame = encode_delegate_sublease_request(&request);
@@ -17360,7 +17440,7 @@ mod tests {
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "nonexistent-parent".to_string(),
                 delegatee_actor_id: "child-sql".to_string(),
-                requested_expiry_ns: 1_900_000,
+                requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-sql-invalid".to_string(),
             };
             let frame = encode_delegate_sublease_request(&request);
@@ -17451,7 +17531,7 @@ mod tests {
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "ds-parent-prod".to_string(),
                 delegatee_actor_id: "child-prod-exec".to_string(),
-                requested_expiry_ns: 1_900_000,
+                requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-prod-001".to_string(),
             };
             let frame = encode_delegate_sublease_request(&request);
