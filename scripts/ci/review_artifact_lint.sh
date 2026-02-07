@@ -348,17 +348,19 @@ done < <(find "$REVIEW_DIR" -type f \( -name '*.md' -o -name '*.sh' -o -name '*.
 log_info "Defense-in-depth: per-line prohibition check..."
 while IFS= read -r review_file; do
     file_basename="$(basename "$review_file")"
-    # Skip exempt files (already checked at file level with appropriate exemptions)
-    if [[ "$file_basename" == "CODE_QUALITY_PROMPT.md" ]]; then
-        continue
-    fi
     # Process with continuation-joining so multiline commands are caught
     while IFS=$'\t' read -r line_num logical_line; do
-        if detect_direct_status_write "$logical_line"; then
-            log_error "Forbidden direct GitHub API call in review artifact:"
-            log_error "  ${review_file}:${line_num}: ${logical_line}"
-            log_error "  Use 'cargo xtask security-review-exec (approve|deny)' instead."
-            VIOLATIONS=1
+        # CODE_QUALITY_PROMPT.md is exempt from the per-line API prohibition
+        # (detect_direct_status_write) because it legitimately uses gh api for
+        # code-quality status writes.  However, it MUST still be checked for
+        # cross-category exec misuse (e.g. invoking security-review-exec).
+        if [[ "$file_basename" != "CODE_QUALITY_PROMPT.md" ]]; then
+            if detect_direct_status_write "$logical_line"; then
+                log_error "Forbidden direct GitHub API call in review artifact:"
+                log_error "  ${review_file}:${line_num}: ${logical_line}"
+                log_error "  Use 'cargo xtask security-review-exec (approve|deny)' instead."
+                VIOLATIONS=1
+            fi
         fi
         if detect_cross_category_exec "$logical_line" "$file_basename"; then
             log_error "Cross-category executor misuse:"

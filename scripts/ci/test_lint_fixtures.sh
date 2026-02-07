@@ -142,6 +142,50 @@ fi
 unset -f log_error
 echo
 
+# --- Test 2d: cross-category exec detection (CODE_QUALITY must not invoke security-review-exec) ---
+echo "Test 2d: review_artifact_lint cross-category exec detection (detect_cross_category_exec)"
+log_error() { :; }
+source <(sed -n '/^detect_cross_category_exec()/,/^}/p' "${SCRIPT_DIR}/review_artifact_lint.sh")
+
+# Test 2d-i: CODE_QUALITY file containing security-review-exec -> MUST FAIL
+cross_cat_fixture="${FIXTURE_DIR}/review_file_cross_category_violation.md"
+cross_cat_found=0
+while IFS= read -r fixture_line; do
+    if detect_cross_category_exec "$fixture_line" "CODE_QUALITY_PROMPT.md"; then
+        cross_cat_found=1
+        break
+    fi
+done < "$cross_cat_fixture"
+if [[ $cross_cat_found -eq 1 ]]; then
+    log_pass "Cross-category exec caught security-review-exec in CODE_QUALITY context"
+else
+    log_fail "Cross-category exec missed security-review-exec in CODE_QUALITY context"
+fi
+
+# Test 2d-ii: SECURITY_REVIEW file containing security-review-exec -> MUST PASS (permitted)
+cross_cat_found=0
+while IFS= read -r fixture_line; do
+    if detect_cross_category_exec "$fixture_line" "SECURITY_REVIEW_PROMPT.md"; then
+        cross_cat_found=1
+        break
+    fi
+done < "$cross_cat_fixture"
+if [[ $cross_cat_found -eq 0 ]]; then
+    log_pass "Cross-category exec correctly permits security-review-exec in SECURITY_REVIEW context"
+else
+    log_fail "Cross-category exec false positive on security-review-exec in SECURITY_REVIEW context"
+fi
+
+# Test 2d-iii: CODE_QUALITY line without security-review-exec -> MUST PASS (no violation)
+if detect_cross_category_exec "cargo xtask review --pr 123 --type code-quality" "CODE_QUALITY_PROMPT.md"; then
+    log_fail "Cross-category exec false positive on CODE_QUALITY line without security-review-exec"
+else
+    log_pass "Cross-category exec correctly permits CODE_QUALITY line without security-review-exec"
+fi
+
+unset -f log_error
+echo
+
 # --- Test 3: evidence_refs_lint block extraction scope ---
 # Source the extract_yaml_list_block function
 source <(sed -n '/^extract_yaml_list_block()/,/^}/p' "${SCRIPT_DIR}/evidence_refs_lint.sh")
