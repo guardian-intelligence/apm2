@@ -118,8 +118,8 @@ pub enum IdentityProofError {
         actual: usize,
     },
 
-    /// Unsupported proof kind for the requested verifier.
-    #[error("unsupported directory proof kind for verification: {kind:?}")]
+    /// Unsupported proof kind for this implementation phase.
+    #[error("unsupported directory proof kind: {kind:?}")]
     UnsupportedDirectoryProofKind {
         /// Proof kind.
         kind: DirectoryProofKindV1,
@@ -829,6 +829,12 @@ impl DirectoryProofV1 {
         )?;
 
         let kind = DirectoryProofKindV1::from_byte(cursor.read_u8("kind")?)?;
+        // Phase 1: only SMT-256 proof verification is implemented.
+        // Reject Patricia proofs at admission/decode time to avoid deferred
+        // availability failures at verification.
+        if kind == DirectoryProofKindV1::PatriciaCompressedV1 {
+            return Err(IdentityProofError::UnsupportedDirectoryProofKind { kind });
+        }
         let key = cursor.read_array::<HASH_BYTES>("key")?;
         let value_hash = cursor.read_array::<HASH_BYTES>("value_hash")?;
         let entry_status = DirectoryEntryStatus::from_byte(cursor.read_u8("entry_status")?)?;
@@ -1730,6 +1736,30 @@ mod tests {
             parsed.proof_bytes_len(),
             u32::try_from(bytes.len()).expect("test proof bytes length should fit in u32")
         );
+    }
+
+    #[test]
+    fn directory_proof_patricia_kind_rejected_at_admission() {
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            [0x01; HASH_BYTES],
+            [0x02; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![SiblingNode::new([0x03; HASH_BYTES])],
+        )
+        .unwrap();
+
+        let mut bytes = proof.canonical_bytes().unwrap();
+        let kind_offset = DIRECTORY_PROOF_DOMAIN_SEPARATOR.len();
+        bytes[kind_offset] = DirectoryProofKindV1::PatriciaCompressedV1.to_byte();
+
+        let err = DirectoryProofV1::from_canonical_bytes_bounded(&bytes, bytes.len()).unwrap_err();
+        assert!(matches!(
+            err,
+            IdentityProofError::UnsupportedDirectoryProofKind {
+                kind: DirectoryProofKindV1::PatriciaCompressedV1
+            }
+        ));
     }
 
     #[test]

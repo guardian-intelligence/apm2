@@ -535,6 +535,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// * `lease_id` - Gate lease identifier associated with this review
     /// * `receipt_id` - Unique receipt identifier (used as `blocked_id`)
     /// * `changeset_digest` - BLAKE3 digest of the reviewed changeset
+    /// * `artifact_bundle_hash` - CAS hash of the artifact bundle
     /// * `reason_code` - Numeric reason code for the blocked review
     /// * `blocked_log_hash` - CAS hash of blocked logs
     /// * `reviewer_actor_id` - Actor ID of the reviewer
@@ -554,6 +555,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         lease_id: &str,
         receipt_id: &str,
         changeset_digest: &[u8; 32],
+        artifact_bundle_hash: &[u8; 32],
         reason_code: u32,
         blocked_log_hash: &[u8; 32],
         reviewer_actor_id: &str,
@@ -1806,6 +1808,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         lease_id: &str,
         receipt_id: &str,
         changeset_digest: &[u8; 32],
+        artifact_bundle_hash: &[u8; 32],
         reason_code: u32,
         blocked_log_hash: &[u8; 32],
         reviewer_actor_id: &str,
@@ -1824,6 +1827,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "lease_id": lease_id,
             "receipt_id": receipt_id,
             "changeset_digest": hex::encode(changeset_digest),
+            "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
             "verdict": "BLOCKED",
             "blocked_reason_code": reason_code,
             // Preserve legacy field for backward compatibility with old readers.
@@ -2948,7 +2952,7 @@ struct ReceiptReplayBindings {
     changeset_digest: [u8; 32],
     verdict: String,
     identity_proof_hash: [u8; 32],
-    artifact_bundle_hash: Option<[u8; 32]>,
+    artifact_bundle_hash: [u8; 32],
     blocked_reason_code: Option<u32>,
     blocked_log_hash: Option<[u8; 32]>,
 }
@@ -3027,12 +3031,9 @@ fn extract_receipt_replay_bindings(event_payload: &[u8]) -> Result<ReceiptReplay
         .try_into()
         .expect("validated to 32 bytes by validate_identity_proof_hash");
 
-    let artifact_bundle_hash = lookup_field("artifact_bundle_hash")
-        .map(|value| decode_hash32("artifact_bundle_hash", value))
-        .transpose()?;
-    if verdict == "APPROVE" && artifact_bundle_hash.is_none() {
-        return Err("missing artifact_bundle_hash".to_string());
-    }
+    let artifact_bundle_hash_hex = lookup_field("artifact_bundle_hash")
+        .ok_or_else(|| "missing artifact_bundle_hash".to_string())?;
+    let artifact_bundle_hash = decode_hash32("artifact_bundle_hash", artifact_bundle_hash_hex)?;
 
     let blocked_reason_code = lookup_value("blocked_reason_code")
         .or_else(|| lookup_value("reason_code"))
@@ -8181,22 +8182,20 @@ impl PrivilegedDispatcher {
                 ));
             }
 
-            if let Some(original_artifact_bundle_hash) = original.artifact_bundle_hash {
-                if original_artifact_bundle_hash != request_artifact_bundle_hash_arr {
-                    warn!(
-                        receipt_id = %request.receipt_id,
-                        existing_event_id = %existing.event_id,
-                        original_artifact_bundle_hash = %hex::encode(original_artifact_bundle_hash),
-                        requested_artifact_bundle_hash = %hex::encode(request_artifact_bundle_hash_arr),
-                        "Idempotent review receipt replay rejected: artifact_bundle_hash mismatch"
-                    );
-                    return Err(format!(
-                        "receipt_id '{}' was originally submitted with artifact_bundle_hash '{}', not '{}'",
-                        request.receipt_id,
-                        hex::encode(original_artifact_bundle_hash),
-                        hex::encode(request_artifact_bundle_hash_arr),
-                    ));
-                }
+            if original.artifact_bundle_hash != request_artifact_bundle_hash_arr {
+                warn!(
+                    receipt_id = %request.receipt_id,
+                    existing_event_id = %existing.event_id,
+                    original_artifact_bundle_hash = %hex::encode(original.artifact_bundle_hash),
+                    requested_artifact_bundle_hash = %hex::encode(request_artifact_bundle_hash_arr),
+                    "Idempotent review receipt replay rejected: artifact_bundle_hash mismatch"
+                );
+                return Err(format!(
+                    "receipt_id '{}' was originally submitted with artifact_bundle_hash '{}', not '{}'",
+                    request.receipt_id,
+                    hex::encode(original.artifact_bundle_hash),
+                    hex::encode(request_artifact_bundle_hash_arr),
+                ));
             }
 
             if let Some(original_blocked_reason_code) = original.blocked_reason_code {
@@ -8310,6 +8309,7 @@ impl PrivilegedDispatcher {
                         &request.lease_id,
                         &request.receipt_id,
                         &request_changeset_digest_arr,
+                        &request_artifact_bundle_hash_arr,
                         request.blocked_reason_code,
                         &blocked_log_hash_arr,
                         &authenticated_reviewer_id,
@@ -19545,6 +19545,61 @@ mod tests {
                 },
                 other => panic!(
                     "expected duplicate receipt_id + artifact_bundle_hash mismatch rejection, got {other:?}"
+                ),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_duplicate_blocked_receipt_different_artifact_bundle_hash_rejected()
+         {
+            let (dispatcher, ctx) = setup_dispatcher_with_lease(
+                "lease-dup-blocked-artifact-001",
+                "W-DUP-BLOCKED-ARTIFACT-001",
+                "gate-001",
+                "reviewer-a",
+            );
+
+            let request1 = IngestReviewReceiptRequest {
+                lease_id: "lease-dup-blocked-artifact-001".to_string(),
+                receipt_id: "RB-DUP-ARTIFACT-001".to_string(),
+                reviewer_actor_id: "reviewer-a".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Blocked.into(),
+                blocked_reason_code: 1,
+                blocked_log_hash: vec![0x55; 32],
+                identity_proof_hash: vec![0x99; 32],
+            };
+            let frame1 = encode_ingest_review_receipt_request(&request1);
+            let response1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
+            assert!(
+                matches!(response1, PrivilegedResponse::IngestReviewReceipt(_)),
+                "first blocked receipt submission should succeed"
+            );
+
+            let request2 = IngestReviewReceiptRequest {
+                lease_id: "lease-dup-blocked-artifact-001".to_string(),
+                receipt_id: "RB-DUP-ARTIFACT-001".to_string(),
+                reviewer_actor_id: "reviewer-a".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x44; 32],
+                verdict: ReviewReceiptVerdict::Blocked.into(),
+                blocked_reason_code: 1,
+                blocked_log_hash: vec![0x55; 32],
+                identity_proof_hash: vec![0x99; 32],
+            };
+            let frame2 = encode_ingest_review_receipt_request(&request2);
+            let response2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+            match response2 {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("artifact_bundle_hash"),
+                        "expected artifact_bundle_hash mismatch rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "expected duplicate BLOCKED receipt_id + artifact_bundle_hash mismatch rejection, got {other:?}"
                 ),
             }
         }

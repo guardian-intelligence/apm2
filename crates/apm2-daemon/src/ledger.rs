@@ -119,25 +119,52 @@ impl SqliteLedgerEventEmitter {
         // while the database constraint provides the authoritative uniqueness
         // guarantee.
         //
-        // MIGRATION: Deduplicate historical `receipt_id` rows before creating
-        // the unique index. Keep the first row (minimum `rowid`) for each
-        // duplicated receipt ID and delete any subsequent duplicates.
-        // This migration is idempotent: if no duplicates exist, it deletes
-        // zero rows and is safe to run repeatedly.
+        // MIGRATION: Quarantine historical duplicate `receipt_id` rows before
+        // creating the unique index. This preserves forensic evidence by
+        // moving duplicate rows out of `ledger_events` rather than deleting
+        // them permanently.
+        //
+        // The migration is idempotent:
+        // - quarantine table is created with `IF NOT EXISTS`
+        // - rows already quarantined are not re-inserted
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ledger_events_quarantine ( \
+                 rowid_orig INTEGER NOT NULL, \
+                 event_id TEXT NOT NULL, \
+                 event_type TEXT NOT NULL, \
+                 work_id TEXT NOT NULL, \
+                 actor_id TEXT NOT NULL, \
+                 payload BLOB NOT NULL, \
+                 signature BLOB NOT NULL, \
+                 timestamp_ns INTEGER NOT NULL, \
+                 quarantine_reason TEXT NOT NULL DEFAULT 'receipt_id_dedupe_migration' \
+             )",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO ledger_events_quarantine \
+                 (rowid_orig, event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
+             SELECT le.rowid, le.event_id, le.event_type, le.work_id, le.actor_id, \
+                    le.payload, le.signature, le.timestamp_ns \
+             FROM ledger_events le \
+             INNER JOIN ( \
+                 SELECT json_extract(CAST(payload AS TEXT), '$.receipt_id') AS rid, \
+                        MIN(rowid) AS keep_rowid \
+                 FROM ledger_events \
+                 WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
+                 AND json_extract(CAST(payload AS TEXT), '$.receipt_id') IS NOT NULL \
+                 GROUP BY json_extract(CAST(payload AS TEXT), '$.receipt_id') \
+                 HAVING COUNT(*) > 1 \
+             ) dups ON json_extract(CAST(le.payload AS TEXT), '$.receipt_id') = dups.rid \
+             WHERE le.event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
+             AND le.rowid != dups.keep_rowid \
+             AND le.rowid NOT IN (SELECT rowid_orig FROM ledger_events_quarantine)",
+            [],
+        )?;
         conn.execute(
             "DELETE FROM ledger_events WHERE rowid IN ( \
-                 SELECT le.rowid FROM ledger_events le \
-                 INNER JOIN ( \
-                     SELECT json_extract(CAST(payload AS TEXT), '$.receipt_id') AS rid, \
-                            MIN(rowid) AS keep_rowid \
-                     FROM ledger_events \
-                     WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
-                     AND json_extract(CAST(payload AS TEXT), '$.receipt_id') IS NOT NULL \
-                     GROUP BY json_extract(CAST(payload AS TEXT), '$.receipt_id') \
-                     HAVING COUNT(*) > 1 \
-                 ) dups ON json_extract(CAST(le.payload AS TEXT), '$.receipt_id') = dups.rid \
-                 WHERE le.event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
-                 AND le.rowid != dups.keep_rowid \
+                 SELECT rowid_orig FROM ledger_events_quarantine \
+                 WHERE quarantine_reason = 'receipt_id_dedupe_migration' \
              )",
             [],
         )?;
@@ -934,6 +961,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         lease_id: &str,
         receipt_id: &str,
         changeset_digest: &[u8; 32],
+        artifact_bundle_hash: &[u8; 32],
         reason_code: u32,
         blocked_log_hash: &[u8; 32],
         reviewer_actor_id: &str,
@@ -952,6 +980,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "lease_id": lease_id,
             "receipt_id": receipt_id,
             "changeset_digest": hex::encode(changeset_digest),
+            "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
             "verdict": "BLOCKED",
             "blocked_reason_code": reason_code,
             // Preserve legacy field for backward compatibility with old readers.
@@ -2899,6 +2928,7 @@ mod tests {
         let emitter = test_emitter();
 
         let changeset_digest = [0x42u8; 32];
+        let artifact_bundle_hash = [0xA5u8; 32];
         let blocked_log_hash = [0xEEu8; 32];
 
         let identity_proof_hash = [0xDDu8; 32];
@@ -2907,6 +2937,7 @@ mod tests {
                 "lease-blocked-001",
                 "RR-BLOCKED-001",
                 &changeset_digest,
+                &artifact_bundle_hash,
                 42,
                 &blocked_log_hash,
                 "reviewer-actor-y",
@@ -2934,6 +2965,7 @@ mod tests {
     fn test_blocked_receipt_payload_contains_replay_bindings() {
         let emitter = test_emitter();
         let changeset_digest = [0x42u8; 32];
+        let artifact_bundle_hash = [0xC3u8; 32];
         let blocked_log_hash = [0xAAu8; 32];
         let identity_proof_hash = [0xBBu8; 32];
 
@@ -2942,6 +2974,7 @@ mod tests {
                 "lease-blocked-iph",
                 "RR-BLOCKED-IPH",
                 &changeset_digest,
+                &artifact_bundle_hash,
                 99,
                 &blocked_log_hash,
                 "reviewer-actor-z",
@@ -2950,9 +2983,18 @@ mod tests {
             )
             .expect("blocked receipt emit should succeed");
 
-        // Parse the payload and verify identity_proof_hash is present
+        // Parse the payload and verify replay bindings are present.
         let payload: serde_json::Value =
             serde_json::from_slice(&event.payload).expect("payload should be valid JSON");
+
+        let artifact_hash = payload
+            .get("artifact_bundle_hash")
+            .expect("payload must contain artifact_bundle_hash field");
+        assert_eq!(
+            artifact_hash.as_str().unwrap(),
+            hex::encode(artifact_bundle_hash),
+            "artifact_bundle_hash in blocked event payload must match the input"
+        );
 
         let blocked_reason_code = payload
             .get("blocked_reason_code")
