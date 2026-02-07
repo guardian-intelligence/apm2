@@ -12,17 +12,16 @@
 //! - [`SessionKeyDelegationV1::new_unchecked`]: Enforces structural and
 //!   cert-independent invariants (key-id binding, key-byte curve-point
 //!   well-formedness, validity window, max lifetime). Use for deserialization
-//!   paths where the full certificate context is not yet available. **Callers
-//!   MUST later call
-//!   [`validate_against_holon_certificate`](SessionKeyDelegationV1::validate_against_holon_certificate)
-//!   before trusting the delegation.**
+//!   paths where the full certificate context is not yet available. Returns
+//!   [`UncheckedSessionDelegation`], which **MUST** be converted via
+//!   [`UncheckedSessionDelegation::validate`] before trust.
 //!
 //! - [`SessionKeyDelegationV1::new_validated`]: Enforces all invariants
 //!   including authority binding and signature verification against a
 //!   `HolonCertificateV1`. This is the recommended constructor for production
 //!   mint paths.
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 
 use super::certificate::{CertificateError, HolonCertificateV1, validate_key_roles};
 use super::{AlgorithmTag, HolonIdV1, PublicKeyIdV1};
@@ -56,6 +55,26 @@ pub struct SessionKeyDelegationV1 {
     channel_binding: Option<[u8; 32]>,
 }
 
+/// Structurally checked, certificate-unvalidated session delegation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UncheckedSessionDelegation {
+    delegation: SessionKeyDelegationV1,
+}
+
+impl UncheckedSessionDelegation {
+    /// Validate delegation authority/signature/temporal bounds against a holon
+    /// certificate and return a fully trusted delegation.
+    pub fn validate(
+        self,
+        holon_certificate: &HolonCertificateV1,
+        current_tick: u64,
+    ) -> Result<SessionKeyDelegationV1, CertificateError> {
+        self.delegation
+            .validate_against_holon_certificate(current_tick, holon_certificate)?;
+        Ok(self.delegation)
+    }
+}
+
 impl SessionKeyDelegationV1 {
     /// Construct a session delegation enforcing **cert-independent**
     /// invariants.
@@ -71,12 +90,10 @@ impl SessionKeyDelegationV1 {
     /// # Safety contract
     ///
     /// This does **not** verify authority binding (issuer key matches a
-    /// certificate) or signature validity. Callers **MUST** subsequently call
-    /// [`validate_against_holon_certificate`](Self::validate_against_holon_certificate)
-    /// with the verifier's current HTF tick before trusting the delegation.
-    /// This constructor exists for deserialization paths where the full
-    /// certificate context is not yet available.
-    #[must_use = "delegation is not fully validated; call validate_against_holon_certificate(current_tick, certificate) before trusting"]
+    /// certificate) or signature validity. This constructor exists for
+    /// deserialization paths where the full certificate context is not yet
+    /// available.
+    #[must_use = "delegation is not fully validated; call .validate(holon_certificate, current_tick) before trusting"]
     #[allow(clippy::too_many_arguments)]
     pub fn new_unchecked(
         session_public_key_id: PublicKeyIdV1,
@@ -87,7 +104,7 @@ impl SessionKeyDelegationV1 {
         expires_at_tick: u64,
         signature: &[u8],
         channel_binding: Option<[u8; 32]>,
-    ) -> Result<Self, CertificateError> {
+    ) -> Result<UncheckedSessionDelegation, CertificateError> {
         let session_key_array =
             copy_ed25519_key("session_public_key_bytes", session_public_key_bytes)?;
         validate_ed25519_curve_point("session_public_key_bytes", &session_key_array)?;
@@ -128,7 +145,7 @@ impl SessionKeyDelegationV1 {
             signature: copy_signature(signature)?,
             channel_binding,
         };
-        Ok(delegation)
+        Ok(UncheckedSessionDelegation { delegation })
     }
 
     /// Construct a **fully validated** session delegation against a holon
@@ -164,10 +181,7 @@ impl SessionKeyDelegationV1 {
             channel_binding,
         )?;
 
-        // Full authority + temporal validation.
-        delegation.validate_against_holon_certificate(current_tick, holon_certificate)?;
-
-        Ok(delegation)
+        delegation.validate(holon_certificate, current_tick)
     }
 
     /// Return canonical unsigned bytes used for signature generation and
@@ -348,9 +362,15 @@ impl SessionKeyDelegationV1 {
                     reason: "invalid Ed25519 public key bytes".to_string(),
                 }
             })?;
+        if verifying_key.is_weak() {
+            return Err(CertificateError::InvalidField {
+                field: "issuer_operational_public_key_bytes",
+                reason: "weak/small-order Ed25519 key rejected".to_string(),
+            });
+        }
         let signature = Signature::from_bytes(&self.signature);
         verifying_key
-            .verify(&self.unsigned_bytes(), &signature)
+            .verify_strict(&self.unsigned_bytes(), &signature)
             .map_err(|_| CertificateError::SignatureVerificationFailed)
     }
 
@@ -412,7 +432,14 @@ fn validate_ed25519_curve_point(
     field: &'static str,
     bytes: &[u8; 32],
 ) -> Result<(), CertificateError> {
-    VerifyingKey::from_bytes(bytes).map_err(|_| CertificateError::MalformedKeyBytes { field })?;
+    let verifying_key = VerifyingKey::from_bytes(bytes)
+        .map_err(|_| CertificateError::MalformedKeyBytes { field })?;
+    if verifying_key.is_weak() {
+        return Err(CertificateError::InvalidField {
+            field,
+            reason: "weak/small-order Ed25519 key rejected".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -427,7 +454,7 @@ fn copy_signature(bytes: &[u8]) -> Result<[u8; 64], CertificateError> {
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::{Signer, SigningKey};
+    use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
     use super::*;
     use crate::identity::{CellGenesisV1, CellIdV1, HolonGenesisV1, HolonPurpose, PolicyRootId};
@@ -497,13 +524,19 @@ mod tests {
             .to_bytes()
     }
 
-    fn make_signed_delegation(
+    fn weak_ed25519_public_key_bytes() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[0] = 0x01;
+        key
+    }
+
+    fn make_signed_unchecked_delegation(
         fixture: &Fixture,
         session_public_key_bytes: [u8; 32],
         issued_at_envelope_ref: u64,
         expires_at_tick: u64,
         channel_binding: Option<[u8; 32]>,
-    ) -> SessionKeyDelegationV1 {
+    ) -> UncheckedSessionDelegation {
         let session_public_key_id =
             PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &session_public_key_bytes);
         let issuer_operational_public_key_id = fixture
@@ -535,6 +568,24 @@ mod tests {
             &signature,
             channel_binding,
         )
+        .unwrap()
+    }
+
+    fn make_signed_delegation(
+        fixture: &Fixture,
+        session_public_key_bytes: [u8; 32],
+        issued_at_envelope_ref: u64,
+        expires_at_tick: u64,
+        channel_binding: Option<[u8; 32]>,
+    ) -> SessionKeyDelegationV1 {
+        make_signed_unchecked_delegation(
+            fixture,
+            session_public_key_bytes,
+            issued_at_envelope_ref,
+            expires_at_tick,
+            channel_binding,
+        )
+        .validate(&fixture.holon_certificate, issued_at_envelope_ref)
         .unwrap()
     }
 
@@ -737,6 +788,80 @@ mod tests {
     }
 
     #[test]
+    fn delegation_rejects_weak_session_key_at_construction() {
+        let fixture = make_fixture();
+        let weak_session_public_key_bytes = weak_ed25519_public_key_bytes();
+        let weak_session_public_key_id =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &weak_session_public_key_bytes);
+
+        let err = SessionKeyDelegationV1::new_unchecked(
+            weak_session_public_key_id,
+            &weak_session_public_key_bytes,
+            fixture.holon_certificate.holon_id().clone(),
+            fixture
+                .holon_certificate
+                .operational_public_key_id()
+                .clone(),
+            10,
+            100,
+            &[0x00; 64],
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            CertificateError::InvalidField {
+                field: "session_public_key_bytes",
+                reason: "weak/small-order Ed25519 key rejected".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn delegation_rejects_weak_issuer_key_bytes_during_signature_verification() {
+        let fixture = make_fixture();
+        let delegation =
+            make_signed_delegation(&fixture, make_session_public_key_bytes(0x44), 10, 100, None);
+        let weak_issuer_public_key_bytes = weak_ed25519_public_key_bytes();
+
+        let err = delegation
+            .verify_signature(&weak_issuer_public_key_bytes)
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            CertificateError::InvalidField {
+                field: "issuer_operational_public_key_bytes",
+                reason: "weak/small-order Ed25519 key rejected".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn verify_strict_rejects_forged_signature_that_verify_accepts_for_weak_key() {
+        let weak_public_key_bytes = weak_ed25519_public_key_bytes();
+        let verifying_key = VerifyingKey::from_bytes(&weak_public_key_bytes).unwrap();
+        assert!(verifying_key.is_weak());
+
+        let mut forged_signature_bytes = [0u8; 64];
+        forged_signature_bytes[0] = 0x01; // R = identity (small-order point)
+        let forged_signature = Signature::from_bytes(&forged_signature_bytes);
+        let message = b"apm2:session-delegation:strict-regression";
+
+        assert!(
+            verifying_key.verify(message, &forged_signature).is_ok(),
+            "expected non-strict verify() to accept forged weak-key signature"
+        );
+        assert!(
+            verifying_key
+                .verify_strict(message, &forged_signature)
+                .is_err(),
+            "expected verify_strict() to reject forged weak-key signature"
+        );
+    }
+
+    #[test]
     fn delegation_rejects_signature_not_from_operational_key() {
         let fixture = make_fixture();
         let session_public_key_bytes = make_session_public_key_bytes(0x44);
@@ -772,7 +897,7 @@ mod tests {
         .unwrap();
 
         let err = delegation
-            .validate_against_holon_certificate(50, &fixture.holon_certificate)
+            .validate(&fixture.holon_certificate, 50)
             .unwrap_err();
         assert_eq!(err, CertificateError::SignatureVerificationFailed);
     }
@@ -782,11 +907,16 @@ mod tests {
         let fixture = make_fixture();
         let overlapping_session_key_bytes =
             *fixture.holon_certificate.operational_public_key_bytes();
-        let delegation =
-            make_signed_delegation(&fixture, overlapping_session_key_bytes, 10, 100, None);
+        let delegation = make_signed_unchecked_delegation(
+            &fixture,
+            overlapping_session_key_bytes,
+            10,
+            100,
+            None,
+        );
 
         let err = delegation
-            .validate_against_holon_certificate(50, &fixture.holon_certificate)
+            .validate(&fixture.holon_certificate, 50)
             .unwrap_err();
         assert_eq!(
             err,
@@ -800,11 +930,16 @@ mod tests {
     #[test]
     fn delegation_rejects_genesis_session_overlap() {
         let fixture = make_fixture();
-        let delegation =
-            make_signed_delegation(&fixture, fixture.genesis_public_key_bytes, 10, 100, None);
+        let delegation = make_signed_unchecked_delegation(
+            &fixture,
+            fixture.genesis_public_key_bytes,
+            10,
+            100,
+            None,
+        );
 
         let err = delegation
-            .validate_against_holon_certificate(50, &fixture.holon_certificate)
+            .validate(&fixture.holon_certificate, 50)
             .unwrap_err();
         assert_eq!(
             err,
@@ -844,9 +979,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = forged
-            .validate_against_holon_certificate(50, &fixture.holon_certificate)
-            .unwrap_err();
+        let err = forged.validate(&fixture.holon_certificate, 50).unwrap_err();
         assert!(matches!(err, CertificateError::InvalidField { field, .. } if field == "holon_id"));
     }
 

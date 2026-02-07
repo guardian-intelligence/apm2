@@ -508,19 +508,33 @@ impl HolonCertificateV1 {
             });
         }
 
-        // Fail-closed: verify genesis key bytes are a valid Ed25519 curve point.
-        VerifyingKey::from_bytes(&self.genesis_public_key_bytes).map_err(|_| {
-            CertificateError::MalformedKeyBytes {
+        // Fail-closed: verify genesis key bytes are a valid Ed25519 curve
+        // point and reject weak/small-order keys.
+        let genesis_verifying_key = VerifyingKey::from_bytes(&self.genesis_public_key_bytes)
+            .map_err(|_| CertificateError::MalformedKeyBytes {
                 field: "genesis_public_key_bytes",
-            }
-        })?;
+            })?;
+        if genesis_verifying_key.is_weak() {
+            return Err(CertificateError::InvalidField {
+                field: "genesis_public_key_bytes",
+                reason: "weak/small-order Ed25519 key rejected".to_string(),
+            });
+        }
 
-        // Fail-closed: verify operational key bytes are a valid Ed25519 curve point.
-        VerifyingKey::from_bytes(&self.operational_public_key_bytes).map_err(|_| {
-            CertificateError::MalformedKeyBytes {
+        // Fail-closed: verify operational key bytes are a valid Ed25519 curve
+        // point and reject weak/small-order keys.
+        let operational_verifying_key =
+            VerifyingKey::from_bytes(&self.operational_public_key_bytes).map_err(|_| {
+                CertificateError::MalformedKeyBytes {
+                    field: "operational_public_key_bytes",
+                }
+            })?;
+        if operational_verifying_key.is_weak() {
+            return Err(CertificateError::InvalidField {
                 field: "operational_public_key_bytes",
-            }
-        })?;
+                reason: "weak/small-order Ed25519 key rejected".to_string(),
+            });
+        }
 
         validate_key_roles(
             &self.genesis_public_key_id,
@@ -867,6 +881,12 @@ mod tests {
         let genesis =
             CellGenesisV1::new(ledger_genesis_hash, policy_root.clone(), trust_domain).unwrap();
         CellIdV1::from_genesis(&genesis)
+    }
+
+    fn weak_ed25519_public_key_bytes() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[0] = 0x01;
+        key
     }
 
     fn make_cell_certificate() -> CellCertificateV1 {
@@ -1395,6 +1415,79 @@ mod tests {
             err,
             CertificateError::MalformedKeyBytes {
                 field: "operational_public_key_bytes",
+            }
+        );
+    }
+
+    #[test]
+    fn holon_certificate_rejects_weak_genesis_key() {
+        let cert = make_holon_certificate();
+        let weak_genesis_bytes = weak_ed25519_public_key_bytes();
+        let weak_genesis_id =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &weak_genesis_bytes);
+
+        // Build a holon_id from the weak genesis key so key-id and holon-id
+        // binding checks still align, then ensure weak-key rejection fires.
+        let holon_id = HolonIdV1::from_genesis(
+            &HolonGenesisV1::new(
+                cert.cell_id().clone(),
+                weak_genesis_id.clone(),
+                weak_genesis_bytes.to_vec(),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+
+        let err = HolonCertificateV1::new(
+            holon_id,
+            cert.cell_id().clone(),
+            weak_genesis_id,
+            &weak_genesis_bytes,
+            cert.operational_public_key_id().clone(),
+            cert.operational_public_key_bytes(),
+            None,
+            None,
+            cert.endpoint_hints().to_vec(),
+            cert.purposes().to_vec(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            CertificateError::InvalidField {
+                field: "genesis_public_key_bytes",
+                reason: "weak/small-order Ed25519 key rejected".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn holon_certificate_rejects_weak_operational_key() {
+        let cert = make_holon_certificate();
+        let weak_operational_bytes = weak_ed25519_public_key_bytes();
+        let weak_operational_id =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &weak_operational_bytes);
+
+        let err = HolonCertificateV1::new(
+            cert.holon_id().clone(),
+            cert.cell_id().clone(),
+            cert.genesis_public_key_id().clone(),
+            cert.genesis_public_key_bytes(),
+            weak_operational_id,
+            &weak_operational_bytes,
+            None,
+            None,
+            cert.endpoint_hints().to_vec(),
+            cert.purposes().to_vec(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            CertificateError::InvalidField {
+                field: "operational_public_key_bytes",
+                reason: "weak/small-order Ed25519 key rejected".to_string(),
             }
         );
     }
