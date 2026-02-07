@@ -3,13 +3,17 @@ evidence_artifact:
   id: "EVID-0017"
   title: "ReceiptPointerV1 and ReceiptMultiProofV1 conformance evidence"
   category: "UNIT_TEST_RESULT"
-  status: "PASS"
+  status: "PARTIAL"
   description: |
     Evidence that REQ-0017 acceptance criteria are met by the
     ReceiptPointerV1 and ReceiptMultiProofV1 implementation in the daemon
     identity module. The implementation supports direct-signature and
-    batch/Merkle authentication paths with equivalent acceptance semantics,
-    and provides compact multiproof verification for batch membership.
+    batch/Merkle authentication paths with equivalent acceptance semantics.
+
+    Implementation status (scope-narrowed): partial. Independent per-receipt
+    inclusion proofs are implemented for multiproof verification. The compact
+    shared-sibling wire shape from RFC-0020 §9.5.5 (`proof_nodes[]` +
+    `proof_structure`) is deferred to TCK-00370.
 
     ReceiptPointerV1 construction: direct pointers require non-zero
     receipt_hash and authority_seal_hash. Batch pointers additionally
@@ -37,16 +41,15 @@ evidence_artifact:
     receipt_hash fields, confirming behavioral acceptance equivalence
     between the two authentication paths.
 
-    ReceiptMultiProofV1 construction: multiproofs require non-empty,
-    canonically sorted, deduplicated receipt hashes with matching proof
-    count. Each individual proof must verify against the batch root at
+    ReceiptMultiProofV1 construction (partial wire shape): multiproofs require
+    non-empty, canonically sorted, deduplicated receipt hashes with matching
+    proof count. Each individual proof must verify against the batch root at
     construction time. Zero authority_seal_hash is rejected.
 
-    Multiproof verification: the verifier validates the seal signature
-    once (O(1) signature checks) and independently re-verifies every
-    inclusion proof at verification time for all K receipts, achieving
-    O(1) signature + O(K log B) hashing verification cost per RFC-0020
-    §9.5.3.
+    Multiproof verification (independent proofs): the verifier validates the
+    seal signature once (O(1) signature checks) and independently re-verifies
+    every inclusion proof at verification time for all K receipts, achieving
+    O(1) signature + O(K log B) hashing verification cost per RFC-0020 §9.5.3.
 
     Canonical bytes: both ReceiptPointerV1 and ReceiptMultiProofV1
     produce deterministic canonical byte representations suitable for
@@ -125,10 +128,13 @@ evidence_artifact:
         Unified verify() dispatch:
         - unified_verify_dispatches_direct: dispatches to direct path
         - unified_verify_dispatches_batch: dispatches to batch path
+        - unified_verify_with_verifier_dispatches_quorum_batch: unified API
+          dispatches to quorum batch verification when explicitly provided
         - unified_verify_rejects_fact_root: FactRoot returns deferred error
       ref:
         - "cargo test -p apm2-daemon identity::receipt_pointer::tests::unified_verify_dispatches_direct"
         - "cargo test -p apm2-daemon identity::receipt_pointer::tests::unified_verify_dispatches_batch"
+        - "cargo test -p apm2-daemon identity::receipt_pointer::tests::unified_verify_with_verifier_dispatches_quorum_batch"
         - "cargo test -p apm2-daemon identity::receipt_pointer::tests::unified_verify_rejects_fact_root"
     - type: "test_output"
       description: |
@@ -157,6 +163,16 @@ evidence_artifact:
         - "cargo test -p apm2-daemon identity::receipt_pointer::tests::multiproof_rejects_zero_seal_hash"
         - "cargo test -p apm2-daemon identity::receipt_pointer::tests::multiproof_rejects_wrong_root"
         - "cargo test -p apm2-daemon identity::receipt_pointer::tests::multiproof_valid_construction_and_membership"
+    - type: "test_output"
+      description: |
+        Proof-count mismatch handling:
+        - multiproof_rejects_mismatched_proof_count: constructor reports
+          ProofCountMismatch for receipt/proof count mismatch
+        - verify_multiproof_rejects_proof_count_mismatch_at_verification_boundary:
+          verifier reports ProofCountMismatch on malformed decoded multiproof
+      ref:
+        - "cargo test -p apm2-daemon identity::receipt_pointer::tests::multiproof_rejects_mismatched_proof_count"
+        - "cargo test -p apm2-daemon identity::receipt_pointer::tests::verify_multiproof_rejects_proof_count_mismatch_at_verification_boundary"
     - type: "test_output"
       description: |
         Multiproof canonical bytes and content-addressing:

@@ -8,9 +8,10 @@
 //!   authentication paths.
 //! - [`ReceiptMultiProofV1`]: a batched verification container that proves
 //!   multiple receipt hashes are members of a single batch root. Each receipt
-//!   carries its own independent inclusion proof; shared-node deduplication
-//!   (the "compact multiproof" optimization from §9.5.5) is deferred to a
-//!   future ticket. Correctness and acceptance equivalence take priority.
+//!   currently carries its own independent inclusion proof; the compact
+//!   shared-sibling wire shape (`proof_nodes[]` + `proof_structure`) from
+//!   RFC-0020 §9.5.5 is deferred to TCK-00370. Correctness and acceptance
+//!   equivalence take priority.
 //! - [`ReceiptPointerVerifier`]: a unified verifier that accepts both direct
 //!   and batched semantics with equivalent acceptance behavior.
 //!
@@ -40,9 +41,9 @@
 //! When a sender transmits multiple receipt pointers from the same batch,
 //! it bundles them into a `ReceiptMultiProofV1` container. The current
 //! implementation uses K independent inclusion proofs (one per receipt).
-//! The compact multiproof optimization (shared-node deduplication) that
-//! would reduce network fanout and verifier hashing work is deferred to
-//! a future ticket.
+//! The compact multiproof optimization (shared-node deduplication via
+//! `proof_nodes[]` + `proof_structure`) that would reduce network fanout
+//! and verifier hashing work is deferred to TCK-00370.
 //!
 //! # Security Invariants
 //!
@@ -158,6 +159,15 @@ pub enum ReceiptPointerError {
         count: usize,
         /// Maximum allowed.
         max: usize,
+    },
+
+    /// Multiproof proof count does not match receipt count.
+    #[error("multiproof proof count mismatch: expected {expected}, got {actual}")]
+    ProofCountMismatch {
+        /// Expected proof count (one proof per receipt).
+        expected: usize,
+        /// Actual provided proof count.
+        actual: usize,
     },
 
     /// Multiproof has zero leaves.
@@ -496,6 +506,10 @@ impl ReceiptPointerV1 {
 /// - `receipt_hashes[]`: K receipt hashes, canonically sorted
 /// - `authority_seal_hash`: hash of the seal authenticating the batch root
 /// - `individual_proofs[]`: one `MerkleInclusionProof` per receipt
+///
+/// Target compact wire shape (`proof_nodes[]` + `proof_structure`) is
+/// deferred to TCK-00370.
+// TODO(TCK-00370): Implement compact shared-sibling multiproof wire shape per RFC-0020 §9.5.5.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptMultiProofV1 {
     /// The batch Merkle root hash being proven against.
@@ -575,9 +589,9 @@ impl ReceiptMultiProofV1 {
 
         // Validate proof count matches receipt count.
         if individual_proofs.len() != receipt_hashes.len() {
-            return Err(ReceiptPointerError::TooManyProofNodes {
-                count: individual_proofs.len(),
-                max: receipt_hashes.len(),
+            return Err(ReceiptPointerError::ProofCountMismatch {
+                expected: receipt_hashes.len(),
+                actual: individual_proofs.len(),
             });
         }
 
@@ -1049,19 +1063,23 @@ impl ReceiptPointerVerifier {
     }
 
     /// Verify a receipt pointer (either direct or batch) against a
-    /// resolved authority seal.
+    /// resolved authority seal, with explicit batch-verifier dispatch.
     ///
-    /// This is the primary entry point for verification. It dispatches
-    /// to the appropriate verification method based on the pointer kind.
+    /// This unified entry point dispatches to the appropriate verification
+    /// method based on pointer kind:
+    /// - `Direct`: uses `verifying_key`
+    /// - `Batch`: uses `batch_verifier` (single-key or quorum)
+    ///
     /// Both paths produce equivalent `VerificationResult` values.
     ///
     /// # Errors
     ///
     /// Returns an error if verification fails for any reason.
-    pub fn verify(
+    pub fn verify_with_verifier(
         pointer: &ReceiptPointerV1,
         seal: &AuthoritySealV1,
         verifying_key: &ed25519_dalek::VerifyingKey,
+        batch_verifier: BatchSealVerifier<'_>,
         expected_subject_kind: &str,
         require_temporal: bool,
     ) -> Result<VerificationResult, ReceiptPointerError> {
@@ -1076,12 +1094,35 @@ impl ReceiptPointerVerifier {
             PointerKind::Batch => Self::verify_batch(
                 pointer,
                 seal,
-                BatchSealVerifier::SingleKey(verifying_key),
+                batch_verifier,
                 expected_subject_kind,
                 require_temporal,
             ),
             PointerKind::FactRoot => Err(ReceiptPointerError::FactRootNotImplemented),
         }
+    }
+
+    /// Verify a receipt pointer (either direct or batch) against a
+    /// resolved authority seal.
+    ///
+    /// Backward-compatible convenience wrapper that uses single-key batch
+    /// verification. Use [`Self::verify_with_verifier`] to dispatch quorum
+    /// batch verification via the same unified API.
+    pub fn verify(
+        pointer: &ReceiptPointerV1,
+        seal: &AuthoritySealV1,
+        verifying_key: &ed25519_dalek::VerifyingKey,
+        expected_subject_kind: &str,
+        require_temporal: bool,
+    ) -> Result<VerificationResult, ReceiptPointerError> {
+        Self::verify_with_verifier(
+            pointer,
+            seal,
+            verifying_key,
+            BatchSealVerifier::SingleKey(verifying_key),
+            expected_subject_kind,
+            require_temporal,
+        )
     }
 
     /// Verify a multiproof: validate that the authority seal
@@ -1123,9 +1164,9 @@ impl ReceiptPointerVerifier {
         }
         validate_canonical_receipt_hashes(&multiproof.receipt_hashes)?;
         if multiproof.individual_proofs.len() != multiproof.receipt_hashes.len() {
-            return Err(ReceiptPointerError::TooManyProofNodes {
-                count: multiproof.individual_proofs.len(),
-                max: multiproof.receipt_hashes.len(),
+            return Err(ReceiptPointerError::ProofCountMismatch {
+                expected: multiproof.receipt_hashes.len(),
+                actual: multiproof.individual_proofs.len(),
             });
         }
         let total_nodes: usize = multiproof
@@ -1969,6 +2010,36 @@ mod tests {
     }
 
     #[test]
+    fn unified_verify_with_verifier_dispatches_quorum_batch() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let receipt_hashes = [[0x42; 32], [0x43; 32]];
+        let (root, proofs) = build_merkle_tree(&receipt_hashes);
+        let (seal, quorum_keys) = make_quorum_batch_seal_multisig(&signer_a, &signer_b, &root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+        let ptr =
+            ReceiptPointerV1::new_batch(receipt_hashes[1], seal_hash, proofs[1].clone()).unwrap();
+
+        let result = ReceiptPointerVerifier::verify_with_verifier(
+            &ptr,
+            &seal,
+            &quorum_keys[0],
+            BatchSealVerifier::QuorumMultisig {
+                verifying_keys: &quorum_keys,
+                weights: None,
+            },
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            result.is_ok(),
+            "unified verifier must accept quorum-issued MERKLE_BATCH pointer when quorum verifier is provided, got: {result:?}",
+        );
+        assert_eq!(result.unwrap().pointer_kind, PointerKind::Batch);
+    }
+
+    #[test]
     fn unified_verify_rejects_fact_root() {
         let signer = Signer::generate();
         let receipt_hash = [0x42; HASH_SIZE];
@@ -2069,7 +2140,10 @@ mod tests {
         let result = ReceiptMultiProofV1::new(root, hashes, [0xAA; 32], vec![proofs[0].clone()]);
         assert!(matches!(
             result,
-            Err(ReceiptPointerError::TooManyProofNodes { .. })
+            Err(ReceiptPointerError::ProofCountMismatch {
+                expected: 2,
+                actual: 1,
+            })
         ));
     }
 
@@ -2677,6 +2751,37 @@ mod tests {
         assert!(
             matches!(result, Err(ReceiptPointerError::TooManyProofNodes { .. })),
             "expected TooManyProofNodes, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn verify_multiproof_rejects_proof_count_mismatch_at_verification_boundary() {
+        let signer = Signer::generate();
+        let mut hashes = vec![[0x42; 32], [0x43; 32]];
+        hashes.sort_unstable();
+        let (root, proofs) = build_merkle_tree(&hashes);
+        let seal = make_batch_seal(&signer, &root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+        let malformed =
+            ReceiptMultiProofV1::new_unchecked(root, hashes, seal_hash, vec![proofs[0].clone()]);
+
+        let result = ReceiptPointerVerifier::verify_multiproof(
+            &malformed,
+            &seal,
+            BatchSealVerifier::SingleKey(&signer.verifying_key()),
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(ReceiptPointerError::ProofCountMismatch {
+                    expected: 2,
+                    actual: 1,
+                })
+            ),
+            "expected ProofCountMismatch(expected=2, actual=1), got: {result:?}",
         );
     }
 
