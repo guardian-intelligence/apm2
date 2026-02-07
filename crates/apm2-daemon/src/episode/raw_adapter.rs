@@ -72,7 +72,9 @@ use tokio::sync::{Mutex, Semaphore};
 
 use super::adapter::{
     AdapterError, AdapterResult, AdapterType, HarnessAdapter, HarnessConfig, HarnessEvent,
-    HarnessEventStream, HarnessHandle, HarnessHandleInner, OutputKind, TerminationClassification,
+    HarnessEventStream, HarnessHandle, OutputKind, TerminationClassification,
+    create_real_handle_inner, process_pty_control_command, pty_control_channel_capacity,
+    read_proc_start_time, send_input_with_handle, terminate_with_handle,
 };
 use super::pty::{PtyConfig, PtyRunner};
 
@@ -300,6 +302,14 @@ impl RawAdapter {
         // Spawn the process via PtyRunner
         let mut runner = PtyRunner::spawn(&config.command, &args, pty_config, timestamp_ns)
             .map_err(|e| AdapterError::spawn_failed(format!("PTY spawn failed: {e}")))?;
+        let pid_raw = runner.pid().as_raw();
+        let pid = u32::try_from(pid_raw)
+            .map_err(|_| AdapterError::spawn_failed(format!("invalid PTY child pid: {pid_raw}")))?;
+        let start_time_ticks = read_proc_start_time(pid);
+
+        let (control_tx, mut control_rx) =
+            tokio::sync::mpsc::channel(pty_control_channel_capacity());
+        let handle_inner = create_real_handle_inner(pid, start_time_ticks, control_tx);
 
         // Create the event channel
         let (tx, rx) = tokio::sync::mpsc::channel(256);
@@ -318,31 +328,59 @@ impl RawAdapter {
             let _permit = permit;
 
             let mut seq = 0u64;
+            let mut exit_status = None;
+            let mut control_open = true;
 
-            // Read output from PTY and emit events
-            while let Some(output) = runner.recv().await {
-                let event = HarnessEvent::output(
-                    output.chunk.to_vec(),
-                    OutputKind::Combined,
-                    seq,
-                    output.ts_mono,
-                );
-                seq += 1;
+            loop {
+                tokio::select! {
+                    maybe_cmd = control_rx.recv(), if control_open => {
+                        match maybe_cmd {
+                            Some(command) => {
+                                if let Some(status) = process_pty_control_command(
+                                    command,
+                                    &mut runner,
+                                    pid,
+                                    start_time_ticks,
+                                ).await {
+                                    exit_status = Some(status);
+                                    break;
+                                }
+                            }
+                            None => {
+                                control_open = false;
+                            }
+                        }
+                    }
+                    maybe_output = runner.recv() => {
+                        if let Some(output) = maybe_output {
+                            let event = HarnessEvent::output(
+                                output.chunk.to_vec(),
+                                OutputKind::Combined,
+                                seq,
+                                output.ts_mono,
+                            );
+                            seq += 1;
 
-                // Update shared state with output count if provided
-                if let Some(ref state) = shared_state {
-                    let mut guard = state.lock().await;
-                    guard.output_event_count = seq;
-                }
+                            // Update shared state with output count if provided
+                            if let Some(ref state) = shared_state {
+                                let mut guard = state.lock().await;
+                                guard.output_event_count = seq;
+                            }
 
-                if tx.send(event).await.is_err() {
-                    // Receiver dropped, stop reading
-                    break;
+                            if tx.send(event).await.is_err() {
+                                // Receiver dropped, stop reading
+                                break;
+                            }
+                        } else {
+                            exit_status = Some(runner.wait().unwrap_or(super::pty::ExitStatus::Running));
+                            break;
+                        }
+                    }
                 }
             }
 
-            // Wait for process to exit and get status
-            let exit_status = runner.wait().unwrap_or(super::pty::ExitStatus::Running);
+            let exit_status = exit_status
+                .unwrap_or_else(|| runner.wait().unwrap_or(super::pty::ExitStatus::Running));
 
             let exit_code = exit_status.code();
             let classification = Self::classify_exit(exit_status);
@@ -363,7 +401,7 @@ impl RawAdapter {
             // Permit is automatically released when dropped here
         });
 
-        let handle = HarnessHandle::new(handle_id, episode_id, HarnessHandleInner::Placeholder);
+        let handle = HarnessHandle::new(handle_id, episode_id, handle_inner);
 
         Ok((handle, rx))
     }
@@ -396,32 +434,22 @@ impl HarnessAdapter for RawAdapter {
 
     fn send_input(
         &self,
-        _handle: &HarnessHandle,
-        _input: &[u8],
+        handle: &HarnessHandle,
+        input: &[u8],
     ) -> Pin<Box<dyn std::future::Future<Output = AdapterResult<()>> + Send + '_>> {
-        Box::pin(async move {
-            // Note: To fully implement send_input, we would need to store the PtyRunner
-            // in the HarnessHandleInner. For now, return an error indicating this
-            // limitation. A future ticket can enhance this to support interactive input.
-            Err(AdapterError::input_failed(
-                "raw adapter send_input requires handle-based PTY storage (not yet implemented)",
-            ))
-        })
+        let handle_id = handle.id();
+        let runner_handle = handle.real_runner_handle();
+        let input = input.to_vec();
+        Box::pin(async move { send_input_with_handle(handle_id, runner_handle, input).await })
     }
 
     fn terminate(
         &self,
-        _handle: &HarnessHandle,
+        handle: &HarnessHandle,
     ) -> Pin<Box<dyn std::future::Future<Output = AdapterResult<ExitStatus>> + Send + '_>> {
-        Box::pin(async move {
-            // Note: Similar to send_input, full terminate support requires storing
-            // the PtyRunner in HarnessHandleInner. The spawned task will handle
-            // cleanup when dropped. For explicit termination, we would need to
-            // signal the runner via the handle.
-            Err(AdapterError::terminate_failed(
-                "raw adapter terminate requires handle-based PTY storage (not yet implemented)",
-            ))
-        })
+        let handle_id = handle.id();
+        let runner_handle = handle.real_runner_handle();
+        Box::pin(async move { terminate_with_handle(handle_id, runner_handle).await })
     }
 }
 
@@ -932,31 +960,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_raw_adapter_send_input_not_implemented() {
+    async fn test_raw_adapter_send_input_and_terminate() {
         let adapter = RawAdapter::new();
-        let config = HarnessConfig::new("cat", "episode-test");
+        let config = HarnessConfig::new("cat", "episode-interactive");
 
-        let (handle, _events) = adapter.spawn(config).await.unwrap();
+        let (handle, mut events) = adapter.spawn(config).await.unwrap();
+        let (pid, start_time_ticks) = match &handle.inner {
+            super::super::adapter::HarnessHandleInner::Real(real) => {
+                let guard = real.lock().await;
+                (guard.pid, guard.start_time_ticks)
+            },
+        };
+        assert!(
+            start_time_ticks.is_some(),
+            "spawn should capture start-time binding for PID validation"
+        );
 
-        let result = adapter.send_input(&handle, b"test input").await;
-        assert!(result.is_err());
+        adapter
+            .send_input(&handle, b"hello from raw adapter\n")
+            .await
+            .unwrap();
 
-        let err = result.unwrap_err();
-        assert!(matches!(err, AdapterError::InputFailed { .. }));
-    }
+        let observed_output = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if let HarnessEvent::Output { chunk, .. } = event {
+                    if String::from_utf8_lossy(&chunk).contains("hello from raw adapter") {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .expect("timed out waiting for output event");
+        assert!(observed_output, "expected echo output from cat");
 
-    #[tokio::test]
-    async fn test_raw_adapter_terminate_not_implemented() {
-        let adapter = RawAdapter::new();
-        let config = HarnessConfig::new("sleep", "episode-test").with_args(vec!["1".to_string()]);
+        let exit_status = adapter.terminate(&handle).await.unwrap();
+        assert!(
+            !exit_status.success(),
+            "terminate should stop the process via signal"
+        );
 
-        let (handle, _events) = adapter.spawn(config).await.unwrap();
+        let terminated_event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if let HarnessEvent::Terminated { .. } = event {
+                    return Some(event);
+                }
+            }
+            None
+        })
+        .await
+        .expect("timed out waiting for terminated event")
+        .expect("expected terminated event after terminate()");
 
-        let result = adapter.terminate(&handle).await;
-        assert!(result.is_err());
+        if let HarnessEvent::Terminated { classification, .. } = terminated_event {
+            assert!(matches!(
+                classification,
+                TerminationClassification::Killed | TerminationClassification::Terminated
+            ));
+        }
 
-        let err = result.unwrap_err();
-        assert!(matches!(err, AdapterError::TerminateFailed { .. }));
+        if let Some(expected_start) = start_time_ticks {
+            assert_ne!(
+                super::super::adapter::read_proc_start_time(pid),
+                Some(expected_start),
+                "original process identity must not remain alive after terminate"
+            );
+        }
+
+        let send_after_terminate = adapter.send_input(&handle, b"post-terminate\n").await;
+        assert!(matches!(
+            send_after_terminate,
+            Err(AdapterError::InvalidHandle { .. })
+        ));
     }
 
     #[test]

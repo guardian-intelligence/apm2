@@ -37,11 +37,14 @@ use std::fmt;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::ExitStatus;
+use std::sync::Arc;
+use std::time::Duration;
 
+use nix::sys::signal::Signal;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 // ============================================================================
 // Validation Constants
@@ -633,6 +636,59 @@ impl HarnessConfig {
     }
 }
 
+const PTY_CONTROL_CHANNEL_CAPACITY: usize = 8;
+const TERMINATE_GRACE_PERIOD: Duration = Duration::from_secs(3);
+const TERMINATE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Control messages for the runner-owning task.
+pub(crate) enum PtyControlCommand {
+    SendInput {
+        input: Vec<u8>,
+        respond_to: oneshot::Sender<AdapterResult<()>>,
+    },
+    Terminate {
+        grace_period: Duration,
+        respond_to: oneshot::Sender<AdapterResult<super::pty::ExitStatus>>,
+    },
+}
+
+/// Shared control handle stored in `HarnessHandle`.
+#[derive(Debug)]
+pub(crate) struct PtyRunnerHandle {
+    pub(crate) pid: u32,
+    pub(crate) start_time_ticks: Option<u64>,
+    control_tx: Option<mpsc::Sender<PtyControlCommand>>,
+    terminated: bool,
+}
+
+impl PtyRunnerHandle {
+    const fn new(
+        pid: u32,
+        start_time_ticks: Option<u64>,
+        control_tx: mpsc::Sender<PtyControlCommand>,
+    ) -> Self {
+        Self {
+            pid,
+            start_time_ticks,
+            control_tx: Some(control_tx),
+            terminated: false,
+        }
+    }
+
+    fn control_channel(&self) -> Option<mpsc::Sender<PtyControlCommand>> {
+        self.control_tx.clone()
+    }
+
+    const fn is_terminated(&self) -> bool {
+        self.terminated
+    }
+
+    fn mark_terminated(&mut self) {
+        self.terminated = true;
+        self.control_tx = None;
+    }
+}
+
 /// Handle to a running harness process.
 ///
 /// This opaque handle is used to interact with a spawned process through
@@ -647,18 +703,14 @@ pub struct HarnessHandle {
     pub(crate) episode_id: String,
 
     /// Adapter-specific internal state.
-    ///
-    /// The actual type depends on the adapter implementation.
-    /// This field will be used when PTY integration is implemented.
-    #[allow(dead_code)]
     pub(crate) inner: HarnessHandleInner,
 }
 
 /// Adapter-specific handle state.
 #[derive(Debug)]
-pub enum HarnessHandleInner {
-    /// Placeholder for adapters not yet implemented.
-    Placeholder,
+pub(crate) enum HarnessHandleInner {
+    /// Real PTY-backed process control state.
+    Real(Arc<Mutex<PtyRunnerHandle>>),
 }
 
 impl HarnessHandle {
@@ -683,6 +735,291 @@ impl HarnessHandle {
     pub fn episode_id(&self) -> &str {
         &self.episode_id
     }
+
+    pub(crate) fn real_runner_handle(&self) -> Arc<Mutex<PtyRunnerHandle>> {
+        let HarnessHandleInner::Real(handle) = &self.inner;
+        Arc::clone(handle)
+    }
+}
+
+/// Channel capacity for PTY control commands.
+#[must_use]
+pub const fn pty_control_channel_capacity() -> usize {
+    PTY_CONTROL_CHANNEL_CAPACITY
+}
+
+/// Builds a real harness handle state from a child PID and control channel.
+pub(crate) fn create_real_handle_inner(
+    pid: u32,
+    start_time_ticks: Option<u64>,
+    control_tx: mpsc::Sender<PtyControlCommand>,
+) -> HarnessHandleInner {
+    let handle = PtyRunnerHandle::new(pid, start_time_ticks, control_tx);
+    HarnessHandleInner::Real(Arc::new(Mutex::new(handle)))
+}
+
+/// Sends input bytes to a spawned harness process via the real handle.
+pub(crate) async fn send_input_with_handle(
+    handle_id: u64,
+    runner_handle: Arc<Mutex<PtyRunnerHandle>>,
+    input: Vec<u8>,
+) -> AdapterResult<()> {
+    let (control_tx, pid) = {
+        let guard = runner_handle.lock().await;
+        if guard.is_terminated() {
+            return Err(AdapterError::invalid_handle(format!(
+                "handle {} for pid {} is already terminated",
+                handle_id, guard.pid
+            )));
+        }
+        let control_tx = guard.control_channel().ok_or_else(|| {
+            AdapterError::invalid_handle(format!(
+                "handle {} for pid {} has no active PTY control channel",
+                handle_id, guard.pid
+            ))
+        })?;
+        (control_tx, guard.pid)
+    };
+
+    let (respond_to, response_rx) = oneshot::channel();
+    control_tx
+        .send(PtyControlCommand::SendInput { input, respond_to })
+        .await
+        .map_err(|_| {
+            AdapterError::invalid_handle(format!(
+                "handle {handle_id} for pid {pid} PTY task is no longer active"
+            ))
+        })?;
+
+    response_rx.await.map_err(|_| {
+        AdapterError::invalid_handle(format!(
+            "handle {handle_id} PTY task dropped input response"
+        ))
+    })?
+}
+
+/// Terminates a spawned harness process via the real handle.
+pub(crate) async fn terminate_with_handle(
+    handle_id: u64,
+    runner_handle: Arc<Mutex<PtyRunnerHandle>>,
+) -> AdapterResult<ExitStatus> {
+    let (control_tx, pid) = {
+        let guard = runner_handle.lock().await;
+        if guard.is_terminated() {
+            return Err(AdapterError::invalid_handle(format!(
+                "handle {} for pid {} is already terminated",
+                handle_id, guard.pid
+            )));
+        }
+        if guard.start_time_ticks.is_none() {
+            return Err(AdapterError::terminate_failed(format!(
+                "refusing terminate for handle {} pid {} without start-time binding",
+                handle_id, guard.pid
+            )));
+        }
+        let control_tx = guard.control_channel().ok_or_else(|| {
+            AdapterError::invalid_handle(format!(
+                "handle {} for pid {} has no active PTY control channel",
+                handle_id, guard.pid
+            ))
+        })?;
+        (control_tx, guard.pid)
+    };
+
+    let (respond_to, response_rx) = oneshot::channel();
+    control_tx
+        .send(PtyControlCommand::Terminate {
+            grace_period: TERMINATE_GRACE_PERIOD,
+            respond_to,
+        })
+        .await
+        .map_err(|_| {
+            AdapterError::invalid_handle(format!(
+                "handle {handle_id} for pid {pid} PTY task is no longer active"
+            ))
+        })?;
+
+    let terminate_result = response_rx.await.map_err(|_| {
+        AdapterError::invalid_handle(format!(
+            "handle {handle_id} PTY task dropped termination response"
+        ))
+    })?;
+
+    {
+        let mut guard = runner_handle.lock().await;
+        guard.mark_terminated();
+    }
+
+    map_pty_exit_status(terminate_result?)
+}
+
+/// Processes a control message for a PTY runner.
+pub(crate) async fn process_pty_control_command(
+    command: PtyControlCommand,
+    runner: &mut super::pty::PtyRunner,
+    pid: u32,
+    start_time_ticks: Option<u64>,
+) -> Option<super::pty::ExitStatus> {
+    match command {
+        PtyControlCommand::SendInput { input, respond_to } => {
+            let result = runner.send_input(&input).await.map_err(|e| {
+                AdapterError::input_failed(format!(
+                    "failed to write to PTY stdin for pid {pid}: {e}"
+                ))
+            });
+            let _ = respond_to.send(result);
+            None
+        },
+        PtyControlCommand::Terminate {
+            grace_period,
+            respond_to,
+        } => {
+            let result = terminate_runner(runner, pid, start_time_ticks, grace_period).await;
+            let status = result.as_ref().ok().copied();
+            let _ = respond_to.send(result);
+            status
+        },
+    }
+}
+
+/// Gracefully terminates a runner with SIGTERM then SIGKILL fallback.
+pub(crate) async fn terminate_runner(
+    runner: &mut super::pty::PtyRunner,
+    pid: u32,
+    start_time_ticks: Option<u64>,
+    grace_period: Duration,
+) -> AdapterResult<super::pty::ExitStatus> {
+    match runner.try_wait() {
+        Ok(super::pty::ExitStatus::Running) => {},
+        Ok(status) => return Ok(status),
+        Err(e) => {
+            return Err(AdapterError::terminate_failed(format!(
+                "failed to query process state for pid {pid}: {e}"
+            )));
+        },
+    }
+
+    ensure_pid_binding(runner, pid, start_time_ticks)?;
+    if let Err(e) = runner.signal(Signal::SIGTERM) {
+        if let Ok(status) = runner.try_wait() {
+            if !matches!(status, super::pty::ExitStatus::Running) {
+                return Ok(status);
+            }
+        }
+        return Err(AdapterError::terminate_failed(format!(
+            "failed to send SIGTERM to pid {pid}: {e}"
+        )));
+    }
+
+    let deadline = tokio::time::Instant::now() + grace_period;
+    loop {
+        match runner.try_wait() {
+            Ok(super::pty::ExitStatus::Running) => {},
+            Ok(status) => return Ok(status),
+            Err(e) => {
+                return Err(AdapterError::terminate_failed(format!(
+                    "failed to poll termination status for pid {pid}: {e}"
+                )));
+            },
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(TERMINATE_POLL_INTERVAL).await;
+    }
+
+    ensure_pid_binding(runner, pid, start_time_ticks)?;
+    if let Err(e) = runner.signal(Signal::SIGKILL) {
+        if let Ok(status) = runner.try_wait() {
+            if !matches!(status, super::pty::ExitStatus::Running) {
+                return Ok(status);
+            }
+        }
+        return Err(AdapterError::terminate_failed(format!(
+            "failed to send SIGKILL to pid {pid}: {e}"
+        )));
+    }
+
+    runner.wait().map_err(|e| {
+        AdapterError::terminate_failed(format!("failed to reap terminated process pid {pid}: {e}"))
+    })
+}
+
+fn map_pty_exit_status(status: super::pty::ExitStatus) -> AdapterResult<ExitStatus> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        match status {
+            super::pty::ExitStatus::Exited(code) => Ok(ExitStatus::from_raw(code << 8)),
+            super::pty::ExitStatus::Signaled(signal) => Ok(ExitStatus::from_raw(signal as i32)),
+            super::pty::ExitStatus::Running => Err(AdapterError::terminate_failed(
+                "process still running after terminate request",
+            )),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        Err(AdapterError::terminate_failed(
+            "process termination status conversion is unsupported on non-unix targets",
+        ))
+    }
+}
+
+fn ensure_pid_binding(
+    runner: &mut super::pty::PtyRunner,
+    pid: u32,
+    start_time_ticks: Option<u64>,
+) -> AdapterResult<()> {
+    match validate_pid_binding(pid, start_time_ticks) {
+        Ok(()) => Ok(()),
+        Err(validation_err) => match runner.try_wait() {
+            Ok(status) if !matches!(status, super::pty::ExitStatus::Running) => Ok(()),
+            _ => Err(validation_err),
+        },
+    }
+}
+
+fn validate_pid_binding(pid: u32, start_time_ticks: Option<u64>) -> AdapterResult<()> {
+    let expected_start = start_time_ticks.ok_or_else(|| {
+        AdapterError::terminate_failed(format!(
+            "refusing signal delivery to pid {pid}: missing start-time binding"
+        ))
+    })?;
+
+    let current_start = read_proc_start_time(pid).ok_or_else(|| {
+        AdapterError::terminate_failed(format!(
+            "refusing signal delivery to pid {pid}: process identity unavailable"
+        ))
+    })?;
+
+    if current_start != expected_start {
+        return Err(AdapterError::terminate_failed(format!(
+            "refusing signal delivery to pid {pid}: PID identity mismatch (expected start {expected_start}, found {current_start})"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Reads `/proc/<pid>/stat` field 22 (`starttime`) for PID-reuse validation.
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn read_proc_start_time(pid: u32) -> Option<u64> {
+    let stat_path = format!("/proc/{pid}/stat");
+    let contents = std::fs::read_to_string(stat_path).ok()?;
+    let after_comm = contents.rsplit_once(')')?.1;
+    let tokens: Vec<&str> = after_comm.split_whitespace().collect();
+    tokens.get(19)?.parse::<u64>().ok()
+}
+
+#[cfg(not(unix))]
+#[must_use]
+pub(crate) const fn read_proc_start_time(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// Output stream kind.
@@ -1396,13 +1733,17 @@ mod tests {
 
     #[test]
     fn test_harness_handle_accessors() {
-        let handle = HarnessHandle::new(
-            42,
-            "episode-abc".to_string(),
-            HarnessHandleInner::Placeholder,
-        );
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(1);
+        let inner = create_real_handle_inner(4242, Some(123), control_tx);
+        let handle = HarnessHandle::new(42, "episode-abc".to_string(), inner);
 
         assert_eq!(handle.id(), 42);
         assert_eq!(handle.episode_id(), "episode-abc");
+    }
+
+    #[test]
+    fn test_harness_handle_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<HarnessHandle>();
     }
 }
