@@ -851,12 +851,16 @@ pub(crate) async fn terminate_with_handle(
                 handle_id, guard.pid
             )));
         }
+        // Fail-closed: refuse to terminate without start-time binding.
+        // Without a start-time binding, we cannot validate PID identity
+        // before signal delivery, which risks sending signals to a
+        // recycled PID (a different process).
         if guard.start_time_ticks.is_none() {
-            tracing::warn!(
-                handle_id,
-                pid = guard.pid,
-                "terminating handle without start-time binding (PID reuse guard unavailable)"
-            );
+            return Err(AdapterError::terminate_failed(format!(
+                "handle {} for pid {}: refusing termination without start-time binding \
+                 (PID reuse guard unavailable)",
+                handle_id, guard.pid,
+            )));
         }
         let control_tx = guard.control_channel().ok_or_else(|| {
             AdapterError::invalid_handle(format!(

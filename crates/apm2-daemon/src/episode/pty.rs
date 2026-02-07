@@ -58,6 +58,8 @@ use std::io::{self, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use nix::errno::Errno;
@@ -694,6 +696,14 @@ impl PtyRunner {
     ///
     /// This is the internal implementation that accepts a configurable
     /// deadline, allowing tests to use shorter timeouts.
+    ///
+    /// # Cancellation Safety
+    ///
+    /// When the async-level timeout fires, the `cancelled` flag is set to
+    /// signal the blocking writer to stop on its next loop iteration. This
+    /// prevents detached writes from continuing after the caller sees a
+    /// timeout error, which could cause duplicate or interleaved data on
+    /// retry.
     async fn send_input_with_deadline(
         &self,
         data: &[u8],
@@ -715,6 +725,14 @@ impl PtyRunner {
 
         // Copy data to owned buffer for spawn_blocking
         let data = data.to_vec();
+
+        // Cancellation flag: set by the async timeout handler to stop the
+        // blocking writer. The blocking task checks this on every loop
+        // iteration. Relaxed ordering is sufficient because we only need
+        // eventual visibility (the writer will see the flag within one
+        // iteration).
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = Arc::clone(&cancelled);
 
         // Use spawn_blocking to avoid blocking the tokio runtime.
         // PTY writes are typically fast (kernel buffer copy), but we don't want
@@ -739,6 +757,12 @@ impl PtyRunner {
             let start = std::time::Instant::now();
             let mut written = 0;
             while written < data.len() {
+                // Check cancellation before each write attempt. If the async
+                // timeout fired, stop immediately to avoid detached writes.
+                if cancelled_inner.load(Ordering::Relaxed) {
+                    return Err(PtyError::WriteTimeout(deadline));
+                }
+
                 // SAFETY: Writing from a valid buffer to a valid fd.
                 let n = unsafe {
                     libc::write(
@@ -754,9 +778,9 @@ impl PtyRunner {
                         continue;
                     }
                     // Handle WouldBlock by yielding and retrying, but only
-                    // if we haven't exceeded the deadline.
+                    // if we haven't exceeded the deadline or been cancelled.
                     if err.kind() == io::ErrorKind::WouldBlock {
-                        if start.elapsed() >= deadline {
+                        if start.elapsed() >= deadline || cancelled_inner.load(Ordering::Relaxed) {
                             return Err(PtyError::WriteTimeout(deadline));
                         }
                         std::thread::yield_now();
@@ -778,7 +802,13 @@ impl PtyRunner {
         // ensures the caller is not blocked forever.
         match tokio::time::timeout(deadline, write_future).await {
             Ok(join_result) => join_result.map_err(|e| PtyError::Write(io::Error::other(e)))?,
-            Err(_elapsed) => Err(PtyError::WriteTimeout(deadline)),
+            Err(_elapsed) => {
+                // Signal the blocking writer to stop on its next iteration.
+                // This prevents detached writes from continuing after the
+                // caller sees the timeout error.
+                cancelled.store(true, Ordering::Relaxed);
+                Err(PtyError::WriteTimeout(deadline))
+            },
         }
     }
 

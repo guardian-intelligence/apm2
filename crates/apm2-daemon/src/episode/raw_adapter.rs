@@ -1050,29 +1050,49 @@ mod tests {
         ));
     }
 
-    /// Verify that terminate succeeds even when start-time binding is missing.
+    /// Verify that terminate fails closed when start-time binding is missing
+    /// on the handle.
     ///
-    /// Previously this was a hard error, but per security review, it was
-    /// downgraded to a warning: it is better to terminate a process without
-    /// identity binding than to leave it stranded.
+    /// Without a start-time binding, signal delivery cannot validate PID
+    /// identity, risking signals to a recycled PID. The handle-level guard
+    /// in `terminate_with_handle` must reject the request before the
+    /// command reaches the control task.
+    ///
+    /// NOTE: This test only exercises the handle-level guard. The control
+    /// task's captured `start_time_ticks` retains the original (non-None)
+    /// value from spawn; the mutation below only affects the handle mirror.
     #[tokio::test]
-    async fn test_raw_adapter_terminate_without_start_time_succeeds() {
+    async fn test_raw_adapter_terminate_fails_without_start_time_binding() {
         let adapter = RawAdapter::new();
         let config = HarnessConfig::new("cat", "episode-terminate-no-start-time");
         let (handle, _events) = adapter.spawn(config).await.unwrap();
 
+        // Clear the handle-side start-time binding to simulate missing
+        // identity data. The spawned control task retains its own copy.
         let runner_handle = handle.real_runner_handle();
         {
             let mut guard = runner_handle.lock().await;
             guard.start_time_ticks = None;
         }
 
-        // Terminate should succeed (with a warning log) even without start-time binding
+        // Terminate must fail closed due to missing start-time binding
         let terminate_result = adapter.terminate(&handle).await;
         assert!(
-            terminate_result.is_ok(),
-            "terminate should succeed without start-time binding, got: {terminate_result:?}"
+            terminate_result.is_err(),
+            "terminate must fail without start-time binding, got: {terminate_result:?}"
         );
+        let err_msg = terminate_result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("start-time binding"),
+            "error must mention start-time binding, got: {err_msg}"
+        );
+
+        // Clean up: restore binding so the process can be terminated
+        {
+            let mut guard = runner_handle.lock().await;
+            guard.start_time_ticks = super::super::adapter::read_proc_start_time(guard.pid);
+        }
+        let _ = adapter.terminate(&handle).await;
     }
 
     #[test]
