@@ -124,11 +124,6 @@ done
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "${REPO_ROOT}"
 
-if [[ ! -f /sys/fs/cgroup/cgroup.controllers ]]; then
-    log_error "cgroup v2 controllers file not found at /sys/fs/cgroup/cgroup.controllers (fail-closed)."
-    exit 1
-fi
-
 run_with_timeout_fallback() {
     if ! command -v timeout >/dev/null 2>&1; then
         log_error "GNU timeout is required for fallback mode."
@@ -211,6 +206,25 @@ log_info "TasksMax: ${PIDS_MAX}"
 log_info "CPUQuota: ${CPU_QUOTA}"
 log_info "Command: ${COMMAND[*]}"
 echo
+
+# Check for cgroup v2 support; fallback to timeout-only mode when allowed.
+if [[ ! -f /sys/fs/cgroup/cgroup.controllers ]]; then
+    if [[ "${ALLOW_TIMEOUT_FALLBACK}" == "1" ]]; then
+        log_warn "cgroup v2 controllers file not found; skipping systemd-run, falling back to timeout."
+        set +e
+        run_with_timeout_fallback
+        fallback_status=$?
+        set -e
+        if [[ ${fallback_status} -eq 0 ]]; then
+            log_info "Fallback command completed successfully."
+            exit 0
+        fi
+        log_error "Fallback command failed with exit code ${fallback_status}."
+        exit 1
+    fi
+    log_error "cgroup v2 controllers file not found at /sys/fs/cgroup/cgroup.controllers (fail-closed)."
+    exit 1
+fi
 
 set +e
 run_with_systemd_scope
