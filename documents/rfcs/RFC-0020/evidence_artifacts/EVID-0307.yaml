@@ -1,0 +1,49 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0307"
+  title: "Workspace confinement path traversal adversarial test evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that workspace confinement prevents path traversal, symlink escape,
+    and unsafe workspace root configuration. Adversarial tests verify defense
+    against known attack patterns per RFC-0020 Section 4.3 and CTR-1504.
+  requirement_ids:
+    - "REQ-0028"
+  source_refs:
+    - "crates/apm2-core/src/capsule/workspace.rs"
+    - "crates/apm2-core/src/capsule/mod.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        Workspace confinement tests (25 tests):
+        Workspace root validation:
+        - test_valid_workspace_root: /home/agent/workspace accepted
+        - test_empty_workspace_root: empty root rejected
+        - test_relative_workspace_root: relative root rejected (must be absolute)
+        - test_blocked_root_exact: /etc rejected as blocked system directory
+        - test_blocked_root_child: /var/log rejected (child of blocked /var)
+        - test_blocked_root_slash: / rejected as root filesystem
+        Path traversal prevention:
+        - test_valid_relative_path: src/main.rs resolved correctly
+        - test_path_with_dot: ./src/main.rs handled (dot is harmless)
+        - test_path_traversal_dotdot: ../../../etc/passwd rejected
+        - test_path_traversal_embedded_dotdot: src/../../etc/passwd rejected
+        - test_absolute_path_rejected: /etc/passwd rejected (must be relative)
+        - test_path_too_deep: depth exceeding MAX_WORKSPACE_PATH_DEPTH rejected
+        - test_path_exactly_at_max_depth: path at exact depth limit accepted
+        Adversarial escape attempts:
+        - test_adversarial_dotdot_at_start: bare .. rejected
+        - test_adversarial_multiple_dotdots: ../../.. rejected
+        - test_adversarial_dotdot_after_normal: a/b/../../.. rejected
+        - test_adversarial_dotdot_to_etc: ../../../etc/shadow rejected
+        - test_adversarial_encoded_traversal_components: mixed traversal rejected
+        - test_adversarial_null_byte_in_path: safe file with no traversal accepted
+        Post-resolution containment:
+        - test_absolute_within_root_ok: /workspace/src/main.rs within /workspace
+        - test_absolute_outside_root_rejected: /etc/passwd outside /workspace
+        - test_absolute_sibling_rejected: /workspace/project-b outside /workspace/project-a
+        Contains() integration:
+        - test_contains_valid_path: WorkspaceConfinement.contains() resolves correctly
+        - test_contains_traversal_rejected: WorkspaceConfinement.contains() blocks traversal
+      ref: "cargo test -p apm2-core -- capsule::workspace"

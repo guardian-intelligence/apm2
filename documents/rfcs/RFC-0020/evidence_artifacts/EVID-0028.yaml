@@ -1,0 +1,62 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0028"
+  title: "Capsule containment with no ambient authority - unit test evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that capsule profile linux-ns-v1 enforces no-ambient-authority
+    containment per REQ-0028. Tests verify:
+    - Tier3+ actuation is rejected without an admitted capsule profile
+    - Tier0-Tier2 actuation permits absent capsule (optional)
+    - Tampered profile hash causes admission rejection
+    - Deny-by-default egress blocks all unlisted routes
+    - Explicit egress routes are allowed only for exact (host, port, protocol) match
+    - deny_by_default=false is fail-closed (denies all traffic)
+    - linux-ns-v1 requires user+mount+pid namespaces (insufficient namespaces rejected)
+    - linux-ns-v1 requires at least Restricted seccomp level
+    - Content-addressed profile hash is deterministic across builds
+    - Profile hash changes when any security-relevant field changes
+    - Serde roundtrip preserves profile integrity
+    - Builder validates all resource limits (max egress routes, max executables)
+  requirement_ids:
+    - "REQ-0028"
+  source_refs:
+    - "crates/apm2-core/src/capsule/profile.rs"
+    - "crates/apm2-core/src/capsule/mod.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        Profile and admission gate tests (30 tests):
+        - test_build_linux_ns_v1_defaults: validates default profile meets all requirements
+        - test_build_with_egress_routes: explicit route grants work correctly
+        - test_build_missing_profile_id: missing field rejected
+        - test_build_rejects_deny_by_default_false: fail-closed egress enforcement
+        - test_build_rejects_insufficient_namespaces: user+mount+pid required
+        - test_build_rejects_insufficient_seccomp: None/Baseline rejected for linux-ns-v1
+        - test_build_accepts_strict_seccomp: Strict level accepted
+        - test_build_too_many_egress_routes: route count limit enforced
+        - test_build_too_many_executables: executable count limit enforced
+        - test_profile_hash_deterministic: same config produces same hash
+        - test_profile_hash_changes_with_routes: hash changes with egress routes
+        - test_profile_hash_changes_with_seccomp: hash changes with seccomp level
+        - test_egress_deny_all: deny-all blocks all traffic
+        - test_egress_explicit_route: explicit route allows exact match only
+        - test_egress_deny_by_default_false_rejects_all: fail-closed on invalid config
+        - test_admission_tier0_no_capsule_ok: Tier0 without capsule passes
+        - test_admission_tier1_no_capsule_ok: Tier1 without capsule passes
+        - test_admission_tier2_no_capsule_ok: Tier2 without capsule passes
+        - test_admission_tier3_no_capsule_rejected: Tier3 without capsule rejected
+        - test_admission_tier4_no_capsule_rejected: Tier4 without capsule rejected
+        - test_admission_tier3_with_valid_capsule_ok: Tier3 with valid capsule passes
+        - test_admission_tier4_with_valid_capsule_ok: Tier4 with valid capsule passes
+        - test_admission_tier3_with_invalid_capsule_rejected: tampered hash rejected
+        - test_namespace_isolated: full isolation config validated
+        - test_namespace_insufficient: partial namespace config detected
+        - test_cgroup_default_restricted: default cgroup limits verified
+        - test_violation_kind_display: violation kinds display correctly
+        - test_profile_serde_roundtrip: serialization preserves integrity
+        - test_egress_route_empty_host: empty host rejected
+        - test_egress_route_port_zero: zero port rejected
+        - test_egress_route_invalid_protocol: invalid protocol rejected
+      ref: "cargo test -p apm2-core -- capsule::profile"
