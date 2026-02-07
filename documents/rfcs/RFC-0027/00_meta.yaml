@@ -50,12 +50,15 @@ rfc_meta:
         summary: "Tier2+ sovereignty uncertainty triggers deny/freeze per policy."
 
   binds_to_prd:
-    prd_id: "NOT_BOUND_YET"
-    prd_base_path: ""
-    requirement_registry_ref: ""
-    evidence_bundle_ref: ""
-    prd_meta_ref: ""
-    note: "RFC authored directly from runtime/security/RFC context; PRD binding may be added later without changing normative semantics."
+    prd_id: "PRD-0009"
+    prd_base_path: "documents/prds/PRD-0009/"
+    requirement_registry_ref: "07_traceability.yaml#prd_traceability.requirement_registry"
+    evidence_bundle_ref: "12_evidence_bundle.yaml#prd_evidence_bundle.bundle"
+    prd_meta_ref: "00_meta.yaml#prd_meta"
+    secondary_prds:
+      - prd_id: "PRD-0010"
+        prd_base_path: "documents/prds/PRD-0010/"
+        rationale: "HSI/runtime identity and acceptance-fact contracts composed by RFC-0027."
 
   strategy_bindings:
     master_strategy_ref: "documents/strategy/MASTER_STRATEGY.json"
