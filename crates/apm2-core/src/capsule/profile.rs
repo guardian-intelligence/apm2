@@ -63,7 +63,7 @@ pub enum CapsuleProfileError {
     EgressDenyRequired,
 
     /// Namespace isolation is insufficient for the requested tier.
-    #[error("namespace isolation insufficient: at least user+mount+pid required for linux-ns-v1")]
+    #[error("namespace isolation insufficient: user+mount+pid+net required for linux-ns-v1")]
     InsufficientNamespaces,
 
     /// Too many egress routes.
@@ -186,7 +186,8 @@ impl std::fmt::Display for ViolationKind {
 
 /// Linux namespace isolation configuration.
 ///
-/// For `linux-ns-v1`, at minimum user + mount + pid namespaces are required.
+/// For `linux-ns-v1`, user + mount + pid + net namespaces are all required.
+/// Network namespace isolation is mandatory to enforce deny-by-default egress.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
@@ -216,9 +217,14 @@ impl NamespaceConfig {
     }
 
     /// Returns true if the minimum requirements for `linux-ns-v1` are met.
+    ///
+    /// Requires all four namespaces: user, mount, pid, and net.
+    /// Network namespace isolation is mandatory to enforce deny-by-default
+    /// egress policy -- without it, agent processes inherit host networking
+    /// and can bypass egress controls.
     #[must_use]
     pub const fn meets_linux_ns_v1(&self) -> bool {
-        self.user && self.mount && self.pid
+        self.user && self.mount && self.pid && self.net
     }
 }
 
@@ -448,7 +454,7 @@ pub struct HashInput<'a> {
 /// A content-addressed capsule profile defining agent containment boundaries.
 ///
 /// The `linux-ns-v1` profile requires:
-/// - user + mount + pid namespaces (net recommended)
+/// - user + mount + pid + net namespaces (all mandatory)
 /// - seccomp at least `Restricted` level
 /// - cgroup resource limits
 /// - deny-by-default egress
@@ -1173,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn test_namespace_insufficient() {
+    fn test_namespace_insufficient_user_missing() {
         let ns = NamespaceConfig {
             user: false,
             mount: true,
@@ -1181,6 +1187,68 @@ mod tests {
             net: true,
         };
         assert!(!ns.meets_linux_ns_v1());
+    }
+
+    #[test]
+    fn test_namespace_insufficient_net_missing() {
+        // SECURITY REGRESSION: net=false MUST be rejected for linux-ns-v1.
+        // Without network namespace isolation, agent processes inherit host
+        // networking and can bypass egress deny-by-default controls.
+        let ns = NamespaceConfig {
+            user: true,
+            mount: true,
+            pid: true,
+            net: false,
+        };
+        assert!(
+            !ns.meets_linux_ns_v1(),
+            "net=false must fail meets_linux_ns_v1 check"
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_net_false_for_linux_ns_v1() {
+        // SECURITY REGRESSION: building linux-ns-v1 profile with net=false
+        // MUST be rejected at the builder level.
+        let result = CapsuleProfileBuilder::new("linux-ns-v1")
+            .namespaces(NamespaceConfig {
+                user: true,
+                mount: true,
+                pid: true,
+                net: false,
+            })
+            .build();
+        assert!(
+            matches!(result, Err(CapsuleProfileError::InsufficientNamespaces)),
+            "linux-ns-v1 with net=false must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_admission_tier3_rejects_net_false_profile() {
+        // SECURITY REGRESSION: Tier3+ admission must reject profiles that
+        // lack network namespace isolation, even if other namespaces are set.
+        let mut profile = CapsuleProfileBuilder::new("linux-ns-v1").build().unwrap();
+        // Tamper to remove net namespace after construction
+        profile.namespaces.net = false;
+        // Recompute hash to avoid hash mismatch (simulates a profile that
+        // was somehow constructed with net=false)
+        profile.profile_hash = CapsuleProfile::compute_hash(&HashInput {
+            profile_id: &profile.profile_id,
+            namespaces: &profile.namespaces,
+            seccomp_level: &profile.seccomp_level,
+            cgroup_limits: &profile.cgroup_limits,
+            egress_policy: &profile.egress_policy,
+            allowed_executables: &profile.allowed_executables,
+            scrub_environment: profile.scrub_environment,
+            readonly_rootfs: profile.readonly_rootfs,
+            tmpfs_tmp: profile.tmpfs_tmp,
+        });
+        let result = AdmissionGate::check(&RiskTier::Tier3, Some(&profile));
+        assert!(
+            matches!(result, Err(AdmissionError::InvalidProfile(_))),
+            "Tier3 admission with net=false must be rejected: got {result:?}"
+        );
     }
 
     // =========================================================================

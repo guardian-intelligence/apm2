@@ -8,13 +8,13 @@
 //!
 //! The capsule profile enforces defense-in-depth containment:
 //!
-//! - **Namespace isolation**: user, mount, pid namespaces
+//! - **Namespace isolation**: user, mount, pid, net namespaces (all mandatory)
 //! - **Syscall filtering**: seccomp-bpf via
 //!   [`SeccompProfileLevel`](crate::adapter::seccomp::SeccompProfileLevel)
 //! - **Resource limits**: cgroup controls for CPU, memory, PIDs, I/O
 //! - **Network isolation**: deny-by-default egress with explicit route grants
-//! - **Workspace confinement**: bind-mounted workspace root with symlink
-//!   rejection
+//! - **Workspace confinement**: bind-mounted workspace root with path traversal
+//!   rejection (symlink detection at runtime layer)
 //! - **Environment scrubbing**: no inherited credentials or host secrets
 //!
 //! # Tier Enforcement

@@ -1,16 +1,25 @@
 // AGENT-AUTHORED
 //! Workspace confinement for capsule containment (RFC-0020 Section 4.3).
 //!
-//! Provides path traversal prevention, symlink escape detection, and
-//! workspace root confinement. Used by the capsule profile to enforce
-//! that agent processes cannot access files outside their workspace.
+//! Provides path traversal prevention, workspace root confinement, and
+//! error types for symlink escape detection. Used by the capsule profile
+//! to enforce that agent processes cannot access files outside their workspace.
 //!
 //! # Security Properties
 //!
-//! - Path traversal via `..` components is rejected
-//! - Absolute paths are rejected (must be relative to workspace root)
-//! - Symlinks are detected and rejected
+//! - Path traversal via `..` components is rejected (both relative and
+//!   absolute)
+//! - Absolute paths must not contain `ParentDir` or `CurDir` components
+//! - Relative paths in workspace context are rejected if absolute
 //! - Workspace root itself is validated (no sensitive system directories)
+//!
+//! # Symlink Detection (Runtime Concern)
+//!
+//! This module defines the [`WorkspaceConfinementError::SymlinkDetected`]
+//! error variant for use by runtime callers that perform filesystem I/O.
+//! Symlink detection requires `symlink_metadata()` calls (per CTR-1503)
+//! and is implemented at the daemon/runtime layer where actual filesystem
+//! access occurs. This module provides only lexical path validation.
 //!
 //! # Example
 //!
@@ -296,18 +305,42 @@ pub fn validate_workspace_path(
     Ok(workspace_root.join(resolved))
 }
 
-/// Validates that an absolute path does not escape the workspace root
-/// using component-aware `starts_with`.
+/// Validates that an absolute path does not escape the workspace root.
+///
+/// Rejects any path containing `ParentDir` (`..`) components to prevent
+/// lexical escapes like `/workspace/../etc/passwd` which satisfy
+/// `starts_with("/workspace")` but resolve outside the root. Callers that
+/// need to accept non-normalized paths must canonicalize them first with
+/// appropriate TOCTOU-safe strategies (see RSK-1501).
+///
+/// Note: `CurDir` (`.`) components are automatically stripped by Rust's
+/// `Path::components()` iterator for absolute paths, so they cannot bypass
+/// this check.
 ///
 /// This is used for post-resolution checks (e.g., after symlink resolution).
 ///
 /// # Errors
 ///
-/// Returns [`WorkspaceConfinementError`] if the path escapes.
+/// Returns [`WorkspaceConfinementError`] if the path escapes or contains
+/// non-normalized components.
 pub fn validate_absolute_within_root(
     resolved_path: &Path,
     workspace_root: &Path,
 ) -> Result<(), WorkspaceConfinementError> {
+    // Reject non-normalized components that could bypass starts_with checks.
+    // A path like `/workspace/../etc/passwd` matches starts_with("/workspace")
+    // because the first two path components match, but the `..` escapes.
+    //
+    // CurDir (`.`) is automatically stripped by `Path::components()` for
+    // absolute paths, so we only need to check for ParentDir here.
+    for component in resolved_path.components() {
+        if matches!(component, Component::ParentDir) {
+            return Err(WorkspaceConfinementError::PathTraversal {
+                path: resolved_path.to_string_lossy().to_string(),
+            });
+        }
+    }
+
     if !resolved_path.starts_with(workspace_root) {
         return Err(WorkspaceConfinementError::PathTraversal {
             path: resolved_path.to_string_lossy().to_string(),
@@ -525,6 +558,77 @@ mod tests {
         let root = Path::new("/workspace/project-a");
         let path = Path::new("/workspace/project-b/secret.txt");
         assert!(validate_absolute_within_root(path, root).is_err());
+    }
+
+    // =========================================================================
+    // SECURITY REGRESSION: Absolute path escape via non-normalized components
+    // =========================================================================
+
+    #[test]
+    fn test_absolute_escape_via_parent_dir() {
+        // SECURITY REGRESSION: /workspace/../etc/passwd lexically
+        // starts_with("/workspace") but resolves outside root.
+        let root = Path::new("/workspace");
+        let path = Path::new("/workspace/../etc/passwd");
+        let result = validate_absolute_within_root(path, root);
+        assert!(
+            result.is_err(),
+            "absolute path with .. must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_absolute_escape_via_double_parent_dir() {
+        // SECURITY REGRESSION: deeper traversal attempt.
+        let root = Path::new("/workspace");
+        let path = Path::new("/workspace/./../../etc/passwd");
+        let result = validate_absolute_within_root(path, root);
+        assert!(
+            result.is_err(),
+            "absolute path with ./../.. must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_absolute_escape_via_nested_parent_dir() {
+        // /workspace/subdir/../../etc/shadow
+        let root = Path::new("/workspace");
+        let path = Path::new("/workspace/subdir/../../etc/shadow");
+        let result = validate_absolute_within_root(path, root);
+        assert!(
+            result.is_err(),
+            "nested .. escape must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_absolute_curdir_stripped_by_components() {
+        // Rust's Path::components() strips CurDir (.) for absolute paths,
+        // so `/workspace/./src/main.rs` is normalized to
+        // `/workspace/src/main.rs` by the iterator. This means CurDir
+        // cannot bypass the starts_with check for absolute paths.
+        let root = Path::new("/workspace");
+        let path = Path::new("/workspace/./src/main.rs");
+        let result = validate_absolute_within_root(path, root);
+        assert!(
+            result.is_ok(),
+            "CurDir in absolute paths is stripped by components(): got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_absolute_clean_path_within_root_ok() {
+        // Verify that clean (normalized) absolute paths still pass.
+        let root = Path::new("/workspace");
+        let path = Path::new("/workspace/src/main.rs");
+        assert!(validate_absolute_within_root(path, root).is_ok());
+    }
+
+    #[test]
+    fn test_absolute_root_exact_ok() {
+        let root = Path::new("/workspace");
+        let path = Path::new("/workspace");
+        assert!(validate_absolute_within_root(path, root).is_ok());
     }
 
     // =========================================================================
