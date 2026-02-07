@@ -590,9 +590,8 @@ fn get_pr_head_sha(sh: &Shell, owner_repo: &str, pr_number: u32) -> Result<Strin
 /// # TCK-00297 (Stage X3): Status writes permanently removed
 ///
 /// Per RFC-0018, direct GitHub status writes from xtask have been removed.
-/// This function logs projection-only status intent for diagnostic purposes and
-/// returns `Ok(())`. The `_sh` parameter is retained for call-site
-/// compatibility.
+/// This function logs projection-only status intent for diagnostic purposes.
+/// The `_sh` parameter is retained for call-site compatibility.
 fn update_status(_sh: &Shell, owner_repo: &str, head_sha: &str, success: bool, description: &str) {
     use crate::util::{StatusWriteDecision, check_status_write_allowed};
 
