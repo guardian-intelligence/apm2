@@ -983,13 +983,25 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 message: format!("TOCTOU path normalization failed: {e}"),
             })?;
 
-        let file = tokio::fs::File::open(&normalized)
+        // Enforce manifest admission before any filesystem I/O so out-of-pack
+        // paths are never opened/read during TOCTOU pre-check.
+        {
+            let context_manifest = self.context_manifest.read().await;
+            let Some(manifest) = context_manifest.as_ref() else {
+                return Ok(None);
+            };
+            if manifest.get_entry_normalized(&normalized).is_none() {
+                return Ok(None);
+            }
+        }
+
+        let file = tokio::fs::File::open(path)
             .await
             .map_err(|e| BrokerError::Internal {
-                message: format!("TOCTOU pre-read open failed for {normalized}: {e}"),
+                message: format!("TOCTOU pre-read open failed for {}: {e}", path.display()),
             })?;
         let metadata = file.metadata().await.map_err(|e| BrokerError::Internal {
-            message: format!("TOCTOU pre-read fstat failed for {normalized}: {e}"),
+            message: format!("TOCTOU pre-read fstat failed for {}: {e}", path.display()),
         })?;
         if !metadata.is_file() {
             // Directory-oriented navigation requests (e.g., list/search scope)
@@ -1001,7 +1013,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         if metadata.len() > MAX_TOCTOU_READ_BYTES {
             return Err(BrokerError::ExecutionFailed {
                 message: format!(
-                    "TOCTOU pre-read denied for {normalized}: file too large ({} bytes > {MAX_TOCTOU_READ_BYTES})",
+                    "TOCTOU pre-read denied for {}: file too large ({} bytes > {MAX_TOCTOU_READ_BYTES})",
+                    path.display(),
                     metadata.len()
                 ),
             });
@@ -1010,22 +1023,25 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         let initial_capacity =
             usize::try_from(metadata.len()).map_err(|_| BrokerError::Internal {
                 message: format!(
-                    "TOCTOU pre-read capacity conversion failed for {normalized}: {} bytes",
+                    "TOCTOU pre-read capacity conversion failed for {}: {} bytes",
+                    path.display(),
                     metadata.len()
                 ),
             })?;
         let mut file_bytes = Vec::with_capacity(initial_capacity);
-        let bytes_read = file
+        let _bytes_read = file
             .take(MAX_TOCTOU_READ_BYTES.saturating_add(1))
             .read_to_end(&mut file_bytes)
             .await
             .map_err(|e| BrokerError::Internal {
-                message: format!("TOCTOU pre-read failed for {normalized}: {e}"),
+                message: format!("TOCTOU pre-read failed for {}: {e}", path.display()),
             })?;
-        if bytes_read as u64 > MAX_TOCTOU_READ_BYTES {
+        if file_bytes.len() as u64 > MAX_TOCTOU_READ_BYTES {
             return Err(BrokerError::ExecutionFailed {
                 message: format!(
-                    "TOCTOU pre-read denied for {normalized}: read {bytes_read} bytes > {MAX_TOCTOU_READ_BYTES}"
+                    "TOCTOU pre-read denied for {}: read {} bytes > {MAX_TOCTOU_READ_BYTES}",
+                    path.display(),
+                    file_bytes.len()
                 ),
             });
         }
@@ -1956,6 +1972,11 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                         verified_content.insert(normalized, bytes);
                                     },
                                     Ok(None) => {
+                                        defects.push(FirewallViolationDefect::toctou_mismatch(
+                                            request.risk_tier.tier(),
+                                            &context_manifest.manifest_id,
+                                            &Self::normalize_path_for_defect(path.as_path()),
+                                        ));
                                         if terminate_on_toctou {
                                             respond!(make_terminate("CONTEXT_TOCTOU_MISMATCH"));
                                         }
