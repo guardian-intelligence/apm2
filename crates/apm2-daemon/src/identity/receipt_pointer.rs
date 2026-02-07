@@ -64,8 +64,8 @@ use apm2_core::crypto::Hash;
 use thiserror::Error;
 
 use super::authority_seal::{
-    AuthoritySealError, AuthoritySealV1, MAX_MERKLE_PROOF_DEPTH, MerkleInclusionProof, SealKind,
-    compute_receipt_leaf_hash,
+    AuthoritySealError, AuthoritySealV1, IssuerId, MAX_MERKLE_PROOF_DEPTH, MerkleInclusionProof,
+    SealKind, compute_receipt_leaf_hash,
 };
 
 // ──────────────────────────────────────────────────────────────
@@ -207,6 +207,24 @@ pub enum ReceiptPointerError {
         expected: Hash,
         /// The hash computed from the provided seal.
         actual: Hash,
+    },
+
+    /// Batch pointer verification requires a `MERKLE_BATCH` seal.
+    #[error("batch pointer verification requires MERKLE_BATCH seal, got {seal_kind:?}")]
+    UnsupportedBatchSealKind {
+        /// The encountered non-batch seal kind.
+        seal_kind: SealKind,
+    },
+
+    /// Provided batch verification material does not match the seal issuer.
+    #[error(
+        "batch verifier material does not match seal issuer {issuer_id:?} for seal kind {seal_kind:?}"
+    )]
+    BatchVerifierMismatch {
+        /// The encountered seal kind.
+        seal_kind: SealKind,
+        /// Issuer encoded in the seal.
+        issuer_id: IssuerId,
     },
 }
 
@@ -494,6 +512,22 @@ pub struct ReceiptMultiProofV1 {
     individual_proofs: Vec<MerkleInclusionProof>,
 }
 
+/// Validate canonical sort/dedup invariants for multiproof receipt hashes.
+fn validate_canonical_receipt_hashes(receipt_hashes: &[Hash]) -> Result<(), ReceiptPointerError> {
+    for window in receipt_hashes.windows(2) {
+        match window[0].cmp(&window[1]) {
+            std::cmp::Ordering::Greater => {
+                return Err(ReceiptPointerError::UnsortedLeaves);
+            },
+            std::cmp::Ordering::Equal => {
+                return Err(ReceiptPointerError::DuplicateLeaves);
+            },
+            std::cmp::Ordering::Less => {},
+        }
+    }
+    Ok(())
+}
+
 impl ReceiptMultiProofV1 {
     /// Construct a validated multiproof.
     ///
@@ -537,17 +571,7 @@ impl ReceiptMultiProofV1 {
         }
 
         // Validate canonical sorted order and no duplicates.
-        for window in receipt_hashes.windows(2) {
-            match window[0].cmp(&window[1]) {
-                std::cmp::Ordering::Greater => {
-                    return Err(ReceiptPointerError::UnsortedLeaves);
-                },
-                std::cmp::Ordering::Equal => {
-                    return Err(ReceiptPointerError::DuplicateLeaves);
-                },
-                std::cmp::Ordering::Less => {},
-            }
-        }
+        validate_canonical_receipt_hashes(&receipt_hashes)?;
 
         // Validate proof count matches receipt count.
         if individual_proofs.len() != receipt_hashes.len() {
@@ -783,6 +807,32 @@ pub struct VerificationResult {
     pub pointer_kind: PointerKind,
 }
 
+/// Verification material for `MERKLE_BATCH` seal validation.
+///
+/// This allows receipt-pointer verification to support both single-key and
+/// quorum-issued batch seals.
+#[derive(Debug, Clone, Copy)]
+pub enum BatchSealVerifier<'a> {
+    /// Verify using the single-key `MERKLE_BATCH` path.
+    SingleKey(&'a ed25519_dalek::VerifyingKey),
+    /// Verify using quorum multisig (n-of-n).
+    QuorumMultisig {
+        /// Verifying keys for the quorum keyset.
+        verifying_keys: &'a [ed25519_dalek::VerifyingKey],
+        /// Optional key weights (required for weighted keysets).
+        weights: Option<&'a [u64]>,
+    },
+    /// Verify using quorum threshold (k-of-n).
+    QuorumThreshold {
+        /// Verifying keys for the quorum keyset.
+        verifying_keys: &'a [ed25519_dalek::VerifyingKey],
+        /// Required valid signature threshold.
+        threshold: usize,
+        /// Optional key weights (required for weighted keysets).
+        weights: Option<&'a [u64]>,
+    },
+}
+
 /// Unified verifier for receipt pointers (RFC-0020 §9.5.1).
 ///
 /// Accepts both direct and batched semantics with equivalent acceptance
@@ -791,6 +841,84 @@ pub struct VerificationResult {
 pub struct ReceiptPointerVerifier;
 
 impl ReceiptPointerVerifier {
+    /// Shared helper for batch-path seal verification.
+    ///
+    /// Dispatches to single-key or quorum verification paths based on
+    /// seal kind + issuer identity. Mismatched verifier material is
+    /// rejected (fail-closed).
+    #[allow(clippy::needless_pass_by_value)]
+    fn verify_batch_membership(
+        seal: &AuthoritySealV1,
+        batch_verifier: BatchSealVerifier<'_>,
+        receipt_hash: &Hash,
+        inclusion_proof: &MerkleInclusionProof,
+        expected_subject_kind: &str,
+        require_temporal: bool,
+    ) -> Result<(), ReceiptPointerError> {
+        if seal.seal_kind() != SealKind::MerkleBatch {
+            return Err(ReceiptPointerError::UnsupportedBatchSealKind {
+                seal_kind: seal.seal_kind(),
+            });
+        }
+
+        match (seal.issuer_id(), batch_verifier) {
+            (IssuerId::PublicKey(_), BatchSealVerifier::SingleKey(verifying_key)) => {
+                seal.verify_merkle_batch(
+                    verifying_key,
+                    receipt_hash,
+                    inclusion_proof,
+                    expected_subject_kind,
+                    seal.subject_hash(),
+                    require_temporal,
+                )?;
+            },
+            (
+                IssuerId::Quorum(_),
+                BatchSealVerifier::QuorumMultisig {
+                    verifying_keys,
+                    weights,
+                },
+            ) => {
+                seal.verify_merkle_batch_quorum_multisig(
+                    verifying_keys,
+                    receipt_hash,
+                    inclusion_proof,
+                    expected_subject_kind,
+                    seal.subject_hash(),
+                    require_temporal,
+                    weights,
+                )?;
+            },
+            (
+                IssuerId::Quorum(_),
+                BatchSealVerifier::QuorumThreshold {
+                    verifying_keys,
+                    threshold,
+                    weights,
+                },
+            ) => {
+                seal.verify_merkle_batch_quorum_threshold(
+                    verifying_keys,
+                    threshold,
+                    receipt_hash,
+                    inclusion_proof,
+                    expected_subject_kind,
+                    seal.subject_hash(),
+                    require_temporal,
+                    weights,
+                )?;
+            },
+            _ => {
+                return Err(ReceiptPointerError::BatchVerifierMismatch {
+                    seal_kind: seal.seal_kind(),
+                    issuer_id: seal.issuer_id().clone(),
+                });
+            },
+        }
+
+        Ok(())
+    }
+
     /// Verify a direct receipt pointer against a resolved authority seal.
     ///
     /// For direct pointers, the seal's `subject_hash` must equal the
@@ -863,7 +991,8 @@ impl ReceiptPointerVerifier {
     ///
     /// - `pointer`: the receipt pointer to verify.
     /// - `seal`: the resolved authority seal (must be `MerkleBatch`).
-    /// - `verifying_key`: the public key to verify the seal's signature.
+    /// - `batch_verifier`: single-key or quorum verification material for the
+    ///   batch seal.
     /// - `expected_subject_kind`: the expected subject kind for the seal.
     /// - `require_temporal`: whether to require temporal authority.
     ///
@@ -878,7 +1007,7 @@ impl ReceiptPointerVerifier {
     pub fn verify_batch(
         pointer: &ReceiptPointerV1,
         seal: &AuthoritySealV1,
-        verifying_key: &ed25519_dalek::VerifyingKey,
+        batch_verifier: BatchSealVerifier<'_>,
         expected_subject_kind: &str,
         require_temporal: bool,
     ) -> Result<VerificationResult, ReceiptPointerError> {
@@ -902,13 +1031,13 @@ impl ReceiptPointerVerifier {
             .ok_or(ReceiptPointerError::MissingInclusionProof)?;
 
         // The seal's subject_hash is the batch root. Verify the seal
-        // signature and the inclusion proof.
-        seal.verify_merkle_batch(
-            verifying_key,
+        // signatures (single-key or quorum path) and the inclusion proof.
+        Self::verify_batch_membership(
+            seal,
+            batch_verifier,
             &pointer.receipt_hash,
             inclusion_proof,
             expected_subject_kind,
-            seal.subject_hash(),
             require_temporal,
         )?;
 
@@ -947,7 +1076,7 @@ impl ReceiptPointerVerifier {
             PointerKind::Batch => Self::verify_batch(
                 pointer,
                 seal,
-                verifying_key,
+                BatchSealVerifier::SingleKey(verifying_key),
                 expected_subject_kind,
                 require_temporal,
             ),
@@ -963,7 +1092,8 @@ impl ReceiptPointerVerifier {
     ///
     /// - `multiproof`: the multiproof to verify.
     /// - `seal`: the resolved authority seal (must be `MerkleBatch`).
-    /// - `verifying_key`: the public key to verify the seal's signature.
+    /// - `batch_verifier`: single-key or quorum verification material for the
+    ///   batch seal.
     /// - `expected_subject_kind`: the expected subject kind for the seal.
     /// - `require_temporal`: whether to require temporal authority.
     ///
@@ -975,7 +1105,7 @@ impl ReceiptPointerVerifier {
     pub fn verify_multiproof(
         multiproof: &ReceiptMultiProofV1,
         seal: &AuthoritySealV1,
-        verifying_key: &ed25519_dalek::VerifyingKey,
+        batch_verifier: BatchSealVerifier<'_>,
         expected_subject_kind: &str,
         require_temporal: bool,
     ) -> Result<Vec<VerificationResult>, ReceiptPointerError> {
@@ -991,6 +1121,7 @@ impl ReceiptPointerVerifier {
                 max: MAX_MULTIPROOF_LEAVES,
             });
         }
+        validate_canonical_receipt_hashes(&multiproof.receipt_hashes)?;
         if multiproof.individual_proofs.len() != multiproof.receipt_hashes.len() {
             return Err(ReceiptPointerError::TooManyProofNodes {
                 count: multiproof.individual_proofs.len(),
@@ -1025,12 +1156,12 @@ impl ReceiptPointerVerifier {
         // Verify the seal authenticates the batch root for the first
         // receipt. This validates the seal signature once (O(1)).
         let first_proof = &multiproof.individual_proofs[0];
-        seal.verify_merkle_batch(
-            verifying_key,
+        Self::verify_batch_membership(
+            seal,
+            batch_verifier,
             &multiproof.receipt_hashes[0],
             first_proof,
             expected_subject_kind,
-            seal.subject_hash(),
             require_temporal,
         )?;
 
@@ -1091,7 +1222,7 @@ mod tests {
         ZERO_TIME_ENVELOPE_REF, compute_receipt_leaf_hash,
     };
     use crate::identity::directory_proof::LedgerAnchorV1;
-    use crate::identity::{AlgorithmTag, CellIdV1, PublicKeyIdV1};
+    use crate::identity::{AlgorithmTag, CellIdV1, KeySetIdV1, PublicKeyIdV1, SetTag};
 
     // ────────── Test helpers ──────────
 
@@ -1235,6 +1366,131 @@ mod tests {
             vec![signature.to_bytes().to_vec()],
         )
         .unwrap()
+    }
+
+    /// Helper: build a quorum multisig `MERKLE_BATCH` seal for a batch root.
+    fn make_quorum_batch_seal_multisig(
+        signer_a: &Signer,
+        signer_b: &Signer,
+        batch_root: &Hash,
+    ) -> (AuthoritySealV1, Vec<ed25519_dalek::VerifyingKey>) {
+        let cell_id = test_cell_id();
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+        let keyset_id = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Multisig,
+            2,
+            &[member_a, member_b],
+            None,
+        )
+        .unwrap();
+        let subject_kind = SubjectKind::new(TEST_SUBJECT_KIND).unwrap();
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 1 };
+
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::Quorum(keyset_id.clone()),
+            subject_kind.clone(),
+            *batch_root,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::MerkleBatch,
+            vec![vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let sig_a = signer_a.sign(&preimage);
+        let sig_b = signer_b.sign(&preimage);
+
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            *batch_root,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::MerkleBatch,
+            vec![sig_a.to_bytes().to_vec(), sig_b.to_bytes().to_vec()],
+        )
+        .unwrap();
+
+        let verifying_keys = vec![signer_a.verifying_key(), signer_b.verifying_key()];
+        (seal, verifying_keys)
+    }
+
+    /// Helper: build a 2-of-3 quorum threshold `MERKLE_BATCH` seal.
+    ///
+    /// `include_signer_b=true` produces 2 valid signatures (threshold met).
+    /// `include_signer_b=false` produces 1 valid signature (threshold not met).
+    fn make_quorum_batch_seal_threshold_2of3(
+        signer_a: &Signer,
+        signer_b: &Signer,
+        signer_c: &Signer,
+        batch_root: &Hash,
+        include_signer_b: bool,
+    ) -> (AuthoritySealV1, Vec<ed25519_dalek::VerifyingKey>) {
+        let cell_id = test_cell_id();
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+        let member_c =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_c.public_key_bytes());
+        let keyset_id = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            2,
+            &[member_a, member_b, member_c],
+            None,
+        )
+        .unwrap();
+        let subject_kind = SubjectKind::new(TEST_SUBJECT_KIND).unwrap();
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 1 };
+
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::Quorum(keyset_id.clone()),
+            subject_kind.clone(),
+            *batch_root,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::MerkleBatch,
+            vec![vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let sig_a = signer_a.sign(&preimage);
+        let sig_b = signer_b.sign(&preimage);
+
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            *batch_root,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::MerkleBatch,
+            vec![
+                sig_a.to_bytes().to_vec(),
+                if include_signer_b {
+                    sig_b.to_bytes().to_vec()
+                } else {
+                    vec![0u8; 64]
+                },
+                vec![0u8; 64],
+            ],
+        )
+        .unwrap();
+
+        let verifying_keys = vec![
+            signer_a.verifying_key(),
+            signer_b.verifying_key(),
+            signer_c.verifying_key(),
+        ];
+        (seal, verifying_keys)
     }
 
     // ────────── PointerKind tests ──────────
@@ -1485,7 +1741,7 @@ mod tests {
             let result = ReceiptPointerVerifier::verify_batch(
                 &ptr,
                 &seal,
-                &signer.verifying_key(),
+                BatchSealVerifier::SingleKey(&signer.verifying_key()),
                 TEST_SUBJECT_KIND,
                 false,
             );
@@ -1520,7 +1776,7 @@ mod tests {
         let result = ReceiptPointerVerifier::verify_batch(
             &ptr,
             &seal,
-            &signer.verifying_key(),
+            BatchSealVerifier::SingleKey(&signer.verifying_key()),
             TEST_SUBJECT_KIND,
             false,
         );
@@ -1528,6 +1784,139 @@ mod tests {
         // Verification should fail because the inclusion proof does not
         // verify against the batch root.
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_batch_pointer_rejects_quorum_seal_with_single_key_verifier() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let receipt_hashes = [[0x42; 32], [0x43; 32]];
+        let (root, proofs) = build_merkle_tree(&receipt_hashes);
+        let (seal, _quorum_keys) = make_quorum_batch_seal_multisig(&signer_a, &signer_b, &root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+
+        let ptr =
+            ReceiptPointerV1::new_batch(receipt_hashes[0], seal_hash, proofs[0].clone()).unwrap();
+
+        let result = ReceiptPointerVerifier::verify_batch(
+            &ptr,
+            &seal,
+            BatchSealVerifier::SingleKey(&signer_a.verifying_key()),
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(ReceiptPointerError::BatchVerifierMismatch {
+                    seal_kind: SealKind::MerkleBatch,
+                    ..
+                })
+            ),
+            "single-key verifier must reject quorum-issued MERKLE_BATCH pointer, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn verify_batch_pointer_accepts_quorum_multisig_verifier() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let receipt_hashes = [[0x42; 32], [0x43; 32]];
+        let (root, proofs) = build_merkle_tree(&receipt_hashes);
+        let (seal, quorum_keys) = make_quorum_batch_seal_multisig(&signer_a, &signer_b, &root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+
+        let ptr =
+            ReceiptPointerV1::new_batch(receipt_hashes[1], seal_hash, proofs[1].clone()).unwrap();
+
+        let result = ReceiptPointerVerifier::verify_batch(
+            &ptr,
+            &seal,
+            BatchSealVerifier::QuorumMultisig {
+                verifying_keys: &quorum_keys,
+                weights: None,
+            },
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            result.is_ok(),
+            "quorum multisig verifier must accept quorum-issued MERKLE_BATCH pointer, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn verify_batch_pointer_accepts_quorum_threshold_verifier() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let signer_c = Signer::generate();
+        let receipt_hashes = [[0x42; 32], [0x43; 32], [0x44; 32], [0x45; 32]];
+        let (root, proofs) = build_merkle_tree(&receipt_hashes);
+        let (seal, quorum_keys) =
+            make_quorum_batch_seal_threshold_2of3(&signer_a, &signer_b, &signer_c, &root, true);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+
+        let ptr =
+            ReceiptPointerV1::new_batch(receipt_hashes[0], seal_hash, proofs[0].clone()).unwrap();
+
+        let result = ReceiptPointerVerifier::verify_batch(
+            &ptr,
+            &seal,
+            BatchSealVerifier::QuorumThreshold {
+                verifying_keys: &quorum_keys,
+                threshold: 2,
+                weights: None,
+            },
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            result.is_ok(),
+            "quorum threshold verifier must accept when threshold is met, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn verify_batch_pointer_rejects_quorum_threshold_when_threshold_not_met() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let signer_c = Signer::generate();
+        let receipt_hashes = [[0x42; 32], [0x43; 32], [0x44; 32], [0x45; 32]];
+        let (root, proofs) = build_merkle_tree(&receipt_hashes);
+        let (seal, quorum_keys) =
+            make_quorum_batch_seal_threshold_2of3(&signer_a, &signer_b, &signer_c, &root, false);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+
+        let ptr =
+            ReceiptPointerV1::new_batch(receipt_hashes[2], seal_hash, proofs[2].clone()).unwrap();
+
+        let result = ReceiptPointerVerifier::verify_batch(
+            &ptr,
+            &seal,
+            BatchSealVerifier::QuorumThreshold {
+                verifying_keys: &quorum_keys,
+                threshold: 2,
+                weights: None,
+            },
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(ReceiptPointerError::SealError(
+                    AuthoritySealError::ThresholdNotMet {
+                        valid_sigs: 1,
+                        threshold: 2,
+                    }
+                ))
+            ),
+            "quorum threshold verifier must reject when threshold is not met, got: {result:?}",
+        );
     }
 
     // ────────── Unified verify() dispatch tests ──────────
@@ -1636,7 +2025,7 @@ mod tests {
         let batch_result = ReceiptPointerVerifier::verify_batch(
             &batch_ptr,
             &batch_seal,
-            &signer.verifying_key(),
+            BatchSealVerifier::SingleKey(&signer.verifying_key()),
             TEST_SUBJECT_KIND,
             false,
         )
@@ -1750,7 +2139,7 @@ mod tests {
         let results = ReceiptPointerVerifier::verify_multiproof(
             &multiproof,
             &seal,
-            &signer.verifying_key(),
+            BatchSealVerifier::SingleKey(&signer.verifying_key()),
             TEST_SUBJECT_KIND,
             false,
         )
@@ -1761,6 +2150,105 @@ mod tests {
             assert_eq!(result.receipt_hash, *hash);
             assert_eq!(result.pointer_kind, PointerKind::Batch);
         }
+    }
+
+    #[test]
+    fn verify_multiproof_rejects_quorum_seal_with_single_key_verifier() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let mut hashes = vec![[0x42; 32], [0x43; 32], [0x44; 32], [0x45; 32]];
+        hashes.sort_unstable();
+        let (root, proofs) = build_merkle_tree(&hashes);
+        let (seal, _quorum_keys) = make_quorum_batch_seal_multisig(&signer_a, &signer_b, &root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+        let multiproof = ReceiptMultiProofV1::new(root, hashes.clone(), seal_hash, proofs).unwrap();
+
+        let result = ReceiptPointerVerifier::verify_multiproof(
+            &multiproof,
+            &seal,
+            BatchSealVerifier::SingleKey(&signer_a.verifying_key()),
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(ReceiptPointerError::BatchVerifierMismatch {
+                    seal_kind: SealKind::MerkleBatch,
+                    ..
+                })
+            ),
+            "single-key verifier must reject quorum-issued MERKLE_BATCH multiproof, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn verify_multiproof_accepts_quorum_multisig_verifier() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let mut hashes = vec![[0x42; 32], [0x43; 32], [0x44; 32], [0x45; 32]];
+        hashes.sort_unstable();
+        let (root, proofs) = build_merkle_tree(&hashes);
+        let (seal, quorum_keys) = make_quorum_batch_seal_multisig(&signer_a, &signer_b, &root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+        let multiproof = ReceiptMultiProofV1::new(root, hashes.clone(), seal_hash, proofs).unwrap();
+
+        let result = ReceiptPointerVerifier::verify_multiproof(
+            &multiproof,
+            &seal,
+            BatchSealVerifier::QuorumMultisig {
+                verifying_keys: &quorum_keys,
+                weights: None,
+            },
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            result.is_ok(),
+            "quorum multisig verifier must accept quorum-issued MERKLE_BATCH multiproof, got: {result:?}",
+        );
+        assert_eq!(result.unwrap().len(), 4);
+    }
+
+    #[test]
+    fn verify_multiproof_rejects_quorum_threshold_when_threshold_not_met() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let signer_c = Signer::generate();
+        let mut hashes = vec![[0x42; 32], [0x43; 32], [0x44; 32], [0x45; 32]];
+        hashes.sort_unstable();
+        let (root, proofs) = build_merkle_tree(&hashes);
+        let (seal, quorum_keys) =
+            make_quorum_batch_seal_threshold_2of3(&signer_a, &signer_b, &signer_c, &root, false);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+        let multiproof = ReceiptMultiProofV1::new(root, hashes, seal_hash, proofs).unwrap();
+
+        let result = ReceiptPointerVerifier::verify_multiproof(
+            &multiproof,
+            &seal,
+            BatchSealVerifier::QuorumThreshold {
+                verifying_keys: &quorum_keys,
+                threshold: 2,
+                weights: None,
+            },
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(ReceiptPointerError::SealError(
+                    AuthoritySealError::ThresholdNotMet {
+                        valid_sigs: 1,
+                        threshold: 2,
+                    }
+                ))
+            ),
+            "quorum threshold verifier must reject when threshold is not met, got: {result:?}",
+        );
     }
 
     #[test]
@@ -1779,7 +2267,7 @@ mod tests {
         let result = ReceiptPointerVerifier::verify_multiproof(
             &multiproof,
             &seal,
-            &wrong_signer.verifying_key(),
+            BatchSealVerifier::SingleKey(&wrong_signer.verifying_key()),
             TEST_SUBJECT_KIND,
             false,
         );
@@ -1840,7 +2328,7 @@ mod tests {
         let result = ReceiptPointerVerifier::verify_batch(
             &ptr,
             &seal,
-            &signer.verifying_key(),
+            BatchSealVerifier::SingleKey(&signer.verifying_key()),
             TEST_SUBJECT_KIND,
             false,
         );
@@ -1866,7 +2354,7 @@ mod tests {
         let result = ReceiptPointerVerifier::verify_multiproof(
             &multiproof,
             &seal,
-            &signer.verifying_key(),
+            BatchSealVerifier::SingleKey(&signer.verifying_key()),
             TEST_SUBJECT_KIND,
             false,
         );
@@ -1893,7 +2381,7 @@ mod tests {
         let result = ReceiptPointerVerifier::verify_multiproof(
             &tampered,
             &seal,
-            &signer.verifying_key(),
+            BatchSealVerifier::SingleKey(&signer.verifying_key()),
             TEST_SUBJECT_KIND,
             false,
         );
@@ -1934,7 +2422,7 @@ mod tests {
         let result = ReceiptPointerVerifier::verify_multiproof(
             &tampered,
             &seal,
-            &signer.verifying_key(),
+            BatchSealVerifier::SingleKey(&signer.verifying_key()),
             TEST_SUBJECT_KIND,
             false,
         );
@@ -1979,7 +2467,7 @@ mod tests {
         let result = ReceiptPointerVerifier::verify_multiproof(
             &tampered,
             &seal,
-            &signer.verifying_key(),
+            BatchSealVerifier::SingleKey(&signer.verifying_key()),
             TEST_SUBJECT_KIND,
             false,
         );
@@ -2011,7 +2499,7 @@ mod tests {
         let results = ReceiptPointerVerifier::verify_multiproof(
             &multiproof,
             &seal,
-            &signer.verifying_key(),
+            BatchSealVerifier::SingleKey(&signer.verifying_key()),
             TEST_SUBJECT_KIND,
             false,
         )
@@ -2138,7 +2626,7 @@ mod tests {
         let result = ReceiptPointerVerifier::verify_multiproof(
             &oversized,
             &seal,
-            &signer.verifying_key(),
+            BatchSealVerifier::SingleKey(&signer.verifying_key()),
             TEST_SUBJECT_KIND,
             false,
         );
@@ -2181,7 +2669,7 @@ mod tests {
         let result = ReceiptPointerVerifier::verify_multiproof(
             &oversized,
             &seal,
-            &signer.verifying_key(),
+            BatchSealVerifier::SingleKey(&signer.verifying_key()),
             TEST_SUBJECT_KIND,
             false,
         );
@@ -2189,6 +2677,65 @@ mod tests {
         assert!(
             matches!(result, Err(ReceiptPointerError::TooManyProofNodes { .. })),
             "expected TooManyProofNodes, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn verify_multiproof_rejects_unsorted_receipts_at_verification_boundary() {
+        let signer = Signer::generate();
+        let unsorted_receipts = vec![[0x43; 32], [0x42; 32]];
+        let (root, proofs) = build_merkle_tree(&unsorted_receipts);
+        let seal = make_batch_seal(&signer, &root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+        let unsorted =
+            ReceiptMultiProofV1::new_unchecked(root, unsorted_receipts, seal_hash, proofs);
+
+        let result = ReceiptPointerVerifier::verify_multiproof(
+            &unsorted,
+            &seal,
+            BatchSealVerifier::SingleKey(&signer.verifying_key()),
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(ReceiptPointerError::UnsortedLeaves)),
+            "expected UnsortedLeaves, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn verify_multiproof_rejects_duplicate_receipts_at_verification_boundary() {
+        let signer = Signer::generate();
+        let duplicate_receipt = [0x55; 32];
+        let duplicates = vec![duplicate_receipt, duplicate_receipt];
+        let seal_root = [0xAD; 32];
+        let seal = make_batch_seal(&signer, &seal_root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+        let duplicate_proofs = vec![
+            MerkleInclusionProof {
+                leaf_hash: compute_receipt_leaf_hash(&duplicate_receipt),
+                siblings: vec![],
+            },
+            MerkleInclusionProof {
+                leaf_hash: compute_receipt_leaf_hash(&duplicate_receipt),
+                siblings: vec![],
+            },
+        ];
+        let duplicate_multiproof =
+            ReceiptMultiProofV1::new_unchecked(seal_root, duplicates, seal_hash, duplicate_proofs);
+
+        let result = ReceiptPointerVerifier::verify_multiproof(
+            &duplicate_multiproof,
+            &seal,
+            BatchSealVerifier::SingleKey(&signer.verifying_key()),
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(ReceiptPointerError::DuplicateLeaves)),
+            "expected DuplicateLeaves, got: {result:?}",
         );
     }
 

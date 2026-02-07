@@ -173,7 +173,7 @@ pub use holon_id::{HolonGenesisV1, HolonIdV1, HolonPurpose};
 pub use keyset_id::{KeySetDigestResolver, KeySetIdV1, ResolvedKeySetSemantics, SetTag};
 pub use public_key_id::{AlgorithmTag, PublicKeyIdV1};
 pub use receipt_pointer::{
-    MAX_MULTIPROOF_LEAVES, MAX_MULTIPROOF_NODES, MAX_RECEIPT_MULTIPROOF_BYTES,
+    BatchSealVerifier, MAX_MULTIPROOF_LEAVES, MAX_MULTIPROOF_NODES, MAX_RECEIPT_MULTIPROOF_BYTES,
     MAX_RECEIPT_POINTER_BYTES, PointerKind, ReceiptMultiProofV1, ReceiptPointerError,
     ReceiptPointerV1, ReceiptPointerVerifier, VerificationResult,
 };
