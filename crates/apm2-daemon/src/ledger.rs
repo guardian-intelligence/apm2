@@ -28,6 +28,7 @@ use crate::protocol::dispatch::{
     LedgerEventError, SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX, STOP_FLAGS_MUTATED_DOMAIN_PREFIX,
     STOP_FLAGS_MUTATED_WORK_ID, SignedLedgerEvent, StopFlagsMutation, WORK_CLAIMED_DOMAIN_PREFIX,
     WORK_TRANSITIONED_DOMAIN_PREFIX, WorkClaim, WorkRegistry, WorkRegistryError, WorkTransition,
+    build_session_started_payload,
 };
 
 /// Durable ledger event emitter backed by `SQLite`.
@@ -412,55 +413,15 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
-        // Build payload as JSON.
-        // TCK-00348: Include contract binding fields when available.
-        let mut payload = serde_json::json!({
-            "event_type": "session_started",
-            "session_id": session_id,
-            "work_id": work_id,
-            "lease_id": lease_id,
-            "actor_id": actor_id,
-            "adapter_profile_hash": hex::encode(adapter_profile_hash),
-        });
-        if let Some(hash) = role_spec_hash {
-            payload.as_object_mut().expect("payload is object").insert(
-                "role_spec_hash".to_string(),
-                serde_json::Value::String(hex::encode(hash)),
-            );
-        } else {
-            payload.as_object_mut().expect("payload is object").insert(
-                "waiver_id".to_string(),
-                serde_json::Value::String("WVR-0002".to_string()),
-            );
-            payload.as_object_mut().expect("payload is object").insert(
-                "role_spec_hash_absent".to_string(),
-                serde_json::Value::Bool(true),
-            );
-        }
-        if let Some(binding) = contract_binding {
-            let obj = payload.as_object_mut().expect("payload is object");
-            obj.insert(
-                "cli_contract_hash".to_string(),
-                serde_json::Value::String(binding.cli_contract_hash.clone()),
-            );
-            obj.insert(
-                "server_contract_hash".to_string(),
-                serde_json::Value::String(binding.server_contract_hash.clone()),
-            );
-            obj.insert(
-                "mismatch_waived".to_string(),
-                serde_json::Value::Bool(binding.mismatch_waived),
-            );
-            obj.insert(
-                "risk_tier".to_string(),
-                serde_json::to_value(binding.risk_tier).expect("RiskTier serializes"),
-            );
-            obj.insert(
-                "client_canonicalizers".to_string(),
-                serde_json::to_value(&binding.client_canonicalizers)
-                    .expect("CanonicalizerInfo serializes"),
-            );
-        }
+        let payload = build_session_started_payload(
+            session_id,
+            work_id,
+            lease_id,
+            actor_id,
+            adapter_profile_hash,
+            role_spec_hash,
+            contract_binding,
+        );
 
         // TCK-00289 BLOCKER 2: Use JCS (RFC 8785) canonicalization for signing.
         // This ensures deterministic JSON representation per RFC-0016.
@@ -1589,63 +1550,15 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
         // --- Event 1: SessionStarted ---
         let session_event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-        // TCK-00348: Include contract binding in SessionStarted payload
-        let mut session_payload = serde_json::json!({
-            "event_type": "session_started",
-            "session_id": session_id,
-            "work_id": work_id,
-            "lease_id": lease_id,
-            "actor_id": actor_id,
-            "adapter_profile_hash": hex::encode(adapter_profile_hash),
-        });
-        if let Some(hash) = role_spec_hash {
-            session_payload
-                .as_object_mut()
-                .expect("payload is object")
-                .insert(
-                    "role_spec_hash".to_string(),
-                    serde_json::Value::String(hex::encode(hash)),
-                );
-        } else {
-            session_payload
-                .as_object_mut()
-                .expect("payload is object")
-                .insert(
-                    "waiver_id".to_string(),
-                    serde_json::Value::String("WVR-0002".to_string()),
-                );
-            session_payload
-                .as_object_mut()
-                .expect("payload is object")
-                .insert(
-                    "role_spec_hash_absent".to_string(),
-                    serde_json::Value::Bool(true),
-                );
-        }
-        if let Some(binding) = contract_binding {
-            let obj = session_payload.as_object_mut().expect("payload is object");
-            obj.insert(
-                "cli_contract_hash".to_string(),
-                serde_json::Value::String(binding.cli_contract_hash.clone()),
-            );
-            obj.insert(
-                "server_contract_hash".to_string(),
-                serde_json::Value::String(binding.server_contract_hash.clone()),
-            );
-            obj.insert(
-                "mismatch_waived".to_string(),
-                serde_json::Value::Bool(binding.mismatch_waived),
-            );
-            obj.insert(
-                "risk_tier".to_string(),
-                serde_json::to_value(binding.risk_tier).expect("RiskTier serializes"),
-            );
-            obj.insert(
-                "client_canonicalizers".to_string(),
-                serde_json::to_value(&binding.client_canonicalizers)
-                    .expect("CanonicalizerInfo serializes"),
-            );
-        }
+        let session_payload = build_session_started_payload(
+            session_id,
+            work_id,
+            lease_id,
+            actor_id,
+            adapter_profile_hash,
+            role_spec_hash,
+            contract_binding,
+        );
         let session_payload_json = session_payload.to_string();
         let session_canonical = canonicalize_json(&session_payload_json).map_err(|e| {
             let _ = conn.execute("ROLLBACK", []);

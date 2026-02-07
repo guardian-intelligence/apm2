@@ -971,6 +971,73 @@ pub const MAX_REASON_LENGTH: usize = 1024;
 /// bounded before persistence to prevent oversized payload retention.
 pub const MAX_ESCALATION_PREDICATE_LEN: usize = 1024;
 
+/// Builds the canonical JSON payload for a `SessionStarted` ledger event.
+///
+/// Extracted to a single helper to eliminate triplicated payload construction
+/// across `StubLedgerEventEmitter::emit_session_started`,
+/// `SqliteLedgerEventEmitter::emit_session_started`, and
+/// `SqliteLedgerEventEmitter::emit_spawn_lifecycle`.
+///
+/// TCK-00348: Includes contract binding fields when available.
+pub fn build_session_started_payload(
+    session_id: &str,
+    work_id: &str,
+    lease_id: &str,
+    actor_id: &str,
+    adapter_profile_hash: &[u8; 32],
+    role_spec_hash: Option<&[u8; 32]>,
+    contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "event_type": "session_started",
+        "session_id": session_id,
+        "work_id": work_id,
+        "lease_id": lease_id,
+        "actor_id": actor_id,
+        "adapter_profile_hash": hex::encode(adapter_profile_hash),
+    });
+    if let Some(hash) = role_spec_hash {
+        payload.as_object_mut().expect("payload is object").insert(
+            "role_spec_hash".to_string(),
+            serde_json::Value::String(hex::encode(hash)),
+        );
+    } else {
+        payload.as_object_mut().expect("payload is object").insert(
+            "waiver_id".to_string(),
+            serde_json::Value::String("WVR-0002".to_string()),
+        );
+        payload.as_object_mut().expect("payload is object").insert(
+            "role_spec_hash_absent".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    if let Some(binding) = contract_binding {
+        let obj = payload.as_object_mut().expect("payload is object");
+        obj.insert(
+            "cli_contract_hash".to_string(),
+            serde_json::Value::String(binding.cli_contract_hash.clone()),
+        );
+        obj.insert(
+            "server_contract_hash".to_string(),
+            serde_json::Value::String(binding.server_contract_hash.clone()),
+        );
+        obj.insert(
+            "mismatch_waived".to_string(),
+            serde_json::Value::Bool(binding.mismatch_waived),
+        );
+        obj.insert(
+            "risk_tier".to_string(),
+            serde_json::to_value(binding.risk_tier).expect("RiskTier serializes"),
+        );
+        obj.insert(
+            "client_canonicalizers".to_string(),
+            serde_json::to_value(&binding.client_canonicalizers)
+                .expect("CanonicalizerInfo serializes"),
+        );
+    }
+    payload
+}
+
 /// Maximum number of events stored in `StubLedgerEventEmitter`.
 ///
 /// Per CTR-1303: In-memory stores must have `max_entries` limit with O(1)
@@ -1167,55 +1234,15 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
-        // Build canonical payload (deterministic JSON).
-        // TCK-00348: Include contract binding fields when available.
-        let mut payload = serde_json::json!({
-            "event_type": "session_started",
-            "session_id": session_id,
-            "work_id": work_id,
-            "lease_id": lease_id,
-            "actor_id": actor_id,
-            "adapter_profile_hash": hex::encode(adapter_profile_hash),
-        });
-        if let Some(hash) = role_spec_hash {
-            payload.as_object_mut().expect("payload is object").insert(
-                "role_spec_hash".to_string(),
-                serde_json::Value::String(hex::encode(hash)),
-            );
-        } else {
-            payload.as_object_mut().expect("payload is object").insert(
-                "waiver_id".to_string(),
-                serde_json::Value::String("WVR-0002".to_string()),
-            );
-            payload.as_object_mut().expect("payload is object").insert(
-                "role_spec_hash_absent".to_string(),
-                serde_json::Value::Bool(true),
-            );
-        }
-        if let Some(binding) = contract_binding {
-            let obj = payload.as_object_mut().expect("payload is object");
-            obj.insert(
-                "cli_contract_hash".to_string(),
-                serde_json::Value::String(binding.cli_contract_hash.clone()),
-            );
-            obj.insert(
-                "server_contract_hash".to_string(),
-                serde_json::Value::String(binding.server_contract_hash.clone()),
-            );
-            obj.insert(
-                "mismatch_waived".to_string(),
-                serde_json::Value::Bool(binding.mismatch_waived),
-            );
-            obj.insert(
-                "risk_tier".to_string(),
-                serde_json::to_value(binding.risk_tier).expect("RiskTier serializes"),
-            );
-            obj.insert(
-                "client_canonicalizers".to_string(),
-                serde_json::to_value(&binding.client_canonicalizers)
-                    .expect("CanonicalizerInfo serializes"),
-            );
-        }
+        let payload = build_session_started_payload(
+            session_id,
+            work_id,
+            lease_id,
+            actor_id,
+            adapter_profile_hash,
+            role_spec_hash,
+            contract_binding,
+        );
 
         let payload_bytes =
             serde_json::to_vec(&payload).map_err(|e| LedgerEventError::SigningFailed {
@@ -5807,7 +5834,8 @@ impl PrivilegedDispatcher {
     ///
     /// If `requested_hash` is provided, validates it is exactly 32 bytes and
     /// exists in CAS (fail-closed). If omitted, resolves a deterministic
-    /// built-in default by `WorkRole`.
+    /// built-in default by `WorkRole` and stores it in CAS so that auditors
+    /// reading the ledger can resolve the hash (MAJOR-1 security fix).
     fn resolve_spawn_adapter_profile_hash(
         &self,
         requested_hash: Option<&[u8]>,
@@ -5839,11 +5867,16 @@ impl PrivilegedDispatcher {
             return Ok(hash);
         }
 
-        Self::resolve_default_adapter_profile(role)
+        self.resolve_default_adapter_profile(role)
     }
 
     /// Resolves the role-based default adapter profile hash.
-    fn resolve_default_adapter_profile(role: WorkRole) -> Result<[u8; 32], String> {
+    ///
+    /// Stores the default profile in CAS so that auditors reading the ledger
+    /// can resolve the hash. If CAS is not configured, falls back to
+    /// computing the hash without persistence.
+    fn resolve_default_adapter_profile(&self, role: WorkRole) -> Result<[u8; 32], String> {
+        // TODO(TCK-00397): differentiate per-role profiles post-rollout
         let profile = match role {
             WorkRole::Implementer
             | WorkRole::GateExecutor
@@ -5851,9 +5884,19 @@ impl PrivilegedDispatcher {
             | WorkRole::Coordinator
             | WorkRole::Unspecified => builtin_profiles::claude_code_profile(),
         };
-        profile
-            .compute_cas_hash()
-            .map_err(|e| format!("default adapter profile hash computation failed: {e}"))
+        // Store in CAS so the hash is resolvable from the ledger.
+        self.cas.as_ref().map_or_else(
+            || {
+                profile
+                    .compute_cas_hash()
+                    .map_err(|e| format!("default adapter profile hash computation failed: {e}"))
+            },
+            |cas| {
+                profile
+                    .store_in_cas(cas.as_ref())
+                    .map_err(|e| format!("default adapter profile CAS storage failed: {e}"))
+            },
+        )
     }
 
     /// Derives role spec attribution from daemon-controlled claim context.
@@ -6839,11 +6882,16 @@ impl PrivilegedDispatcher {
         // workspace directory. The episode must be started BEFORE returning
         // to the client so that tool handlers are properly initialized.
         //
-        // Generate envelope hash from session_id + work_id + lease_id for uniqueness
+        // Generate envelope hash from session_id + work_id + lease_id for uniqueness.
+        // Null-byte delimiters prevent collision between fields (MAJOR-2 security fix).
+        // adapter_profile_hash and role_spec_hash are included in the envelope
+        // hash to ensure the envelope identity reflects the adapter binding.
+        // TODO(TCK-00397): migrate to EpisodeEnvelopeBuilder for structured
+        // envelope construction once the full EpisodeEnvelope lifecycle is wired.
         let role_spec_hash_component =
             role_spec_hash.map_or_else(|| "WVR-0002".to_string(), hex::encode);
         let envelope_data = format!(
-            "{}{}{}{}{}",
+            "{}\0{}\0{}\0{}\0{}",
             session_id,
             request.work_id,
             claim.lease_id,
