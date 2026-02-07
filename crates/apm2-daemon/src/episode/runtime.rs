@@ -1636,6 +1636,9 @@ impl EpisodeRuntime {
                         "agent process termination error during episode stop \
                          (process may have already exited)"
                     );
+                    // SECURITY: Escalate to direct SIGKILL to prevent
+                    // orphaned processes when the control channel fails.
+                    crate::episode::adapter::escalate_sigkill(harness_handle).await;
                 },
             }
         }
@@ -1985,6 +1988,9 @@ impl EpisodeRuntime {
                         "agent process termination error during episode quarantine \
                          (process may have already exited)"
                     );
+                    // SECURITY: Escalate to direct SIGKILL to prevent
+                    // orphaned processes when the control channel fails.
+                    crate::episode::adapter::escalate_sigkill(harness_handle).await;
                 },
             }
         }

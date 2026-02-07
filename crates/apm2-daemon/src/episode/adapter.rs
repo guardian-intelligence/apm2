@@ -1005,6 +1005,61 @@ pub(crate) async fn terminate_with_handle(
     Ok(mapped_exit_status)
 }
 
+/// Last-resort SIGKILL escalation for when [`terminate_with_handle`] fails.
+///
+/// This bypasses the PTY control channel and sends `SIGKILL` directly to the
+/// underlying PID after validating PID identity via `/proc` start-time binding.
+/// If the process has already exited or the PID has been recycled, this is a
+/// safe no-op.
+pub(crate) async fn escalate_sigkill(harness_handle: &HarnessHandle) {
+    let runner_handle = harness_handle.real_runner_handle();
+    let mut guard = runner_handle.lock().await;
+
+    if guard.is_terminated() {
+        return;
+    }
+
+    let pid = guard.pid;
+    let start_time_ticks = guard.start_time_ticks;
+
+    // Validate PID identity before sending a raw signal. If validation
+    // fails the PID may have been recycled and we must not kill a random
+    // process.
+    if let Err(e) = validate_pid_binding(pid, start_time_ticks) {
+        tracing::warn!(
+            pid,
+            error = %e,
+            "escalate_sigkill: skipping -- PID binding validation failed"
+        );
+        return;
+    }
+
+    // Linux PIDs fit in i32 (max_pid <= 4_194_304).
+    #[allow(clippy::cast_possible_wrap)]
+    let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+    match nix::sys::signal::kill(nix_pid, Signal::SIGKILL) {
+        Ok(()) => {
+            tracing::warn!(
+                pid,
+                "escalate_sigkill: sent SIGKILL directly (control-channel fallback)"
+            );
+            guard.mark_terminated();
+        },
+        Err(nix::errno::Errno::ESRCH) => {
+            // Process already exited -- mark terminated so we don't retry.
+            tracing::debug!(pid, "escalate_sigkill: process already exited (ESRCH)");
+            guard.mark_terminated();
+        },
+        Err(e) => {
+            tracing::error!(
+                pid,
+                error = %e,
+                "escalate_sigkill: SIGKILL delivery failed"
+            );
+        },
+    }
+}
+
 /// Processes a control message for a PTY runner.
 pub(crate) async fn process_pty_control_command(
     command: PtyControlCommand,
