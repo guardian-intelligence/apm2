@@ -13,10 +13,10 @@
 //! 1. **Broker authorization**: The `ToolBroker` must validate the request.
 //! 2. **Capability manifest**: A capability manifest must be loaded and the
 //!    request validated against it.
-//! 3. **Context firewall**: A `ContextPackManifest` must be loaded for
-//!    firewall enforcement.
-//! 4. **Capsule profile admission**: The `AdmissionGate` must admit the
-//!    capsule profile (Tier3+).
+//! 3. **Context firewall**: A `ContextPackManifest` must be loaded for firewall
+//!    enforcement.
+//! 4. **Capsule profile admission**: The `AdmissionGate` must admit the capsule
+//!    profile (Tier3+).
 //!
 //! # Tier Enforcement
 //!
