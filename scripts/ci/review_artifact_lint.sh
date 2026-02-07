@@ -79,24 +79,39 @@ detect_direct_status_write() {
     if [[ "$stripped" == "#"* ]]; then
         return 1
     fi
+    # Normalise to lowercase for case-insensitive matching (bash 4+ built-in)
+    local lc="${line,,}"
     # Pattern C: gh pr review --approve (always forbidden)
-    if [[ "$line" == *"gh"* ]] && [[ "$line" == *"pr"* ]] && [[ "$line" == *"review"* ]] && [[ "$line" == *"--approve"* ]]; then
+    if [[ "$lc" == *"gh"* ]] && [[ "$lc" == *"pr"* ]] && [[ "$lc" == *"review"* ]] && [[ "$lc" == *"--approve"* ]]; then
         return 0
     fi
-    # Pattern A: gh api + statuses + POST (any order)
-    if [[ "$line" == *"gh"* ]] && [[ "$line" == *"api"* ]] && [[ "$line" == *"statuses"* ]] && [[ "$line" == *"POST"* ]]; then
+    # Pattern A: gh api + statuses + POST (any order, case-insensitive)
+    if [[ "$lc" == *"gh"* ]] && [[ "$lc" == *"api"* ]] && [[ "$lc" == *"statuses"* ]] && [[ "$lc" == *"post"* ]]; then
         # Permit writes targeting ai-review/code-quality (no xtask alternative)
-        if [[ "$line" == *"ai-review/code-quality"* ]]; then
+        if [[ "$lc" == *"ai-review/code-quality"* ]]; then
             return 1
         fi
         return 0
     fi
-    # Pattern B: gh api + check-runs + POST (any order)
-    if [[ "$line" == *"gh"* ]] && [[ "$line" == *"api"* ]] && [[ "$line" == *"check-runs"* ]] && [[ "$line" == *"POST"* ]]; then
-        if [[ "$line" == *"ai-review/code-quality"* ]]; then
+    # Pattern B: gh api + check-runs + POST (any order, case-insensitive)
+    if [[ "$lc" == *"gh"* ]] && [[ "$lc" == *"api"* ]] && [[ "$lc" == *"check-runs"* ]] && [[ "$lc" == *"post"* ]]; then
+        if [[ "$lc" == *"ai-review/code-quality"* ]]; then
             return 1
         fi
         return 0
+    fi
+    # Pattern D: gh api + statuses without explicit method (gh api defaults to GET,
+    # but --method/--field/-X variants may smuggle writes; flag any gh api + statuses
+    # that is NOT targeting ai-review/code-quality as suspicious)
+    if [[ "$lc" == *"gh"* ]] && [[ "$lc" == *"api"* ]] && [[ "$lc" == *"statuses"* ]]; then
+        if [[ "$lc" == *"ai-review/code-quality"* ]]; then
+            return 1
+        fi
+        # Flag if it contains any method-setting flag or field-setting flag
+        # that could imply a write (-X, --method, -f, --field)
+        if [[ "$lc" == *"--method"* ]] || [[ "$lc" == *"-x"* ]] || [[ "$lc" == *"-f "* ]] || [[ "$lc" == *"--field"* ]] || [[ "$lc" == *"-f\""* ]]; then
+            return 0
+        fi
     fi
     return 1
 }

@@ -82,6 +82,36 @@ extract_proto_enum_names() {
     done < "$file"
 }
 
+# Extract enum variant NAME=DISCRIMINANT pairs from a .proto file.
+# Outputs lines of the form: EnumName=VARIANT_A:0,VARIANT_B:1,...
+extract_proto_enum_discriminants() {
+    local file="$1"
+    local current_enum=""
+    local pairs=""
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*enum[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*\{ ]]; then
+            current_enum="${BASH_REMATCH[1]}"
+            pairs=""
+            continue
+        fi
+        if [[ -n "$current_enum" ]] && [[ "$line" =~ ^[[:space:]]*\} ]]; then
+            echo "${current_enum}=${pairs}"
+            current_enum=""
+            continue
+        fi
+        if [[ -n "$current_enum" ]] && [[ "$line" =~ ^[[:space:]]*([A-Z_][A-Z0-9_]*)[[:space:]]*=[[:space:]]*([0-9]+) ]]; then
+            local vname="${BASH_REMATCH[1]}"
+            local vnum="${BASH_REMATCH[2]}"
+            if [[ -n "$pairs" ]]; then
+                pairs="${pairs},${vname}:${vnum}"
+            else
+                pairs="${vname}:${vnum}"
+            fi
+        fi
+    done < "$file"
+}
+
 # Extract variant names from the Rust as_str_name() impl for a given enum.
 # prost generates:
 #   impl EnumName {
@@ -142,6 +172,96 @@ extract_rs_enum_names() {
     echo "$names"
 }
 
+# Extract enum variant NAME:DISCRIMINANT pairs from generated Rust code.
+# prost generates:
+#   pub enum EnumName {
+#     VariantCamelCase = 0,
+#     ...
+#   }
+#   impl EnumName {
+#     pub fn as_str_name(&self) -> &'static str {
+#       match self {
+#         Self::VariantCamelCase => "PROTO_NAME",
+#       }
+#     }
+#   }
+# We join the two to produce PROTO_NAME:discriminant pairs.
+extract_rs_enum_discriminants() {
+    local file="$1"
+    local target_enum="$2"
+
+    # Step 1: Extract CamelCase=discriminant from the pub enum block
+    declare -A camel_to_disc
+    local in_enum=0
+    local brace_depth=0
+    while IFS= read -r line; do
+        if [[ $in_enum -eq 0 ]] && [[ "$line" =~ ^pub\ enum\ ${target_enum}\ \{ ]]; then
+            in_enum=1
+            brace_depth=1
+            continue
+        fi
+        if [[ $in_enum -eq 1 ]]; then
+            local opens="${line//[^\{]/}"
+            local closes="${line//[^\}]/}"
+            brace_depth=$((brace_depth + ${#opens} - ${#closes}))
+            if [[ "$line" =~ ^[[:space:]]*([A-Za-z][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*([0-9]+) ]]; then
+                camel_to_disc["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+            fi
+            if [[ $brace_depth -le 0 ]]; then
+                break
+            fi
+        fi
+    done < "$file"
+
+    # Step 2: Extract CamelCase => "PROTO_NAME" from as_str_name
+    declare -A camel_to_proto
+    local in_impl=0
+    local in_as_str=0
+    brace_depth=0
+    while IFS= read -r line; do
+        if [[ $in_impl -eq 0 ]] && [[ "$line" =~ ^impl\ ${target_enum}\ \{ ]]; then
+            in_impl=1
+            brace_depth=1
+            continue
+        fi
+        if [[ $in_impl -eq 1 ]]; then
+            local opens="${line//[^\{]/}"
+            local closes="${line//[^\}]/}"
+            brace_depth=$((brace_depth + ${#opens} - ${#closes}))
+            if [[ "$line" =~ pub\ fn\ as_str_name ]]; then
+                in_as_str=1
+                continue
+            fi
+            if [[ $in_as_str -eq 1 ]]; then
+                if [[ "$line" =~ Self::([A-Za-z0-9_]+)[[:space:]]*=\>[[:space:]]*\"([A-Z_][A-Z0-9_]*)\" ]]; then
+                    camel_to_proto["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+                fi
+                if [[ "$line" =~ ^[[:space:]]*\} ]] && [[ "$line" != *"=>"* ]]; then
+                    in_as_str=0
+                fi
+            fi
+            if [[ $brace_depth -le 0 ]]; then
+                break
+            fi
+        fi
+    done < "$file"
+
+    # Step 3: Join on CamelCase key to produce PROTO_NAME:discriminant
+    local pairs=""
+    for camel in "${!camel_to_disc[@]}"; do
+        local proto_name="${camel_to_proto[$camel]:-}"
+        local disc="${camel_to_disc[$camel]}"
+        if [[ -n "$proto_name" ]]; then
+            if [[ -n "$pairs" ]]; then
+                pairs="${pairs},${proto_name}:${disc}"
+            else
+                pairs="${proto_name}:${disc}"
+            fi
+        fi
+    done
+    echo "$pairs"
+}
+
 log_info "Comparing enum variant names..."
 
 proto_enums=$(extract_proto_enum_names "$PROTO_FILE")
@@ -183,6 +303,47 @@ for entry in $proto_enums; do
     else
         proto_count=$(echo "$proto_sorted" | wc -l)
         log_info "  ${enum_name}: ${proto_count} variants (OK)"
+    fi
+done
+
+# Check 2: Compare enum discriminant (numeric) values.
+log_info "Comparing enum discriminant values..."
+
+proto_disc_enums=$(extract_proto_enum_discriminants "$PROTO_FILE")
+
+for entry in $proto_disc_enums; do
+    enum_name="${entry%%=*}"
+    proto_pairs_csv="${entry##*=}"
+
+    rs_pairs_csv=$(extract_rs_enum_discriminants "$GENERATED_RS" "$enum_name")
+
+    if [[ -z "$rs_pairs_csv" ]]; then
+        # Already reported in name check above
+        continue
+    fi
+
+    # Build sorted "NAME:DISC" lines for comparison
+    proto_disc_sorted=$(printf '%s\n' ${proto_pairs_csv//,/ } | sort)
+    rs_disc_sorted=$(printf '%s\n' ${rs_pairs_csv//,/ } | sort)
+
+    if [[ "$proto_disc_sorted" != "$rs_disc_sorted" ]]; then
+        # Find which pairs differ
+        disc_only_proto=$(comm -23 <(echo "$proto_disc_sorted") <(echo "$rs_disc_sorted"))
+        disc_only_rust=$(comm -13 <(echo "$proto_disc_sorted") <(echo "$rs_disc_sorted"))
+        log_error "Enum discriminant drift: ${enum_name} numeric values differ between proto and Rust"
+        if [[ -n "$disc_only_proto" ]]; then
+            log_error "  Only in proto: $(echo "$disc_only_proto" | paste -sd' ')"
+        fi
+        if [[ -n "$disc_only_rust" ]]; then
+            log_error "  Only in Rust:  $(echo "$disc_only_rust" | paste -sd' ')"
+        fi
+        log_error "  Proto: ${PROTO_FILE}"
+        log_error "  Rust:  ${GENERATED_RS}"
+        log_error "  Run 'cargo build -p apm2-daemon' to regenerate."
+        VIOLATIONS=1
+    else
+        disc_count=$(echo "$proto_disc_sorted" | wc -l)
+        log_info "  ${enum_name}: ${disc_count} discriminants (OK)"
     fi
 done
 
