@@ -152,6 +152,32 @@ fn fetch_pr_issue_comments(
     let mut page: u32 = 1;
 
     loop {
+        // Fail-closed when attempting to fetch beyond the cap. All pages up
+        // to MAX_COMMENT_PAGES have already been ingested; if the previous
+        // page was full we probe page MAX_COMMENT_PAGES + 1 to check for
+        // truncation, and only fail if it returns non-empty content.
+        if page > MAX_COMMENT_PAGES {
+            let probe_endpoint = format!(
+                "/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100&page={page}"
+            );
+            let probe_output = cmd!(sh, "gh api {probe_endpoint}")
+                .read()
+                .with_context(|| {
+                    format!("Failed to fetch overflow probe page {page} for PR #{pr_number}")
+                })?;
+            let probe_comments: Vec<IssueComment> =
+                serde_json::from_str(&probe_output).with_context(|| {
+                    format!("Failed to parse overflow probe page {page} for PR #{pr_number}")
+                })?;
+            if probe_comments.is_empty() {
+                // Exactly MAX_COMMENT_PAGES pages — all comments ingested.
+                break;
+            }
+            bail!(
+                "PR #{pr_number} has more than {MAX_COMMENT_PAGES} pages of comments; refusing to evaluate with truncated comment history"
+            );
+        }
+
         let endpoint =
             format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100&page={page}");
         let output = cmd!(sh, "gh api {endpoint}")
@@ -169,17 +195,6 @@ fn fetch_pr_issue_comments(
 
         all_comments.extend(page_comments);
         page += 1;
-
-        // Fail-closed when we've fetched MAX_COMMENT_PAGES pages worth of
-        // comments. The cap check is placed *after* ingesting the current
-        // page so that all MAX_COMMENT_PAGES pages are included in the
-        // result, and we only bail when attempting to fetch page
-        // MAX_COMMENT_PAGES + 1.
-        if page > MAX_COMMENT_PAGES {
-            bail!(
-                "Reached comment pagination cap ({MAX_COMMENT_PAGES} pages) for PR #{pr_number}; refusing to continue with potentially truncated comment history"
-            );
-        }
     }
 
     Ok(all_comments)
