@@ -117,6 +117,8 @@ use super::messages::{
     TerminationOutcome,
     UnsubscribePulseRequest,
     UnsubscribePulseResponse,
+    UpdateStopFlagsRequest,
+    UpdateStopFlagsResponse,
     WorkRole,
     WorkStatusRequest,
     WorkStatusResponse,
@@ -3029,6 +3031,8 @@ pub enum PrivilegedMessageType {
     EndSession          = 16,
     /// `IngestReviewReceipt` request (IPC-PRIV-017, TCK-00389)
     IngestReviewReceipt = 17,
+    /// `UpdateStopFlags` request (IPC-PRIV-018, TCK-00351)
+    UpdateStopFlags     = 18,
     // --- Credential Management (CTR-PROTO-012, RFC-0018, TCK-00343) ---
     /// `ListCredentials` request (IPC-PRIV-021)
     ListCredentials     = 21,
@@ -3084,6 +3088,8 @@ impl PrivilegedMessageType {
             16 => Some(Self::EndSession),
             // TCK-00389: IngestReviewReceipt for external reviewer results
             17 => Some(Self::IngestReviewReceipt),
+            // TCK-00351: stop flags update
+            18 => Some(Self::UpdateStopFlags),
             // Credential management tags (21-26, TCK-00343)
             21 => Some(Self::ListCredentials),
             22 => Some(Self::AddCredential),
@@ -3135,6 +3141,7 @@ impl PrivilegedMessageType {
             Self::WorkStatus,
             Self::EndSession,
             Self::IngestReviewReceipt,
+            Self::UpdateStopFlags,
             Self::ListCredentials,
             Self::AddCredential,
             Self::RemoveCredential,
@@ -3179,6 +3186,7 @@ impl PrivilegedMessageType {
             | Self::WorkStatus
             | Self::EndSession
             | Self::IngestReviewReceipt
+            | Self::UpdateStopFlags
             | Self::ListCredentials
             | Self::AddCredential
             | Self::RemoveCredential
@@ -3219,6 +3227,7 @@ impl PrivilegedMessageType {
             Self::WorkStatus => "hsi.work.status",
             Self::EndSession => "hsi.session.end",
             Self::IngestReviewReceipt => "hsi.review.ingest_receipt",
+            Self::UpdateStopFlags => "hsi.stop.update_flags",
             Self::ListCredentials => "hsi.credential.list",
             Self::AddCredential => "hsi.credential.add",
             Self::RemoveCredential => "hsi.credential.remove",
@@ -3254,6 +3263,7 @@ impl PrivilegedMessageType {
             Self::WorkStatus => "WORK_STATUS",
             Self::EndSession => "END_SESSION",
             Self::IngestReviewReceipt => "INGEST_REVIEW_RECEIPT",
+            Self::UpdateStopFlags => "UPDATE_STOP_FLAGS",
             Self::ListCredentials => "LIST_CREDENTIALS",
             Self::AddCredential => "ADD_CREDENTIAL",
             Self::RemoveCredential => "REMOVE_CREDENTIAL",
@@ -3289,6 +3299,7 @@ impl PrivilegedMessageType {
             Self::WorkStatus => "apm2.work_status_request.v1",
             Self::EndSession => "apm2.end_session_request.v1",
             Self::IngestReviewReceipt => "apm2.ingest_review_receipt_request.v1",
+            Self::UpdateStopFlags => "apm2.update_stop_flags_request.v1",
             Self::ListCredentials => "apm2.list_credentials_request.v1",
             Self::AddCredential => "apm2.add_credential_request.v1",
             Self::RemoveCredential => "apm2.remove_credential_request.v1",
@@ -3324,6 +3335,7 @@ impl PrivilegedMessageType {
             Self::WorkStatus => "apm2.work_status_response.v1",
             Self::EndSession => "apm2.end_session_response.v1",
             Self::IngestReviewReceipt => "apm2.ingest_review_receipt_response.v1",
+            Self::UpdateStopFlags => "apm2.update_stop_flags_response.v1",
             Self::ListCredentials => "apm2.list_credentials_response.v1",
             Self::AddCredential => "apm2.add_credential_response.v1",
             Self::RemoveCredential => "apm2.remove_credential_response.v1",
@@ -3375,6 +3387,8 @@ pub enum PrivilegedResponse {
     EndSession(EndSessionResponse),
     /// Successful `IngestReviewReceipt` response (TCK-00389).
     IngestReviewReceipt(IngestReviewReceiptResponse),
+    /// Successful `UpdateStopFlags` response (TCK-00351).
+    UpdateStopFlags(UpdateStopFlagsResponse),
     // --- Credential Management (CTR-PROTO-012, TCK-00343) ---
     /// Successful `ListCredentials` response.
     ListCredentials(ListCredentialsResponse),
@@ -3491,6 +3505,10 @@ impl PrivilegedResponse {
             // TCK-00389: IngestReviewReceipt
             Self::IngestReviewReceipt(resp) => {
                 buf.push(PrivilegedMessageType::IngestReviewReceipt.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::UpdateStopFlags(resp) => {
+                buf.push(PrivilegedMessageType::UpdateStopFlags.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             // Credential Management (CTR-PROTO-012, TCK-00343)
@@ -4124,6 +4142,10 @@ pub struct PrivilegedDispatcher {
     /// gate to enforce `max_episodes` / `escalation_predicate`.
     stop_conditions_store: Option<Arc<crate::session::SessionStopConditionsStore>>,
 
+    /// Shared stop authority used by privileged control-plane handlers to
+    /// mutate emergency/governance stop flags at runtime.
+    stop_authority: Option<Arc<crate::episode::preactuation::StopAuthority>>,
+
     /// Governance freshness monitor wired from production `DispatcherState`.
     ///
     /// Successful governance-backed operations call `record_success()`.
@@ -4269,6 +4291,7 @@ impl PrivilegedDispatcher {
             v1_manifest_store: None,
             gate_orchestrator: None,
             stop_conditions_store: None,
+            stop_authority: None,
             governance_freshness_monitor: None,
         }
     }
@@ -4330,6 +4353,7 @@ impl PrivilegedDispatcher {
             v1_manifest_store: None,
             gate_orchestrator: None,
             stop_conditions_store: None,
+            stop_authority: None,
             governance_freshness_monitor: None,
         }
     }
@@ -4410,6 +4434,7 @@ impl PrivilegedDispatcher {
             v1_manifest_store: None,
             gate_orchestrator: None,
             stop_conditions_store: None,
+            stop_authority: None,
             governance_freshness_monitor: None,
         }
     }
@@ -4467,6 +4492,7 @@ impl PrivilegedDispatcher {
             v1_manifest_store: None,
             gate_orchestrator: None,
             stop_conditions_store: None,
+            stop_authority: None,
             governance_freshness_monitor: None,
         }
     }
@@ -4558,6 +4584,16 @@ impl PrivilegedDispatcher {
         store: Arc<crate::session::SessionStopConditionsStore>,
     ) -> Self {
         self.stop_conditions_store = Some(store);
+        self
+    }
+
+    /// Sets the shared stop authority for runtime stop-flag mutation.
+    #[must_use]
+    pub fn with_stop_authority(
+        mut self,
+        authority: Arc<crate::episode::preactuation::StopAuthority>,
+    ) -> Self {
+        self.stop_authority = Some(authority);
         self
     }
 
@@ -4910,6 +4946,8 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::IngestReviewReceipt => {
                 self.handle_ingest_review_receipt(payload, ctx)
             },
+            // TCK-00351: Runtime stop-flag mutation
+            PrivilegedMessageType::UpdateStopFlags => self.handle_update_stop_flags(payload, ctx),
             // Credential Management (CTR-PROTO-012, TCK-00343)
             PrivilegedMessageType::ListCredentials => self.handle_list_credentials(payload, ctx),
             PrivilegedMessageType::AddCredential => self.handle_add_credential(payload, ctx),
@@ -4958,6 +4996,8 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::EndSession => "EndSession",
                 // TCK-00389
                 PrivilegedMessageType::IngestReviewReceipt => "IngestReviewReceipt",
+                // TCK-00351
+                PrivilegedMessageType::UpdateStopFlags => "UpdateStopFlags",
                 // Credential Management (CTR-PROTO-012, TCK-00343)
                 PrivilegedMessageType::ListCredentials => "ListCredentials",
                 PrivilegedMessageType::AddCredential => "AddCredential",
@@ -6796,6 +6836,70 @@ impl PrivilegedDispatcher {
                 message: "Shutdown acknowledged (stub — daemon state not configured)".to_string(),
             }))
         }
+    }
+
+    /// Handles `UpdateStopFlags` requests (IPC-PRIV-018, TCK-00351).
+    ///
+    /// Mutates the shared runtime stop flags used by pre-actuation gating.
+    fn handle_update_stop_flags(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request = UpdateStopFlagsRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid UpdateStopFlagsRequest: {e}"),
+            })?;
+
+        if request.emergency_stop_active.is_none() && request.governance_stop_active.is_none() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "at least one stop flag must be provided",
+            ));
+        }
+
+        let peer = ctx
+            .peer_credentials()
+            .ok_or_else(|| ProtocolError::Serialization {
+                reason: "peer credentials required for UpdateStopFlags".to_string(),
+            })?;
+        let actor_id = derive_actor_id(peer);
+
+        let Some(authority) = self.stop_authority.as_ref() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                "stop authority is not configured",
+            ));
+        };
+
+        let prev_emergency = authority.emergency_stop_active();
+        let prev_governance = authority.governance_stop_active();
+
+        if let Some(active) = request.emergency_stop_active {
+            authority.set_emergency_stop(active);
+        }
+        if let Some(active) = request.governance_stop_active {
+            authority.set_governance_stop(active);
+        }
+
+        let emergency_stop_active = authority.emergency_stop_active();
+        let governance_stop_active = authority.governance_stop_active();
+
+        info!(
+            actor_id = %actor_id,
+            emergency_stop_previous = prev_emergency,
+            emergency_stop_current = emergency_stop_active,
+            governance_stop_previous = prev_governance,
+            governance_stop_current = governance_stop_active,
+            "UpdateStopFlags applied"
+        );
+
+        Ok(PrivilegedResponse::UpdateStopFlags(
+            UpdateStopFlagsResponse {
+                emergency_stop_active,
+                governance_stop_active,
+            },
+        ))
     }
 
     /// Handles `WorkStatus` requests (IPC-PRIV-005, TCK-00344).
@@ -10107,6 +10211,14 @@ pub fn encode_shutdown_request(request: &ShutdownRequest) -> Bytes {
     Bytes::from(buf)
 }
 
+/// Encodes an `UpdateStopFlags` request to bytes for sending (TCK-00351).
+#[must_use]
+pub fn encode_update_stop_flags_request(request: &UpdateStopFlagsRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::UpdateStopFlags.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
 /// Encodes an `EndSession` request to bytes for sending (TCK-00395).
 #[must_use]
 pub fn encode_end_session_request(request: &EndSessionRequest) -> Bytes {
@@ -10342,6 +10454,7 @@ mod tests {
             let monitor = Arc::new(GovernanceFreshnessMonitor::new(
                 Arc::clone(&authority),
                 GovernanceFreshnessConfig::default(),
+                false,
             ));
             monitor.record_success();
 
@@ -10386,6 +10499,7 @@ mod tests {
             let monitor = Arc::new(GovernanceFreshnessMonitor::new(
                 Arc::clone(&authority),
                 GovernanceFreshnessConfig::default(),
+                false,
             ));
             monitor.record_success();
 
@@ -10447,6 +10561,7 @@ mod tests {
     // ========================================================================
     mod privileged_routing {
         use super::*;
+        use crate::episode::preactuation::StopAuthority;
 
         #[test]
         fn test_claim_work_routing() {
@@ -10467,6 +10582,40 @@ mod tests {
 
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
             assert!(matches!(response, PrivilegedResponse::ClaimWork(_)));
+        }
+
+        #[test]
+        fn test_update_stop_flags_tag_and_routing() {
+            let authority = Arc::new(StopAuthority::new());
+            let dispatcher =
+                PrivilegedDispatcher::new().with_stop_authority(Arc::clone(&authority));
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            assert_eq!(PrivilegedMessageType::UpdateStopFlags.tag(), 18);
+            assert_eq!(
+                PrivilegedMessageType::from_tag(18),
+                Some(PrivilegedMessageType::UpdateStopFlags)
+            );
+
+            let request = UpdateStopFlagsRequest {
+                emergency_stop_active: Some(true),
+                governance_stop_active: None,
+            };
+            let frame = encode_update_stop_flags_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::UpdateStopFlags(resp) => {
+                    assert!(resp.emergency_stop_active);
+                    assert!(!resp.governance_stop_active);
+                },
+                other => panic!("expected UpdateStopFlags response, got {other:?}"),
+            }
+            assert!(authority.emergency_stop_active());
         }
 
         #[test]

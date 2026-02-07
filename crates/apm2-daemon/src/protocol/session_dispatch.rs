@@ -90,7 +90,7 @@ use crate::episode::decision::{BrokerToolRequest, DedupeKey, ToolDecision};
 use crate::episode::envelope::RiskTier;
 use crate::episode::executor::ContentAddressedStore;
 use crate::episode::preactuation::{
-    PreActuationReceipt, ReplayEntry, ReplayEntryKind, ReplayVerifier,
+    PreActuationReceipt, ReplayEntry, ReplayEntryKind, ReplayTimestamp, ReplayVerifier,
 };
 use crate::episode::registry::TerminationReason;
 use crate::episode::{CapabilityManifest, EpisodeId, EpisodeRuntime, SharedToolBroker, ToolClass};
@@ -1492,7 +1492,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 ));
             };
 
-            match gate.check(
+            match gate.check_with_timestamp(
                 &conditions,
                 current_episode_count,
                 emergency_stop,
@@ -1733,7 +1733,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // Per DOD: "RequestTool executes via ToolBroker and returns ToolResult or Deny"
         if let Some(ref broker) = self.broker {
             // TCK-00290 BLOCKER 3: Get monotonic timestamp from HolonicClock
-            let timestamp_ns = self.get_htf_timestamp()?;
+            let actuation_timestamp = self.get_htf_timestamp()?;
+            let timestamp_ns = actuation_timestamp.wall_ns;
 
             // Build BrokerToolRequest
             let request_id = format!("REQ-{}", uuid::Uuid::new_v4());
@@ -1801,7 +1802,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 &token.session_id,
                 tool_class,
                 &request_arguments,
-                timestamp_ns,
+                actuation_timestamp,
                 &episode_id,
                 preactuation_receipt.as_ref(),
             );
@@ -1854,10 +1855,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         session_id: &str,
         tool_class: ToolClass,
         request_arguments: &[u8],
-        timestamp_ns: u64,
+        actuation_timestamp: ReplayTimestamp,
         episode_id: &EpisodeId,
         preactuation_receipt: Option<&PreActuationReceipt>,
     ) -> ProtocolResult<SessionResponse> {
+        let timestamp_ns = actuation_timestamp.wall_ns;
         match decision {
             Ok(ToolDecision::Allow {
                 request_id,
@@ -1875,7 +1877,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
                 if let Err(violation) = Self::verify_preactuation_replay_ordering(
                     preactuation_receipt,
-                    timestamp_ns,
+                    actuation_timestamp,
                     tool_class,
                     &request_id,
                 ) {
@@ -2310,7 +2312,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// This is the production call site for `ReplayVerifier::verify`.
     fn verify_preactuation_replay_ordering(
         preactuation_receipt: Option<&PreActuationReceipt>,
-        actuation_timestamp_ns: u64,
+        actuation_timestamp: ReplayTimestamp,
         tool_class: ToolClass,
         request_id: &str,
     ) -> Result<(), crate::episode::preactuation::ReplayViolation> {
@@ -2320,7 +2322,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
         let trace = [
             ReplayEntry {
-                timestamp_ns: receipt.timestamp_ns,
+                timestamp: receipt.replay_timestamp,
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: receipt.stop_checked,
                     budget_checked: receipt.budget_checked,
@@ -2328,7 +2330,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 },
             },
             ReplayEntry {
-                timestamp_ns: actuation_timestamp_ns,
+                timestamp: actuation_timestamp,
                 kind: ReplayEntryKind::ToolActuation {
                     tool_class: tool_class.to_string(),
                     request_id: request_id.to_string(),
@@ -2353,19 +2355,22 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// Per SEC-CTRL-FAC-0015, we must fail-closed when the clock is required
     /// rather than falling back to an insecure `SystemTime::now()`.
     #[allow(clippy::option_if_let_else, clippy::single_match_else)]
-    fn get_htf_timestamp(&self) -> ProtocolResult<u64> {
+    fn get_htf_timestamp(&self) -> ProtocolResult<ReplayTimestamp> {
         // Using match here for clarity - the error paths have important security
         // comments that would be less readable with map_or_else or if let/else.
         match &self.clock {
-            Some(clock) => clock.now_hlc().map(|hlc| hlc.wall_ns).map_err(|e| {
-                if let ClockError::ClockRegression { current, previous } = e {
-                    self.emit_htf_regression_defect(current, previous);
-                }
-                error!("HolonicClock failed: {}", e);
-                ProtocolError::Serialization {
-                    reason: format!("clock failure: {e}"),
-                }
-            }),
+            Some(clock) => clock
+                .now_hlc()
+                .map(|hlc| ReplayTimestamp::new(hlc.wall_ns, hlc.logical))
+                .map_err(|e| {
+                    if let ClockError::ClockRegression { current, previous } = e {
+                        self.emit_htf_regression_defect(current, previous);
+                    }
+                    error!("HolonicClock failed: {}", e);
+                    ProtocolError::Serialization {
+                        reason: format!("clock failure: {e}"),
+                    }
+                }),
             None => {
                 // MAJOR 2 FIX (TCK-00290): Fail-closed when clock is not configured.
                 // Per SEC-CTRL-FAC-0015, we must not fall back to SystemTime::now()
@@ -2456,7 +2461,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         };
 
         // TCK-00290 BLOCKER 3: Get monotonic timestamp from HolonicClock
-        let now_ns = self.get_htf_timestamp()?;
+        let now_ns = self.get_htf_timestamp()?.wall_ns;
 
         // Increment sequence counter atomically
         let seq = self.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -4592,6 +4597,7 @@ mod tests {
                 stop_checked: true,
                 budget_checked: true,
                 budget_enforcement_deferred: false,
+                replay_timestamp: ReplayTimestamp::new(200, 0),
                 timestamp_ns: 200,
             };
 
@@ -4603,7 +4609,7 @@ mod tests {
                     "session-001",
                     ToolClass::Read,
                     b"{}",
-                    100,
+                    ReplayTimestamp::new(100, 0),
                     &episode_id,
                     Some(&receipt),
                 )

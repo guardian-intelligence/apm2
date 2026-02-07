@@ -342,6 +342,7 @@ impl Default for GovernanceFreshnessConfig {
 /// let monitor = GovernanceFreshnessMonitor::new(
 ///     Arc::clone(&authority),
 ///     GovernanceFreshnessConfig::default(),
+///     false, // authenticated governance transport present
 /// );
 /// // In a background loop:
 /// monitor.check_freshness();
@@ -360,9 +361,13 @@ pub struct GovernanceFreshnessMonitor {
     stop_authority: std::sync::Arc<crate::episode::preactuation::StopAuthority>,
     /// Monitor configuration.
     config: GovernanceFreshnessConfig,
-    /// Timestamp (milliseconds since epoch) of the last successful
-    /// governance probe.  Updated by the monitor loop.
-    last_success_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Most recent successful authenticated governance probe timestamp.
+    ///
+    /// `Instant` is monotonic and not affected by wall-clock rollback.
+    last_success: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// Whether the active resolver path is transitional-local (no authenticated
+    /// governance transport freshness evidence).
+    transitional_resolver: bool,
 }
 
 impl GovernanceFreshnessMonitor {
@@ -371,25 +376,22 @@ impl GovernanceFreshnessMonitor {
     pub fn new(
         stop_authority: std::sync::Arc<crate::episode::preactuation::StopAuthority>,
         config: GovernanceFreshnessConfig,
+        transitional_resolver: bool,
     ) -> Self {
+        stop_authority.set_governance_transitional_resolver(transitional_resolver);
+        if transitional_resolver {
+            stop_authority.set_governance_uncertain(true);
+        }
         Self {
             stop_authority,
             config,
-            last_success_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                Self::current_ms(),
-            )),
+            last_success: std::sync::Arc::new(std::sync::Mutex::new(if transitional_resolver {
+                None
+            } else {
+                Some(std::time::Instant::now())
+            })),
+            transitional_resolver,
         }
-    }
-
-    /// Returns the current wall-clock time in milliseconds since epoch.
-    fn current_ms() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| {
-                #[allow(clippy::cast_possible_truncation)]
-                let ms = d.as_millis() as u64;
-                ms
-            })
     }
 
     /// Records a successful governance probe.
@@ -397,8 +399,19 @@ impl GovernanceFreshnessMonitor {
     /// Call this from any path that confirms the governance service is
     /// healthy (e.g., after a successful policy resolution response).
     pub fn record_success(&self) {
-        self.last_success_ms
-            .store(Self::current_ms(), std::sync::atomic::Ordering::Release);
+        if self.transitional_resolver {
+            warn!(
+                "Governance freshness probe used transitional local resolver; \
+                 success does not provide freshness evidence"
+            );
+            self.stop_authority.set_governance_uncertain(true);
+            return;
+        }
+
+        *self
+            .last_success
+            .lock()
+            .expect("governance monitor lock poisoned") = Some(std::time::Instant::now());
         self.stop_authority.set_governance_uncertain(false);
     }
 
@@ -411,8 +424,10 @@ impl GovernanceFreshnessMonitor {
     pub fn record_failure(&self) {
         // Failure invalidates the freshness watermark until a new explicit
         // success is recorded.
-        self.last_success_ms
-            .store(0, std::sync::atomic::Ordering::Release);
+        *self
+            .last_success
+            .lock()
+            .expect("governance monitor lock poisoned") = None;
         self.stop_authority.set_governance_uncertain(true);
     }
 
@@ -421,19 +436,27 @@ impl GovernanceFreshnessMonitor {
     ///
     /// Returns `true` if governance is considered fresh, `false` if stale.
     pub fn check_freshness(&self) -> bool {
-        let last = self
-            .last_success_ms
-            .load(std::sync::atomic::Ordering::Acquire);
-        let now = Self::current_ms();
-        let elapsed = now.saturating_sub(last);
-
-        if elapsed > self.config.freshness_threshold_ms {
+        if self.transitional_resolver {
             self.stop_authority.set_governance_uncertain(true);
-            false
-        } else {
-            self.stop_authority.set_governance_uncertain(false);
-            true
+            return false;
         }
+
+        let last_success = *self
+            .last_success
+            .lock()
+            .expect("governance monitor lock poisoned");
+        let Some(last_success) = last_success else {
+            self.stop_authority.set_governance_uncertain(true);
+            return false;
+        };
+
+        if last_success.elapsed().as_millis() > u128::from(self.config.freshness_threshold_ms) {
+            self.stop_authority.set_governance_uncertain(true);
+            return false;
+        }
+
+        self.stop_authority.set_governance_uncertain(false);
+        true
     }
 
     /// Returns the configured freshness threshold in milliseconds.
@@ -442,10 +465,29 @@ impl GovernanceFreshnessMonitor {
         self.config.freshness_threshold_ms
     }
 
-    /// Returns a reference to the last-success timestamp for testing.
+    /// Returns whether monitor freshness evidence is currently transitional.
     #[must_use]
-    pub const fn last_success_ms(&self) -> &std::sync::Arc<std::sync::atomic::AtomicU64> {
-        &self.last_success_ms
+    pub const fn transitional_resolver(&self) -> bool {
+        self.transitional_resolver
+    }
+
+    /// Clears the last-success sample (test helper).
+    #[cfg(test)]
+    pub fn clear_last_success_for_test(&self) {
+        *self
+            .last_success
+            .lock()
+            .expect("governance monitor lock poisoned") = None;
+    }
+
+    /// Returns whether a last-success sample is present (test helper).
+    #[cfg(test)]
+    #[must_use]
+    pub fn has_last_success_for_test(&self) -> bool {
+        self.last_success
+            .lock()
+            .expect("governance monitor lock poisoned")
+            .is_some()
     }
 }
 
@@ -455,11 +497,14 @@ impl std::fmt::Debug for GovernanceFreshnessMonitor {
             .field("config", &self.config)
             .field("stop_authority", &"<StopAuthority>")
             .field(
-                "last_success_ms",
+                "last_success_is_some",
                 &self
-                    .last_success_ms
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                    .last_success
+                    .lock()
+                    .expect("governance monitor lock poisoned")
+                    .is_some(),
             )
+            .field("transitional_resolver", &self.transitional_resolver)
             .finish()
     }
 }

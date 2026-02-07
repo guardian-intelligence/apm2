@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::budget_tracker::{BudgetExhaustedError, BudgetTracker};
 use super::envelope::StopConditions;
@@ -90,16 +91,19 @@ pub struct StopAuthority {
     /// [`StopStatus::Uncertain`], which triggers deadline-based fail-closed
     /// denial.
     ///
-    /// # Production Wiring (TCK-00364)
+    /// # Production Wiring
     ///
-    /// Currently this flag is only set in tests.  The production call path
-    /// will be wired in TCK-00364 (`FreshnessPolicyV1`), where the
-    /// governance freshness monitor periodically checks the governance
-    /// service health and calls [`StopAuthority::set_governance_uncertain`]
-    /// when the response is stale beyond the configured threshold.  The
-    /// control surface exists and is fully testable; only the monitoring
-    /// integration remains.
+    /// The governance freshness monitor mutates this flag from production
+    /// probe paths. In transitional-local mode (no authenticated governance
+    /// transport), this flag remains true by default.
     governance_uncertain: AtomicBool,
+    /// Whether governance freshness is currently sourced from a transitional
+    /// local resolver rather than authenticated external transport.
+    ///
+    /// When `true`, governance freshness evidence is not authoritative and the
+    /// pre-actuation gate applies the documented transitional carve-out: it
+    /// logs uncertainty but does not enforce `stop_uncertainty_deadline`.
+    governance_transitional_resolver: AtomicBool,
 }
 
 impl StopAuthority {
@@ -110,6 +114,7 @@ impl StopAuthority {
             emergency_stop: AtomicBool::new(false),
             governance_stop: AtomicBool::new(false),
             governance_uncertain: AtomicBool::new(false),
+            governance_transitional_resolver: AtomicBool::new(false),
         }
     }
 
@@ -131,6 +136,13 @@ impl StopAuthority {
         self.governance_uncertain.load(Ordering::Acquire)
     }
 
+    /// Returns whether governance freshness is in transitional-local mode.
+    #[must_use]
+    pub fn governance_transitional_resolver(&self) -> bool {
+        self.governance_transitional_resolver
+            .load(Ordering::Acquire)
+    }
+
     /// Sets the emergency stop flag.
     pub fn set_emergency_stop(&self, active: bool) {
         self.emergency_stop.store(active, Ordering::Release);
@@ -148,6 +160,13 @@ impl StopAuthority {
     pub fn set_governance_uncertain(&self, uncertain: bool) {
         self.governance_uncertain
             .store(uncertain, Ordering::Release);
+    }
+
+    /// Sets whether governance freshness is using transitional-local resolver
+    /// mode (no authenticated transport freshness evidence).
+    pub fn set_governance_transitional_resolver(&self, transitional: bool) {
+        self.governance_transitional_resolver
+            .store(transitional, Ordering::Release);
     }
 }
 
@@ -250,6 +269,33 @@ impl BudgetStatus {
 // PreActuationReceipt
 // =============================================================================
 
+/// Replay-order timestamp using full HLC ordering components.
+///
+/// Ordering is lexicographic by `(wall_ns, logical)`, which preserves
+/// monotonicity even when consecutive HLC samples share the same wall time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ReplayTimestamp {
+    /// Wall-time component (nanoseconds since epoch).
+    pub wall_ns: u64,
+    /// HLC logical counter component.
+    #[serde(default)]
+    pub logical: u64,
+}
+
+impl ReplayTimestamp {
+    /// Constructs a replay timestamp from HLC components.
+    #[must_use]
+    pub const fn new(wall_ns: u64, logical: u64) -> Self {
+        Self { wall_ns, logical }
+    }
+}
+
+impl fmt::Display for ReplayTimestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.wall_ns, self.logical)
+    }
+}
+
 /// Proof that stop and budget checks were performed before actuation.
 ///
 /// This receipt is embedded into tool-response proto fields
@@ -272,7 +318,13 @@ pub struct PreActuationReceipt {
     /// check in replay traces.
     #[serde(default)]
     pub budget_enforcement_deferred: bool,
+    /// Full replay-order timestamp for HLC-aware ordering verification.
+    #[serde(default)]
+    pub replay_timestamp: ReplayTimestamp,
     /// HTF timestamp (nanoseconds) when the checks completed.
+    ///
+    /// This is retained for protocol compatibility and mirrors
+    /// `replay_timestamp.wall_ns`.
     pub timestamp_ns: u64,
 }
 
@@ -641,7 +693,7 @@ impl PreActuationGate {
     ///   **Ignored** when a [`StopAuthority`] is configured; the authority's
     ///   value takes precedence.
     /// * `elapsed_ms` - Milliseconds elapsed since episode started.
-    /// * `timestamp_ns` - HTF timestamp for the receipt.
+    /// * `timestamp_ns` - HTF wall timestamp for the receipt.
     ///
     /// # Errors
     ///
@@ -655,18 +707,43 @@ impl PreActuationGate {
         elapsed_ms: u64,
         timestamp_ns: u64,
     ) -> Result<PreActuationReceipt, PreActuationDenial> {
+        self.check_with_timestamp(
+            conditions,
+            current_episode_count,
+            emergency_stop_active,
+            governance_stop_active,
+            elapsed_ms,
+            ReplayTimestamp::new(timestamp_ns, 0),
+        )
+    }
+
+    /// Performs pre-actuation checks using a full replay-order timestamp.
+    ///
+    /// `timestamp.wall_ns` is reflected into `timestamp_ns` for backwards
+    /// protocol compatibility.
+    pub fn check_with_timestamp(
+        &self,
+        conditions: &StopConditions,
+        current_episode_count: u64,
+        emergency_stop_active: bool,
+        governance_stop_active: bool,
+        elapsed_ms: u64,
+        timestamp: ReplayTimestamp,
+    ) -> Result<PreActuationReceipt, PreActuationDenial> {
         // TCK-00351 BLOCKER 1 FIX: Read from authoritative stop state
         // when available, instead of trusting caller-supplied values.
-        let (emer_stop, gov_stop, gov_uncertain) = self.stop_authority.as_ref().map_or(
-            (emergency_stop_active, governance_stop_active, false),
-            |authority| {
-                (
-                    authority.emergency_stop_active(),
-                    authority.governance_stop_active(),
-                    authority.governance_uncertain(),
-                )
-            },
-        );
+        let (emer_stop, gov_stop, gov_uncertain, gov_transitional_resolver) =
+            self.stop_authority.as_ref().map_or(
+                (emergency_stop_active, governance_stop_active, false, false),
+                |authority| {
+                    (
+                        authority.emergency_stop_active(),
+                        authority.governance_stop_active(),
+                        authority.governance_uncertain(),
+                        authority.governance_transitional_resolver(),
+                    )
+                },
+            );
 
         // --- Step 1: Evaluate stop conditions ---
         // TCK-00351 MAJOR 1 v2 FIX: Use evaluate_with_uncertainty so
@@ -684,8 +761,19 @@ impl PreActuationGate {
                 return Err(PreActuationDenial::StopActive { class });
             },
             StopStatus::Uncertain => {
-                // Fail-closed: if uncertainty deadline has elapsed, deny.
-                if elapsed_ms >= self.evaluator.uncertainty_deadline_ms() {
+                // Transitional carve-out: when freshness is sourced from the
+                // local transitional resolver (no authenticated governance
+                // transport), uncertainty is logged but the deadline is not
+                // enforced to avoid denying all actuation in Phase 1.
+                if gov_transitional_resolver {
+                    warn!(
+                        elapsed_ms,
+                        uncertainty_deadline_ms = self.evaluator.uncertainty_deadline_ms(),
+                        "governance uncertainty observed under transitional resolver; \
+                         stop_uncertainty_deadline not enforced"
+                    );
+                } else if elapsed_ms >= self.evaluator.uncertainty_deadline_ms() {
+                    // Fail-closed: if uncertainty deadline has elapsed, deny.
                     return Err(PreActuationDenial::StopUncertain);
                 }
                 // Within deadline: allow through (optimistic).
@@ -721,7 +809,8 @@ impl PreActuationGate {
             stop_checked,
             budget_checked,
             budget_enforcement_deferred,
-            timestamp_ns,
+            replay_timestamp: timestamp,
+            timestamp_ns: timestamp.wall_ns,
         })
     }
 
@@ -823,8 +912,8 @@ impl PreActuationGate {
 /// Entry in a replay trace for ordering verification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayEntry {
-    /// HTF timestamp of the event (nanoseconds).
-    pub timestamp_ns: u64,
+    /// HLC timestamp of the event for ordering verification.
+    pub timestamp: ReplayTimestamp,
     /// The kind of entry.
     pub kind: ReplayEntryKind,
 }
@@ -872,9 +961,9 @@ pub enum ReplayViolation {
         /// Index of the actuation entry.
         actuation_index: usize,
         /// Timestamp of the pre-actuation check.
-        check_timestamp_ns: u64,
+        check_timestamp_ns: ReplayTimestamp,
         /// Timestamp of the actuation.
-        actuation_timestamp_ns: u64,
+        actuation_timestamp_ns: ReplayTimestamp,
     },
     /// A pre-actuation check did not include stop checking.
     StopNotChecked {
@@ -1021,11 +1110,11 @@ impl ReplayVerifier {
                     };
 
                     // Invariant 2: Check timestamp < actuation timestamp.
-                    if check_entry.timestamp_ns >= entry.timestamp_ns {
+                    if check_entry.timestamp >= entry.timestamp {
                         return Err(ReplayViolation::OrderingViolation {
                             actuation_index: i,
-                            check_timestamp_ns: check_entry.timestamp_ns,
-                            actuation_timestamp_ns: entry.timestamp_ns,
+                            check_timestamp_ns: check_entry.timestamp,
+                            actuation_timestamp_ns: entry.timestamp,
                         });
                     }
 
@@ -1267,7 +1356,7 @@ mod tests {
     fn test_replay_valid_check_then_actuation() {
         let trace = vec![
             ReplayEntry {
-                timestamp_ns: 100,
+                timestamp: ReplayTimestamp::new(100, 0),
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: true,
@@ -1275,7 +1364,7 @@ mod tests {
                 },
             },
             ReplayEntry {
-                timestamp_ns: 200,
+                timestamp: ReplayTimestamp::new(200, 0),
                 kind: ReplayEntryKind::ToolActuation {
                     tool_class: "file_read".to_string(),
                     request_id: "REQ-001".to_string(),
@@ -1289,7 +1378,7 @@ mod tests {
     fn test_replay_multiple_check_actuation_pairs() {
         let trace = vec![
             ReplayEntry {
-                timestamp_ns: 100,
+                timestamp: ReplayTimestamp::new(100, 0),
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: true,
@@ -1297,14 +1386,14 @@ mod tests {
                 },
             },
             ReplayEntry {
-                timestamp_ns: 200,
+                timestamp: ReplayTimestamp::new(200, 0),
                 kind: ReplayEntryKind::ToolActuation {
                     tool_class: "file_read".to_string(),
                     request_id: "REQ-001".to_string(),
                 },
             },
             ReplayEntry {
-                timestamp_ns: 300,
+                timestamp: ReplayTimestamp::new(300, 0),
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: true,
@@ -1312,7 +1401,7 @@ mod tests {
                 },
             },
             ReplayEntry {
-                timestamp_ns: 400,
+                timestamp: ReplayTimestamp::new(400, 0),
                 kind: ReplayEntryKind::ToolActuation {
                     tool_class: "file_write".to_string(),
                     request_id: "REQ-002".to_string(),
@@ -1325,7 +1414,7 @@ mod tests {
     #[test]
     fn test_replay_actuation_without_check_fails() {
         let trace = vec![ReplayEntry {
-            timestamp_ns: 100,
+            timestamp: ReplayTimestamp::new(100, 0),
             kind: ReplayEntryKind::ToolActuation {
                 tool_class: "file_read".to_string(),
                 request_id: "REQ-001".to_string(),
@@ -1350,7 +1439,7 @@ mod tests {
     fn test_replay_ordering_violation() {
         let trace = vec![
             ReplayEntry {
-                timestamp_ns: 200,
+                timestamp: ReplayTimestamp::new(200, 0),
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: true,
@@ -1358,7 +1447,7 @@ mod tests {
                 },
             },
             ReplayEntry {
-                timestamp_ns: 100, // Earlier than check!
+                timestamp: ReplayTimestamp::new(100, 0), // Earlier than check!
                 kind: ReplayEntryKind::ToolActuation {
                     tool_class: "file_read".to_string(),
                     request_id: "REQ-001".to_string(),
@@ -1373,8 +1462,8 @@ mod tests {
                 actuation_timestamp_ns,
             } => {
                 assert_eq!(actuation_index, 1);
-                assert_eq!(check_timestamp_ns, 200);
-                assert_eq!(actuation_timestamp_ns, 100);
+                assert_eq!(check_timestamp_ns, ReplayTimestamp::new(200, 0));
+                assert_eq!(actuation_timestamp_ns, ReplayTimestamp::new(100, 0));
             },
             other => panic!("unexpected violation: {other}"),
         }
@@ -1384,7 +1473,7 @@ mod tests {
     fn test_replay_equal_timestamps_violates() {
         let trace = vec![
             ReplayEntry {
-                timestamp_ns: 100,
+                timestamp: ReplayTimestamp::new(100, 0),
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: true,
@@ -1392,7 +1481,7 @@ mod tests {
                 },
             },
             ReplayEntry {
-                timestamp_ns: 100, // Equal, not strictly less
+                timestamp: ReplayTimestamp::new(100, 0), // Equal, not strictly less
                 kind: ReplayEntryKind::ToolActuation {
                     tool_class: "file_read".to_string(),
                     request_id: "REQ-001".to_string(),
@@ -1404,10 +1493,32 @@ mod tests {
     }
 
     #[test]
+    fn test_replay_equal_wall_higher_logical_allows() {
+        let trace = vec![
+            ReplayEntry {
+                timestamp: ReplayTimestamp::new(100, 7),
+                kind: ReplayEntryKind::PreActuationCheck {
+                    stop_checked: true,
+                    budget_checked: true,
+                    budget_enforcement_deferred: false,
+                },
+            },
+            ReplayEntry {
+                timestamp: ReplayTimestamp::new(100, 8),
+                kind: ReplayEntryKind::ToolActuation {
+                    tool_class: "file_read".to_string(),
+                    request_id: "REQ-001".to_string(),
+                },
+            },
+        ];
+        assert!(ReplayVerifier::verify(&trace).is_ok());
+    }
+
+    #[test]
     fn test_replay_stop_not_checked_fails() {
         let trace = vec![
             ReplayEntry {
-                timestamp_ns: 100,
+                timestamp: ReplayTimestamp::new(100, 0),
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: false,
                     budget_checked: true,
@@ -1415,7 +1526,7 @@ mod tests {
                 },
             },
             ReplayEntry {
-                timestamp_ns: 200,
+                timestamp: ReplayTimestamp::new(200, 0),
                 kind: ReplayEntryKind::ToolActuation {
                     tool_class: "file_read".to_string(),
                     request_id: "REQ-001".to_string(),
@@ -1430,7 +1541,7 @@ mod tests {
     fn test_replay_budget_not_checked_allowed_when_deferred() {
         let trace = vec![
             ReplayEntry {
-                timestamp_ns: 100,
+                timestamp: ReplayTimestamp::new(100, 0),
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: false,
@@ -1438,7 +1549,7 @@ mod tests {
                 },
             },
             ReplayEntry {
-                timestamp_ns: 200,
+                timestamp: ReplayTimestamp::new(200, 0),
                 kind: ReplayEntryKind::ToolActuation {
                     tool_class: "file_read".to_string(),
                     request_id: "REQ-001".to_string(),
@@ -1456,7 +1567,7 @@ mod tests {
         let mut trace = Vec::with_capacity(MAX_REPLAY_ENTRIES + 1);
         for i in 0..=MAX_REPLAY_ENTRIES {
             trace.push(ReplayEntry {
-                timestamp_ns: i as u64,
+                timestamp: ReplayTimestamp::new(i as u64, 0),
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: true,
@@ -1472,7 +1583,7 @@ mod tests {
     fn test_replay_budget_not_checked_without_deferred_fails() {
         let trace = vec![
             ReplayEntry {
-                timestamp_ns: 100,
+                timestamp: ReplayTimestamp::new(100, 0),
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: false,
@@ -1480,7 +1591,7 @@ mod tests {
                 },
             },
             ReplayEntry {
-                timestamp_ns: 200,
+                timestamp: ReplayTimestamp::new(200, 0),
                 kind: ReplayEntryKind::ToolActuation {
                     tool_class: "file_read".to_string(),
                     request_id: "REQ-001".to_string(),
@@ -1499,7 +1610,7 @@ mod tests {
         // Check -> Actuation -> Actuation (second has no check)
         let trace = vec![
             ReplayEntry {
-                timestamp_ns: 100,
+                timestamp: ReplayTimestamp::new(100, 0),
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: true,
@@ -1507,14 +1618,14 @@ mod tests {
                 },
             },
             ReplayEntry {
-                timestamp_ns: 200,
+                timestamp: ReplayTimestamp::new(200, 0),
                 kind: ReplayEntryKind::ToolActuation {
                     tool_class: "file_read".to_string(),
                     request_id: "REQ-001".to_string(),
                 },
             },
             ReplayEntry {
-                timestamp_ns: 300,
+                timestamp: ReplayTimestamp::new(300, 0),
                 kind: ReplayEntryKind::ToolActuation {
                     tool_class: "file_write".to_string(),
                     request_id: "REQ-002".to_string(),
@@ -1576,6 +1687,7 @@ mod tests {
             stop_checked: true,
             budget_checked: true,
             budget_enforcement_deferred: false,
+            replay_timestamp: ReplayTimestamp::new(1000, 0),
             timestamp_ns: 1000,
         };
         assert!(receipt.is_cleared());
@@ -1587,6 +1699,7 @@ mod tests {
             stop_checked: false,
             budget_checked: true,
             budget_enforcement_deferred: false,
+            replay_timestamp: ReplayTimestamp::new(1000, 0),
             timestamp_ns: 1000,
         };
         assert!(!receipt.is_cleared());
@@ -1598,6 +1711,7 @@ mod tests {
             stop_checked: true,
             budget_checked: false,
             budget_enforcement_deferred: true,
+            replay_timestamp: ReplayTimestamp::new(1000, 0),
             timestamp_ns: 1000,
         };
         assert!(!receipt.is_cleared());
@@ -1643,8 +1757,8 @@ mod tests {
 
         let violation = ReplayViolation::OrderingViolation {
             actuation_index: 5,
-            check_timestamp_ns: 200,
-            actuation_timestamp_ns: 100,
+            check_timestamp_ns: ReplayTimestamp::new(200, 0),
+            actuation_timestamp_ns: ReplayTimestamp::new(100, 0),
         };
         let msg = violation.to_string();
         assert!(msg.contains("index 5"));
@@ -1665,6 +1779,7 @@ mod tests {
         let authority = StopAuthority::new();
         assert!(!authority.emergency_stop_active());
         assert!(!authority.governance_stop_active());
+        assert!(!authority.governance_transitional_resolver());
     }
 
     #[test]
@@ -1978,6 +2093,22 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn test_gate_uncertain_transitional_mode_allows_past_deadline() {
+        let authority = Arc::new(StopAuthority::new());
+        authority.set_governance_uncertain(true);
+        authority.set_governance_transitional_resolver(true);
+
+        let deadline_ms = 5_000;
+        let evaluator = StopConditionEvaluator::with_uncertainty_deadline_ms(deadline_ms);
+        let gate =
+            PreActuationGate::new(evaluator, None).with_stop_authority(Arc::clone(&authority));
+
+        let conditions = StopConditions::default();
+        let result = gate.check(&conditions, 0, false, false, deadline_ms, 2000);
+        assert!(result.is_ok());
+    }
+
     // =========================================================================
     // TCK-00351 MAJOR 2 v2 FIX: StopAuthority runtime mutation test
     // =========================================================================
@@ -2068,7 +2199,7 @@ mod tests {
         // Build trace as the runtime would
         let trace = vec![
             ReplayEntry {
-                timestamp_ns: receipt1.timestamp_ns,
+                timestamp: receipt1.replay_timestamp,
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: receipt1.stop_checked,
                     budget_checked: receipt1.budget_checked,
@@ -2076,14 +2207,14 @@ mod tests {
                 },
             },
             ReplayEntry {
-                timestamp_ns: 200, // actuation at ts=200
+                timestamp: ReplayTimestamp::new(200, 0), // actuation at ts=200
                 kind: ReplayEntryKind::ToolActuation {
                     tool_class: "file_read".to_string(),
                     request_id: "REQ-001".to_string(),
                 },
             },
             ReplayEntry {
-                timestamp_ns: receipt2.timestamp_ns,
+                timestamp: receipt2.replay_timestamp,
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: receipt2.stop_checked,
                     budget_checked: receipt2.budget_checked,
@@ -2091,7 +2222,7 @@ mod tests {
                 },
             },
             ReplayEntry {
-                timestamp_ns: 400, // actuation at ts=400
+                timestamp: ReplayTimestamp::new(400, 0), // actuation at ts=400
                 kind: ReplayEntryKind::ToolActuation {
                     tool_class: "shell_exec".to_string(),
                     request_id: "REQ-002".to_string(),
@@ -2109,7 +2240,7 @@ mod tests {
     fn test_replay_verifier_rejects_ungated_actuation_evid_0305() {
         // Trace with actuation but no preceding check
         let trace = vec![ReplayEntry {
-            timestamp_ns: 100,
+            timestamp: ReplayTimestamp::new(100, 0),
             kind: ReplayEntryKind::ToolActuation {
                 tool_class: "file_write".to_string(),
                 request_id: "REQ-UNGATED".to_string(),

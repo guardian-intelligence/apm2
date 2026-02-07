@@ -414,6 +414,26 @@ pub struct ShutdownResponse {
     #[prost(string, tag = "1")]
     pub message: ::prost::alloc::string::String,
 }
+/// IPC-PRIV-018: UpdateStopFlags
+/// Mutate runtime emergency/governance stop flags used by pre-actuation gating.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct UpdateStopFlagsRequest {
+    /// Optional emergency stop state update.
+    #[prost(bool, optional, tag = "1")]
+    pub emergency_stop_active: ::core::option::Option<bool>,
+    /// Optional governance stop state update.
+    #[prost(bool, optional, tag = "2")]
+    pub governance_stop_active: ::core::option::Option<bool>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct UpdateStopFlagsResponse {
+    /// Effective emergency stop state after applying updates.
+    #[prost(bool, tag = "1")]
+    pub emergency_stop_active: bool,
+    /// Effective governance stop state after applying updates.
+    #[prost(bool, tag = "2")]
+    pub governance_stop_active: bool,
+}
 /// IPC-PRIV-005: WorkStatus (TCK-00344)
 /// Query the status of a work item from the work queue.
 #[derive(Clone, PartialEq, ::prost::Message)]

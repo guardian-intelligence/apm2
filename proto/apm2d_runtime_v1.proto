@@ -369,6 +369,22 @@ message ShutdownResponse {
   string message = 1;
 }
 
+// IPC-PRIV-018: UpdateStopFlags
+// Mutate runtime emergency/governance stop flags used by pre-actuation gating.
+message UpdateStopFlagsRequest {
+  // Optional emergency stop state update.
+  optional bool emergency_stop_active = 1;
+  // Optional governance stop state update.
+  optional bool governance_stop_active = 2;
+}
+
+message UpdateStopFlagsResponse {
+  // Effective emergency stop state after applying updates.
+  bool emergency_stop_active = 1;
+  // Effective governance stop state after applying updates.
+  bool governance_stop_active = 2;
+}
+
 // IPC-PRIV-005: WorkStatus (TCK-00344)
 // Query the status of a work item from the work queue.
 message WorkStatusRequest {
