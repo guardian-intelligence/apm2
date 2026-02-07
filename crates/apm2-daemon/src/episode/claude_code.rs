@@ -296,6 +296,12 @@ impl ClaudeCodeAdapter {
             let mut control_open = true;
             let mut output_live = true;
 
+            // Bounded backpressure telemetry: count dropped events and only
+            // log on the first drop per category to avoid unbounded log write
+            // amplification.
+            let mut dropped_output_events: u64 = 0;
+            let mut dropped_tool_events: u64 = 0;
+
             loop {
                 tokio::select! {
                     maybe_cmd = control_rx.recv(), if control_open => {
@@ -349,11 +355,19 @@ impl ClaudeCodeAdapter {
                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                         // Channel full — drop event to avoid blocking the
                                         // select loop (control-plane decoupling invariant).
-                                        tracing::warn!(
-                                            episode_id = %episode_id,
-                                            seq = seq - 1,
-                                            "output event dropped: event channel full (backpressure)"
-                                        );
+                                        //
+                                        // Rate-limited telemetry: log only on the first
+                                        // drop to prevent unbounded log write amplification.
+                                        // Total drops are summarised at task exit.
+                                        if dropped_output_events == 0 {
+                                            tracing::warn!(
+                                                episode_id = %episode_id,
+                                                seq = seq - 1,
+                                                "output event dropped: event channel full (backpressure); \
+                                                 further drops will be counted silently"
+                                            );
+                                        }
+                                        dropped_output_events += 1;
                                     },
                                 }
 
@@ -374,10 +388,16 @@ impl ClaudeCodeAdapter {
                                             break;
                                         },
                                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                            tracing::warn!(
-                                                episode_id = %episode_id,
-                                                "tool event dropped: event channel full (backpressure)"
-                                            );
+                                            // Rate-limited telemetry: log only on first
+                                            // tool event drop. Total summarised at exit.
+                                            if dropped_tool_events == 0 {
+                                                tracing::warn!(
+                                                    episode_id = %episode_id,
+                                                    "tool event dropped: event channel full (backpressure); \
+                                                     further drops will be counted silently"
+                                                );
+                                            }
+                                            dropped_tool_events += 1;
                                         },
                                     }
                                 }
@@ -413,9 +433,30 @@ impl ClaudeCodeAdapter {
                 guard.process_terminated = true;
             }
 
-            // Emit terminated event (best-effort, non-blocking to avoid
-            // stalling permit release if the receiver is backpressured).
-            let _ = tx.try_send(HarnessEvent::terminated(exit_code, classification));
+            // Log backpressure drop summary at task exit if any events were lost.
+            if dropped_output_events > 0 || dropped_tool_events > 0 {
+                tracing::warn!(
+                    episode_id = %episode_id,
+                    dropped_output_events,
+                    dropped_tool_events,
+                    "task exiting with dropped events due to backpressure"
+                );
+            }
+
+            // Emit terminated event using blocking send. Terminated is a
+            // control-significant one-shot event (at most once per task
+            // lifetime) and must not be silently lost. Blocking here is
+            // acceptable because the task is about to exit anyway.
+            if tx
+                .send(HarnessEvent::terminated(exit_code, classification))
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    episode_id = %episode_id,
+                    "terminated event could not be delivered: receiver dropped"
+                );
+            }
         });
 
         let handle =
