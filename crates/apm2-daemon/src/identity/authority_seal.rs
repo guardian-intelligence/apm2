@@ -41,13 +41,19 @@
 //! - Verification methods enforce expected `subject_kind` and `subject_hash` at
 //!   call boundaries to prevent semantically wrong seals from being accepted.
 //!
-//! # Issuer-Key Binding Contract
+//! # Issuer-Key Binding Enforcement
 //!
-//! All verification methods accept caller-provided verifying keys. The caller
-//! is responsible for resolving the `issuer_id` in the seal to the authentic
-//! verifying keys via an authenticated directory or equivalent trusted
-//! mechanism. The verification methods validate cryptographic signatures but
-//! do NOT perform issuer identity resolution.
+//! All verification methods enforce that caller-supplied verifying key(s)
+//! correspond to the seal's embedded `issuer_id`. For single-key issuers,
+//! the `PublicKeyIdV1` is derived from the verifying key and compared. For
+//! quorum issuers, the `KeySetIdV1` is re-derived from the verifying keys
+//! and compared. If the derived identity does not match, verification fails
+//! with `IssuerKeyMismatch` before any signature check occurs.
+//!
+//! Callers are still responsible for resolving the `issuer_id` in the seal
+//! to authentic verifying keys via an authenticated directory or equivalent
+//! trusted mechanism. The binding check prevents accidental or adversarial
+//! key/issuer mismatches at the verification boundary.
 //!
 //! # Contract References
 //!
@@ -62,7 +68,7 @@ use ed25519_dalek::Verifier as _;
 use thiserror::Error;
 
 use super::directory_proof::LedgerAnchorV1;
-use super::{CellIdV1, KeySetIdV1, PublicKeyIdV1};
+use super::{AlgorithmTag, CellIdV1, KeySetIdV1, PublicKeyIdV1, SetTag};
 
 // ──────────────────────────────────────────────────────────────
 // Domain separation constants
@@ -224,6 +230,19 @@ pub enum AuthoritySealError {
         max: usize,
         /// Estimated actual size.
         actual: usize,
+    },
+
+    /// The caller-supplied verifying key(s) do not correspond to the seal's
+    /// embedded `issuer_id`. This prevents a seal claiming issuer X from being
+    /// verified with a key belonging to issuer Y.
+    #[error(
+        "issuer key mismatch: seal issuer_id does not match derived issuer from verifying key(s)"
+    )]
+    IssuerKeyMismatch {
+        /// The `IssuerId` embedded in the seal.
+        expected: IssuerId,
+        /// The `IssuerId` derived from the caller-supplied verifying key(s).
+        derived: IssuerId,
     },
 }
 
@@ -766,6 +785,70 @@ impl AuthoritySealV1 {
         Ok(())
     }
 
+    // ────────── Issuer-key binding ──────────
+
+    /// Check that a single verifying key corresponds to the seal's
+    /// `issuer_id` for `PublicKey` issuers. Derives a `PublicKeyIdV1` from
+    /// the verifying key bytes and compares it against the embedded issuer.
+    fn check_single_key_issuer_binding(
+        &self,
+        verifying_key: &ed25519_dalek::VerifyingKey,
+    ) -> Result<(), AuthoritySealError> {
+        let derived_pkid =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &verifying_key.to_bytes());
+        let derived = IssuerId::PublicKey(derived_pkid);
+        if self.issuer_id != derived {
+            return Err(AuthoritySealError::IssuerKeyMismatch {
+                expected: self.issuer_id.clone(),
+                derived,
+            });
+        }
+        Ok(())
+    }
+
+    /// Check that a set of verifying keys corresponds to the seal's
+    /// `issuer_id` for `Quorum` issuers. Derives member `PublicKeyIdV1`s
+    /// from the verifying key bytes, constructs the `KeySetIdV1` using the
+    /// same descriptor parameters, and compares the merkle root against
+    /// the embedded issuer keyset id.
+    fn check_quorum_key_issuer_binding(
+        &self,
+        verifying_keys: &[ed25519_dalek::VerifyingKey],
+        set_tag: SetTag,
+        threshold_k: u32,
+    ) -> Result<(), AuthoritySealError> {
+        let members: Vec<PublicKeyIdV1> = verifying_keys
+            .iter()
+            .map(|k| PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &k.to_bytes()))
+            .collect();
+        // Derive the keyset ID from the provided keys. If derivation fails
+        // (e.g. duplicate keys, empty members), that itself indicates a
+        // mismatch since the seal's keyset was validly constructed.
+        let derived_keyset = KeySetIdV1::from_descriptor(
+            "ed25519",
+            set_tag,
+            threshold_k,
+            &members,
+            None, // weights are not available at verification time
+        )
+        .map_err(|_| AuthoritySealError::IssuerKeyMismatch {
+            expected: self.issuer_id.clone(),
+            derived: IssuerId::Quorum(KeySetIdV1::from_binary(&[0u8; 32]).unwrap_or_else(|_| {
+                // Unreachable: 32-byte input is always valid for from_binary.
+                // Defensive fallback for the error path.
+                KeySetIdV1::from_binary(&[0u8; 32]).expect("32-byte hash is valid")
+            })),
+        })?;
+        let derived = IssuerId::Quorum(derived_keyset);
+        if self.issuer_id != derived {
+            return Err(AuthoritySealError::IssuerKeyMismatch {
+                expected: self.issuer_id.clone(),
+                derived,
+            });
+        }
+        Ok(())
+    }
+
     // ────────── Verification ──────────
 
     /// Verify a `SINGLE_SIG` seal against the provided verifying key.
@@ -774,6 +857,7 @@ impl AuthoritySealV1 {
     ///
     /// Returns an error if:
     /// - The seal kind is not `SingleSig`
+    /// - The verifying key does not correspond to the seal's `issuer_id`
     /// - The expected subject kind or hash does not match
     /// - Temporal authority is required but `time_envelope_ref` is zero
     /// - The signature does not verify against the preimage
@@ -790,6 +874,7 @@ impl AuthoritySealV1 {
             });
         }
 
+        self.check_single_key_issuer_binding(verifying_key)?;
         self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
         self.check_temporal_authority(require_temporal)?;
 
@@ -815,6 +900,7 @@ impl AuthoritySealV1 {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The verifying keys do not correspond to the seal's `issuer_id`
     /// - The expected subject kind or hash does not match
     /// - Temporal authority is required but `time_envelope_ref` is zero
     /// - Any signature fails verification
@@ -831,6 +917,9 @@ impl AuthoritySealV1 {
             });
         }
 
+        #[allow(clippy::cast_possible_truncation)]
+        let n = verifying_keys.len() as u32;
+        self.check_quorum_key_issuer_binding(verifying_keys, SetTag::Multisig, n)?;
         self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
         self.check_temporal_authority(require_temporal)?;
 
@@ -874,6 +963,7 @@ impl AuthoritySealV1 {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The verifying keys do not correspond to the seal's `issuer_id`
     /// - The expected subject kind or hash does not match
     /// - Temporal authority is required but `time_envelope_ref` is zero
     /// - The threshold is not met
@@ -891,6 +981,9 @@ impl AuthoritySealV1 {
             });
         }
 
+        #[allow(clippy::cast_possible_truncation)]
+        let threshold_u32 = threshold as u32;
+        self.check_quorum_key_issuer_binding(verifying_keys, SetTag::Threshold, threshold_u32)?;
         self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
         self.check_temporal_authority(require_temporal)?;
 
@@ -979,6 +1072,7 @@ impl AuthoritySealV1 {
             });
         }
 
+        self.check_single_key_issuer_binding(verifying_key)?;
         self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
         self.check_temporal_authority(require_temporal)?;
 
@@ -1022,6 +1116,7 @@ impl AuthoritySealV1 {
     /// Returns an error if:
     /// - The seal kind is not `MerkleBatch`
     /// - The issuer is not a quorum
+    /// - The verifying keys do not correspond to the seal's `issuer_id`
     /// - The number of verifying keys does not match the number of signatures
     /// - The expected subject kind or hash does not match
     /// - Temporal authority is required but `time_envelope_ref` is zero
@@ -1049,6 +1144,9 @@ impl AuthoritySealV1 {
             });
         }
 
+        #[allow(clippy::cast_possible_truncation)]
+        let n = verifying_keys.len() as u32;
+        self.check_quorum_key_issuer_binding(verifying_keys, SetTag::Multisig, n)?;
         self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
         self.check_temporal_authority(require_temporal)?;
 
@@ -1110,6 +1208,7 @@ impl AuthoritySealV1 {
     /// Returns an error if:
     /// - The seal kind is not `MerkleBatch`
     /// - The issuer is not a quorum
+    /// - The verifying keys do not correspond to the seal's `issuer_id`
     /// - The threshold is zero or exceeds the number of verifying keys
     /// - The expected subject kind or hash does not match
     /// - Temporal authority is required but `time_envelope_ref` is zero
@@ -1139,6 +1238,9 @@ impl AuthoritySealV1 {
             });
         }
 
+        #[allow(clippy::cast_possible_truncation)]
+        let threshold_u32 = threshold as u32;
+        self.check_quorum_key_issuer_binding(verifying_keys, SetTag::Threshold, threshold_u32)?;
         self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
         self.check_temporal_authority(require_temporal)?;
 
@@ -1464,6 +1566,9 @@ mod tests {
         let wrong_signer = Signer::generate();
         let seal = make_single_sig_seal(&signer);
 
+        // Wrong key is now caught at the issuer-key binding check (before
+        // reaching signature verification). This is correct: if the key
+        // doesn't match the issuer, we fail early with IssuerKeyMismatch.
         assert!(matches!(
             seal.verify_single_sig(
                 &wrong_signer.verifying_key(),
@@ -1471,7 +1576,7 @@ mod tests {
                 &[0x42; HASH_SIZE],
                 false,
             ),
-            Err(AuthoritySealError::SignatureVerificationFailed { .. })
+            Err(AuthoritySealError::IssuerKeyMismatch { .. })
         ));
     }
 
@@ -2451,6 +2556,9 @@ mod tests {
     }
 
     /// Quorum multisig `MERKLE_BATCH`: mismatched key count must fail.
+    /// With issuer-key binding enforcement, providing fewer keys than the
+    /// seal's keyset will be caught by `IssuerKeyMismatch` (since a 1-key
+    /// keyset differs from the 2-key keyset in the seal).
     #[test]
     fn merkle_batch_quorum_multisig_rejects_key_count_mismatch() {
         let signer_a = Signer::generate();
@@ -2458,7 +2566,8 @@ mod tests {
         let (seal, _keys, receipt_hash, inclusion_proof, batch_root) =
             make_quorum_merkle_batch_seal(&signer_a, &signer_b, true);
 
-        // Provide only 1 key for a 2-sig seal.
+        // Provide only 1 key for a 2-sig seal. The keyset derived from 1
+        // key will not match the 2-key keyset in the seal.
         let result = seal.verify_merkle_batch_quorum_multisig(
             &[signer_a.verifying_key()],
             &receipt_hash,
@@ -2468,11 +2577,8 @@ mod tests {
             false,
         );
         assert!(
-            matches!(
-                result,
-                Err(AuthoritySealError::InvalidQuorumSignatureCount { .. })
-            ),
-            "Key count mismatch must be rejected"
+            matches!(result, Err(AuthoritySealError::IssuerKeyMismatch { .. })),
+            "Key count mismatch must be rejected (caught by issuer-key binding)"
         );
     }
 
@@ -3132,6 +3238,350 @@ mod tests {
                 })
             ),
             "Empty signature bytes must be rejected"
+        );
+    }
+
+    // ────────── Issuer-key binding enforcement tests (SECURITY BLOCKER 6)
+    // ──────────
+
+    /// SECURITY: A `SINGLE_SIG` seal with issuer A must be rejected when
+    /// verified with key B (key-to-issuer mismatch).
+    #[test]
+    fn verify_single_sig_rejects_key_issuer_mismatch() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+
+        // Seal is issued by signer_a (issuer_id derived from signer_a's key).
+        let seal = make_single_sig_seal(&signer_a);
+
+        // Attempt verification with signer_b's key — different issuer.
+        let result = seal.verify_single_sig(
+            &signer_b.verifying_key(),
+            TEST_SUBJECT_KIND,
+            &[0x42; HASH_SIZE],
+            false,
+        );
+        assert!(
+            matches!(result, Err(AuthoritySealError::IssuerKeyMismatch { .. })),
+            "verify_single_sig must reject key that does not match seal's issuer_id, \
+             got: {result:?}"
+        );
+    }
+
+    /// SECURITY: A `QUORUM_MULTISIG` seal with keyset A must be rejected
+    /// when verified with keys from keyset B (keyset-to-issuer mismatch).
+    #[test]
+    fn verify_quorum_multisig_rejects_keyset_issuer_mismatch() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let signer_c = Signer::generate();
+        let signer_d = Signer::generate();
+        let cell_id = test_cell_id();
+
+        // Build keyset from signers a+b.
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+        let keyset_ab = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Multisig,
+            2,
+            &[member_a, member_b],
+            None,
+        )
+        .unwrap();
+
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+        let subject_hash = [0x42; HASH_SIZE];
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 5 };
+
+        // Build seal with keyset a+b, sign with a+b.
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::Quorum(keyset_ab.clone()),
+            subject_kind.clone(),
+            subject_hash,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            vec![vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let sig_a = signer_a.sign(&preimage);
+        let sig_b = signer_b.sign(&preimage);
+
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_ab),
+            subject_kind,
+            subject_hash,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            vec![sig_a.to_bytes().to_vec(), sig_b.to_bytes().to_vec()],
+        )
+        .unwrap();
+
+        // Verify with keys from a completely different keyset (c+d).
+        let wrong_keys = [signer_c.verifying_key(), signer_d.verifying_key()];
+        let result = seal.verify_quorum_multisig(&wrong_keys, "apm2.test.v1", &subject_hash, false);
+        assert!(
+            matches!(result, Err(AuthoritySealError::IssuerKeyMismatch { .. })),
+            "verify_quorum_multisig must reject keys that do not match seal's issuer_id keyset, \
+             got: {result:?}"
+        );
+    }
+
+    /// Positive control: `verify_single_sig` must still succeed when the
+    /// verifying key matches the seal's `issuer_id` (no regression).
+    #[test]
+    fn verify_single_sig_valid_with_matching_issuer() {
+        let signer = Signer::generate();
+        let seal = make_single_sig_seal(&signer);
+        let result = seal.verify_single_sig(
+            &signer.verifying_key(),
+            TEST_SUBJECT_KIND,
+            &[0x42; HASH_SIZE],
+            false,
+        );
+        assert!(
+            result.is_ok(),
+            "verify_single_sig must succeed with matching issuer key, got: {result:?}"
+        );
+    }
+
+    /// SECURITY: A `QUORUM_THRESHOLD` seal must reject keys from a
+    /// different keyset.
+    #[test]
+    fn verify_quorum_threshold_rejects_keyset_issuer_mismatch() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let signer_c = Signer::generate();
+        let signer_x = Signer::generate();
+        let signer_y = Signer::generate();
+        let signer_z = Signer::generate();
+        let cell_id = test_cell_id();
+
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+        let member_c =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_c.public_key_bytes());
+        let keyset_abc = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            2,
+            &[member_a, member_b, member_c],
+            None,
+        )
+        .unwrap();
+
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+        let subject_hash = [0x42; HASH_SIZE];
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 10 };
+
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::Quorum(keyset_abc.clone()),
+            subject_kind.clone(),
+            subject_hash,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumThreshold,
+            vec![vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let sig_a = signer_a.sign(&preimage);
+        let sig_b = signer_b.sign(&preimage);
+
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_abc),
+            subject_kind,
+            subject_hash,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumThreshold,
+            vec![
+                sig_a.to_bytes().to_vec(),
+                sig_b.to_bytes().to_vec(),
+                vec![0u8; 64],
+            ],
+        )
+        .unwrap();
+
+        // Use keys from a different keyset (x, y, z).
+        let wrong_keys = [
+            signer_x.verifying_key(),
+            signer_y.verifying_key(),
+            signer_z.verifying_key(),
+        ];
+        let result =
+            seal.verify_quorum_threshold(&wrong_keys, 2, "apm2.test.v1", &subject_hash, false);
+        assert!(
+            matches!(result, Err(AuthoritySealError::IssuerKeyMismatch { .. })),
+            "verify_quorum_threshold must reject keys from a different keyset, got: {result:?}"
+        );
+    }
+
+    /// SECURITY: `verify_merkle_batch` (single-key) must reject key-issuer
+    /// mismatch.
+    #[test]
+    fn verify_merkle_batch_rejects_key_issuer_mismatch() {
+        let signer = Signer::generate();
+        let wrong_signer = Signer::generate();
+        let cell_id = test_cell_id();
+        let pkid = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer.public_key_bytes());
+
+        let receipt_hash = [0x42; HASH_SIZE];
+        let other_receipt_hash = [0x43; HASH_SIZE];
+
+        let leaf0 = compute_receipt_leaf_hash(&receipt_hash);
+        let leaf1 = compute_receipt_leaf_hash(&other_receipt_hash);
+        let (batch_root, inclusion_proof) = build_merkle_tree_2(leaf0, leaf1);
+
+        let subject_kind = SubjectKind::new("apm2.receipt_batch.v1").unwrap();
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 1 };
+
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::PublicKey(pkid.clone()),
+            subject_kind.clone(),
+            batch_root,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::MerkleBatch,
+            vec![vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let signature = signer.sign(&preimage);
+
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::PublicKey(pkid),
+            subject_kind,
+            batch_root,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::MerkleBatch,
+            vec![signature.to_bytes().to_vec()],
+        )
+        .unwrap();
+
+        // Verify with wrong signer's key — issuer mismatch.
+        let result = seal.verify_merkle_batch(
+            &wrong_signer.verifying_key(),
+            &receipt_hash,
+            &inclusion_proof,
+            "apm2.receipt_batch.v1",
+            &batch_root,
+            false,
+        );
+        assert!(
+            matches!(result, Err(AuthoritySealError::IssuerKeyMismatch { .. })),
+            "verify_merkle_batch must reject key-issuer mismatch, got: {result:?}"
+        );
+    }
+
+    /// SECURITY: `verify_merkle_batch_quorum_multisig` must reject
+    /// keyset-issuer mismatch.
+    #[test]
+    fn verify_merkle_batch_quorum_multisig_rejects_keyset_mismatch() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let signer_c = Signer::generate();
+        let signer_d = Signer::generate();
+
+        // Build seal with keyset a+b, both sign.
+        let (seal, _keys, receipt_hash, inclusion_proof, batch_root) =
+            make_quorum_merkle_batch_seal(&signer_a, &signer_b, true);
+
+        // Verify with completely different keys c+d.
+        let wrong_keys = [signer_c.verifying_key(), signer_d.verifying_key()];
+        let result = seal.verify_merkle_batch_quorum_multisig(
+            &wrong_keys,
+            &receipt_hash,
+            &inclusion_proof,
+            "apm2.receipt_batch.v1",
+            &batch_root,
+            false,
+        );
+        assert!(
+            matches!(result, Err(AuthoritySealError::IssuerKeyMismatch { .. })),
+            "verify_merkle_batch_quorum_multisig must reject keyset-issuer mismatch, \
+             got: {result:?}"
+        );
+    }
+
+    /// SECURITY: Adversarial scenario — a seal claims issuer A but is
+    /// successfully signed by key B over the same preimage. Without
+    /// issuer-key binding, verification would succeed because B signed
+    /// the correct preimage (which includes A's identity). The binding
+    /// check MUST reject this before reaching signature verification.
+    #[test]
+    fn verify_single_sig_accepts_key_mismatched_to_issuer_id_is_blocked() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let cell_id = test_cell_id();
+
+        // Build seal claiming issuer A.
+        let pkid_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let subject_kind = SubjectKind::new(TEST_SUBJECT_KIND).unwrap();
+        let subject_hash = [0x42; HASH_SIZE];
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 1 };
+
+        // Create unsigned seal to get preimage.
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::PublicKey(pkid_a.clone()),
+            subject_kind.clone(),
+            subject_hash,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::SingleSig,
+            vec![vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let preimage = seal_unsigned.domain_separated_preimage();
+
+        // Sign with signer B (NOT the claimed issuer A).
+        let sig_b = signer_b.sign(&preimage);
+
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::PublicKey(pkid_a),
+            subject_kind,
+            subject_hash,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::SingleSig,
+            vec![sig_b.to_bytes().to_vec()],
+        )
+        .unwrap();
+
+        // Verify with signer B's key: the signature IS valid over the
+        // preimage, but the issuer_id is A, not B. The binding check
+        // must catch this.
+        let result = seal.verify_single_sig(
+            &signer_b.verifying_key(),
+            TEST_SUBJECT_KIND,
+            &subject_hash,
+            false,
+        );
+        assert!(
+            matches!(result, Err(AuthoritySealError::IssuerKeyMismatch { .. })),
+            "SECURITY: seal claiming issuer A must not be verifiable with key B, \
+             even when B signed the correct preimage. Got: {result:?}"
         );
     }
 }
