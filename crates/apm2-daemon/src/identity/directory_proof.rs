@@ -1038,10 +1038,32 @@ fn resolve_profile_for_verification(
 ) -> Result<Option<IdentityProofProfileV1>, IdentityProofError> {
     let strict = requires_strict_profile_enforcement(risk_tier);
 
+    // SECURITY (REQ-0012): In strict mode (Tier2+), the known-profile registry
+    // check is MANDATORY and cannot be bypassed by supplying an expected_profile.
+    // We must validate that the directory head's profile hash is in the known
+    // registry BEFORE accepting any profile, including a caller-supplied one.
+    if strict {
+        // Fail-closed: reject if the head's profile hash is not in the
+        // known-profile registry, regardless of whether expected_profile
+        // was supplied and hash-matches.
+        let known = resolve_known_profile(directory_head.identity_proof_profile_hash())?;
+
+        // If caller supplied an expected_profile, verify it binds to the head.
+        if let Some(profile) = expected_profile {
+            directory_head.verify_profile_binding(profile)?;
+            return Ok(Some(profile.clone()));
+        }
+
+        // No expected_profile supplied; use the registry-resolved profile.
+        directory_head.verify_profile_binding(&known)?;
+        return Ok(Some(known));
+    }
+
+    // Non-strict mode (Tier0/Tier1): tolerate unknown or mismatched profiles
+    // with warnings to preserve local/self-signed development flows.
     if let Some(profile) = expected_profile {
         match directory_head.verify_profile_binding(profile) {
             Ok(()) => return Ok(Some(profile.clone())),
-            Err(err) if strict => return Err(err),
             Err(err) => {
                 warn!(
                     risk_tier = ?risk_tier,
@@ -1056,7 +1078,6 @@ fn resolve_profile_for_verification(
     match resolve_known_profile(directory_head.identity_proof_profile_hash()) {
         Ok(profile) => match directory_head.verify_profile_binding(&profile) {
             Ok(()) => Ok(Some(profile)),
-            Err(err) if strict => Err(err),
             Err(err) => {
                 warn!(
                     risk_tier = ?risk_tier,
@@ -1067,7 +1088,6 @@ fn resolve_profile_for_verification(
                 Ok(None)
             },
         },
-        Err(err) if strict => Err(err),
         Err(err) => {
             warn!(
                 risk_tier = ?risk_tier,
@@ -3812,6 +3832,103 @@ mod tests {
                 }
             ),
             "expected InvalidEnumTag for 0xFF, got: {err:?}"
+        );
+    }
+
+    /// Regression test (Round 3): Tier2+ strict mode MUST reject an
+    /// `expected_profile` whose hash matches the directory head but is NOT in
+    /// the known-profile registry. Before the fix, supplying `expected_profile`
+    /// bypassed `resolve_known_profile()`, violating REQ-0012.
+    #[test]
+    fn test_tier2_rejects_unknown_but_hash_matching_expected_profile() {
+        let cell_cert = make_cell_certificate();
+        let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
+
+        let key = derive_directory_key(holon_cert.holon_id());
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            key,
+            [0xAB; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![SiblingNode::new([0x10; HASH_BYTES])],
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+
+        // Construct a custom profile that is NOT in the known-profile registry.
+        // It differs from baseline_smt_10e12 by using a different max_proof_bytes.
+        let custom_profile = IdentityProofProfileV1 {
+            directory_kind: DirectoryProofKindV1::Smt256CompressedV1,
+            max_depth: MAX_SMT_DEPTH,
+            max_proof_bytes: 4096, // different from baseline's 8192
+            max_non_default_siblings: MAX_SMT_DEPTH,
+            supports_membership_multiproof: false,
+            supports_non_membership_proof: true,
+            verifier_cost_target: VerifierCostTarget {
+                max_hash_ops_per_membership_proof: MAX_HASH_OPS_PER_MEMBERSHIP_PROOF_10E12,
+                max_signature_or_quorum_checks_per_cached_head: 1,
+                max_bytes_fetched_for_verification: 16 * 1024,
+            },
+        };
+
+        // Confirm the custom profile is NOT the baseline (different hash).
+        let custom_hash = custom_profile
+            .content_hash()
+            .expect("custom profile hash should compute");
+        assert_ne!(
+            custom_hash,
+            baseline_profile_hash(),
+            "test requires a profile hash that differs from the baseline"
+        );
+
+        // Confirm resolve_known_profile rejects it.
+        assert!(
+            resolve_known_profile(&custom_hash).is_err(),
+            "custom profile must not be in the known-profile registry"
+        );
+
+        // Build a directory head whose identity_proof_profile_hash matches
+        // the custom (unknown) profile hash.
+        let head = HolonDirectoryHeadV1::new(
+            cell_cert.cell_id().clone(),
+            12,
+            LedgerAnchorV1::ConsensusIndex { index: 99 },
+            root,
+            DirectoryKindV1::Smt256V1,
+            1,
+            8192,
+            custom_hash,
+            [0x62; HASH_BYTES],
+            [0x63; HASH_BYTES],
+            None,
+        )
+        .unwrap();
+
+        let identity_proof = make_test_identity_proof(&cell_cert, &holon_cert, &head, proof, 100);
+
+        // Supply expected_profile = custom_profile (hash matches the head).
+        // In Tier2+ strict mode, this MUST be rejected because the profile
+        // hash is not in the known-profile registry.
+        let err = identity_proof
+            .verify_with_profile_policy(
+                holon_cert.holon_id(),
+                &cell_cert,
+                &holon_cert,
+                &head,
+                false,
+                105,
+                10,
+                head.freshness_policy_hash(),
+                &[0xAB; HASH_BYTES],
+                RiskTier::Tier2,
+                Some(&custom_profile),
+                |_, _, _| Ok(()),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, IdentityProofError::UnknownIdentityProofProfile { .. }),
+            "Tier2+ must reject unknown-but-hash-matching expected_profile; got: {err:?}"
         );
     }
 }
