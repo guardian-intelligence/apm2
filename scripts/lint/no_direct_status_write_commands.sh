@@ -29,13 +29,16 @@ check_logical_line() {
     fi
 
     local lc="${line,,}"
+    # Collapse runs of whitespace so `gh   api` matches `gh api`.
+    local squeezed
+    squeezed="$(echo "$lc" | sed 's/[[:space:]]\+/ /g')"
 
-    if [[ "$lc" == *"gh api"* ]] && [[ "$lc" == *"/statuses/"* ]]; then
-        if [[ "$lc" == *"--method post"* ]] || [[ "$lc" == *"--method=post"* ]] ||
-            [[ "$lc" == *"-x post"* ]] || [[ "$lc" == *"-x=post"* ]] ||
-            [[ "$lc" == *"--input"* ]] ||
-            [[ "$lc" == *"-f state="* ]] || [[ "$lc" == *"--field state="* ]] ||
-            [[ "$lc" == *"-f context="* ]] || [[ "$lc" == *"--field context="* ]]; then
+    if [[ "$squeezed" == *"gh api"* ]] && [[ "$squeezed" == *"/statuses/"* ]]; then
+        if [[ "$squeezed" == *"--method post"* ]] || [[ "$squeezed" == *"--method=post"* ]] ||
+            [[ "$squeezed" == *"-x post"* ]] || [[ "$squeezed" == *"-x=post"* ]] ||
+            [[ "$squeezed" == *"--input"* ]] ||
+            [[ "$squeezed" == *"-f state="* ]] || [[ "$squeezed" == *"--field state="* ]] ||
+            [[ "$squeezed" == *"-f context="* ]] || [[ "$squeezed" == *"--field context="* ]]; then
             local rel="${file#"$REPO_ROOT/"}"
             echo "::error file=$rel,line=$line_no::Direct GitHub status-write command string is forbidden in prompts/xtask assets (TCK-00411)."
             VIOLATIONS=1
