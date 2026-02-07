@@ -40,7 +40,10 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use apm2_core::context::ContextPackManifest;
-use apm2_core::context::firewall::{ContextAwareValidator, DefaultContextFirewall, FirewallMode};
+use apm2_core::context::firewall::{
+    ContextAwareValidator, ContextRiskTier, DefaultContextFirewall, FirewallViolationDefect,
+    RiskTierFirewallPolicy, ToctouVerifier,
+};
 use apm2_core::policy::{Decision as CoreDecision, LoadedPolicy, PolicyEngine};
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
@@ -428,6 +431,27 @@ impl StubPolicyEngine {
 // use `DurableCas` via `new_shared_broker_with_cas()` or `.with_cas()`.
 // =============================================================================
 
+// =============================================================================
+// RiskTier <-> ContextRiskTier Conversion (TCK-00375)
+// =============================================================================
+
+/// Converts the daemon's `RiskTier` to the firewall's `ContextRiskTier`.
+///
+/// This conversion is infallible because both enums have the same variants.
+/// If a new `RiskTier` variant is added without a corresponding
+/// `ContextRiskTier`, this will fail at compile time (fail-closed).
+impl From<super::envelope::RiskTier> for ContextRiskTier {
+    fn from(tier: super::envelope::RiskTier) -> Self {
+        match tier {
+            super::envelope::RiskTier::Tier0 => Self::Tier0,
+            super::envelope::RiskTier::Tier1 => Self::Tier1,
+            super::envelope::RiskTier::Tier2 => Self::Tier2,
+            super::envelope::RiskTier::Tier3 => Self::Tier3,
+            super::envelope::RiskTier::Tier4 => Self::Tier4,
+        }
+    }
+}
+
 /// Stub content-addressed store for testing.
 ///
 /// **WARNING**: This stub does NOT persist artifacts across daemon restarts.
@@ -639,6 +663,19 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// TODO(TCK-FUTURE): Wire `ToolBroker` into `main.rs` via
     /// `PrivilegedDispatcher` to enable tool mediation metrics.
     metrics: Option<SharedMetricsRegistry>,
+
+    /// Risk-tier-aware firewall enforcement policy (TCK-00375).
+    ///
+    /// Maps risk tiers to firewall enforcement modes. Tier3+ violations
+    /// ALWAYS use `HardFail` (mandatory session termination) per REQ-0029.
+    firewall_policy: RiskTierFirewallPolicy,
+
+    /// Accumulated firewall violation defects (TCK-00375).
+    ///
+    /// Per REQ-0029, Tier3+ violations MUST emit defects. This vec collects
+    /// defects for the caller to drain and emit to the event ledger.
+    /// Uses per-invocation collection (not shared buffer) per review pattern.
+    firewall_defects: tokio::sync::Mutex<Vec<FirewallViolationDefect>>,
 }
 
 impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
@@ -658,6 +695,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             github_store: None,
             ssh_store: None,
             metrics: None,
+            firewall_policy: RiskTierFirewallPolicy::default(),
+            firewall_defects: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -677,6 +716,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             github_store: None,
             ssh_store: None,
             metrics: None,
+            firewall_policy: RiskTierFirewallPolicy::default(),
+            firewall_defects: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -702,6 +743,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             github_store: Some(github_store),
             ssh_store: None,
             metrics: None,
+            firewall_policy: RiskTierFirewallPolicy::default(),
+            firewall_defects: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -728,6 +771,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             github_store: None,
             ssh_store: Some(ssh_store),
             metrics: None,
+            firewall_policy: RiskTierFirewallPolicy::default(),
+            firewall_defects: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -755,6 +800,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             github_store: Some(github_store),
             ssh_store: Some(ssh_store),
             metrics: None,
+            firewall_policy: RiskTierFirewallPolicy::default(),
+            firewall_defects: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -774,6 +821,124 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     pub fn with_metrics(mut self, metrics: SharedMetricsRegistry) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    /// Sets the risk-tier-aware firewall policy (TCK-00375).
+    ///
+    /// Per REQ-0029, Tier3+ violations always use `HardFail` regardless of
+    /// this policy. This method controls the mode for lower tiers.
+    #[must_use]
+    pub const fn with_firewall_policy(mut self, policy: RiskTierFirewallPolicy) -> Self {
+        self.firewall_policy = policy;
+        self
+    }
+
+    /// Drains accumulated firewall violation defects (TCK-00375).
+    ///
+    /// Per REQ-0029, the caller MUST emit these defects to the event ledger
+    /// after processing tool requests. The defects are cleared after draining.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec` of defects accumulated since the last drain call.
+    pub async fn drain_firewall_defects(&self) -> Vec<FirewallViolationDefect> {
+        let mut defects = self.firewall_defects.lock().await;
+        std::mem::take(&mut *defects)
+    }
+
+    /// Verifies TOCTOU hash consistency for file content (TCK-00375).
+    ///
+    /// This method should be called after a read operation succeeds but
+    /// before the content is delivered to the agent. It verifies that the
+    /// runtime content matches the hash recorded in the manifest.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The file path (normalized)
+    /// * `content` - The file content bytes read at runtime
+    /// * `risk_tier` - The current episode's risk tier
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the hash matches or if no manifest is loaded.
+    /// `Err(BrokerError)` if the hash mismatches.
+    ///
+    /// # Security
+    ///
+    /// Per REQ-0029, TOCTOU mismatches detected at Tier3+ will:
+    /// 1. Emit a mandatory `FirewallViolationDefect`
+    /// 2. Return an error that should trigger session termination
+    pub async fn verify_toctou(
+        &self,
+        path: &str,
+        content: &[u8],
+        risk_tier: super::envelope::RiskTier,
+    ) -> Result<(), BrokerError> {
+        let context_manifest = self.context_manifest.read().await;
+        let Some(manifest) = context_manifest.as_ref() else {
+            // No context manifest loaded; TOCTOU check not applicable
+            return Ok(());
+        };
+
+        // Look up the entry for this path
+        let normalized =
+            apm2_core::context::normalize_path(path).map_err(|e| BrokerError::Internal {
+                message: format!("TOCTOU path normalization failed: {e}"),
+            })?;
+
+        let Some(entry) = manifest.get_entry_normalized(&normalized) else {
+            // Path not in manifest; this should have been caught by the
+            // allowlist check already. If we get here, it's a logic error.
+            return Err(BrokerError::Internal {
+                message: format!("TOCTOU: path {normalized} passed allowlist but has no entry"),
+            });
+        };
+
+        let ctx_risk_tier: ContextRiskTier = risk_tier.into();
+        let mode = self.firewall_policy.mode_for_tier(ctx_risk_tier);
+
+        if let Err(e) = ToctouVerifier::verify_for_firewall(
+            content,
+            entry.content_hash(),
+            &manifest.manifest_id,
+            &normalized,
+            mode,
+        ) {
+            // TCK-00375: Emit mandatory defect for Tier3+ violations
+            if ctx_risk_tier.is_high_risk() {
+                let defect = FirewallViolationDefect::toctou_mismatch(
+                    risk_tier.tier(),
+                    &manifest.manifest_id,
+                    &normalized,
+                );
+                self.firewall_defects.lock().await.push(defect);
+            }
+
+            // Emit metrics if available
+            if let Some(ref metrics) = self.metrics {
+                metrics
+                    .daemon_metrics()
+                    .context_firewall_denied("TOCTOU_MISMATCH");
+                if e.should_terminate_session() {
+                    metrics
+                        .daemon_metrics()
+                        .session_terminated("TOCTOU_MISMATCH");
+                }
+            }
+
+            warn!(
+                path = %normalized,
+                risk_tier = risk_tier.tier(),
+                should_terminate = e.should_terminate_session(),
+                "TOCTOU hash mismatch detected"
+            );
+
+            return Err(BrokerError::Internal {
+                message: e.to_string(),
+            });
+        }
+
+        Ok(())
     }
 
     /// Sets the content-addressed store for evidence artifacts (TCK-00293).
@@ -1386,6 +1551,10 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         };
 
         if let Some(context_manifest) = self.context_manifest.read().await.as_ref() {
+            // TCK-00375: Determine firewall mode based on risk tier
+            let ctx_risk_tier: ContextRiskTier = request.risk_tier.into();
+            let tier_mode = self.firewall_policy.mode_for_tier(ctx_risk_tier);
+
             // Helper to create termination decision and emit metrics
             // NOTE: We use episode_id as session_id here because the broker operates
             // at the episode layer. Session-level identifiers are not available at
@@ -1415,6 +1584,12 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 }
             };
 
+            // TCK-00375: Helper to emit mandatory defect for Tier3+ violations.
+            // Per REQ-0029, Tier3+ violations MUST emit defects.
+            let emit_defect = |defect: FirewallViolationDefect| async move {
+                self.firewall_defects.lock().await.push(defect);
+            };
+
             match request.tool_class {
                 super::tool_class::ToolClass::Read
                 | super::tool_class::ToolClass::ListFiles
@@ -1425,16 +1600,64 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                             request_id = %request.request_id,
                             "context firewall violation: Read/Navigation request missing path"
                         );
+                        // TCK-00375: Emit defect for Tier3+ no-path violations
+                        if ctx_risk_tier.is_high_risk() {
+                            let defect = FirewallViolationDefect::allowlist_denied(
+                                request.risk_tier.tier(),
+                                &context_manifest.manifest_id,
+                                "<no_path>",
+                            );
+                            emit_defect(defect).await;
+                        }
                         return Ok(make_terminate("CONTEXT_READ_NO_PATH"));
                     };
 
-                    let firewall =
-                        DefaultContextFirewall::new(context_manifest, FirewallMode::HardFail);
+                    // TCK-00375: Use risk-tier-aware firewall mode
+                    let firewall = DefaultContextFirewall::new(context_manifest, tier_mode);
                     let path_str = path.to_string_lossy();
 
                     if let Err(e) = firewall.validate_read(&path_str, None) {
-                        warn!(path = %path_str, error = %e, "context firewall violation");
-                        return Ok(make_terminate("CONTEXT_MISS"));
+                        warn!(
+                            path = %path_str,
+                            risk_tier = request.risk_tier.tier(),
+                            error = %e,
+                            "context firewall violation"
+                        );
+
+                        // TCK-00375: Emit mandatory defect for Tier3+ violations
+                        if ctx_risk_tier.is_high_risk() {
+                            let defect = if e.is_toctou_mismatch() {
+                                FirewallViolationDefect::toctou_mismatch(
+                                    request.risk_tier.tier(),
+                                    &context_manifest.manifest_id,
+                                    &path_str,
+                                )
+                            } else {
+                                FirewallViolationDefect::allowlist_denied(
+                                    request.risk_tier.tier(),
+                                    &context_manifest.manifest_id,
+                                    &path_str,
+                                )
+                            };
+                            emit_defect(defect).await;
+                        }
+
+                        // TCK-00375: Tier3+ always terminates
+                        if e.should_terminate_session() || ctx_risk_tier.is_high_risk() {
+                            return Ok(make_terminate("CONTEXT_MISS"));
+                        }
+
+                        // Non-Tier3+ with non-terminating error: still deny but
+                        // don't terminate (SoftFail behavior)
+                        return Ok(ToolDecision::Deny {
+                            request_id: request.request_id.clone(),
+                            reason: DenyReason::PolicyDenied {
+                                rule_id: "CONTEXT_FIREWALL".to_string(),
+                                reason: e.to_string(),
+                            },
+                            rule_id: Some("CONTEXT_FIREWALL".to_string()),
+                            policy_hash: self.policy.policy_hash(),
+                        });
                     }
                 },
                 super::tool_class::ToolClass::Write => {
@@ -1446,6 +1669,14 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 request_id = %request.request_id,
                                 "context firewall violation: Write request missing path"
                             );
+                            if ctx_risk_tier.is_high_risk() {
+                                let defect = FirewallViolationDefect::allowlist_denied(
+                                    request.risk_tier.tier(),
+                                    &context_manifest.manifest_id,
+                                    "<no_path>",
+                                );
+                                emit_defect(defect).await;
+                            }
                             return Ok(make_terminate("CONTEXT_WRITE_NO_PATH"));
                         };
 
@@ -1454,6 +1685,14 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 path = %path.display(),
                                 "context firewall violation: path not in write_allowlist"
                             );
+                            if ctx_risk_tier.is_high_risk() {
+                                let defect = FirewallViolationDefect::allowlist_denied(
+                                    request.risk_tier.tier(),
+                                    &context_manifest.manifest_id,
+                                    &path.to_string_lossy(),
+                                );
+                                emit_defect(defect).await;
+                            }
                             return Ok(make_terminate("CONTEXT_WRITE_DENIED"));
                         }
                     }
@@ -1467,6 +1706,14 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 request_id = %request.request_id,
                                 "context firewall violation: Execute request missing shell_command"
                             );
+                            if ctx_risk_tier.is_high_risk() {
+                                let defect = FirewallViolationDefect::allowlist_denied(
+                                    request.risk_tier.tier(),
+                                    &context_manifest.manifest_id,
+                                    "<no_command>",
+                                );
+                                emit_defect(defect).await;
+                            }
                             return Ok(make_terminate("CONTEXT_EXEC_NO_CMD"));
                         };
 
@@ -1475,6 +1722,14 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 command = %command,
                                 "context firewall violation: command not in shell_allowlist"
                             );
+                            if ctx_risk_tier.is_high_risk() {
+                                let defect = FirewallViolationDefect::allowlist_denied(
+                                    request.risk_tier.tier(),
+                                    &context_manifest.manifest_id,
+                                    command,
+                                );
+                                emit_defect(defect).await;
+                            }
                             return Ok(make_terminate("CONTEXT_EXEC_DENIED"));
                         }
                     }
