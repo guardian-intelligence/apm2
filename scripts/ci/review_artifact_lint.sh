@@ -41,8 +41,14 @@ check_dependencies() {
 
 VIOLATIONS=0
 
-REVIEW_DIR="documents/reviews"
-REVIEW_GATE_DIR=".github/review-gate"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+REVIEW_DIR="${REPO_ROOT}/documents/reviews"
+REVIEW_GATE_DIR="${REPO_ROOT}/.github/review-gate"
+
+if [[ ! -d "$REVIEW_DIR" ]]; then
+    log_error "Review directory not found: ${REVIEW_DIR} (are you inside the repository?)"
+    exit 2
+fi
 
 log_info "=== Review Artifact Integrity Lint (TCK-00409) ==="
 echo
@@ -57,9 +63,9 @@ log_info "Checking for deprecated direct status-write patterns in review scripts
 # Patterns that indicate direct status-write commands.
 # We search broadly, then filter out approved uses that bind to $reviewed_sha.
 STATUS_WRITE_PATTERNS=(
-    'gh api.*statuses.*--method POST'
+    'gh api.*(statuses.*--method POST|--method POST.*statuses)'
     'gh api.*statuses.*state=.success'
-    'gh api.*check-runs.*--method POST'
+    'gh api.*(check-runs.*--method POST|--method POST.*check-runs)'
     'gh pr review.*--approve'
 )
 

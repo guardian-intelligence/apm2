@@ -29,8 +29,13 @@ log_error() { echo -e "${RED}ERROR:${NC} $*" >&2; }
 log_info() { echo -e "${GREEN}INFO:${NC} $*"; }
 
 VIOLATIONS=0
-RFC_DIR="documents/rfcs"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+RFC_DIR="${REPO_ROOT}/documents/rfcs"
+
+if [[ ! -d "$RFC_DIR" ]]; then
+    log_error "RFC directory not found: ${RFC_DIR} (are you inside the repository?)"
+    exit 2
+fi
 
 log_info "=== Test/Source Reference Lint (TCK-00409) ==="
 echo
