@@ -361,12 +361,11 @@ pub struct GovernanceFreshnessMonitor {
     stop_authority: std::sync::Arc<crate::episode::preactuation::StopAuthority>,
     /// Monitor configuration.
     config: GovernanceFreshnessConfig,
-    /// Most recent successful authenticated governance probe timestamp.
+    /// Most recent successful governance probe timestamp.
     ///
     /// `Instant` is monotonic and not affected by wall-clock rollback.
     last_success: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
-    /// Whether the active resolver path is transitional-local (no authenticated
-    /// governance transport freshness evidence).
+    /// Whether the active resolver path is transitional-local.
     transitional_resolver: bool,
 }
 
@@ -400,12 +399,9 @@ impl GovernanceFreshnessMonitor {
     /// healthy (e.g., after a successful policy resolution response).
     pub fn record_success(&self) {
         if self.transitional_resolver {
-            warn!(
-                "Governance freshness probe used transitional local resolver; \
-                 success does not provide freshness evidence"
+            tracing::info!(
+                "Governance freshness evidence sourced from transitional local resolver"
             );
-            self.stop_authority.set_governance_uncertain(true);
-            return;
         }
 
         *self
@@ -436,11 +432,6 @@ impl GovernanceFreshnessMonitor {
     ///
     /// Returns `true` if governance is considered fresh, `false` if stale.
     pub fn check_freshness(&self) -> bool {
-        if self.transitional_resolver {
-            self.stop_authority.set_governance_uncertain(true);
-            return false;
-        }
-
         let last_success = *self
             .last_success
             .lock()

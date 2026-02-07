@@ -37,7 +37,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
 use super::budget_tracker::{BudgetExhaustedError, BudgetTracker};
 use super::envelope::StopConditions;
@@ -732,18 +731,16 @@ impl PreActuationGate {
     ) -> Result<PreActuationReceipt, PreActuationDenial> {
         // TCK-00351 BLOCKER 1 FIX: Read from authoritative stop state
         // when available, instead of trusting caller-supplied values.
-        let (emer_stop, gov_stop, gov_uncertain, gov_transitional_resolver) =
-            self.stop_authority.as_ref().map_or(
-                (emergency_stop_active, governance_stop_active, false, false),
-                |authority| {
-                    (
-                        authority.emergency_stop_active(),
-                        authority.governance_stop_active(),
-                        authority.governance_uncertain(),
-                        authority.governance_transitional_resolver(),
-                    )
-                },
-            );
+        let (emer_stop, gov_stop, gov_uncertain) = self.stop_authority.as_ref().map_or(
+            (emergency_stop_active, governance_stop_active, false),
+            |authority| {
+                (
+                    authority.emergency_stop_active(),
+                    authority.governance_stop_active(),
+                    authority.governance_uncertain(),
+                )
+            },
+        );
 
         // --- Step 1: Evaluate stop conditions ---
         // TCK-00351 MAJOR 1 v2 FIX: Use evaluate_with_uncertainty so
@@ -761,18 +758,7 @@ impl PreActuationGate {
                 return Err(PreActuationDenial::StopActive { class });
             },
             StopStatus::Uncertain => {
-                // Transitional carve-out: when freshness is sourced from the
-                // local transitional resolver (no authenticated governance
-                // transport), uncertainty is logged but the deadline is not
-                // enforced to avoid denying all actuation in Phase 1.
-                if gov_transitional_resolver {
-                    warn!(
-                        elapsed_ms,
-                        uncertainty_deadline_ms = self.evaluator.uncertainty_deadline_ms(),
-                        "governance uncertainty observed under transitional resolver; \
-                         stop_uncertainty_deadline not enforced"
-                    );
-                } else if elapsed_ms >= self.evaluator.uncertainty_deadline_ms() {
+                if elapsed_ms >= self.evaluator.uncertainty_deadline_ms() {
                     // Fail-closed: if uncertainty deadline has elapsed, deny.
                     return Err(PreActuationDenial::StopUncertain);
                 }
@@ -2094,7 +2080,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gate_uncertain_transitional_mode_allows_past_deadline() {
+    fn test_gate_uncertain_transitional_mode_denies_past_deadline() {
         let authority = Arc::new(StopAuthority::new());
         authority.set_governance_uncertain(true);
         authority.set_governance_transitional_resolver(true);
@@ -2106,7 +2092,11 @@ mod tests {
 
         let conditions = StopConditions::default();
         let result = gate.check(&conditions, 0, false, false, deadline_ms, 2000);
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PreActuationDenial::StopUncertain => {},
+            other => panic!("expected StopUncertain, got: {other}"),
+        }
     }
 
     // =========================================================================

@@ -885,14 +885,12 @@ impl DispatcherState {
 
     /// Executes a lightweight active governance health probe.
     ///
-    /// Governance freshness requires authenticated governance transport. The
-    /// transitional local resolver does not provide freshness evidence. When
-    /// only the transitional resolver is present, the system defaults to
-    /// uncertain (fail-closed). Future tickets (TCK-00364) will wire real
-    /// governance transport.
+    /// Transitional local resolver success is accepted as Phase-1 freshness
+    /// evidence that the governance code path is operational. The monitor still
+    /// starts uncertain in transitional mode until a probe succeeds.
     ///
     /// This probe records monitor state using strict classification:
-    /// - `record_success()` only when authenticated transport exists
+    /// - `record_success()` on successful resolver responses
     /// - `record_failure()` only for governance transport/service failures
     /// - local resolver contract errors are ignored here (freshness falls back
     ///   to elapsed-time checks and existing watermark state)
@@ -911,15 +909,10 @@ impl DispatcherState {
             static TRANSITIONAL_WARN_ONCE: std::sync::Once = std::sync::Once::new();
             TRANSITIONAL_WARN_ONCE.call_once(|| {
                 tracing::warn!(
-                    "Governance freshness requires authenticated transport; transitional \
-                     local resolver is not freshness evidence. Forcing governance_uncertain=true \
-                     until TCK-00364 wires real transport."
+                    "Governance freshness is sourced from transitional local resolver \
+                     until authenticated governance transport is wired (TCK-00364)."
                 );
             });
-            // Transitional-local success is not governance freshness evidence.
-            monitor.record_failure();
-            let _ = probe_result;
-            return;
         }
 
         match probe_result {
@@ -1378,7 +1371,7 @@ mod tests {
     use crate::protocol::session_dispatch::{SessionResponse, encode_request_tool_request};
 
     #[test]
-    fn production_wiring_transitional_governance_uncertain_allows_gate() {
+    fn production_wiring_transitional_governance_uncertainty_denies_until_success() {
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
         let state = DispatcherState::with_persistence(session_registry, None, None, None);
 
@@ -1395,24 +1388,19 @@ mod tests {
             monitor.transitional_resolver(),
             "production monitor should run in transitional resolver mode"
         );
-
-        // Transitional mode: no authenticated governance transport evidence.
-        // Mark as stale and evaluate freshness.
-        monitor.clear_last_success_for_test();
         assert!(
-            !monitor.check_freshness(),
-            "monitor should report stale governance in transitional mode"
+            !monitor.has_last_success_for_test(),
+            "transitional production monitor should start with no success watermark"
         );
         assert!(
             authority.governance_uncertain(),
-            "transitional mode should force governance uncertainty"
+            "transitional production monitor should start uncertain until first success"
         );
 
-        // Transitional carve-out: uncertainty is logged, but deadline-based
-        // StopUncertain denial is not enforced until authenticated transport
-        // exists.
+        // Before first successful probe/sample, uncertainty must deny once the
+        // deadline has elapsed.
         let gate = PreActuationGate::production_gate(Arc::clone(&authority), None);
-        let receipt = gate
+        let denial = gate
             .check(
                 &StopConditions::default(),
                 0,
@@ -1421,12 +1409,31 @@ mod tests {
                 DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS,
                 1_000,
             )
-            .expect("transitional uncertainty should not deny");
+            .expect_err("transitional uncertainty should deny after deadline");
+        assert!(matches!(denial, PreActuationDenial::StopUncertain));
+
+        // Successful probe/sample clears uncertainty and gate allows.
+        monitor.record_success();
+        assert!(monitor.check_freshness());
+        assert!(
+            !authority.governance_uncertain(),
+            "transitional success should clear governance uncertainty"
+        );
+        let receipt = gate
+            .check(
+                &StopConditions::default(),
+                0,
+                false,
+                false,
+                DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS,
+                2_000,
+            )
+            .expect("fresh transitional governance should allow");
         assert!(receipt.stop_checked);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn production_wiring_periodic_probe_keeps_governance_uncertainty_in_transitional_mode() {
+    async fn production_wiring_periodic_probe_clears_governance_uncertainty_in_transitional_mode() {
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
         let state = DispatcherState::with_persistence(session_registry, None, None, None);
 
@@ -1447,19 +1454,28 @@ mod tests {
             "explicit governance failure should set uncertainty"
         );
 
-        // In transitional mode, periodic local probes must NOT clear uncertainty.
-        tokio::time::sleep(std::time::Duration::from_millis(
-            GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS.saturating_mul(2),
-        ))
-        .await;
+        // Periodic probe runs should re-establish freshness and clear uncertainty.
+        let timeout = std::time::Duration::from_millis(
+            GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS.saturating_mul(8),
+        );
+        let poll = std::time::Duration::from_millis(GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS.max(1));
+        let started = std::time::Instant::now();
+        while authority.governance_uncertain() && started.elapsed() < timeout {
+            tokio::time::sleep(poll).await;
+        }
+
         assert!(
-            authority.governance_uncertain(),
-            "transitional local probe must not clear governance uncertainty"
+            !authority.governance_uncertain(),
+            "periodic transitional probe should clear governance uncertainty"
+        );
+        assert!(
+            monitor.has_last_success_for_test(),
+            "periodic transitional probe should refresh success watermark"
         );
     }
 
     #[test]
-    fn production_wiring_claim_work_success_does_not_clear_transitional_uncertainty() {
+    fn production_wiring_claim_work_success_clears_transitional_uncertainty() {
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
         let state = DispatcherState::with_persistence(session_registry, None, None, None);
 
@@ -1503,13 +1519,84 @@ mod tests {
         );
 
         assert!(
-            authority.governance_uncertain(),
-            "transitional resolver success must not clear governance uncertainty"
+            !authority.governance_uncertain(),
+            "transitional ClaimWork success should clear governance uncertainty"
         );
         assert!(
-            !monitor.has_last_success_for_test(),
-            "transitional resolver success must not produce freshness evidence"
+            monitor.has_last_success_for_test(),
+            "transitional ClaimWork success should produce freshness evidence"
         );
+    }
+
+    #[test]
+    fn production_wiring_transitional_probe_lifecycle_enforces_uncertainty_deadline() {
+        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+        let state = DispatcherState::with_persistence(session_registry, None, None, None);
+
+        let monitor = Arc::clone(
+            state
+                .governance_freshness_monitor()
+                .expect("production constructor must wire governance freshness monitor"),
+        );
+        let authority = Arc::clone(
+            state
+                .stop_authority()
+                .expect("production constructor must wire stop authority"),
+        );
+        let gate = PreActuationGate::production_gate(Arc::clone(&authority), None);
+
+        assert!(
+            authority.governance_uncertain(),
+            "production transitional wiring should start uncertain"
+        );
+        let denial = gate
+            .check(
+                &StopConditions::default(),
+                0,
+                false,
+                false,
+                DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS,
+                1_000,
+            )
+            .expect_err("startup uncertainty should deny after deadline");
+        assert!(matches!(denial, PreActuationDenial::StopUncertain));
+
+        DispatcherState::run_governance_health_probe(&monitor, monitor.transitional_resolver());
+        assert!(
+            monitor.check_freshness(),
+            "successful transitional probe should mark governance fresh"
+        );
+        assert!(
+            !authority.governance_uncertain(),
+            "successful transitional probe should clear uncertainty"
+        );
+        gate.check(
+            &StopConditions::default(),
+            0,
+            false,
+            false,
+            DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS,
+            2_000,
+        )
+        .expect("fresh governance should allow gate");
+
+        // Simulate a subsequent governance probe classified as a service failure.
+        monitor.record_failure();
+        assert!(
+            authority.governance_uncertain(),
+            "probe failure should restore uncertainty"
+        );
+        let denial = gate
+            .check(
+                &StopConditions::default(),
+                0,
+                false,
+                false,
+                DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS,
+                3_000,
+            )
+            .expect_err("uncertainty should deny after deadline");
+        assert!(matches!(denial, PreActuationDenial::StopUncertain));
     }
 
     #[test]
