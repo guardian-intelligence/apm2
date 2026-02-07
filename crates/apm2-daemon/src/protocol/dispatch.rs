@@ -339,6 +339,8 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// * `role_spec_hash` - CAS hash of the role spec (if available)
     /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
     /// * `contract_binding` - Contract binding from handshake (if available)
+    /// * `identity_proof_profile_hash` - Active identity proof profile hash for
+    ///   the session identity context (when available)
     ///
     /// # Returns
     ///
@@ -358,6 +360,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         role_spec_hash: Option<&[u8; 32]>,
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
+        identity_proof_profile_hash: Option<&[u8; 32]>,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
     /// Emits a generic session event to the ledger (TCK-00290).
@@ -724,6 +727,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         role_spec_hash: Option<&[u8; 32]>,
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
+        identity_proof_profile_hash: Option<&[u8; 32]>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         // Default implementation: emit sequentially.
         let session_event = self.emit_session_started(
@@ -735,6 +739,7 @@ pub trait LedgerEventEmitter: Send + Sync {
             role_spec_hash,
             timestamp_ns,
             contract_binding,
+            identity_proof_profile_hash,
         )?;
         let transition_count = self.get_work_transition_count(work_id);
         if let Err(e) = self.emit_work_transitioned(&WorkTransition {
@@ -979,6 +984,7 @@ pub const MAX_ESCALATION_PREDICATE_LEN: usize = 1024;
 /// `SqliteLedgerEventEmitter::emit_spawn_lifecycle`.
 ///
 /// TCK-00348: Includes contract binding fields when available.
+#[allow(clippy::too_many_arguments)]
 pub fn build_session_started_payload(
     session_id: &str,
     work_id: &str,
@@ -987,6 +993,7 @@ pub fn build_session_started_payload(
     adapter_profile_hash: &[u8; 32],
     role_spec_hash: Option<&[u8; 32]>,
     contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
+    identity_proof_profile_hash: Option<&[u8; 32]>,
 ) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "event_type": "session_started",
@@ -1033,6 +1040,12 @@ pub fn build_session_started_payload(
             "client_canonicalizers".to_string(),
             serde_json::to_value(&binding.client_canonicalizers)
                 .expect("CanonicalizerInfo serializes"),
+        );
+    }
+    if let Some(profile_hash) = identity_proof_profile_hash {
+        payload.as_object_mut().expect("payload is object").insert(
+            "identity_proof_profile_hash".to_string(),
+            serde_json::Value::String(hex::encode(profile_hash)),
         );
     }
     payload
@@ -1225,6 +1238,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         role_spec_hash: Option<&[u8; 32]>,
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
+        identity_proof_profile_hash: Option<&[u8; 32]>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
@@ -1242,6 +1256,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             adapter_profile_hash,
             role_spec_hash,
             contract_binding,
+            identity_proof_profile_hash,
         );
 
         let payload_bytes =
@@ -3167,6 +3182,15 @@ pub struct ConnectionContext {
     /// session ID (not a surrogate connection ID).
     contract_binding: Option<crate::hsi_contract::SessionContractBinding>,
 
+    /// Active identity proof profile hash for this connection's identity
+    /// context.
+    ///
+    /// This is persisted into `SessionStarted` payloads when present so
+    /// session-open audit records bind to the verifier economics contract
+    /// (REQ-0012). Full identity proof dereference wiring is deferred under
+    /// WVR-0003 / TCK-00361.
+    identity_proof_profile_hash: Option<[u8; 32]>,
+
     /// Connection phase for session-typed state machine (TCK-00349).
     ///
     /// Per REQ-0003, authority-bearing operations require valid session-state
@@ -3199,6 +3223,7 @@ impl ConnectionContext {
             session_id: None,
             connection_id,
             contract_binding: None,
+            identity_proof_profile_hash: None,
             // TCK-00349: New connections start in Connected phase.
             // Callers MUST advance to SessionOpen before dispatch.
             phase: crate::protocol::connection_handler::ConnectionPhase::Connected,
@@ -3231,6 +3256,7 @@ impl ConnectionContext {
             session_id,
             connection_id,
             contract_binding: None,
+            identity_proof_profile_hash: None,
             // TCK-00349: New connections start in Connected phase.
             // Callers MUST advance to SessionOpen before dispatch.
             phase: crate::protocol::connection_handler::ConnectionPhase::Connected,
@@ -3279,6 +3305,27 @@ impl ConnectionContext {
     #[must_use]
     pub const fn contract_binding(&self) -> Option<&crate::hsi_contract::SessionContractBinding> {
         self.contract_binding.as_ref()
+    }
+
+    /// Sets the active identity proof profile hash for this connection.
+    pub fn set_identity_proof_profile_hash(
+        &mut self,
+        profile_hash: [u8; 32],
+    ) -> Result<(), crate::identity::IdentityProofError> {
+        if profile_hash == [0u8; 32] {
+            return Err(crate::identity::IdentityProofError::InvalidField {
+                field: "identity_proof_profile_hash",
+                reason: "must be non-zero".to_string(),
+            });
+        }
+        self.identity_proof_profile_hash = Some(profile_hash);
+        Ok(())
+    }
+
+    /// Returns the active identity proof profile hash, if known.
+    #[must_use]
+    pub const fn identity_proof_profile_hash(&self) -> Option<&[u8; 32]> {
+        self.identity_proof_profile_hash.as_ref()
     }
 
     /// Returns the current connection phase (TCK-00349).
@@ -7094,6 +7141,7 @@ impl PrivilegedDispatcher {
             role_spec_hash.as_ref(),
             timestamp_ns,
             ctx.contract_binding(),
+            ctx.identity_proof_profile_hash(),
         ) {
             // TCK-00384 review fix: unified post-start rollback stops the
             // episode and cleans up session/telemetry/manifest.
@@ -17002,6 +17050,7 @@ mod tests {
                     None,
                     ts,
                     None,
+                    None,
                 )
                 .unwrap();
 
@@ -17113,6 +17162,7 @@ mod tests {
                 &[0xAA; 32],
                 None,
                 2_000_000_000,
+                None,
                 None,
             );
             assert!(result.is_ok(), "emit_spawn_lifecycle should succeed");
@@ -18187,6 +18237,56 @@ mod tests {
             assert_eq!(payload["adapter_profile_hash"], hex::encode(adapter_hash));
             assert_eq!(payload["waiver_id"], "WVR-0002");
             assert_eq!(payload["role_spec_hash_absent"], true);
+        }
+
+        #[test]
+        fn test_session_context_records_profile_hash() {
+            let (dispatcher, cas, mut ctx) = dispatcher_with_cas();
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
+
+            let adapter_hash = builtin_profiles::claude_code_profile()
+                .store_in_cas(cas.as_ref())
+                .expect("builtin profile should store in CAS");
+            let identity_profile_hash =
+                crate::identity::IdentityProofProfileV1::baseline_smt_10e12()
+                    .content_hash()
+                    .expect("baseline identity proof profile hash should compute");
+            ctx.set_identity_proof_profile_hash(identity_profile_hash)
+                .expect("non-zero profile hash should be accepted");
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+                adapter_profile_hash: Some(adapter_hash.to_vec()),
+                max_episodes: None,
+                escalation_predicate: None,
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+            assert!(
+                matches!(response, PrivilegedResponse::SpawnEpisode(_)),
+                "expected spawn success with context-bound identity profile hash"
+            );
+
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let session_started: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == "session_started")
+                .collect();
+            assert_eq!(
+                session_started.len(),
+                1,
+                "expected one SessionStarted event"
+            );
+
+            let payload: serde_json::Value =
+                serde_json::from_slice(&session_started[0].payload).expect("valid JSON payload");
+            assert_eq!(
+                payload["identity_proof_profile_hash"],
+                hex::encode(identity_profile_hash)
+            );
         }
     }
 

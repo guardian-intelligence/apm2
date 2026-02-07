@@ -1,0 +1,52 @@
+evidence_artifact:
+  schema_version: "2026-02-07"
+  id: "EVID-0012"
+  title: "IdentityProofProfileV1 profile-hash pinning and Tier2+ enforcement evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that REQ-0012 is implemented in daemon identity and protocol
+    paths. Directory heads now enforce non-zero profile-hash pinning,
+    verification enforces profile binding and known-profile resolution with
+    Tier2+ fail-closed semantics, and SessionStarted payloads can persist the
+    active identity_proof_profile_hash from connection context wiring.
+
+    Strict verifier cache invalidation behavior remains out of scope for this
+    ticket and is deferred to TCK-00359.
+  requirement_ids:
+    - "REQ-0012"
+  source_refs:
+    - "documents/rfcs/RFC-0020/requirements/REQ-0012.yaml"
+    - "crates/apm2-daemon/src/identity/directory_proof.rs"
+    - "crates/apm2-daemon/src/identity/mod.rs"
+    - "crates/apm2-daemon/src/protocol/dispatch.rs"
+    - "crates/apm2-daemon/src/ledger.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        Directory-head profile pinning and compatibility checks:
+        - test_directory_head_rejects_zero_profile_hash
+        - test_profile_binding_verified_against_head
+      ref:
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::test_directory_head_rejects_zero_profile_hash"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::test_profile_binding_verified_against_head"
+    - type: "test_output"
+      description: |
+        Tier2+ fail-closed profile enforcement:
+        - test_unknown_profile_hash_rejected_for_tier2
+        - test_profile_mismatch_rejected_during_verification
+      ref:
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::test_unknown_profile_hash_rejected_for_tier2"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::test_profile_mismatch_rejected_during_verification"
+    - type: "test_output"
+      description: |
+        Session-open path profile recording wiring:
+        - test_session_context_records_profile_hash
+      ref:
+        - "cargo test -p apm2-daemon protocol::dispatch::tests::tck_00397_adapter_profile_binding::test_session_context_records_profile_hash"
+    - type: "test_output"
+      description: |
+        Daemon-level regression suite for identity/profile/session payload
+        changes in this ticket.
+      ref:
+        - "cargo test -p apm2-daemon"
