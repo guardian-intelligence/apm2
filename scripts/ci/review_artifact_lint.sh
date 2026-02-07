@@ -33,8 +33,8 @@ log_warn() { echo -e "${YELLOW}WARN:${NC} $*" >&2; }
 log_info() { echo -e "${GREEN}INFO:${NC} $*"; }
 
 check_dependencies() {
-    if ! command -v rg &>/dev/null; then
-        log_error "ripgrep (rg) is required but not installed."
+    if ! command -v find &>/dev/null; then
+        log_error "find is required but not installed."
         exit 2
     fi
 }
@@ -56,59 +56,56 @@ echo
 check_dependencies
 
 # Check 1: Review prompts must not contain deprecated direct status-write commands.
-# The approved path is through the review gate (gh pr comment + cargo xtask).
-# Direct gh api calls to set statuses bypass the gate.
+# The ONLY approved path for setting review statuses is:
+#   cargo xtask security-review-exec (approve|deny)
+# Any direct `gh api` call to the statuses or check-runs endpoints is deprecated,
+# regardless of whether it references $reviewed_sha or any other variable.
+# Similarly, `gh pr review --approve` bypasses the review gate.
 log_info "Checking for deprecated direct status-write patterns in review scripts..."
 
-# Patterns that indicate direct status-write commands.
-# We search broadly, then filter out approved uses that bind to $reviewed_sha.
-STATUS_WRITE_PATTERNS=(
-    'gh api.*(statuses.*--method POST|--method POST.*statuses)'
-    'gh api.*statuses.*state=.success'
-    'gh api.*(check-runs.*--method POST|--method POST.*check-runs)'
-    'gh pr review.*--approve'
-)
+# detect_direct_status_write checks whether a single line contains a direct
+# GitHub status write.  Returns 0 (true) if the line is a violation.
+# A line is a violation if it contains ALL of:
+#   - "gh" and "api" (the gh api command)
+#   - "statuses" OR "check-runs" (the endpoint)
+#   - "POST" (the HTTP method)
+# in ANY order.  Lines that are comments (leading #) are ignored.
+# Also catches: gh pr review --approve
+detect_direct_status_write() {
+    local line="$1"
+    # Skip comment lines
+    local stripped="${line#"${line%%[![:space:]]*}"}"
+    if [[ "$stripped" == "#"* ]]; then
+        return 1
+    fi
+    # Pattern A: gh api + statuses + POST (any order)
+    if [[ "$line" == *"gh"* ]] && [[ "$line" == *"api"* ]] && [[ "$line" == *"statuses"* ]] && [[ "$line" == *"POST"* ]]; then
+        return 0
+    fi
+    # Pattern B: gh api + check-runs + POST (any order)
+    if [[ "$line" == *"gh"* ]] && [[ "$line" == *"api"* ]] && [[ "$line" == *"check-runs"* ]] && [[ "$line" == *"POST"* ]]; then
+        return 0
+    fi
+    # Pattern C: gh pr review --approve
+    if [[ "$line" == *"gh"* ]] && [[ "$line" == *"pr"* ]] && [[ "$line" == *"review"* ]] && [[ "$line" == *"--approve"* ]]; then
+        return 0
+    fi
+    return 1
+}
 
-for pattern in "${STATUS_WRITE_PATTERNS[@]}"; do
-    # Search only in review prompt/script files, not in this lint script itself.
-    # Do NOT suppress rg errors — the script must fail-closed on regex failure.
-    rg_exit=0
-    matches=$(rg -l "$pattern" "$REVIEW_DIR" 2>&1) || rg_exit=$?
-    if [[ $rg_exit -eq 2 ]]; then
-        log_error "ripgrep failed on pattern: $pattern"
-        exit 2
-    fi
-    if [[ $rg_exit -eq 1 ]]; then
-        # exit code 1 means no matches — continue to next pattern
-        continue
-    fi
-    if [[ -n "$matches" ]]; then
-        for match_file in $matches; do
-            # Get all matching lines; fail-closed on rg error
-            rg_exit=0
-            violating_lines=$(rg -n "$pattern" "$match_file" 2>&1) || rg_exit=$?
-            if [[ $rg_exit -eq 2 ]]; then
-                log_error "ripgrep failed on pattern: $pattern in $match_file"
-                exit 2
-            fi
-            if [[ $rg_exit -eq 1 ]]; then
-                continue
-            fi
-            if [[ -n "$violating_lines" ]]; then
-                # Allow the approved pattern: posting status with $reviewed_sha
-                safe=$(echo "$violating_lines" | grep -c '\$reviewed_sha\|"$reviewed_sha"' || true)
-                total=$(echo "$violating_lines" | wc -l)
-                if [[ $safe -lt $total ]]; then
-                    log_error "Deprecated status-write bypassing review gate in: $match_file"
-                    echo "$violating_lines" | grep -v '\$reviewed_sha' | while read -r line; do
-                        log_error "  $line"
-                    done
-                    VIOLATIONS=1
-                fi
-            fi
-        done
-    fi
-done
+# Scan every file in the review directory for direct status writes.
+while IFS= read -r review_file; do
+    line_num=0
+    while IFS= read -r line; do
+        line_num=$((line_num + 1))
+        if detect_direct_status_write "$line"; then
+            log_error "Deprecated direct status-write bypassing review gate:"
+            log_error "  ${review_file}:${line_num}: ${line}"
+            log_error "  Use 'cargo xtask security-review-exec (approve|deny)' instead."
+            VIOLATIONS=1
+        fi
+    done < "$review_file"
+done < <(find "$REVIEW_DIR" -type f \( -name '*.md' -o -name '*.sh' -o -name '*.yaml' -o -name '*.yml' \) 2>/dev/null)
 
 # Check 2: Review prompt metadata templates must require head_sha and pr_number binding.
 # Both CODE_QUALITY_PROMPT.md and SECURITY_REVIEW_PROMPT.md must contain

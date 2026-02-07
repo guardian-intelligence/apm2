@@ -36,8 +36,9 @@ log_info() { echo -e "${GREEN}INFO:${NC} $*"; }
 
 VIOLATIONS=0
 
-PROTO_FILE="proto/apm2d_runtime_v1.proto"
-GENERATED_RS="crates/apm2-daemon/src/protocol/apm2.daemon.v1.rs"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+PROTO_FILE="${REPO_ROOT}/proto/apm2d_runtime_v1.proto"
+GENERATED_RS="${REPO_ROOT}/crates/apm2-daemon/src/protocol/apm2.daemon.v1.rs"
 
 log_info "=== Proto Enum Drift Detection (TCK-00409) ==="
 echo
@@ -52,78 +53,106 @@ if [[ ! -f "$GENERATED_RS" ]]; then
     exit 2
 fi
 
-# Extract enum names and variant counts from .proto file
-extract_proto_enums() {
+# Extract enum variant NAMES from a .proto file.
+# Outputs lines of the form: EnumName=VARIANT_A,VARIANT_B,...
+extract_proto_enum_names() {
     local file="$1"
     local current_enum=""
-    local variant_count=0
+    local variants=""
 
     while IFS= read -r line; do
         if [[ "$line" =~ ^[[:space:]]*enum[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*\{ ]]; then
             current_enum="${BASH_REMATCH[1]}"
-            variant_count=0
+            variants=""
             continue
         fi
         if [[ -n "$current_enum" ]] && [[ "$line" =~ ^[[:space:]]*\} ]]; then
-            echo "${current_enum}=${variant_count}"
+            echo "${current_enum}=${variants}"
             current_enum=""
             continue
         fi
-        if [[ -n "$current_enum" ]] && [[ "$line" =~ ^[[:space:]]*[A-Z_]+[[:space:]]*=[[:space:]]*[0-9]+ ]]; then
-            variant_count=$((variant_count + 1))
+        if [[ -n "$current_enum" ]] && [[ "$line" =~ ^[[:space:]]*([A-Z_][A-Z0-9_]*)[[:space:]]*=[[:space:]]*[0-9]+ ]]; then
+            local vname="${BASH_REMATCH[1]}"
+            if [[ -n "$variants" ]]; then
+                variants="${variants},${vname}"
+            else
+                variants="${vname}"
+            fi
         fi
     done < "$file"
 }
 
-# Count variants in a Rust enum block from the generated file.
-# prost generates: pub enum Name { Variant = 0, ... }
-# We look for lines matching "Identifier = N," inside the enum braces.
-count_rs_enum_variants() {
+# Extract variant names from the Rust as_str_name() impl for a given enum.
+# prost generates:
+#   impl EnumName {
+#     pub fn as_str_name(&self) -> &'static str {
+#       match self {
+#         Self::Variant => "PROTO_NAME",
+#         ...
+#       }
+#     }
+# We extract the quoted "PROTO_NAME" strings, which are the canonical proto names.
+extract_rs_enum_names() {
     local file="$1"
     local target_enum="$2"
-    local count=0
-    local in_enum=0
+    local in_impl=0
+    local in_as_str=0
+    local names=""
     local brace_depth=0
 
     while IFS= read -r line; do
-        if [[ $in_enum -eq 0 ]] && [[ "$line" =~ ^pub\ enum\ ${target_enum}[[:space:]] ]]; then
-            in_enum=1
-            if [[ "$line" == *"{"* ]]; then
-                brace_depth=1
-            fi
+        # Find: impl EnumName {
+        if [[ $in_impl -eq 0 ]] && [[ "$line" =~ ^impl\ ${target_enum}\ \{ ]]; then
+            in_impl=1
+            brace_depth=1
             continue
         fi
-        if [[ $in_enum -eq 1 ]]; then
+        if [[ $in_impl -eq 1 ]]; then
             # Track brace depth
-            if [[ "$line" == *"{"* ]]; then
-                brace_depth=$((brace_depth + 1))
+            local opens="${line//[^\{]/}"
+            local closes="${line//[^\}]/}"
+            brace_depth=$((brace_depth + ${#opens} - ${#closes}))
+
+            # Detect as_str_name method
+            if [[ "$line" =~ pub\ fn\ as_str_name ]]; then
+                in_as_str=1
+                continue
             fi
-            if [[ "$line" == *"}"* ]]; then
-                brace_depth=$((brace_depth - 1))
-                if [[ $brace_depth -le 0 ]]; then
-                    break
+            # In as_str_name, extract Self::Variant => "PROTO_NAME"
+            if [[ $in_as_str -eq 1 ]]; then
+                if [[ "$line" =~ Self::[A-Za-z0-9_]+[[:space:]]*=\>[[:space:]]*\"([A-Z_][A-Z0-9_]*)\" ]]; then
+                    local vname="${BASH_REMATCH[1]}"
+                    if [[ -n "$names" ]]; then
+                        names="${names},${vname}"
+                    else
+                        names="${vname}"
+                    fi
+                fi
+                # End of as_str_name: next pub fn or closing brace
+                if [[ "$line" =~ ^[[:space:]]*\} ]] && [[ "$line" != *"=>"* ]]; then
+                    in_as_str=0
                 fi
             fi
-            # Match prost-generated variant: "    VariantName = N,"
-            if [[ "$line" =~ ^[[:space:]]+[A-Z][A-Za-z0-9]*[[:space:]]*=[[:space:]]*[0-9]+, ]]; then
-                count=$((count + 1))
+
+            if [[ $brace_depth -le 0 ]]; then
+                break
             fi
         fi
     done < "$file"
-    echo "$count"
+    echo "$names"
 }
 
-log_info "Comparing enum variant counts..."
+log_info "Comparing enum variant names..."
 
-proto_enums=$(extract_proto_enums "$PROTO_FILE")
+proto_enums=$(extract_proto_enum_names "$PROTO_FILE")
 
 for entry in $proto_enums; do
     enum_name="${entry%%=*}"
-    proto_count="${entry##*=}"
+    proto_names_csv="${entry##*=}"
 
-    rs_count=$(count_rs_enum_variants "$GENERATED_RS" "$enum_name")
+    rs_names_csv=$(extract_rs_enum_names "$GENERATED_RS" "$enum_name")
 
-    if [[ $rs_count -eq 0 ]]; then
+    if [[ -z "$rs_names_csv" ]]; then
         log_error "Enum ${enum_name} defined in proto but not found in generated Rust code"
         log_error "  Proto: ${PROTO_FILE}"
         log_error "  Rust:  ${GENERATED_RS}"
@@ -132,13 +161,27 @@ for entry in $proto_enums; do
         continue
     fi
 
-    if [[ $proto_count -ne $rs_count ]]; then
-        log_error "Enum drift: ${enum_name} has ${proto_count} variants in proto but ${rs_count} in generated Rust"
+    # Sort both name sets for comparison (use ${var//,/$'\n'} to avoid tr portability issues)
+    proto_sorted=$(printf '%s\n' ${proto_names_csv//,/ } | sort)
+    rs_sorted=$(printf '%s\n' ${rs_names_csv//,/ } | sort)
+
+    if [[ "$proto_sorted" != "$rs_sorted" ]]; then
+        # Compute set differences for a helpful error message
+        only_in_proto=$(comm -23 <(echo "$proto_sorted") <(echo "$rs_sorted"))
+        only_in_rust=$(comm -13 <(echo "$proto_sorted") <(echo "$rs_sorted"))
+        log_error "Enum drift: ${enum_name} variant names differ between proto and generated Rust"
+        if [[ -n "$only_in_proto" ]]; then
+            log_error "  Only in proto: $(echo "$only_in_proto" | paste -sd' ')"
+        fi
+        if [[ -n "$only_in_rust" ]]; then
+            log_error "  Only in Rust:  $(echo "$only_in_rust" | paste -sd' ')"
+        fi
         log_error "  Proto: ${PROTO_FILE}"
         log_error "  Rust:  ${GENERATED_RS}"
         log_error "  Run 'cargo build -p apm2-daemon' to regenerate."
         VIOLATIONS=1
     else
+        proto_count=$(echo "$proto_sorted" | wc -l)
         log_info "  ${enum_name}: ${proto_count} variants (OK)"
     fi
 done

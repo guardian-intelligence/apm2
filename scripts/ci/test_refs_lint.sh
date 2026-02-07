@@ -65,14 +65,20 @@ while IFS= read -r evid_file; do
                 # - Strip trailing :line-number ranges (like "file.rs:482-567")
                 file_path=$(echo "$ref_path" | awk '{print $1}' | sed 's/:[0-9].*$//')
                 if [[ -n "$file_path" ]] && ! [[ "$file_path" =~ ^# ]]; then
+                    # Anchor relative paths to REPO_ROOT for consistent resolution
+                    if [[ "$file_path" != /* ]]; then
+                        anchored_path="${REPO_ROOT}/${file_path}"
+                    else
+                        anchored_path="$file_path"
+                    fi
                     # Validate path is within the repository root (prevent path traversal)
-                    resolved="$(realpath -m "$file_path")"
+                    resolved="$(realpath -m "$anchored_path")"
                     if [[ "$resolved" != "$REPO_ROOT"/* ]]; then
                         log_error "Path traversal: ${evid_file} references '${file_path}' which is outside repo root"
                         VIOLATIONS=1
                         continue
                     fi
-                    if [[ ! -e "$file_path" ]]; then
+                    if [[ ! -e "$anchored_path" ]]; then
                         log_error "Missing source_ref: ${evid_file} references '${file_path}' which does not exist"
                         VIOLATIONS=1
                     fi

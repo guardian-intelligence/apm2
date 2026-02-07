@@ -289,7 +289,11 @@ decision_tree:
           action: command
           run: |
             gh pr comment $PR_URL --body-file quality_findings.md
-            gh api --method POST "/repos/{owner}/{repo}/statuses/$reviewed_sha" -f state="$VERDICT_STATE" -f context="ai-review/code-quality" -f description="Code quality review $VERDICT_STATE"
+            if [ "$VERDICT_STATE" == "success" ]; then
+              cargo xtask security-review-exec approve $ticket_id
+            else
+              cat quality_findings.md | cargo xtask security-review-exec deny $ticket_id --reason -
+            fi
             rm quality_findings.md
         - id: TERMINATE
           action: output
