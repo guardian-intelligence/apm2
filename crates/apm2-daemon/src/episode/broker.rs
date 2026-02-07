@@ -53,8 +53,8 @@ use super::capability::{
     ManifestLoadError, ManifestLoader,
 };
 use super::decision::{
-    BrokerToolRequest, BudgetDelta, Credential, DedupeKey, RequestValidationError,
-    SessionTerminationInfo, ToolDecision, ToolResult,
+    BrokerResponse, BrokerToolRequest, BudgetDelta, Credential, DedupeKey, RequestValidationError,
+    SessionTerminationInfo, ToolDecision, ToolResult, VerifiedToolContent,
 };
 use super::dedupe::{DedupeCache, DedupeCacheConfig, SharedDedupeCache};
 use super::error::EpisodeId;
@@ -106,6 +106,15 @@ pub enum BrokerError {
     #[error("internal broker error: {message}")]
     Internal {
         /// Error message.
+        message: String,
+    },
+
+    /// TOCTOU mismatch detected while verifying runtime bytes.
+    #[error("TOCTOU mismatch for path '{path}': {message}")]
+    ToctouMismatch {
+        /// Normalized path that failed verification.
+        path: String,
+        /// Error message from the verifier.
         message: String,
     },
 
@@ -161,6 +170,7 @@ impl BrokerError {
             Self::BudgetExceeded { .. } => "budget_exceeded",
             Self::ExecutionFailed { .. } => "execution_failed",
             Self::Internal { .. } => "internal",
+            Self::ToctouMismatch { .. } => "toctou_mismatch",
             Self::ContextPackNotFound { .. } => "context_pack_not_found",
             Self::ContextPackSealInvalid { .. } => "context_pack_seal_invalid",
             Self::ContextPackDeserializationFailed { .. } => "context_pack_deserialization_failed",
@@ -172,6 +182,12 @@ impl BrokerError {
     #[must_use]
     pub const fn is_retriable(&self) -> bool {
         matches!(self, Self::ExecutionFailed { .. })
+    }
+
+    /// Returns `true` if this error is a TOCTOU mismatch.
+    #[must_use]
+    pub const fn is_toctou_mismatch(&self) -> bool {
+        matches!(self, Self::ToctouMismatch { .. })
     }
 
     /// Returns `true` if this error should trigger `ReviewBlockedRecorded`
@@ -225,6 +241,23 @@ pub const NO_POLICY_RATIONALE: &str = "POLICY_MISSING";
 const ROLE_ALLOWLIST_POLICY_VERSION: &str = "1.0.0";
 const ROLE_ALLOWLIST_RULE_PREFIX: &str = "ALLOW_ROLE_TOOL";
 const ROLE_ALLOWLIST_DENY_ALL_RULE_ID: &str = "DENY_ALL_TOOLS";
+
+/// Maximum bytes read for a single TOCTOU verification operation (10 MiB).
+const MAX_TOCTOU_READ_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Maximum files verified for a single Search request.
+const SEARCH_TOCTOU_MAX_FILES: usize = 10_000;
+
+/// Maximum directory entries visited while collecting Search files.
+const SEARCH_TOCTOU_MAX_VISITED_ENTRIES: usize = 100_000;
+
+/// Maximum total verified bytes for a Search request.
+const SEARCH_TOCTOU_MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+
+enum ToctouVerificationStatus {
+    Verified,
+    NotInManifest,
+}
 
 /// Policy engine wrapper for the tool broker (TCK-00292).
 ///
@@ -669,13 +702,6 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// Maps risk tiers to firewall enforcement modes. Tier3+ violations
     /// ALWAYS use `HardFail` (mandatory session termination) per REQ-0029.
     firewall_policy: RiskTierFirewallPolicy,
-
-    /// Accumulated firewall violation defects (TCK-00375).
-    ///
-    /// Per REQ-0029, Tier3+ violations MUST emit defects. This vec collects
-    /// defects for the caller to drain and emit to the event ledger.
-    /// Uses per-invocation collection (not shared buffer) per review pattern.
-    firewall_defects: tokio::sync::Mutex<Vec<FirewallViolationDefect>>,
 }
 
 impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
@@ -696,7 +722,6 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             ssh_store: None,
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
-            firewall_defects: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -717,7 +742,6 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             ssh_store: None,
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
-            firewall_defects: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -744,7 +768,6 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             ssh_store: None,
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
-            firewall_defects: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -772,7 +795,6 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             ssh_store: Some(ssh_store),
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
-            firewall_defects: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -801,7 +823,6 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             ssh_store: Some(ssh_store),
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
-            firewall_defects: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -833,19 +854,6 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         self
     }
 
-    /// Drains accumulated firewall violation defects (TCK-00375).
-    ///
-    /// Per REQ-0029, the caller MUST emit these defects to the event ledger
-    /// after processing tool requests. The defects are cleared after draining.
-    ///
-    /// # Returns
-    ///
-    /// A `Vec` of defects accumulated since the last drain call.
-    pub async fn drain_firewall_defects(&self) -> Vec<FirewallViolationDefect> {
-        let mut defects = self.firewall_defects.lock().await;
-        std::mem::take(&mut *defects)
-    }
-
     /// Verifies TOCTOU hash consistency for file content (TCK-00375).
     ///
     /// This method verifies that runtime content matches the hash recorded in
@@ -874,10 +882,29 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         content: &[u8],
         risk_tier: super::envelope::RiskTier,
     ) -> Result<(), BrokerError> {
+        let mut defects = Vec::new();
+        match self
+            .verify_toctou_with_defects(path, content, risk_tier, &mut defects)
+            .await?
+        {
+            ToctouVerificationStatus::Verified => Ok(()),
+            ToctouVerificationStatus::NotInManifest => Err(BrokerError::Internal {
+                message: format!("TOCTOU: path {path} has no matching manifest entry"),
+            }),
+        }
+    }
+
+    async fn verify_toctou_with_defects(
+        &self,
+        path: &str,
+        content: &[u8],
+        risk_tier: super::envelope::RiskTier,
+        defects: &mut Vec<FirewallViolationDefect>,
+    ) -> Result<ToctouVerificationStatus, BrokerError> {
         let context_manifest = self.context_manifest.read().await;
         let Some(manifest) = context_manifest.as_ref() else {
             // No context manifest loaded; TOCTOU check not applicable
-            return Ok(());
+            return Ok(ToctouVerificationStatus::Verified);
         };
 
         // Look up the entry for this path
@@ -887,11 +914,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             })?;
 
         let Some(entry) = manifest.get_entry_normalized(&normalized) else {
-            // Path not in manifest; this should have been caught by the
-            // allowlist check already. If we get here, it's a logic error.
-            return Err(BrokerError::Internal {
-                message: format!("TOCTOU: path {normalized} passed allowlist but has no entry"),
-            });
+            return Ok(ToctouVerificationStatus::NotInManifest);
         };
 
         let ctx_risk_tier: ContextRiskTier = risk_tier.into();
@@ -911,7 +934,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 &manifest.manifest_id,
                 &normalized,
             );
-            self.firewall_defects.lock().await.push(defect);
+            defects.push(defect);
 
             // Emit metrics if available
             if let Some(ref metrics) = self.metrics {
@@ -932,12 +955,13 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 "TOCTOU hash mismatch detected"
             );
 
-            return Err(BrokerError::Internal {
+            return Err(BrokerError::ToctouMismatch {
+                path: normalized,
                 message: e.to_string(),
             });
         }
 
-        Ok(())
+        Ok(ToctouVerificationStatus::Verified)
     }
 
     /// Reads file bytes from disk and performs TOCTOU verification before
@@ -950,7 +974,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         &self,
         path: &std::path::Path,
         risk_tier: super::envelope::RiskTier,
-    ) -> Result<(), BrokerError> {
+        defects: &mut Vec<FirewallViolationDefect>,
+    ) -> Result<Option<(String, Vec<u8>)>, BrokerError> {
         let path_str = path.to_string_lossy();
         let normalized = apm2_core::context::normalize_path(path_str.as_ref()).map_err(|e| {
             BrokerError::Internal {
@@ -968,7 +993,16 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             // Directory-oriented navigation requests (e.g., list/search scope)
             // may target non-file paths. TOCTOU hash verification applies to
             // concrete file bytes only.
-            return Ok(());
+            return Ok(None);
+        }
+
+        if metadata.len() > MAX_TOCTOU_READ_BYTES {
+            return Err(BrokerError::ExecutionFailed {
+                message: format!(
+                    "TOCTOU pre-read denied for {normalized}: file too large ({} bytes > {MAX_TOCTOU_READ_BYTES})",
+                    metadata.len()
+                ),
+            });
         }
 
         let file_bytes = tokio::fs::read(&normalized)
@@ -977,8 +1011,137 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 message: format!("TOCTOU pre-read failed for {normalized}: {e}"),
             })?;
 
-        self.verify_toctou(&normalized, &file_bytes, risk_tier)
+        match self
+            .verify_toctou_with_defects(&normalized, &file_bytes, risk_tier, defects)
+            .await?
+        {
+            ToctouVerificationStatus::Verified => Ok(Some((normalized, file_bytes))),
+            ToctouVerificationStatus::NotInManifest => Ok(None),
+        }
+    }
+
+    async fn collect_search_verified_content(
+        &self,
+        scope: &std::path::Path,
+        risk_tier: super::envelope::RiskTier,
+        terminate_on_toctou: bool,
+        defects: &mut Vec<FirewallViolationDefect>,
+        verified_content: &mut VerifiedToolContent,
+    ) -> Result<(), BrokerError> {
+        let metadata = tokio::fs::metadata(scope)
             .await
+            .map_err(|e| BrokerError::Internal {
+                message: format!("TOCTOU search stat failed for '{}': {e}", scope.display()),
+            })?;
+
+        let mut total_bytes = 0u64;
+        let mut files_seen = 0usize;
+
+        if metadata.is_file() {
+            match self
+                .verify_toctou_from_disk(scope, risk_tier, defects)
+                .await
+            {
+                Ok(Some((normalized, bytes))) => {
+                    let bytes_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                    if bytes_len > SEARCH_TOCTOU_MAX_TOTAL_BYTES {
+                        return Err(BrokerError::ExecutionFailed {
+                            message: format!(
+                                "TOCTOU search pre-check exceeded max total bytes ({SEARCH_TOCTOU_MAX_TOTAL_BYTES})"
+                            ),
+                        });
+                    }
+                    verified_content.insert(normalized, bytes);
+                },
+                Ok(None) => {},
+                Err(err) if err.is_toctou_mismatch() && !terminate_on_toctou => {},
+                Err(err) => return Err(err),
+            }
+            return Ok(());
+        }
+
+        if !metadata.is_dir() {
+            return Ok(());
+        }
+
+        let mut to_visit: Vec<std::path::PathBuf> = vec![scope.to_path_buf()];
+        let mut visited_entries = 0usize;
+
+        while let Some(current_dir) = to_visit.pop() {
+            if files_seen >= SEARCH_TOCTOU_MAX_FILES {
+                break;
+            }
+
+            let mut dir_iter =
+                tokio::fs::read_dir(&current_dir)
+                    .await
+                    .map_err(|e| BrokerError::Internal {
+                        message: format!(
+                            "TOCTOU search directory read failed for '{}': {e}",
+                            current_dir.display()
+                        ),
+                    })?;
+
+            while let Some(entry) =
+                dir_iter
+                    .next_entry()
+                    .await
+                    .map_err(|e| BrokerError::Internal {
+                        message: format!("TOCTOU search directory entry read failed: {e}"),
+                    })?
+            {
+                if files_seen >= SEARCH_TOCTOU_MAX_FILES {
+                    break;
+                }
+
+                visited_entries += 1;
+                if visited_entries > SEARCH_TOCTOU_MAX_VISITED_ENTRIES {
+                    return Err(BrokerError::ExecutionFailed {
+                        message: format!(
+                            "TOCTOU search pre-check exceeded max visited entries ({SEARCH_TOCTOU_MAX_VISITED_ENTRIES})"
+                        ),
+                    });
+                }
+
+                let file_type = entry.file_type().await.map_err(|e| BrokerError::Internal {
+                    message: format!("TOCTOU search file_type failed: {e}"),
+                })?;
+
+                if file_type.is_symlink() {
+                    continue;
+                }
+
+                let entry_path = entry.path();
+                if file_type.is_file() {
+                    files_seen += 1;
+                    match self
+                        .verify_toctou_from_disk(&entry_path, risk_tier, defects)
+                        .await
+                    {
+                        Ok(Some((normalized, bytes))) => {
+                            let bytes_len = bytes.len() as u64;
+                            if total_bytes.saturating_add(bytes_len) > SEARCH_TOCTOU_MAX_TOTAL_BYTES
+                            {
+                                return Err(BrokerError::ExecutionFailed {
+                                    message: format!(
+                                        "TOCTOU search pre-check exceeded max total bytes ({SEARCH_TOCTOU_MAX_TOTAL_BYTES})"
+                                    ),
+                                });
+                            }
+                            total_bytes = total_bytes.saturating_add(bytes_len);
+                            verified_content.insert(normalized, bytes);
+                        },
+                        Ok(None) => {},
+                        Err(err) if err.is_toctou_mismatch() && !terminate_on_toctou => {},
+                        Err(err) => return Err(err),
+                    }
+                } else if file_type.is_dir() {
+                    to_visit.push(entry_path);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Sets the content-addressed store for evidence artifacts (TCK-00293).
@@ -1551,15 +1714,45 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     ///
     /// Returns an error if the broker is not initialized or request
     /// validation fails.
-    #[instrument(skip(self, request, session_context), fields(request_id = %request.request_id))]
     pub async fn request(
         &self,
         request: &BrokerToolRequest,
         timestamp_ns: u64,
         session_context: Option<&super::decision::SessionContext>,
     ) -> Result<ToolDecision, BrokerError> {
+        let response = self
+            .request_with_response(request, timestamp_ns, session_context)
+            .await?;
+        Ok(response.decision)
+    }
+
+    /// Processes a tool request and returns the full atomic broker response.
+    ///
+    /// The response contains:
+    /// - the authorization decision,
+    /// - request-scoped firewall defects, and
+    /// - TOCTOU-verified file content for downstream execution.
+    #[instrument(skip(self, request, session_context), fields(request_id = %request.request_id))]
+    pub async fn request_with_response(
+        &self,
+        request: &BrokerToolRequest,
+        timestamp_ns: u64,
+        session_context: Option<&super::decision::SessionContext>,
+    ) -> Result<BrokerResponse, BrokerError> {
         // TCK-00268: Record start time for latency metrics
         let start_time = std::time::Instant::now();
+        let mut defects = Vec::new();
+        let mut verified_content = VerifiedToolContent::default();
+
+        macro_rules! respond {
+            ($decision:expr) => {
+                return Ok(BrokerResponse::new(
+                    $decision,
+                    std::mem::take(&mut defects),
+                    std::mem::take(&mut verified_content),
+                ));
+            };
+        }
 
         // Step 1: Validate request structure
         request.validate()?;
@@ -1594,6 +1787,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             // TCK-00375: Determine firewall mode based on risk tier
             let ctx_risk_tier: ContextRiskTier = request.risk_tier.into();
             let tier_mode = self.firewall_policy.mode_for_tier(ctx_risk_tier);
+            let terminate_on_toctou = ctx_risk_tier.is_high_risk()
+                || tier_mode == apm2_core::context::firewall::FirewallMode::HardFail;
 
             // Helper to create termination decision and emit metrics
             // NOTE: We use episode_id as session_id here because the broker operates
@@ -1624,12 +1819,6 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 }
             };
 
-            // TCK-00375: Helper to emit mandatory defect for Tier3+ violations.
-            // Per REQ-0029, Tier3+ violations MUST emit defects.
-            let emit_defect = |defect: FirewallViolationDefect| async move {
-                self.firewall_defects.lock().await.push(defect);
-            };
-
             match request.tool_class {
                 super::tool_class::ToolClass::Read
                 | super::tool_class::ToolClass::ListFiles
@@ -1645,8 +1834,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                             &context_manifest.manifest_id,
                             "<no_path>",
                         );
-                        emit_defect(defect).await;
-                        return Ok(make_terminate("CONTEXT_READ_NO_PATH"));
+                        defects.push(defect);
+                        respond!(make_terminate("CONTEXT_READ_NO_PATH"));
                     };
 
                     // TCK-00375: Use risk-tier-aware firewall mode
@@ -1655,33 +1844,84 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
 
                     match firewall.validate_read(&path_str, None) {
                         Ok(ValidationResult::Allowed) => {
-                            // Path is in the manifest and allowed. Enforce
-                            // pre-execution TOCTOU verification against raw
-                            // on-disk bytes before capability checks.
                             if request.tool_class == super::tool_class::ToolClass::Read {
+                                match self
+                                    .verify_toctou_from_disk(
+                                        path.as_path(),
+                                        request.risk_tier,
+                                        &mut defects,
+                                    )
+                                    .await
+                                {
+                                    Ok(Some((normalized, bytes))) => {
+                                        verified_content.insert(normalized, bytes);
+                                    },
+                                    Ok(None) => {
+                                        if terminate_on_toctou {
+                                            respond!(make_terminate("CONTEXT_TOCTOU_MISMATCH"));
+                                        }
+                                        respond!(ToolDecision::Deny {
+                                            request_id: request.request_id.clone(),
+                                            reason: DenyReason::PolicyDenied {
+                                                rule_id: "CONTEXT_FIREWALL".to_string(),
+                                                reason: "TOCTOU verification failed: file is not in context manifest".to_string(),
+                                            },
+                                            rule_id: Some("CONTEXT_FIREWALL".to_string()),
+                                            policy_hash: self.policy.policy_hash(),
+                                        });
+                                    },
+                                    Err(e) => {
+                                        warn!(
+                                            path = %path_str,
+                                            risk_tier = request.risk_tier.tier(),
+                                            error = %e,
+                                            "TOCTOU pre-execution verification failed"
+                                        );
+
+                                        if terminate_on_toctou {
+                                            respond!(make_terminate("CONTEXT_TOCTOU_MISMATCH"));
+                                        }
+
+                                        respond!(ToolDecision::Deny {
+                                            request_id: request.request_id.clone(),
+                                            reason: DenyReason::PolicyDenied {
+                                                rule_id: "CONTEXT_FIREWALL".to_string(),
+                                                reason: format!("TOCTOU verification failed: {e}"),
+                                            },
+                                            rule_id: Some("CONTEXT_FIREWALL".to_string()),
+                                            policy_hash: self.policy.policy_hash(),
+                                        });
+                                    },
+                                }
+                            } else if request.tool_class == super::tool_class::ToolClass::Search {
                                 if let Err(e) = self
-                                    .verify_toctou_from_disk(path.as_path(), request.risk_tier)
+                                    .collect_search_verified_content(
+                                        path.as_path(),
+                                        request.risk_tier,
+                                        terminate_on_toctou,
+                                        &mut defects,
+                                        &mut verified_content,
+                                    )
                                     .await
                                 {
                                     warn!(
                                         path = %path_str,
                                         risk_tier = request.risk_tier.tier(),
                                         error = %e,
-                                        "TOCTOU pre-execution verification failed"
+                                        "Search TOCTOU pre-verification failed"
                                     );
 
-                                    if ctx_risk_tier.is_high_risk()
-                                        || tier_mode
-                                            == apm2_core::context::firewall::FirewallMode::HardFail
-                                    {
-                                        return Ok(make_terminate("CONTEXT_TOCTOU_MISMATCH"));
+                                    if terminate_on_toctou {
+                                        respond!(make_terminate("CONTEXT_TOCTOU_MISMATCH"));
                                     }
 
-                                    return Ok(ToolDecision::Deny {
+                                    respond!(ToolDecision::Deny {
                                         request_id: request.request_id.clone(),
                                         reason: DenyReason::PolicyDenied {
                                             rule_id: "CONTEXT_FIREWALL".to_string(),
-                                            reason: format!("TOCTOU verification failed: {e}"),
+                                            reason: format!(
+                                                "Search TOCTOU verification failed: {e}"
+                                            ),
                                         },
                                         rule_id: Some("CONTEXT_FIREWALL".to_string()),
                                         policy_hash: self.policy.policy_hash(),
@@ -1708,17 +1948,17 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 &context_manifest.manifest_id,
                                 &path_str,
                             );
-                            emit_defect(defect).await;
+                            defects.push(defect);
 
                             // Always deny out-of-pack reads: terminate for
                             // Tier3+ or HardFail; soft-deny otherwise.
                             if ctx_risk_tier.is_high_risk()
                                 || tier_mode == apm2_core::context::firewall::FirewallMode::HardFail
                             {
-                                return Ok(make_terminate("CONTEXT_MISS"));
+                                respond!(make_terminate("CONTEXT_MISS"));
                             }
 
-                            return Ok(ToolDecision::Deny {
+                            respond!(ToolDecision::Deny {
                                 request_id: request.request_id.clone(),
                                 reason: DenyReason::PolicyDenied {
                                     rule_id: "CONTEXT_FIREWALL".to_string(),
@@ -1745,8 +1985,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 &context_manifest.manifest_id,
                                 &path_str,
                             );
-                            emit_defect(defect).await;
-                            return Ok(make_terminate("CONTEXT_MISS"));
+                            defects.push(defect);
+                            respond!(make_terminate("CONTEXT_MISS"));
                         },
                         Err(e) => {
                             warn!(
@@ -1769,16 +2009,16 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                     &path_str,
                                 )
                             };
-                            emit_defect(defect).await;
+                            defects.push(defect);
 
                             // TCK-00375: Tier3+ always terminates
                             if e.should_terminate_session() || ctx_risk_tier.is_high_risk() {
-                                return Ok(make_terminate("CONTEXT_MISS"));
+                                respond!(make_terminate("CONTEXT_MISS"));
                             }
 
                             // Non-Tier3+ with non-terminating error: still deny but
                             // don't terminate (SoftFail behavior)
-                            return Ok(ToolDecision::Deny {
+                            respond!(ToolDecision::Deny {
                                 request_id: request.request_id.clone(),
                                 reason: DenyReason::PolicyDenied {
                                     rule_id: "CONTEXT_FIREWALL".to_string(),
@@ -1804,8 +2044,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 &context_manifest.manifest_id,
                                 "<no_path>",
                             );
-                            emit_defect(defect).await;
-                            return Ok(make_terminate("CONTEXT_WRITE_NO_PATH"));
+                            defects.push(defect);
+                            respond!(make_terminate("CONTEXT_WRITE_NO_PATH"));
                         };
 
                         if !context_manifest.is_write_path_allowed(path) {
@@ -1818,8 +2058,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 &context_manifest.manifest_id,
                                 &path.to_string_lossy(),
                             );
-                            emit_defect(defect).await;
-                            return Ok(make_terminate("CONTEXT_WRITE_DENIED"));
+                            defects.push(defect);
+                            respond!(make_terminate("CONTEXT_WRITE_DENIED"));
                         }
                     }
                 },
@@ -1837,8 +2077,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 &context_manifest.manifest_id,
                                 "<no_command>",
                             );
-                            emit_defect(defect).await;
-                            return Ok(make_terminate("CONTEXT_EXEC_NO_CMD"));
+                            defects.push(defect);
+                            respond!(make_terminate("CONTEXT_EXEC_NO_CMD"));
                         };
 
                         if !context_manifest.is_shell_command_allowed(command) {
@@ -1851,8 +2091,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 &context_manifest.manifest_id,
                                 command,
                             );
-                            emit_defect(defect).await;
-                            return Ok(make_terminate("CONTEXT_EXEC_DENIED"));
+                            defects.push(defect);
+                            respond!(make_terminate("CONTEXT_EXEC_DENIED"));
                         }
                     }
                 },
@@ -1882,7 +2122,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                         .daemon_metrics()
                         .record_tool_mediation_latency(tool_id, "deny", latency);
                 }
-                return Ok(ToolDecision::Deny {
+                respond!(ToolDecision::Deny {
                     request_id: request.request_id.clone(),
                     reason,
                     rule_id: None,
@@ -1903,7 +2143,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                         .daemon_metrics()
                         .record_tool_mediation_latency(tool_id, "deny", latency);
                 }
-                return Ok(ToolDecision::Deny {
+                respond!(ToolDecision::Deny {
                     request_id: request.request_id.clone(),
                     // F02: Use PolicyDenied reason instead of misleading NoMatchingCapability
                     reason: DenyReason::PolicyDenied {
@@ -1933,7 +2173,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                         latency,
                     );
                 }
-                return Ok(ToolDecision::DedupeCacheHit {
+                respond!(ToolDecision::DedupeCacheHit {
                     request_id: request.request_id.clone(),
                     result: Box::new(cached),
                 });
@@ -1959,7 +2199,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 .record_tool_mediation_latency(tool_id, "allow", latency);
         }
 
-        Ok(ToolDecision::Allow {
+        respond!(ToolDecision::Allow {
             request_id: request.request_id.clone(),
             capability_id,
             rule_id: if self.config.check_policy {
@@ -1974,7 +2214,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             policy_hash: self.policy.policy_hash(),
             budget_delta: BudgetDelta::single_call(),
             credential,
-        })
+        });
     }
 
     /// Executes a tool and returns the result.
@@ -4737,13 +4977,24 @@ policy:
     #[tokio::test]
     async fn test_broker_search_allowed() {
         use apm2_core::context::{AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder};
+        use tempfile::TempDir;
 
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
-        // Manifest allowing /workspace/src/main.rs
+        let temp_dir = TempDir::new().unwrap();
+        let src_dir = temp_dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let main_path = src_dir.join("main.rs");
+        let content = b"fn main() {}\n";
+        std::fs::write(&main_path, content).unwrap();
+
+        let path_str = main_path.to_string_lossy().to_string();
+        let content_hash = *blake3::hash(content).as_bytes();
+
+        // Manifest allowing the search target file.
         let context_manifest = ContextPackManifestBuilder::new("ctx-1", "prof-1")
             .add_entry(
-                ManifestEntryBuilder::new("/workspace/src/main.rs", [0u8; 32])
+                ManifestEntryBuilder::new(path_str.clone(), content_hash)
                     .access_level(AccessLevel::Read)
                     .build(),
             )
@@ -4758,7 +5009,7 @@ policy:
             capability_id: "cap-search".to_string(),
             tool_class: ToolClass::Search,
             scope: CapabilityScope {
-                root_paths: vec![PathBuf::from("/workspace")],
+                root_paths: vec![temp_dir.path().to_path_buf()],
                 allowed_patterns: Vec::new(),
                 size_limits: super::super::scope::SizeLimits::default_limits(),
                 network_policy: None,
@@ -4767,13 +5018,9 @@ policy:
         }]);
         broker.initialize_with_manifest(manifest).await.unwrap();
 
-        // Request Search for allowed path
-        let request = make_request(
-            "req-search",
-            ToolClass::Search,
-            Some("/workspace/src/main.rs"),
-        )
-        .with_query("fn main");
+        // Request Search for allowed path.
+        let request =
+            make_request("req-search", ToolClass::Search, Some(&path_str)).with_query("fn main");
         let decision = broker
             .request(&request, timestamp_ns(0), None)
             .await
@@ -5265,15 +5512,18 @@ policy:
             RiskTier::Tier3,
         );
         req = req.with_path("/workspace/secret.rs");
-        let decision = broker.request(&req, timestamp_ns(0), None).await.unwrap();
+        let response = broker
+            .request_with_response(&req, timestamp_ns(0), None)
+            .await
+            .unwrap();
+        let decision = response.decision;
+        let defects = response.defects;
 
         assert!(
             decision.is_terminate(),
             "Tier3 out-of-pack read must terminate, got: {decision:?}"
         );
 
-        // Drain defects — there should be at least one
-        let defects = broker.drain_firewall_defects().await;
         assert!(
             !defects.is_empty(),
             "Tier3+ violation MUST emit at least one FirewallViolationDefect"
@@ -5342,12 +5592,16 @@ policy:
 
         // Tampered content at Tier3
         let tampered = b"rm -rf /";
+        let mut defects = Vec::new();
         let result = broker
-            .verify_toctou("/workspace/main.rs", tampered, RiskTier::Tier3)
+            .verify_toctou_with_defects(
+                "/workspace/main.rs",
+                tampered,
+                RiskTier::Tier3,
+                &mut defects,
+            )
             .await;
         assert!(result.is_err(), "TOCTOU mismatch must fail");
-
-        let defects = broker.drain_firewall_defects().await;
         assert!(
             !defects.is_empty(),
             "Tier3 TOCTOU mismatch MUST emit a defect"

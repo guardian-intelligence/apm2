@@ -89,7 +89,9 @@ use super::pulse_acl::{
 };
 use super::session_token::{SessionToken, SessionTokenError, TokenMinter};
 use crate::episode::capability::StubManifestLoader;
-use crate::episode::decision::{BrokerToolRequest, DedupeKey, ToolDecision};
+use crate::episode::decision::{
+    BrokerResponse, BrokerToolRequest, DedupeKey, ToolDecision, VerifiedToolContent,
+};
 use crate::episode::envelope::RiskTier;
 use crate::episode::executor::ContentAddressedStore;
 use crate::episode::preactuation::{
@@ -2018,10 +2020,26 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
 
         // Call broker.request() asynchronously using tokio runtime
-        let decision = tokio::task::block_in_place(|| {
+        let broker_response = tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
-            handle.block_on(async { broker.request(&broker_request, timestamp_ns, None).await })
+            handle.block_on(async {
+                broker
+                    .request_with_response(&broker_request, timestamp_ns, None)
+                    .await
+            })
         });
+        let (decision, defects, verified_content): (
+            Result<ToolDecision, crate::episode::BrokerError>,
+            Vec<FirewallViolationDefect>,
+            Option<VerifiedToolContent>,
+        ) = match broker_response {
+            Ok(BrokerResponse {
+                decision,
+                defects,
+                verified_content,
+            }) => (Ok(decision), defects, Some(verified_content)),
+            Err(err) => (Err(err), Vec::new(), None),
+        };
         let decision_requires_termination = matches!(&decision, Ok(ToolDecision::Terminate { .. }));
 
         let mut response = self.handle_broker_decision(
@@ -2032,12 +2050,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             actuation_timestamp,
             &episode_id,
             preactuation_receipt.as_ref(),
+            verified_content,
         );
 
-        let defects = tokio::task::block_in_place(|| {
-            let handle = tokio::runtime::Handle::current();
-            handle.block_on(async { broker.drain_firewall_defects().await })
-        });
         if !defects.is_empty() {
             let has_mandatory_termination_defect = defects
                 .iter()
@@ -2051,7 +2066,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     rule_id = %defect.rule_id,
                     manifest_id = %defect.manifest_id,
                     path = %defect.path,
-                    "firewall violation defect drained"
+                    "firewall violation defect from broker response"
                 );
             }
 
@@ -2140,6 +2155,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         actuation_timestamp: ReplayTimestamp,
         episode_id: &EpisodeId,
         preactuation_receipt: Option<&PreActuationReceipt>,
+        mut verified_content: Option<VerifiedToolContent>,
     ) -> ProtocolResult<SessionResponse> {
         let timestamp_ns = actuation_timestamp.wall_ns;
         match decision {
@@ -2206,16 +2222,19 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     //
                     // For now, max_concurrent_episodes (100) provides backpressure to
                     // limit the impact on the worker pool.
-                    let execution_result = tokio::task::block_in_place(|| {
+                    let verified_for_execution = verified_content.take();
+                    let request_id_for_execution = request_id.clone();
+                    let execution_result = tokio::task::block_in_place(move || {
                         let handle = tokio::runtime::Handle::current();
-                        handle.block_on(async {
+                        handle.block_on(async move {
                             runtime
-                                .execute_tool(
+                                .execute_tool_with_verified_content(
                                     episode_id,
                                     &tool_args,
                                     credential.as_ref(),
                                     timestamp_ns,
-                                    &request_id,
+                                    &request_id_for_execution,
+                                    verified_for_execution,
                                 )
                                 .await
                         })
@@ -4941,6 +4960,7 @@ mod tests {
                     ReplayTimestamp::new(100, 0),
                     &episode_id,
                     Some(&receipt),
+                    None,
                 )
                 .expect("dispatch should return application-level error response");
 

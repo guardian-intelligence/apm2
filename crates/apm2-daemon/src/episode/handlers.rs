@@ -42,8 +42,8 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
 
-use super::decision::{BudgetDelta, Credential, MAX_TOOL_OUTPUT_SIZE};
-use super::executor::ContentAddressedStore;
+use super::decision::{BudgetDelta, Credential, MAX_TOOL_OUTPUT_SIZE, VerifiedToolContent};
+use super::executor::{ContentAddressedStore, ExecutionContext};
 use super::tool_class::ToolClass;
 use super::tool_handler::{ToolArgs, ToolHandler, ToolHandlerError, ToolResultData};
 
@@ -440,18 +440,22 @@ impl ReadFileHandler {
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
-}
 
-#[async_trait]
-impl ToolHandler for ReadFileHandler {
-    fn tool_class(&self) -> ToolClass {
-        ToolClass::Read
+    fn normalized_verified_path(path: &Path) -> Result<String, ToolHandlerError> {
+        apm2_core::context::normalize_path(path.to_string_lossy().as_ref()).map_err(|e| {
+            ToolHandlerError::ExecutionFailed {
+                message: format!(
+                    "failed to normalize verified content path '{}': {e}",
+                    path.display()
+                ),
+            }
+        })
     }
 
-    async fn execute(
+    async fn execute_impl(
         &self,
         args: &ToolArgs,
-        _credential: Option<&Credential>,
+        verified_content: Option<&VerifiedToolContent>,
     ) -> Result<ToolResultData, ToolHandlerError> {
         // Validate arguments first (MAJOR 1 fix)
         self.validate(args)?;
@@ -480,45 +484,99 @@ impl ToolHandler for ReadFileHandler {
         let validated_path =
             validate_path_with_toctou_mitigation(&read_args.path, &canonical_root)?;
 
-        // TCK-00319: Open file with O_NOFOLLOW to prevent TOCTOU symlink attacks
-        // This ensures the kernel rejects symlinks at open time, closing the window
-        // between validation and access.
-        let mut file = open_file_nofollow(&validated_path).await.map_err(|e| {
-            ToolHandlerError::ExecutionFailed {
-                message: format!("failed to open file '{}': {}", read_args.path.display(), e),
-            }
-        })?;
-
-        // Seek if offset provided
-        if let Some(offset) = read_args.offset {
-            file.seek(std::io::SeekFrom::Start(offset))
-                .await
-                .map_err(|e| ToolHandlerError::ExecutionFailed {
-                    message: format!("failed to seek: {e}"),
-                })?;
-        }
-
         // Determine read limit (default 10MB)
         let limit = read_args.limit.unwrap_or(10 * 1024 * 1024);
 
-        // Read content with limit
-        let mut buffer = Vec::new();
-        let bytes_read = file
-            .take(limit)
-            .read_to_end(&mut buffer)
-            .await
-            .map_err(|e| ToolHandlerError::ExecutionFailed {
-                message: format!("failed to read: {e}"),
+        let (buffer, bytes_read) = if let Some(verified) = verified_content {
+            let normalized = Self::normalized_verified_path(&validated_path)?;
+            if let Some(content) = verified.get(&normalized) {
+                let start = read_args
+                    .offset
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .unwrap_or(0)
+                    .min(content.len());
+                let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+                let end = start.saturating_add(limit_usize).min(content.len());
+                let out = content[start..end].to_vec();
+                let out_len = u64::try_from(out.len()).unwrap_or(u64::MAX);
+                (out, out_len)
+            } else {
+                return Err(ToolHandlerError::ExecutionFailed {
+                    message: format!(
+                        "missing TOCTOU-verified content for '{}'; refusing disk re-read",
+                        validated_path.display()
+                    ),
+                });
+            }
+        } else {
+            // TCK-00319: Open file with O_NOFOLLOW to prevent TOCTOU symlink attacks
+            // This ensures the kernel rejects symlinks at open time, closing the window
+            // between validation and access.
+            let mut file = open_file_nofollow(&validated_path).await.map_err(|e| {
+                ToolHandlerError::ExecutionFailed {
+                    message: format!("failed to open file '{}': {}", read_args.path.display(), e),
+                }
             })?;
+
+            // Seek if offset provided
+            if let Some(offset) = read_args.offset {
+                file.seek(std::io::SeekFrom::Start(offset))
+                    .await
+                    .map_err(|e| ToolHandlerError::ExecutionFailed {
+                        message: format!("failed to seek: {e}"),
+                    })?;
+            }
+
+            // Read content with limit
+            let mut buffer = Vec::new();
+            let bytes_read = file
+                .take(limit)
+                .read_to_end(&mut buffer)
+                .await
+                .map_err(|e| ToolHandlerError::ExecutionFailed {
+                    message: format!("failed to read: {e}"),
+                })?;
+
+            (buffer, bytes_read as u64)
+        };
 
         // Capture actual I/O duration (MAJOR 2 fix)
         let io_duration = io_start.elapsed();
 
         Ok(ToolResultData::success(
             buffer,
-            BudgetDelta::single_call().with_bytes_io(bytes_read as u64),
+            BudgetDelta::single_call().with_bytes_io(bytes_read),
             io_duration,
         ))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ReadFileHandler {
+    fn tool_class(&self) -> ToolClass {
+        ToolClass::Read
+    }
+
+    async fn execute(
+        &self,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
+        self.execute_impl(args, None).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &ExecutionContext,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
+        let verified = if ctx.verified_content.is_empty() {
+            None
+        } else {
+            Some(&ctx.verified_content)
+        };
+        self.execute_impl(args, verified).await
     }
 
     fn validate(&self, args: &ToolArgs) -> Result<(), ToolHandlerError> {
@@ -2742,9 +2800,23 @@ impl SearchHandler {
         display_path: &str,
         query: &str,
         out: &mut SearchOutputState,
+        verified_content: Option<&VerifiedToolContent>,
     ) -> Result<bool, ToolHandlerError> {
-        let Ok(content) = tokio::fs::read_to_string(path).await else {
-            return Ok(false); // Skip unreadable/binary files
+        let content = if let Some(verified) = verified_content {
+            let normalized = ReadFileHandler::normalized_verified_path(path)?;
+            let Some(bytes) = verified.get(&normalized) else {
+                // Fail-closed: files without pre-verified bytes are excluded.
+                return Ok(false);
+            };
+            let Ok(content) = std::str::from_utf8(bytes) else {
+                return Ok(false); // Skip binary files
+            };
+            content.to_string()
+        } else {
+            let Ok(content) = tokio::fs::read_to_string(path).await else {
+                return Ok(false); // Skip unreadable/binary files
+            };
+            content
         };
 
         for (line_num, line) in content.lines().enumerate() {
@@ -2767,18 +2839,11 @@ impl SearchHandler {
 
         Ok(false)
     }
-}
 
-#[async_trait]
-impl ToolHandler for SearchHandler {
-    fn tool_class(&self) -> ToolClass {
-        ToolClass::Search
-    }
-
-    async fn execute(
+    async fn execute_impl(
         &self,
         args: &ToolArgs,
-        _credential: Option<&Credential>,
+        verified_content: Option<&VerifiedToolContent>,
     ) -> Result<ToolResultData, ToolHandlerError> {
         use super::tool_handler::{NAVIGATION_OUTPUT_MAX_BYTES, NAVIGATION_OUTPUT_MAX_LINES};
 
@@ -2899,6 +2964,7 @@ impl ToolHandler for SearchHandler {
                     &target.display_path,
                     query,
                     &mut out,
+                    verified_content,
                 )
                 .await?;
             }
@@ -2944,6 +3010,35 @@ impl ToolHandler for SearchHandler {
                 .with_bytes_io(scanned_bytes.saturating_add(output_len as u64)),
             search_duration,
         ))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for SearchHandler {
+    fn tool_class(&self) -> ToolClass {
+        ToolClass::Search
+    }
+
+    async fn execute(
+        &self,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
+        self.execute_impl(args, None).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &ExecutionContext,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
+        let verified = if ctx.verified_content.is_empty() {
+            None
+        } else {
+            Some(&ctx.verified_content)
+        };
+        self.execute_impl(args, verified).await
     }
 
     fn validate(&self, args: &ToolArgs) -> Result<(), ToolHandlerError> {
