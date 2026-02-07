@@ -35,6 +35,9 @@ use thiserror::Error;
 use super::merkle::{hash_internal, hash_leaf};
 use crate::crypto::{EventHasher, HASH_SIZE, Hash};
 
+// TODO(EVID-0025): evidence artifact for AAT flake classification and
+// quarantine tests is deferred to a follow-up ticket.
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -99,6 +102,18 @@ pub enum BatchEpochError {
         /// The epoch number.
         epoch: u64,
     },
+
+    /// Genesis epoch (epoch 0) has a non-zero previous epoch root.
+    #[error("genesis epoch must have zero prev_epoch_root")]
+    GenesisPrevNotZero,
+
+    /// Pointer epoch root hash is all zeros.
+    #[error("epoch anti-entropy pointer hash must not be zero")]
+    ZeroPointerHash,
+
+    /// Pointer batch count is zero.
+    #[error("epoch anti-entropy pointer batch_count must not be zero")]
+    ZeroPointerBatchCount,
 
     /// Epoch number mismatch during traversal.
     #[error("epoch mismatch: expected {expected}, found {found}")]
@@ -228,6 +243,11 @@ impl BatchEpochRootV1 {
             return Err(BatchEpochError::MissingPreviousRoot { epoch });
         }
 
+        // Validate genesis epoch has zero prev_epoch_root.
+        if epoch == 0 && prev_epoch_root != [0u8; HASH_SIZE] {
+            return Err(BatchEpochError::GenesisPrevNotZero);
+        }
+
         // Validate no zero batch roots and no duplicates.
         for (i, root) in batch_root_hashes.iter().enumerate() {
             if *root == [0u8; HASH_SIZE] {
@@ -256,15 +276,22 @@ impl BatchEpochRootV1 {
 
     /// Compute the Merkle root over the batch root hashes (root-of-roots).
     ///
+    /// Batch root hashes are sorted lexicographically before Merkle computation
+    /// to ensure canonical ordering. This guarantees deterministic output
+    /// regardless of insertion order.
+    ///
     /// Uses domain-separated leaf hashing consistent with the consensus
     /// Merkle tree implementation.
     #[must_use]
     fn compute_root_of_roots(batch_root_hashes: &[Hash]) -> Hash {
-        if batch_root_hashes.len() == 1 {
-            return hash_leaf(&batch_root_hashes[0]);
+        let mut sorted = batch_root_hashes.to_vec();
+        sorted.sort_unstable();
+
+        if sorted.len() == 1 {
+            return hash_leaf(&sorted[0]);
         }
 
-        let mut current_level: Vec<Hash> = batch_root_hashes.iter().map(hash_leaf).collect();
+        let mut current_level: Vec<Hash> = sorted.iter().map(hash_leaf).collect();
 
         while current_level.len() > 1 {
             let mut next_level = Vec::with_capacity(current_level.len().div_ceil(2));
@@ -429,10 +456,10 @@ impl EpochRootBuilder {
         }
 
         // Check for duplicates.
-        for (i, existing) in self.batch_roots.iter().enumerate() {
+        for existing in &self.batch_roots {
             if *existing == batch_root {
                 return Err(BatchEpochError::DuplicateBatchRoot {
-                    index: i + 1, // +1 because we report the would-be index
+                    index: self.batch_roots.len(),
                 });
             }
         }
@@ -522,13 +549,28 @@ impl EpochAntiEntropyPointer {
     }
 
     /// Create a pointer from individual components.
-    #[must_use]
-    pub const fn new(epoch: u64, epoch_root_hash: Hash, batch_count: u32) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `epoch_root_hash` is all zeros
+    /// - `batch_count` is zero
+    pub fn new(
+        epoch: u64,
+        epoch_root_hash: Hash,
+        batch_count: u32,
+    ) -> Result<Self, BatchEpochError> {
+        if epoch_root_hash == [0u8; HASH_SIZE] {
+            return Err(BatchEpochError::ZeroPointerHash);
+        }
+        if batch_count == 0 {
+            return Err(BatchEpochError::ZeroPointerBatchCount);
+        }
+        Ok(Self {
             epoch,
             epoch_root_hash,
             batch_count,
-        }
+        })
     }
 
     // ────────── Accessors ──────────
@@ -554,7 +596,9 @@ impl EpochAntiEntropyPointer {
     /// Check whether this pointer matches a given `BatchEpochRootV1`.
     #[must_use]
     pub fn matches(&self, root: &BatchEpochRootV1) -> bool {
-        self.epoch == root.epoch() && self.epoch_root_hash == root.content_hash()
+        self.epoch == root.epoch()
+            && self.epoch_root_hash == root.content_hash()
+            && self.batch_count == root.batch_count()
     }
 
     // ────────── Canonical bytes and content hash ──────────
@@ -990,7 +1034,7 @@ mod tck_00371_unit_tests {
 
     #[test]
     fn pointer_manual_construction() {
-        let pointer = EpochAntiEntropyPointer::new(42, test_hash(999), 10);
+        let pointer = EpochAntiEntropyPointer::new(42, test_hash(999), 10).unwrap();
         assert_eq!(pointer.epoch(), 42);
         assert_eq!(pointer.epoch_root_hash(), &test_hash(999));
         assert_eq!(pointer.batch_count(), 10);
@@ -1233,6 +1277,104 @@ mod tck_00371_unit_tests {
 
         // The content hashes should be different due to domain separation.
         assert_ne!(epoch_root.content_hash(), pointer.content_hash());
+    }
+
+    // ── Fix regression tests ──
+
+    #[test]
+    fn genesis_epoch_rejects_nonzero_prev_epoch_root() {
+        let result = BatchEpochRootV1::new(
+            0,
+            &[test_hash(1)],
+            test_hash(100),
+            test_hash(999), // non-zero prev for genesis
+        );
+        assert!(
+            matches!(result, Err(BatchEpochError::GenesisPrevNotZero)),
+            "genesis epoch must reject non-zero prev_epoch_root, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn pointer_new_rejects_zero_hash() {
+        let result = EpochAntiEntropyPointer::new(0, [0u8; HASH_SIZE], 5);
+        assert!(
+            matches!(result, Err(BatchEpochError::ZeroPointerHash)),
+            "pointer should reject zero epoch_root_hash, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn pointer_new_rejects_zero_batch_count() {
+        let result = EpochAntiEntropyPointer::new(0, test_hash(1), 0);
+        assert!(
+            matches!(result, Err(BatchEpochError::ZeroPointerBatchCount)),
+            "pointer should reject zero batch_count, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn pointer_matches_includes_batch_count() {
+        let er = BatchEpochRootV1::new(
+            0,
+            &[test_hash(1), test_hash(2)],
+            test_hash(100),
+            [0u8; HASH_SIZE],
+        )
+        .unwrap();
+
+        // Correct pointer from epoch root matches.
+        let good_pointer = EpochAntiEntropyPointer::from_epoch_root(&er);
+        assert!(good_pointer.matches(&er));
+
+        // Pointer with wrong batch_count does not match.
+        let bad_pointer = EpochAntiEntropyPointer::new(er.epoch(), er.content_hash(), 999).unwrap();
+        assert!(
+            !bad_pointer.matches(&er),
+            "pointer with wrong batch_count should not match"
+        );
+    }
+
+    #[test]
+    fn canonical_ordering_is_insertion_order_independent() {
+        let a = test_hash(1);
+        let b = test_hash(2);
+        let c = test_hash(3);
+
+        // Build with order [a, b, c]
+        let er1 = BatchEpochRootV1::new(0, &[a, b, c], test_hash(100), [0u8; HASH_SIZE]).unwrap();
+
+        // Build with order [c, a, b]
+        let er2 = BatchEpochRootV1::new(0, &[c, a, b], test_hash(100), [0u8; HASH_SIZE]).unwrap();
+
+        assert_eq!(
+            er1.root_of_roots(),
+            er2.root_of_roots(),
+            "root_of_roots must be identical regardless of insertion order"
+        );
+        assert_eq!(
+            er1.content_hash(),
+            er2.content_hash(),
+            "content_hash must be identical regardless of insertion order"
+        );
+    }
+
+    #[test]
+    fn builder_duplicate_reports_correct_insertion_index() {
+        let mut builder = EpochRootBuilder::new(0, [0u8; HASH_SIZE]);
+        builder.add_batch_root(test_hash(10)).unwrap();
+        builder.add_batch_root(test_hash(20)).unwrap();
+        builder.add_batch_root(test_hash(30)).unwrap();
+
+        // Attempting to add test_hash(10) again at what would be index 3
+        let result = builder.add_batch_root(test_hash(10));
+        assert!(
+            matches!(
+                result,
+                Err(BatchEpochError::DuplicateBatchRoot { index: 3 })
+            ),
+            "should report the attempted insertion index (3), got: {result:?}"
+        );
     }
 }
 
