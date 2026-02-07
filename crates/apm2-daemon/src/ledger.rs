@@ -893,11 +893,15 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         blocked_log_hash: &[u8; 32],
         reviewer_actor_id: &str,
         timestamp_ns: u64,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use crate::protocol::dispatch::REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX;
 
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
+        // SECURITY (TCK-00356 Fix 2): identity_proof_hash is included in
+        // the signed payload so it is audit-bound and cannot be stripped
+        // post-signing, matching the APPROVE path's payload binding.
         let payload_json = serde_json::json!({
             "event_type": "review_blocked_recorded",
             "receipt_id": receipt_id,
@@ -905,6 +909,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "blocked_log_hash": hex::encode(blocked_log_hash),
             "reviewer_actor_id": reviewer_actor_id,
             "timestamp_ns": timestamp_ns,
+            "identity_proof_hash": hex::encode(identity_proof_hash),
         });
 
         let payload_string = payload_json.to_string();
@@ -2845,6 +2850,7 @@ mod tests {
 
         let blocked_log_hash = [0xEEu8; 32];
 
+        let identity_proof_hash = [0xDDu8; 32];
         let blocked_event = emitter
             .emit_review_blocked_receipt(
                 "RR-BLOCKED-001",
@@ -2852,6 +2858,7 @@ mod tests {
                 &blocked_log_hash,
                 "reviewer-actor-y",
                 2_000_000_000,
+                &identity_proof_hash,
             )
             .expect("blocked receipt emit should succeed");
 
@@ -2866,5 +2873,37 @@ mod tests {
             "Must return the same event_id as the original blocked emission"
         );
         assert_eq!(found.event_type, "review_blocked_recorded");
+    }
+
+    /// Verifies that `emit_review_blocked_receipt` includes
+    /// `identity_proof_hash` in the signed payload (TCK-00356 Fix 2).
+    #[test]
+    fn test_blocked_receipt_payload_contains_identity_proof_hash() {
+        let emitter = test_emitter();
+        let blocked_log_hash = [0xAAu8; 32];
+        let identity_proof_hash = [0xBBu8; 32];
+
+        let event = emitter
+            .emit_review_blocked_receipt(
+                "RR-BLOCKED-IPH",
+                99,
+                &blocked_log_hash,
+                "reviewer-actor-z",
+                3_000_000_000,
+                &identity_proof_hash,
+            )
+            .expect("blocked receipt emit should succeed");
+
+        // Parse the payload and verify identity_proof_hash is present
+        let payload: serde_json::Value =
+            serde_json::from_slice(&event.payload).expect("payload should be valid JSON");
+        let iph = payload
+            .get("identity_proof_hash")
+            .expect("payload must contain identity_proof_hash field");
+        assert_eq!(
+            iph.as_str().unwrap(),
+            hex::encode(identity_proof_hash),
+            "identity_proof_hash in blocked event payload must match the input"
+        );
     }
 }

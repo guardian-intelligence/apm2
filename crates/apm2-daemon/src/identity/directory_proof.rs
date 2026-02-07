@@ -709,11 +709,17 @@ impl SiblingNode {
 }
 
 /// Bounded authenticated-directory proof for identity membership checks.
+///
+/// The `entry_status` field is part of the value commitment: the directory
+/// authority hashes `(certificate_hash, entry_status)` into the leaf
+/// `value_hash`. This ensures the entry status is proof-derived and cannot
+/// be caller-asserted (TCK-00356 Fix 4).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DirectoryProofV1 {
     kind: DirectoryProofKindV1,
     key: [u8; HASH_BYTES],
     value_hash: [u8; HASH_BYTES],
+    entry_status: DirectoryEntryStatus,
     siblings: Vec<SiblingNode>,
     proof_bytes_len: u32,
 }
@@ -724,12 +730,14 @@ impl DirectoryProofV1 {
         kind: DirectoryProofKindV1,
         key: [u8; HASH_BYTES],
         value_hash: [u8; HASH_BYTES],
+        entry_status: DirectoryEntryStatus,
         siblings: Vec<SiblingNode>,
     ) -> Result<Self, IdentityProofError> {
         let mut proof = Self {
             kind,
             key,
             value_hash,
+            entry_status,
             siblings,
             proof_bytes_len: 0,
         };
@@ -779,6 +787,7 @@ impl DirectoryProofV1 {
         out.push(self.kind.to_byte());
         out.extend_from_slice(&self.key);
         out.extend_from_slice(&self.value_hash);
+        out.push(self.entry_status.to_byte());
         out.extend_from_slice(&self.proof_bytes_len.to_le_bytes());
 
         let sibling_count =
@@ -823,6 +832,7 @@ impl DirectoryProofV1 {
         let kind = DirectoryProofKindV1::from_byte(cursor.read_u8("kind")?)?;
         let key = cursor.read_array::<HASH_BYTES>("key")?;
         let value_hash = cursor.read_array::<HASH_BYTES>("value_hash")?;
+        let entry_status = DirectoryEntryStatus::from_byte(cursor.read_u8("entry_status")?)?;
         let proof_bytes_len = cursor.read_u32("proof_bytes_len")?;
         let sibling_count = cursor.read_u32("siblings.count")?;
 
@@ -852,6 +862,7 @@ impl DirectoryProofV1 {
             kind,
             key,
             value_hash,
+            entry_status,
             siblings,
             proof_bytes_len,
         };
@@ -909,11 +920,12 @@ impl DirectoryProofV1 {
 
     fn encoded_len(&self) -> usize {
         DIRECTORY_PROOF_DOMAIN_SEPARATOR.len()
-            + 1
-            + HASH_BYTES
-            + HASH_BYTES
-            + 4
-            + 4
+            + 1              // kind byte
+            + HASH_BYTES     // key
+            + HASH_BYTES     // value_hash
+            + 1              // entry_status byte
+            + 4              // proof_bytes_len
+            + 4              // sibling_count
             + (self.siblings.len() * HASH_BYTES)
     }
 
@@ -930,6 +942,15 @@ impl DirectoryProofV1 {
     /// Returns value hash.
     pub const fn value_hash(&self) -> &[u8; HASH_BYTES] {
         &self.value_hash
+    }
+
+    /// Returns the proof-derived entry status.
+    ///
+    /// This status is committed into the directory leaf value by the
+    /// directory authority and is verified as part of the ADS proof.
+    /// It MUST NOT be caller-asserted (TCK-00356 Fix 4).
+    pub const fn entry_status(&self) -> DirectoryEntryStatus {
+        self.entry_status
     }
 
     /// Returns siblings.
@@ -1121,15 +1142,24 @@ impl IdentityProofV1 {
     ///
     /// Verification steps (RFC-0020 §1.7.7):
     ///
-    /// 1. Proof object is already fetched and decoded with bounds.
-    ///    1a. Directory kind compatibility check (head kind vs. proof kind).
+    /// 1. Proof object is already fetched and decoded with bounds. 1a.
+    ///    Directory kind compatibility check (head kind vs. proof kind).
     /// 2. Verify `CellCertificateV1`.
     /// 3. Verify `HolonCertificateV1` and recompute identity bindings.
     /// 4. Verify directory head authority seal binding.
-    /// 5. Verify ADS proof against head root.
-    ///    5a. Verify K->V semantics: `expected_value_hash` matches proof `value_hash`.
-    ///    5b. Verify directory entry status: revoked entries fail-closed.
+    /// 5. Verify ADS proof against head root. 5a. Verify K->V semantics:
+    ///    `expected_value_hash` matches proof `value_hash`. 5b. Verify
+    ///    directory entry status is Active (proof-derived, not
+    ///    caller-asserted).
     /// 6. Enforce tick-based freshness.
+    ///
+    /// # Entry Status (TCK-00356 Fix 4)
+    ///
+    /// The entry status is **proof-derived**: it comes from the
+    /// `DirectoryProofV1::entry_status` field, which is committed into the
+    /// directory leaf by the directory authority. Callers do NOT supply the
+    /// expected status — if the proof carries a Revoked or Suspended status,
+    /// verification fails with `EntryRevoked`.
     #[allow(clippy::too_many_arguments)]
     pub fn verify<F>(
         &self,
@@ -1142,7 +1172,6 @@ impl IdentityProofV1 {
         max_staleness_ticks: u64,
         expected_freshness_policy_hash: &[u8; HASH_BYTES],
         expected_value_hash: &[u8; HASH_BYTES],
-        expected_entry_status: DirectoryEntryStatus,
         authority_seal_verifier: F,
     ) -> Result<(), IdentityProofError>
     where
@@ -1264,11 +1293,15 @@ impl IdentityProofV1 {
             });
         }
 
-        // Step 5b: Verify directory entry status.
+        // Step 5b: Verify directory entry status (proof-derived).
         //
-        // If the directory entry is revoked or suspended, authoritative
-        // operations MUST be denied (fail-closed).
-        if !expected_entry_status.is_active() {
+        // SECURITY (TCK-00356 Fix 4): The entry status is extracted from
+        // the proof's `DirectoryProofV1::entry_status` field, which is
+        // committed into the directory leaf by the directory authority.
+        // This prevents callers from asserting an Active status for a
+        // Revoked/Suspended entry. If the proof-derived status is not
+        // Active, authoritative operations MUST be denied (fail-closed).
+        if !self.directory_proof.entry_status().is_active() {
             return Err(IdentityProofError::EntryRevoked);
         }
 
@@ -1365,12 +1398,17 @@ fn hash_bytes(bytes: &[u8]) -> Hash {
 
 /// Validates an identity proof hash at the handler admission boundary.
 ///
-/// Phase 1 (pre-CAS transport): This validates that the hash is well-formed
-/// and non-zero, acting as a binding commitment. The caller attests they hold
-/// a valid `IdentityProofV1` by providing its content hash.
+/// **WVR-0003 (Phase 1 limitation):** This validates that the hash is
+/// well-formed and non-zero, acting as a shape-only binding commitment.
+/// The caller attests they hold a valid `IdentityProofV1` by providing
+/// its content hash.
 ///
-/// Full proof dereference + `IdentityProofV1::verify()` requires CAS
-/// integration, which is deferred to TCK-00359 (CAS transport).
+/// Full CAS dereference + `IdentityProofV1::verify()` requires CAS
+/// transport integration, which is deferred to TCK-00359 (verifier cache
+/// contract and invalidation correctness). Until then, the hash is bound
+/// into signed ledger event payloads for audit traceability.
+///
+/// See `documents/security/waivers/WVR-0003.yaml` for the formal waiver.
 ///
 /// # Errors
 ///
@@ -1591,6 +1629,7 @@ mod tests {
             DirectoryProofKindV1::Smt256CompressedV1,
             key,
             value_hash,
+            DirectoryEntryStatus::Active,
             siblings,
         )
         .unwrap();
@@ -1611,6 +1650,7 @@ mod tests {
             DirectoryProofKindV1::Smt256CompressedV1,
             key,
             value_hash,
+            DirectoryEntryStatus::Active,
             siblings,
         )
         .unwrap();
@@ -1628,6 +1668,7 @@ mod tests {
             DirectoryProofKindV1::Smt256CompressedV1,
             [0x01; HASH_BYTES],
             [0x02; HASH_BYTES],
+            DirectoryEntryStatus::Active,
             vec![SiblingNode::new([0x03; HASH_BYTES])],
         )
         .unwrap();
@@ -1648,6 +1689,7 @@ mod tests {
             DirectoryProofKindV1::PatriciaCompressedV1,
             [0x10; HASH_BYTES],
             [0x20; HASH_BYTES],
+            DirectoryEntryStatus::Active,
             vec![SiblingNode::new([0x30; HASH_BYTES])],
         )
         .unwrap();
@@ -1700,6 +1742,7 @@ mod tests {
             DirectoryProofKindV1::Smt256CompressedV1,
             key,
             [0xAB; HASH_BYTES],
+            DirectoryEntryStatus::Active,
             vec![
                 SiblingNode::new([0x10; HASH_BYTES]),
                 SiblingNode::new([0x11; HASH_BYTES]),
@@ -1745,7 +1788,6 @@ mod tests {
                 10,
                 head.freshness_policy_hash(),
                 &[0xAB; HASH_BYTES],
-                DirectoryEntryStatus::Active,
                 |_, _, authority_seal_hash| {
                     if authority_seal_hash == &[0u8; HASH_BYTES] {
                         return Err(IdentityProofError::InvalidField {
@@ -1769,6 +1811,7 @@ mod tests {
             DirectoryProofKindV1::Smt256CompressedV1,
             key,
             [0xAA; HASH_BYTES],
+            DirectoryEntryStatus::Active,
             vec![SiblingNode::new([0xBB; HASH_BYTES])],
         )
         .unwrap();
@@ -1809,7 +1852,6 @@ mod tests {
                 10,
                 head.freshness_policy_hash(),
                 &[0xAA; HASH_BYTES],
-                DirectoryEntryStatus::Active,
                 |_, _, _| Ok(()),
             )
             .unwrap_err();
@@ -1827,6 +1869,7 @@ mod tests {
             DirectoryProofKindV1::Smt256CompressedV1,
             key,
             [0x01; HASH_BYTES],
+            DirectoryEntryStatus::Active,
             vec![SiblingNode::new([0x02; HASH_BYTES])],
         )
         .unwrap();
@@ -1867,7 +1910,6 @@ mod tests {
                 5,
                 head.freshness_policy_hash(),
                 &[0x01; HASH_BYTES],
-                DirectoryEntryStatus::Active,
                 |_, _, _| Ok(()),
             )
             .unwrap_err();
@@ -1881,6 +1923,7 @@ mod tests {
             DirectoryProofKindV1::Smt256CompressedV1,
             [0x99; HASH_BYTES],
             default_empty_value_hash(),
+            DirectoryEntryStatus::Active,
             vec![SiblingNode::new([0x88; HASH_BYTES])],
         )
         .unwrap();
@@ -1962,6 +2005,7 @@ mod tests {
             DirectoryProofKindV1::Smt256CompressedV1,
             key,
             actual_value_hash,
+            DirectoryEntryStatus::Active,
             vec![
                 SiblingNode::new([0x10; HASH_BYTES]),
                 SiblingNode::new([0x11; HASH_BYTES]),
@@ -2007,7 +2051,6 @@ mod tests {
                 10,
                 head.freshness_policy_hash(),
                 &wrong_expected,
-                DirectoryEntryStatus::Active,
                 |_, _, _| Ok(()),
             )
             .unwrap_err();
@@ -2025,10 +2068,13 @@ mod tests {
 
         let key = derive_directory_key(holon_cert.holon_id());
         let value_hash = [0xAB; HASH_BYTES];
+        // TCK-00356 Fix 4: Revoked status is now proof-derived, not caller-asserted.
+        // The directory proof itself carries DirectoryEntryStatus::Revoked.
         let proof = DirectoryProofV1::new(
             DirectoryProofKindV1::Smt256CompressedV1,
             key,
             value_hash,
+            DirectoryEntryStatus::Revoked,
             vec![
                 SiblingNode::new([0x10; HASH_BYTES]),
                 SiblingNode::new([0x11; HASH_BYTES]),
@@ -2061,7 +2107,7 @@ mod tests {
         )
         .unwrap();
 
-        // Provide correct value hash but revoked status
+        // Proof-derived status is Revoked — verify must reject
         let err = identity_proof
             .verify(
                 holon_cert.holon_id(),
@@ -2073,7 +2119,6 @@ mod tests {
                 10,
                 head.freshness_policy_hash(),
                 &value_hash,
-                DirectoryEntryStatus::Revoked,
                 |_, _, _| Ok(()),
             )
             .unwrap_err();

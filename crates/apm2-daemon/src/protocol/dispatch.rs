@@ -537,6 +537,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// * `blocked_log_hash` - CAS hash of blocked logs
     /// * `reviewer_actor_id` - Actor ID of the reviewer
     /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    /// * `identity_proof_hash` - Identity proof hash binding (32 bytes)
     ///
     /// # Returns
     ///
@@ -552,6 +553,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         blocked_log_hash: &[u8; 32],
         reviewer_actor_id: &str,
         timestamp_ns: u64,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
     /// Returns the number of `work_transitioned` events for a given work ID.
@@ -1798,11 +1800,15 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         blocked_log_hash: &[u8; 32],
         reviewer_actor_id: &str,
         timestamp_ns: u64,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
+        // SECURITY (TCK-00356 Fix 2): identity_proof_hash is included in
+        // the signed payload so it is audit-bound and cannot be stripped
+        // post-signing, matching the APPROVE path's payload binding.
         let payload_json = serde_json::json!({
             "event_type": "review_blocked_recorded",
             "receipt_id": receipt_id,
@@ -1810,6 +1816,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "blocked_log_hash": hex::encode(blocked_log_hash),
             "reviewer_actor_id": reviewer_actor_id,
             "timestamp_ns": timestamp_ns,
+            "identity_proof_hash": hex::encode(identity_proof_hash),
         });
 
         let payload_string = payload_json.to_string();
@@ -7662,6 +7669,19 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        // WVR-0003: Log once that identity proof hash is validated as
+        // shape-only commitment (Phase 1 / pre-CAS transport).
+        {
+            static PROOF_WAIVER_WARN: std::sync::Once = std::sync::Once::new();
+            PROOF_WAIVER_WARN.call_once(|| {
+                warn!(
+                    waiver = "WVR-0003",
+                    "identity proof hash validated as shape-only commitment; \
+                     full CAS dereference + IdentityProofV1::verify() deferred (WVR-0003)"
+                );
+            });
+        }
+
         // Validate changeset_digest is exactly 32 bytes
         if request.changeset_digest.len() != 32 {
             return Ok(PrivilegedResponse::error(
@@ -7973,6 +7993,10 @@ impl PrivilegedDispatcher {
 
                 // SECURITY (v6 Finding 1): Use authenticated reviewer identity
                 // for event actor attribution, not the caller-supplied value.
+                //
+                // SECURITY (TCK-00356 Fix 2): identity_proof_hash is passed
+                // into the blocked event emitter so it is included in the
+                // signed payload, matching the APPROVE path's binding.
                 let event = self
                     .event_emitter
                     .emit_review_blocked_receipt(
@@ -7981,6 +8005,7 @@ impl PrivilegedDispatcher {
                         &blocked_log_hash,
                         &authenticated_reviewer_id,
                         timestamp_ns,
+                        &identity_proof_hash_arr,
                     )
                     .map_err(|e| ProtocolError::Serialization {
                         reason: format!("review blocked emission failed: {e}"),
@@ -8872,6 +8897,19 @@ impl PrivilegedDispatcher {
                 PrivilegedErrorCode::CapabilityRequestRejected,
                 format!("identity_proof_hash validation failed: {e}"),
             ));
+        }
+
+        // WVR-0003: Log once that identity proof hash is validated as
+        // shape-only commitment (Phase 1 / pre-CAS transport).
+        {
+            static SUBLEASE_PROOF_WAIVER_WARN: std::sync::Once = std::sync::Once::new();
+            SUBLEASE_PROOF_WAIVER_WARN.call_once(|| {
+                warn!(
+                    waiver = "WVR-0003",
+                    "identity proof hash validated as shape-only commitment; \
+                     full CAS dereference + IdentityProofV1::verify() deferred (WVR-0003)"
+                );
+            });
         }
 
         if request.sublease_id.is_empty() {
