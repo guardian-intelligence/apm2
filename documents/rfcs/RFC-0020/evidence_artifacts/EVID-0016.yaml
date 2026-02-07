@@ -9,18 +9,30 @@ evidence_artifact:
     implementation in the daemon identity module. The implementation supports
     four seal kinds (SINGLE_SIG, QUORUM_MULTISIG, QUORUM_THRESHOLD,
     MERKLE_BATCH) with domain-separated preimages, mandatory ledger-anchor
-    binding, and fail-closed validation of all construction and verification
-    parameters.
+    binding, temporal authority binding, call-site subject enforcement, and
+    fail-closed validation of all construction and verification parameters.
 
     Domain separation: every preimage hashed for verification includes the
     authority seal domain separator, seal kind tag, subject kind string
-    (artifact kind + schema version), subject hash, and ledger anchor
-    canonical bytes. Tests confirm that different subject kinds, seal kinds,
-    and ledger anchors produce distinct preimages.
+    (artifact kind + schema version), subject hash, ledger anchor canonical
+    bytes, and time_envelope_ref. Tests confirm that different subject kinds,
+    seal kinds, ledger anchors, and time_envelope_ref values produce distinct
+    preimages.
+
+    Temporal authority binding: all seals carry a time_envelope_ref field
+    (32-byte hash binding to an HTF time envelope). Verification methods
+    accept a require_temporal flag; when set, a zero time_envelope_ref is
+    rejected with TemporalAuthorityRequired, enforcing temporal authority
+    for Tier2+ and governance contexts.
+
+    Call-site subject enforcement: all verification methods accept
+    expected_subject_kind and expected_subject_hash parameters. Mismatches
+    are rejected with SubjectKindMismatch before any cryptographic work,
+    preventing cross-artifact verification confusion.
 
     Ledger anchor binding: all seals require a LedgerAnchorV1 at construction
-    time. The reject_free_floating_batch_root function provides explicit
-    API-level enforcement of RFC-0020 section 0.1(11b).
+    time. The reject_free_floating_batch_root function provides construction-
+    time and type-level enforcement of RFC-0020 section 0.1(11b).
 
     Quorum identifier validation: quorum/threshold seal kinds require an
     IssuerId::Quorum issuer; single-sig seals require IssuerId::PublicKey.
@@ -29,6 +41,10 @@ evidence_artifact:
     Unsigned batch root rejection: MerkleBatch seals reject empty signature
     vectors at construction, preventing unsigned batch roots from entering
     the verification path.
+
+    Single-key MERKLE_BATCH signature count: when a MerkleBatch seal uses a
+    single-key (PublicKey) issuer, exactly one signature is required at
+    construction time. Multiple signatures are rejected.
   requirement_ids:
     - "REQ-0016"
   source_refs:
@@ -140,6 +156,30 @@ evidence_artifact:
       ref:
         - "cargo test -p apm2-daemon identity::authority_seal::tests::merkle_proof_empty_siblings_single_leaf"
         - "cargo test -p apm2-daemon identity::authority_seal::tests::merkle_proof_wrong_root"
+    - type: "test_output"
+      description: |
+        Temporal authority binding (time_envelope_ref):
+        - test_tier2_seal_rejects_zero_time_envelope_ref: Tier2+ require_temporal=true rejects zero ref
+        - test_time_envelope_ref_included_in_preimage: different refs produce different preimages
+        - test_time_envelope_ref_in_canonical_bytes: ref survives canonical bytes round-trip
+      ref:
+        - "cargo test -p apm2-daemon identity::authority_seal::tests::test_tier2_seal_rejects_zero_time_envelope_ref"
+        - "cargo test -p apm2-daemon identity::authority_seal::tests::test_time_envelope_ref_included_in_preimage"
+        - "cargo test -p apm2-daemon identity::authority_seal::tests::test_time_envelope_ref_in_canonical_bytes"
+    - type: "test_output"
+      description: |
+        Call-site subject enforcement:
+        - test_verify_rejects_subject_kind_mismatch: wrong expected_subject_kind rejected
+        - test_verify_rejects_subject_hash_mismatch: wrong expected_subject_hash rejected
+      ref:
+        - "cargo test -p apm2-daemon identity::authority_seal::tests::test_verify_rejects_subject_kind_mismatch"
+        - "cargo test -p apm2-daemon identity::authority_seal::tests::test_verify_rejects_subject_hash_mismatch"
+    - type: "test_output"
+      description: |
+        Single-key MERKLE_BATCH signature count enforcement:
+        - merkle_batch_single_key_rejects_multiple_signatures: two sigs rejected for single-key issuer
+      ref:
+        - "cargo test -p apm2-daemon identity::authority_seal::tests::merkle_batch_single_key_rejects_multiple_signatures"
     - type: "test_output"
       description: |
         Full daemon test suite regression check.

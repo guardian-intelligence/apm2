@@ -19,6 +19,14 @@
 //! free-floating batch roots are rejected for authority use (RFC-0020
 //! §0.1(11b)).
 //!
+//! # Temporal Authority Binding
+//!
+//! All authority seals carry a `time_envelope_ref` field — a 32-byte hash
+//! reference to the HTF time envelope artifact. For Tier2+ and governance
+//! contexts this binding MUST be non-zero, enabling verifiers to
+//! cryptographically bind a seal to HTF freshness context (RFC-0020 §9.2,
+//! REQ-0016).
+//!
 //! # Security Invariants
 //!
 //! - Fail-closed: unknown seal kinds and missing fields produce errors, never
@@ -30,6 +38,8 @@
 //!   multisig requires all signatures valid (n-of-n), threshold requires
 //!   k-of-n. The single-key `verify_merkle_batch` method rejects quorum issuers
 //!   to prevent single-signature bypass.
+//! - Verification methods enforce expected `subject_kind` and `subject_hash` at
+//!   call boundaries to prevent semantically wrong seals from being accepted.
 //!
 //! # Issuer-Key Binding Contract
 //!
@@ -82,6 +92,10 @@ pub const MAX_QUORUM_SIGNATURES: usize = 256;
 
 /// Minimum number of quorum signatures required.
 pub const MIN_QUORUM_SIGNATURES: usize = 1;
+
+/// Zero time envelope reference — used when temporal authority is absent or
+/// not applicable (Tier0/Tier1 contexts).
+pub const ZERO_TIME_ENVELOPE_REF: [u8; 32] = [0u8; 32];
 
 // ──────────────────────────────────────────────────────────────
 // Error types
@@ -170,6 +184,22 @@ pub enum AuthoritySealError {
         valid_sigs: usize,
         /// Threshold required.
         threshold: usize,
+    },
+
+    /// Temporal authority binding is required for Tier2+/governance contexts
+    /// but the seal has a zero `time_envelope_ref`.
+    #[error(
+        "temporal authority required: time_envelope_ref must be non-zero for Tier2+/governance contexts"
+    )]
+    TemporalAuthorityRequired,
+
+    /// The subject kind in the seal does not match the expected subject kind.
+    #[error("subject kind mismatch: expected \"{expected}\", found \"{found}\"")]
+    SubjectKindMismatch {
+        /// Expected subject kind.
+        expected: String,
+        /// Found subject kind.
+        found: String,
     },
 }
 
@@ -367,6 +397,10 @@ pub fn compute_receipt_leaf_hash(receipt_hash: &Hash) -> Hash {
 /// multisig/threshold, or Merkle-batch attestations. All seals are
 /// domain-separated by artifact kind + schema version and MUST reference
 /// a ledger anchor.
+///
+/// The `time_envelope_ref` field provides temporal authority binding. For
+/// Tier2+/governance contexts it MUST be non-zero to enable verifiers to
+/// cryptographically bind a seal to HTF freshness context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthoritySealV1 {
     /// Cell that issued the seal.
@@ -379,6 +413,9 @@ pub struct AuthoritySealV1 {
     subject_hash: Hash,
     /// Ledger anchor binding (REQUIRED).
     ledger_anchor: LedgerAnchorV1,
+    /// Hash reference to the HTF time envelope artifact.
+    /// Zero ([0u8; 32]) = absent/not-applicable (valid for Tier0/Tier1 only).
+    time_envelope_ref: [u8; 32],
     /// Kind of seal.
     seal_kind: SealKind,
     /// Raw signature bytes (for `SINGLE_SIG`, `MERKLE_BATCH` with single
@@ -396,6 +433,7 @@ impl AuthoritySealV1 {
     /// - A quorum seal kind lacks an issuer quorum id
     /// - A single-sig seal kind uses a quorum issuer
     /// - Signature count is out of bounds for quorum seals
+    /// - `MERKLE_BATCH` with single-key issuer has more than one signature
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         issuer_cell_id: CellIdV1,
@@ -403,6 +441,7 @@ impl AuthoritySealV1 {
         subject_kind: SubjectKind,
         subject_hash: Hash,
         ledger_anchor: LedgerAnchorV1,
+        time_envelope_ref: [u8; 32],
         seal_kind: SealKind,
         signatures: Vec<Vec<u8>>,
     ) -> Result<Self, AuthoritySealError> {
@@ -449,6 +488,14 @@ impl AuthoritySealV1 {
                         max: MAX_QUORUM_SIGNATURES,
                     });
                 }
+                // Single-key MERKLE_BATCH must have exactly 1 signature.
+                if matches!(issuer_id, IssuerId::PublicKey(_)) && signatures.len() != 1 {
+                    return Err(AuthoritySealError::InvalidQuorumSignatureCount {
+                        count: signatures.len(),
+                        min: 1,
+                        max: 1,
+                    });
+                }
             },
         }
 
@@ -458,6 +505,7 @@ impl AuthoritySealV1 {
             subject_kind,
             subject_hash,
             ledger_anchor,
+            time_envelope_ref,
             seal_kind,
             signatures,
         })
@@ -495,6 +543,12 @@ impl AuthoritySealV1 {
         &self.ledger_anchor
     }
 
+    /// Returns the time envelope reference hash.
+    #[must_use]
+    pub const fn time_envelope_ref(&self) -> &[u8; 32] {
+        &self.time_envelope_ref
+    }
+
     /// Returns the seal kind.
     #[must_use]
     pub const fn seal_kind(&self) -> SealKind {
@@ -505,6 +559,60 @@ impl AuthoritySealV1 {
     #[must_use]
     pub fn signatures(&self) -> &[Vec<u8>] {
         &self.signatures
+    }
+
+    // ────────── Canonical bytes ──────────
+
+    /// Compute the canonical byte representation of this seal for
+    /// serialization and round-trip testing.
+    ///
+    /// The layout is:
+    /// ```text
+    /// seal_kind_tag (1 byte)
+    /// + subject_kind_len (4 bytes LE)
+    /// + subject_kind_bytes
+    /// + subject_hash (32 bytes)
+    /// + ledger_anchor_canonical_bytes
+    /// + time_envelope_ref (32 bytes)
+    /// + signature_count (4 bytes LE)
+    /// + [signature_len (4 bytes LE) + signature_bytes] * signature_count
+    /// ```
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let kind_bytes = self.subject_kind.as_str().as_bytes();
+        let anchor_bytes = self.ledger_anchor.canonical_bytes();
+
+        let mut out = Vec::with_capacity(
+            1 + 4
+                + kind_bytes.len()
+                + 32
+                + anchor_bytes.len()
+                + 32
+                + 4
+                + self.signatures.iter().map(|s| 4 + s.len()).sum::<usize>(),
+        );
+
+        out.push(self.seal_kind.tag());
+
+        #[allow(clippy::cast_possible_truncation)]
+        let kind_len = kind_bytes.len() as u32;
+        out.extend_from_slice(&kind_len.to_le_bytes());
+        out.extend_from_slice(kind_bytes);
+        out.extend_from_slice(&self.subject_hash);
+        out.extend_from_slice(&anchor_bytes);
+        out.extend_from_slice(&self.time_envelope_ref);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let sig_count = self.signatures.len() as u32;
+        out.extend_from_slice(&sig_count.to_le_bytes());
+        for sig in &self.signatures {
+            #[allow(clippy::cast_possible_truncation)]
+            let sig_len = sig.len() as u32;
+            out.extend_from_slice(&sig_len.to_le_bytes());
+            out.extend_from_slice(sig);
+        }
+
+        out
     }
 
     // ────────── Domain-separated preimage ──────────
@@ -519,6 +627,7 @@ impl AuthoritySealV1 {
     ///     + subject_kind_bytes
     ///     + subject_hash (32 bytes)
     ///     + ledger_anchor_canonical_bytes
+    ///     + time_envelope_ref (32 bytes)
     /// )
     /// ```
     #[must_use]
@@ -534,7 +643,38 @@ impl AuthoritySealV1 {
         hasher.update(kind_bytes);
         hasher.update(&self.subject_hash);
         hasher.update(&self.ledger_anchor.canonical_bytes());
+        hasher.update(&self.time_envelope_ref);
         *hasher.finalize().as_bytes()
+    }
+
+    // ────────── Subject validation helpers ──────────
+
+    /// Check that the seal's subject kind and subject hash match the expected
+    /// values. This prevents semantically wrong seals from being accepted.
+    fn check_expected_subject(
+        &self,
+        expected_subject_kind: &str,
+        expected_subject_hash: &[u8; 32],
+    ) -> Result<(), AuthoritySealError> {
+        if self.subject_kind.as_str() != expected_subject_kind {
+            return Err(AuthoritySealError::SubjectKindMismatch {
+                expected: expected_subject_kind.to_string(),
+                found: self.subject_kind.as_str().to_string(),
+            });
+        }
+        if self.subject_hash != *expected_subject_hash {
+            return Err(AuthoritySealError::SubjectHashMismatch);
+        }
+        Ok(())
+    }
+
+    /// Check temporal authority binding: for Tier2+/governance contexts,
+    /// `time_envelope_ref` must be non-zero.
+    fn check_temporal_authority(&self, require_temporal: bool) -> Result<(), AuthoritySealError> {
+        if require_temporal && self.time_envelope_ref == ZERO_TIME_ENVELOPE_REF {
+            return Err(AuthoritySealError::TemporalAuthorityRequired);
+        }
+        Ok(())
     }
 
     // ────────── Verification ──────────
@@ -545,16 +685,24 @@ impl AuthoritySealV1 {
     ///
     /// Returns an error if:
     /// - The seal kind is not `SingleSig`
+    /// - The expected subject kind or hash does not match
+    /// - Temporal authority is required but `time_envelope_ref` is zero
     /// - The signature does not verify against the preimage
     pub fn verify_single_sig(
         &self,
         verifying_key: &ed25519_dalek::VerifyingKey,
+        expected_subject_kind: &str,
+        expected_subject_hash: &[u8; 32],
+        require_temporal: bool,
     ) -> Result<(), AuthoritySealError> {
         if self.seal_kind != SealKind::SingleSig {
             return Err(AuthoritySealError::SignatureVerificationFailed {
                 seal_kind: self.seal_kind,
             });
         }
+
+        self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
+        self.check_temporal_authority(require_temporal)?;
 
         let preimage = self.domain_separated_preimage();
         let sig_bytes = &self.signatures[0];
@@ -577,16 +725,25 @@ impl AuthoritySealV1 {
     ///
     /// # Errors
     ///
-    /// Returns an error if any signature fails verification.
+    /// Returns an error if:
+    /// - The expected subject kind or hash does not match
+    /// - Temporal authority is required but `time_envelope_ref` is zero
+    /// - Any signature fails verification
     pub fn verify_quorum_multisig(
         &self,
         verifying_keys: &[ed25519_dalek::VerifyingKey],
+        expected_subject_kind: &str,
+        expected_subject_hash: &[u8; 32],
+        require_temporal: bool,
     ) -> Result<(), AuthoritySealError> {
         if self.seal_kind != SealKind::QuorumMultisig {
             return Err(AuthoritySealError::SignatureVerificationFailed {
                 seal_kind: self.seal_kind,
             });
         }
+
+        self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
+        self.check_temporal_authority(require_temporal)?;
 
         if verifying_keys.len() != self.signatures.len() {
             return Err(AuthoritySealError::InvalidQuorumSignatureCount {
@@ -627,17 +784,26 @@ impl AuthoritySealV1 {
     ///
     /// # Errors
     ///
-    /// Returns an error if the threshold is not met.
+    /// Returns an error if:
+    /// - The expected subject kind or hash does not match
+    /// - Temporal authority is required but `time_envelope_ref` is zero
+    /// - The threshold is not met
     pub fn verify_quorum_threshold(
         &self,
         verifying_keys: &[ed25519_dalek::VerifyingKey],
         threshold: usize,
+        expected_subject_kind: &str,
+        expected_subject_hash: &[u8; 32],
+        require_temporal: bool,
     ) -> Result<(), AuthoritySealError> {
         if self.seal_kind != SealKind::QuorumThreshold {
             return Err(AuthoritySealError::SignatureVerificationFailed {
                 seal_kind: self.seal_kind,
             });
         }
+
+        self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
+        self.check_temporal_authority(require_temporal)?;
 
         if threshold == 0 || threshold > verifying_keys.len() {
             return Err(AuthoritySealError::ThresholdNotMet {
@@ -687,6 +853,8 @@ impl AuthoritySealV1 {
     /// - The issuer is a quorum (use
     ///   [`Self::verify_merkle_batch_quorum_multisig`] or
     ///   [`Self::verify_merkle_batch_quorum_threshold`] instead)
+    /// - The expected subject kind or hash does not match
+    /// - Temporal authority is required but `time_envelope_ref` is zero
     /// - The batch root signature is invalid
     /// - The inclusion proof does not reconstruct to the batch root
     pub fn verify_merkle_batch(
@@ -694,6 +862,9 @@ impl AuthoritySealV1 {
         verifying_key: &ed25519_dalek::VerifyingKey,
         artifact_hash: &Hash,
         inclusion_proof: &MerkleInclusionProof,
+        expected_subject_kind: &str,
+        expected_subject_hash: &[u8; 32],
+        require_temporal: bool,
     ) -> Result<(), AuthoritySealError> {
         if self.seal_kind != SealKind::MerkleBatch {
             return Err(AuthoritySealError::SignatureVerificationFailed {
@@ -709,6 +880,9 @@ impl AuthoritySealV1 {
                 seal_kind: self.seal_kind,
             });
         }
+
+        self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
+        self.check_temporal_authority(require_temporal)?;
 
         // Step 1: Verify the single signature over the batch root
         // (subject_hash).
@@ -751,6 +925,8 @@ impl AuthoritySealV1 {
     /// - The seal kind is not `MerkleBatch`
     /// - The issuer is not a quorum
     /// - The number of verifying keys does not match the number of signatures
+    /// - The expected subject kind or hash does not match
+    /// - Temporal authority is required but `time_envelope_ref` is zero
     /// - Any signature fails verification (n-of-n required)
     /// - The inclusion proof does not reconstruct to the batch root
     pub fn verify_merkle_batch_quorum_multisig(
@@ -758,6 +934,9 @@ impl AuthoritySealV1 {
         verifying_keys: &[ed25519_dalek::VerifyingKey],
         artifact_hash: &Hash,
         inclusion_proof: &MerkleInclusionProof,
+        expected_subject_kind: &str,
+        expected_subject_hash: &[u8; 32],
+        require_temporal: bool,
     ) -> Result<(), AuthoritySealError> {
         if self.seal_kind != SealKind::MerkleBatch {
             return Err(AuthoritySealError::SignatureVerificationFailed {
@@ -771,6 +950,9 @@ impl AuthoritySealV1 {
                 seal_kind: self.seal_kind,
             });
         }
+
+        self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
+        self.check_temporal_authority(require_temporal)?;
 
         // Enforce n-of-n: key count must equal signature count.
         if verifying_keys.len() != self.signatures.len() {
@@ -831,14 +1013,20 @@ impl AuthoritySealV1 {
     /// - The seal kind is not `MerkleBatch`
     /// - The issuer is not a quorum
     /// - The threshold is zero or exceeds the number of verifying keys
+    /// - The expected subject kind or hash does not match
+    /// - Temporal authority is required but `time_envelope_ref` is zero
     /// - Fewer than `threshold` signatures are valid
     /// - The inclusion proof does not reconstruct to the batch root
+    #[allow(clippy::too_many_arguments)]
     pub fn verify_merkle_batch_quorum_threshold(
         &self,
         verifying_keys: &[ed25519_dalek::VerifyingKey],
         threshold: usize,
         artifact_hash: &Hash,
         inclusion_proof: &MerkleInclusionProof,
+        expected_subject_kind: &str,
+        expected_subject_hash: &[u8; 32],
+        require_temporal: bool,
     ) -> Result<(), AuthoritySealError> {
         if self.seal_kind != SealKind::MerkleBatch {
             return Err(AuthoritySealError::SignatureVerificationFailed {
@@ -852,6 +1040,9 @@ impl AuthoritySealV1 {
                 seal_kind: self.seal_kind,
             });
         }
+
+        self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
+        self.check_temporal_authority(require_temporal)?;
 
         if threshold == 0 || threshold > verifying_keys.len() {
             return Err(AuthoritySealError::ThresholdNotMet {
@@ -915,9 +1106,10 @@ impl AuthoritySealV1 {
 /// `AuthoritySealV1::new()` already enforces that a `ledger_anchor` is
 /// present for all seal kinds at construction time. This function exists
 /// as an explicit semantic assertion at call sites where the §0.1(11b)
-/// invariant is safety-critical, providing defense-in-depth and
-/// self-documenting intent. It is intentionally a lightweight check
-/// because the heavy validation occurs at construction.
+/// invariant is safety-critical. Enforcement is construction-time and
+/// type-level (the `ledger_anchor` field is required and non-optional),
+/// so this function serves as a lightweight defense-in-depth marker
+/// rather than a runtime assertion.
 pub const fn reject_free_floating_batch_root(
     seal: &AuthoritySealV1,
 ) -> Result<(), AuthoritySealError> {
@@ -964,11 +1156,14 @@ mod tests {
             .unwrap()
     }
 
+    /// Standard subject kind used in tests.
+    const TEST_SUBJECT_KIND: &str = "apm2.tool_execution_receipt.v1";
+
     /// Helper: build a single-sig seal.
     fn make_single_sig_seal(signer: &Signer) -> AuthoritySealV1 {
         let cell_id = test_cell_id();
         let pkid = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer.public_key_bytes());
-        let subject_kind = SubjectKind::new("apm2.tool_execution_receipt.v1").unwrap();
+        let subject_kind = SubjectKind::new(TEST_SUBJECT_KIND).unwrap();
         let subject_hash = [0x42; HASH_SIZE];
         let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 1 };
 
@@ -979,6 +1174,7 @@ mod tests {
             subject_kind.clone(),
             subject_hash,
             ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::SingleSig,
             vec![vec![0u8; 64]], // placeholder
         )
@@ -993,6 +1189,7 @@ mod tests {
             subject_kind,
             subject_hash,
             ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::SingleSig,
             vec![signature.to_bytes().to_vec()],
         )
@@ -1063,6 +1260,7 @@ mod tests {
             subject_kind,
             [0; HASH_SIZE],
             LedgerAnchorV1::ConsensusIndex { index: 1 },
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::SingleSig,
             vec![vec![0u8; 64]],
         );
@@ -1085,6 +1283,7 @@ mod tests {
             subject_kind,
             [0; HASH_SIZE],
             LedgerAnchorV1::ConsensusIndex { index: 1 },
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::QuorumMultisig,
             vec![vec![0u8; 64], vec![0u8; 64]],
         );
@@ -1107,6 +1306,7 @@ mod tests {
             subject_kind,
             [0; HASH_SIZE],
             LedgerAnchorV1::ConsensusIndex { index: 1 },
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::QuorumMultisig,
             vec![], // no signatures
         );
@@ -1129,6 +1329,7 @@ mod tests {
             subject_kind,
             [0; HASH_SIZE],
             LedgerAnchorV1::ConsensusIndex { index: 1 },
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::SingleSig,
             vec![vec![0u8; 64], vec![0u8; 64]], // 2 sigs for single sig
         );
@@ -1145,7 +1346,15 @@ mod tests {
     fn verify_single_sig_valid() {
         let signer = Signer::generate();
         let seal = make_single_sig_seal(&signer);
-        assert!(seal.verify_single_sig(&signer.verifying_key()).is_ok());
+        assert!(
+            seal.verify_single_sig(
+                &signer.verifying_key(),
+                TEST_SUBJECT_KIND,
+                &[0x42; HASH_SIZE],
+                false,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1155,7 +1364,12 @@ mod tests {
         let seal = make_single_sig_seal(&signer);
 
         assert!(matches!(
-            seal.verify_single_sig(&wrong_signer.verifying_key()),
+            seal.verify_single_sig(
+                &wrong_signer.verifying_key(),
+                TEST_SUBJECT_KIND,
+                &[0x42; HASH_SIZE],
+                false,
+            ),
             Err(AuthoritySealError::SignatureVerificationFailed { .. })
         ));
     }
@@ -1168,7 +1382,12 @@ mod tests {
         seal.subject_hash = [0xFF; HASH_SIZE];
 
         assert!(matches!(
-            seal.verify_single_sig(&signer.verifying_key()),
+            seal.verify_single_sig(
+                &signer.verifying_key(),
+                TEST_SUBJECT_KIND,
+                &[0xFF; HASH_SIZE],
+                false,
+            ),
             Err(AuthoritySealError::SignatureVerificationFailed { .. })
         ));
     }
@@ -1205,6 +1424,7 @@ mod tests {
             subject_kind.clone(),
             subject_hash,
             ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::QuorumMultisig,
             vec![vec![0u8; 64], vec![0u8; 64]],
         )
@@ -1220,13 +1440,17 @@ mod tests {
             subject_kind,
             subject_hash,
             ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::QuorumMultisig,
             vec![sig_a.to_bytes().to_vec(), sig_b.to_bytes().to_vec()],
         )
         .unwrap();
 
         let keys = [signer_a.verifying_key(), signer_b.verifying_key()];
-        assert!(seal.verify_quorum_multisig(&keys).is_ok());
+        assert!(
+            seal.verify_quorum_multisig(&keys, "apm2.test.v1", &subject_hash, false)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1259,6 +1483,7 @@ mod tests {
             subject_kind.clone(),
             subject_hash,
             ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::QuorumMultisig,
             vec![vec![0u8; 64], vec![0u8; 64]],
         )
@@ -1275,6 +1500,7 @@ mod tests {
             subject_kind,
             subject_hash,
             ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::QuorumMultisig,
             vec![sig_a.to_bytes().to_vec(), bad_sig.to_bytes().to_vec()],
         )
@@ -1282,7 +1508,7 @@ mod tests {
 
         let keys = [signer_a.verifying_key(), signer_b.verifying_key()];
         assert!(matches!(
-            seal.verify_quorum_multisig(&keys),
+            seal.verify_quorum_multisig(&keys, "apm2.test.v1", &subject_hash, false),
             Err(AuthoritySealError::SignatureVerificationFailed { .. })
         ));
     }
@@ -1321,6 +1547,7 @@ mod tests {
             subject_kind.clone(),
             subject_hash,
             ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::QuorumThreshold,
             vec![vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]],
         )
@@ -1338,6 +1565,7 @@ mod tests {
             subject_kind,
             subject_hash,
             ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::QuorumThreshold,
             vec![
                 sig_a.to_bytes().to_vec(),
@@ -1353,7 +1581,10 @@ mod tests {
             signer_c.verifying_key(),
         ];
         // 2-of-3 threshold: a and b sign, c doesn't.
-        assert!(seal.verify_quorum_threshold(&keys, 2).is_ok());
+        assert!(
+            seal.verify_quorum_threshold(&keys, 2, "apm2.test.v1", &subject_hash, false)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1388,6 +1619,7 @@ mod tests {
             subject_kind.clone(),
             subject_hash,
             ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::QuorumThreshold,
             vec![vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]],
         )
@@ -1403,6 +1635,7 @@ mod tests {
             subject_kind,
             subject_hash,
             ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::QuorumThreshold,
             vec![sig_a.to_bytes().to_vec(), vec![0u8; 64], vec![0u8; 64]],
         )
@@ -1414,7 +1647,7 @@ mod tests {
             signer_c.verifying_key(),
         ];
         assert!(matches!(
-            seal.verify_quorum_threshold(&keys, 2),
+            seal.verify_quorum_threshold(&keys, 2, "apm2.test.v1", &subject_hash, false),
             Err(AuthoritySealError::ThresholdNotMet {
                 valid_sigs: 1,
                 threshold: 2
@@ -1467,6 +1700,7 @@ mod tests {
             subject_kind.clone(),
             batch_root,
             ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::MerkleBatch,
             vec![vec![0u8; 64]],
         )
@@ -1481,14 +1715,22 @@ mod tests {
             subject_kind,
             batch_root,
             ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::MerkleBatch,
             vec![signature.to_bytes().to_vec()],
         )
         .unwrap();
 
         assert!(
-            seal.verify_merkle_batch(&signer.verifying_key(), &receipt_hash, &inclusion_proof)
-                .is_ok()
+            seal.verify_merkle_batch(
+                &signer.verifying_key(),
+                &receipt_hash,
+                &inclusion_proof,
+                "apm2.receipt_batch.v1",
+                &batch_root,
+                false,
+            )
+            .is_ok()
         );
     }
 
@@ -1515,6 +1757,7 @@ mod tests {
             subject_kind.clone(),
             batch_root,
             ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::MerkleBatch,
             vec![vec![0u8; 64]],
         )
@@ -1529,6 +1772,7 @@ mod tests {
             subject_kind,
             batch_root,
             ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::MerkleBatch,
             vec![signature.to_bytes().to_vec()],
         )
@@ -1537,7 +1781,14 @@ mod tests {
         // Verify with a hash NOT in the batch.
         let wrong_hash = [0xFF; HASH_SIZE];
         assert!(matches!(
-            seal.verify_merkle_batch(&signer.verifying_key(), &wrong_hash, &inclusion_proof),
+            seal.verify_merkle_batch(
+                &signer.verifying_key(),
+                &wrong_hash,
+                &inclusion_proof,
+                "apm2.receipt_batch.v1",
+                &batch_root,
+                false,
+            ),
             Err(AuthoritySealError::MerkleProofFailed { .. })
         ));
     }
@@ -1578,6 +1829,7 @@ mod tests {
             SubjectKind::new("apm2.tool_execution_receipt.v1").unwrap(),
             subject_hash,
             ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::SingleSig,
             vec![vec![0u8; 64]],
         )
@@ -1589,6 +1841,7 @@ mod tests {
             SubjectKind::new("apm2.directory_head.v1").unwrap(),
             subject_hash,
             ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::SingleSig,
             vec![vec![0u8; 64]],
         )
@@ -1615,6 +1868,7 @@ mod tests {
             subject_kind.clone(),
             subject_hash,
             ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::QuorumMultisig,
             vec![vec![0u8; 64]],
         )
@@ -1626,6 +1880,7 @@ mod tests {
             subject_kind,
             subject_hash,
             ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::QuorumThreshold,
             vec![vec![0u8; 64]],
         )
@@ -1652,6 +1907,7 @@ mod tests {
             subject_kind.clone(),
             subject_hash,
             LedgerAnchorV1::ConsensusIndex { index: 1 },
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::SingleSig,
             vec![vec![0u8; 64]],
         )
@@ -1663,6 +1919,7 @@ mod tests {
             subject_kind,
             subject_hash,
             LedgerAnchorV1::ConsensusIndex { index: 2 },
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::SingleSig,
             vec![vec![0u8; 64]],
         )
@@ -1721,6 +1978,7 @@ mod tests {
             subject_kind,
             [0; HASH_SIZE],
             LedgerAnchorV1::ConsensusIndex { index: 1 },
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::MerkleBatch,
             vec![], // unsigned!
         );
@@ -1770,7 +2028,7 @@ mod tests {
     // ──────────
 
     /// Helper: build a quorum-issued `MERKLE_BATCH` seal with 2 signers.
-    /// Returns (seal, keys, receipt hash, inclusion proof).
+    /// Returns (seal, keys, receipt hash, inclusion proof, `batch_root`).
     fn make_quorum_merkle_batch_seal(
         signer_a: &Signer,
         signer_b: &Signer,
@@ -1780,6 +2038,7 @@ mod tests {
         [ed25519_dalek::VerifyingKey; 2],
         Hash,
         MerkleInclusionProof,
+        Hash,
     ) {
         let cell_id = test_cell_id();
         let member_a =
@@ -1811,6 +2070,7 @@ mod tests {
             subject_kind.clone(),
             batch_root,
             ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::MerkleBatch,
             vec![vec![0u8; 64], vec![0u8; 64]],
         )
@@ -1830,13 +2090,14 @@ mod tests {
             subject_kind,
             batch_root,
             ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::MerkleBatch,
             vec![sig_a.to_bytes().to_vec(), sig_b],
         )
         .unwrap();
 
         let keys = [signer_a.verifying_key(), signer_b.verifying_key()];
-        (seal, keys, receipt_hash, inclusion_proof)
+        (seal, keys, receipt_hash, inclusion_proof, batch_root)
     }
 
     /// SECURITY REGRESSION: quorum-issued `MERKLE_BATCH` with only 1 valid
@@ -1845,13 +2106,19 @@ mod tests {
     fn merkle_batch_quorum_issuer_rejected_by_single_key_verify() {
         let signer_a = Signer::generate();
         let signer_b = Signer::generate();
-        let (seal, _keys, receipt_hash, inclusion_proof) =
+        let (seal, _keys, receipt_hash, inclusion_proof, batch_root) =
             make_quorum_merkle_batch_seal(&signer_a, &signer_b, true);
 
         // Attempting to use the single-key verification method on a
         // quorum-issued MERKLE_BATCH seal must fail.
-        let result =
-            seal.verify_merkle_batch(&signer_a.verifying_key(), &receipt_hash, &inclusion_proof);
+        let result = seal.verify_merkle_batch(
+            &signer_a.verifying_key(),
+            &receipt_hash,
+            &inclusion_proof,
+            "apm2.receipt_batch.v1",
+            &batch_root,
+            false,
+        );
         assert!(
             result.is_err(),
             "verify_merkle_batch must reject quorum-issued MERKLE_BATCH seals"
@@ -1865,11 +2132,17 @@ mod tests {
         let signer_a = Signer::generate();
         let signer_b = Signer::generate();
         // sign_both=false: only signer_a signs, signer_b's sig is invalid.
-        let (seal, keys, receipt_hash, inclusion_proof) =
+        let (seal, keys, receipt_hash, inclusion_proof, batch_root) =
             make_quorum_merkle_batch_seal(&signer_a, &signer_b, false);
 
-        let result =
-            seal.verify_merkle_batch_quorum_multisig(&keys, &receipt_hash, &inclusion_proof);
+        let result = seal.verify_merkle_batch_quorum_multisig(
+            &keys,
+            &receipt_hash,
+            &inclusion_proof,
+            "apm2.receipt_batch.v1",
+            &batch_root,
+            false,
+        );
         assert!(
             matches!(
                 result,
@@ -1884,11 +2157,17 @@ mod tests {
     fn merkle_batch_quorum_multisig_accepts_all_valid_sigs() {
         let signer_a = Signer::generate();
         let signer_b = Signer::generate();
-        let (seal, keys, receipt_hash, inclusion_proof) =
+        let (seal, keys, receipt_hash, inclusion_proof, batch_root) =
             make_quorum_merkle_batch_seal(&signer_a, &signer_b, true);
 
-        let result =
-            seal.verify_merkle_batch_quorum_multisig(&keys, &receipt_hash, &inclusion_proof);
+        let result = seal.verify_merkle_batch_quorum_multisig(
+            &keys,
+            &receipt_hash,
+            &inclusion_proof,
+            "apm2.receipt_batch.v1",
+            &batch_root,
+            false,
+        );
         assert!(
             result.is_ok(),
             "Quorum multisig MERKLE_BATCH must accept when all sigs are valid"
@@ -1934,6 +2213,7 @@ mod tests {
             subject_kind.clone(),
             batch_root,
             ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::MerkleBatch,
             vec![vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]],
         )
@@ -1949,6 +2229,7 @@ mod tests {
             subject_kind,
             batch_root,
             ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::MerkleBatch,
             vec![sig_a.to_bytes().to_vec(), vec![0u8; 64], vec![0u8; 64]],
         )
@@ -1960,8 +2241,15 @@ mod tests {
             signer_c.verifying_key(),
         ];
 
-        let result =
-            seal.verify_merkle_batch_quorum_threshold(&keys, 2, &receipt_hash, &inclusion_proof);
+        let result = seal.verify_merkle_batch_quorum_threshold(
+            &keys,
+            2,
+            &receipt_hash,
+            &inclusion_proof,
+            "apm2.receipt_batch.v1",
+            &batch_root,
+            false,
+        );
         assert!(
             matches!(
                 result,
@@ -2013,6 +2301,7 @@ mod tests {
             subject_kind.clone(),
             batch_root,
             ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::MerkleBatch,
             vec![vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]],
         )
@@ -2029,6 +2318,7 @@ mod tests {
             subject_kind,
             batch_root,
             ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::MerkleBatch,
             vec![
                 sig_a.to_bytes().to_vec(),
@@ -2044,8 +2334,15 @@ mod tests {
             signer_c.verifying_key(),
         ];
 
-        let result =
-            seal.verify_merkle_batch_quorum_threshold(&keys, 2, &receipt_hash, &inclusion_proof);
+        let result = seal.verify_merkle_batch_quorum_threshold(
+            &keys,
+            2,
+            &receipt_hash,
+            &inclusion_proof,
+            "apm2.receipt_batch.v1",
+            &batch_root,
+            false,
+        );
         assert!(
             result.is_ok(),
             "Quorum threshold MERKLE_BATCH must accept when threshold is met"
@@ -2057,7 +2354,7 @@ mod tests {
     fn merkle_batch_quorum_multisig_rejects_key_count_mismatch() {
         let signer_a = Signer::generate();
         let signer_b = Signer::generate();
-        let (seal, _keys, receipt_hash, inclusion_proof) =
+        let (seal, _keys, receipt_hash, inclusion_proof, batch_root) =
             make_quorum_merkle_batch_seal(&signer_a, &signer_b, true);
 
         // Provide only 1 key for a 2-sig seal.
@@ -2065,6 +2362,9 @@ mod tests {
             &[signer_a.verifying_key()],
             &receipt_hash,
             &inclusion_proof,
+            "apm2.receipt_batch.v1",
+            &batch_root,
+            false,
         );
         assert!(
             matches!(
@@ -2097,6 +2397,7 @@ mod tests {
             subject_kind.clone(),
             batch_root,
             ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::MerkleBatch,
             vec![vec![0u8; 64]],
         )
@@ -2111,6 +2412,7 @@ mod tests {
             subject_kind,
             batch_root,
             ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
             SealKind::MerkleBatch,
             vec![signature.to_bytes().to_vec()],
         )
@@ -2121,6 +2423,9 @@ mod tests {
             &[signer.verifying_key()],
             &receipt_hash,
             &inclusion_proof,
+            "apm2.receipt_batch.v1",
+            &batch_root,
+            false,
         );
         assert!(
             result.is_err(),
@@ -2133,10 +2438,185 @@ mod tests {
             1,
             &receipt_hash,
             &inclusion_proof,
+            "apm2.receipt_batch.v1",
+            &batch_root,
+            false,
         );
         assert!(
             result.is_err(),
             "verify_merkle_batch_quorum_threshold must reject single-key issuers"
+        );
+    }
+
+    // ────────── Temporal authority binding tests ──────────
+
+    /// Tier2+ seal with zero `time_envelope_ref` MUST be rejected.
+    #[test]
+    fn test_tier2_seal_rejects_zero_time_envelope_ref() {
+        let signer = Signer::generate();
+        let seal = make_single_sig_seal(&signer);
+
+        // Verify with require_temporal=true should fail because
+        // make_single_sig_seal uses ZERO_TIME_ENVELOPE_REF.
+        let result = seal.verify_single_sig(
+            &signer.verifying_key(),
+            TEST_SUBJECT_KIND,
+            &[0x42; HASH_SIZE],
+            true, // require temporal authority
+        );
+        assert!(
+            matches!(result, Err(AuthoritySealError::TemporalAuthorityRequired)),
+            "Tier2+ seal with zero time_envelope_ref must be rejected"
+        );
+    }
+
+    /// Changing `time_envelope_ref` MUST produce a different preimage hash.
+    #[test]
+    fn test_time_envelope_ref_included_in_preimage() {
+        let cell_id = test_cell_id();
+        let pkid = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0x01; 32]);
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+        let subject_hash = [0x42; HASH_SIZE];
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 1 };
+
+        let seal_zero = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::PublicKey(pkid.clone()),
+            subject_kind.clone(),
+            subject_hash,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::SingleSig,
+            vec![vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let seal_nonzero = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::PublicKey(pkid),
+            subject_kind,
+            subject_hash,
+            ledger_anchor,
+            [0xAB; 32],
+            SealKind::SingleSig,
+            vec![vec![0u8; 64]],
+        )
+        .unwrap();
+
+        assert_ne!(
+            seal_zero.domain_separated_preimage(),
+            seal_nonzero.domain_separated_preimage(),
+            "Different time_envelope_ref values must produce different preimages"
+        );
+    }
+
+    /// `time_envelope_ref` MUST survive canonical bytes round-trip.
+    #[test]
+    fn test_time_envelope_ref_in_canonical_bytes() {
+        let cell_id = test_cell_id();
+        let pkid = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0x01; 32]);
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+        let subject_hash = [0x42; HASH_SIZE];
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 1 };
+        let time_ref = [0xCD; 32];
+
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::PublicKey(pkid),
+            subject_kind,
+            subject_hash,
+            ledger_anchor,
+            time_ref,
+            SealKind::SingleSig,
+            vec![vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let bytes = seal.canonical_bytes();
+        // Verify time_envelope_ref is present in the canonical bytes.
+        // It appears after subject_hash and ledger_anchor_canonical_bytes.
+        assert!(
+            bytes.windows(32).any(|w| w == time_ref),
+            "time_envelope_ref must be present in canonical bytes"
+        );
+
+        // Verify accessor returns correct value.
+        assert_eq!(
+            seal.time_envelope_ref(),
+            &time_ref,
+            "time_envelope_ref accessor must return stored value"
+        );
+    }
+
+    // ────────── Subject kind/hash mismatch tests ──────────
+
+    /// Verification must reject subject kind mismatch.
+    #[test]
+    fn test_verify_rejects_subject_kind_mismatch() {
+        let signer = Signer::generate();
+        let seal = make_single_sig_seal(&signer);
+
+        let result = seal.verify_single_sig(
+            &signer.verifying_key(),
+            "apm2.wrong_kind.v1", // wrong kind
+            &[0x42; HASH_SIZE],
+            false,
+        );
+        assert!(
+            matches!(result, Err(AuthoritySealError::SubjectKindMismatch { .. })),
+            "Verification must reject subject kind mismatch"
+        );
+    }
+
+    /// Verification must reject subject hash mismatch.
+    #[test]
+    fn test_verify_rejects_subject_hash_mismatch() {
+        let signer = Signer::generate();
+        let seal = make_single_sig_seal(&signer);
+
+        let result = seal.verify_single_sig(
+            &signer.verifying_key(),
+            TEST_SUBJECT_KIND,
+            &[0xFF; HASH_SIZE], // wrong hash
+            false,
+        );
+        assert!(
+            matches!(result, Err(AuthoritySealError::SubjectHashMismatch)),
+            "Verification must reject subject hash mismatch"
+        );
+    }
+
+    // ────────── MERKLE_BATCH single-key rejects multiple signatures ──────────
+
+    /// Single-key `MERKLE_BATCH` with 2 signatures MUST be rejected at
+    /// construction.
+    #[test]
+    fn merkle_batch_single_key_rejects_multiple_signatures() {
+        let cell_id = test_cell_id();
+        let pkid = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0x01; 32]);
+        let subject_kind = SubjectKind::new("apm2.receipt_batch.v1").unwrap();
+
+        let result = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::PublicKey(pkid),
+            subject_kind,
+            [0; HASH_SIZE],
+            LedgerAnchorV1::ConsensusIndex { index: 1 },
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::MerkleBatch,
+            vec![vec![0u8; 64], vec![0u8; 64]], // 2 sigs for single key
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(AuthoritySealError::InvalidQuorumSignatureCount {
+                    count: 2,
+                    min: 1,
+                    max: 1,
+                })
+            ),
+            "Single-key MERKLE_BATCH must reject more than 1 signature"
         );
     }
 }
