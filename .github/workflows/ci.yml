@@ -316,6 +316,18 @@ jobs:
       - name: Validate review artifact integrity
         run: ./scripts/ci/review_artifact_lint.sh
 
+  # Direct status-write command drift guard (TCK-00411)
+  # Fails closed if prompt/xtask assets reintroduce `gh api ... /statuses/...`
+  status-write-command-lint:
+    name: Status Write Command Lint
+    if: github.event_name != 'issue_comment'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Validate status-write command contract
+        run: ./scripts/lint/no_direct_status_write_commands.sh
+
   # Release build check
   build:
     name: Release Build
