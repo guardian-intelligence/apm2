@@ -6010,10 +6010,12 @@ impl PrivilegedDispatcher {
                 ));
             }
         } else {
-            // Rollout waiver WVR-0003: policy does not yet bind a specific
-            // adapter profile hash. CAS-existence + caller authorization
-            // (established upstream) is the current trust basis. This branch
-            // will be removed once governance populates the binding.
+            // WVR-0003: Policy-level adapter profile binding is not yet
+            // populated by governance resolution. Once governance populates
+            // expected_adapter_profile_hash in PolicyResolution, this branch
+            // will be removed and mismatches will be hard-rejected.
+            // Accepted risk: CAS-existence serves as the authorization check
+            // until governance wiring is complete.
             tracing::debug!(
                 work_id = %claim.work_id,
                 resolved_hash = %hex::encode(resolved_hash),

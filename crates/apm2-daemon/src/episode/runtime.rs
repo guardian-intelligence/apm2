@@ -1502,6 +1502,43 @@ impl EpisodeRuntime {
                     ),
                 });
             }
+            // SECURITY: Atomic check-and-set under write lock. A concurrent
+            // spawn_adapter caller may have won the race between our read-lock
+            // admission check and this write-lock commit. Re-check under the
+            // write lock to prevent overwriting a live handle, which would
+            // orphan the first caller's process.
+            if entry.harness_handle.is_some() {
+                warn!(
+                    episode_id = %episode_id,
+                    "concurrent spawn_adapter won the race; \
+                     terminating duplicate adapter process"
+                );
+                drop(episodes);
+                if let Err(e) = adapter.terminate(&handle).await {
+                    warn!(
+                        episode_id = %episode_id,
+                        error = %e,
+                        "failed to terminate duplicate adapter process; \
+                         escalating to SIGKILL"
+                    );
+                    if let Err(kill_err) = crate::episode::adapter::escalate_sigkill(&handle).await
+                    {
+                        error!(
+                            episode_id = %episode_id,
+                            error = %kill_err,
+                            "SIGKILL escalation failed for duplicate adapter process; \
+                             retaining handle in orphan tracker"
+                        );
+                        self.orphan_harness_handles.lock().await.push(handle);
+                    }
+                }
+                return Err(EpisodeError::Internal {
+                    message: format!(
+                        "episode {episode_id} already has an active harness handle; \
+                         concurrent spawn_adapter won the race"
+                    ),
+                });
+            }
             entry.harness_handle = Some(handle);
         }
 
@@ -1625,6 +1662,14 @@ impl EpisodeRuntime {
         // 5. Kill subprocess (outside lock)
         // 6. On kill success: re-acquire lock, commit Terminated state
         // 7. On kill failure: re-acquire lock, restore handle, return error
+        //
+        // NOTE (WVR-0005): Concurrent stop/quarantine callers can both pass
+        // the phase-1 admission check before either commits the terminal
+        // state in phase-3. This is a known limitation of the current
+        // lock-release-reacquire pattern. A future ticket should introduce a
+        // per-episode transition mutex or compare-and-swap guard. The current
+        // behavior is safe (both callers attempt kill, only one state
+        // transition commits) but may produce duplicate kill attempts.
 
         // Phase 1: Validate and prepare (inside lock).
         let (created_at_ns, started_at_ns, envelope_hash, harness_handle_opt) = {
@@ -2022,6 +2067,8 @@ impl EpisodeRuntime {
     ) -> Result<(), EpisodeError> {
         // SECURITY: Fail-closed terminal transition (same pattern as stop).
         // Process death MUST be confirmed before committing terminal state.
+        // See WVR-0005 note on stop() regarding concurrent terminal
+        // transition callers and the lock-release-reacquire pattern.
 
         // Phase 1: Validate and prepare (inside lock).
         let (created_at_ns, started_at_ns, envelope_hash, quarantine_harness_handle) = {
