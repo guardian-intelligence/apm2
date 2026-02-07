@@ -206,6 +206,71 @@ pub const XTASK_STRICT_MODE_ENV: &str = "XTASK_STRICT_MODE";
 pub const XTASK_ALLOW_STATUS_WRITES_ENV: &str = "XTASK_ALLOW_STATUS_WRITES";
 
 // =============================================================================
+// Cutover Policy Propagation (TCK-00408)
+// =============================================================================
+
+/// Name of the environment variable propagating cutover policy to child
+/// processes.
+///
+/// Per TCK-00408, when emit-only cutover is active, ALL spawned child processes
+/// (reviewers, executors) MUST inherit the same cutover policy. This
+/// environment variable is set by the parent process and read by child
+/// processes to enforce consistent behavior.
+///
+/// Value: `"emit_only"` | `"legacy"` (default: `"legacy"`)
+pub const XTASK_CUTOVER_POLICY_ENV: &str = "XTASK_CUTOVER_POLICY";
+
+/// Returns the effective cutover policy from environment.
+///
+/// Per TCK-00408, this checks both the explicit policy env var and the
+/// emit-receipt-only flag. If either indicates emit-only mode, the policy
+/// is emit-only.
+pub fn effective_cutover_policy() -> CutoverPolicy {
+    // Explicit policy propagation takes precedence
+    if let Ok(policy) = std::env::var(XTASK_CUTOVER_POLICY_ENV) {
+        if policy == "emit_only" {
+            return CutoverPolicy::EmitOnly;
+        }
+    }
+    // Fall back to legacy emit-receipt-only flag
+    if emit_receipt_only_from_env() {
+        return CutoverPolicy::EmitOnly;
+    }
+    CutoverPolicy::Legacy
+}
+
+/// Cutover policy governing side-effect behavior.
+///
+/// Per TCK-00408, this enum determines whether xtask commands perform direct
+/// GitHub writes or emit receipts only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutoverPolicy {
+    /// Legacy mode: direct writes allowed (being phased out).
+    Legacy,
+    /// Emit-only mode: no direct GitHub writes; emit receipts only.
+    /// Child processes MUST inherit this policy.
+    EmitOnly,
+}
+
+impl CutoverPolicy {
+    /// Returns true if direct GitHub writes are forbidden under this policy.
+    #[must_use]
+    pub const fn is_emit_only(self) -> bool {
+        matches!(self, Self::EmitOnly)
+    }
+
+    /// Returns the environment variable value to propagate this policy to
+    /// child processes.
+    #[must_use]
+    pub const fn env_value(self) -> &'static str {
+        match self {
+            Self::EmitOnly => "emit_only",
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
+// =============================================================================
 // Cutover Stage 1 Feature Flags (TCK-00324)
 // =============================================================================
 
@@ -479,6 +544,53 @@ pub fn emit_projection_request_receipt(
         event_payload.to_string().as_bytes(),
         correlation_id,
     )
+}
+
+// =============================================================================
+// Durable Projection Acknowledgement (TCK-00408)
+// =============================================================================
+
+/// Emits a projection request receipt and requires a durable acknowledgement.
+///
+/// Per TCK-00408, emit-only mode operations MUST NOT report success unless
+/// the projection layer returns a durable receipt/event ID. This function
+/// wraps `emit_projection_request_receipt` and fails closed when no
+/// acknowledgement is returned.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The receipt emission itself fails
+/// - No durable acknowledgement (event ID) is returned from the projection
+///   layer
+pub fn emit_projection_receipt_with_ack(
+    operation: &str,
+    owner_repo: &str,
+    target_ref: &str,
+    payload: &str,
+    correlation_id: &str,
+) -> Result<String> {
+    match emit_projection_request_receipt(
+        operation,
+        owner_repo,
+        target_ref,
+        payload,
+        correlation_id,
+    ) {
+        Ok(Some(event_id)) => {
+            eprintln!("  [TCK-00408] Durable projection acknowledgement received: {event_id}");
+            Ok(event_id)
+        },
+        Ok(None) => {
+            // TCK-00408: Fail closed — emit-only mode requires durable ack
+            bail!(
+                "TCK-00408: emit-only mode requires durable projection acknowledgement, \
+                 but the projection layer returned no event ID for operation '{operation}'. \
+                 The side-effect has NOT been confirmed."
+            )
+        },
+        Err(e) => Err(e),
+    }
 }
 
 // =============================================================================
@@ -1341,6 +1453,97 @@ mod tests {
         assert!(
             EMIT_RECEIPT_ONLY_MESSAGE.contains("allow-github-write"),
             "Message must mention allow-github-write override"
+        );
+    }
+
+    // =============================================================================
+    // Cutover Policy Tests (TCK-00408)
+    // =============================================================================
+
+    #[test]
+    fn test_cutover_policy_is_emit_only() {
+        assert!(CutoverPolicy::EmitOnly.is_emit_only());
+        assert!(!CutoverPolicy::Legacy.is_emit_only());
+    }
+
+    #[test]
+    fn test_cutover_policy_env_value() {
+        assert_eq!(CutoverPolicy::EmitOnly.env_value(), "emit_only");
+        assert_eq!(CutoverPolicy::Legacy.env_value(), "legacy");
+    }
+
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_effective_cutover_policy_default_is_legacy() {
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+        }
+        assert_eq!(
+            effective_cutover_policy(),
+            CutoverPolicy::Legacy,
+            "Default cutover policy should be Legacy"
+        );
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_effective_cutover_policy_explicit_emit_only() {
+        unsafe {
+            std::env::set_var(XTASK_CUTOVER_POLICY_ENV, "emit_only");
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+        }
+        assert_eq!(
+            effective_cutover_policy(),
+            CutoverPolicy::EmitOnly,
+            "Explicit emit_only policy should be EmitOnly"
+        );
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_effective_cutover_policy_inherit_from_receipt_only() {
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+            std::env::set_var(XTASK_EMIT_RECEIPT_ONLY_ENV, "true");
+        }
+        assert_eq!(
+            effective_cutover_policy(),
+            CutoverPolicy::EmitOnly,
+            "XTASK_EMIT_RECEIPT_ONLY=true should infer EmitOnly policy"
+        );
+        unsafe {
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+        }
+    }
+
+    /// TCK-00408: Durable acknowledgement fails closed when daemon unavailable.
+    #[test]
+    fn test_emit_projection_receipt_with_ack_fails_closed() {
+        let result = emit_projection_receipt_with_ack(
+            "test_op",
+            "owner/repo",
+            "abc123",
+            r#"{"test": true}"#,
+            "test-correlation",
+        );
+        assert!(
+            result.is_err(),
+            "emit_projection_receipt_with_ack must fail closed when no durable ack is returned"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("TCK-00408"),
+            "Error must reference TCK-00408"
         );
     }
 }

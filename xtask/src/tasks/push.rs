@@ -145,26 +145,35 @@ pub fn run(emit_receipt_only: bool, allow_github_write: bool) -> Result<()> {
         url.trim().to_string()
     };
 
+    // TCK-00408: Check effective cutover policy before any further GitHub writes.
+    let cutover = crate::util::effective_cutover_policy();
+
     // Enable auto-merge if available
     println!("\nEnabling auto-merge...");
-    let auto_merge_result = cmd!(sh, "gh pr merge --auto --squash {branch_name}")
-        .ignore_status()
-        .read();
+    if cutover.is_emit_only() {
+        println!(
+            "  [TCK-00408] Emit-only cutover active — skipping auto-merge (direct GitHub write)."
+        );
+    } else {
+        let auto_merge_result = cmd!(sh, "gh pr merge --auto --squash {branch_name}")
+            .ignore_status()
+            .read();
 
-    match auto_merge_result {
-        Ok(output) => {
-            if output.contains("auto-merge")
-                || output.contains("enabled")
-                || output.trim().is_empty()
-            {
-                println!("  Auto-merge enabled (will merge when checks pass).");
-            } else {
-                println!("  Auto-merge response: {}", output.trim());
-            }
-        },
-        Err(_) => {
-            println!("  Note: Auto-merge not available (may require branch protection rules).");
-        },
+        match auto_merge_result {
+            Ok(output) => {
+                if output.contains("auto-merge")
+                    || output.contains("enabled")
+                    || output.trim().is_empty()
+                {
+                    println!("  Auto-merge enabled (will merge when checks pass).");
+                } else {
+                    println!("  Auto-merge response: {}", output.trim());
+                }
+            },
+            Err(_) => {
+                println!("  Note: Auto-merge not available (may require branch protection rules).");
+            },
+        }
     }
 
     // Trigger AI reviews

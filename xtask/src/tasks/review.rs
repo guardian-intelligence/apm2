@@ -320,11 +320,30 @@ fn run_uat_signoff(
         ---\n\
         *Signed off via `cargo xtask review uat`*";
 
-    cmd!(sh, "gh pr comment {pr_url} --body {comment_body}")
-        .run()
-        .context("Failed to post UAT comment")?;
-
-    println!("  Comment posted.");
+    // TCK-00408: Check effective cutover policy. When emit-only is active,
+    // even informational comments must go through the projection layer.
+    let cutover = crate::util::effective_cutover_policy();
+    if cutover.is_emit_only() {
+        println!("  [TCK-00408] Emit-only cutover active — skipping direct GitHub comment.");
+        let payload = serde_json::json!({
+            "operation": "pr_comment",
+            "pr_url": pr_url,
+            "body": comment_body,
+        });
+        let correlation_id = format!("uat-comment-{head_sha}");
+        crate::util::emit_projection_receipt_with_ack(
+            "pr_comment",
+            owner_repo,
+            head_sha,
+            &payload.to_string(),
+            &correlation_id,
+        )?;
+    } else {
+        cmd!(sh, "gh pr comment {pr_url} --body {comment_body}")
+            .run()
+            .context("Failed to post UAT comment")?;
+        println!("  Comment posted.");
+    }
 
     println!("\nUAT review complete!");
     println!("  [TCK-00297] Direct status update removed. Comment posted only.");
