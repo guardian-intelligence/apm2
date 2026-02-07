@@ -29,9 +29,8 @@ use apm2_core::supervisor::Supervisor;
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use tokio::sync::RwLock;
-use tracing::warn;
 
-use crate::cas::{DurableCas, DurableCasConfig};
+use crate::cas::{DurableCas, DurableCasConfig, DurableCasError};
 use crate::episode::capability::{InMemoryCasManifestLoader, StubManifestLoader};
 use crate::episode::executor::ContentAddressedStore;
 use crate::episode::handlers::{
@@ -618,24 +617,15 @@ impl DispatcherState {
             // TCK-00400: Store all builtin adapter profiles in CAS at startup.
             let profile_hashes = seed_builtin_profiles_in_cas(cas.as_ref())
                 .expect("builtin adapter profile CAS seeding should succeed");
+            // Fail-closed: invalid adapter rotation config must prevent
+            // startup rather than silently falling back to defaults.
             let (adapter_selection_policy, available_profile_hashes) =
                 build_adapter_selection_policy(
                     adapter_rotation,
                     &profile_hashes,
                     &adapter_registry,
                 )
-                .unwrap_or_else(|error| {
-                    warn!(
-                        error = %error,
-                        "Invalid daemon.adapter_rotation config; falling back to defaults"
-                    );
-                    build_adapter_selection_policy(
-                        &AdapterRotationConfig::default(),
-                        &profile_hashes,
-                        &adapter_registry,
-                    )
-                    .expect("default adapter rotation policy should be valid")
-                });
+                .expect("daemon.adapter_rotation config must be valid at startup");
             let adapter_registry = Arc::new(adapter_registry);
 
             PrivilegedDispatcher::with_dependencies(
@@ -950,20 +940,11 @@ impl DispatcherState {
         // TCK-00400: Store all builtin adapter profiles in CAS at startup.
         let profile_hashes = seed_builtin_profiles_in_cas(evidence_cas.as_ref())
             .expect("builtin adapter profile CAS seeding should succeed");
+        // Fail-closed: invalid adapter rotation config must prevent startup
+        // rather than silently falling back to defaults (propagate error).
         let (adapter_selection_policy, available_profile_hashes) =
             build_adapter_selection_policy(&adapter_rotation, &profile_hashes, &adapter_registry)
-                .unwrap_or_else(|error| {
-                    warn!(
-                        error = %error,
-                        "Invalid daemon.adapter_rotation config; falling back to defaults"
-                    );
-                    build_adapter_selection_policy(
-                        &AdapterRotationConfig::default(),
-                        &profile_hashes,
-                        &adapter_registry,
-                    )
-                    .expect("default adapter rotation policy should be valid")
-                });
+                .map_err(|error| DurableCasError::InitializationFailed { message: error })?;
         let adapter_registry = Arc::new(adapter_registry);
         let episode_runtime = episode_runtime.with_adapter_registry(Arc::clone(&adapter_registry));
 

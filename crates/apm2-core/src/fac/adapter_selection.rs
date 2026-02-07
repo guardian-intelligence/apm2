@@ -70,10 +70,19 @@ impl ProfileWeight {
 
     fn clear_expired_backoff(&mut self, now_secs: u64, backoff_secs: u64) {
         if self.is_in_backoff(now_secs, backoff_secs) {
+            // Still in active backoff window — keep failure state.
             return;
         }
-        self.last_failure_at = None;
-        self.failure_count = 0;
+        // Only reset failure_count when a previous backoff has actually expired
+        // (i.e., last_failure_at was set but the window has elapsed). When
+        // last_failure_at is None, the counter must continue to accumulate so
+        // FAILURE_BACKOFF_THRESHOLD can be reached across selection cycles.
+        if self.last_failure_at.is_some() {
+            // Backoff window has expired — clear state so the profile is
+            // eligible again.
+            self.last_failure_at = None;
+            self.failure_count = 0;
+        }
     }
 }
 
@@ -358,6 +367,11 @@ impl AdapterSelectionPolicy {
 
     /// Compute eligibility snapshots, eligible entries, and fallback
     /// candidates.
+    ///
+    /// Fallback candidates are profiles that are enabled and adapter-available,
+    /// regardless of backoff state. This ensures the fallback path can always
+    /// select a profile even when all weighted profiles are in backoff
+    /// (selecting the one with the highest fallback priority).
     fn compute_eligibility(
         &self,
         now_secs: u64,
@@ -376,11 +390,16 @@ impl AdapterSelectionPolicy {
                 0
             };
 
-            if entry.enabled && is_available && !is_rate_limited {
+            if entry.enabled && is_available && !is_rate_limited && effective_weight > 0 {
+                eligible.push((index, effective_weight));
+            }
+
+            // Fallback candidates include ALL enabled+available profiles,
+            // even those in backoff. When every profile is rate-limited,
+            // fallback picks the highest-priority one rather than returning
+            // NoEligibleProfile.
+            if entry.enabled && is_available {
                 fallback_candidates.push(index);
-                if effective_weight > 0 {
-                    eligible.push((index, effective_weight));
-                }
             }
 
             snapshots.push(SelectionWeightSnapshot {
@@ -752,6 +771,132 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("at least one profile must be enabled")
+        );
+    }
+
+    #[test]
+    fn fallback_selects_profile_when_all_in_backoff() {
+        let mut policy = sample_policy();
+        let available = BTreeSet::from([hash(0x11), hash(0x22)]);
+
+        // Put ALL profiles into backoff.
+        policy
+            .record_failure(&hash(0x11), 60_000, true)
+            .expect("profile should exist");
+        policy
+            .record_failure(&hash(0x22), 60_000, true)
+            .expect("profile should exist");
+
+        // Selection must still succeed via fallback, choosing the
+        // highest-priority profile even though it is rate-limited.
+        let decision = policy
+            .select_profile_at("W-ALL-BACKOFF-001", 0, 60_001, &available)
+            .expect("fallback must succeed when all profiles are in backoff");
+
+        assert!(
+            decision.used_fallback,
+            "must use fallback when all weighted profiles are in backoff"
+        );
+        // Primary has fallback_priority 0 (highest).
+        assert_eq!(
+            decision.selected_profile_hash,
+            hash(0x11),
+            "fallback must pick the profile with highest priority"
+        );
+    }
+
+    #[test]
+    fn failure_count_accumulates_across_selections_for_non_rate_limit_failures() {
+        let mut policy = sample_policy();
+        let available = BTreeSet::from([hash(0x11), hash(0x22)]);
+
+        // Record a non-rate-limit failure (failure_count = 1, below threshold).
+        policy
+            .record_failure(&hash(0x11), 70_000, false)
+            .expect("profile should exist");
+
+        // Selection should succeed and primary should still be eligible
+        // (failure_count=1 < FAILURE_BACKOFF_THRESHOLD=2, no backoff set).
+        let decision = policy
+            .select_profile_at("W-ACCUM-001", 0, 70_001, &available)
+            .expect("selection should succeed");
+
+        // Verify primary is still eligible (failure_count was NOT reset).
+        let primary_snap = decision
+            .selection_weights
+            .iter()
+            .find(|s| s.profile_id == "primary")
+            .expect("primary snapshot must exist");
+        assert!(
+            !primary_snap.rate_limited,
+            "primary should not be rate-limited after 1 failure"
+        );
+
+        // Record a second non-rate-limit failure (failure_count = 2, meets threshold).
+        policy
+            .record_failure(&hash(0x11), 70_002, false)
+            .expect("profile should exist");
+
+        // Now primary should be in backoff because threshold was reached.
+        let decision2 = policy
+            .select_profile_at("W-ACCUM-002", 0, 70_003, &available)
+            .expect("selection should succeed");
+        let primary_snap2 = decision2
+            .selection_weights
+            .iter()
+            .find(|s| s.profile_id == "primary")
+            .expect("primary snapshot must exist");
+        assert!(
+            primary_snap2.rate_limited,
+            "primary must be in backoff after reaching failure threshold"
+        );
+        assert_eq!(
+            primary_snap2.effective_weight, 0,
+            "primary must have zero effective weight during backoff"
+        );
+    }
+
+    #[test]
+    fn failure_count_resets_only_after_backoff_expires() {
+        let mut policy = sample_policy();
+        let available = BTreeSet::from([hash(0x11), hash(0x22)]);
+
+        // Trigger backoff for primary via threshold.
+        policy
+            .record_failure(&hash(0x11), 80_000, false)
+            .expect("profile should exist");
+        policy
+            .record_failure(&hash(0x11), 80_001, false)
+            .expect("profile should exist");
+
+        // During backoff window, primary is rate-limited.
+        let decision = policy
+            .select_profile_at("W-EXPIRE-001", 0, 80_100, &available)
+            .expect("selection should succeed");
+        let snap = decision
+            .selection_weights
+            .iter()
+            .find(|s| s.profile_id == "primary")
+            .expect("primary snapshot must exist");
+        assert!(snap.rate_limited, "primary must be in backoff");
+
+        // After backoff expires (300s window), failure state resets and
+        // primary regains eligibility.
+        let recovered = policy
+            .select_profile_at("W-EXPIRE-001", 0, 80_500, &available)
+            .expect("selection should succeed");
+        let snap_recovered = recovered
+            .selection_weights
+            .iter()
+            .find(|s| s.profile_id == "primary")
+            .expect("primary snapshot must exist");
+        assert!(
+            !snap_recovered.rate_limited,
+            "primary must recover after backoff expires"
+        );
+        assert!(
+            snap_recovered.effective_weight > 0,
+            "primary must regain positive weight after backoff expires"
         );
     }
 }
