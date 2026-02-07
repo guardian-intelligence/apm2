@@ -124,7 +124,7 @@ pub use certificate::{
 pub use holon_id::{HolonGenesisV1, HolonIdV1, HolonPurpose};
 pub use keyset_id::{KeySetIdV1, SetTag};
 pub use public_key_id::{AlgorithmTag, PublicKeyIdV1};
-pub use session_delegation::SessionKeyDelegationV1;
+pub use session_delegation::{MAX_SESSION_DELEGATION_TICKS, SessionKeyDelegationV1};
 use thiserror::Error;
 
 /// Maximum length of any canonical text form (bytes).

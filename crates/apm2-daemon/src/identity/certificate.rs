@@ -110,6 +110,15 @@ pub enum CertificateError {
     #[error("signature verification failed")]
     SignatureVerificationFailed,
 
+    /// Session delegation lifetime exceeds the maximum allowed ticks.
+    #[error("delegation lifetime {lifetime_ticks} exceeds maximum of {max_ticks}")]
+    DelegationLifetimeExceeded {
+        /// Actual delegation lifetime in ticks.
+        lifetime_ticks: u64,
+        /// Maximum allowed lifetime in ticks.
+        max_ticks: u64,
+    },
+
     /// Unknown purpose token encountered while parsing.
     #[error("unknown purpose tag: {tag}")]
     UnknownPurposeTag {

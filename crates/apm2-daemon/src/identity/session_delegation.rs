@@ -4,6 +4,22 @@
 //! through a signature from the holon's operational key. Validity uses HTF
 //! references only (`issued_at_envelope_ref`, `expires_at_tick`) and never
 //! wall-clock time.
+//!
+//! # Construction API
+//!
+//! Two constructors are provided with different safety guarantees:
+//!
+//! - [`SessionKeyDelegationV1::new_unchecked`]: Enforces structural and
+//!   cert-independent invariants (key-id binding, validity window, max
+//!   lifetime). Use for deserialization paths where the full certificate
+//!   context is not yet available. **Callers MUST later call
+//!   [`validate_against_holon_certificate`](SessionKeyDelegationV1::validate_against_holon_certificate)
+//!   before trusting the delegation.**
+//!
+//! - [`SessionKeyDelegationV1::new_validated`]: Enforces all invariants
+//!   including authority binding and signature verification against a
+//!   `HolonCertificateV1`. This is the recommended constructor for production
+//!   mint paths.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
@@ -17,6 +33,13 @@ const SESSION_DELEGATION_DOMAIN_SEPARATOR: &[u8] = b"apm2:session_key_delegation
 const ED25519_PUBLIC_KEY_LEN: usize = 32;
 /// Ed25519 signature size.
 const ED25519_SIGNATURE_LEN: usize = 64;
+
+/// Maximum session delegation lifetime in ticks.
+///
+/// Set to 86 400 ticks (approximately one day at 1 tick/second). Delegations
+/// exceeding this window are rejected to bound the blast radius of key
+/// compromise or replay.
+pub const MAX_SESSION_DELEGATION_TICKS: u64 = 86_400;
 
 /// `SessionKeyDelegationV1` binds a session key to a holon via an operational
 /// signing key.
@@ -33,9 +56,27 @@ pub struct SessionKeyDelegationV1 {
 }
 
 impl SessionKeyDelegationV1 {
-    /// Construct a session delegation from validated field values.
+    /// Construct a session delegation enforcing **cert-independent**
+    /// invariants.
+    ///
+    /// This constructor validates:
+    /// - Ed25519 key and signature byte lengths
+    /// - `session_public_key_id` is correctly derived from
+    ///   `session_public_key_bytes`
+    /// - `expires_at_tick > issued_at_envelope_ref` (non-empty validity window)
+    /// - delegation lifetime does not exceed [`MAX_SESSION_DELEGATION_TICKS`]
+    ///
+    /// # Safety contract
+    ///
+    /// This does **not** verify authority binding (issuer key matches a
+    /// certificate) or signature validity. Callers **MUST** subsequently call
+    /// [`validate_against_holon_certificate`](Self::validate_against_holon_certificate)
+    /// before trusting the delegation. This constructor exists for
+    /// deserialization paths where the full certificate context is not yet
+    /// available.
+    #[must_use = "delegation is not fully validated; call validate_against_holon_certificate before trusting"]
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub fn new_unchecked(
         session_public_key_id: PublicKeyIdV1,
         session_public_key_bytes: &[u8],
         holon_id: HolonIdV1,
@@ -45,12 +86,38 @@ impl SessionKeyDelegationV1 {
         signature: &[u8],
         channel_binding: Option<[u8; 32]>,
     ) -> Result<Self, CertificateError> {
+        let session_key_array =
+            copy_ed25519_key("session_public_key_bytes", session_public_key_bytes)?;
+
+        // Verify session key-id is correctly derived from session key bytes.
+        let expected_session_id =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &session_key_array);
+        if expected_session_id != session_public_key_id {
+            return Err(CertificateError::PublicKeyIdMismatch {
+                field: "session_public_key_id",
+            });
+        }
+
+        // Validity window: expires_at_tick must be strictly after issued_at.
+        if expires_at_tick <= issued_at_envelope_ref {
+            return Err(CertificateError::InvalidValidityWindow {
+                issued_at_envelope_ref,
+                expires_at_tick,
+            });
+        }
+
+        // Max delegation lifetime bound.
+        let lifetime = expires_at_tick - issued_at_envelope_ref;
+        if lifetime > MAX_SESSION_DELEGATION_TICKS {
+            return Err(CertificateError::DelegationLifetimeExceeded {
+                lifetime_ticks: lifetime,
+                max_ticks: MAX_SESSION_DELEGATION_TICKS,
+            });
+        }
+
         let delegation = Self {
             session_public_key_id,
-            session_public_key_bytes: copy_ed25519_key(
-                "session_public_key_bytes",
-                session_public_key_bytes,
-            )?,
+            session_public_key_bytes: session_key_array,
             holon_id,
             issuer_operational_public_key_id,
             issued_at_envelope_ref,
@@ -58,6 +125,42 @@ impl SessionKeyDelegationV1 {
             signature: copy_signature(signature)?,
             channel_binding,
         };
+        Ok(delegation)
+    }
+
+    /// Construct a **fully validated** session delegation against a holon
+    /// certificate.
+    ///
+    /// This is the recommended production constructor. It enforces every
+    /// invariant enforced by [`new_unchecked`](Self::new_unchecked) **plus**:
+    /// - delegation holon matches certificate holon
+    /// - issuer operational key ID matches certificate operational key
+    /// - session key role does not overlap genesis/operational roles
+    /// - signature verifies under the certificate's operational public key
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_validated(
+        holon_certificate: &HolonCertificateV1,
+        session_public_key_id: PublicKeyIdV1,
+        session_public_key_bytes: &[u8],
+        issued_at_envelope_ref: u64,
+        expires_at_tick: u64,
+        signature: &[u8],
+        channel_binding: Option<[u8; 32]>,
+    ) -> Result<Self, CertificateError> {
+        let delegation = Self::new_unchecked(
+            session_public_key_id,
+            session_public_key_bytes,
+            holon_certificate.holon_id().clone(),
+            holon_certificate.operational_public_key_id().clone(),
+            issued_at_envelope_ref,
+            expires_at_tick,
+            signature,
+            channel_binding,
+        )?;
+
+        // Full authority validation (key roles + signature).
+        delegation.validate_against_holon_certificate(holon_certificate)?;
+
         Ok(delegation)
     }
 
@@ -108,9 +211,14 @@ impl SessionKeyDelegationV1 {
     /// Enforced invariants:
     /// - delegation holon matches certificate holon
     /// - issuer operational key ID matches certificate operational key
+    /// - issuer operational key ID is correctly derived from certificate key
+    ///   bytes
     /// - session key role does not overlap genesis/operational roles
-    /// - `expires_at_tick > issued_at_envelope_ref`
     /// - signature verifies under the operational public key bytes
+    ///
+    /// Note: cert-independent invariants (key-id binding, validity window, max
+    /// lifetime) are enforced at construction in
+    /// [`new_unchecked`](Self::new_unchecked).
     pub fn validate_against_holon_certificate(
         &self,
         holon_certificate: &HolonCertificateV1,
@@ -129,25 +237,19 @@ impl SessionKeyDelegationV1 {
             });
         }
 
-        self.validate_common(
+        self.validate_authority(
             holon_certificate.genesis_public_key_id(),
             holon_certificate.operational_public_key_bytes(),
         )
     }
 
-    fn validate_common(
+    /// Validate authority binding: issuer key-id derivation, role separation,
+    /// and cryptographic signature.
+    fn validate_authority(
         &self,
         genesis_public_key_id: &PublicKeyIdV1,
         issuer_operational_public_key_bytes: &[u8; 32],
     ) -> Result<(), CertificateError> {
-        let expected_session_id =
-            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &self.session_public_key_bytes);
-        if expected_session_id != self.session_public_key_id {
-            return Err(CertificateError::PublicKeyIdMismatch {
-                field: "session_public_key_id",
-            });
-        }
-
         let expected_issuer_id = PublicKeyIdV1::from_key_bytes(
             AlgorithmTag::Ed25519,
             issuer_operational_public_key_bytes,
@@ -163,13 +265,6 @@ impl SessionKeyDelegationV1 {
             &self.issuer_operational_public_key_id,
             Some(&self.session_public_key_id),
         )?;
-
-        if self.expires_at_tick <= self.issued_at_envelope_ref {
-            return Err(CertificateError::InvalidValidityWindow {
-                issued_at_envelope_ref: self.issued_at_envelope_ref,
-                expires_at_tick: self.expires_at_tick,
-            });
-        }
 
         self.verify_signature(issuer_operational_public_key_bytes)
     }
@@ -348,7 +443,7 @@ mod tests {
             .sign(&unsigned_bytes)
             .to_bytes();
 
-        SessionKeyDelegationV1::new(
+        SessionKeyDelegationV1::new_unchecked(
             session_public_key_id,
             &session_public_key_bytes,
             fixture.holon_certificate.holon_id().clone(),
@@ -372,18 +467,151 @@ mod tests {
     }
 
     #[test]
-    fn delegation_rejects_invalid_validity_window() {
+    fn new_validated_round_trips_successfully() {
         let fixture = make_fixture();
-        let delegation = make_signed_delegation(&fixture, [0x44; 32], 50, 50, None);
+        let session_public_key_bytes = [0x44; 32];
+        let session_public_key_id =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &session_public_key_bytes);
+        let issuer_operational_public_key_id = fixture
+            .holon_certificate
+            .operational_public_key_id()
+            .clone();
 
-        let err = delegation
-            .validate_against_holon_certificate(&fixture.holon_certificate)
-            .unwrap_err();
+        let unsigned_bytes = SessionKeyDelegationV1::unsigned_bytes_for(
+            &session_public_key_id,
+            &session_public_key_bytes,
+            fixture.holon_certificate.holon_id(),
+            &issuer_operational_public_key_id,
+            10,
+            100,
+            None,
+        );
+        let signature = fixture
+            .operational_signing_key
+            .sign(&unsigned_bytes)
+            .to_bytes();
+
+        let delegation = SessionKeyDelegationV1::new_validated(
+            &fixture.holon_certificate,
+            session_public_key_id,
+            &session_public_key_bytes,
+            10,
+            100,
+            &signature,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(delegation.issued_at_envelope_ref(), 10);
+        assert_eq!(delegation.expires_at_tick(), 100);
+    }
+
+    #[test]
+    fn new_validated_rejects_bad_signature() {
+        let fixture = make_fixture();
+        let session_public_key_bytes = [0x44; 32];
+        let session_public_key_id =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &session_public_key_bytes);
+
+        let wrong_signing_key = SigningKey::from_bytes(&[0x99; 32]);
+        let issuer_operational_public_key_id = fixture
+            .holon_certificate
+            .operational_public_key_id()
+            .clone();
+
+        let unsigned_bytes = SessionKeyDelegationV1::unsigned_bytes_for(
+            &session_public_key_id,
+            &session_public_key_bytes,
+            fixture.holon_certificate.holon_id(),
+            &issuer_operational_public_key_id,
+            10,
+            100,
+            None,
+        );
+        let signature = wrong_signing_key.sign(&unsigned_bytes).to_bytes();
+
+        let err = SessionKeyDelegationV1::new_validated(
+            &fixture.holon_certificate,
+            session_public_key_id,
+            &session_public_key_bytes,
+            10,
+            100,
+            &signature,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, CertificateError::SignatureVerificationFailed);
+    }
+
+    #[test]
+    fn delegation_rejects_invalid_validity_window_at_construction() {
+        let fixture = make_fixture();
+        let session_public_key_bytes = [0x44; 32];
+        let session_public_key_id =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &session_public_key_bytes);
+
+        // expires_at == issued_at (zero-width window)
+        let err = SessionKeyDelegationV1::new_unchecked(
+            session_public_key_id,
+            &session_public_key_bytes,
+            fixture.holon_certificate.holon_id().clone(),
+            fixture
+                .holon_certificate
+                .operational_public_key_id()
+                .clone(),
+            50,
+            50,
+            &[0x00; 64],
+            None,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             CertificateError::InvalidValidityWindow {
                 issued_at_envelope_ref: 50,
                 expires_at_tick: 50
+            }
+        );
+    }
+
+    #[test]
+    fn delegation_rejects_invalid_validity_window_via_validate() {
+        let fixture = make_fixture();
+        // Use make_signed_delegation which calls new_unchecked internally.
+        // A valid window but test the full pipeline through validate.
+        let delegation = make_signed_delegation(&fixture, [0x44; 32], 10, 100, None);
+
+        delegation
+            .validate_against_holon_certificate(&fixture.holon_certificate)
+            .unwrap();
+    }
+
+    #[test]
+    fn delegation_rejects_mismatched_session_key_id_at_construction() {
+        let fixture = make_fixture();
+        let session_public_key_bytes = [0x44; 32];
+        // Derive key-id from DIFFERENT bytes to create a mismatch
+        let wrong_session_public_key_id =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0x55; 32]);
+
+        let err = SessionKeyDelegationV1::new_unchecked(
+            wrong_session_public_key_id,
+            &session_public_key_bytes,
+            fixture.holon_certificate.holon_id().clone(),
+            fixture
+                .holon_certificate
+                .operational_public_key_id()
+                .clone(),
+            10,
+            100,
+            &[0x00; 64],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            CertificateError::PublicKeyIdMismatch {
+                field: "session_public_key_id"
             }
         );
     }
@@ -411,7 +639,7 @@ mod tests {
         let wrong_signing_key = SigningKey::from_bytes(&[0x99; 32]);
         let signature = wrong_signing_key.sign(&unsigned_bytes).to_bytes();
 
-        let delegation = SessionKeyDelegationV1::new(
+        let delegation = SessionKeyDelegationV1::new_unchecked(
             session_public_key_id,
             &session_public_key_bytes,
             fixture.holon_certificate.holon_id().clone(),
@@ -483,7 +711,7 @@ mod tests {
             .unwrap(),
         );
 
-        let forged = SessionKeyDelegationV1::new(
+        let forged = SessionKeyDelegationV1::new_unchecked(
             delegation.session_public_key_id().clone(),
             delegation.session_public_key_bytes(),
             other_holon_id,
@@ -504,7 +732,7 @@ mod tests {
     #[test]
     fn delegation_rejects_signature_length_mismatch() {
         let fixture = make_fixture();
-        let err = SessionKeyDelegationV1::new(
+        let err = SessionKeyDelegationV1::new_unchecked(
             PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0x44; 32]),
             &[0x44; 32],
             fixture.holon_certificate.holon_id().clone(),
@@ -527,5 +755,92 @@ mod tests {
         let fixture = make_fixture();
         let delegation = make_signed_delegation(&fixture, [0x44; 32], 10, 100, Some([0xAA; 32]));
         assert_eq!(delegation.unsigned_bytes(), delegation.unsigned_bytes());
+    }
+
+    // ---- Max delegation lifetime adversarial tests ----
+
+    #[test]
+    fn delegation_rejects_lifetime_exceeding_max() {
+        let fixture = make_fixture();
+        let session_public_key_bytes = [0x44; 32];
+        let session_public_key_id =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &session_public_key_bytes);
+
+        // MAX + 1 ticks => rejected
+        let err = SessionKeyDelegationV1::new_unchecked(
+            session_public_key_id,
+            &session_public_key_bytes,
+            fixture.holon_certificate.holon_id().clone(),
+            fixture
+                .holon_certificate
+                .operational_public_key_id()
+                .clone(),
+            0,
+            MAX_SESSION_DELEGATION_TICKS + 1,
+            &[0x00; 64],
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            CertificateError::DelegationLifetimeExceeded {
+                lifetime_ticks: MAX_SESSION_DELEGATION_TICKS + 1,
+                max_ticks: MAX_SESSION_DELEGATION_TICKS,
+            }
+        );
+    }
+
+    #[test]
+    fn delegation_accepts_lifetime_at_max() {
+        let fixture = make_fixture();
+        // Exactly MAX ticks => accepted (signature is garbage but construction
+        // succeeds)
+        let delegation =
+            make_signed_delegation(&fixture, [0x44; 32], 0, MAX_SESSION_DELEGATION_TICKS, None);
+        assert_eq!(delegation.expires_at_tick(), MAX_SESSION_DELEGATION_TICKS);
+    }
+
+    #[test]
+    fn delegation_accepts_minimal_lifetime() {
+        let fixture = make_fixture();
+        // 1 tick => accepted
+        let delegation = make_signed_delegation(&fixture, [0x44; 32], 10, 11, None);
+        assert_eq!(
+            delegation.expires_at_tick() - delegation.issued_at_envelope_ref(),
+            1
+        );
+    }
+
+    #[test]
+    fn delegation_rejects_large_lifetime_offset() {
+        let fixture = make_fixture();
+        let session_public_key_bytes = [0x44; 32];
+        let session_public_key_id =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &session_public_key_bytes);
+
+        // Very large lifetime from a non-zero start
+        let err = SessionKeyDelegationV1::new_unchecked(
+            session_public_key_id,
+            &session_public_key_bytes,
+            fixture.holon_certificate.holon_id().clone(),
+            fixture
+                .holon_certificate
+                .operational_public_key_id()
+                .clone(),
+            1000,
+            1000 + MAX_SESSION_DELEGATION_TICKS + 1,
+            &[0x00; 64],
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            CertificateError::DelegationLifetimeExceeded {
+                lifetime_ticks: MAX_SESSION_DELEGATION_TICKS + 1,
+                max_ticks: MAX_SESSION_DELEGATION_TICKS,
+            }
+        );
     }
 }
