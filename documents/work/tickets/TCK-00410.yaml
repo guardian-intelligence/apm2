@@ -125,7 +125,6 @@ ticket_meta:
       - scripts/ci/run_bounded_tests.sh
       - scripts/ci/test_safety_allowlist.txt
       - documents/reviews/CI_EXPECTATIONS.md
-      - DEVELOPMENT_EXPERIENCE_BROOKLYN_PROJECT.md
     security: |
       - Test execution must occur in isolated, least-privilege environments with explicit resource ceilings.
       - Any missing safety control (sandbox, timeout, integrity check, receipt persistence) must fail closed.
