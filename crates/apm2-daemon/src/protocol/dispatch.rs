@@ -6070,6 +6070,14 @@ impl PrivilegedDispatcher {
         // WVR-0002: Pass session token via environment only.
         config = config.with_secret_env("APM2_SESSION_TOKEN", session_token.clone());
 
+        // SECURITY: After clearenv() the child has no PATH, so non-absolute
+        // commands (claude, gemini, codex, ollama) would fail at exec.
+        // Inject a daemon-controlled safe default PATH.  This is NOT
+        // profile-controlled (FORBIDDEN_ENV_KEYS still blocks profile
+        // overrides) -- it is set by the daemon after all profile env
+        // expansion.
+        config = config.with_env("PATH", "/usr/local/bin:/usr/bin:/bin");
+
         if profile.requires_pty {
             config = config.with_pty_size(120, 40);
         }

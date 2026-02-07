@@ -645,13 +645,22 @@ impl PtyRunner {
                 if !config.env.is_empty() {
                     // SAFETY: clearenv is safe in the post-fork child
                     // (single-threaded).
+                    // SECURITY: Fail-closed -- if clearenv() fails, the child
+                    // would inherit the daemon's ambient env, violating
+                    // containment.
                     unsafe {
-                        libc::clearenv();
+                        if libc::clearenv() != 0 {
+                            libc::_exit(1);
+                        }
                     }
                     for (key, value) in &config.env {
                         // SAFETY: setenv with valid CStrings is safe.
+                        // SECURITY: Fail-closed -- if setenv() fails, the
+                        // child runs with an incomplete env, which is unsafe.
                         unsafe {
-                            libc::setenv(key.as_ptr(), value.as_ptr(), 1);
+                            if libc::setenv(key.as_ptr(), value.as_ptr(), 1) != 0 {
+                                libc::_exit(1);
+                            }
                         }
                     }
                 }

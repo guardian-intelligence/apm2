@@ -1348,12 +1348,28 @@ impl EpisodeRuntime {
         // to prevent orphaned processes surviving past terminal transition.
         {
             let mut episodes = self.episodes.write().await;
-            let entry =
-                episodes
-                    .get_mut(episode_id.as_str())
-                    .ok_or_else(|| EpisodeError::NotFound {
-                        id: episode_id.as_str().to_string(),
-                    })?;
+            // SECURITY: If the episode was removed while we were spawning,
+            // terminate the just-spawned process to prevent an orphan.
+            #[allow(clippy::option_if_let_else)]
+            let Some(entry) = episodes.get_mut(episode_id.as_str()) else {
+                drop(episodes);
+                warn!(
+                    episode_id = %episode_id,
+                    "episode entry missing after spawn; \
+                     terminating orphaned adapter process"
+                );
+                if let Err(e) = adapter.terminate(&handle).await {
+                    warn!(
+                        episode_id = %episode_id,
+                        error = %e,
+                        "failed to terminate orphaned adapter process \
+                         on missing episode"
+                    );
+                }
+                return Err(EpisodeError::NotFound {
+                    id: episode_id.as_str().to_string(),
+                });
+            };
             if !matches!(entry.state, EpisodeState::Running { .. }) {
                 warn!(
                     episode_id = %episode_id,
