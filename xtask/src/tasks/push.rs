@@ -156,16 +156,28 @@ pub fn run(emit_receipt_only: bool, allow_github_write: bool) -> Result<()> {
             println!(
                 "  [TCK-00408] Emit-only cutover active — emitting PR creation projection event."
             );
+            // Resolve canonical owner/repo from git remote for the projection payload.
+            let remote_url = cmd!(sh, "git remote get-url origin")
+                .read()
+                .unwrap_or_default();
+            let owner_repo = parse_owner_repo(&remote_url);
+            if owner_repo.is_empty() {
+                bail!(
+                    "TCK-00408: cannot emit pr_create projection — \
+                     failed to resolve owner/repo from git remote 'origin'"
+                );
+            }
             let payload = serde_json::json!({
                 "operation": "pr_create",
                 "branch": branch_name,
                 "ticket_id": ticket_branch.ticket_id,
                 "base": "main",
+                "owner_repo": owner_repo,
             });
             let correlation_id = format!("push-pr-create-{}", &ticket_branch.ticket_id);
             crate::util::emit_projection_receipt_with_ack(
                 "pr_create",
-                "pending",
+                owner_repo,
                 &branch_name,
                 &payload.to_string(),
                 &correlation_id,

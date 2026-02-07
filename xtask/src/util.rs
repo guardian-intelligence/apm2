@@ -119,45 +119,54 @@ pub fn try_emit_internal_receipt(
     // Convert payload bytes to string for the CLI --payload argument
     let payload_str = String::from_utf8_lossy(payload).to_string();
 
-    let result = cmd!(
+    // Use --json for structured output so we can reliably parse the event_id.
+    let output = cmd!(
         sh,
-        "timeout 5 apm2 event emit --event-type {event_type_arg} --payload {payload_str} --correlation-id {correlation_id_arg}"
+        "timeout 5 apm2 event emit --json --event-type {event_type_arg} --payload {payload_str} --correlation-id {correlation_id_arg}"
     )
     .ignore_status()
-    .read();
+    .output();
 
-    match result {
+    match output {
         Ok(output) => {
-            if output.contains("event_id") || output.contains("success") {
-                // Try to extract event_id from output (best effort)
-                let event_id = output
-                    .lines()
-                    .find(|line| line.contains("event_id"))
-                    .map(|line| line.trim().to_string());
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if !output.status.success() {
+                // Non-zero exit: CLI ran but failed
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stdout.contains("not found")
+                    || stderr.contains("not found")
+                    || stderr.contains("No such file")
+                {
+                    eprintln!("  [EMIT_INTERNAL] apm2 CLI not available for internal emission");
+                    eprintln!("  [EMIT_INTERNAL] Continuing without internal receipt emission.");
+                    return Ok(None);
+                }
                 eprintln!(
-                    "  [EMIT_INTERNAL] Internal receipt emitted: {}",
-                    event_id.as_deref().unwrap_or("OK")
+                    "  [EMIT_INTERNAL] Internal emission failed (exit {}): {}",
+                    output.status,
+                    stderr.trim()
                 );
-                Ok(event_id)
-            } else if output.contains("not found")
-                || output.contains("No such file")
-                || output.is_empty()
-            {
-                // apm2 CLI not available
-                eprintln!("  [EMIT_INTERNAL] apm2 CLI not available for internal emission");
                 eprintln!("  [EMIT_INTERNAL] Continuing without internal receipt emission.");
-                Ok(None)
-            } else {
-                // Other output - log and continue
-                eprintln!(
-                    "  [EMIT_INTERNAL] Internal emission returned: {}",
-                    output.trim()
-                );
-                Ok(None)
+                return Ok(None);
             }
+            // Parse structured JSON to extract event_id
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+                if let Some(event_id) = parsed.get("event_id").and_then(|v| v.as_str()) {
+                    if !event_id.is_empty() {
+                        eprintln!("  [EMIT_INTERNAL] Internal receipt emitted: {event_id}");
+                        return Ok(Some(event_id.to_string()));
+                    }
+                }
+            }
+            // Exit success but no parseable event_id — log and continue
+            eprintln!(
+                "  [EMIT_INTERNAL] Internal emission returned unparseable output: {}",
+                stdout.trim()
+            );
+            Ok(None)
         },
         Err(e) => {
-            // Command execution failed (timeout, etc.)
+            // Command execution failed (timeout, binary not found, etc.)
             eprintln!("  [EMIT_INTERNAL] Internal emission failed: {e}");
             eprintln!("  [EMIT_INTERNAL] Continuing without internal receipt emission.");
             Ok(None)
@@ -240,10 +249,13 @@ pub fn effective_cutover_policy() -> CutoverPolicy {
 /// function merges both sources so that callers which have the CLI flag
 /// available can thread it through to every enforcement point.
 pub fn effective_cutover_policy_with_flag(cli_emit_receipt_only: bool) -> CutoverPolicy {
-    // Explicit policy propagation takes precedence
+    // Explicit policy propagation takes precedence — both "emit_only" and
+    // "legacy" are terminal decisions that override all other sources.
     if let Ok(policy) = std::env::var(XTASK_CUTOVER_POLICY_ENV) {
-        if policy == "emit_only" {
-            return CutoverPolicy::EmitOnly;
+        match policy.as_str() {
+            "emit_only" => return CutoverPolicy::EmitOnly,
+            "legacy" => return CutoverPolicy::Legacy,
+            _ => {},
         }
     }
     // CLI flag has the same semantics as the env var
@@ -1576,6 +1588,33 @@ mod tests {
             "Explicit env var should override CLI flag=false"
         );
         // Cleanup
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+        }
+    }
+
+    /// TCK-00408: Explicit "legacy" policy overrides env-based
+    /// emit-receipt-only.
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_explicit_legacy_policy_overrides_env() {
+        unsafe {
+            std::env::set_var(XTASK_CUTOVER_POLICY_ENV, "legacy");
+            std::env::set_var(XTASK_EMIT_RECEIPT_ONLY_ENV, "true");
+        }
+        assert_eq!(
+            effective_cutover_policy_with_flag(false),
+            CutoverPolicy::Legacy,
+            "Explicit 'legacy' policy must be terminal and override XTASK_EMIT_RECEIPT_ONLY=true"
+        );
+        // Even with CLI flag true, explicit "legacy" policy wins
+        assert_eq!(
+            effective_cutover_policy_with_flag(true),
+            CutoverPolicy::Legacy,
+            "Explicit 'legacy' policy must override CLI --emit-receipt-only flag"
+        );
         unsafe {
             std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
             std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
