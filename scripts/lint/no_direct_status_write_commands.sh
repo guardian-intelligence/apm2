@@ -31,7 +31,9 @@ check_logical_line() {
     local lc="${line,,}"
 
     if [[ "$lc" == *"gh api"* ]] && [[ "$lc" == *"/statuses/"* ]]; then
-        if [[ "$lc" == *"--method post"* ]] || [[ "$lc" == *"-x post"* ]] ||
+        if [[ "$lc" == *"--method post"* ]] || [[ "$lc" == *"--method=post"* ]] ||
+            [[ "$lc" == *"-x post"* ]] || [[ "$lc" == *"-x=post"* ]] ||
+            [[ "$lc" == *"--input"* ]] ||
             [[ "$lc" == *"-f state="* ]] || [[ "$lc" == *"--field state="* ]] ||
             [[ "$lc" == *"-f context="* ]] || [[ "$lc" == *"--field context="* ]]; then
             local rel="${file#"$REPO_ROOT/"}"
