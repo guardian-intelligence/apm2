@@ -5993,6 +5993,7 @@ impl PrivilegedDispatcher {
         episode_id: &str,
         workspace_root: &str,
         prompt: &str,
+        model: &str,
         session_token: &secrecy::SecretString,
     ) -> Result<crate::episode::HarnessConfig, String> {
         use secrecy::ExposeSecret;
@@ -6016,6 +6017,7 @@ impl PrivilegedDispatcher {
             .map(|arg| {
                 arg.replace("{workspace}", workspace_root)
                     .replace("{prompt}", prompt)
+                    .replace("{model}", model)
             })
             .collect();
 
@@ -6027,6 +6029,18 @@ impl PrivilegedDispatcher {
                     "security violation: session_token found in argv[{i}] \
                      after template expansion"
                 ));
+            }
+        }
+
+        // Fail-closed: reject any unresolved template placeholders in args.
+        for (i, arg) in expanded_args.iter().enumerate() {
+            if let (Some(open), Some(close)) = (arg.find('{'), arg.find('}')) {
+                if open < close {
+                    let token = &arg[open..=close];
+                    return Err(format!(
+                        "unresolved template placeholder {token} in argv[{i}]"
+                    ));
+                }
             }
         }
 
@@ -6048,7 +6062,8 @@ impl PrivilegedDispatcher {
             #[allow(clippy::literal_string_with_formatting_args)]
             let expanded_value = value_template
                 .replace("{workspace}", workspace_root)
-                .replace("{prompt}", prompt);
+                .replace("{prompt}", prompt)
+                .replace("{model}", model);
             config = config.with_env(key, expanded_value);
         }
 
@@ -7212,10 +7227,39 @@ impl PrivilegedDispatcher {
         //
         // After the episode is created and Running, load the adapter profile
         // from CAS, build a HarnessConfig with template expansion, and spawn
-        // the agent process. Best-effort: if no adapter registry is
-        // configured (tests, legacy paths), the episode proceeds without a
-        // spawned agent process.
-        if let (Some(episode_id), Some(registry)) = (&episode_id_opt, &self.adapter_registry) {
+        // the agent process. Fail-closed: if the adapter registry is not
+        // configured, SpawnEpisode must return an error -- a "successful"
+        // response without a spawned agent process is a silent failure.
+        if let Some(episode_id) = &episode_id_opt {
+            let Some(registry) = &self.adapter_registry else {
+                error!(
+                    episode_id = %episode_id,
+                    "adapter registry not configured; cannot spawn adapter process"
+                );
+                let rollback_warn = self.rollback_spawn_with_episode_stop(
+                    episode_id_opt.as_ref(),
+                    &session_id,
+                    &evicted_sessions,
+                    &evicted_telemetry,
+                    &evicted_manifests,
+                    &evicted_stop_conditions,
+                    timestamp_ns,
+                    "missing adapter registry",
+                );
+                let msg = rollback_warn.map_or_else(
+                    || "adapter registry not configured: cannot spawn adapter process".to_string(),
+                    |rw| {
+                        format!(
+                            "adapter registry not configured: cannot spawn adapter process \
+                         (rollback partial failure: {rw})"
+                        )
+                    },
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    msg,
+                ));
+            };
             let spawn_result: Result<(), String> = (|| {
                 let cas = self
                     .cas
@@ -7256,19 +7300,20 @@ impl PrivilegedDispatcher {
                     episode_id.as_str(),
                     &request.workspace_root,
                     "",
+                    &profile.profile_id,
                     &session_token_secret,
                 )?;
 
-                if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
-                    tokio::task::block_in_place(|| {
-                        rt_handle.block_on(async {
-                            self.episode_runtime
-                                .spawn_adapter(episode_id, config, adapter)
-                                .await
-                                .map_err(|e| format!("adapter spawn failed: {e}"))
-                        })
-                    })?;
-                }
+                let rt_handle = tokio::runtime::Handle::try_current()
+                    .map_err(|_| "adapter spawn requires async runtime".to_string())?;
+                tokio::task::block_in_place(|| {
+                    rt_handle.block_on(async {
+                        self.episode_runtime
+                            .spawn_adapter(episode_id, config, adapter)
+                            .await
+                            .map_err(|e| format!("adapter spawn failed: {e}"))
+                    })
+                })?;
 
                 Ok(())
             })();
@@ -22808,6 +22853,7 @@ mod tests {
                 "ep-001",
                 "/home/user/workspace",
                 "do something",
+                "claude-code-v1",
                 &token,
             )
             .expect("build_harness_config should succeed");
@@ -22850,6 +22896,7 @@ mod tests {
                 "ep-001",
                 "/workspace",
                 "",
+                "claude-code-v1",
                 &token,
             );
             assert!(result.is_err());
@@ -22870,6 +22917,7 @@ mod tests {
                 "ep-001",
                 "/workspace",
                 "",
+                "claude-code-v1",
                 &token,
             );
             assert!(result.is_err());
@@ -22888,12 +22936,58 @@ mod tests {
                 "ep-001",
                 "/workspace",
                 "",
+                "claude-code-v1",
                 &token,
             );
             assert!(result.is_err());
             assert!(
                 result.unwrap_err().contains("session_token found in argv"),
                 "Error should mention session_token in argv"
+            );
+        }
+
+        #[test]
+        fn test_model_template_expansion() {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.args_template = vec!["run".to_string(), "{model}".to_string()];
+            profile.env_template = vec![];
+            let token = secrecy::SecretString::from("token".to_string());
+
+            let config = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/workspace",
+                "",
+                "llama3",
+                &token,
+            )
+            .expect("build_harness_config should succeed");
+
+            assert_eq!(config.args[0], "run");
+            assert_eq!(config.args[1], "llama3");
+        }
+
+        #[test]
+        fn test_unresolved_placeholder_rejected() {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.args_template = vec!["run".to_string(), "{unknown}".to_string()];
+            profile.env_template = vec![];
+            let token = secrecy::SecretString::from("token".to_string());
+
+            let result = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/workspace",
+                "",
+                "llama3",
+                &token,
+            );
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("unresolved template placeholder"),
+                "Error should mention unresolved template placeholder"
             );
         }
     }

@@ -483,6 +483,20 @@ impl DispatcherState {
             let clock =
                 Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock failed"));
 
+            // TCK-00399: Create adapter registry so SpawnEpisode can spawn
+            // adapter processes (fail-closed: registry is required).
+            let mut adapter_registry = crate::episode::AdapterRegistry::new();
+            adapter_registry
+                .register(Box::new(crate::episode::raw_adapter::RawAdapter::new()));
+            adapter_registry.register(Box::new(
+                crate::episode::claude_code::ClaudeCodeAdapter::new(),
+            ));
+            let adapter_registry = Arc::new(adapter_registry);
+
+            // TCK-00399: CAS for adapter profile resolution during spawn.
+            let cas: Arc<dyn apm2_core::evidence::ContentAddressedStore> =
+                Arc::new(apm2_core::evidence::MemoryCas::new());
+
             PrivilegedDispatcher::with_dependencies(
                 DecodeConfig::default(),
                 policy_resolver,
@@ -500,6 +514,9 @@ impl DispatcherState {
             )
             // TCK-00352: Wire V1 manifest store into production path
             .with_v1_manifest_store(Arc::clone(&v1_manifest_store))
+            // TCK-00399: Wire adapter registry and CAS for agent CLI process spawning
+            .with_adapter_registry(adapter_registry)
+            .with_cas(cas)
         } else {
             // Use stubs
             let clock = Arc::new(
