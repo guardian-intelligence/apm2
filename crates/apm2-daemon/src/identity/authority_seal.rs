@@ -809,13 +809,14 @@ impl AuthoritySealV1 {
     /// Check that a set of verifying keys corresponds to the seal's
     /// `issuer_id` for `Quorum` issuers. Derives member `PublicKeyIdV1`s
     /// from the verifying key bytes, constructs the `KeySetIdV1` using the
-    /// same descriptor parameters, and compares the merkle root against
-    /// the embedded issuer keyset id.
+    /// same descriptor parameters (including optional weights), and compares
+    /// the merkle root against the embedded issuer keyset id.
     fn check_quorum_key_issuer_binding(
         &self,
         verifying_keys: &[ed25519_dalek::VerifyingKey],
         set_tag: SetTag,
         threshold_k: u32,
+        weights: Option<&[u64]>,
     ) -> Result<(), AuthoritySealError> {
         let members: Vec<PublicKeyIdV1> = verifying_keys
             .iter()
@@ -824,21 +825,18 @@ impl AuthoritySealV1 {
         // Derive the keyset ID from the provided keys. If derivation fails
         // (e.g. duplicate keys, empty members), that itself indicates a
         // mismatch since the seal's keyset was validly constructed.
-        let derived_keyset = KeySetIdV1::from_descriptor(
-            "ed25519",
-            set_tag,
-            threshold_k,
-            &members,
-            None, // weights are not available at verification time
-        )
-        .map_err(|_| AuthoritySealError::IssuerKeyMismatch {
-            expected: self.issuer_id.clone(),
-            derived: IssuerId::Quorum(KeySetIdV1::from_binary(&[0u8; 32]).unwrap_or_else(|_| {
-                // Unreachable: 32-byte input is always valid for from_binary.
-                // Defensive fallback for the error path.
-                KeySetIdV1::from_binary(&[0u8; 32]).expect("32-byte hash is valid")
-            })),
-        })?;
+        let derived_keyset =
+            KeySetIdV1::from_descriptor("ed25519", set_tag, threshold_k, &members, weights)
+                .map_err(|_| AuthoritySealError::IssuerKeyMismatch {
+                    expected: self.issuer_id.clone(),
+                    derived: IssuerId::Quorum(KeySetIdV1::from_binary(&[0u8; 32]).unwrap_or_else(
+                        |_| {
+                            // Unreachable: 32-byte input is always valid for from_binary.
+                            // Defensive fallback for the error path.
+                            KeySetIdV1::from_binary(&[0u8; 32]).expect("32-byte hash is valid")
+                        },
+                    )),
+                })?;
         let derived = IssuerId::Quorum(derived_keyset);
         if self.issuer_id != derived {
             return Err(AuthoritySealError::IssuerKeyMismatch {
@@ -895,7 +893,15 @@ impl AuthoritySealV1 {
 
     /// Verify a `QUORUM_MULTISIG` seal against the provided verifying keys.
     ///
-    /// All provided signatures must be valid (n-of-n).
+    /// All provided signatures must be valid (n-of-n). Verification is
+    /// order-independent: each signature is matched against all remaining
+    /// unused keys, and a key can only be consumed by one signature.
+    ///
+    /// # Weights
+    ///
+    /// If the keyset was created with weights, the same weights must be
+    /// provided here so that issuer-key binding verification can reconstruct
+    /// the canonical `KeySetIdV1`. Pass `None` for unweighted keysets.
     ///
     /// # Errors
     ///
@@ -910,6 +916,7 @@ impl AuthoritySealV1 {
         expected_subject_kind: &str,
         expected_subject_hash: &[u8; 32],
         require_temporal: bool,
+        weights: Option<&[u64]>,
     ) -> Result<(), AuthoritySealError> {
         if self.seal_kind != SealKind::QuorumMultisig {
             return Err(AuthoritySealError::SignatureVerificationFailed {
@@ -919,7 +926,7 @@ impl AuthoritySealV1 {
 
         #[allow(clippy::cast_possible_truncation)]
         let n = verifying_keys.len() as u32;
-        self.check_quorum_key_issuer_binding(verifying_keys, SetTag::Multisig, n)?;
+        self.check_quorum_key_issuer_binding(verifying_keys, SetTag::Multisig, n, weights)?;
         self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
         self.check_temporal_authority(require_temporal)?;
 
@@ -933,24 +940,34 @@ impl AuthoritySealV1 {
 
         let preimage = self.domain_separated_preimage();
 
-        for (i, (sig_bytes, key)) in self
-            .signatures
-            .iter()
-            .zip(verifying_keys.iter())
-            .enumerate()
-        {
+        // Order-independent verification: for each signature, try all
+        // remaining unused keys. A key can only be consumed by one signature.
+        let mut used_keys = vec![false; verifying_keys.len()];
+
+        for sig_bytes in &self.signatures {
             let signature = ed25519_dalek::Signature::from_slice(sig_bytes).map_err(|_| {
                 AuthoritySealError::SignatureVerificationFailed {
                     seal_kind: self.seal_kind,
                 }
             })?;
 
-            key.verify(&preimage, &signature).map_err(|_| {
-                tracing::warn!(index = i, "quorum multisig: signature verification failed");
-                AuthoritySealError::SignatureVerificationFailed {
-                    seal_kind: self.seal_kind,
+            let mut matched = false;
+            for (k_idx, key) in verifying_keys.iter().enumerate() {
+                if used_keys[k_idx] {
+                    continue;
                 }
-            })?;
+                if key.verify(&preimage, &signature).is_ok() {
+                    used_keys[k_idx] = true;
+                    matched = true;
+                    break;
+                }
+            }
+
+            if !matched {
+                return Err(AuthoritySealError::SignatureVerificationFailed {
+                    seal_kind: self.seal_kind,
+                });
+            }
         }
 
         Ok(())
@@ -959,6 +976,15 @@ impl AuthoritySealV1 {
     /// Verify a `QUORUM_THRESHOLD` seal against the provided verifying keys.
     ///
     /// At least `threshold` of the provided signatures must be valid.
+    /// Verification is order-independent: each signature is matched against
+    /// all remaining unused keys, and a key can only be consumed by one
+    /// signature.
+    ///
+    /// # Weights
+    ///
+    /// If the keyset was created with weights, the same weights must be
+    /// provided here so that issuer-key binding verification can reconstruct
+    /// the canonical `KeySetIdV1`. Pass `None` for unweighted keysets.
     ///
     /// # Errors
     ///
@@ -974,6 +1000,7 @@ impl AuthoritySealV1 {
         expected_subject_kind: &str,
         expected_subject_hash: &[u8; 32],
         require_temporal: bool,
+        weights: Option<&[u64]>,
     ) -> Result<(), AuthoritySealError> {
         if self.seal_kind != SealKind::QuorumThreshold {
             return Err(AuthoritySealError::SignatureVerificationFailed {
@@ -983,11 +1010,16 @@ impl AuthoritySealV1 {
 
         #[allow(clippy::cast_possible_truncation)]
         let threshold_u32 = threshold as u32;
-        self.check_quorum_key_issuer_binding(verifying_keys, SetTag::Threshold, threshold_u32)?;
+        self.check_quorum_key_issuer_binding(
+            verifying_keys,
+            SetTag::Threshold,
+            threshold_u32,
+            weights,
+        )?;
         self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
         self.check_temporal_authority(require_temporal)?;
 
-        // Reject extra signatures that would be silently ignored by zip.
+        // Reject extra signatures that would be silently ignored.
         if self.signatures.len() > verifying_keys.len() {
             return Err(AuthoritySealError::InvalidQuorumSignatureCount {
                 count: self.signatures.len(),
@@ -1004,12 +1036,23 @@ impl AuthoritySealV1 {
         }
 
         let preimage = self.domain_separated_preimage();
+
+        // Order-independent verification: for each signature, try all
+        // remaining unused keys. A key can only be consumed by one signature.
+        let mut used_keys = vec![false; verifying_keys.len()];
         let mut valid_count = 0usize;
 
-        for (sig_bytes, key) in self.signatures.iter().zip(verifying_keys.iter()) {
+        for sig_bytes in &self.signatures {
             if let Ok(signature) = ed25519_dalek::Signature::from_slice(sig_bytes) {
-                if key.verify(&preimage, &signature).is_ok() {
-                    valid_count = valid_count.saturating_add(1);
+                for (k_idx, key) in verifying_keys.iter().enumerate() {
+                    if used_keys[k_idx] {
+                        continue;
+                    }
+                    if key.verify(&preimage, &signature).is_ok() {
+                        used_keys[k_idx] = true;
+                        valid_count = valid_count.saturating_add(1);
+                        break;
+                    }
                 }
             }
         }
@@ -1099,7 +1142,8 @@ impl AuthoritySealV1 {
 
     /// Verify a `MERKLE_BATCH` seal with a quorum multisig issuer (n-of-n):
     /// verify ALL signatures over the batch root hash, then verify the
-    /// inclusion proof that the artifact is a member.
+    /// inclusion proof that the artifact is a member. Verification is
+    /// order-independent.
     ///
     /// # Issuer-Key Binding Contract
     ///
@@ -1110,6 +1154,12 @@ impl AuthoritySealV1 {
     /// Callers MUST resolve the quorum `issuer_id` to a trusted keyset via
     /// an authenticated directory or equivalent mechanism before calling
     /// this method.
+    ///
+    /// # Weights
+    ///
+    /// If the keyset was created with weights, the same weights must be
+    /// provided here so that issuer-key binding verification can reconstruct
+    /// the canonical `KeySetIdV1`. Pass `None` for unweighted keysets.
     ///
     /// # Errors
     ///
@@ -1122,6 +1172,7 @@ impl AuthoritySealV1 {
     /// - Temporal authority is required but `time_envelope_ref` is zero
     /// - Any signature fails verification (n-of-n required)
     /// - The inclusion proof does not reconstruct to the batch root
+    #[allow(clippy::too_many_arguments)]
     pub fn verify_merkle_batch_quorum_multisig(
         &self,
         verifying_keys: &[ed25519_dalek::VerifyingKey],
@@ -1130,6 +1181,7 @@ impl AuthoritySealV1 {
         expected_subject_kind: &str,
         expected_subject_hash: &[u8; 32],
         require_temporal: bool,
+        weights: Option<&[u64]>,
     ) -> Result<(), AuthoritySealError> {
         if self.seal_kind != SealKind::MerkleBatch {
             return Err(AuthoritySealError::SignatureVerificationFailed {
@@ -1146,7 +1198,7 @@ impl AuthoritySealV1 {
 
         #[allow(clippy::cast_possible_truncation)]
         let n = verifying_keys.len() as u32;
-        self.check_quorum_key_issuer_binding(verifying_keys, SetTag::Multisig, n)?;
+        self.check_quorum_key_issuer_binding(verifying_keys, SetTag::Multisig, n, weights)?;
         self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
         self.check_temporal_authority(require_temporal)?;
 
@@ -1161,28 +1213,34 @@ impl AuthoritySealV1 {
 
         let preimage = self.domain_separated_preimage();
 
-        // Verify ALL signatures (n-of-n multisig).
-        for (i, (sig_bytes, key)) in self
-            .signatures
-            .iter()
-            .zip(verifying_keys.iter())
-            .enumerate()
-        {
+        // Order-independent verification: for each signature, try all
+        // remaining unused keys. A key can only be consumed by one signature.
+        let mut used_keys = vec![false; verifying_keys.len()];
+
+        for sig_bytes in &self.signatures {
             let signature = ed25519_dalek::Signature::from_slice(sig_bytes).map_err(|_| {
                 AuthoritySealError::SignatureVerificationFailed {
                     seal_kind: self.seal_kind,
                 }
             })?;
 
-            key.verify(&preimage, &signature).map_err(|_| {
-                tracing::warn!(
-                    index = i,
-                    "merkle batch quorum multisig: signature verification failed"
-                );
-                AuthoritySealError::SignatureVerificationFailed {
-                    seal_kind: self.seal_kind,
+            let mut matched = false;
+            for (k_idx, key) in verifying_keys.iter().enumerate() {
+                if used_keys[k_idx] {
+                    continue;
                 }
-            })?;
+                if key.verify(&preimage, &signature).is_ok() {
+                    used_keys[k_idx] = true;
+                    matched = true;
+                    break;
+                }
+            }
+
+            if !matched {
+                return Err(AuthoritySealError::SignatureVerificationFailed {
+                    seal_kind: self.seal_kind,
+                });
+            }
         }
 
         Self::verify_merkle_inclusion(artifact_hash, inclusion_proof, &self.subject_hash)
@@ -1190,7 +1248,8 @@ impl AuthoritySealV1 {
 
     /// Verify a `MERKLE_BATCH` seal with a quorum threshold issuer (k-of-n):
     /// verify at least `threshold` signatures over the batch root hash, then
-    /// verify the inclusion proof that the artifact is a member.
+    /// verify the inclusion proof that the artifact is a member. Verification
+    /// is order-independent.
     ///
     /// # Issuer-Key Binding Contract
     ///
@@ -1202,6 +1261,12 @@ impl AuthoritySealV1 {
     /// the quorum `issuer_id` to a trusted keyset and threshold via an
     /// authenticated directory or equivalent mechanism before calling this
     /// method.
+    ///
+    /// # Weights
+    ///
+    /// If the keyset was created with weights, the same weights must be
+    /// provided here so that issuer-key binding verification can reconstruct
+    /// the canonical `KeySetIdV1`. Pass `None` for unweighted keysets.
     ///
     /// # Errors
     ///
@@ -1224,6 +1289,7 @@ impl AuthoritySealV1 {
         expected_subject_kind: &str,
         expected_subject_hash: &[u8; 32],
         require_temporal: bool,
+        weights: Option<&[u64]>,
     ) -> Result<(), AuthoritySealError> {
         if self.seal_kind != SealKind::MerkleBatch {
             return Err(AuthoritySealError::SignatureVerificationFailed {
@@ -1240,11 +1306,16 @@ impl AuthoritySealV1 {
 
         #[allow(clippy::cast_possible_truncation)]
         let threshold_u32 = threshold as u32;
-        self.check_quorum_key_issuer_binding(verifying_keys, SetTag::Threshold, threshold_u32)?;
+        self.check_quorum_key_issuer_binding(
+            verifying_keys,
+            SetTag::Threshold,
+            threshold_u32,
+            weights,
+        )?;
         self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
         self.check_temporal_authority(require_temporal)?;
 
-        // Reject extra signatures that would be silently ignored by zip.
+        // Reject extra signatures that would be silently ignored.
         if self.signatures.len() > verifying_keys.len() {
             return Err(AuthoritySealError::InvalidQuorumSignatureCount {
                 count: self.signatures.len(),
@@ -1261,12 +1332,23 @@ impl AuthoritySealV1 {
         }
 
         let preimage = self.domain_separated_preimage();
+
+        // Order-independent verification: for each signature, try all
+        // remaining unused keys. A key can only be consumed by one signature.
+        let mut used_keys = vec![false; verifying_keys.len()];
         let mut valid_count = 0usize;
 
-        for (sig_bytes, key) in self.signatures.iter().zip(verifying_keys.iter()) {
+        for sig_bytes in &self.signatures {
             if let Ok(signature) = ed25519_dalek::Signature::from_slice(sig_bytes) {
-                if key.verify(&preimage, &signature).is_ok() {
-                    valid_count = valid_count.saturating_add(1);
+                for (k_idx, key) in verifying_keys.iter().enumerate() {
+                    if used_keys[k_idx] {
+                        continue;
+                    }
+                    if key.verify(&preimage, &signature).is_ok() {
+                        used_keys[k_idx] = true;
+                        valid_count = valid_count.saturating_add(1);
+                        break;
+                    }
                 }
             }
         }
@@ -1654,7 +1736,7 @@ mod tests {
 
         let keys = [signer_a.verifying_key(), signer_b.verifying_key()];
         assert!(
-            seal.verify_quorum_multisig(&keys, "apm2.test.v1", &subject_hash, false)
+            seal.verify_quorum_multisig(&keys, "apm2.test.v1", &subject_hash, false, None)
                 .is_ok()
         );
     }
@@ -1714,7 +1796,7 @@ mod tests {
 
         let keys = [signer_a.verifying_key(), signer_b.verifying_key()];
         assert!(matches!(
-            seal.verify_quorum_multisig(&keys, "apm2.test.v1", &subject_hash, false),
+            seal.verify_quorum_multisig(&keys, "apm2.test.v1", &subject_hash, false, None),
             Err(AuthoritySealError::SignatureVerificationFailed { .. })
         ));
     }
@@ -1788,7 +1870,7 @@ mod tests {
         ];
         // 2-of-3 threshold: a and b sign, c doesn't.
         assert!(
-            seal.verify_quorum_threshold(&keys, 2, "apm2.test.v1", &subject_hash, false)
+            seal.verify_quorum_threshold(&keys, 2, "apm2.test.v1", &subject_hash, false, None)
                 .is_ok()
         );
     }
@@ -1853,7 +1935,7 @@ mod tests {
             signer_c.verifying_key(),
         ];
         assert!(matches!(
-            seal.verify_quorum_threshold(&keys, 2, "apm2.test.v1", &subject_hash, false),
+            seal.verify_quorum_threshold(&keys, 2, "apm2.test.v1", &subject_hash, false, None),
             Err(AuthoritySealError::ThresholdNotMet {
                 valid_sigs: 1,
                 threshold: 2
@@ -2348,6 +2430,7 @@ mod tests {
             "apm2.receipt_batch.v1",
             &batch_root,
             false,
+            None,
         );
         assert!(
             matches!(
@@ -2373,6 +2456,7 @@ mod tests {
             "apm2.receipt_batch.v1",
             &batch_root,
             false,
+            None,
         );
         assert!(
             result.is_ok(),
@@ -2455,6 +2539,7 @@ mod tests {
             "apm2.receipt_batch.v1",
             &batch_root,
             false,
+            None,
         );
         assert!(
             matches!(
@@ -2548,6 +2633,7 @@ mod tests {
             "apm2.receipt_batch.v1",
             &batch_root,
             false,
+            None,
         );
         assert!(
             result.is_ok(),
@@ -2575,6 +2661,7 @@ mod tests {
             "apm2.receipt_batch.v1",
             &batch_root,
             false,
+            None,
         );
         assert!(
             matches!(result, Err(AuthoritySealError::IssuerKeyMismatch { .. })),
@@ -2633,6 +2720,7 @@ mod tests {
             "apm2.receipt_batch.v1",
             &batch_root,
             false,
+            None,
         );
         assert!(
             result.is_err(),
@@ -2648,6 +2736,7 @@ mod tests {
             "apm2.receipt_batch.v1",
             &batch_root,
             false,
+            None,
         );
         assert!(
             result.is_err(),
@@ -2964,7 +3053,8 @@ mod tests {
         .unwrap();
 
         let keys = [signer_a.verifying_key(), signer_b.verifying_key()];
-        let result = seal.verify_quorum_threshold(&keys, 1, "apm2.test.v1", &subject_hash, false);
+        let result =
+            seal.verify_quorum_threshold(&keys, 1, "apm2.test.v1", &subject_hash, false, None);
         assert!(
             matches!(
                 result,
@@ -3026,6 +3116,7 @@ mod tests {
             "apm2.receipt_batch.v1",
             &batch_root,
             false,
+            None,
         );
         assert!(
             matches!(
@@ -3327,7 +3418,8 @@ mod tests {
 
         // Verify with keys from a completely different keyset (c+d).
         let wrong_keys = [signer_c.verifying_key(), signer_d.verifying_key()];
-        let result = seal.verify_quorum_multisig(&wrong_keys, "apm2.test.v1", &subject_hash, false);
+        let result =
+            seal.verify_quorum_multisig(&wrong_keys, "apm2.test.v1", &subject_hash, false, None);
         assert!(
             matches!(result, Err(AuthoritySealError::IssuerKeyMismatch { .. })),
             "verify_quorum_multisig must reject keys that do not match seal's issuer_id keyset, \
@@ -3422,8 +3514,14 @@ mod tests {
             signer_y.verifying_key(),
             signer_z.verifying_key(),
         ];
-        let result =
-            seal.verify_quorum_threshold(&wrong_keys, 2, "apm2.test.v1", &subject_hash, false);
+        let result = seal.verify_quorum_threshold(
+            &wrong_keys,
+            2,
+            "apm2.test.v1",
+            &subject_hash,
+            false,
+            None,
+        );
         assert!(
             matches!(result, Err(AuthoritySealError::IssuerKeyMismatch { .. })),
             "verify_quorum_threshold must reject keys from a different keyset, got: {result:?}"
@@ -3513,6 +3611,7 @@ mod tests {
             "apm2.receipt_batch.v1",
             &batch_root,
             false,
+            None,
         );
         assert!(
             matches!(result, Err(AuthoritySealError::IssuerKeyMismatch { .. })),
@@ -3582,6 +3681,445 @@ mod tests {
             matches!(result, Err(AuthoritySealError::IssuerKeyMismatch { .. })),
             "SECURITY: seal claiming issuer A must not be verifiable with key B, \
              even when B signed the correct preimage. Got: {result:?}"
+        );
+    }
+
+    // ────────── Order-independent quorum verification tests ──────────
+
+    /// Quorum multisig verification must succeed regardless of the order
+    /// of keys relative to signatures. This test reverses the key order
+    /// and confirms verification still passes.
+    #[test]
+    fn verify_quorum_multisig_order_independent() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let cell_id = test_cell_id();
+
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+        let keyset_id = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Multisig,
+            2,
+            &[member_a, member_b],
+            None,
+        )
+        .unwrap();
+
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+        let subject_hash = [0x42; HASH_SIZE];
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 5 };
+
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::Quorum(keyset_id.clone()),
+            subject_kind.clone(),
+            subject_hash,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            vec![vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let sig_a = signer_a.sign(&preimage);
+        let sig_b = signer_b.sign(&preimage);
+
+        // Seal has sigs in order [a, b].
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            subject_hash,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            vec![sig_a.to_bytes().to_vec(), sig_b.to_bytes().to_vec()],
+        )
+        .unwrap();
+
+        // Verify with keys in order [a, b] — should pass.
+        let keys_ab = [signer_a.verifying_key(), signer_b.verifying_key()];
+        assert!(
+            seal.verify_quorum_multisig(&keys_ab, "apm2.test.v1", &subject_hash, false, None)
+                .is_ok(),
+            "Multisig must pass with keys in original order"
+        );
+
+        // Verify with keys in REVERSED order [b, a] — must also pass
+        // (order-independent verification).
+        let keys_ba = [signer_b.verifying_key(), signer_a.verifying_key()];
+        assert!(
+            seal.verify_quorum_multisig(&keys_ba, "apm2.test.v1", &subject_hash, false, None)
+                .is_ok(),
+            "Multisig must pass with keys in reversed order (order-independent)"
+        );
+    }
+
+    /// Quorum threshold verification must succeed regardless of the order
+    /// of keys relative to signatures.
+    #[test]
+    fn verify_quorum_threshold_order_independent() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let signer_c = Signer::generate();
+        let cell_id = test_cell_id();
+
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+        let member_c =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_c.public_key_bytes());
+        let keyset_id = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            2,
+            &[member_a, member_b, member_c],
+            None,
+        )
+        .unwrap();
+
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+        let subject_hash = [0x42; HASH_SIZE];
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 10 };
+
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::Quorum(keyset_id.clone()),
+            subject_kind.clone(),
+            subject_hash,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumThreshold,
+            vec![vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let sig_a = signer_a.sign(&preimage);
+        let sig_b = signer_b.sign(&preimage);
+
+        // Seal has sigs: [valid_a, valid_b, invalid_placeholder].
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            subject_hash,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumThreshold,
+            vec![
+                sig_a.to_bytes().to_vec(),
+                sig_b.to_bytes().to_vec(),
+                vec![0u8; 64],
+            ],
+        )
+        .unwrap();
+
+        // Original key order [a, b, c] — should pass (2 of 3).
+        let keys_abc = [
+            signer_a.verifying_key(),
+            signer_b.verifying_key(),
+            signer_c.verifying_key(),
+        ];
+        assert!(
+            seal.verify_quorum_threshold(&keys_abc, 2, "apm2.test.v1", &subject_hash, false, None)
+                .is_ok(),
+            "Threshold must pass with keys in original order"
+        );
+
+        // Reversed key order [c, b, a] — must also pass (order-independent).
+        let keys_cba = [
+            signer_c.verifying_key(),
+            signer_b.verifying_key(),
+            signer_a.verifying_key(),
+        ];
+        assert!(
+            seal.verify_quorum_threshold(&keys_cba, 2, "apm2.test.v1", &subject_hash, false, None)
+                .is_ok(),
+            "Threshold must pass with keys in reversed order (order-independent)"
+        );
+
+        // Rotated key order [b, c, a] — must also pass (order-independent).
+        let keys_bca = [
+            signer_b.verifying_key(),
+            signer_c.verifying_key(),
+            signer_a.verifying_key(),
+        ];
+        assert!(
+            seal.verify_quorum_threshold(&keys_bca, 2, "apm2.test.v1", &subject_hash, false, None)
+                .is_ok(),
+            "Threshold must pass with keys in rotated order (order-independent)"
+        );
+    }
+
+    /// Order-independent multisig must NOT allow the same key to verify
+    /// multiple signatures (duplicate signature attack prevention).
+    #[test]
+    fn verify_quorum_multisig_prevents_key_reuse() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let cell_id = test_cell_id();
+
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+        let keyset_id = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Multisig,
+            2,
+            &[member_a, member_b],
+            None,
+        )
+        .unwrap();
+
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+        let subject_hash = [0x42; HASH_SIZE];
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 5 };
+
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::Quorum(keyset_id.clone()),
+            subject_kind.clone(),
+            subject_hash,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            vec![vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let sig_a = signer_a.sign(&preimage);
+
+        // Use sig_a TWICE: attempting to bypass n-of-n by replaying one
+        // signer's signature. The second sig_a should NOT match key_b, and
+        // key_a should be consumed by the first sig_a, preventing reuse.
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            subject_hash,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            vec![sig_a.to_bytes().to_vec(), sig_a.to_bytes().to_vec()],
+        )
+        .unwrap();
+
+        let keys = [signer_a.verifying_key(), signer_b.verifying_key()];
+        let result = seal.verify_quorum_multisig(&keys, "apm2.test.v1", &subject_hash, false, None);
+        assert!(
+            result.is_err(),
+            "Duplicate signature must not pass multisig: a single key cannot satisfy \
+             two signature slots. Got: {result:?}"
+        );
+    }
+
+    // ────────── Weighted keyset issuer binding tests ──────────
+
+    /// Weighted keyset verification must pass when the correct weights are
+    /// provided to the verification method.
+    #[test]
+    fn verify_quorum_multisig_weighted_keyset_passes() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let cell_id = test_cell_id();
+
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+
+        let weights: &[u64] = &[10, 20];
+        let keyset_id = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Multisig,
+            2,
+            &[member_a, member_b],
+            Some(weights),
+        )
+        .unwrap();
+
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+        let subject_hash = [0x42; HASH_SIZE];
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 5 };
+
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::Quorum(keyset_id.clone()),
+            subject_kind.clone(),
+            subject_hash,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            vec![vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let sig_a = signer_a.sign(&preimage);
+        let sig_b = signer_b.sign(&preimage);
+
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            subject_hash,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            vec![sig_a.to_bytes().to_vec(), sig_b.to_bytes().to_vec()],
+        )
+        .unwrap();
+
+        let keys = [signer_a.verifying_key(), signer_b.verifying_key()];
+        // Verify with the same weights used during keyset creation.
+        let result =
+            seal.verify_quorum_multisig(&keys, "apm2.test.v1", &subject_hash, false, Some(weights));
+        assert!(
+            result.is_ok(),
+            "Weighted keyset verification must pass with correct weights, got: {result:?}"
+        );
+    }
+
+    /// Weighted keyset verification with `weights=None` must fail with
+    /// `IssuerKeyMismatch` because the derived keyset ID differs.
+    #[test]
+    fn verify_quorum_multisig_weighted_keyset_fails_without_weights() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let cell_id = test_cell_id();
+
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+
+        let weights: &[u64] = &[10, 20];
+        let keyset_id = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Multisig,
+            2,
+            &[member_a, member_b],
+            Some(weights),
+        )
+        .unwrap();
+
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+        let subject_hash = [0x42; HASH_SIZE];
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 5 };
+
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::Quorum(keyset_id.clone()),
+            subject_kind.clone(),
+            subject_hash,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            vec![vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let sig_a = signer_a.sign(&preimage);
+        let sig_b = signer_b.sign(&preimage);
+
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            subject_hash,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            vec![sig_a.to_bytes().to_vec(), sig_b.to_bytes().to_vec()],
+        )
+        .unwrap();
+
+        let keys = [signer_a.verifying_key(), signer_b.verifying_key()];
+        // Verify WITHOUT weights — should fail because the keyset was
+        // created with weights, and None produces a different KeySetIdV1.
+        let result = seal.verify_quorum_multisig(&keys, "apm2.test.v1", &subject_hash, false, None);
+        assert!(
+            matches!(result, Err(AuthoritySealError::IssuerKeyMismatch { .. })),
+            "Weighted keyset must fail verification when weights are omitted, got: {result:?}"
+        );
+    }
+
+    /// Weighted keyset verification with wrong weights must fail.
+    #[test]
+    fn verify_quorum_multisig_weighted_keyset_fails_wrong_weights() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let cell_id = test_cell_id();
+
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+
+        let weights: &[u64] = &[10, 20];
+        let keyset_id = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Multisig,
+            2,
+            &[member_a, member_b],
+            Some(weights),
+        )
+        .unwrap();
+
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+        let subject_hash = [0x42; HASH_SIZE];
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 5 };
+
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::Quorum(keyset_id.clone()),
+            subject_kind.clone(),
+            subject_hash,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            vec![vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let sig_a = signer_a.sign(&preimage);
+        let sig_b = signer_b.sign(&preimage);
+
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            subject_hash,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            vec![sig_a.to_bytes().to_vec(), sig_b.to_bytes().to_vec()],
+        )
+        .unwrap();
+
+        let keys = [signer_a.verifying_key(), signer_b.verifying_key()];
+        // Verify with WRONG weights — should fail.
+        let wrong_weights: &[u64] = &[99, 99];
+        let result = seal.verify_quorum_multisig(
+            &keys,
+            "apm2.test.v1",
+            &subject_hash,
+            false,
+            Some(wrong_weights),
+        );
+        assert!(
+            matches!(result, Err(AuthoritySealError::IssuerKeyMismatch { .. })),
+            "Weighted keyset must fail verification with wrong weights, got: {result:?}"
         );
     }
 }
