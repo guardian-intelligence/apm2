@@ -549,3 +549,251 @@ fn tck_00412_publish_changeset_concurrent_publish_exactly_once() {
         "concurrent publish must produce exactly one changeset_published event"
     );
 }
+
+/// Regression: `init_schema` quarantine migration moves duplicate
+/// `changeset_published` rows (same `(work_id, changeset_digest)`) into
+/// `ledger_events_quarantine` with reason `changeset_digest_dedupe_migration`,
+/// creates the `idx_unique_changeset_published` unique index, and is idempotent
+/// across repeated invocations.
+#[test]
+fn tck_00412_quarantine_migration_deduplicates_changeset_published() {
+    use rusqlite::params;
+
+    let conn = Connection::open_in_memory().expect("sqlite in-memory should open");
+
+    // Step 1: Create the ledger_events table WITHOUT unique indexes or
+    // quarantine infrastructure -- simulating a database that predates the
+    // quarantine migration.
+    conn.execute(
+        "CREATE TABLE ledger_events (
+            event_id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            work_id TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            payload BLOB NOT NULL,
+            signature BLOB NOT NULL,
+            timestamp_ns INTEGER NOT NULL
+        )",
+        [],
+    )
+    .expect("bare ledger_events table creation should succeed");
+
+    // Step 2: Insert two changeset_published rows with the SAME
+    // (work_id, changeset_digest) pair.  The first-inserted row (lowest
+    // rowid) should be kept; the second should be quarantined.
+    let shared_work_id = "work-quarantine-test";
+    let shared_digest = "abcd1234deadbeef";
+    let canonical_payload = format!(r#"{{"changeset_digest":"{shared_digest}","cas_hash":"aaa"}}"#);
+    let duplicate_payload = format!(r#"{{"changeset_digest":"{shared_digest}","cas_hash":"bbb"}}"#);
+
+    conn.execute(
+        "INSERT INTO ledger_events
+            (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            "cs-event-keep",
+            "changeset_published",
+            shared_work_id,
+            "actor-1",
+            canonical_payload.as_bytes(),
+            b"sig-keep".as_slice(),
+            100_i64,
+        ],
+    )
+    .expect("insert canonical changeset_published row");
+
+    conn.execute(
+        "INSERT INTO ledger_events
+            (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            "cs-event-duplicate",
+            "changeset_published",
+            shared_work_id,
+            "actor-1",
+            duplicate_payload.as_bytes(),
+            b"sig-dup".as_slice(),
+            101_i64,
+        ],
+    )
+    .expect("insert duplicate changeset_published row");
+
+    // Also insert an unrelated event to ensure it is not affected.
+    conn.execute(
+        "INSERT INTO ledger_events
+            (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            "unrelated-event",
+            "work_claimed",
+            shared_work_id,
+            "actor-1",
+            br#"{"ok":true}"#.as_slice(),
+            b"sig-unrelated".as_slice(),
+            99_i64,
+        ],
+    )
+    .expect("insert unrelated event");
+
+    // Step 3: Run init_schema -- this triggers the quarantine migration.
+    SqliteLedgerEventEmitter::init_schema(&conn)
+        .expect("init_schema should succeed with pre-existing duplicates");
+
+    // Verification (a): Only one canonical row with that (work_id,
+    // changeset_digest) remains in ledger_events.
+    let canonical_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ledger_events
+             WHERE event_type = 'changeset_published'
+             AND work_id = ?1
+             AND json_extract(CAST(payload AS TEXT), '$.changeset_digest') = ?2",
+            params![shared_work_id, shared_digest],
+            |row| row.get(0),
+        )
+        .expect("count canonical rows");
+    assert_eq!(
+        canonical_count, 1,
+        "exactly one canonical changeset_published row must remain"
+    );
+
+    let kept_event_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM ledger_events WHERE event_id = 'cs-event-keep'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check kept event");
+    assert!(
+        kept_event_exists,
+        "the earliest-inserted (canonical) event must be preserved"
+    );
+
+    let duplicate_removed: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM ledger_events WHERE event_id = 'cs-event-duplicate'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check duplicate event");
+    assert!(
+        !duplicate_removed,
+        "the duplicate event must be removed from ledger_events"
+    );
+
+    // Verification (b): The quarantine table exists and contains the
+    // duplicate with the correct reason.
+    let quarantine_table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'ledger_events_quarantine'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check quarantine table exists");
+    assert!(
+        quarantine_table_exists,
+        "ledger_events_quarantine table must exist after migration"
+    );
+
+    let quarantine_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ledger_events_quarantine
+             WHERE event_id = 'cs-event-duplicate'
+             AND quarantine_reason = 'changeset_digest_dedupe_migration'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count quarantined duplicates");
+    assert_eq!(
+        quarantine_count, 1,
+        "duplicate changeset_published event must be quarantined exactly once \
+         with reason 'changeset_digest_dedupe_migration'"
+    );
+
+    // The canonical event must NOT appear in quarantine.
+    let canonical_not_quarantined: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM ledger_events_quarantine
+                WHERE event_id = 'cs-event-keep'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check canonical not quarantined");
+    assert!(
+        !canonical_not_quarantined,
+        "the canonical event must not be quarantined"
+    );
+
+    // The unrelated event must be untouched.
+    let unrelated_still_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM ledger_events WHERE event_id = 'unrelated-event'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check unrelated event");
+    assert!(
+        unrelated_still_exists,
+        "unrelated events must not be affected by changeset quarantine migration"
+    );
+
+    // Verification (c): The unique index exists.
+    let index_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'index'
+                AND name = 'idx_unique_changeset_published'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check unique index exists");
+    assert!(
+        index_exists,
+        "idx_unique_changeset_published unique index must exist after migration"
+    );
+
+    // Verification (d): Running init_schema a second time is idempotent.
+    SqliteLedgerEventEmitter::init_schema(&conn)
+        .expect("second init_schema invocation must be idempotent");
+
+    let canonical_count_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ledger_events
+             WHERE event_type = 'changeset_published'
+             AND work_id = ?1
+             AND json_extract(CAST(payload AS TEXT), '$.changeset_digest') = ?2",
+            params![shared_work_id, shared_digest],
+            |row| row.get(0),
+        )
+        .expect("count canonical rows after rerun");
+    assert_eq!(
+        canonical_count_after, 1,
+        "idempotent rerun must not change canonical row count"
+    );
+
+    let quarantine_count_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ledger_events_quarantine
+             WHERE event_id = 'cs-event-duplicate'
+             AND quarantine_reason = 'changeset_digest_dedupe_migration'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count quarantined duplicates after rerun");
+    assert_eq!(
+        quarantine_count_after, 1,
+        "idempotent rerun must not duplicate quarantine entries"
+    );
+}
