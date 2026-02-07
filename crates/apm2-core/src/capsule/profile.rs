@@ -11,6 +11,14 @@
 //! - Capsule profiles are content-addressed (referenced by BLAKE3 hash)
 //! - Deny-by-default egress is mandatory (fail-closed)
 //! - Tier3+ actuation requires an admitted capsule profile
+//!
+//! # Runtime Wiring
+//!
+//! TODO(TCK-00375): Wire `AdmissionGate::check` into the daemon episode
+//! spawn path so that Tier3+ actuation is rejected at runtime when no
+//! admitted capsule profile is present. Currently the gate is validated
+//! in unit tests only; runtime integration is deferred to TCK-00375 and
+//! TCK-00376.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -36,6 +44,13 @@ const MAX_EXECUTABLE_PATH_LENGTH: usize = 4096;
 
 /// Maximum length of host in an egress route.
 const MAX_HOST_LENGTH: usize = 253;
+
+/// The set of profile IDs admitted for Tier3+ enforcement.
+///
+/// Only profiles whose `profile_id` matches one of these strings may pass
+/// `AdmissionGate::check` at Tier3 or above. This prevents a crafted profile
+/// with an arbitrary `profile_id` from disabling mandatory isolation controls.
+const ADMITTED_PROFILE_IDS: &[&str] = &["linux-ns-v1"];
 
 // =============================================================================
 // Error Types
@@ -114,6 +129,32 @@ pub enum CapsuleProfileError {
     InsufficientSeccomp {
         /// The configured level name.
         level: String,
+    },
+
+    /// Cgroup memory limit must be non-zero for linux-ns-v1.
+    #[error("cgroup memory_limit_bytes must be > 0 for linux-ns-v1")]
+    ZeroCgroupMemory,
+
+    /// Cgroup `pids_max` must be non-zero for linux-ns-v1.
+    #[error("cgroup pids_max must be > 0 for linux-ns-v1")]
+    ZeroCgroupPids,
+
+    /// Cgroup `cpu_quota_us` must be non-zero for linux-ns-v1.
+    #[error("cgroup cpu_quota_us must be > 0 for linux-ns-v1")]
+    ZeroCgroupCpuQuota,
+
+    /// Cgroup `io_weight` out of valid range (1..=10000) for linux-ns-v1.
+    #[error("cgroup io_weight must be in 1..=10000 for linux-ns-v1, got {value}")]
+    InvalidCgroupIoWeight {
+        /// The invalid `io_weight` value.
+        value: u16,
+    },
+
+    /// Profile ID is not in the admitted set for Tier3+ enforcement.
+    #[error("profile_id '{profile_id}' is not in the admitted profile set for Tier3+ enforcement")]
+    ProfileNotAdmitted {
+        /// The rejected profile ID.
+        profile_id: String,
     },
 }
 
@@ -598,7 +639,7 @@ impl CapsuleProfile {
             });
         }
 
-        // Namespaces (linux-ns-v1 requires user+mount+pid)
+        // Namespaces (linux-ns-v1 requires user+mount+pid+net)
         if self.profile_id == "linux-ns-v1" && !self.namespaces.meets_linux_ns_v1() {
             return Err(CapsuleProfileError::InsufficientNamespaces);
         }
@@ -612,6 +653,24 @@ impl CapsuleProfile {
                     });
                 },
                 SeccompProfileLevel::Restricted | SeccompProfileLevel::Strict => {},
+            }
+        }
+
+        // Cgroup controls (linux-ns-v1 requires bounded non-zero values)
+        if self.profile_id == "linux-ns-v1" {
+            if self.cgroup_limits.memory_limit_bytes == 0 {
+                return Err(CapsuleProfileError::ZeroCgroupMemory);
+            }
+            if self.cgroup_limits.pids_max == 0 {
+                return Err(CapsuleProfileError::ZeroCgroupPids);
+            }
+            if self.cgroup_limits.cpu_quota_us == 0 {
+                return Err(CapsuleProfileError::ZeroCgroupCpuQuota);
+            }
+            if self.cgroup_limits.io_weight == 0 || self.cgroup_limits.io_weight > 10000 {
+                return Err(CapsuleProfileError::InvalidCgroupIoWeight {
+                    value: self.cgroup_limits.io_weight,
+                });
             }
         }
 
@@ -827,6 +886,13 @@ impl CapsuleProfileBuilder {
 /// Per REQ-0028: "Tier3+ actuation executes only inside admitted capsule
 /// profile." This gate rejects actuation requests that lack an admitted capsule
 /// profile when the risk tier is 3 or above.
+///
+/// The gate enforces:
+/// 1. Presence of a capsule profile at Tier3+.
+/// 2. The profile's `profile_id` MUST be in the enumerated admitted set
+///    (`ADMITTED_PROFILE_IDS`).
+/// 3. Structural invariants (all namespaces, seccomp, bounded cgroups) via
+///    `CapsuleProfile::validate`.
 pub struct AdmissionGate;
 
 impl AdmissionGate {
@@ -836,8 +902,17 @@ impl AdmissionGate {
     /// # Rules
     ///
     /// - **`Tier3`+ (`risk_tier` >= 3)**: MUST have an admitted (validated)
-    ///   capsule profile
+    ///   capsule profile whose `profile_id` is in `ADMITTED_PROFILE_IDS`. The
+    ///   profile must also pass full structural validation (namespaces,
+    ///   seccomp, cgroups, egress, hash integrity).
     /// - **`Tier0`-`Tier2` (`risk_tier` < 3)**: Capsule is optional
+    ///
+    /// # Runtime Wiring
+    ///
+    /// NOTE: Runtime integration of this gate into the daemon episode spawn
+    /// path is deferred to TCK-00375 and TCK-00376. Currently the gate is
+    /// exercised only in unit tests and must be called explicitly by the
+    /// daemon spawn logic once those tickets land.
     ///
     /// # Errors
     ///
@@ -856,6 +931,20 @@ impl AdmissionGate {
                     });
                 },
                 Some(profile) => {
+                    // Enforce admitted profile set: only enumerated profile IDs
+                    // are accepted at Tier3+. This prevents a crafted profile
+                    // with an arbitrary profile_id from bypassing mandatory
+                    // isolation controls.
+                    if !ADMITTED_PROFILE_IDS.contains(&profile.profile_id.as_str()) {
+                        return Err(AdmissionError::InvalidProfile(
+                            CapsuleProfileError::ProfileNotAdmitted {
+                                profile_id: profile.profile_id.clone(),
+                            },
+                        ));
+                    }
+
+                    // Full structural validation (namespaces, seccomp, cgroups,
+                    // egress, hash integrity).
                     profile.validate().map_err(AdmissionError::InvalidProfile)?;
                 },
             }
@@ -1330,5 +1419,257 @@ mod tests {
             protocol: "icmp".to_string(),
         };
         assert!(route.validate().is_err());
+    }
+
+    // =========================================================================
+    // BLOCKER 1: Tier3 admission rejects non-admitted profile IDs
+    // =========================================================================
+
+    #[test]
+    fn test_admission_tier3_rejects_custom_weak_profile() {
+        // A crafted profile with profile_id="custom-weak" that has namespaces
+        // disabled, seccomp None, unlimited cgroups MUST be rejected by
+        // AdmissionGate::check at Tier3.
+        let weak_ns = NamespaceConfig {
+            user: false,
+            mount: false,
+            pid: false,
+            net: false,
+        };
+        let weak_cgroups = CgroupLimits {
+            cpu_quota_us: 0,
+            cpu_period_us: 0,
+            memory_limit_bytes: 0,
+            pids_max: 0,
+            io_weight: 0,
+        };
+        let profile_hash = CapsuleProfile::compute_hash(&HashInput {
+            profile_id: "custom-weak",
+            namespaces: &weak_ns,
+            seccomp_level: &SeccompProfileLevel::None,
+            cgroup_limits: &weak_cgroups,
+            egress_policy: &EgressPolicy::deny_all(),
+            allowed_executables: &[],
+            scrub_environment: false,
+            readonly_rootfs: false,
+            tmpfs_tmp: false,
+        });
+        let weak_profile = CapsuleProfile {
+            profile_id: "custom-weak".to_string(),
+            profile_hash,
+            namespaces: weak_ns,
+            seccomp_level: SeccompProfileLevel::None,
+            cgroup_limits: weak_cgroups,
+            egress_policy: EgressPolicy::deny_all(),
+            allowed_executables: Vec::new(),
+            scrub_environment: false,
+            readonly_rootfs: false,
+            tmpfs_tmp: false,
+        };
+
+        let result = AdmissionGate::check(&RiskTier::Tier3, Some(&weak_profile));
+        assert!(
+            matches!(
+                result,
+                Err(AdmissionError::InvalidProfile(
+                    CapsuleProfileError::ProfileNotAdmitted { .. }
+                ))
+            ),
+            "Tier3 admission with custom-weak profile_id must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_admission_tier4_rejects_unadmitted_profile_id() {
+        // Even if the profile has strong settings, a non-admitted profile_id
+        // must be rejected at Tier4.
+        let strong_ns = NamespaceConfig::isolated();
+        let strong_cgroups = CgroupLimits::default_restricted();
+        let profile_hash = CapsuleProfile::compute_hash(&HashInput {
+            profile_id: "my-custom-profile",
+            namespaces: &strong_ns,
+            seccomp_level: &SeccompProfileLevel::Strict,
+            cgroup_limits: &strong_cgroups,
+            egress_policy: &EgressPolicy::deny_all(),
+            allowed_executables: &[],
+            scrub_environment: true,
+            readonly_rootfs: true,
+            tmpfs_tmp: true,
+        });
+        let profile = CapsuleProfile {
+            profile_id: "my-custom-profile".to_string(),
+            profile_hash,
+            namespaces: strong_ns,
+            seccomp_level: SeccompProfileLevel::Strict,
+            cgroup_limits: strong_cgroups,
+            egress_policy: EgressPolicy::deny_all(),
+            allowed_executables: Vec::new(),
+            scrub_environment: true,
+            readonly_rootfs: true,
+            tmpfs_tmp: true,
+        };
+
+        let result = AdmissionGate::check(&RiskTier::Tier4, Some(&profile));
+        assert!(
+            matches!(
+                result,
+                Err(AdmissionError::InvalidProfile(
+                    CapsuleProfileError::ProfileNotAdmitted { .. }
+                ))
+            ),
+            "Tier4 admission with non-admitted profile_id must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_admission_tier2_allows_non_admitted_profile_id() {
+        // Below Tier3, the admission gate does not enforce the admitted set.
+        assert!(AdmissionGate::check(&RiskTier::Tier2, None).is_ok());
+    }
+
+    // =========================================================================
+    // BLOCKER 3: Cgroup zero/unbounded configurations rejected
+    // =========================================================================
+
+    #[test]
+    fn test_build_rejects_zero_memory_limit() {
+        let result = CapsuleProfileBuilder::new("linux-ns-v1")
+            .cgroup_limits(CgroupLimits {
+                cpu_quota_us: 200_000,
+                cpu_period_us: 100_000,
+                memory_limit_bytes: 0,
+                pids_max: 1024,
+                io_weight: 100,
+            })
+            .build();
+        assert!(
+            matches!(result, Err(CapsuleProfileError::ZeroCgroupMemory)),
+            "zero memory_limit_bytes must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_zero_pids_max() {
+        let result = CapsuleProfileBuilder::new("linux-ns-v1")
+            .cgroup_limits(CgroupLimits {
+                cpu_quota_us: 200_000,
+                cpu_period_us: 100_000,
+                memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+                pids_max: 0,
+                io_weight: 100,
+            })
+            .build();
+        assert!(
+            matches!(result, Err(CapsuleProfileError::ZeroCgroupPids)),
+            "zero pids_max must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_zero_cpu_quota() {
+        let result = CapsuleProfileBuilder::new("linux-ns-v1")
+            .cgroup_limits(CgroupLimits {
+                cpu_quota_us: 0,
+                cpu_period_us: 100_000,
+                memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+                pids_max: 1024,
+                io_weight: 100,
+            })
+            .build();
+        assert!(
+            matches!(result, Err(CapsuleProfileError::ZeroCgroupCpuQuota)),
+            "zero cpu_quota_us must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_zero_io_weight() {
+        let result = CapsuleProfileBuilder::new("linux-ns-v1")
+            .cgroup_limits(CgroupLimits {
+                cpu_quota_us: 200_000,
+                cpu_period_us: 100_000,
+                memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+                pids_max: 1024,
+                io_weight: 0,
+            })
+            .build();
+        assert!(
+            matches!(
+                result,
+                Err(CapsuleProfileError::InvalidCgroupIoWeight { value: 0 })
+            ),
+            "zero io_weight must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_io_weight_above_10000() {
+        let result = CapsuleProfileBuilder::new("linux-ns-v1")
+            .cgroup_limits(CgroupLimits {
+                cpu_quota_us: 200_000,
+                cpu_period_us: 100_000,
+                memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+                pids_max: 1024,
+                io_weight: 10001,
+            })
+            .build();
+        assert!(
+            matches!(
+                result,
+                Err(CapsuleProfileError::InvalidCgroupIoWeight { value: 10001 })
+            ),
+            "io_weight > 10000 must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_accepts_io_weight_at_boundaries() {
+        // io_weight = 1 (minimum valid)
+        let result = CapsuleProfileBuilder::new("linux-ns-v1")
+            .cgroup_limits(CgroupLimits {
+                cpu_quota_us: 200_000,
+                cpu_period_us: 100_000,
+                memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+                pids_max: 1024,
+                io_weight: 1,
+            })
+            .build();
+        assert!(
+            result.is_ok(),
+            "io_weight=1 should be valid: got {result:?}"
+        );
+
+        // io_weight = 10000 (maximum valid)
+        let result = CapsuleProfileBuilder::new("linux-ns-v1")
+            .cgroup_limits(CgroupLimits {
+                cpu_quota_us: 200_000,
+                cpu_period_us: 100_000,
+                memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+                pids_max: 1024,
+                io_weight: 10000,
+            })
+            .build();
+        assert!(
+            result.is_ok(),
+            "io_weight=10000 should be valid: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_all_zero_cgroups() {
+        // All cgroup controls at zero must be rejected
+        let result = CapsuleProfileBuilder::new("linux-ns-v1")
+            .cgroup_limits(CgroupLimits {
+                cpu_quota_us: 0,
+                cpu_period_us: 0,
+                memory_limit_bytes: 0,
+                pids_max: 0,
+                io_weight: 0,
+            })
+            .build();
+        assert!(
+            result.is_err(),
+            "all-zero cgroup limits must be rejected: got {result:?}"
+        );
     }
 }

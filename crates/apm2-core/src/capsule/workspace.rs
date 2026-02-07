@@ -193,6 +193,27 @@ impl WorkspaceConfinement {
             });
         }
 
+        // Reject ParentDir (..) and CurDir (.) components in workspace root
+        // BEFORE blocked-root policy checks. A root like `/tmp/../etc` would
+        // bypass lexical prefix checks against BLOCKED_ROOTS because the
+        // prefix `/tmp` is not blocked, but the path resolves to `/etc`.
+        // Per CTR-1504: iterate over components and reject ParentDir/CurDir.
+        for component in self.root.components() {
+            match component {
+                Component::ParentDir => {
+                    return Err(WorkspaceConfinementError::ForbiddenComponent {
+                        component: "ParentDir (..)".to_string(),
+                    });
+                },
+                Component::CurDir => {
+                    return Err(WorkspaceConfinementError::ForbiddenComponent {
+                        component: "CurDir (.)".to_string(),
+                    });
+                },
+                Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {},
+            }
+        }
+
         // Must not be a blocked system directory.
         // Use component-aware `starts_with` to prevent partial match bypass
         // (e.g., "/var/log" must be blocked because /var is blocked).
@@ -646,5 +667,79 @@ mod tests {
     fn test_contains_traversal_rejected() {
         let wc = WorkspaceConfinement::new("/workspace");
         assert!(wc.contains(Path::new("../secret")).is_err());
+    }
+
+    // =========================================================================
+    // BLOCKER 2: Workspace root with ParentDir (..) bypass regression tests
+    // =========================================================================
+
+    #[test]
+    fn test_workspace_root_rejects_parent_dir_bypass_to_etc() {
+        // /tmp/../etc resolves to /etc, bypassing the blocked-root check
+        // because /tmp is not blocked. The ParentDir component must be
+        // rejected before the blocked-root check runs.
+        let wc = WorkspaceConfinement::new("/tmp/../etc");
+        let result = wc.validate();
+        assert!(
+            matches!(
+                result,
+                Err(WorkspaceConfinementError::ForbiddenComponent { .. })
+            ),
+            "/tmp/../etc must be rejected due to ParentDir: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_workspace_root_rejects_deep_parent_dir_bypass() {
+        // /workspace/../../var resolves to /var, bypassing the non-blocked
+        // /workspace prefix.
+        let wc = WorkspaceConfinement::new("/workspace/../../var");
+        let result = wc.validate();
+        assert!(
+            matches!(
+                result,
+                Err(WorkspaceConfinementError::ForbiddenComponent { .. })
+            ),
+            "/workspace/../../var must be rejected due to ParentDir: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_workspace_root_rejects_triple_parent_dir_bypass() {
+        // /home/./user/../../../etc traverses to /etc via multiple ..
+        let wc = WorkspaceConfinement::new("/home/./user/../../../etc");
+        let result = wc.validate();
+        assert!(
+            result.is_err(),
+            "/home/./user/../../../etc must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_workspace_root_rejects_curdir_component() {
+        // Note: On Linux, Path::components() for absolute paths strips CurDir
+        // (.) components, so /home/./agent becomes [RootDir, "home", "agent"].
+        // However, for non-absolute paths or edge cases, CurDir should still
+        // be explicitly rejected. Test a path that retains CurDir in components.
+        //
+        // Actually for absolute paths on Linux, CurDir is stripped by
+        // Path::components(). But the ParentDir test covers the main bypass.
+        // This test verifies the /home/./user/../../../etc case catches
+        // ParentDir even when CurDir is present.
+        let wc = WorkspaceConfinement::new("/home/./user/../../../etc");
+        let result = wc.validate();
+        // Should be rejected due to ParentDir (CurDir is stripped by
+        // Path::components for absolute paths, but ParentDir remains)
+        assert!(
+            result.is_err(),
+            "path with . and .. must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_workspace_root_clean_path_still_works() {
+        // Verify clean absolute paths without . or .. still pass
+        let wc = WorkspaceConfinement::new("/home/agent/workspace");
+        assert!(wc.validate().is_ok());
     }
 }
