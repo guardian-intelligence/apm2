@@ -6,7 +6,8 @@
         "reviewer_id": "apm2-codex-security",
         "github_logins": [
           "apm2-security-bot",
-          "github-actions[bot]"
+          "github-actions[bot]",
+          "Anveio"
         ]
       }
     ],
@@ -15,7 +16,8 @@
         "reviewer_id": "apm2-codex-quality",
         "github_logins": [
           "apm2-quality-bot",
-          "github-actions[bot]"
+          "github-actions[bot]",
+          "Anveio"
         ]
       }
     ]
