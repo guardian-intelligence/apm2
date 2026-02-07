@@ -24,7 +24,10 @@ evidence_artifact:
         - test_proof_exceeds_max_proof_bytes_rejected
         - test_proof_exceeds_max_siblings_rejected
         - test_truncated_proof_bytes_rejected
-      ref: "cargo test -p apm2-daemon identity::directory_proof::tests::test_proof_exceeds_max_proof_bytes_rejected identity::directory_proof::tests::test_proof_exceeds_max_siblings_rejected identity::directory_proof::tests::test_truncated_proof_bytes_rejected"
+      ref:
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::test_proof_exceeds_max_proof_bytes_rejected"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::test_proof_exceeds_max_siblings_rejected"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::test_truncated_proof_bytes_rejected"
     - type: "test_output"
       description: |
         Post-decode depth/node economics:
@@ -32,10 +35,16 @@ evidence_artifact:
         - test_proof_exceeds_max_depth_rejected
         - test_proof_exceeds_profile_max_depth_rejected
         - directory_proof_rejects_non_default_sibling_inflation
-      ref: "cargo test -p apm2-daemon identity::directory_proof::tests::test_empty_siblings_list_rejected identity::directory_proof::tests::test_proof_exceeds_max_depth_rejected identity::directory_proof::tests::test_proof_exceeds_profile_max_depth_rejected identity::directory_proof::tests::directory_proof_rejects_non_default_sibling_inflation"
+      ref:
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::test_empty_siblings_list_rejected"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::test_proof_exceeds_max_depth_rejected"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::test_proof_exceeds_profile_max_depth_rejected"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::directory_proof_rejects_non_default_sibling_inflation"
     - type: "test_output"
       description: |
         Kind compatibility fail-closed admission checks:
         - test_patricia_proof_rejected_at_admission
         - test_profile_kind_mismatch_rejected
-      ref: "cargo test -p apm2-daemon identity::directory_proof::tests::test_patricia_proof_rejected_at_admission identity::directory_proof::tests::test_profile_kind_mismatch_rejected"
+      ref:
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::test_patricia_proof_rejected_at_admission"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::test_profile_kind_mismatch_rejected"
