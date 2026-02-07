@@ -491,13 +491,16 @@ impl DispatcherState {
     ///   dispatcher reuses this key instead of generating a new ephemeral one.
     ///   Per Security Review v5 MAJOR 2, there must be ONE signing key per
     ///   daemon lifecycle, shared between crash recovery and the dispatcher.
-    #[must_use]
+    /// # Errors
+    ///
+    /// Returns `Err` if adapter rotation initialization fails (e.g. CAS
+    /// seeding or policy validation).
     pub fn with_persistence(
         session_registry: Arc<dyn SessionRegistry>,
         metrics_registry: Option<SharedMetricsRegistry>,
         sqlite_conn: Option<Arc<Mutex<Connection>>>,
         ledger_signing_key: Option<ed25519_dalek::SigningKey>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         Self::with_persistence_and_adapter_rotation(
             session_registry,
             metrics_registry,
@@ -509,14 +512,23 @@ impl DispatcherState {
 
     /// Creates new dispatcher state with persistent ledger components and
     /// adapter rotation config (TCK-00400).
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if adapter rotation initialization fails. Specifically:
+    /// - CAS seeding of builtin adapter profiles fails
+    /// - Adapter selection policy validation fails
+    /// - No adapter-eligible enabled profile is available at startup
+    ///
+    /// Fail-closed: startup errors must be surfaced to the caller rather
+    /// than silently falling back to defaults that may violate policy.
     pub fn with_persistence_and_adapter_rotation(
         session_registry: Arc<dyn SessionRegistry>,
         metrics_registry: Option<SharedMetricsRegistry>,
         sqlite_conn: Option<Arc<Mutex<Connection>>>,
         ledger_signing_key: Option<ed25519_dalek::SigningKey>,
         adapter_rotation: &AdapterRotationConfig,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let token_secret = TokenMinter::generate_secret();
         let token_minter = Arc::new(TokenMinter::new(token_secret));
         let manifest_store = Arc::new(InMemoryManifestStore::new());
@@ -616,7 +628,7 @@ impl DispatcherState {
 
             // TCK-00400: Store all builtin adapter profiles in CAS at startup.
             let profile_hashes = seed_builtin_profiles_in_cas(cas.as_ref())
-                .expect("builtin adapter profile CAS seeding should succeed");
+                .map_err(|e| format!("builtin adapter profile CAS seeding failed: {e}"))?;
             // Fail-closed: invalid adapter rotation config must prevent
             // startup rather than silently falling back to defaults.
             let (adapter_selection_policy, available_profile_hashes) =
@@ -624,8 +636,7 @@ impl DispatcherState {
                     adapter_rotation,
                     &profile_hashes,
                     &adapter_registry,
-                )
-                .expect("daemon.adapter_rotation config must be valid at startup");
+                )?;
             let adapter_registry = Arc::new(adapter_registry);
 
             PrivilegedDispatcher::with_dependencies(
@@ -724,7 +735,7 @@ impl DispatcherState {
                 .with_stop_conditions_store(stop_conditions_store)
                 .with_v1_manifest_store(v1_manifest_store);
 
-        Self {
+        Ok(Self {
             privileged_dispatcher,
             session_dispatcher,
             gate_orchestrator: None,
@@ -733,7 +744,7 @@ impl DispatcherState {
             // runtime mutation by operator/governance control plane.
             stop_authority: Some(stop_authority),
             governance_freshness_monitor: Some(governance_freshness_monitor),
-        }
+        })
     }
 
     /// Creates new dispatcher state with persistent ledger, CAS, and
@@ -938,8 +949,11 @@ impl DispatcherState {
             crate::episode::claude_code::ClaudeCodeAdapter::new(),
         ));
         // TCK-00400: Store all builtin adapter profiles in CAS at startup.
-        let profile_hashes = seed_builtin_profiles_in_cas(evidence_cas.as_ref())
-            .expect("builtin adapter profile CAS seeding should succeed");
+        let profile_hashes = seed_builtin_profiles_in_cas(evidence_cas.as_ref()).map_err(|e| {
+            DurableCasError::InitializationFailed {
+                message: format!("builtin adapter profile CAS seeding failed: {e}"),
+            }
+        })?;
         // Fail-closed: invalid adapter rotation config must prevent startup
         // rather than silently falling back to defaults (propagate error).
         let (adapter_selection_policy, available_profile_hashes) =
@@ -1585,7 +1599,8 @@ mod tests {
     #[test]
     fn production_wiring_transitional_governance_uncertain_allows_gate() {
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
-        let state = DispatcherState::with_persistence(session_registry, None, None, None);
+        let state = DispatcherState::with_persistence(session_registry, None, None, None)
+            .expect("test dispatcher state initialization must succeed");
 
         let monitor = state
             .governance_freshness_monitor()
@@ -1628,7 +1643,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn production_wiring_periodic_probe_keeps_governance_uncertainty_in_transitional_mode() {
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
-        let state = DispatcherState::with_persistence(session_registry, None, None, None);
+        let state = DispatcherState::with_persistence(session_registry, None, None, None)
+            .expect("test dispatcher state initialization must succeed");
 
         let monitor = Arc::clone(
             state
@@ -1666,7 +1682,8 @@ mod tests {
     #[test]
     fn production_wiring_claim_work_success_does_not_clear_transitional_uncertainty() {
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
-        let state = DispatcherState::with_persistence(session_registry, None, None, None);
+        let state = DispatcherState::with_persistence(session_registry, None, None, None)
+            .expect("test dispatcher state initialization must succeed");
 
         let monitor = Arc::clone(
             state
@@ -1854,7 +1871,8 @@ mod tests {
     #[test]
     fn production_constructor_binds_deferred_budget_receipt_fields() {
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
-        let state = DispatcherState::with_persistence(session_registry, None, None, None);
+        let state = DispatcherState::with_persistence(session_registry, None, None, None)
+            .expect("test dispatcher state initialization must succeed");
         let gate = state
             .session_dispatcher()
             .preactuation_gate_for_test()

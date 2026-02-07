@@ -124,7 +124,7 @@ pub use aat_spec::{
 // Re-export adapter selection policy types (TCK-00400)
 pub use adapter_selection::{
     AdapterSelectionError, AdapterSelectionPolicy, AdapterSelectionStrategy, ProfileWeight,
-    SelectionDecision, SelectionWeightSnapshot,
+    SelectionDecision, SelectionWeightSnapshot, monotonic_secs,
 };
 // Re-export agent adapter profile types (TCK-00328)
 pub use agent_adapter_profile::{

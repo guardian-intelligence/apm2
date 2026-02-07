@@ -11,9 +11,28 @@
 //! reproduce profile selection decisions exactly.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Process-wide monotonic reference instant for backoff timing.
+///
+/// All backoff comparisons use seconds elapsed from this reference point,
+/// ensuring monotonic behaviour immune to wall-clock adjustments or drift.
+/// `Instant` is guaranteed monotonic on all supported platforms.
+static MONOTONIC_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Returns monotonic seconds elapsed since the process-wide reference instant.
+///
+/// This replaces `SystemTime::now()` for all backoff timing paths. The value
+/// increases monotonically and is never affected by NTP adjustments, leap
+/// seconds, or manual clock changes.
+#[must_use]
+pub fn monotonic_secs() -> u64 {
+    MONOTONIC_EPOCH.elapsed().as_secs()
+}
 
 /// Minimum number of failures before non-rate-limit failures trigger backoff.
 pub const FAILURE_BACKOFF_THRESHOLD: u32 = 2;
@@ -292,25 +311,28 @@ impl AdapterSelectionPolicy {
         *blake3::hash(&bytes).as_bytes()
     }
 
-    /// Select a profile using current wall clock time.
+    /// Select a profile using monotonic (non-wall-clock) time for backoff.
     ///
     /// `adapter_available` is the set of profile hashes whose adapters are
     /// currently implemented and registered in runtime.
+    ///
+    /// # Monotonic Time
+    ///
+    /// Uses [`monotonic_secs`] (backed by `Instant`) instead of `SystemTime`.
+    /// This ensures backoff windows are immune to NTP adjustments, leap
+    /// seconds, and manual clock changes.
     ///
     /// # Errors
     ///
     /// Returns [`AdapterSelectionError`] when policy validation fails or
     /// no eligible profile is available.
-    #[allow(clippy::disallowed_methods)] // Wall-clock fallback for convenience API
     pub fn select_profile(
         &mut self,
         work_id: &str,
         selection_attempt: u32,
         adapter_available: &BTreeSet<[u8; 32]>,
     ) -> Result<SelectionDecision, AdapterSelectionError> {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_secs());
+        let now_secs = monotonic_secs();
         self.select_profile_at(work_id, selection_attempt, now_secs, adapter_available)
     }
 

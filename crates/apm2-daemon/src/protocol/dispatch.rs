@@ -5253,24 +5253,18 @@ impl PrivilegedDispatcher {
         }
     }
 
-    fn is_rate_limited_spawn_error(error: &str) -> bool {
-        let normalized = error.to_ascii_lowercase();
-        normalized.contains("rate limit")
-            || normalized.contains("rate-limited")
-            || normalized.contains("429")
-            || normalized.contains("too many requests")
-            || normalized.contains("resource limit exceeded")
-    }
-
-    fn record_adapter_profile_failure(&self, profile_hash: &[u8; 32], error: &str) {
+    /// Records an adapter spawn failure with a pre-classified `rate_limited`
+    /// flag derived from typed error variants (not string matching).
+    ///
+    /// This is the preferred path for spawn failures from the typed
+    /// `SpawnFailure` flow where the error has already been classified via
+    /// `EpisodeError::is_rate_limited()` or `AdapterError` variant matching.
+    fn record_adapter_profile_failure_typed(&self, profile_hash: &[u8; 32], rate_limited: bool) {
         let Some(policy) = &self.adapter_selection_policy else {
             return;
         };
 
-        let now_secs = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_secs());
-        let rate_limited = Self::is_rate_limited_spawn_error(error);
+        let now_secs = apm2_core::fac::adapter_selection::monotonic_secs();
         match policy.lock() {
             Ok(mut guard) => {
                 if let Err(policy_err) = guard.record_failure(profile_hash, now_secs, rate_limited)
@@ -7609,11 +7603,46 @@ impl PrivilegedDispatcher {
                     msg,
                 ));
             };
-            let spawn_result: Result<(), String> = (|| {
-                let cas = self
-                    .cas
-                    .as_ref()
-                    .ok_or_else(|| "adapter spawn requires CAS configuration".to_string())?;
+            // SpawnFailure carries both the display message and a typed
+            // rate-limit classification derived from `AdapterError` variants,
+            // avoiding heuristic string matching for routing-state updates.
+            #[allow(clippy::items_after_statements)]
+            struct SpawnFailure {
+                message: String,
+                rate_limited: bool,
+            }
+
+            #[allow(clippy::items_after_statements)]
+            impl std::fmt::Display for SpawnFailure {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str(&self.message)
+                }
+            }
+
+            #[allow(clippy::items_after_statements)]
+            impl SpawnFailure {
+                fn config(msg: impl Into<String>) -> Self {
+                    Self {
+                        message: msg.into(),
+                        rate_limited: false,
+                    }
+                }
+
+                fn from_episode_error(prefix: &str, err: &crate::episode::EpisodeError) -> Self {
+                    // Typed classification: use `is_rate_limited()` on the
+                    // structured error instead of heuristic string matching.
+                    let rate_limited = err.is_rate_limited();
+                    Self {
+                        message: format!("{prefix}: {err}"),
+                        rate_limited,
+                    }
+                }
+            }
+
+            let spawn_result: Result<(), SpawnFailure> = (|| {
+                let cas = self.cas.as_ref().ok_or_else(|| {
+                    SpawnFailure::config("adapter spawn requires CAS configuration")
+                })?;
 
                 // SECURITY: adapter_profile_hash was resolved by
                 // resolve_spawn_adapter_profile_hash which documents the
@@ -7625,7 +7654,7 @@ impl PrivilegedDispatcher {
                     cas.as_ref(),
                     &adapter_profile_hash,
                 )
-                .map_err(|e| format!("adapter profile load failed: {e}"))?;
+                .map_err(|e| SpawnFailure::config(format!("adapter profile load failed: {e}")))?;
 
                 // SECURITY: Fail-closed adapter mode mapping.  Unknown or
                 // unsupported modes MUST be denied, not silently downgraded
@@ -7636,15 +7665,17 @@ impl PrivilegedDispatcher {
                     },
                     apm2_core::fac::AdapterMode::BlackBox => crate::episode::AdapterType::Raw,
                     unsupported => {
-                        return Err(format!(
+                        return Err(SpawnFailure::config(format!(
                             "unsupported adapter mode '{unsupported}': \
                              only BlackBox and StructuredOutput are supported"
-                        ));
+                        )));
                     },
                 };
 
                 let adapter = registry.get(adapter_type).ok_or_else(|| {
-                    format!("adapter type {adapter_type} not registered in registry")
+                    SpawnFailure::config(format!(
+                        "adapter type {adapter_type} not registered in registry"
+                    ))
                 })?;
 
                 // Build HarnessConfig. Prompt is empty -- actual prompt
@@ -7657,16 +7688,19 @@ impl PrivilegedDispatcher {
                     "",
                     &profile.profile_id,
                     &session_token_secret,
-                )?;
+                )
+                .map_err(SpawnFailure::config)?;
 
                 let rt_handle = tokio::runtime::Handle::try_current()
-                    .map_err(|_| "adapter spawn requires async runtime".to_string())?;
+                    .map_err(|_| SpawnFailure::config("adapter spawn requires async runtime"))?;
                 tokio::task::block_in_place(|| {
                     rt_handle.block_on(async {
                         self.episode_runtime
                             .spawn_adapter(episode_id, config, adapter)
                             .await
-                            .map_err(|e| format!("adapter spawn failed: {e}"))
+                            .map_err(|e| {
+                                SpawnFailure::from_episode_error("adapter spawn failed", &e)
+                            })
                     })
                 })?;
 
@@ -7677,7 +7711,7 @@ impl PrivilegedDispatcher {
                 // MAJOR fix: Fail-closed on spawn errors.  A successful
                 // SpawnEpisode response with no agent process is a silent
                 // failure.  Roll back the episode and return an error.
-                self.record_adapter_profile_failure(&adapter_profile_hash, &e);
+                self.record_adapter_profile_failure_typed(&adapter_profile_hash, e.rate_limited);
                 error!(
                     episode_id = %episode_id,
                     error = %e,

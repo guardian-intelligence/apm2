@@ -966,6 +966,7 @@ async fn async_main(args: Args) -> Result<()> {
                 Some(ledger_signing_key),
                 &daemon_config.config.daemon.adapter_rotation,
             )
+            .map_err(|e| anyhow::anyhow!("adapter rotation initialization failed: {e}"))?
         }
         .with_daemon_state(Arc::clone(&state)),
     );
