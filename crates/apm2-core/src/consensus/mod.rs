@@ -123,7 +123,7 @@ pub use equivocation::{
 pub use fact_root::{
     CompactMultiProof, FactRootError, FactRootV1, FactRootVerificationResult, FactRootVerifier,
     MAX_BATCH_ROOTS, MAX_COMPACT_MULTIPROOF_LEAVES, MAX_COMPACT_PROOF_NODES,
-    MAX_COMPACT_PROOF_STRUCTURE, ProofPathEntry, build_compact_multiproof,
+    MAX_COMPACT_PROOF_STRUCTURE, ProofPathEntry, build_compact_multiproof, compute_qc_anchor_hash,
 };
 pub use genesis::{
     Genesis, GenesisConfig, GenesisConfigBuilder, GenesisError, GenesisValidator, InvitationToken,

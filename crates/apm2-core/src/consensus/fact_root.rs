@@ -68,6 +68,57 @@ pub const MAX_COMPACT_PROOF_STRUCTURE: usize = 4096;
 pub const MAX_COMPACT_MULTIPROOF_LEAVES: usize = 1 << 20;
 
 // ============================================================================
+// QC canonical hash
+// ============================================================================
+
+/// Domain separator for QC anchor hash computation.
+const QC_ANCHOR_DOMAIN_SEPARATOR: &[u8] = b"apm2:qc_anchor:v1\0";
+
+/// Computes the anchor-binding hash of a `QuorumCertificate`.
+///
+/// This hash covers the QC's identity fields (epoch, round) and quorum
+/// signatures but **excludes** `block_hash`, because `block_hash` is already
+/// separately verified via `fact_root.content_hash() == qc.block_hash`.
+/// Excluding `block_hash` avoids a circular dependency: the fact root's
+/// `content_hash()` depends on `qc_anchor_hash`, which would depend on
+/// `block_hash`, which in turn depends on `content_hash()`.
+///
+/// Layout:
+/// ```text
+/// domain_separator
+/// + epoch (8 bytes LE)
+/// + round (8 bytes LE)
+/// + sig_count (4 bytes LE)
+/// + [validator_id (32 bytes) + signature (64 bytes)] * sig_count
+/// ```
+///
+/// Signatures are included in their existing order (deterministic from QC
+/// construction) so that the hash is stable.
+#[must_use]
+pub fn compute_qc_anchor_hash(qc: &super::bft::QuorumCertificate) -> Hash {
+    let sig_count = qc.signatures.len();
+    let total = QC_ANCHOR_DOMAIN_SEPARATOR.len()
+        + 8 // epoch
+        + 8 // round
+        + 4 // sig_count
+        + sig_count * (32 + 64); // validator_id + signature per sig
+
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(QC_ANCHOR_DOMAIN_SEPARATOR);
+    out.extend_from_slice(&qc.epoch.to_le_bytes());
+    out.extend_from_slice(&qc.round.to_le_bytes());
+    #[allow(clippy::cast_possible_truncation)]
+    let count = sig_count as u32;
+    out.extend_from_slice(&count.to_le_bytes());
+    for sig in &qc.signatures {
+        out.extend_from_slice(&sig.validator_id);
+        out.extend_from_slice(&sig.signature);
+    }
+
+    EventHasher::hash_content(&out)
+}
+
+// ============================================================================
 // Errors
 // ============================================================================
 
@@ -119,6 +170,14 @@ pub enum FactRootError {
     /// QC verification failed.
     #[error("QC verification failed: {0}")]
     QcVerificationFailed(String),
+
+    /// Genesis QC is not allowed in non-genesis verification context.
+    #[error("genesis QC (round=0, no signatures) is not accepted in non-genesis context")]
+    GenesisQcNotAllowed,
+
+    /// The QC anchor hash does not match the canonical hash of the provided QC.
+    #[error("QC anchor hash mismatch: fact root references a different QC")]
+    QcAnchorHashMismatch,
 
     /// Compact multiproof has too many proof nodes.
     #[error("compact multiproof node count {count} exceeds maximum {max}")]
@@ -385,10 +444,12 @@ impl FactRootV1 {
 /// Verifier for `FactRootV1` against QC-certified checkpoints.
 ///
 /// Validates that:
-/// 1. The QC is valid (quorum met, signatures verified).
-/// 2. The `FactRootV1` epoch matches the QC epoch.
-/// 3. The `FactRootV1` content hash matches the QC block hash (binding).
-/// 4. Free-floating batch roots (no QC anchor) are rejected.
+/// 1. Genesis QCs are rejected unless explicitly trusted.
+/// 2. The QC is valid (quorum met, signatures verified).
+/// 3. The `FactRootV1` epoch matches the QC epoch.
+/// 4. The `FactRootV1` content hash matches the QC block hash (binding).
+/// 5. The `qc_anchor_hash` matches the canonical hash of the provided QC.
+/// 6. Free-floating batch roots (no QC anchor) are rejected.
 pub struct FactRootVerifier;
 
 /// Result of `FactRootV1` verification.
@@ -407,6 +468,10 @@ pub struct FactRootVerificationResult {
 impl FactRootVerifier {
     /// Verify a `FactRootV1` against a quorum certificate.
     ///
+    /// Genesis QCs (round=0, no signatures) are **rejected** in this path.
+    /// Use [`Self::verify_trusted_genesis`] for explicitly trusted genesis
+    /// contexts.
+    ///
     /// # Arguments
     ///
     /// - `fact_root`: the fact root to verify.
@@ -416,10 +481,49 @@ impl FactRootVerifier {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The QC is a genesis QC (use `verify_trusted_genesis` instead)
     /// - The QC fails verification (insufficient quorum, invalid signatures)
     /// - The fact root epoch does not match the QC epoch
     /// - The fact root content hash does not match the QC block hash
+    /// - The `qc_anchor_hash` does not match the canonical hash of the QC
     pub fn verify(
+        fact_root: &FactRootV1,
+        qc: &super::bft::QuorumCertificate,
+        context: &QcVerificationContext,
+    ) -> Result<FactRootVerificationResult, FactRootError> {
+        // 1. Reject genesis QCs in non-genesis context.
+        if qc.is_genesis() {
+            return Err(FactRootError::GenesisQcNotAllowed);
+        }
+
+        Self::verify_inner(fact_root, qc, context)
+    }
+
+    /// Verify a `FactRootV1` against an explicitly trusted genesis QC.
+    ///
+    /// This method accepts genesis QCs (round=0, no signatures) and should
+    /// only be used in trusted genesis bootstrap contexts where the genesis
+    /// state is known to be authentic.
+    ///
+    /// # Arguments
+    ///
+    /// - `fact_root`: the fact root to verify.
+    /// - `qc`: the genesis quorum certificate.
+    /// - `context`: the QC verification context (validator set + threshold).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if verification fails for any other reason.
+    pub fn verify_trusted_genesis(
+        fact_root: &FactRootV1,
+        qc: &super::bft::QuorumCertificate,
+        context: &QcVerificationContext,
+    ) -> Result<FactRootVerificationResult, FactRootError> {
+        Self::verify_inner(fact_root, qc, context)
+    }
+
+    /// Shared verification logic for both genesis and non-genesis paths.
+    fn verify_inner(
         fact_root: &FactRootV1,
         qc: &super::bft::QuorumCertificate,
         context: &QcVerificationContext,
@@ -427,7 +531,14 @@ impl FactRootVerifier {
         // 1. Verify the QC itself.
         verify_qc(qc, context).map_err(|e| FactRootError::QcVerificationFailed(e.to_string()))?;
 
-        // 2. Epoch binding: fact root epoch must match QC epoch.
+        // 2. QC anchor hash binding: the fact root's qc_anchor_hash must match the
+        //    canonical hash of the provided QC.
+        let qc_canonical_hash = compute_qc_anchor_hash(qc);
+        if fact_root.qc_anchor_hash != qc_canonical_hash {
+            return Err(FactRootError::QcAnchorHashMismatch);
+        }
+
+        // 3. Epoch binding: fact root epoch must match QC epoch.
         if fact_root.epoch != qc.epoch {
             return Err(FactRootError::EpochMismatch {
                 fact_root_epoch: fact_root.epoch,
@@ -435,7 +546,7 @@ impl FactRootVerifier {
             });
         }
 
-        // 3. Content binding: fact root content hash must match QC block hash.
+        // 4. Content binding: fact root content hash must match QC block hash.
         let content_hash = fact_root.content_hash();
         if content_hash != qc.block_hash {
             return Err(FactRootError::ContentHashMismatch);
@@ -974,20 +1085,39 @@ mod tck_00370_unit_tests {
     // ── FactRootVerifier tests ──
 
     #[test]
+    fn fact_root_verifier_rejects_genesis_qc_in_non_genesis_context() {
+        use crate::consensus::bft::QuorumCertificate;
+
+        let qc = QuorumCertificate::genesis(0, [0xab; 32]);
+        let qc_anchor = compute_qc_anchor_hash(&qc);
+        let batch_roots = vec![test_hash(1)];
+        let fact_root = FactRootV1::new(batch_roots, 0, qc_anchor).unwrap();
+
+        let validators = create_test_validators(4);
+        let context = QcVerificationContext::new(&validators, 3);
+
+        // verify() must reject genesis QCs
+        let result = FactRootVerifier::verify(&fact_root, &qc, &context);
+        assert!(
+            matches!(result, Err(FactRootError::GenesisQcNotAllowed)),
+            "expected GenesisQcNotAllowed, got: {result:?}"
+        );
+    }
+
+    #[test]
     fn fact_root_verifier_rejects_epoch_mismatch() {
         use crate::consensus::bft::QuorumCertificate;
 
+        // Use genesis path (via verify_trusted_genesis) to isolate the epoch check.
+        let qc = QuorumCertificate::genesis(2, [0xab; 32]);
+        let qc_anchor = compute_qc_anchor_hash(&qc);
         let batch_roots = vec![test_hash(1)];
-        let fact_root = FactRootV1::new(batch_roots, 1, test_hash(100)).unwrap();
-
-        // QC with different epoch
-        let qc = QuorumCertificate::genesis(2, fact_root.content_hash());
+        let fact_root = FactRootV1::new(batch_roots, 1, qc_anchor).unwrap();
 
         let validators = create_test_validators(4);
-        let threshold = 3;
-        let context = QcVerificationContext::new(&validators, threshold);
+        let context = QcVerificationContext::new(&validators, 3);
 
-        let result = FactRootVerifier::verify(&fact_root, &qc, &context);
+        let result = FactRootVerifier::verify_trusted_genesis(&fact_root, &qc, &context);
         assert!(matches!(result, Err(FactRootError::EpochMismatch { .. })));
     }
 
@@ -995,36 +1125,57 @@ mod tck_00370_unit_tests {
     fn fact_root_verifier_rejects_content_hash_mismatch() {
         use crate::consensus::bft::QuorumCertificate;
 
-        let batch_roots = vec![test_hash(1)];
-        let fact_root = FactRootV1::new(batch_roots, 1, test_hash(100)).unwrap();
-
-        // QC with wrong block hash
         let qc = QuorumCertificate::genesis(1, [0xab; 32]);
+        let qc_anchor = compute_qc_anchor_hash(&qc);
+        let batch_roots = vec![test_hash(1)];
+        let fact_root = FactRootV1::new(batch_roots, 1, qc_anchor).unwrap();
 
         let validators = create_test_validators(4);
-        let threshold = 3;
-        let context = QcVerificationContext::new(&validators, threshold);
+        let context = QcVerificationContext::new(&validators, 3);
 
-        let result = FactRootVerifier::verify(&fact_root, &qc, &context);
+        let result = FactRootVerifier::verify_trusted_genesis(&fact_root, &qc, &context);
         assert!(matches!(result, Err(FactRootError::ContentHashMismatch)));
     }
 
     #[test]
-    fn fact_root_verifier_valid_genesis_qc() {
+    fn fact_root_verifier_rejects_wrong_qc_anchor_hash() {
         use crate::consensus::bft::QuorumCertificate;
 
-        let batch_roots = vec![test_hash(1), test_hash(2)];
-        let fact_root = FactRootV1::new(batch_roots, 0, test_hash(100)).unwrap();
+        // Build a genesis QC and a fact root whose qc_anchor_hash is
+        // arbitrary (non-zero but does NOT match the QC's canonical hash).
+        let qc = QuorumCertificate::genesis(0, [0xab; 32]);
+        let wrong_anchor = test_hash(999); // not the canonical QC hash
+        let batch_roots = vec![test_hash(1)];
+        let fact_root = FactRootV1::new(batch_roots, 0, wrong_anchor).unwrap();
 
-        // Genesis QC with matching content hash and epoch 0
+        let validators = create_test_validators(4);
+        let context = QcVerificationContext::new(&validators, 3);
+
+        let result = FactRootVerifier::verify_trusted_genesis(&fact_root, &qc, &context);
+        assert!(
+            matches!(result, Err(FactRootError::QcAnchorHashMismatch)),
+            "expected QcAnchorHashMismatch, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn fact_root_verifier_valid_trusted_genesis_qc() {
+        use crate::consensus::bft::QuorumCertificate;
+
+        // The anchor hash excludes block_hash, so all genesis QCs for the
+        // same epoch share the same anchor hash regardless of block_hash.
+        let qc_anchor = compute_qc_anchor_hash(&QuorumCertificate::genesis(0, [0u8; 32]));
+        let batch_roots = vec![test_hash(1), test_hash(2)];
+        let fact_root = FactRootV1::new(batch_roots, 0, qc_anchor).unwrap();
         let content_hash = fact_root.content_hash();
+
+        // Build the real QC whose block_hash = fact root content hash.
         let qc = QuorumCertificate::genesis(0, content_hash);
 
         let validators = create_test_validators(4);
-        let threshold = 3;
-        let context = QcVerificationContext::new(&validators, threshold);
+        let context = QcVerificationContext::new(&validators, 3);
 
-        let result = FactRootVerifier::verify(&fact_root, &qc, &context).unwrap();
+        let result = FactRootVerifier::verify_trusted_genesis(&fact_root, &qc, &context).unwrap();
         assert_eq!(result.content_hash, content_hash);
         assert_eq!(result.epoch, 0);
         assert_eq!(result.batch_count, 2);
