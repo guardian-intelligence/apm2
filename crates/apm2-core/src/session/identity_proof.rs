@@ -73,10 +73,6 @@ const SESSION_OPEN_RESPONSE_DOMAIN: &[u8] = b"apm2:session_open_response:v1\0";
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SessionIdentityError {
-    /// Identity proof hash is missing (all zeros).
-    #[error("identity proof hash is missing")]
-    MissingIdentityProofHash,
-
     /// Holon ID hash is missing (all zeros).
     #[error("holon ID hash is missing")]
     MissingHolonId,
@@ -116,6 +112,16 @@ pub enum SessionIdentityError {
         current_tick: u64,
         /// Proof generation tick.
         proof_generated_at_tick: u64,
+    },
+
+    /// Freshness threshold is zero for an authoritative tier (Tier2+).
+    ///
+    /// A zero threshold means "no freshness check" which violates
+    /// fail-closed semantics for authoritative tiers.
+    #[error("freshness threshold must be > 0 for authoritative tier {risk_tier:?}")]
+    ZeroThresholdForAuthoritativeTier {
+        /// The risk tier with the invalid threshold.
+        risk_tier: RiskTier,
     },
 }
 
@@ -157,12 +163,33 @@ impl Default for FreshnessPolicy {
 
 impl FreshnessPolicy {
     /// Creates a new freshness policy with explicit thresholds.
-    #[must_use]
-    pub const fn new(thresholds: [u64; 5], allow_degraded_discovery: bool) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionIdentityError::ZeroThresholdForAuthoritativeTier`]
+    /// if any Tier2+ threshold is zero. A zero threshold would disable
+    /// freshness enforcement, violating fail-closed semantics.
+    pub fn new(
+        thresholds: [u64; 5],
+        allow_degraded_discovery: bool,
+    ) -> Result<Self, SessionIdentityError> {
+        // Tier2 = index 2, Tier3 = index 3, Tier4 = index 4.
+        let authoritative_tiers = [
+            (2, RiskTier::Tier2),
+            (3, RiskTier::Tier3),
+            (4, RiskTier::Tier4),
+        ];
+        for (idx, tier) in authoritative_tiers {
+            if thresholds[idx] == 0 {
+                return Err(SessionIdentityError::ZeroThresholdForAuthoritativeTier {
+                    risk_tier: tier,
+                });
+            }
+        }
+        Ok(Self {
             thresholds,
             allow_degraded_discovery,
-        }
+        })
     }
 
     /// Returns the maximum staleness in ticks for the given risk tier.
@@ -288,6 +315,9 @@ impl SessionOpenRequest {
 ///
 /// The response MUST include non-zero `cell_certificate_hash` and
 /// `directory_head_hash` for the session authority to be valid.
+///
+/// For Tier2+ (authoritative) sessions, `freshness_witness` and
+/// `policy_pointer` MUST be populated to satisfy bound requirements.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionOpenResponse {
     /// Hash of the cell certificate binding the session authority.
@@ -301,6 +331,14 @@ pub struct SessionOpenResponse {
 
     /// Risk tier acknowledged by the daemon.
     risk_tier: RiskTier,
+
+    /// Verifier-side freshness witness hash binding the proof evaluation
+    /// to the verifier's observed state. Required for Tier2+ responses.
+    freshness_witness: Option<Hash>,
+
+    /// Hash of the freshness policy that was applied. Required for Tier2+
+    /// responses so clients can verify which policy governed admission.
+    policy_pointer: Option<Hash>,
 }
 
 impl SessionOpenResponse {
@@ -309,12 +347,15 @@ impl SessionOpenResponse {
     /// # Errors
     ///
     /// Returns an error if required hashes are missing for the given
-    /// decision.
+    /// decision. For Tier2+ admitted/degraded sessions, `freshness_witness`
+    /// and `policy_pointer` must be provided.
     pub fn new(
         cell_certificate_hash: Hash,
         directory_head_hash: Hash,
         decision: FreshnessDecision,
         risk_tier: RiskTier,
+        freshness_witness: Option<Hash>,
+        policy_pointer: Option<Hash>,
     ) -> Result<Self, SessionIdentityError> {
         // For admitted sessions, both hashes must be present.
         if decision != FreshnessDecision::Denied {
@@ -330,6 +371,8 @@ impl SessionOpenResponse {
             directory_head_hash,
             decision,
             risk_tier,
+            freshness_witness,
+            policy_pointer,
         })
     }
 
@@ -357,6 +400,18 @@ impl SessionOpenResponse {
         self.risk_tier
     }
 
+    /// Returns the freshness witness hash, if present.
+    #[must_use]
+    pub const fn freshness_witness(&self) -> Option<&Hash> {
+        self.freshness_witness.as_ref()
+    }
+
+    /// Returns the policy pointer hash, if present.
+    #[must_use]
+    pub const fn policy_pointer(&self) -> Option<&Hash> {
+        self.policy_pointer.as_ref()
+    }
+
     /// Computes the canonical hash of this response for receipt binding.
     #[must_use]
     pub fn canonical_hash(&self) -> Hash {
@@ -366,6 +421,24 @@ impl SessionOpenResponse {
         hasher.update(&self.directory_head_hash);
         hasher.update(&[self.decision as u8]);
         hasher.update(&[self.risk_tier as u8]);
+        match &self.freshness_witness {
+            Some(h) => {
+                hasher.update(&[0x01]);
+                hasher.update(h);
+            },
+            None => {
+                hasher.update(&[0x00]);
+            },
+        }
+        match &self.policy_pointer {
+            Some(h) => {
+                hasher.update(&[0x01]);
+                hasher.update(h);
+            },
+            None => {
+                hasher.update(&[0x00]);
+            },
+        }
         *hasher.finalize().as_bytes()
     }
 }
@@ -435,13 +508,24 @@ impl FreshnessEvaluator {
     /// # Arguments
     ///
     /// * `request` - The session-open request to evaluate.
-    /// * `current_tick` - The current authoritative tick.
+    /// * `current_tick` - The current authoritative tick from the verifier.
+    /// * `verifier_observed_tick` - Verifier-side tick at which the proof was
+    ///   first observed or validated. This MUST come from verifier-bound data,
+    ///   NOT from the request. Freshness age is computed as `current_tick -
+    ///   verifier_observed_tick` to prevent clients from claiming an
+    ///   artificially recent generation time.
     ///
     /// # Returns
     ///
     /// A [`FreshnessOutcome`] describing the decision and any defect to emit.
     #[must_use]
-    pub fn evaluate(&self, request: &SessionOpenRequest, current_tick: u64) -> FreshnessOutcome {
+    #[allow(clippy::too_many_lines)]
+    pub fn evaluate(
+        &self,
+        request: &SessionOpenRequest,
+        current_tick: u64,
+        verifier_observed_tick: u64,
+    ) -> FreshnessOutcome {
         let risk_tier = request.risk_tier();
         let max_staleness = self.policy.max_staleness_ticks(risk_tier);
         let is_authoritative = FreshnessPolicy::is_authoritative_tier(risk_tier);
@@ -478,8 +562,8 @@ impl FreshnessEvaluator {
             };
         }
 
-        // Case 2: Tick reversal (current < generated).
-        if current_tick < request.proof_generated_at_tick() {
+        // Case 2: Tick reversal (current < verifier observed).
+        if current_tick < verifier_observed_tick {
             return FreshnessOutcome {
                 decision: FreshnessDecision::Denied,
                 risk_tier,
@@ -488,15 +572,24 @@ impl FreshnessEvaluator {
                 defect: Some(SessionIdentityDefect::TickReversal {
                     risk_tier,
                     current_tick,
-                    proof_generated_at_tick: request.proof_generated_at_tick(),
+                    proof_generated_at_tick: verifier_observed_tick,
                 }),
             };
         }
 
-        let age_ticks = current_tick - request.proof_generated_at_tick();
+        // Use verifier-side timestamp for age computation, not the
+        // client-provided proof_generated_at_tick. This prevents a
+        // client from claiming an artificially recent generation time.
+        let age_ticks = current_tick - verifier_observed_tick;
 
         // Case 3: No staleness enforcement for this tier (threshold == 0).
+        // This is only reachable for Tier0/Tier1; FreshnessPolicy::new rejects
+        // threshold=0 for Tier2+ to enforce fail-closed semantics.
         if max_staleness == 0 {
+            debug_assert!(
+                !is_authoritative,
+                "threshold=0 should be rejected at construction for Tier2+"
+            );
             return FreshnessOutcome {
                 decision: FreshnessDecision::Admitted,
                 risk_tier,
@@ -765,6 +858,19 @@ impl SessionOpenReceipt {
 // Top-Level Session Open Handler
 // =============================================================================
 
+/// Result of [`process_session_open`] including the response, receipt,
+/// and any defects emitted during evaluation.
+#[derive(Debug, Clone)]
+pub struct SessionOpenResult {
+    /// The response outcome: `Ok` on admit/degrade, `Err` on deny.
+    pub response: Result<SessionOpenResponse, SessionIdentityError>,
+    /// Audit receipt binding the request, response, and freshness decision.
+    pub receipt: SessionOpenReceipt,
+    /// Defects emitted during freshness evaluation (stale/missing proofs,
+    /// tick reversals, etc.). Empty when the proof is valid and fresh.
+    pub defects: Vec<SessionIdentityDefect>,
+}
+
 /// Processes a session-open request against a freshness policy.
 ///
 /// This is the primary entry point for session-open identity enforcement.
@@ -775,25 +881,39 @@ impl SessionOpenReceipt {
 ///
 /// * `evaluator` - The freshness evaluator with configured policy.
 /// * `request` - The session-open request.
-/// * `current_tick` - Authoritative current tick for freshness computation.
+/// * `current_tick` - Authoritative current tick from the verifier.
+/// * `verifier_observed_tick` - Verifier-side tick at which the proof was first
+///   observed. MUST NOT come from the request.
 /// * `cell_certificate_hash` - Cell certificate hash from the daemon.
 /// * `directory_head_hash` - Directory head hash from the daemon.
+/// * `freshness_witness` - Verifier freshness witness hash (required for
+///   Tier2+).
+/// * `policy_pointer` - Hash of the applied freshness policy (required for
+///   Tier2+).
 ///
 /// # Returns
 ///
-/// A tuple of `(Result<SessionOpenResponse, SessionIdentityError>,
-/// SessionOpenReceipt)`.
+/// A [`SessionOpenResult`] containing the response, receipt, and defects.
+///
+/// # Integration
+///
+/// TODO: Daemon wiring is a separate integration task. The daemon's
+/// session-open flow must call this function with verifier-local tick
+/// and proof-observation data. See RFC-0020 for the integration path.
+#[must_use]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn process_session_open(
     evaluator: &FreshnessEvaluator,
     request: &SessionOpenRequest,
     current_tick: u64,
+    verifier_observed_tick: u64,
     cell_certificate_hash: Hash,
     directory_head_hash: Hash,
-) -> (
-    Result<SessionOpenResponse, SessionIdentityError>,
-    SessionOpenReceipt,
-) {
-    let outcome = evaluator.evaluate(request, current_tick);
+    freshness_witness: Option<Hash>,
+    policy_pointer: Option<Hash>,
+) -> SessionOpenResult {
+    let outcome = evaluator.evaluate(request, current_tick, verifier_observed_tick);
+    let defects: Vec<SessionIdentityDefect> = outcome.defect.clone().into_iter().collect();
 
     match outcome.decision {
         FreshnessDecision::Admitted | FreshnessDecision::Degraded => {
@@ -802,6 +922,8 @@ pub fn process_session_open(
                 directory_head_hash,
                 outcome.decision,
                 request.risk_tier(),
+                freshness_witness,
+                policy_pointer,
             ) {
                 Ok(response) => {
                     let receipt = SessionOpenReceipt::from_outcome(
@@ -810,13 +932,21 @@ pub fn process_session_open(
                         &outcome,
                         current_tick,
                     );
-                    (Ok(response), receipt)
+                    SessionOpenResult {
+                        response: Ok(response),
+                        receipt,
+                        defects,
+                    }
                 },
                 Err(e) => {
                     // Response construction failed (missing hashes).
                     let receipt =
                         SessionOpenReceipt::from_outcome(request, None, &outcome, current_tick);
-                    (Err(e), receipt)
+                    SessionOpenResult {
+                        response: Err(e),
+                        receipt,
+                        defects,
+                    }
                 },
             }
         },
@@ -826,13 +956,13 @@ pub fn process_session_open(
                 SessionIdentityError::ProofRequired {
                     risk_tier: request.risk_tier(),
                 }
-            } else if current_tick < request.proof_generated_at_tick() {
+            } else if current_tick < verifier_observed_tick {
                 SessionIdentityError::TickReversal {
                     current_tick,
-                    proof_generated_at_tick: request.proof_generated_at_tick(),
+                    proof_generated_at_tick: verifier_observed_tick,
                 }
             } else {
-                let age_ticks = current_tick - request.proof_generated_at_tick();
+                let age_ticks = current_tick - verifier_observed_tick;
                 SessionIdentityError::ProofStale {
                     age_ticks,
                     max_staleness_ticks: evaluator
@@ -841,7 +971,11 @@ pub fn process_session_open(
                     risk_tier: request.risk_tier(),
                 }
             };
-            (Err(error), receipt)
+            SessionOpenResult {
+                response: Err(error),
+                receipt,
+                defects,
+            }
         },
     }
 }
@@ -867,10 +1001,9 @@ mod tests {
     }
 
     fn strict_evaluator() -> FreshnessEvaluator {
-        FreshnessEvaluator::new(FreshnessPolicy::new(
-            [0, 1_000_000, 100_000, 10_000, 1_000],
-            false,
-        ))
+        FreshnessEvaluator::new(
+            FreshnessPolicy::new([0, 1_000_000, 100_000, 10_000, 1_000], false).unwrap(),
+        )
     }
 
     // =========================================================================
@@ -930,6 +1063,8 @@ mod tests {
             test_hash(0x02),
             FreshnessDecision::Admitted,
             RiskTier::Tier2,
+            None,
+            None,
         );
         assert_eq!(
             result.unwrap_err(),
@@ -944,6 +1079,8 @@ mod tests {
             zero_hash(),
             FreshnessDecision::Admitted,
             RiskTier::Tier2,
+            None,
+            None,
         );
         assert_eq!(
             result.unwrap_err(),
@@ -958,6 +1095,8 @@ mod tests {
             zero_hash(),
             FreshnessDecision::Denied,
             RiskTier::Tier3,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(resp.decision(), FreshnessDecision::Denied);
@@ -970,6 +1109,8 @@ mod tests {
             test_hash(0x02),
             FreshnessDecision::Admitted,
             RiskTier::Tier2,
+            Some(test_hash(0xCC)),
+            Some(test_hash(0xDD)),
         )
         .unwrap();
         let r2 = SessionOpenResponse::new(
@@ -977,9 +1118,49 @@ mod tests {
             test_hash(0x02),
             FreshnessDecision::Admitted,
             RiskTier::Tier2,
+            Some(test_hash(0xCC)),
+            Some(test_hash(0xDD)),
         )
         .unwrap();
         assert_eq!(r1.canonical_hash(), r2.canonical_hash());
+    }
+
+    #[test]
+    fn response_freshness_witness_and_policy_pointer_accessors() {
+        let resp = SessionOpenResponse::new(
+            test_hash(0x01),
+            test_hash(0x02),
+            FreshnessDecision::Admitted,
+            RiskTier::Tier2,
+            Some(test_hash(0xCC)),
+            Some(test_hash(0xDD)),
+        )
+        .unwrap();
+        assert_eq!(resp.freshness_witness(), Some(&test_hash(0xCC)));
+        assert_eq!(resp.policy_pointer(), Some(&test_hash(0xDD)));
+    }
+
+    #[test]
+    fn response_canonical_hash_differs_with_witness() {
+        let r1 = SessionOpenResponse::new(
+            test_hash(0x01),
+            test_hash(0x02),
+            FreshnessDecision::Admitted,
+            RiskTier::Tier2,
+            None,
+            None,
+        )
+        .unwrap();
+        let r2 = SessionOpenResponse::new(
+            test_hash(0x01),
+            test_hash(0x02),
+            FreshnessDecision::Admitted,
+            RiskTier::Tier2,
+            Some(test_hash(0xCC)),
+            None,
+        )
+        .unwrap();
+        assert_ne!(r1.canonical_hash(), r2.canonical_hash());
     }
 
     // =========================================================================
@@ -1021,6 +1202,46 @@ mod tests {
         assert!(FreshnessPolicy::is_authoritative_tier(RiskTier::Tier4));
     }
 
+    #[test]
+    fn policy_rejects_zero_threshold_for_tier2() {
+        let result = FreshnessPolicy::new([0, 1_000, 0, 10_000, 1_000], true);
+        assert_eq!(
+            result.unwrap_err(),
+            SessionIdentityError::ZeroThresholdForAuthoritativeTier {
+                risk_tier: RiskTier::Tier2,
+            }
+        );
+    }
+
+    #[test]
+    fn policy_rejects_zero_threshold_for_tier3() {
+        let result = FreshnessPolicy::new([0, 1_000, 100_000, 0, 1_000], true);
+        assert_eq!(
+            result.unwrap_err(),
+            SessionIdentityError::ZeroThresholdForAuthoritativeTier {
+                risk_tier: RiskTier::Tier3,
+            }
+        );
+    }
+
+    #[test]
+    fn policy_rejects_zero_threshold_for_tier4() {
+        let result = FreshnessPolicy::new([0, 1_000, 100_000, 10_000, 0], true);
+        assert_eq!(
+            result.unwrap_err(),
+            SessionIdentityError::ZeroThresholdForAuthoritativeTier {
+                risk_tier: RiskTier::Tier4,
+            }
+        );
+    }
+
+    #[test]
+    fn policy_allows_zero_threshold_for_tier0_tier1() {
+        let policy = FreshnessPolicy::new([0, 0, 100_000, 10_000, 1_000], true).unwrap();
+        assert_eq!(policy.max_staleness_ticks(RiskTier::Tier0), 0);
+        assert_eq!(policy.max_staleness_ticks(RiskTier::Tier1), 0);
+    }
+
     // =========================================================================
     // FreshnessEvaluator: Tier0 Tests
     // =========================================================================
@@ -1030,7 +1251,8 @@ mod tests {
         let eval = default_evaluator();
         let req = SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 100, RiskTier::Tier0)
             .unwrap();
-        let outcome = eval.evaluate(&req, 200);
+        // verifier_observed_tick = 100 (same as client claim), current = 200
+        let outcome = eval.evaluate(&req, 200, 100);
         assert_eq!(outcome.decision, FreshnessDecision::Admitted);
         assert!(outcome.defect.is_none());
     }
@@ -1040,7 +1262,7 @@ mod tests {
         let eval = default_evaluator();
         let req =
             SessionOpenRequest::new(test_hash(0x01), zero_hash(), 0, RiskTier::Tier0).unwrap();
-        let outcome = eval.evaluate(&req, 200);
+        let outcome = eval.evaluate(&req, 200, 0);
         assert_eq!(outcome.decision, FreshnessDecision::Degraded);
         assert!(matches!(
             outcome.defect,
@@ -1053,7 +1275,7 @@ mod tests {
         let eval = strict_evaluator();
         let req =
             SessionOpenRequest::new(test_hash(0x01), zero_hash(), 0, RiskTier::Tier0).unwrap();
-        let outcome = eval.evaluate(&req, 200);
+        let outcome = eval.evaluate(&req, 200, 0);
         assert_eq!(outcome.decision, FreshnessDecision::Denied);
         assert!(matches!(
             outcome.defect,
@@ -1070,7 +1292,7 @@ mod tests {
         let eval = default_evaluator();
         let req = SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 100, RiskTier::Tier1)
             .unwrap();
-        let outcome = eval.evaluate(&req, 200);
+        let outcome = eval.evaluate(&req, 200, 100);
         assert_eq!(outcome.decision, FreshnessDecision::Admitted);
         assert!(outcome.defect.is_none());
     }
@@ -1078,10 +1300,10 @@ mod tests {
     #[test]
     fn tier1_stale_proof_degraded() {
         let eval = default_evaluator();
-        // Proof generated at tick 0, current at 2_000_000 => age exceeds 1M.
+        // Verifier observed at tick 0, current at 2_000_000 => age exceeds 1M.
         let req =
             SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 0, RiskTier::Tier1).unwrap();
-        let outcome = eval.evaluate(&req, 2_000_000);
+        let outcome = eval.evaluate(&req, 2_000_000, 0);
         assert_eq!(outcome.decision, FreshnessDecision::Degraded);
         assert!(matches!(
             outcome.defect,
@@ -1094,7 +1316,7 @@ mod tests {
         let eval = default_evaluator();
         let req =
             SessionOpenRequest::new(test_hash(0x01), zero_hash(), 0, RiskTier::Tier1).unwrap();
-        let outcome = eval.evaluate(&req, 200);
+        let outcome = eval.evaluate(&req, 200, 0);
         assert_eq!(outcome.decision, FreshnessDecision::Degraded);
     }
 
@@ -1107,7 +1329,7 @@ mod tests {
         let eval = default_evaluator();
         let req = SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 100, RiskTier::Tier2)
             .unwrap();
-        let outcome = eval.evaluate(&req, 200);
+        let outcome = eval.evaluate(&req, 200, 100);
         assert_eq!(outcome.decision, FreshnessDecision::Admitted);
         assert_eq!(outcome.age_ticks, Some(100));
         assert!(outcome.defect.is_none());
@@ -1116,10 +1338,10 @@ mod tests {
     #[test]
     fn tier2_stale_proof_denied() {
         let eval = default_evaluator();
-        // Proof at 0, current at 200_000 => age 200k > threshold 100k.
+        // Verifier observed at 0, current at 200_000 => age 200k > threshold 100k.
         let req =
             SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 0, RiskTier::Tier2).unwrap();
-        let outcome = eval.evaluate(&req, 200_000);
+        let outcome = eval.evaluate(&req, 200_000, 0);
         assert_eq!(outcome.decision, FreshnessDecision::Denied);
         assert!(matches!(
             outcome.defect,
@@ -1135,7 +1357,7 @@ mod tests {
         let eval = default_evaluator();
         let req =
             SessionOpenRequest::new(test_hash(0x01), zero_hash(), 0, RiskTier::Tier2).unwrap();
-        let outcome = eval.evaluate(&req, 200);
+        let outcome = eval.evaluate(&req, 200, 0);
         assert_eq!(outcome.decision, FreshnessDecision::Denied);
         assert!(matches!(
             outcome.defect,
@@ -1148,10 +1370,10 @@ mod tests {
     #[test]
     fn tier2_boundary_exactly_at_threshold_admitted() {
         let eval = default_evaluator();
-        // Proof at 0, current at exactly 100_000 => age == threshold.
+        // Verifier observed at 0, current at exactly 100_000 => age == threshold.
         let req =
             SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 0, RiskTier::Tier2).unwrap();
-        let outcome = eval.evaluate(&req, DEFAULT_TIER2_MAX_STALENESS_TICKS);
+        let outcome = eval.evaluate(&req, DEFAULT_TIER2_MAX_STALENESS_TICKS, 0);
         assert_eq!(outcome.decision, FreshnessDecision::Admitted);
     }
 
@@ -1160,8 +1382,23 @@ mod tests {
         let eval = default_evaluator();
         let req =
             SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 0, RiskTier::Tier2).unwrap();
-        let outcome = eval.evaluate(&req, DEFAULT_TIER2_MAX_STALENESS_TICKS + 1);
+        let outcome = eval.evaluate(&req, DEFAULT_TIER2_MAX_STALENESS_TICKS + 1, 0);
         assert_eq!(outcome.decision, FreshnessDecision::Denied);
+    }
+
+    #[test]
+    fn tier2_verifier_tick_prevents_client_freshness_lie() {
+        // Client claims proof was generated at tick 900 (recent),
+        // but verifier observed it at tick 100 (old). Current = 200_000.
+        // Age should be 200_000 - 100 = 199_900, NOT 200_000 - 900.
+        let eval = default_evaluator();
+        let req = SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 900, RiskTier::Tier2)
+            .unwrap();
+        // With verifier_observed_tick=100, age = 200_000 - 100 = 199_900 > 100k
+        // threshold
+        let outcome = eval.evaluate(&req, 200_000, 100);
+        assert_eq!(outcome.decision, FreshnessDecision::Denied);
+        assert_eq!(outcome.age_ticks, Some(199_900));
     }
 
     // =========================================================================
@@ -1173,7 +1410,7 @@ mod tests {
         let eval = default_evaluator();
         let req = SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 100, RiskTier::Tier3)
             .unwrap();
-        let outcome = eval.evaluate(&req, 200);
+        let outcome = eval.evaluate(&req, 200, 100);
         assert_eq!(outcome.decision, FreshnessDecision::Admitted);
     }
 
@@ -1182,7 +1419,7 @@ mod tests {
         let eval = default_evaluator();
         let req =
             SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 0, RiskTier::Tier3).unwrap();
-        let outcome = eval.evaluate(&req, 20_000);
+        let outcome = eval.evaluate(&req, 20_000, 0);
         assert_eq!(outcome.decision, FreshnessDecision::Denied);
         assert!(matches!(
             outcome.defect,
@@ -1198,7 +1435,7 @@ mod tests {
         let eval = default_evaluator();
         let req =
             SessionOpenRequest::new(test_hash(0x01), zero_hash(), 0, RiskTier::Tier3).unwrap();
-        let outcome = eval.evaluate(&req, 200);
+        let outcome = eval.evaluate(&req, 200, 0);
         assert_eq!(outcome.decision, FreshnessDecision::Denied);
     }
 
@@ -1211,7 +1448,7 @@ mod tests {
         let eval = default_evaluator();
         let req = SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 100, RiskTier::Tier4)
             .unwrap();
-        let outcome = eval.evaluate(&req, 200);
+        let outcome = eval.evaluate(&req, 200, 100);
         assert_eq!(outcome.decision, FreshnessDecision::Admitted);
     }
 
@@ -1220,7 +1457,7 @@ mod tests {
         let eval = default_evaluator();
         let req =
             SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 0, RiskTier::Tier4).unwrap();
-        let outcome = eval.evaluate(&req, 2_000);
+        let outcome = eval.evaluate(&req, 2_000, 0);
         assert_eq!(outcome.decision, FreshnessDecision::Denied);
     }
 
@@ -1229,7 +1466,7 @@ mod tests {
         let eval = default_evaluator();
         let req =
             SessionOpenRequest::new(test_hash(0x01), zero_hash(), 0, RiskTier::Tier4).unwrap();
-        let outcome = eval.evaluate(&req, 200);
+        let outcome = eval.evaluate(&req, 200, 0);
         assert_eq!(outcome.decision, FreshnessDecision::Denied);
     }
 
@@ -1248,7 +1485,8 @@ mod tests {
             RiskTier::Tier4,
         ] {
             let req = SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 500, tier).unwrap();
-            let outcome = eval.evaluate(&req, 100);
+            // verifier_observed_tick=500 > current_tick=100 => reversal
+            let outcome = eval.evaluate(&req, 100, 500);
             assert_eq!(
                 outcome.decision,
                 FreshnessDecision::Denied,
@@ -1322,12 +1560,14 @@ mod tests {
         let eval = default_evaluator();
         let req = SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 100, RiskTier::Tier2)
             .unwrap();
-        let outcome = eval.evaluate(&req, 200);
+        let outcome = eval.evaluate(&req, 200, 100);
         let resp = SessionOpenResponse::new(
             test_hash(0x0A),
             test_hash(0x0B),
             outcome.decision,
             RiskTier::Tier2,
+            Some(test_hash(0xCC)),
+            Some(test_hash(0xDD)),
         )
         .unwrap();
         let r1 = SessionOpenReceipt::from_outcome(&req, Some(&resp), &outcome, 200);
@@ -1387,13 +1627,24 @@ mod tests {
         let eval = default_evaluator();
         let req = SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 100, RiskTier::Tier2)
             .unwrap();
-        let (result, receipt) =
-            process_session_open(&eval, &req, 200, test_hash(0xAA), test_hash(0xBB));
-        let resp = result.unwrap();
+        let result = process_session_open(
+            &eval,
+            &req,
+            200,
+            100,
+            test_hash(0xAA),
+            test_hash(0xBB),
+            Some(test_hash(0xCC)),
+            Some(test_hash(0xDD)),
+        );
+        let resp = result.response.unwrap();
         assert_eq!(resp.decision(), FreshnessDecision::Admitted);
         assert_eq!(resp.cell_certificate_hash(), &test_hash(0xAA));
         assert_eq!(resp.directory_head_hash(), &test_hash(0xBB));
-        assert_eq!(receipt.decision(), FreshnessDecision::Admitted);
+        assert_eq!(resp.freshness_witness(), Some(&test_hash(0xCC)));
+        assert_eq!(resp.policy_pointer(), Some(&test_hash(0xDD)));
+        assert_eq!(result.receipt.decision(), FreshnessDecision::Admitted);
+        assert!(result.defects.is_empty());
     }
 
     #[test]
@@ -1401,10 +1652,19 @@ mod tests {
         let eval = default_evaluator();
         let req =
             SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 0, RiskTier::Tier2).unwrap();
-        let (result, receipt) =
-            process_session_open(&eval, &req, 200_000, test_hash(0xAA), test_hash(0xBB));
-        assert!(result.is_err());
-        assert_eq!(receipt.decision(), FreshnessDecision::Denied);
+        let result = process_session_open(
+            &eval,
+            &req,
+            200_000,
+            0,
+            test_hash(0xAA),
+            test_hash(0xBB),
+            Some(test_hash(0xCC)),
+            Some(test_hash(0xDD)),
+        );
+        assert!(result.response.is_err());
+        assert_eq!(result.receipt.decision(), FreshnessDecision::Denied);
+        assert!(!result.defects.is_empty());
     }
 
     #[test]
@@ -1412,11 +1672,20 @@ mod tests {
         let eval = default_evaluator();
         let req =
             SessionOpenRequest::new(test_hash(0x01), zero_hash(), 0, RiskTier::Tier0).unwrap();
-        let (result, receipt) =
-            process_session_open(&eval, &req, 200, test_hash(0xAA), test_hash(0xBB));
-        let resp = result.unwrap();
+        let result = process_session_open(
+            &eval,
+            &req,
+            200,
+            0,
+            test_hash(0xAA),
+            test_hash(0xBB),
+            None,
+            None,
+        );
+        let resp = result.response.unwrap();
         assert_eq!(resp.decision(), FreshnessDecision::Degraded);
-        assert_eq!(receipt.decision(), FreshnessDecision::Degraded);
+        assert_eq!(result.receipt.decision(), FreshnessDecision::Degraded);
+        assert!(!result.defects.is_empty());
     }
 
     #[test]
@@ -1424,15 +1693,23 @@ mod tests {
         let eval = default_evaluator();
         let req =
             SessionOpenRequest::new(test_hash(0x01), zero_hash(), 0, RiskTier::Tier3).unwrap();
-        let (result, receipt) =
-            process_session_open(&eval, &req, 200, test_hash(0xAA), test_hash(0xBB));
+        let result = process_session_open(
+            &eval,
+            &req,
+            200,
+            0,
+            test_hash(0xAA),
+            test_hash(0xBB),
+            Some(test_hash(0xCC)),
+            Some(test_hash(0xDD)),
+        );
         assert!(matches!(
-            result.unwrap_err(),
+            result.response.unwrap_err(),
             SessionIdentityError::ProofRequired {
                 risk_tier: RiskTier::Tier3,
             }
         ));
-        assert_eq!(receipt.decision(), FreshnessDecision::Denied);
+        assert_eq!(result.receipt.decision(), FreshnessDecision::Denied);
     }
 
     #[test]
@@ -1440,13 +1717,22 @@ mod tests {
         let eval = default_evaluator();
         let req = SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 500, RiskTier::Tier4)
             .unwrap();
-        let (result, receipt) =
-            process_session_open(&eval, &req, 100, test_hash(0xAA), test_hash(0xBB));
+        // verifier_observed_tick=500 > current_tick=100 => reversal
+        let result = process_session_open(
+            &eval,
+            &req,
+            100,
+            500,
+            test_hash(0xAA),
+            test_hash(0xBB),
+            Some(test_hash(0xCC)),
+            Some(test_hash(0xDD)),
+        );
         assert!(matches!(
-            result.unwrap_err(),
+            result.response.unwrap_err(),
             SessionIdentityError::TickReversal { .. }
         ));
-        assert_eq!(receipt.decision(), FreshnessDecision::Denied);
+        assert_eq!(result.receipt.decision(), FreshnessDecision::Denied);
     }
 
     #[test]
@@ -1454,14 +1740,47 @@ mod tests {
         let eval = default_evaluator();
         let req = SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 100, RiskTier::Tier2)
             .unwrap();
-        let (result, receipt) =
-            process_session_open(&eval, &req, 200, zero_hash(), test_hash(0xBB));
+        let result = process_session_open(
+            &eval,
+            &req,
+            200,
+            100,
+            zero_hash(),
+            test_hash(0xBB),
+            None,
+            None,
+        );
         assert!(matches!(
-            result.unwrap_err(),
+            result.response.unwrap_err(),
             SessionIdentityError::MissingCellCertificateHash
         ));
         // Receipt still emitted even on response construction failure.
-        assert_eq!(receipt.decision(), FreshnessDecision::Admitted);
+        assert_eq!(result.receipt.decision(), FreshnessDecision::Admitted);
+    }
+
+    #[test]
+    fn process_defects_surfaced_in_result() {
+        let eval = default_evaluator();
+        let req =
+            SessionOpenRequest::new(test_hash(0x01), zero_hash(), 0, RiskTier::Tier2).unwrap();
+        let result = process_session_open(
+            &eval,
+            &req,
+            200,
+            0,
+            test_hash(0xAA),
+            test_hash(0xBB),
+            Some(test_hash(0xCC)),
+            Some(test_hash(0xDD)),
+        );
+        assert!(result.response.is_err());
+        assert_eq!(result.defects.len(), 1);
+        assert!(matches!(
+            result.defects[0],
+            SessionIdentityDefect::MissingProof {
+                risk_tier: RiskTier::Tier2
+            }
+        ));
     }
 
     // =========================================================================

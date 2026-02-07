@@ -108,7 +108,7 @@ pub use identity_proof::{
     DEFAULT_TIER2_MAX_STALENESS_TICKS, DEFAULT_TIER3_MAX_STALENESS_TICKS,
     DEFAULT_TIER4_MAX_STALENESS_TICKS, FreshnessDecision, FreshnessEvaluator, FreshnessOutcome,
     FreshnessPolicy, SessionIdentityDefect, SessionIdentityError, SessionOpenReceipt,
-    SessionOpenRequest, SessionOpenResponse, process_session_open,
+    SessionOpenRequest, SessionOpenResponse, SessionOpenResult, process_session_open,
 };
 pub use quarantine::{
     QuarantineConfig, QuarantineEvaluation, QuarantineInfo, QuarantineManager, QuarantineReason,
