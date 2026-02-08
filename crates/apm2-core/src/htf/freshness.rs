@@ -39,6 +39,28 @@ use serde::{Deserialize, Serialize};
 use crate::fac::RiskTier;
 
 // =============================================================================
+// Validated deserialization helper for FreshnessPolicyV1
+// =============================================================================
+
+/// Internal raw representation for `serde(try_from)` deserialization.
+/// This type is identical in layout to `FreshnessPolicyV1` but bypasses
+/// our validation -- deserialization targets this type, and then
+/// `TryFrom` runs the validation before producing a `FreshnessPolicyV1`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FreshnessPolicyV1Raw {
+    tiers: [TierFreshnessConfig; 5],
+}
+
+impl TryFrom<FreshnessPolicyV1Raw> for FreshnessPolicyV1 {
+    type Error = FreshnessPolicyError;
+
+    fn try_from(raw: FreshnessPolicyV1Raw) -> Result<Self, Self::Error> {
+        Self::new(raw.tiers)
+    }
+}
+
+// =============================================================================
 // Constants
 // =============================================================================
 
@@ -126,12 +148,21 @@ pub struct TierFreshnessConfig {
 /// - Thresholds decrease as tier increases (higher tiers are stricter).
 /// - A threshold of `0` disables staleness enforcement for that tier (only
 ///   valid for Tier0/Tier1; Tier2+ MUST have non-zero thresholds).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FreshnessPolicyV1 {
     /// Per-tier configuration, indexed by tier ordinal (0 = Tier0, ..., 4 =
     /// Tier4).
     tiers: [TierFreshnessConfig; NUM_TIERS],
+}
+
+impl<'de> Deserialize<'de> for FreshnessPolicyV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = FreshnessPolicyV1Raw::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 impl Default for FreshnessPolicyV1 {
@@ -1434,5 +1465,90 @@ mod tests {
         assert!(!verdict.is_stale);
         assert_eq!(verdict.head_age_ticks, Some(0));
         assert_eq!(verdict.action, StalenessAction::Allow);
+    }
+
+    // =========================================================================
+    // MAJOR: Serde validation bypass regression tests
+    // =========================================================================
+
+    #[test]
+    #[allow(clippy::unreadable_literal)]
+    fn serde_rejects_invalid_tier2_allow_policy() {
+        // Construct a JSON payload where Tier2 has Allow action.
+        // Deserialization must reject this because the custom Deserialize
+        // runs FreshnessPolicyV1::new() validation.
+        let json = serde_json::json!({
+            "tiers": [
+                {"max_head_age_ticks": 0, "staleness_action": "ALLOW"},
+                {"max_head_age_ticks": 1000000, "staleness_action": "WARN"},
+                {"max_head_age_ticks": 100000, "staleness_action": "ALLOW"},
+                {"max_head_age_ticks": 10000, "staleness_action": "DENY"},
+                {"max_head_age_ticks": 1000, "staleness_action": "DENY"}
+            ]
+        });
+        let result: Result<FreshnessPolicyV1, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "deserialization must reject Tier2 with Allow action"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Tier2") || err_msg.contains("Deny"),
+            "error should reference Tier2 or Deny requirement, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unreadable_literal)]
+    fn serde_rejects_tier3_zero_threshold_policy() {
+        // Tier3 with zero threshold must be rejected during deserialization.
+        let json = serde_json::json!({
+            "tiers": [
+                {"max_head_age_ticks": 0, "staleness_action": "ALLOW"},
+                {"max_head_age_ticks": 1000000, "staleness_action": "WARN"},
+                {"max_head_age_ticks": 100000, "staleness_action": "DENY"},
+                {"max_head_age_ticks": 0, "staleness_action": "DENY"},
+                {"max_head_age_ticks": 1000, "staleness_action": "DENY"}
+            ]
+        });
+        let result: Result<FreshnessPolicyV1, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "deserialization must reject Tier3 with zero threshold"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Tier3") || err_msg.contains("zero threshold"),
+            "error should reference Tier3 or zero threshold, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn serde_accepts_valid_policy() {
+        // A valid policy must roundtrip through serde without error.
+        let policy = FreshnessPolicyV1::default();
+        let json = serde_json::to_string(&policy).unwrap();
+        let deserialized: FreshnessPolicyV1 = serde_json::from_str(&json).unwrap();
+        assert_eq!(policy, deserialized);
+    }
+
+    #[test]
+    #[allow(clippy::unreadable_literal)]
+    fn serde_rejects_tier4_warn_policy() {
+        // Tier4 with Warn action must be rejected during deserialization.
+        let json = serde_json::json!({
+            "tiers": [
+                {"max_head_age_ticks": 0, "staleness_action": "ALLOW"},
+                {"max_head_age_ticks": 1000000, "staleness_action": "WARN"},
+                {"max_head_age_ticks": 100000, "staleness_action": "DENY"},
+                {"max_head_age_ticks": 10000, "staleness_action": "DENY"},
+                {"max_head_age_ticks": 1000, "staleness_action": "WARN"}
+            ]
+        });
+        let result: Result<FreshnessPolicyV1, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "deserialization must reject Tier4 with Warn action"
+        );
     }
 }

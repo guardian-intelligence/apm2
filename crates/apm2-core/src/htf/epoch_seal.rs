@@ -404,10 +404,47 @@ impl EpochSealV1 {
         Ok(())
     }
 
-    /// Computes the canonical BLAKE3 hash of this seal for verification.
+    /// Computes the canonical BLAKE3 content hash of the seal payload
+    /// (all fields except `content_hash` and `signature`).
     ///
-    /// The preimage includes all semantically significant fields using
-    /// length-prefixed framing to prevent ambiguity:
+    /// This is used to verify that the claimed `content_hash` is
+    /// authentic. The preimage includes all semantically significant
+    /// fields using length-prefixed framing to prevent ambiguity:
+    /// - Domain separator
+    /// - `epoch_number` (8 bytes LE)
+    /// - `sealed_root_hash` (32 bytes)
+    /// - `issuer_cell_id` (length-prefixed)
+    /// - `cell_id` (length-prefixed)
+    /// - `directory_epoch` (8 bytes LE)
+    /// - `receipt_batch_epoch` (8 bytes LE)
+    /// - `htf_time_envelope_ref` (32 bytes)
+    /// - `quorum_anchor` (32 bytes)
+    /// - `authority_seal_hash` (32 bytes)
+    #[must_use]
+    pub fn compute_content_hash(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2:epoch_seal_v1:content:v1\0");
+        hasher.update(&self.epoch_number.to_le_bytes());
+        hasher.update(&self.sealed_root_hash);
+        // Length-prefixed string fields to prevent concatenation ambiguity.
+        let issuer_bytes = self.issuer_cell_id.as_bytes();
+        hasher.update(&(issuer_bytes.len() as u64).to_le_bytes());
+        hasher.update(issuer_bytes);
+        let cell_bytes = self.cell_id.as_bytes();
+        hasher.update(&(cell_bytes.len() as u64).to_le_bytes());
+        hasher.update(cell_bytes);
+        hasher.update(&self.directory_epoch.to_le_bytes());
+        hasher.update(&self.receipt_batch_epoch.to_le_bytes());
+        hasher.update(&self.htf_time_envelope_ref);
+        hasher.update(&self.quorum_anchor);
+        hasher.update(&self.authority_seal_hash);
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Computes the canonical BLAKE3 hash of this seal for CAS addressing.
+    ///
+    /// The preimage includes all semantically significant fields including
+    /// `content_hash`, using length-prefixed framing to prevent ambiguity:
     /// - Domain separator
     /// - `epoch_number` (8 bytes LE)
     /// - `sealed_root_hash` (32 bytes)
@@ -902,9 +939,26 @@ pub enum EpochSealVerificationError {
 // IssuerState (internal)
 // =============================================================================
 
-/// Per-issuer state tracked by the verifier.
+/// Composite key for per-cell monotonicity tracking.
+///
+/// Per HSI section 1.9 rule 4, monotonicity must be enforced on
+/// `(cell_id, htf_time_envelope_ref, quorum_anchor)` -- not on
+/// `issuer_cell_id` alone.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MonotonicityKey {
+    /// Owning cell identity (RFC-required authority anchor).
+    cell_id: String,
+
+    /// Content-hash reference to the HTF time envelope.
+    htf_time_envelope_ref: [u8; 32],
+
+    /// Quorum-anchor hash for consensus binding.
+    quorum_anchor: [u8; 32],
+}
+
+/// Per-cell monotonicity state tracked by the verifier.
 #[derive(Debug, Clone)]
-struct IssuerState {
+struct CellState {
     /// The last accepted epoch number.
     epoch: u64,
 
@@ -913,6 +967,18 @@ struct IssuerState {
 
     /// The content hash of the last accepted seal.
     content_hash: [u8; 32],
+
+    /// Directory epoch of the last accepted seal.
+    directory_epoch: u64,
+
+    /// Receipt-batch epoch of the last accepted seal.
+    receipt_batch_epoch: u64,
+
+    /// Authority seal hash of the last accepted seal.
+    authority_seal_hash: [u8; 32],
+
+    /// Issuer cell ID of the last accepted seal.
+    issuer_cell_id: String,
 }
 
 // =============================================================================
@@ -922,21 +988,25 @@ struct IssuerState {
 /// Verifies epoch seals for monotonicity, rollback rejection,
 /// equivocation detection, and signature authenticity.
 ///
-/// The verifier maintains per-issuer state mapping each issuer cell ID
-/// to its last accepted epoch and root hash. Verification enforces:
+/// The verifier maintains per-cell state keyed on
+/// `(cell_id, htf_time_envelope_ref, quorum_anchor)` as required
+/// by HSI section 1.9 rule 4. Verification enforces:
 ///
 /// 1. **Validation**: Seal fields satisfy constructor invariants.
-/// 2. **Signature**: Cryptographic authenticity via [`SignatureVerifier`].
-/// 3. **Monotonicity**: `seal.epoch_number > state[issuer].last_epoch`
-/// 4. **Anti-equivocation**: If `seal.epoch_number ==
-///    state[issuer].last_epoch`, the root hashes AND content hashes must match
-///    (duplicate acceptance is idempotent).
-/// 5. **Fail-closed**: Tier2+ admissions require a valid seal. When no
+/// 2. **Content hash verification**: The claimed `content_hash` must match the
+///    recomputed canonical hash of the seal payload.
+/// 3. **Signature**: Cryptographic authenticity via [`SignatureVerifier`].
+/// 4. **Monotonicity**: `seal.epoch_number > state[key].last_epoch`
+/// 5. **Anti-equivocation**: If `seal.epoch_number == state[key].last_epoch`,
+///    ALL seal fields must match (duplicate acceptance is idempotent). Any
+///    field difference is equivocation.
+/// 6. **Fail-closed**: Tier2+ admissions require a valid seal. When no
 ///    [`SignatureVerifier`] is configured, ALL seals are rejected.
 #[derive(Debug)]
 pub struct EpochSealVerifier {
-    /// Per-issuer epoch state.
-    issuers: HashMap<String, IssuerState>,
+    /// Per-cell epoch state, keyed on `(cell_id, htf_time_envelope_ref,
+    /// quorum_anchor)`.
+    cells: HashMap<MonotonicityKey, CellState>,
 
     /// Optional signature verifier. When `None`, all seals are rejected
     /// (fail-closed). This ensures that the verifier cannot accept seals
@@ -949,14 +1019,14 @@ impl Clone for EpochSealVerifier {
         // The signature verifier is not cloneable; cloned verifiers
         // start without a verifier (fail-closed).
         Self {
-            issuers: self.issuers.clone(),
+            cells: self.cells.clone(),
             signature_verifier: None,
         }
     }
 }
 
 impl EpochSealVerifier {
-    /// Creates a new verifier with no tracked issuers and no signature
+    /// Creates a new verifier with no tracked cells and no signature
     /// verifier.
     ///
     /// **WARNING**: Without a signature verifier, ALL seals will be
@@ -967,7 +1037,7 @@ impl EpochSealVerifier {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            issuers: HashMap::new(),
+            cells: HashMap::new(),
             signature_verifier: None,
         }
     }
@@ -976,7 +1046,7 @@ impl EpochSealVerifier {
     #[must_use]
     pub fn with_signature_verifier(signature_verifier: Box<dyn SignatureVerifier>) -> Self {
         Self {
-            issuers: HashMap::new(),
+            cells: HashMap::new(),
             signature_verifier: Some(signature_verifier),
         }
     }
@@ -992,25 +1062,33 @@ impl EpochSealVerifier {
         self.signature_verifier.is_some()
     }
 
-    /// Returns the number of tracked issuers.
+    /// Returns the number of tracked cell keys.
     #[must_use]
     pub fn tracked_issuer_count(&self) -> usize {
-        self.issuers.len()
+        self.cells.len()
     }
 
-    /// Returns the last accepted epoch for the given issuer, or `None`
-    /// if no seal has been accepted from this issuer.
+    /// Returns the last accepted epoch for the given issuer cell ID.
+    ///
+    /// This performs a linear scan to find entries matching the given
+    /// `issuer_cell_id`. Returns `None` if no seal has been accepted
+    /// from this issuer.
     #[must_use]
     pub fn last_epoch_for(&self, issuer_cell_id: &str) -> Option<u64> {
-        self.issuers.get(issuer_cell_id).map(|s| s.epoch)
+        self.cells
+            .values()
+            .filter(|s| s.issuer_cell_id == issuer_cell_id)
+            .map(|s| s.epoch)
+            .max()
     }
 
     /// Verifies and accepts an epoch seal, updating internal state.
     ///
     /// Verification order:
     /// 1. Validate seal fields (deserialization invariants).
-    /// 2. Verify cryptographic signature (fail-closed when no verifier).
-    /// 3. Check monotonicity and equivocation.
+    /// 2. Verify content hash (recompute canonical hash and compare).
+    /// 3. Verify cryptographic signature (fail-closed when no verifier).
+    /// 4. Check monotonicity and equivocation.
     ///
     /// # Returns
     ///
@@ -1029,12 +1107,30 @@ impl EpochSealVerifier {
             };
         }
 
-        // Step 2: Verify signature (fail-closed when no verifier).
+        // Step 2: Verify content hash (recompute and compare).
+        let recomputed = seal.compute_content_hash();
+        if recomputed != seal.content_hash {
+            return EpochSealVerdict {
+                accepted: false,
+                risk_tier,
+                epoch_number: seal.epoch_number,
+                issuer_cell_id: seal.issuer_cell_id.clone(),
+                audit_event: EpochSealAuditEvent::ValidationFailed {
+                    reason: format!(
+                        "content_hash mismatch: claimed {} != recomputed {}",
+                        hex::encode(seal.content_hash),
+                        hex::encode(recomputed),
+                    ),
+                },
+            };
+        }
+
+        // Step 3: Verify signature (fail-closed when no verifier).
         if let Some(verdict) = self.verify_signature(seal, risk_tier) {
             return verdict;
         }
 
-        // Step 3: Monotonicity and equivocation checks.
+        // Step 4: Monotonicity and equivocation checks.
         self.verify_monotonicity(seal, risk_tier)
     }
 
@@ -1076,11 +1172,19 @@ impl EpochSealVerifier {
         }
     }
 
-    /// Checks monotonicity and equivocation against per-issuer state,
+    /// Checks monotonicity and equivocation against per-cell state,
     /// updating state on acceptance.
+    ///
+    /// The key is `(cell_id, htf_time_envelope_ref, quorum_anchor)` per
+    /// HSI section 1.9 rule 4.
     fn verify_monotonicity(&mut self, seal: &EpochSealV1, risk_tier: RiskTier) -> EpochSealVerdict {
         let issuer = seal.issuer_cell_id();
-        if let Some(state) = self.issuers.get_mut(issuer) {
+        let key = MonotonicityKey {
+            cell_id: seal.cell_id().to_string(),
+            htf_time_envelope_ref: *seal.htf_time_envelope_ref(),
+            quorum_anchor: *seal.quorum_anchor(),
+        };
+        if let Some(state) = self.cells.get_mut(&key) {
             if seal.epoch_number() < state.epoch {
                 return EpochSealVerdict {
                     accepted: false,
@@ -1102,6 +1206,10 @@ impl EpochSealVerifier {
             state.epoch = seal.epoch_number();
             state.root_hash = *seal.sealed_root_hash();
             state.content_hash = *seal.content_hash();
+            state.directory_epoch = seal.directory_epoch();
+            state.receipt_batch_epoch = seal.receipt_batch_epoch();
+            state.authority_seal_hash = *seal.authority_seal_hash();
+            state.issuer_cell_id = issuer.to_string();
             EpochSealVerdict {
                 accepted: true,
                 risk_tier,
@@ -1114,15 +1222,20 @@ impl EpochSealVerifier {
                 },
             }
         } else {
-            self.accept_first_seal(seal, risk_tier)
+            self.accept_first_seal(seal, &key, risk_tier)
         }
     }
 
-    /// Accepts the first seal from a new issuer, or rejects if too
-    /// many issuers are tracked.
-    fn accept_first_seal(&mut self, seal: &EpochSealV1, risk_tier: RiskTier) -> EpochSealVerdict {
+    /// Accepts the first seal from a new cell key, or rejects if too
+    /// many cells are tracked.
+    fn accept_first_seal(
+        &mut self,
+        seal: &EpochSealV1,
+        key: &MonotonicityKey,
+        risk_tier: RiskTier,
+    ) -> EpochSealVerdict {
         let issuer = seal.issuer_cell_id();
-        if self.issuers.len() >= MAX_TRACKED_ISSUERS {
+        if self.cells.len() >= MAX_TRACKED_ISSUERS {
             return EpochSealVerdict {
                 accepted: false,
                 risk_tier,
@@ -1131,17 +1244,21 @@ impl EpochSealVerifier {
                 audit_event: EpochSealAuditEvent::InvalidSeal {
                     reason: format!(
                         "too many tracked issuers: {} >= {MAX_TRACKED_ISSUERS}",
-                        self.issuers.len()
+                        self.cells.len()
                     ),
                 },
             };
         }
-        self.issuers.insert(
-            issuer.to_string(),
-            IssuerState {
+        self.cells.insert(
+            key.clone(),
+            CellState {
                 epoch: seal.epoch_number(),
                 root_hash: *seal.sealed_root_hash(),
                 content_hash: *seal.content_hash(),
+                directory_epoch: seal.directory_epoch(),
+                receipt_batch_epoch: seal.receipt_batch_epoch(),
+                authority_seal_hash: *seal.authority_seal_hash(),
+                issuer_cell_id: issuer.to_string(),
             },
         );
         EpochSealVerdict {
@@ -1194,7 +1311,7 @@ impl EpochSealVerifier {
                 }),
                 EpochSealAuditEvent::InvalidSeal { .. } => {
                     Err(EpochSealVerificationError::TooManyIssuers {
-                        count: self.issuers.len(),
+                        count: self.cells.len(),
                         max: MAX_TRACKED_ISSUERS,
                     })
                 },
@@ -1243,17 +1360,28 @@ impl EpochSealVerifier {
 /// detection. Free function to avoid borrow-checker conflicts within
 /// `verify_monotonicity`.
 ///
-/// Identity for same-epoch idempotence requires BOTH `sealed_root_hash`
-/// AND `content_hash` to match. Differing `content_hash` with the same
-/// root hash is treated as equivocation (distinct seals at the same epoch).
+/// Identity for same-epoch idempotence requires ALL seal fields to match:
+/// `sealed_root_hash`, `content_hash`, `directory_epoch`,
+/// `receipt_batch_epoch`, `authority_seal_hash`, and `issuer_cell_id`.
+/// Any field difference is equivocation (distinct seals at the same epoch).
+///
+/// Note: `cell_id`, `htf_time_envelope_ref`, and `quorum_anchor` are
+/// already guaranteed to match because they form the monotonicity key.
 fn verify_same_epoch(
     seal: &EpochSealV1,
-    state: &IssuerState,
+    state: &CellState,
     risk_tier: RiskTier,
 ) -> EpochSealVerdict {
     let issuer = seal.issuer_cell_id();
-    if seal.sealed_root_hash() == &state.root_hash && seal.content_hash() == &state.content_hash {
-        // Idempotent re-acceptance of same seal (root + content match).
+    let all_match = seal.sealed_root_hash() == &state.root_hash
+        && seal.content_hash() == &state.content_hash
+        && seal.directory_epoch() == state.directory_epoch
+        && seal.receipt_batch_epoch() == state.receipt_batch_epoch
+        && seal.authority_seal_hash() == &state.authority_seal_hash
+        && seal.issuer_cell_id() == state.issuer_cell_id;
+
+    if all_match {
+        // Idempotent re-acceptance of identical seal.
         EpochSealVerdict {
             accepted: true,
             risk_tier,
@@ -1266,7 +1394,7 @@ fn verify_same_epoch(
             },
         }
     } else {
-        // Equivocation: same epoch, different root hash or content hash.
+        // Equivocation: same epoch, different field(s).
         EpochSealVerdict {
             accepted: false,
             risk_tier,
@@ -1327,25 +1455,90 @@ mod tests {
         h
     }
 
-    fn make_seal(epoch: u64, issuer: &str, root_seed: u8) -> EpochSealV1 {
-        EpochSealV1::new(
-            epoch,
-            test_root_hash(root_seed),
-            issuer,
-            test_signature(),
-            test_content_hash(root_seed.wrapping_add(0x10)),
-            issuer, // cell_id mirrors issuer for tests
-            epoch,  // directory_epoch mirrors seal epoch
-            epoch,  // receipt_batch_epoch mirrors seal epoch
-            test_anchor_hash(root_seed.wrapping_add(0x20)),
-            test_anchor_hash(root_seed.wrapping_add(0x30)),
-            test_anchor_hash(root_seed.wrapping_add(0x40)),
-        )
-        .expect("valid seal")
+    /// Fixed anchor hashes for `make_seal` so all seals from the same
+    /// `issuer` share the same monotonicity key
+    /// `(cell_id, htf_time_envelope_ref, quorum_anchor)`.
+    fn fixed_htf_ref() -> [u8; 32] {
+        test_anchor_hash(0xA0)
+    }
+    fn fixed_quorum() -> [u8; 32] {
+        test_anchor_hash(0xB0)
+    }
+    fn fixed_auth() -> [u8; 32] {
+        test_anchor_hash(0xC0)
     }
 
-    /// Helper to build a seal with an explicit content hash (for
-    /// equivocation tests that need distinct content hashes).
+    /// Builds a seal whose `content_hash` equals `compute_content_hash()`.
+    ///
+    /// All seals from the same `issuer` share the same monotonicity key
+    /// `(cell_id, htf_time_envelope_ref, quorum_anchor)` so that
+    /// rollback/equivocation tests work correctly.
+    fn make_seal(epoch: u64, issuer: &str, root_seed: u8) -> EpochSealV1 {
+        make_seal_full(
+            epoch,
+            issuer,
+            test_root_hash(root_seed),
+            issuer,
+            epoch,
+            epoch,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+        )
+    }
+
+    /// Builds a seal with explicit field control, `content_hash` set to
+    /// `compute_content_hash()`.
+    #[allow(clippy::too_many_arguments)]
+    fn make_seal_full(
+        epoch: u64,
+        issuer: &str,
+        root_hash: [u8; 32],
+        cell_id: &str,
+        directory_epoch: u64,
+        receipt_batch_epoch: u64,
+        htf_time_envelope_ref: [u8; 32],
+        quorum_anchor: [u8; 32],
+        authority_seal_hash: [u8; 32],
+    ) -> EpochSealV1 {
+        // First pass: build with placeholder content hash to compute the
+        // correct content hash. `compute_content_hash()` does NOT include
+        // `content_hash` in its preimage, so the result is stable.
+        let placeholder = EpochSealV1::new(
+            epoch,
+            root_hash,
+            issuer,
+            test_signature(),
+            [0xFF; 32], // placeholder (will be replaced)
+            cell_id,
+            directory_epoch,
+            receipt_batch_epoch,
+            htf_time_envelope_ref,
+            quorum_anchor,
+            authority_seal_hash,
+        )
+        .expect("valid seal (placeholder pass)");
+
+        let content_hash = placeholder.compute_content_hash();
+        EpochSealV1::new(
+            epoch,
+            root_hash,
+            issuer,
+            test_signature(),
+            content_hash,
+            cell_id,
+            directory_epoch,
+            receipt_batch_epoch,
+            htf_time_envelope_ref,
+            quorum_anchor,
+            authority_seal_hash,
+        )
+        .expect("valid seal (final pass)")
+    }
+
+    /// Helper to build a seal with an explicit content hash (for tests
+    /// that bypass the verifier or test content hash mismatch).
+    /// The `content_hash` will NOT match `compute_content_hash()`.
     fn make_seal_with_content(
         epoch: u64,
         issuer: &str,
@@ -1361,9 +1554,9 @@ mod tests {
             issuer,
             epoch,
             epoch,
-            test_anchor_hash(root_seed.wrapping_add(0x20)),
-            test_anchor_hash(root_seed.wrapping_add(0x30)),
-            test_anchor_hash(root_seed.wrapping_add(0x40)),
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
         )
         .expect("valid seal")
     }
@@ -2269,16 +2462,24 @@ mod tests {
             prop::array::uniform32(1u8..=255u8)
         }
 
-        fn arb_content_hash() -> impl Strategy<Value = [u8; 32]> {
-            prop::array::uniform32(1u8..=255u8)
-        }
-
-        fn arb_signature() -> impl Strategy<Value = [u8; 64]> {
-            prop::collection::vec(0u8..=255u8, 64).prop_map(|v| {
-                let mut arr = [0u8; 64];
-                arr.copy_from_slice(&v);
-                arr
-            })
+        /// Builds a seal with valid `content_hash` from arbitrary fields.
+        fn make_verified_seal(
+            epoch: u64,
+            root: [u8; 32],
+            issuer: &str,
+            cell_id: &str,
+        ) -> EpochSealV1 {
+            make_seal_full(
+                epoch,
+                issuer,
+                root,
+                cell_id,
+                epoch,
+                epoch,
+                super::test_anchor_hash(0xA0),
+                super::test_anchor_hash(0xB0),
+                super::test_anchor_hash(0xC0),
+            )
         }
 
         proptest! {
@@ -2349,26 +2550,11 @@ mod tests {
                 epoch in 1u64..=1_000_000,
                 root_a in arb_root_hash(),
                 root_b in arb_root_hash(),
-                sig in arb_signature(),
-                content_a in arb_content_hash(),
-                content_b in arb_content_hash(),
             ) {
                 prop_assume!(root_a != root_b);
 
-                let seal_a = EpochSealV1::new(
-                    epoch, root_a, "prop-issuer", sig, content_a,
-                    "prop-cell", epoch, epoch,
-                    super::test_anchor_hash(0xA0),
-                    super::test_anchor_hash(0xB0),
-                    super::test_anchor_hash(0xC0),
-                ).unwrap();
-                let seal_b = EpochSealV1::new(
-                    epoch, root_b, "prop-issuer", sig, content_b,
-                    "prop-cell", epoch, epoch,
-                    super::test_anchor_hash(0xA0),
-                    super::test_anchor_hash(0xB0),
-                    super::test_anchor_hash(0xC0),
-                ).unwrap();
+                let seal_a = make_verified_seal(epoch, root_a, "prop-issuer", "prop-cell");
+                let seal_b = make_verified_seal(epoch, root_b, "prop-issuer", "prop-cell");
 
                 let mut verifier = test_verifier();
                 let v1 = verifier.verify(&seal_a, RiskTier::Tier2);
@@ -2391,16 +2577,8 @@ mod tests {
             fn replay_same_seal_is_idempotent(
                 epoch in 1u64..=1_000_000,
                 root in arb_root_hash(),
-                sig in arb_signature(),
-                content in arb_content_hash(),
             ) {
-                let seal = EpochSealV1::new(
-                    epoch, root, "prop-issuer", sig, content,
-                    "prop-cell", epoch, epoch,
-                    super::test_anchor_hash(0xA0),
-                    super::test_anchor_hash(0xB0),
-                    super::test_anchor_hash(0xC0),
-                ).unwrap();
+                let seal = make_verified_seal(epoch, root, "prop-issuer", "prop-cell");
 
                 let mut verifier = test_verifier();
                 let v1 = verifier.verify(&seal, RiskTier::Tier2);
@@ -2700,20 +2878,40 @@ mod tests {
     }
 
     #[test]
-    fn equivocation_detected_on_differing_content_hash_same_root() {
-        // Same (issuer, epoch, root) but different content_hash must be
-        // treated as equivocation, not idempotent re-acceptance.
+    fn equivocation_detected_on_differing_directory_epoch() {
+        // Same (cell_id, htf_time_envelope_ref, quorum_anchor, epoch)
+        // but different directory_epoch must be equivocation.
         let mut verifier = test_verifier();
 
-        let seal_a = make_seal_with_content(5, "cell-alpha", 0x11, 0xAA);
+        let seal_a = make_seal_full(
+            5,
+            "cell-alpha",
+            test_root_hash(0x11),
+            "cell-alpha",
+            100,
+            200,
+            test_anchor_hash(0x31),
+            test_anchor_hash(0x41),
+            test_anchor_hash(0x51),
+        );
         let verdict_a = verifier.verify(&seal_a, RiskTier::Tier2);
         assert!(verdict_a.accepted, "first seal should be accepted");
 
-        let seal_b = make_seal_with_content(5, "cell-alpha", 0x11, 0xBB);
+        let seal_b = make_seal_full(
+            5,
+            "cell-alpha",
+            test_root_hash(0x11),
+            "cell-alpha",
+            999,
+            200, // different directory_epoch
+            test_anchor_hash(0x31),
+            test_anchor_hash(0x41),
+            test_anchor_hash(0x51),
+        );
         let verdict_b = verifier.verify(&seal_b, RiskTier::Tier2);
         assert!(
             !verdict_b.accepted,
-            "same root + different content_hash at same epoch must be equivocation"
+            "same epoch + different directory_epoch must be equivocation"
         );
         assert!(matches!(
             verdict_b.audit_event,
@@ -2725,19 +2923,108 @@ mod tests {
     }
 
     #[test]
-    fn idempotent_reaccept_requires_matching_content_hash() {
-        // Same (issuer, epoch, root, content_hash) = idempotent accept.
+    fn equivocation_detected_on_differing_receipt_batch_epoch() {
+        // Same epoch but different receipt_batch_epoch = equivocation.
+        let mut verifier = test_verifier();
+
+        let seal_a = make_seal_full(
+            5,
+            "cell-alpha",
+            test_root_hash(0x11),
+            "cell-alpha",
+            100,
+            200,
+            test_anchor_hash(0x31),
+            test_anchor_hash(0x41),
+            test_anchor_hash(0x51),
+        );
+        assert!(verifier.verify(&seal_a, RiskTier::Tier2).accepted);
+
+        let seal_b = make_seal_full(
+            5,
+            "cell-alpha",
+            test_root_hash(0x11),
+            "cell-alpha",
+            100,
+            999, // different receipt_batch_epoch
+            test_anchor_hash(0x31),
+            test_anchor_hash(0x41),
+            test_anchor_hash(0x51),
+        );
+        let verdict_b = verifier.verify(&seal_b, RiskTier::Tier2);
+        assert!(
+            !verdict_b.accepted,
+            "same epoch + different receipt_batch_epoch must be equivocation"
+        );
+    }
+
+    #[test]
+    fn equivocation_detected_on_differing_authority_seal_hash() {
+        // Same epoch but different authority_seal_hash = equivocation.
+        let mut verifier = test_verifier();
+
+        let seal_a = make_seal_full(
+            5,
+            "cell-alpha",
+            test_root_hash(0x11),
+            "cell-alpha",
+            100,
+            200,
+            test_anchor_hash(0x31),
+            test_anchor_hash(0x41),
+            test_anchor_hash(0x51),
+        );
+        assert!(verifier.verify(&seal_a, RiskTier::Tier2).accepted);
+
+        let seal_b = make_seal_full(
+            5,
+            "cell-alpha",
+            test_root_hash(0x11),
+            "cell-alpha",
+            100,
+            200,
+            test_anchor_hash(0x31),
+            test_anchor_hash(0x41),
+            test_anchor_hash(0xFF), // different authority_seal_hash
+        );
+        let verdict_b = verifier.verify(&seal_b, RiskTier::Tier2);
+        assert!(
+            !verdict_b.accepted,
+            "same epoch + different authority_seal_hash must be equivocation"
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_tampered_content_hash() {
+        // A seal with a content_hash that does NOT match
+        // compute_content_hash() must be rejected.
         let mut verifier = test_verifier();
 
         let seal = make_seal_with_content(5, "cell-alpha", 0x11, 0xAA);
+        // content_hash is 0xAA... which won't match compute_content_hash()
+        let verdict = verifier.verify(&seal, RiskTier::Tier2);
+        assert!(
+            !verdict.accepted,
+            "seal with tampered content_hash must be rejected"
+        );
+        assert!(matches!(
+            verdict.audit_event,
+            EpochSealAuditEvent::ValidationFailed { ref reason }
+            if reason.contains("content_hash mismatch")
+        ));
+    }
+
+    #[test]
+    fn idempotent_reaccept_requires_all_fields_matching() {
+        // Same seal replayed = idempotent accept.
+        let mut verifier = test_verifier();
+
+        let seal = make_seal(5, "cell-alpha", 0x11);
         assert!(verifier.verify(&seal, RiskTier::Tier2).accepted);
 
         // Replay same seal: must be accepted idempotently.
         let verdict = verifier.verify(&seal, RiskTier::Tier2);
-        assert!(
-            verdict.accepted,
-            "identical seal (including content_hash) must be idempotent"
-        );
+        assert!(verdict.accepted, "identical seal must be idempotent");
     }
 
     // =========================================================================
@@ -2850,41 +3137,37 @@ mod tests {
     #[test]
     fn end_to_end_seal_issuance_and_verification_flow() {
         // Demonstrates the complete seal lifecycle:
-        // 1. Issuer creates seals monotonically.
+        // 1. Seals are created with valid content_hash.
         // 2. Verifier accepts monotonic seals.
         // 3. Verifier rejects rollback, equivocation, and missing signatures.
 
-        // --- Phase 1: Issuance ---
-        let mut issuer = EpochSealIssuer::new("cell-authority").unwrap();
-
-        let seal1 = issuer
-            .issue(
-                test_root_hash(0x01),
-                test_signature(),
-                test_content_hash(0x11),
-                "cell-authority",
-                100,
-                200,
-                test_anchor_hash(0xA1),
-                test_anchor_hash(0xB1),
-                test_anchor_hash(0xC1),
-            )
-            .unwrap();
+        // --- Phase 1: Build seals with correct content_hash ---
+        // Both seals share the same (cell_id, htf_ref, quorum_anchor)
+        // so they are in the same monotonicity chain.
+        let seal1 = make_seal_full(
+            1,
+            "cell-authority",
+            test_root_hash(0x01),
+            "cell-authority",
+            100,
+            200,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+        );
         assert_eq!(seal1.epoch_number(), 1);
 
-        let seal2 = issuer
-            .issue(
-                test_root_hash(0x02),
-                test_signature(),
-                test_content_hash(0x12),
-                "cell-authority",
-                101,
-                201,
-                test_anchor_hash(0xA2),
-                test_anchor_hash(0xB2),
-                test_anchor_hash(0xC2),
-            )
-            .unwrap();
+        let seal2 = make_seal_full(
+            2,
+            "cell-authority",
+            test_root_hash(0x02),
+            "cell-authority",
+            101,
+            201,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+        );
         assert_eq!(seal2.epoch_number(), 2);
 
         // --- Phase 2: Verification (accept monotonic) ---
@@ -2968,5 +3251,205 @@ mod tests {
             bad_seal.validate(),
             Err(EpochSealError::EmptyCellId)
         ));
+    }
+
+    // =========================================================================
+    // BLOCKER 1 regression: monotonicity keyed on cell_id + HTF/quorum
+    // =========================================================================
+
+    #[test]
+    fn monotonicity_keyed_on_cell_id_not_issuer() {
+        // Two seals from the SAME issuer but different cell_id must
+        // have independent monotonicity chains.
+        let mut verifier = test_verifier();
+
+        let seal_cell_a = make_seal_full(
+            5,
+            "issuer-1",
+            test_root_hash(0x11),
+            "cell-A",
+            100,
+            200,
+            test_anchor_hash(0x31),
+            test_anchor_hash(0x41),
+            test_anchor_hash(0x51),
+        );
+        assert!(verifier.verify(&seal_cell_a, RiskTier::Tier2).accepted);
+
+        // Same issuer, different cell_id: epoch 1 should be accepted
+        // (independent chain).
+        let seal_cell_b = make_seal_full(
+            1,
+            "issuer-1",
+            test_root_hash(0x22),
+            "cell-B",
+            10,
+            20,
+            test_anchor_hash(0x31),
+            test_anchor_hash(0x41),
+            test_anchor_hash(0x51),
+        );
+        let verdict = verifier.verify(&seal_cell_b, RiskTier::Tier2);
+        assert!(
+            verdict.accepted,
+            "different cell_id must have independent chain (epoch 1 accepted despite cell-A at 5)"
+        );
+    }
+
+    #[test]
+    fn monotonicity_includes_quorum_anchor_in_key() {
+        // Same cell_id + htf_time_envelope_ref but different quorum_anchor
+        // must be independent chains.
+        let mut verifier = test_verifier();
+
+        let seal_qa1 = make_seal_full(
+            5,
+            "issuer-1",
+            test_root_hash(0x11),
+            "cell-A",
+            100,
+            200,
+            test_anchor_hash(0x31),
+            test_anchor_hash(0x41),
+            test_anchor_hash(0x51),
+        );
+        assert!(verifier.verify(&seal_qa1, RiskTier::Tier2).accepted);
+
+        // Same cell_id, same htf_time_envelope_ref, different quorum_anchor:
+        // epoch 1 should be accepted (independent key).
+        let seal_qa2 = make_seal_full(
+            1,
+            "issuer-1",
+            test_root_hash(0x22),
+            "cell-A",
+            10,
+            20,
+            test_anchor_hash(0x31),
+            test_anchor_hash(0xFF),
+            test_anchor_hash(0x51),
+        );
+        let verdict = verifier.verify(&seal_qa2, RiskTier::Tier2);
+        assert!(
+            verdict.accepted,
+            "different quorum_anchor must yield independent monotonicity chain"
+        );
+    }
+
+    #[test]
+    fn monotonicity_includes_htf_time_envelope_ref_in_key() {
+        // Same cell_id + quorum_anchor but different htf_time_envelope_ref
+        // must be independent chains.
+        let mut verifier = test_verifier();
+
+        let seal_htf1 = make_seal_full(
+            5,
+            "issuer-1",
+            test_root_hash(0x11),
+            "cell-A",
+            100,
+            200,
+            test_anchor_hash(0x31),
+            test_anchor_hash(0x41),
+            test_anchor_hash(0x51),
+        );
+        assert!(verifier.verify(&seal_htf1, RiskTier::Tier2).accepted);
+
+        // Same cell_id, same quorum_anchor, different htf_time_envelope_ref:
+        // epoch 1 should be accepted (independent key).
+        let seal_htf2 = make_seal_full(
+            1,
+            "issuer-1",
+            test_root_hash(0x22),
+            "cell-A",
+            10,
+            20,
+            test_anchor_hash(0xFF),
+            test_anchor_hash(0x41),
+            test_anchor_hash(0x51),
+        );
+        let verdict = verifier.verify(&seal_htf2, RiskTier::Tier2);
+        assert!(
+            verdict.accepted,
+            "different htf_time_envelope_ref must yield independent monotonicity chain"
+        );
+    }
+
+    #[test]
+    fn rollback_detected_for_same_cell_id_and_anchors() {
+        // Same (cell_id, htf_time_envelope_ref, quorum_anchor): rollback
+        // must be detected.
+        let mut verifier = test_verifier();
+
+        let seal1 = make_seal_full(
+            10,
+            "issuer-1",
+            test_root_hash(0x11),
+            "cell-A",
+            100,
+            200,
+            test_anchor_hash(0x31),
+            test_anchor_hash(0x41),
+            test_anchor_hash(0x51),
+        );
+        assert!(verifier.verify(&seal1, RiskTier::Tier2).accepted);
+
+        // Same cell_id + anchors, lower epoch = rollback.
+        let seal2 = make_seal_full(
+            5,
+            "issuer-1",
+            test_root_hash(0x22),
+            "cell-A",
+            50,
+            100,
+            test_anchor_hash(0x31),
+            test_anchor_hash(0x41),
+            test_anchor_hash(0x51),
+        );
+        let verdict = verifier.verify(&seal2, RiskTier::Tier2);
+        assert!(
+            !verdict.accepted,
+            "rollback must be detected for same (cell_id, htf_ref, quorum_anchor)"
+        );
+        assert!(matches!(
+            verdict.audit_event,
+            EpochSealAuditEvent::RollbackRejected {
+                epoch_number: 5,
+                last_accepted_epoch: 10,
+                ..
+            }
+        ));
+    }
+
+    // =========================================================================
+    // BLOCKER 2 regression: content_hash recomputation
+    // =========================================================================
+
+    #[test]
+    fn compute_content_hash_deterministic() {
+        let seal = make_seal(3, "cell-alpha", 0x42);
+        let h1 = seal.compute_content_hash();
+        let h2 = seal.compute_content_hash();
+        assert_eq!(h1, h2, "compute_content_hash must be deterministic");
+    }
+
+    #[test]
+    fn compute_content_hash_differs_on_different_fields() {
+        let seal_a = make_seal(3, "cell-alpha", 0x42);
+        let seal_b = make_seal(4, "cell-alpha", 0x42);
+        assert_ne!(
+            seal_a.compute_content_hash(),
+            seal_b.compute_content_hash(),
+            "different epoch must yield different content hash"
+        );
+    }
+
+    #[test]
+    fn valid_seal_content_hash_matches_compute() {
+        let seal = make_seal(5, "cell-alpha", 0x11);
+        assert_eq!(
+            seal.content_hash(),
+            &seal.compute_content_hash(),
+            "make_seal must produce a seal whose content_hash matches compute_content_hash"
+        );
     }
 }
