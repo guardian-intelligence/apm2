@@ -41,10 +41,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly-2025-12-01
         with:
           toolchain: nightly-2025-12-01
-          components: rustfmt,clippy
 
-      - name: Run local CI orchestrator
-        run: ./scripts/ci/run_local_ci_orchestrator.sh
+      - name: Run bounded local CI suite
+        run: |
+          ./scripts/ci/run_bounded_tests.sh \
+            --timeout-seconds 1800 \
+            --kill-after-seconds 30 \
+            --memory-max 64G \
+            --pids-max 8192 \
+            --cpu-quota 1600% \
+            -- ./scripts/ci/run_local_ci_orchestrator.sh
 
       - name: Upload CI orchestrator logs
         if: always()

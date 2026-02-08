@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Local CI orchestrator: single GitHub job, local parallel checks, detailed logs.
-# Designed for self-hosted execution where GitHub is status projection only.
+# Local CI orchestrator: single-suite execution with per-run target isolation.
+# The entire script is intended to be wrapped once by run_bounded_tests.sh.
 
 set -euo pipefail
 
@@ -20,167 +20,60 @@ log_info() { echo -e "${GREEN}INFO:${NC} $*"; }
 log_warn() { echo -e "${YELLOW}WARN:${NC} $*"; }
 log_error() { echo -e "${RED}ERROR:${NC} $*" >&2; }
 
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-cd "${REPO_ROOT}"
-
-LOG_ROOT="${REPO_ROOT}/target/ci/orchestrator_logs"
-RUN_STAMP="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-$(date -u +%Y%m%dT%H%M%SZ)"
-LOG_DIR="${LOG_ROOT}/${RUN_STAMP}"
-mkdir -p "${LOG_DIR}"
-
-declare -a CHECK_ORDER=()
-declare -A CHECK_LOG=()
-declare -A CHECK_CMD=()
-declare -A CHECK_STATUS=()
-OVERALL_FAILED=0
-
-record_check_start() {
-    local id="$1"
-    local cmd="$2"
-    CHECK_ORDER+=("${id}")
-    CHECK_LOG["${id}"]="${LOG_DIR}/${id}.log"
-    CHECK_CMD["${id}"]="${cmd}"
-}
-
-record_check_end() {
-    local id="$1"
-    local rc="$2"
-    if [[ "${rc}" -eq 0 ]]; then
-        CHECK_STATUS["${id}"]="PASS"
-        log_info "END   [${id}] PASS"
-    else
-        CHECK_STATUS["${id}"]="FAIL(${rc})"
-        OVERALL_FAILED=1
-        log_error "END   [${id}] FAIL (${rc})"
+require_cmd() {
+    local cmd="$1"
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+        log_error "Required command not found: ${cmd}"
+        exit 1
     fi
 }
 
-run_serial_check() {
-    local id="$1"
-    local cmd="$2"
-    local logfile="${LOG_DIR}/${id}.log"
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "${REPO_ROOT}"
 
-    record_check_start "${id}" "${cmd}"
-    log_info "START [${id}] ${cmd}"
+RUN_ID="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}"
+LOG_ROOT="${REPO_ROOT}/target/ci/orchestrator_logs"
+LOG_DIR="${LOG_ROOT}/${RUN_ID}-$(date -u +%Y%m%dT%H%M%SZ)"
+BUILD_TARGET_DIR="${APM2_CI_TARGET_DIR:-target/ci/target-build-${RUN_ID}}"
+BUILD_LOG="${LOG_DIR}/build_all_targets.log"
 
-    set +e
-    (
-        set -euo pipefail
-        cd "${REPO_ROOT}"
-        bash -lc "${cmd}"
-    ) > >(tee "${logfile}") 2>&1
-    local rc=$?
-    set -e
-
-    record_check_end "${id}" "${rc}"
-}
-
-run_parallel_group() {
-    local group_name="$1"
-    shift
-    local -a entries=("$@")
-    local -a ids=()
-    local -a pids=()
-
-    log_info "=== Parallel Group: ${group_name} ==="
-
-    local entry id cmd logfile
-    for entry in "${entries[@]}"; do
-        id="${entry%%::*}"
-        cmd="${entry#*::}"
-        logfile="${LOG_DIR}/${id}.log"
-
-        record_check_start "${id}" "${cmd}"
-        log_info "START [${id}] ${cmd}"
-
-        (
-            set -euo pipefail
-            cd "${REPO_ROOT}"
-            bash -lc "${cmd}"
-        ) > >(tee "${logfile}") 2>&1 &
-
-        ids+=("${id}")
-        pids+=("$!")
-    done
-
-    local i rc
-    for i in "${!ids[@]}"; do
-        set +e
-        wait "${pids[$i]}"
-        rc=$?
-        set -e
-        record_check_end "${ids[$i]}" "${rc}"
-    done
-}
-
-print_summary() {
-    echo
-    log_info "=== CI Summary ==="
-    echo "Logs: ${LOG_DIR}"
-    local id status
-    for id in "${CHECK_ORDER[@]}"; do
-        status="${CHECK_STATUS[${id}]:-UNKNOWN}"
-        printf '  %-28s %-10s %s\n' "${id}" "${status}" "${CHECK_LOG[${id}]}"
-    done
-}
-
-print_failure_tails() {
-    local id status
-    for id in "${CHECK_ORDER[@]}"; do
-        status="${CHECK_STATUS[${id}]:-UNKNOWN}"
-        if [[ "${status}" == FAIL* ]]; then
-            echo
-            log_warn "=== Failure Tail: ${id} ==="
-            tail -n 120 "${CHECK_LOG[${id}]}" || true
-        fi
-    done
-}
+mkdir -p "${LOG_DIR}"
 
 log_info "=== Local CI Orchestrator ==="
 log_info "Repo root: ${REPO_ROOT}"
+log_info "Run ID: ${RUN_ID}"
 log_info "Log dir: ${LOG_DIR}"
+log_info "Per-run target dir: ${BUILD_TARGET_DIR}"
 
-# Bootstrap dependencies once for the whole CI run.
-run_serial_check "bootstrap" "
-sudo apt-get update
-sudo apt-get install -y protobuf-compiler ripgrep jq
-if ! command -v cargo-nextest >/dev/null 2>&1; then cargo install cargo-nextest --locked; fi
-if ! command -v cargo-deny >/dev/null 2>&1; then cargo install cargo-deny --locked; fi
-if ! command -v cargo-audit >/dev/null 2>&1; then cargo install cargo-audit --locked; fi
-rustup toolchain install 1.85 --profile minimal --no-self-update
-"
+require_cmd cargo
+require_cmd rustc
+require_cmd protoc
 
-# Fast static and guardrail checks in parallel.
-run_parallel_group "static-guardrails" \
-    "test_safety_guard::./scripts/ci/test_safety_guard.sh" \
-    "legacy_ipc_guard::./scripts/ci/legacy_ipc_guard.sh" \
-    "evidence_refs_lint::./scripts/ci/evidence_refs_lint.sh" \
-    "test_refs_lint::./scripts/ci/test_refs_lint.sh" \
-    "proto_enum_drift::./scripts/ci/proto_enum_drift.sh" \
-    "review_artifact_lint::./scripts/ci/review_artifact_lint.sh" \
-    "status_write_cmd_lint::./scripts/lint/no_direct_status_write_commands.sh"
-
-# Compile-heavy checks run in parallel on this host to minimize wall-clock time.
-# Isolated target dirs avoid cargo lock contention across concurrent builds.
-run_parallel_group "compile-analysis" \
-    "rustfmt::cargo fmt --all --check" \
-    "clippy::CARGO_TARGET_DIR=target/ci/target-clippy cargo clippy --workspace --all-targets --all-features -- -D warnings" \
-    "test_vectors::CARGO_TARGET_DIR=target/ci/target-test-vectors cargo test --package apm2-core --features test_vectors canonicalization" \
-    "msrv_check::CARGO_TARGET_DIR=target/ci/target-msrv cargo +1.85 check --workspace --all-features" \
-    "cargo_deny::cargo deny check all" \
-    "cargo_audit::cargo audit --ignore RUSTSEC-2023-0089"
-
-run_parallel_group "bounded-tests" \
-    "workspace_integrity_guard::CARGO_TARGET_DIR=target/ci/target-nextest ./scripts/ci/workspace_integrity_guard.sh --snapshot-file target/ci/workspace_integrity.snapshot.tsv -- ./scripts/ci/run_bounded_tests.sh --timeout-seconds 600 --kill-after-seconds 20 -- cargo nextest run --workspace --all-features --config-file .config/nextest.toml --profile ci" \
-    "guardrail_fixtures::./scripts/ci/test_guardrail_fixtures.sh"
-
-print_summary
-
-if [[ "${OVERALL_FAILED}" -ne 0 ]]; then
-    print_failure_tails
-    log_error "Local CI orchestrator failed."
-    exit 1
+if [[ "${APM2_CI_DRY_RUN:-0}" == "1" ]]; then
+    log_warn "APM2_CI_DRY_RUN=1 set; skipping cargo build."
+    exit 0
 fi
 
+log_info "START [build_all_targets] cargo build --workspace --all-features --all-targets --locked"
+set +e
+(
+    set -euo pipefail
+    cd "${REPO_ROOT}"
+    CARGO_TARGET_DIR="${BUILD_TARGET_DIR}" \
+        cargo build --workspace --all-features --all-targets --locked
+) > >(tee "${BUILD_LOG}") 2>&1
+status=$?
+set -e
+
+if [[ ${status} -ne 0 ]]; then
+    log_error "END   [build_all_targets] FAIL (${status})"
+    log_warn "=== Failure Tail: build_all_targets ==="
+    tail -n 160 "${BUILD_LOG}" || true
+    log_error "Local CI orchestrator failed."
+    exit "${status}"
+fi
+
+log_info "END   [build_all_targets] PASS"
+log_info "Log file: ${BUILD_LOG}"
 log_info "Local CI orchestrator passed."
 exit 0

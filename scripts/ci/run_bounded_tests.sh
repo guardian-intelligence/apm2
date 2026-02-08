@@ -196,12 +196,30 @@ log_info "Preflight passed: systemd-run --user is functional."
 
 UNIT="apm2-ci-bounded-${GITHUB_RUN_ID:-local}-${RANDOM}-$$"
 
+# Preserve selected caller environment in the transient unit.
+declare -a SETENV_ARGS=()
+for var_name in \
+    GITHUB_RUN_ID \
+    GITHUB_RUN_ATTEMPT \
+    APM2_CI_DRY_RUN \
+    APM2_CI_TARGET_DIR \
+    CARGO_TERM_COLOR \
+    CARGO_INCREMENTAL \
+    RUSTFLAGS \
+    RUST_BACKTRACE; do
+    if [[ -n "${!var_name:-}" ]]; then
+        SETENV_ARGS+=(--setenv "${var_name}=${!var_name}")
+    fi
+done
+
 log_info "Starting bounded command in transient user unit: ${UNIT}"
 systemd-run \
     --user \
     --quiet \
     --wait \
     --collect \
+    --working-directory "${REPO_ROOT}" \
+    "${SETENV_ARGS[@]}" \
     --unit "${UNIT}" \
     --property "MemoryAccounting=yes" \
     --property "CPUAccounting=yes" \

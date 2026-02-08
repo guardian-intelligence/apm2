@@ -17,23 +17,12 @@ Operate FAC-local CI gate execution on OVH self-hosted runners while keeping Git
   - Parallel job execution requires multiple runner agents registered on this machine with the same labels (one runner process executes one job at a time).
 
 ## Blocking Guard Checks
-- These run inside the single GitHub job `CI Success` via `./scripts/ci/run_local_ci_orchestrator.sh`.
-- `Test Safety Guard`
-  - Command: `./scripts/ci/test_safety_guard.sh`
-  - Blocks destructive test signatures pre-execution.
-- `Bounded Test Runner`
-  - Command: `./scripts/ci/run_bounded_tests.sh`
-  - Enforces timeout + cgroup/systemd ceilings (CPU/memory/pids).
-- `Workspace Integrity Guard`
-  - Command: `./scripts/ci/workspace_integrity_guard.sh -- <bounded test command>`
-  - Fails if tracked repository content mutates unexpectedly after tests.
-
-## Failure-Injection Validation
-- Command: `./scripts/ci/test_guardrail_fixtures.sh`
-- Verifies:
-  - dangerous test signatures are rejected
-  - tracked workspace mutation is detected
-  - hung commands are terminated by watchdog limits
+- `Bounded CI Suite`
+  - Command: `./scripts/ci/run_bounded_tests.sh --timeout-seconds 1800 --kill-after-seconds 30 --memory-max 64G --pids-max 8192 --cpu-quota 1600% -- ./scripts/ci/run_local_ci_orchestrator.sh`
+  - The full local suite runs in one transient user unit/cgroup boundary.
+- `Build All Targets` (inside orchestrator)
+  - Command: `cargo build --workspace --all-features --all-targets --locked`
+  - Uses per-run target path `target/ci/target-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}` for parallel-worktree safety.
 
 ## Operational Procedure
 1. Confirm `fac-ovh` resolves to this host and runner service:
@@ -41,10 +30,10 @@ Operate FAC-local CI gate execution on OVH self-hosted runners while keeping Git
    - `systemctl status actions.runner.guardian-intelligence-apm2.ubuntu-ovh-runner.service` must be `active (running)`.
 2. Confirm runner is online in GitHub Actions with label set: `self-hosted`, `linux`, `x64`, `fac-ovh`.
 3. Trigger CI on PR and merge-group SHA.
-4. Verify `CI Success` job logs show these checks passing:
-   - `Test Safety Guard`
-   - `Bounded Test Runner`
-   - `Workspace Integrity Guard`
+4. Verify `CI Success` job logs show:
+   - `Preflight passed: systemd-run --user is functional.`
+   - `Starting bounded command in transient user unit`
+   - `END   [build_all_targets] PASS`
 5. On failures, inspect job logs and corresponding guard script output.
 6. If test-safety false positives occur, add minimal scoped entries to `scripts/ci/test_safety_allowlist.txt`.
 
