@@ -40,6 +40,7 @@ ticket_meta:
       - "Cut over GitHub AI review projection to a unified workflow (`.github/workflows/ai-review.yml`) that uses `apm2 fac review`."
       - "Launch `security` and `quality` FAC reviewers in parallel from GitHub workflow execution."
       - "Emit one condensed reviewer-fleet status line per second in GitHub logs and print explicit error lines for crash/stall/fallback/SHA-update events."
+      - "Use asynchronous workflow dispatch semantics: GitHub workflow launches detached FAC review processes and exits after a bounded 1Hz projection window."
       - "Implement uniform random model selection across `gemini-3.0-flash-preview`, `gemini-3.0-pro-preview`, and `gpt-5.3-codex-xhigh`."
       - "Implement backend-aware command dispatch for Codex and Gemini initial spawn and resume paths."
       - "Emit append-only review lifecycle telemetry to `~/.apm2/review_events.ndjson` with rotation at 10MB."
@@ -65,6 +66,7 @@ ticket_meta:
       - "Rewrite orchestrator-monitor launch/check/poll assets to call `apm2 fac review` and parse FAC review telemetry/state files."
       - "Replace split AI-review workflows with unified `.github/workflows/ai-review.yml`, launching security and quality reviews in parallel via FAC."
       - "Implement 1Hz projection logging in GitHub workflow using `apm2 fac --json review status --pr <N>` and explicit error-event lines."
+      - "Change workflow execution from synchronous wait-until-complete to asynchronous detached dispatch with short projection loop to minimize runner occupancy and queue pressure."
       - "Run `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo doc --workspace --no-deps`, and `cargo test -p apm2-cli`."
   definition_of_done:
     evidence_ids:
@@ -72,6 +74,7 @@ ticket_meta:
     criteria:
       - "`apm2 fac review run --type all <PR_URL>` executes security and quality sequentially and records deterministic event ordering."
       - "Unified GitHub AI review workflow launches `security` and `quality` FAC review runs in parallel for the same PR head SHA."
+      - "Unified GitHub AI review workflow does not block on review completion; it dispatches detached runs and exits after bounded projection output."
       - "GitHub run logs show one condensed status line per second with current reviewer-agent state and surface explicit error lines when faults appear."
       - "Review runs are observable through NDJSON lifecycle events and pulse/state files without relying on ad-hoc mtime/process greps."
       - "On SHA drift, active review sessions are terminated and resumed with preserved context via backend-native resume commands."

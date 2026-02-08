@@ -159,7 +159,7 @@ jobs:
             done <<< "$IDS"
           done
 
-      - name: Run FAC reviews in parallel with 1Hz status projection
+      - name: Dispatch FAC reviews asynchronously with 1Hz projection window
         if: steps.pr.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.AUTO_APPROVE_PAT }}
@@ -187,41 +187,38 @@ jobs:
             FAC_BIN=(target/debug/apm2)
           fi
 
-          RUN_DIR=$(mktemp -d /tmp/apm2-ai-review-XXXXXX)
-          SEC_LOG="${RUN_DIR}/security.log"
-          QUAL_LOG="${RUN_DIR}/quality.log"
+          DISPATCH_DIR="${HOME}/.apm2/review_dispatch"
+          mkdir -p "${DISPATCH_DIR}"
 
-          terminate_children() {
-            set +e
-            for pid in ${SEC_PID:-} ${QUAL_PID:-}; do
-              if [[ -n "${pid:-}" ]] && kill -0 "${pid}" 2>/dev/null; then
-                kill "${pid}" 2>/dev/null || true
-              fi
-            done
-            wait ${SEC_PID:-} 2>/dev/null || true
-            wait ${QUAL_PID:-} 2>/dev/null || true
-            set -e
+          STATUS_JSON=$("${FAC_BIN[@]}" fac --json review status --pr "${PR_NUMBER}" 2>/dev/null || echo '{}')
+
+          launch_review_async() {
+            local review_type="$1"
+            local active_count
+            active_count=$(jq -r --arg t "${review_type}" '
+              [.state_entries[]? | select(.review_type == $t and (.alive // false))] | length
+            ' <<<"${STATUS_JSON}")
+
+            if [[ "${active_count}" != "0" ]]; then
+              echo "dispatch review_type=${review_type} skipped=active"
+              return 0
+            fi
+
+            local ts
+            ts=$(date -u +"%Y%m%dT%H%M%SZ")
+            local log_file="${DISPATCH_DIR}/pr${PR_NUMBER}-${review_type}-${HEAD_SHA:0:12}-${ts}.log"
+            nohup env GH_TOKEN="${GH_TOKEN}" \
+              "${FAC_BIN[@]}" fac review run "${PR_URL}" --type "${review_type}" --expected-head-sha "${HEAD_SHA}" \
+              >"${log_file}" 2>&1 < /dev/null &
+            local pid=$!
+            echo "dispatch review_type=${review_type} pid=${pid} log=${log_file}"
           }
 
-          trap terminate_children INT TERM
-
-          (
-            set +e
-            "${FAC_BIN[@]}" fac review run "${PR_URL}" --type security --expected-head-sha "${HEAD_SHA}" >"${SEC_LOG}" 2>&1
-            echo "$?" >"${RUN_DIR}/security.exit"
-          ) &
-          SEC_PID=$!
-
-          (
-            set +e
-            "${FAC_BIN[@]}" fac review run "${PR_URL}" --type quality --expected-head-sha "${HEAD_SHA}" >"${QUAL_LOG}" 2>&1
-            echo "$?" >"${RUN_DIR}/quality.exit"
-          ) &
-          QUAL_PID=$!
+          launch_review_async security
+          launch_review_async quality
 
           LAST_SEQ=0
-
-          while kill -0 "${SEC_PID}" 2>/dev/null || kill -0 "${QUAL_PID}" 2>/dev/null; do
+          for _ in $(seq 1 30); do
             NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
             STATUS_JSON=$("${FAC_BIN[@]}" fac --json review status --pr "${PR_NUMBER}" 2>/dev/null || true)
 
@@ -287,30 +284,6 @@ jobs:
 
             sleep 1
           done
-
-          set +e
-          wait "${SEC_PID}"; SEC_EXIT=$?
-          wait "${QUAL_PID}"; QUAL_EXIT=$?
-          set -e
-
-          trap - INT TERM
-
-          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          echo "ts=${NOW} security_exit=${SEC_EXIT} quality_exit=${QUAL_EXIT} run_dir=${RUN_DIR}"
-
-          if [[ ${SEC_EXIT} -ne 0 ]]; then
-            echo "ERROR security review failed with exit=${SEC_EXIT}"
-            tail -n 40 "${SEC_LOG}" || true
-          fi
-
-          if [[ ${QUAL_EXIT} -ne 0 ]]; then
-            echo "ERROR quality review failed with exit=${QUAL_EXIT}"
-            tail -n 40 "${QUAL_LOG}" || true
-          fi
-
-          if [[ ${SEC_EXIT} -ne 0 || ${QUAL_EXIT} -ne 0 ]]; then
-            exit 1
-          fi
 
       # Review Gate Success status is posted exclusively by
       # .github/workflows/review-gate.yml (trusted base-branch evaluator).
