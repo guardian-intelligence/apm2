@@ -577,7 +577,7 @@ mod tests {
 
         // Test with a simple path (no log)
         let prompt_path = Path::new("/tmp/test_prompt.txt");
-        let shell_cmd = build_script_command(prompt_path, None, None);
+        let shell_cmd = build_script_command(prompt_path, None, None, None);
 
         // Verify command includes PTY allocation
         if cfg!(target_os = "macos") {
@@ -606,7 +606,7 @@ mod tests {
 
         // Test with a path containing spaces - must be properly quoted
         let special_path = Path::new("/tmp/test file.txt");
-        let special_cmd = build_script_command(special_path, None, None);
+        let special_cmd = build_script_command(special_path, None, None, None);
 
         // Verify the command is well-formed
         if cfg!(target_os = "macos") {

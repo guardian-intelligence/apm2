@@ -360,7 +360,7 @@ fn run_uat_signoff(
 fn run_ai_review(
     sh: &Shell,
     pr_url: &str,
-    owner_repo: &str,
+    _owner_repo: &str,
     head_sha: &str,
     repo_root: &str,
     review_type: ReviewType,
@@ -430,17 +430,6 @@ fn run_ai_review(
         ReviewType::Uat => unreachable!("UAT is handled separately"),
     };
 
-    // Read the prompt and substitute additional variables (owner/repo)
-    let prompt_content =
-        std::fs::read_to_string(&full_prompt_path).context("Failed to read review prompt")?;
-
-    // Substitute all variables including owner/repo
-    let prompt = prompt_content
-        .replace("$PR_URL", pr_url)
-        .replace("$HEAD_SHA", head_sha)
-        .replace("{owner}", owner_repo.split('/').next().unwrap_or(""))
-        .replace("{repo}", owner_repo.split('/').nth(1).unwrap_or(""));
-
     println!("  Prompt loaded from: {full_prompt_path}");
 
     println!(
@@ -450,7 +439,7 @@ fn run_ai_review(
 
     // Use ReviewerSpawner for centralized spawn logic (synchronous mode)
     let spawner = ReviewerSpawner::new(reviewer_type_key, pr_url, head_sha)
-        .with_prompt_content(&prompt)
+        .with_prompt_file(Path::new(&full_prompt_path))?
         .with_model(select_review_model());
 
     match spawner.spawn_sync() {
@@ -657,7 +646,7 @@ mod tests {
 
         // Test with a simple path (no log)
         let prompt_path = Path::new("/tmp/test_prompt.txt");
-        let shell_cmd = build_script_command(prompt_path, None, None);
+        let shell_cmd = build_script_command(prompt_path, None, None, None);
 
         // Verify command includes PTY allocation
         if cfg!(target_os = "macos") {
@@ -686,7 +675,7 @@ mod tests {
 
         // Test with a path containing spaces - must be properly quoted
         let special_path = Path::new("/tmp/test file.txt");
-        let special_cmd = build_script_command(special_path, None, None);
+        let special_cmd = build_script_command(special_path, None, None, None);
 
         // Verify the command is well-formed
         if cfg!(target_os = "macos") {

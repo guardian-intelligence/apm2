@@ -16,10 +16,12 @@
 //! | All passed         | Wait for auto-merge, then cleanup             |
 //! | Already merged     | `cargo xtask finish` to cleanup               |
 
-use std::thread;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use std::{fs, thread};
 
 use anyhow::{Context, Result};
+use regex::Regex;
 use serde::Deserialize;
 use xshell::{Shell, cmd};
 
@@ -708,22 +710,50 @@ fn remediate_reviewer(
     };
 
     if is_review_completed(sh, &current_entry.head_sha, status_context) {
-        // Review completed, clean up the state entry and all temp files
-        let cleaned = cleanup_reviewer_temp_files(&mut state, reviewer_type);
-        state.save()?;
-        if cleaned.is_empty() {
-            println!(
-                "      {} review completed, cleaning up state",
-                capitalize(reviewer_type)
-            );
+        // Review completed. If we have captured output, validate it before
+        // cleaning up so shallow/non-compliant reviews are automatically
+        // re-run (bounded by restart_count).
+        if let Some(path) = current_entry.last_message_file.as_ref() {
+            match validate_reviewer_last_message(reviewer_type, &current_entry.head_sha, path) {
+                Ok(()) => {
+                    let cleaned = cleanup_reviewer_temp_files(&mut state, reviewer_type);
+                    state.save()?;
+                    if cleaned.is_empty() {
+                        println!(
+                            "      {} review completed, cleaning up state",
+                            capitalize(reviewer_type)
+                        );
+                    } else {
+                        println!(
+                            "      {} review completed, cleaned up {} temp file(s)",
+                            capitalize(reviewer_type),
+                            cleaned.len()
+                        );
+                    }
+                    return Ok(());
+                },
+                Err(reasons) => {
+                    println!(
+                        "      {} review completed, but output failed validation (will restart):",
+                        capitalize(reviewer_type)
+                    );
+                    for reason in reasons {
+                        println!("        - {reason}");
+                    }
+                    // Continue to restart logic below (do NOT clean up yet).
+                },
+            }
         } else {
+            // No capture file (older state entries). Clean up as before.
+            let cleaned = cleanup_reviewer_temp_files(&mut state, reviewer_type);
+            state.save()?;
             println!(
-                "      {} review completed, cleaned up {} temp file(s)",
+                "      {} review completed (no capture file), cleaned up {} temp file(s)",
                 capitalize(reviewer_type),
                 cleaned.len()
             );
+            return Ok(());
         }
-        return Ok(());
     }
 
     // Check restart count limit
@@ -885,6 +915,122 @@ fn restart_review(
     }
 
     Ok(())
+}
+
+fn validate_reviewer_last_message(
+    reviewer_type: &str,
+    expected_head_sha: &str,
+    path: &std::path::Path,
+) -> std::result::Result<(), Vec<String>> {
+    let mut reasons = Vec::new();
+
+    let content = match fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(e) => {
+            reasons.push(format!(
+                "Could not read last-message capture file {}: {e}",
+                path.display()
+            ));
+            return Err(reasons);
+        },
+    };
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        reasons.push("Last-message capture file is empty".to_string());
+        return Err(reasons);
+    }
+
+    // Minimal size threshold: shallow reviews tend to be tiny and omit
+    // required sections. Keep this conservative to avoid false restarts on
+    // small PRs.
+    if trimmed.len() < 800 {
+        reasons.push(format!(
+            "Review output too short ({} chars); expected a structured review comment",
+            trimmed.len()
+        ));
+    }
+
+    let (banner_prefix, marker, required_sections): (&str, &str, &[&str]) = match reviewer_type {
+        "security" => (
+            "## Security Review:",
+            "<!-- apm2-review-metadata:v1:security -->",
+            &[
+                "Summary",
+                "SCP Determination",
+                "Markov Blanket",
+                "Machine-Readable Metadata",
+            ],
+        ),
+        "quality" => (
+            "## Code Quality Review:",
+            "<!-- apm2-review-metadata:v1:code-quality -->",
+            &[
+                "Summary",
+                "Quality Analysis",
+                "Lenses Applied",
+                "Machine-Readable Metadata",
+            ],
+        ),
+        _ => (
+            "##",
+            "<!-- apm2-review-metadata:v1:",
+            &["Machine-Readable Metadata"],
+        ),
+    };
+
+    if !trimmed.contains(banner_prefix) {
+        reasons.push(format!(
+            "Missing required verdict banner starting with `{banner_prefix}`"
+        ));
+    }
+
+    if !trimmed.contains(marker) {
+        reasons.push(format!("Missing required metadata marker `{marker}`"));
+    }
+
+    if !trimmed
+        .to_ascii_lowercase()
+        .contains(&expected_head_sha.to_ascii_lowercase())
+    {
+        reasons.push(format!(
+            "Missing expected head SHA {expected_head_sha} in output (gate requires SHA binding)"
+        ));
+    }
+
+    for section in required_sections {
+        if !trimmed.contains(section) {
+            reasons.push(format!("Missing required section keyword `{section}`"));
+        }
+    }
+
+    let file_refs = count_file_references(trimmed);
+    if file_refs < 5 {
+        reasons.push(format!(
+            "Too few file references ({file_refs}); expected at least 5 concrete file paths"
+        ));
+    }
+
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons)
+    }
+}
+
+fn file_reference_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // Conservative file reference matcher for APM2-style reviews.
+        Regex::new(
+            r"(?m)\b[\w./@-]+\.(?:rs|toml|yml|yaml|md|sh|json|proto|lock)(?::\d+(?::\d+)?)?\b",
+        )
+        .expect("file reference regex must compile")
+    })
+}
+
+fn count_file_references(text: &str) -> usize {
+    file_reference_regex().find_iter(text).count()
 }
 
 #[cfg(test)]
