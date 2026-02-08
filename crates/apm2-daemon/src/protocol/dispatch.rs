@@ -5256,7 +5256,7 @@ impl PrivilegedDispatcher {
 
     /// Sets the per-session broker configuration template.
     #[must_use]
-    pub const fn with_broker_config(mut self, config: ToolBrokerConfig) -> Self {
+    pub fn with_broker_config(mut self, config: ToolBrokerConfig) -> Self {
         self.broker_config = config;
         self
     }

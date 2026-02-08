@@ -560,6 +560,17 @@ pub struct ToolBrokerConfig {
 
     /// Whether to use dedupe cache (default: true).
     pub use_dedupe_cache: bool,
+
+    /// Optional shell bridge policy for runtime configuration (TCK-00377).
+    ///
+    /// When `Some`, the broker uses this policy for shell bridge allowlist
+    /// enforcement instead of the default `ShellBridgePolicy::deny_all()`.
+    /// This allows the allowlist to be configured at runtime via config
+    /// without requiring builder-pattern chaining.
+    ///
+    /// Default: `None` (broker falls back to `ShellBridgePolicy::deny_all()`
+    /// unless overridden via [`ToolBroker::with_shell_bridge_policy`]).
+    pub shell_bridge_policy: Option<ShellBridgePolicy>,
 }
 
 impl Default for ToolBrokerConfig {
@@ -568,6 +579,7 @@ impl Default for ToolBrokerConfig {
             dedupe_config: DedupeCacheConfig::default(),
             check_policy: true,
             use_dedupe_cache: true,
+            shell_bridge_policy: None,
         }
     }
 }
@@ -591,6 +603,16 @@ impl ToolBrokerConfig {
     #[must_use]
     pub const fn without_dedupe_cache(mut self) -> Self {
         self.use_dedupe_cache = false;
+        self
+    }
+
+    /// Sets the shell bridge policy for runtime configuration (TCK-00377).
+    ///
+    /// When set, the broker uses this policy for shell bridge allowlist
+    /// enforcement instead of the default `ShellBridgePolicy::deny_all()`.
+    #[must_use]
+    pub fn with_shell_bridge_policy(mut self, policy: ShellBridgePolicy) -> Self {
+        self.shell_bridge_policy = Some(policy);
         self
     }
 }
@@ -746,6 +768,10 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     #[must_use]
     pub fn new(config: ToolBrokerConfig) -> Self {
         let dedupe_cache = Arc::new(DedupeCache::new(config.dedupe_config.clone()));
+        let shell_bridge_policy = config
+            .shell_bridge_policy
+            .clone()
+            .unwrap_or(ShellBridgePolicy::deny_all());
 
         Self {
             config,
@@ -759,7 +785,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             ssh_store: None,
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
-            shell_bridge_policy: ShellBridgePolicy::deny_all(),
+            shell_bridge_policy,
             precondition_evaluator: None,
         }
     }
@@ -768,6 +794,10 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     #[must_use]
     pub fn with_loader(config: ToolBrokerConfig, loader: Arc<L>) -> Self {
         let dedupe_cache = Arc::new(DedupeCache::new(config.dedupe_config.clone()));
+        let shell_bridge_policy = config
+            .shell_bridge_policy
+            .clone()
+            .unwrap_or(ShellBridgePolicy::deny_all());
 
         Self {
             config,
@@ -781,7 +811,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             ssh_store: None,
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
-            shell_bridge_policy: ShellBridgePolicy::deny_all(),
+            shell_bridge_policy,
             precondition_evaluator: None,
         }
     }
@@ -796,6 +826,10 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         github_store: Arc<dyn GitHubCredentialStore>,
     ) -> Self {
         let dedupe_cache = Arc::new(DedupeCache::new(config.dedupe_config.clone()));
+        let shell_bridge_policy = config
+            .shell_bridge_policy
+            .clone()
+            .unwrap_or(ShellBridgePolicy::deny_all());
 
         Self {
             config,
@@ -809,7 +843,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             ssh_store: None,
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
-            shell_bridge_policy: ShellBridgePolicy::deny_all(),
+            shell_bridge_policy,
             precondition_evaluator: None,
         }
     }
@@ -825,6 +859,10 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         ssh_store: Arc<dyn SshCredentialStore>,
     ) -> Self {
         let dedupe_cache = Arc::new(DedupeCache::new(config.dedupe_config.clone()));
+        let shell_bridge_policy = config
+            .shell_bridge_policy
+            .clone()
+            .unwrap_or(ShellBridgePolicy::deny_all());
 
         Self {
             config,
@@ -838,7 +876,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             ssh_store: Some(ssh_store),
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
-            shell_bridge_policy: ShellBridgePolicy::deny_all(),
+            shell_bridge_policy,
             precondition_evaluator: None,
         }
     }
@@ -855,6 +893,10 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         ssh_store: Arc<dyn SshCredentialStore>,
     ) -> Self {
         let dedupe_cache = Arc::new(DedupeCache::new(config.dedupe_config.clone()));
+        let shell_bridge_policy = config
+            .shell_bridge_policy
+            .clone()
+            .unwrap_or(ShellBridgePolicy::deny_all());
 
         Self {
             config,
@@ -868,7 +910,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             ssh_store: Some(ssh_store),
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
-            shell_bridge_policy: ShellBridgePolicy::deny_all(),
+            shell_bridge_policy,
             precondition_evaluator: None,
         }
     }
@@ -2048,6 +2090,25 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                     policy_hash: self.policy.policy_hash(),
                 });
             }
+        }
+
+        // Step 1d: Idempotency precondition enforcement (TCK-00377 BLOCKER).
+        //
+        // If the request carries a typed `ToolKind` with a precondition, evaluate
+        // it **before** capability/policy checks.  This ensures that stale or
+        // invalid preconditions are rejected before any side effects occur.
+        //
+        // Fail-closed: if a precondition is declared but no evaluator is
+        // configured, the request is denied.
+        if let Some(ref tool_kind) = request.tool_kind {
+            self.evaluate_precondition(tool_kind).map_err(|e| {
+                warn!(
+                    request_id = %request.request_id,
+                    error = %e,
+                    "TCK-00377: idempotency precondition evaluation failed"
+                );
+                e
+            })?;
         }
 
         // Step 2: Validate against context firewall (TCK-00261, TCK-00286)
@@ -6509,6 +6570,184 @@ policy:
         assert!(
             result.is_ok(),
             "ReadFile should skip precondition evaluation"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00377 BLOCKER: Integration test — precondition-fail rejects in the
+    // production `request_with_response` pipeline.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_precondition_fail_rejects_in_request_pipeline() {
+        // TCK-00377 BLOCKER: Build a full BrokerToolRequest with a ToolKind
+        // carrying a precondition that fails.  The request pipeline must
+        // reject it before reaching capability or firewall checks.
+        let evaluator = Arc::new(AlwaysFailedEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        // Initialize broker with a manifest allowing writes
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_write_capability(
+                "cap-write",
+                vec![PathBuf::from("/workspace")],
+            )])
+            .tool_allowlist(vec![ToolClass::Write])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // WriteFile with FileNotExists precondition (evaluator always fails)
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new("/workspace/new-file.txt").unwrap(),
+            content_hash: [0u8; 32],
+            create_only: true,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileNotExists),
+        };
+
+        let request = make_request(
+            "precond-fail-req",
+            ToolClass::Write,
+            Some("/workspace/new-file.txt"),
+        )
+        .with_tool_kind(tool_kind);
+
+        let result = broker.request(&request, timestamp_ns(0), None).await;
+
+        // The request must fail with PreconditionFailed — not proceed to
+        // capability checks or return Allow.
+        assert!(
+            result.is_err(),
+            "request with failing precondition must be rejected, got: {result:?}"
+        );
+        assert!(
+            matches!(result, Err(BrokerError::PreconditionFailed { .. })),
+            "error must be PreconditionFailed, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_precondition_pass_allows_through_pipeline() {
+        // TCK-00377: When precondition passes, the request should proceed
+        // through the normal pipeline (not be blocked by precondition check).
+        let evaluator = Arc::new(AlwaysSatisfiedEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        // Initialize broker with a manifest allowing writes
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_write_capability(
+                "cap-write",
+                vec![PathBuf::from("/workspace")],
+            )])
+            .tool_allowlist(vec![ToolClass::Write])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new("/workspace/new-file.txt").unwrap(),
+            content_hash: [0u8; 32],
+            create_only: true,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileNotExists),
+        };
+
+        let request = make_request(
+            "precond-pass-req",
+            ToolClass::Write,
+            Some("/workspace/new-file.txt"),
+        )
+        .with_tool_kind(tool_kind);
+
+        let result = broker.request(&request, timestamp_ns(0), None).await;
+
+        // The request must NOT fail with PreconditionFailed.
+        // It should proceed to capability checks (and succeed if capabilities allow).
+        assert!(
+            result.is_ok(),
+            "request with satisfied precondition must proceed, got: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00377 MAJOR 2: Shell bridge policy from config test
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_shell_bridge_policy_from_config() {
+        // TCK-00377: ToolBrokerConfig can carry a shell_bridge_policy that
+        // the broker uses at construction time. This proves the allowlist
+        // is runtime-configurable via config.
+        let shell_policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        let config = ToolBrokerConfig::default()
+            .without_policy_check()
+            .with_shell_bridge_policy(shell_policy);
+
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(config);
+
+        // Initialize broker with execute capability
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_execute_capability("cap-exec")])
+            .tool_allowlist(vec![ToolClass::Execute])
+            .shell_allowlist(vec!["*".to_string()])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Request with allowlisted command should pass the shell bridge check
+        let request = make_request("config-policy-req", ToolClass::Execute, None)
+            .with_shell_command("cargo test --release");
+
+        let result = broker.request(&request, timestamp_ns(0), None).await;
+        assert!(
+            result.is_ok(),
+            "config-sourced shell_bridge_policy must be respected, got: {result:?}"
+        );
+        let decision = result.unwrap();
+        assert!(
+            decision.is_allowed(),
+            "allowlisted command via config policy must be allowed, got: {decision:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_bridge_policy_from_config_denies_unlisted() {
+        // TCK-00377: Config policy that allows only "cargo" must deny "rm".
+        let shell_policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        let config = ToolBrokerConfig::default()
+            .without_policy_check()
+            .with_shell_bridge_policy(shell_policy);
+
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(config);
+
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_execute_capability("cap-exec")])
+            .tool_allowlist(vec![ToolClass::Execute])
+            .shell_allowlist(vec!["*".to_string()])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // "rm" is not in the config-sourced allowlist
+        let request = make_request("config-deny-req", ToolClass::Execute, None)
+            .with_shell_command("rm -rf /tmp/data");
+
+        let result = broker.request(&request, timestamp_ns(0), None).await;
+        assert!(
+            result.is_ok(),
+            "request should return a decision, not error"
+        );
+        let decision = result.unwrap();
+        assert!(
+            decision.is_denied(),
+            "unlisted command via config policy must be denied, got: {decision:?}"
         );
     }
 }

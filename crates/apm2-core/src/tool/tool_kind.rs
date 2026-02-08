@@ -492,6 +492,37 @@ impl GitOpKind {
         }
     }
 
+    /// Returns `true` if this operation accepts URL or refspec arguments
+    /// that should NOT be validated with [`validate_git_ref`].
+    ///
+    /// Operations like `clone` and `fetch` accept repository URLs
+    /// (e.g., `https://github.com/foo/bar.git`). Operations like `push`,
+    /// `pull`, and `fetch` accept refspecs (e.g., `main:refs/heads/main`).
+    /// The `remote` subcommand `add` also accepts URLs.
+    ///
+    /// These argument types contain characters (`://`, `:`, `@`) that are
+    /// forbidden in strict git ref validation, so they must be exempt from
+    /// ref validation while still being checked for shell metacharacters.
+    #[must_use]
+    pub const fn accepts_url_or_refspec_args(&self) -> bool {
+        match self {
+            Self::Clone | Self::Fetch | Self::Pull | Self::Push | Self::Remote => true,
+            Self::Checkout
+            | Self::Merge
+            | Self::Branch
+            | Self::Rebase
+            | Self::Tag
+            | Self::Reset
+            | Self::Diff
+            | Self::Log
+            | Self::Status
+            | Self::Show
+            | Self::Add
+            | Self::Commit
+            | Self::Stash => false,
+        }
+    }
+
     /// Returns the canonical operation name.
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
@@ -861,6 +892,14 @@ pub struct ShellBridgePolicy {
 
     /// Whether Tier2+ routes are allowed to use shell execution at all.
     /// Defaults to `false` (deny).
+    ///
+    /// **NOTE (TCK-00377):** This field is currently unused in enforcement
+    /// because `check()` unconditionally denies Tier2+ shell execution per
+    /// CQ review requirements.  It is retained for forward-compatibility:
+    /// a future policy revision may gate Tier2+ shell access behind an
+    /// explicit opt-in flag, at which point this field will be consulted.
+    /// Removing it would be a breaking change to the serialized config
+    /// schema (`Serialize`/`Deserialize`).
     tier2_plus_allowed: bool,
 }
 
@@ -1106,6 +1145,45 @@ fn from_file_edit(req: &FileEdit) -> Result<ToolKind, ToolKindError> {
     })
 }
 
+/// Returns `true` if the argument looks like a URL.
+///
+/// Detects common git remote URL schemes:
+/// - `https://...`, `http://...`, `git://...`, `ssh://...`, `file://...`
+/// - SCP-style: `user@host:path` (contains `@` before `:`)
+///
+/// These must NOT be validated as git ref names since they contain characters
+/// forbidden in refs (`:`, `//`, `@`).
+fn looks_like_url(arg: &str) -> bool {
+    // Scheme-based URLs (https://, git://, ssh://, file://, etc.)
+    if arg.contains("://") {
+        return true;
+    }
+    // SCP-style git URLs: user@host:path (must have @ before :)
+    matches!(
+        (arg.find('@'), arg.find(':')),
+        (Some(at_pos), Some(colon_pos)) if at_pos < colon_pos
+    )
+}
+
+/// Returns `true` if the argument looks like a git refspec.
+///
+/// Refspecs have the form `src:dst` (e.g., `main:refs/heads/main`,
+/// `refs/heads/*:refs/remotes/origin/*`). The `:` character is forbidden
+/// in strict ref names, but is the standard refspec separator.
+///
+/// Only matches if neither side of the `:` is empty (a bare `:` is not
+/// a refspec but a special git syntax for deleting remote refs, which is
+/// side-effectful and should still be validated).
+fn looks_like_refspec(arg: &str) -> bool {
+    arg.find(':').is_some_and(|colon_pos| {
+        // Ensure both sides are non-empty to avoid matching bare `:`
+        // or trailing `:` patterns.
+        let lhs = &arg[..colon_pos];
+        let rhs = &arg[colon_pos + 1..];
+        !lhs.is_empty() && !rhs.is_empty()
+    })
+}
+
 fn from_git_op(req: &GitOperation) -> Result<ToolKind, ToolKindError> {
     let operation = GitOpKind::parse(&req.operation)?;
 
@@ -1126,12 +1204,24 @@ fn from_git_op(req: &GitOperation) -> Result<ToolKind, ToolKindError> {
         // arguments for ref-accepting operations. Arguments starting with
         // `-` are flags. Arguments after `--` are pathspecs. Everything
         // else is a potential ref name that must be validated.
+        //
+        // Exception: operations that accept URLs or refspecs (clone, fetch,
+        // push, pull, remote) skip ref validation for arguments that look
+        // like URLs or refspecs. These are still validated for shell
+        // metacharacters via `validate_git_arg` above.
         if !past_double_dash
             && !arg.starts_with('-')
             && !arg.is_empty()
             && operation.accepts_ref_args()
         {
-            validate_git_ref(arg)?;
+            // Skip ref validation for URL-like or refspec-like args when
+            // the operation accepts them.
+            let skip_ref_validation = operation.accepts_url_or_refspec_args()
+                && (looks_like_url(arg) || looks_like_refspec(arg));
+
+            if !skip_ref_validation {
+                validate_git_ref(arg)?;
+            }
         }
 
         args.push(validated);
@@ -2351,6 +2441,132 @@ mod tests {
         assert!(!GitOpKind::Add.accepts_ref_args());
         assert!(!GitOpKind::Commit.accepts_ref_args());
         assert!(!GitOpKind::Stash.accepts_ref_args());
+    }
+
+    // =========================================================================
+    // TCK-00377 MAJOR 1: Git URL/refspec validation tests
+    // =========================================================================
+
+    #[test]
+    fn test_git_clone_with_https_url() {
+        // Clone with HTTPS URL must pass — URL contains `://` which is
+        // forbidden in strict ref validation but valid for clone.
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "CLONE".to_string(),
+            args: vec!["https://github.com/example/repo.git".to_string()],
+            cwd: String::new(),
+        });
+        assert!(
+            tool_kind_from_proto(&tool).is_ok(),
+            "CLONE with HTTPS URL should pass validation"
+        );
+    }
+
+    #[test]
+    fn test_git_clone_with_ssh_url() {
+        // Clone with SCP-style SSH URL (user@host:path) must pass.
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "CLONE".to_string(),
+            args: vec!["git@github.com:example/repo.git".to_string()],
+            cwd: String::new(),
+        });
+        assert!(
+            tool_kind_from_proto(&tool).is_ok(),
+            "CLONE with SSH URL should pass validation"
+        );
+    }
+
+    #[test]
+    fn test_git_fetch_with_url() {
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "FETCH".to_string(),
+            args: vec!["https://github.com/example/repo.git".to_string()],
+            cwd: String::new(),
+        });
+        assert!(
+            tool_kind_from_proto(&tool).is_ok(),
+            "FETCH with HTTPS URL should pass validation"
+        );
+    }
+
+    #[test]
+    fn test_git_push_with_refspec() {
+        // Push with refspec `main:refs/heads/main` must pass —
+        // refspecs contain `:` which is forbidden in strict ref validation.
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "PUSH".to_string(),
+            args: vec!["origin".to_string(), "main:refs/heads/main".to_string()],
+            cwd: String::new(),
+        });
+        assert!(
+            tool_kind_from_proto(&tool).is_ok(),
+            "PUSH with refspec should pass validation"
+        );
+    }
+
+    #[test]
+    fn test_git_fetch_with_refspec() {
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "FETCH".to_string(),
+            args: vec![
+                "origin".to_string(),
+                "refs/heads/main:refs/remotes/origin/main".to_string(),
+            ],
+            cwd: String::new(),
+        });
+        assert!(
+            tool_kind_from_proto(&tool).is_ok(),
+            "FETCH with refspec should pass validation"
+        );
+    }
+
+    #[test]
+    fn test_git_remote_add_with_url() {
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "REMOTE".to_string(),
+            args: vec![
+                "add".to_string(),
+                "upstream".to_string(),
+                "https://github.com/upstream/repo.git".to_string(),
+            ],
+            cwd: String::new(),
+        });
+        assert!(
+            tool_kind_from_proto(&tool).is_ok(),
+            "REMOTE add with URL should pass validation"
+        );
+    }
+
+    #[test]
+    fn test_git_checkout_rejects_url() {
+        // Checkout does NOT accept URLs — a colon in a checkout arg
+        // should still fail ref validation.
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "CHECKOUT".to_string(),
+            args: vec!["https://example.com/repo.git".to_string()],
+            cwd: String::new(),
+        });
+        assert!(
+            tool_kind_from_proto(&tool).is_err(),
+            "CHECKOUT with URL should fail ref validation"
+        );
+    }
+
+    #[test]
+    fn test_git_op_accepts_url_or_refspec_args_coverage() {
+        assert!(GitOpKind::Clone.accepts_url_or_refspec_args());
+        assert!(GitOpKind::Fetch.accepts_url_or_refspec_args());
+        assert!(GitOpKind::Pull.accepts_url_or_refspec_args());
+        assert!(GitOpKind::Push.accepts_url_or_refspec_args());
+        assert!(GitOpKind::Remote.accepts_url_or_refspec_args());
+
+        // Operations that do NOT accept URLs/refspecs
+        assert!(!GitOpKind::Checkout.accepts_url_or_refspec_args());
+        assert!(!GitOpKind::Merge.accepts_url_or_refspec_args());
+        assert!(!GitOpKind::Branch.accepts_url_or_refspec_args());
+        assert!(!GitOpKind::Rebase.accepts_url_or_refspec_args());
+        assert!(!GitOpKind::Tag.accepts_url_or_refspec_args());
+        assert!(!GitOpKind::Reset.accepts_url_or_refspec_args());
     }
 
     // =========================================================================
