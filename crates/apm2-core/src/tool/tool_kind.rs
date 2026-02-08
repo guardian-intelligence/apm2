@@ -740,6 +740,105 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 // =============================================================================
+// PreconditionEvaluator
+// =============================================================================
+
+/// Trait for evaluating idempotency preconditions at runtime.
+///
+/// Per RFC-0020 Section 6.1.2, preconditions must be checked **before**
+/// side-effectful operations execute. Implementations provide runtime access
+/// to the filesystem, git state, etc. needed to evaluate each precondition
+/// variant.
+///
+/// # Fail-Closed
+///
+/// If the evaluator encounters an error (e.g., I/O failure, permission
+/// denied), it MUST return `Err` to deny the operation.  Precondition
+/// evaluation never defaults to pass.
+///
+/// # Contract References
+///
+/// - `REQ-0031`: `ToolKinds` idempotency enforcement
+/// - `RFC-0020 Section 6.1.2`: Precondition guard semantics
+pub trait PreconditionEvaluator: Send + Sync + fmt::Debug {
+    /// Evaluate a single precondition.
+    ///
+    /// Returns `Ok(())` if the precondition is satisfied, or
+    /// `Err(ToolKindError::PreconditionFailed { .. })` if it is not.
+    ///
+    /// # Arguments
+    ///
+    /// * `precondition` - The precondition to evaluate.
+    /// * `path` - Optional path context for file-based preconditions.
+    /// * `cwd` - Optional working directory for git-based preconditions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolKindError::PreconditionFailed`] if the precondition is
+    /// not satisfied, or if evaluation encounters an I/O or system error.
+    fn evaluate(
+        &self,
+        precondition: &IdempotencyPrecondition,
+        path: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<(), ToolKindError>;
+}
+
+/// Evaluate all preconditions declared on a [`ToolKind`] using the given
+/// evaluator.
+///
+/// This is the entry point for wiring precondition enforcement into the
+/// broker's request path.  It extracts the precondition (if any) and the
+/// relevant path context from the `ToolKind`, then delegates to the
+/// evaluator trait.
+///
+/// # Fail-Closed
+///
+/// If the `ToolKind` carries a precondition and the evaluator returns an
+/// error, the entire operation is denied.
+///
+/// # Returns
+///
+/// `Ok(())` if there is no precondition, or if the precondition is
+/// satisfied.  `Err(ToolKindError::PreconditionFailed)` otherwise.
+///
+/// # Errors
+///
+/// Returns [`ToolKindError::PreconditionFailed`] if the declared
+/// precondition is not satisfied according to the evaluator.
+pub fn evaluate_preconditions(
+    tool_kind: &ToolKind,
+    evaluator: &dyn PreconditionEvaluator,
+) -> Result<(), ToolKindError> {
+    let (precondition, path, cwd) = match tool_kind {
+        ToolKind::WriteFile {
+            path, precondition, ..
+        }
+        | ToolKind::EditFile {
+            path, precondition, ..
+        } => (precondition.as_ref(), Some(path.as_str()), None),
+        ToolKind::GitOp { cwd, .. } => {
+            // GitOp does not currently carry a precondition field, but
+            // we support `GitCleanWorkingTree` / `GitRefAtCommit` via
+            // the evaluator if the caller constructs one externally.
+            let cwd_str = cwd.as_ref().map(ValidatedPath::as_str);
+            (None, None, cwd_str)
+        },
+        ToolKind::ReadFile { .. } | ToolKind::ShellExec { .. } => {
+            // Read-only and shell-exec operations do not carry
+            // preconditions in their ToolKind variant.
+            return Ok(());
+        },
+    };
+
+    if let Some(precondition) = precondition {
+        evaluator.evaluate(precondition, path, cwd)?;
+    }
+
+    Ok(())
+}
+
+// =============================================================================
 // ShellBridgePolicy
 // =============================================================================
 
@@ -2475,5 +2574,126 @@ mod tests {
     #[test]
     fn test_reject_metachar_null() {
         assert!(reject_shell_metacharacters("echo\0evil").is_err());
+    }
+
+    // =========================================================================
+    // PreconditionEvaluator + evaluate_preconditions tests (TCK-00377)
+    // =========================================================================
+
+    /// Stub evaluator that always succeeds.
+    #[derive(Debug)]
+    struct AlwaysSatisfiedEvaluator;
+
+    impl PreconditionEvaluator for AlwaysSatisfiedEvaluator {
+        fn evaluate(
+            &self,
+            _precondition: &IdempotencyPrecondition,
+            _path: Option<&str>,
+            _cwd: Option<&str>,
+        ) -> Result<(), ToolKindError> {
+            Ok(())
+        }
+    }
+
+    /// Stub evaluator that always fails.
+    #[derive(Debug)]
+    struct AlwaysFailedEvaluator;
+
+    impl PreconditionEvaluator for AlwaysFailedEvaluator {
+        fn evaluate(
+            &self,
+            precondition: &IdempotencyPrecondition,
+            _path: Option<&str>,
+            _cwd: Option<&str>,
+        ) -> Result<(), ToolKindError> {
+            Err(ToolKindError::PreconditionFailed {
+                reason: format!("precondition not satisfied: {}", precondition.description()),
+            })
+        }
+    }
+
+    #[test]
+    fn test_evaluate_preconditions_write_file_satisfied() {
+        let evaluator = AlwaysSatisfiedEvaluator;
+        let tool_kind = ToolKind::WriteFile {
+            path: ValidatedPath::new("/workspace/new.txt").unwrap(),
+            content_hash: [0u8; 32],
+            create_only: true,
+            append: false,
+            precondition: Some(IdempotencyPrecondition::FileNotExists),
+        };
+        assert!(evaluate_preconditions(&tool_kind, &evaluator).is_ok());
+    }
+
+    #[test]
+    fn test_evaluate_preconditions_edit_file_failed() {
+        let evaluator = AlwaysFailedEvaluator;
+        let tool_kind = ToolKind::EditFile {
+            path: ValidatedPath::new("/workspace/code.rs").unwrap(),
+            old_content_hash: [0u8; 32],
+            new_content_hash: [1u8; 32],
+            precondition: Some(IdempotencyPrecondition::FileExists),
+        };
+        let err = evaluate_preconditions(&tool_kind, &evaluator).unwrap_err();
+        assert!(
+            matches!(err, ToolKindError::PreconditionFailed { .. }),
+            "expected PreconditionFailed, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_preconditions_no_precondition_passes() {
+        // Tool kinds without a precondition always pass.
+        let evaluator = AlwaysFailedEvaluator;
+        let tool_kind = ToolKind::WriteFile {
+            path: ValidatedPath::new("/workspace/out.txt").unwrap(),
+            content_hash: [0u8; 32],
+            create_only: false,
+            append: false,
+            precondition: None,
+        };
+        assert!(evaluate_preconditions(&tool_kind, &evaluator).is_ok());
+    }
+
+    #[test]
+    fn test_evaluate_preconditions_read_file_skipped() {
+        // ReadFile has no preconditions and always passes.
+        let evaluator = AlwaysFailedEvaluator;
+        let tool_kind = ToolKind::ReadFile {
+            path: ValidatedPath::new("/workspace/file.rs").unwrap(),
+            offset: 0,
+            limit: 0,
+        };
+        assert!(evaluate_preconditions(&tool_kind, &evaluator).is_ok());
+    }
+
+    #[test]
+    fn test_evaluate_preconditions_shell_exec_skipped() {
+        // ShellExec has no preconditions and always passes.
+        let evaluator = AlwaysFailedEvaluator;
+        let tool_kind = ToolKind::ShellExec {
+            executable: "cargo".to_string(),
+            args: vec!["test".to_string()],
+            cwd: None,
+            timeout_ms: 60_000,
+        };
+        assert!(evaluate_preconditions(&tool_kind, &evaluator).is_ok());
+    }
+
+    #[test]
+    fn test_evaluate_preconditions_hash_match_failed() {
+        // FileHashMatch precondition with stale hash must fail.
+        let evaluator = AlwaysFailedEvaluator;
+        let tool_kind = ToolKind::WriteFile {
+            path: ValidatedPath::new("/workspace/config.toml").unwrap(),
+            content_hash: [0u8; 32],
+            create_only: false,
+            append: false,
+            precondition: Some(IdempotencyPrecondition::FileHashMatch {
+                expected_hash: [0xABu8; 32],
+            }),
+        };
+        let err = evaluate_preconditions(&tool_kind, &evaluator).unwrap_err();
+        assert!(matches!(err, ToolKindError::PreconditionFailed { .. }));
     }
 }
