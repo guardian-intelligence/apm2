@@ -2825,6 +2825,15 @@ pub struct WorkClaim {
     /// Per TCK-00258, these are the domains of the actors who authored the
     /// changeset being reviewed.
     pub author_custody_domains: Vec<String>,
+
+    /// TCK-00373: Optional permeability receipt for delegated spawns.
+    ///
+    /// When present, `handle_spawn_episode` routes through the
+    /// delegated spawn gate for full consumption-binding verification
+    /// before allowing the spawn. The receipt is resolved during
+    /// `ClaimWork` and bound to the policy resolution context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permeability_receipt: Option<apm2_core::policy::permeability::PermeabilityReceipt>,
 }
 
 mod work_role_serde {
@@ -5930,6 +5939,7 @@ impl PrivilegedDispatcher {
             policy_resolution: policy_resolution.clone(),
             executor_custody_domains,
             author_custody_domains,
+            permeability_receipt: None,
         };
 
         let claim = match self.work_registry.register_claim(claim) {
@@ -6874,6 +6884,148 @@ impl PrivilegedDispatcher {
                     ));
                 }
             }
+        }
+
+        // =====================================================================
+        // TCK-00373: Delegated spawn gate — consumption binding verification
+        //
+        // When the spawn request carries a permeability_receipt_hash AND the
+        // claim carries a permeability_receipt, route through the full
+        // consumption-binding check (validate_delegated_spawn_gate) before
+        // allowing the spawn. This prevents fabricated or replayed receipt
+        // hashes from authorizing a delegated spawn.
+        // =====================================================================
+        if let Some(ref receipt_hash_bytes) = request.permeability_receipt_hash {
+            if receipt_hash_bytes.len() != 32 {
+                warn!(
+                    work_id = %request.work_id,
+                    receipt_hash_len = receipt_hash_bytes.len(),
+                    "SpawnEpisode rejected: permeability_receipt_hash must be 32 bytes"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "permeability_receipt_hash must be 32 bytes, got {}",
+                        receipt_hash_bytes.len()
+                    ),
+                ));
+            }
+
+            let mut receipt_hash = [0u8; 32];
+            receipt_hash.copy_from_slice(receipt_hash_bytes);
+
+            // Fail-closed: receipt hash must be non-zero.
+            if receipt_hash == [0u8; 32] {
+                warn!(
+                    work_id = %request.work_id,
+                    "SpawnEpisode rejected: permeability_receipt_hash is zero"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "permeability_receipt_hash is zero (fail-closed)",
+                ));
+            }
+
+            // The claim MUST carry the actual receipt for consumption
+            // binding verification. Without the receipt object, we cannot
+            // verify the hash or authority — fail closed.
+            let Some(receipt) = &claim.permeability_receipt else {
+                warn!(
+                    work_id = %request.work_id,
+                    "SpawnEpisode rejected: permeability_receipt_hash present but claim has no receipt"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "permeability_receipt_hash present but claim has no associated receipt (fail-closed)",
+                ));
+            };
+
+            // Verify the receipt content hash matches the declared hash.
+            let actual_hash = receipt.content_hash();
+            if actual_hash != receipt_hash {
+                warn!(
+                    work_id = %request.work_id,
+                    expected = %hex::encode(receipt_hash),
+                    actual = %hex::encode(actual_hash),
+                    "SpawnEpisode rejected: permeability receipt hash mismatch"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "permeability receipt hash mismatch: expected {}, got {}",
+                        hex::encode(receipt_hash),
+                        hex::encode(actual_hash)
+                    ),
+                ));
+            }
+
+            // Derive required authority from the claim's policy resolution.
+            // For delegated spawns, the minimum required authority is
+            // determined by the resolved risk tier ceiling.
+            let required_authority = {
+                use apm2_core::policy::permeability::{
+                    AuthorityVector, BudgetLevel, CapabilityLevel, ClassificationLevel, RiskLevel,
+                    StopPredicateLevel, TaintCeiling,
+                };
+                // Minimum authority: use bottom as baseline (any valid
+                // delegated authority satisfies it).
+                AuthorityVector::new(
+                    RiskLevel::Low,
+                    CapabilityLevel::ReadOnly,
+                    BudgetLevel::Capped(1),
+                    StopPredicateLevel::Inherit,
+                    TaintCeiling::Attested,
+                    ClassificationLevel::Public,
+                )
+            };
+
+            // Use HTF timestamp for consumption time verification.
+            let now_ms = match self.get_htf_timestamp_ns() {
+                Ok(ts_ns) => ts_ns / 1_000_000, // convert ns -> ms
+                Err(e) => {
+                    warn!(
+                        work_id = %request.work_id,
+                        error = %e,
+                        "SpawnEpisode rejected: HTF timestamp error for permeability gate"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("HTF timestamp error for permeability gate: {e}"),
+                    ));
+                },
+            };
+
+            // Full consumption binding verification. This checks:
+            // - Receipt admission (expired, revoked, issuance-time)
+            // - Hash binding
+            // - Policy root provenance
+            // - Scope binding
+            // - Delegation chain continuity
+            // - Chain commitment
+            // - Authority subset
+            if let Err(e) = apm2_core::policy::permeability::validate_consumption_binding(
+                receipt,
+                &receipt_hash,
+                &required_authority,
+                now_ms,
+                None, // No envelope-level ConsumptionContext in dispatch path
+            ) {
+                warn!(
+                    work_id = %request.work_id,
+                    error = %e,
+                    "SpawnEpisode rejected: permeability consumption binding failed"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("permeability consumption binding failed: {e}"),
+                ));
+            }
+
+            info!(
+                work_id = %request.work_id,
+                receipt_hash = %hex::encode(receipt_hash),
+                "Delegated spawn gate passed: permeability receipt verified"
+            );
         }
 
         // TCK-00351 BLOCKER 2: Validate caller-supplied stop conditions
@@ -12330,6 +12482,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let frame = encode_spawn_episode_request(&request);
 
@@ -12538,6 +12691,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let frame = encode_spawn_episode_request(&request);
 
@@ -12578,6 +12732,7 @@ mod tests {
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -12658,6 +12813,7 @@ mod tests {
                     adapter_profile_hash: None,
                     max_episodes: None,
                     escalation_predicate: None,
+                    permeability_receipt_hash: None,
                 }),
                 encode_issue_capability_request(&IssueCapabilityRequest {
                     session_id: "S-001".to_string(),
@@ -12742,6 +12898,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -12855,6 +13012,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -12901,6 +13059,7 @@ mod tests {
             },
             author_custody_domains: vec![],
             executor_custody_domains: vec![],
+            permeability_receipt: None,
         };
         dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -13529,6 +13688,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -13577,6 +13737,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -13630,6 +13791,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -13687,6 +13849,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -13739,6 +13902,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -13785,6 +13949,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
         let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -13840,6 +14005,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -13885,6 +14051,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -13931,6 +14098,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -14071,6 +14239,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -14129,6 +14298,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_req);
 
@@ -14198,6 +14368,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_req);
 
@@ -14258,6 +14429,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_req);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -14310,6 +14482,7 @@ mod tests {
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
+                permeability_receipt: None,
             };
             registry.register_claim(claim).unwrap();
         }
@@ -14345,6 +14518,7 @@ mod tests {
             },
             executor_custody_domains: vec![],
             author_custody_domains: vec![],
+            permeability_receipt: None,
         };
 
         // First registration succeeds
@@ -14417,6 +14591,7 @@ mod tests {
             },
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()],
+            permeability_receipt: None,
         };
 
         // Register the claim directly
@@ -14436,6 +14611,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -14482,6 +14658,7 @@ mod tests {
             },
             executor_custody_domains: vec!["team-review".to_string()],
             author_custody_domains: vec!["team-dev".to_string()],
+            permeability_receipt: None,
         };
 
         // Register the claim
@@ -14503,6 +14680,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -14551,6 +14729,7 @@ mod tests {
             },
             executor_custody_domains: vec!["team-review".to_string()],
             author_custody_domains: vec![], // Empty - resolution failed
+            permeability_receipt: None,
         };
 
         // Register the claim
@@ -14572,6 +14751,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -14617,6 +14797,7 @@ mod tests {
             },
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()], // Overlapping!
+            permeability_receipt: None,
         };
 
         // Register the claim
@@ -14631,6 +14812,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15379,6 +15561,7 @@ mod tests {
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -15557,6 +15740,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15660,6 +15844,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -16378,6 +16563,7 @@ mod tests {
                     adapter_profile_hash: None,
                     max_episodes: None,
                     escalation_predicate: None,
+                    permeability_receipt_hash: None,
                 };
                 let spawn_frame = encode_spawn_episode_request(&spawn_request);
                 let spawn_resp = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -16823,6 +17009,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let result = dispatcher.dispatch(&spawn_frame, &no_creds_ctx);
@@ -17242,6 +17429,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: Some(0),
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let frame = encode_spawn_episode_request(&tampered_spawn);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -17303,6 +17491,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: Some(oversized_predicate),
+                permeability_receipt_hash: None,
             };
             let frame = encode_spawn_episode_request(&spawn_request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -17427,6 +17616,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -17594,6 +17784,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -17792,6 +17983,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -17876,6 +18068,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -18088,6 +18281,7 @@ mod tests {
                         },
                         executor_custody_domains: vec![],
                         author_custody_domains: vec![],
+                        permeability_receipt: None,
                     },
                     ts,
                 )
@@ -18170,6 +18364,7 @@ mod tests {
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
+                permeability_receipt: None,
             };
 
             let result = emitter.emit_claim_lifecycle(&claim, "uid:1000", 1_000_000_000);
@@ -18216,6 +18411,7 @@ mod tests {
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
+                permeability_receipt: None,
             };
             emitter
                 .emit_claim_lifecycle(&claim, "uid:1000", 1_000_000_000)
@@ -18287,6 +18483,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -18377,6 +18574,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -18447,6 +18645,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -18510,6 +18709,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -18593,6 +18793,7 @@ mod tests {
                     adapter_profile_hash: None,
                     max_episodes: None,
                     escalation_predicate: None,
+                    permeability_receipt_hash: None,
                 };
                 let spawn_frame = encode_spawn_episode_request(&spawn_request);
                 let spawn_response = d.dispatch(&spawn_frame, &ctx).unwrap();
@@ -18784,6 +18985,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -18889,6 +19091,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &valid_ctx).unwrap();
@@ -18984,6 +19187,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let result = dispatcher.dispatch(&spawn_frame, &no_creds_ctx);
@@ -19237,6 +19441,7 @@ mod tests {
                 adapter_profile_hash: Some(vec![0x55; 32]),
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -19283,6 +19488,7 @@ mod tests {
                 adapter_profile_hash: Some(adapter_hash.to_vec()),
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -19332,6 +19538,7 @@ mod tests {
                 adapter_profile_hash: Some(adapter_hash.to_vec()),
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -19388,6 +19595,7 @@ mod tests {
                 adapter_profile_hash: Some(adapter_hash.to_vec()),
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -19472,6 +19680,7 @@ mod tests {
                 adapter_profile_hash: Some(adapter_hash.to_vec()),
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -20214,6 +20423,7 @@ mod tests {
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
             let ctx = ConnectionContext::privileged_session_open(Some(peer_creds));
@@ -21554,6 +21764,7 @@ mod tests {
                     },
                     executor_custody_domains: vec![],
                     author_custody_domains: vec![],
+                    permeability_receipt: None,
                 })
                 .expect("second work claim registration should succeed");
 
@@ -21640,6 +21851,7 @@ mod tests {
                     },
                     executor_custody_domains: vec![],
                     author_custody_domains: vec![],
+                    permeability_receipt: None,
                 })
                 .expect("work claim registration should succeed");
 
@@ -22804,6 +23016,7 @@ mod tests {
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -22879,6 +23092,7 @@ mod tests {
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -23170,6 +23384,7 @@ mod tests {
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
+                permeability_receipt: None,
             };
             state
                 .privileged_dispatcher()
@@ -23290,6 +23505,7 @@ mod tests {
                 policy_resolution,
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
+                permeability_receipt: None,
             };
             state
                 .privileged_dispatcher()
@@ -23731,6 +23947,7 @@ mod tests {
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -23742,6 +23959,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let frame = encode_spawn_episode_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -23794,6 +24012,7 @@ mod tests {
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -23805,6 +24024,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let frame = encode_spawn_episode_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -23861,6 +24081,7 @@ mod tests {
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -23872,6 +24093,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let frame = encode_spawn_episode_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -23926,6 +24148,7 @@ mod tests {
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -23937,6 +24160,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let frame = encode_spawn_episode_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
