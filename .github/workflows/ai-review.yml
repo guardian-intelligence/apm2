@@ -180,12 +180,10 @@ jobs:
           PR_NUMBER="${{ steps.pr.outputs.pr_number }}"
           HEAD_SHA="${{ steps.pr.outputs.head_sha }}"
 
-          if command -v apm2 >/dev/null 2>&1; then
-            FAC_BIN=(apm2)
-          else
-            cargo build --locked -p apm2-cli
-            FAC_BIN=(target/debug/apm2)
-          fi
+          cargo build --locked -p apm2-cli
+          FAC_BIN=("${PWD}/target/debug/apm2")
+          DISPATCH_EPOCH=$(date -u +%s)
+          HEAD_SHA_LOWER="${HEAD_SHA,,}"
 
           DISPATCH_DIR="${HOME}/.apm2/review_dispatch"
           mkdir -p "${DISPATCH_DIR}"
@@ -212,6 +210,9 @@ jobs:
                 --unit "${unit}" \
                 --property "WorkingDirectory=${PWD}" \
                 --setenv "GH_TOKEN=${GH_TOKEN}" \
+                --setenv "PATH=${PATH}" \
+                --setenv "HOME=${HOME}" \
+                --setenv "CARGO_HOME=${CARGO_HOME:-${HOME}/.cargo}" \
                 "${FAC_BIN[@]}" fac review run "${PR_URL}" --type "${review_type}" --expected-head-sha "${HEAD_SHA}" \
                 >/dev/null
               echo "dispatch review_type=${review_type} unit=${unit}"
@@ -228,7 +229,7 @@ jobs:
           launch_review_async security
           launch_review_async quality
 
-          LAST_SEQ=0
+          declare -A SEEN_ERROR_KEYS=()
           for _ in $(seq 1 30); do
             NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
             STATUS_JSON=$("${FAC_BIN[@]}" fac --json review status --pr "${PR_NUMBER}" 2>/dev/null || true)
@@ -239,59 +240,81 @@ jobs:
               continue
             fi
 
-            SEC_STATE=$(jq -r '
-              ([.state_entries[]? | select(.review_type == "security")] | first) as $s
+            SEC_STATE=$(jq -r --arg head "${HEAD_SHA_LOWER}" '
+              ([.state_entries[]?
+                | select(
+                    .review_type == "security"
+                    and (.alive // false)
+                    and ((.head_sha // "" | ascii_downcase) == $head)
+                  )
+              ] | first) as $s
               | if $s == null then
                   "none"
                 else
-                  (if ($s.alive // false) then "alive" else "done" end)
-                  + ":" + ($s.model // "n/a") + "/" + ($s.backend // "n/a")
+                  "alive:" + ($s.model // "n/a") + "/" + ($s.backend // "n/a")
                   + ":r" + (($s.restart_count // 0) | tostring)
                   + ":" + (($s.head_sha // "-") | tostring | .[0:7])
                 end
             ' <<<"${STATUS_JSON}")
 
-            QUAL_STATE=$(jq -r '
-              ([.state_entries[]? | select(.review_type == "quality")] | first) as $s
+            QUAL_STATE=$(jq -r --arg head "${HEAD_SHA_LOWER}" '
+              ([.state_entries[]?
+                | select(
+                    .review_type == "quality"
+                    and (.alive // false)
+                    and ((.head_sha // "" | ascii_downcase) == $head)
+                  )
+              ] | first) as $s
               | if $s == null then
                   "none"
                 else
-                  (if ($s.alive // false) then "alive" else "done" end)
-                  + ":" + ($s.model // "n/a") + "/" + ($s.backend // "n/a")
+                  "alive:" + ($s.model // "n/a") + "/" + ($s.backend // "n/a")
                   + ":r" + (($s.restart_count // 0) | tostring)
                   + ":" + (($s.head_sha // "-") | tostring | .[0:7])
                 end
             ' <<<"${STATUS_JSON}")
 
-            LAST_EVENTS=$(jq -r '
-              [.recent_events[]? | .event // empty] | .[-2:] | join(",") | if . == "" then "-" else . end
+            LAST_EVENTS=$(jq -r --arg head "${HEAD_SHA_LOWER}" --argjson start_epoch "${DISPATCH_EPOCH}" '
+              [.recent_events[]?
+                | select((.head_sha // "" | ascii_downcase) == $head)
+                | select((((.ts // "") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601?) // 0) >= $start_epoch)
+                | .event // empty
+              ]
+              | .[-2:]
+              | join(",")
+              | if . == "" then "-" else . end
             ' <<<"${STATUS_JSON}")
 
             echo "ts=${NOW} security=${SEC_STATE} quality=${QUAL_STATE} events=${LAST_EVENTS}"
 
-            NEW_ERRORS=$(jq -c --argjson last "${LAST_SEQ}" '
-              [.recent_events[]?
-                | select((.seq // 0) > $last)
-                | select(
-                    .event == "run_crash"
-                    or .event == "stall_detected"
-                    or .event == "model_fallback"
-                    or .event == "sha_update"
-                  )
-              ]
-            ' <<<"${STATUS_JSON}")
-
-            if [[ "$(jq 'length' <<<"${NEW_ERRORS}")" -gt 0 ]]; then
+            while IFS= read -r error_event; do
+              [[ -z "${error_event}" ]] && continue
+              error_key=$(jq -r '
+                [
+                  (.ts // "-"),
+                  (.event // "-"),
+                  (.review_type // "-"),
+                  ((.reason // .signal // .exit_code // .new_sha // "-") | tostring)
+                ] | join("|")
+              ' <<<"${error_event}")
+              if [[ -n "${SEEN_ERROR_KEYS[${error_key}]:-}" ]]; then
+                continue
+              fi
+              SEEN_ERROR_KEYS["${error_key}"]=1
               jq -r '
-                .[]
-                | "ERROR ts=\(.ts // "-") event=\(.event // "-") review=\(.review_type // "-") seq=\(.seq // 0) detail=\((.reason // .signal // .exit_code // .new_sha // "-") | tostring)"
-              ' <<<"${NEW_ERRORS}"
-            fi
-
-            MAX_SEQ=$(jq -r '[.recent_events[]? | (.seq // 0)] | max // 0' <<<"${STATUS_JSON}")
-            if (( MAX_SEQ > LAST_SEQ )); then
-              LAST_SEQ=${MAX_SEQ}
-            fi
+                "ERROR ts=\(.ts // "-") event=\(.event // "-") review=\(.review_type // "-") seq=\(.seq // 0) detail=\((.reason // .signal // .exit_code // .new_sha // "-") | tostring)"
+              ' <<<"${error_event}"
+            done < <(jq -c --arg head "${HEAD_SHA_LOWER}" --argjson start_epoch "${DISPATCH_EPOCH}" '
+              .recent_events[]?
+              | select((.head_sha // "" | ascii_downcase) == $head)
+              | select((((.ts // "") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601?) // 0) >= $start_epoch)
+              | select(
+                  .event == "run_crash"
+                  or .event == "stall_detected"
+                  or .event == "model_fallback"
+                  or .event == "sha_update"
+                )
+            ' <<<"${STATUS_JSON}")
 
             sleep 1
           done
