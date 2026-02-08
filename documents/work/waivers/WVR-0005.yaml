@@ -62,8 +62,8 @@ waiver:
 
   references:
     pr_url: "https://github.com/guardian-intelligence/apm2/pull/502"
-    commit_sha: "5703774652fd58ada2090730086c661aae0f260c"
-    commit_message: "review-gate: strict JSON stdout + fail-closed trust"
+    commit_sha: "59be983295ced33f0d8b1e4845736734cec43331"
+    commit_message: "reviews: apply waiver semantics to code-quality"
     related_ticket: "TCK-00410"
 
   approval:
