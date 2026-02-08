@@ -574,97 +574,162 @@ fn run_single_review(
                 let exit_code = status.code();
                 if status.success() {
                     let verdict = infer_verdict(review_kind, &last_message_path, &log_path)?;
-                    emit_event(
-                        event_ctx,
-                        "run_complete",
-                        review_kind.as_str(),
-                        &current_head_sha,
-                        serde_json::json!({
-                            "exit_code": exit_code.unwrap_or(0),
-                            "duration_secs": run_started.elapsed().as_secs(),
-                            "verdict": verdict,
-                        }),
-                    )?;
-
-                    if let Some(comment_id) = confirm_review_posted(
+                    let comment_id = confirm_review_posted_with_retry(
                         owner_repo,
                         pr_number,
                         review_kind.marker(),
                         &current_head_sha,
-                    )? {
+                    )?;
+                    let is_valid_completion = verdict != "UNKNOWN" && comment_id.is_some();
+
+                    if is_valid_completion {
                         emit_event(
                             event_ctx,
-                            "review_posted",
+                            "run_complete",
                             review_kind.as_str(),
                             &current_head_sha,
                             serde_json::json!({
-                                "comment_id": comment_id,
+                                "exit_code": exit_code.unwrap_or(0),
+                                "duration_secs": run_started.elapsed().as_secs(),
                                 "verdict": verdict,
                             }),
                         )?;
+
+                        if let Some(comment_id) = comment_id {
+                            emit_event(
+                                event_ctx,
+                                "review_posted",
+                                review_kind.as_str(),
+                                &current_head_sha,
+                                serde_json::json!({
+                                    "comment_id": comment_id,
+                                    "verdict": verdict,
+                                }),
+                            )?;
+                        }
+
+                        let latest_head = fetch_pr_head_sha(owner_repo, pr_number)?;
+                        emit_event(
+                            event_ctx,
+                            "pulse_check",
+                            review_kind.as_str(),
+                            &current_head_sha,
+                            serde_json::json!({
+                                "pulse_sha": latest_head,
+                                "match": latest_head.eq_ignore_ascii_case(&current_head_sha),
+                            }),
+                        )?;
+                        if !latest_head.eq_ignore_ascii_case(&current_head_sha) {
+                            let old_sha = current_head_sha.clone();
+                            emit_event(
+                                event_ctx,
+                                "sha_update",
+                                review_kind.as_str(),
+                                &old_sha,
+                                serde_json::json!({
+                                    "old_sha": old_sha,
+                                    "new_sha": latest_head,
+                                }),
+                            )?;
+                            current_head_sha.clone_from(&latest_head);
+                            write_pulse_file(review_kind.as_str(), &current_head_sha)?;
+                            spawn_mode = SpawnMode::Resume {
+                                message: build_sha_update_message(
+                                    pr_number,
+                                    &old_sha,
+                                    &latest_head,
+                                ),
+                            };
+                            continue 'restart_loop;
+                        }
+
+                        state.reviewers.remove(review_kind.as_str());
+                        state.save()?;
+
+                        return Ok(SingleReviewResult {
+                            summary: SingleReviewSummary {
+                                review_type: review_kind.as_str().to_string(),
+                                success: true,
+                                verdict,
+                                model: current_model.model,
+                                backend: current_model.backend.as_str().to_string(),
+                                duration_secs: review_started.elapsed().as_secs(),
+                                restart_count,
+                            },
+                            final_head_sha: current_head_sha,
+                        });
                     }
 
-                    let latest_head = fetch_pr_head_sha(owner_repo, pr_number)?;
                     emit_event(
                         event_ctx,
-                        "pulse_check",
+                        "run_crash",
                         review_kind.as_str(),
                         &current_head_sha,
                         serde_json::json!({
-                            "pulse_sha": latest_head,
-                            "match": latest_head.eq_ignore_ascii_case(&current_head_sha),
+                            "exit_code": exit_code.unwrap_or(0),
+                            "signal": "invalid_completion",
+                            "duration_secs": run_started.elapsed().as_secs(),
+                            "restart_count": restart_count,
+                            "completion_issue": if comment_id.is_none() { "comment_not_posted" } else { "unknown_verdict" },
+                            "verdict": verdict,
                         }),
                     )?;
-                    if !latest_head.eq_ignore_ascii_case(&current_head_sha) {
-                        let old_sha = current_head_sha.clone();
-                        emit_event(
-                            event_ctx,
-                            "sha_update",
-                            review_kind.as_str(),
-                            &old_sha,
-                            serde_json::json!({
-                                "old_sha": old_sha,
-                                "new_sha": latest_head,
-                            }),
-                        )?;
-                        current_head_sha.clone_from(&latest_head);
-                        write_pulse_file(review_kind.as_str(), &current_head_sha)?;
-                        spawn_mode = SpawnMode::Resume {
-                            message: build_sha_update_message(pr_number, &old_sha, &latest_head),
-                        };
-                        continue 'restart_loop;
+                } else {
+                    let reason_is_http = detect_http_400_or_rate_limit(&log_path);
+                    emit_event(
+                        event_ctx,
+                        "run_crash",
+                        review_kind.as_str(),
+                        &current_head_sha,
+                        serde_json::json!({
+                            "exit_code": exit_code.unwrap_or(1),
+                            "signal": exit_signal(status),
+                            "duration_secs": run_started.elapsed().as_secs(),
+                            "restart_count": restart_count,
+                        }),
+                    )?;
+
+                    restart_count = restart_count.saturating_add(1);
+                    if restart_count > MAX_RESTART_ATTEMPTS {
+                        state.reviewers.remove(review_kind.as_str());
+                        state.save()?;
+                        return Ok(SingleReviewResult {
+                            summary: SingleReviewSummary {
+                                review_type: review_kind.as_str().to_string(),
+                                success: false,
+                                verdict: "UNKNOWN".to_string(),
+                                model: current_model.model,
+                                backend: current_model.backend.as_str().to_string(),
+                                duration_secs: review_started.elapsed().as_secs(),
+                                restart_count,
+                            },
+                            final_head_sha: current_head_sha,
+                        });
                     }
 
-                    state.reviewers.remove(review_kind.as_str());
-                    state.save()?;
+                    let fallback = if reason_is_http {
+                        select_cross_family_fallback(&current_model.model)
+                    } else {
+                        select_fallback_model(&current_model.model)
+                    }
+                    .ok_or_else(|| "no fallback model available".to_string())?;
 
-                    return Ok(SingleReviewResult {
-                        summary: SingleReviewSummary {
-                            review_type: review_kind.as_str().to_string(),
-                            success: true,
-                            verdict,
-                            model: current_model.model,
-                            backend: current_model.backend.as_str().to_string(),
-                            duration_secs: review_started.elapsed().as_secs(),
-                            restart_count,
-                        },
-                        final_head_sha: current_head_sha,
-                    });
+                    emit_event(
+                        event_ctx,
+                        "model_fallback",
+                        review_kind.as_str(),
+                        &current_head_sha,
+                        serde_json::json!({
+                            "from_model": current_model.model,
+                            "to_model": fallback.model,
+                            "reason": if reason_is_http { "http_400_or_rate_limit" } else { "run_crash" },
+                        }),
+                    )?;
+
+                    current_model = ensure_model_backend_available(fallback)?;
+                    spawn_mode = SpawnMode::Initial;
+                    continue 'restart_loop;
                 }
-
-                let reason_is_http = detect_http_400_or_rate_limit(&log_path);
-                emit_event(
-                    event_ctx,
-                    "run_crash",
-                    review_kind.as_str(),
-                    &current_head_sha,
-                    serde_json::json!({
-                        "exit_code": exit_code.unwrap_or(1),
-                        "signal": exit_signal(status),
-                        "duration_secs": run_started.elapsed().as_secs(),
-                        "restart_count": restart_count,
-                    }),
-                )?;
 
                 restart_count = restart_count.saturating_add(1);
                 if restart_count > MAX_RESTART_ATTEMPTS {
@@ -684,6 +749,7 @@ fn run_single_review(
                     });
                 }
 
+                let reason_is_http = detect_http_400_or_rate_limit(&log_path);
                 let fallback = if reason_is_http {
                     select_cross_family_fallback(&current_model.model)
                 } else {
@@ -699,7 +765,7 @@ fn run_single_review(
                     serde_json::json!({
                         "from_model": current_model.model,
                         "to_model": fallback.model,
-                        "reason": if reason_is_http { "http_400_or_rate_limit" } else { "run_crash" },
+                        "reason": if reason_is_http { "http_400_or_rate_limit" } else { "invalid_completion" },
                     }),
                 )?;
 
@@ -1302,6 +1368,25 @@ fn confirm_review_posted(
             if id != 0 {
                 return Ok(Some(id));
             }
+        }
+    }
+    Ok(None)
+}
+
+fn confirm_review_posted_with_retry(
+    owner_repo: &str,
+    pr_number: u32,
+    marker: &str,
+    head_sha: &str,
+) -> Result<Option<u64>, String> {
+    const MAX_ATTEMPTS: usize = 5;
+    for attempt in 0..MAX_ATTEMPTS {
+        let maybe_id = confirm_review_posted(owner_repo, pr_number, marker, head_sha)?;
+        if maybe_id.is_some() {
+            return Ok(maybe_id);
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            thread::sleep(Duration::from_secs(1));
         }
     }
     Ok(None)
