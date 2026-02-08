@@ -143,13 +143,15 @@ enum Commands {
 
     /// Evaluate authoritative AI review gate for a pull request.
     ///
-    /// This command reads:
-    /// - Commit statuses for `ai-review/security` and `ai-review/code-quality`
-    /// - Machine-readable review metadata from PR comments
-    /// - Trusted reviewer allowlist from repo configuration
+    /// This command reads machine-readable review metadata from PR comments
+    /// and enforces a trusted reviewer allowlist.
     ///
-    /// It fails closed on missing/invalid artifacts and exits non-zero if the
-    /// authoritative verdict blocks merge.
+    /// Notes:
+    /// - Direct `ai-review/*` commit statuses are not required and are no
+    ///   longer authoritative.
+    /// - The gate is **pending** until both categories have authoritative
+    ///   verdicts for the current PR head SHA.
+    /// - The gate **fails** only when an authoritative verdict is `FAIL`.
     #[command(name = "review-gate")]
     ReviewGate {
         /// Pull request number to evaluate

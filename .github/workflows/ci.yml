@@ -43,6 +43,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
 
+      - name: Add Cargo bin to PATH
+        run: |
+          if [[ -n "${CARGO_HOME:-}" ]]; then
+            echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+          else
+            echo "${HOME}/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
       - name: Run bounded local CI suite
         run: |
           PROFILE="github-deep"

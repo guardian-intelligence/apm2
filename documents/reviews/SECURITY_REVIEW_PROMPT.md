@@ -327,12 +327,11 @@ decision_tree:
         - id: POST_AND_UPDATE
           action: command
           run: |
-            if [ "$verdict" == "PASS" ]; then
-              gh pr comment $PR_URL --body-file security_findings.md
-              cargo xtask security-review-exec approve $ticket_id
-            else
-              cat security_findings.md | cargo xtask security-review-exec deny $ticket_id --reason -
-            fi
+            # Post exactly one authoritative comment containing BOTH the human
+            # findings and the machine-readable metadata block appended above.
+            # Do NOT call `security-review-exec` here; it will produce a second
+            # comment and can confuse downstream evaluation.
+            gh pr comment $PR_URL --body-file security_findings.md
             rm security_findings.md
         - id: TERMINATE
           action: output

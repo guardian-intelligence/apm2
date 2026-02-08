@@ -701,15 +701,15 @@ fn remediate_reviewer(
         return Ok(());
     }
 
-    // Check if the GitHub status is already completed (success or failure)
-    // If so, the reviewer finished successfully and we don't need to restart
-    let status_context = match reviewer_type {
-        "security" => "ai-review/security",
-        "quality" => "ai-review/code-quality",
-        _ => return Ok(()),
-    };
-
-    if is_review_completed(sh, &current_entry.head_sha, status_context) {
+    // Check if the reviewer has already posted a machine-readable review
+    // artifact bound to the recorded HEAD SHA. If so, the reviewer finished
+    // and we don't need to restart.
+    if is_review_completed_by_comment(
+        sh,
+        &current_entry.pr_url,
+        &current_entry.head_sha,
+        reviewer_type,
+    ) {
         // Review completed. If we have captured output, validate it before
         // cleaning up so shallow/non-compliant reviews are automatically
         // re-run (bounded by restart_count).
@@ -809,64 +809,88 @@ fn remediate_reviewer(
     Ok(())
 }
 
-/// Check if a review status on GitHub is already completed (success or
-/// failure).
+/// Check if a reviewer has already posted a machine-readable review artifact
+/// bound to `head_sha`.
 ///
-/// Returns true if the status is not pending, false otherwise.
-fn is_review_completed(sh: &Shell, head_sha: &str, status_context: &str) -> bool {
-    // Get owner/repo from git remote
-    let remote_url = cmd!(sh, "git remote get-url origin")
-        .read()
-        .unwrap_or_default();
+/// This deliberately does **not** rely on `ai-review/*` commit statuses. The
+/// authoritative signal is the comment artifact containing:
+/// - the category marker (security/code-quality)
+/// - the exact 40-hex head SHA
+fn is_review_completed_by_comment(
+    sh: &Shell,
+    pr_url: &str,
+    head_sha: &str,
+    reviewer_type: &str,
+) -> bool {
+    const SECURITY_MARKER: &str = "<!-- apm2-review-metadata:v1:security -->";
+    const QUALITY_MARKER: &str = "<!-- apm2-review-metadata:v1:code-quality -->";
+    const MAX_PAGES: u32 = 10;
 
-    let owner_repo = parse_owner_repo_for_check(&remote_url);
-    if owner_repo.is_empty() {
-        return false;
-    }
-
-    // Build the jq filter
-    let jq_filter = format!(".statuses[] | select(.context == \"{status_context}\") | .state");
-
-    // Get the status from GitHub
-    let api_path = format!("/repos/{owner_repo}/commits/{head_sha}/status");
-    let output = cmd!(sh, "gh api {api_path} --jq {jq_filter}")
-        .ignore_status()
-        .read();
-
-    // Couldn't check, assume not completed
-    output.is_ok_and(|state| {
-        let state = state.trim();
-        // If state is "success" or "failure", the review is completed
-        state == "success" || state == "failure"
-    })
-}
-
-/// Parse owner/repo from a GitHub remote URL (for check module).
-fn parse_owner_repo_for_check(url: &str) -> String {
-    // Parse formats like:
-    // - git@github.com:owner/repo.git
-    // - https://github.com/owner/repo.git
-    // - https://github.com/owner/repo
-    let url = url.trim();
-
-    // Extract the owner/repo part
-    let owner_repo = if url.contains("github.com:") {
-        // SSH format: git@github.com:owner/repo.git
-        url.split("github.com:")
-            .nth(1)
-            .unwrap_or("")
-            .trim_end_matches(".git")
-    } else if url.contains("github.com/") {
-        // HTTPS format: https://github.com/owner/repo.git
-        url.split("github.com/")
-            .nth(1)
-            .unwrap_or("")
-            .trim_end_matches(".git")
-    } else {
-        ""
+    let marker = match reviewer_type {
+        "security" => SECURITY_MARKER,
+        "quality" => QUALITY_MARKER,
+        _ => return false,
     };
 
-    owner_repo.to_string()
+    let Some((owner_repo, pr_number)) = parse_pr_url_for_check(pr_url) else {
+        return false;
+    };
+
+    let needle_sha = head_sha.to_ascii_lowercase();
+    for page in 1..=MAX_PAGES {
+        let endpoint =
+            format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100&page={page}");
+        let output = cmd!(sh, "gh api {endpoint}").ignore_status().read().ok();
+
+        let Some(payload) = output else {
+            return false; // couldn't check, assume not completed
+        };
+
+        let comments: Vec<GithubIssueCommentForCheck> = match serde_json::from_str(&payload) {
+            Ok(comments) => comments,
+            Err(_) => return false,
+        };
+
+        if comments.is_empty() {
+            break;
+        }
+
+        for comment in comments {
+            let Some(body) = comment.body else {
+                continue;
+            };
+
+            if body.contains(marker) && body.to_ascii_lowercase().contains(&needle_sha) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubIssueCommentForCheck {
+    body: Option<String>,
+}
+
+fn parse_pr_url_for_check(pr_url: &str) -> Option<(String, u32)> {
+    let url = pr_url.trim();
+    let path = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let path = path.strip_prefix("github.com/")?;
+
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() < 4 || parts[2] != "pull" {
+        return None;
+    }
+
+    let owner = parts[0];
+    let repo = parts[1];
+    let pr_number: u32 = parts[3].parse().ok()?;
+    Some((format!("{owner}/{repo}"), pr_number))
 }
 
 /// Restart a review using the PR URL and HEAD SHA from the state file.

@@ -466,8 +466,7 @@ fn create_pending_statuses(
         StatusWriteDecision::Removed => {
             println!("{PUSH_STATUS_PROJECTION_NOTICE}");
             println!("    Target commit: {owner_repo}@{head_sha}");
-            println!("      - ai-review/security  = pending (Waiting for security review)");
-            println!("      - ai-review/code-quality = pending (Waiting for code quality review)");
+            println!("      - Review Gate Success = pending (Waiting for AI reviews)");
             crate::util::print_status_writes_removed_notice();
         },
         // Legacy variants are inert after TCK-00297; keep projection-only output.

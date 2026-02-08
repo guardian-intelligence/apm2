@@ -1,7 +1,6 @@
 //! Implementation of the `review-gate` command.
 //!
 //! This command enforces authoritative AI review gating for pull requests:
-//! - Verifies `ai-review/security` and `ai-review/code-quality` commit statuses
 //! - Parses machine-readable metadata from PR comments
 //! - Enforces exact PR number + head SHA binding
 //! - Enforces trusted reviewer identity allowlists
@@ -14,9 +13,6 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use xshell::{Shell, cmd};
-
-const SECURITY_CONTEXT: &str = "ai-review/security";
-const QUALITY_CONTEXT: &str = "ai-review/code-quality";
 
 const TRUSTED_REVIEWER_SCHEMA: &str = "apm2.trusted_reviewers.v1";
 const REVIEW_METADATA_SCHEMA: &str = "apm2.review.metadata.v1";
@@ -52,13 +48,11 @@ pub fn run(
         }
     }
 
-    let statuses = fetch_commit_statuses(&sh, &owner_repo, &pr_head_sha)?;
     let comments = fetch_pr_issue_comments(&sh, &owner_repo, pr_number)?;
 
     let input = GateEvaluationInput {
         pr_number,
         head_sha: &pr_head_sha,
-        statuses: &statuses,
         comments: &comments,
         trusted_reviewers: &trusted_reviewers,
     };
@@ -124,26 +118,6 @@ fn fetch_pr_head_sha(sh: &Shell, owner_repo: &str, pr_number: u64) -> Result<Str
     }
 
     Ok(response.head.sha)
-}
-
-fn fetch_commit_statuses(
-    sh: &Shell,
-    owner_repo: &str,
-    head_sha: &str,
-) -> Result<Vec<NormalizedStatus>> {
-    let endpoint = format!("/repos/{owner_repo}/commits/{head_sha}/status");
-    let output = cmd!(sh, "gh api {endpoint}")
-        .read()
-        .with_context(|| format!("Failed to fetch commit status for {owner_repo}@{head_sha}"))?;
-
-    let response: CommitStatusResponse = serde_json::from_str(&output)
-        .with_context(|| format!("Failed to parse commit status payload for {head_sha}"))?;
-
-    response
-        .statuses
-        .into_iter()
-        .map(NormalizedStatus::try_from)
-        .collect()
 }
 
 fn fetch_pr_issue_comments(
@@ -231,7 +205,6 @@ fn evaluate_category(
     category: ReviewCategory,
 ) -> CategoryEvaluation {
     let mut reasons = Vec::new();
-    let context = category.status_context();
 
     let artifacts = collect_category_artifacts(input, category);
     if artifacts.is_empty() {
@@ -239,12 +212,6 @@ fn evaluate_category(
             "No machine-readable review artifacts found for {}",
             category.display_name()
         ));
-    }
-
-    let latest_status = latest_status_for_context(input.statuses, context);
-    let status_state = latest_status.map(|status| status.state.clone());
-    if latest_status.is_none() {
-        reasons.push(format!("Missing commit status context `{context}`"));
     }
 
     let latest_artifact = artifacts.last();
@@ -292,48 +259,14 @@ fn evaluate_category(
                 category.display_name()
             ));
         }
-
-        if let Some(status) = latest_status {
-            let normalized_state = status.state.to_ascii_lowercase();
-            match normalized_state.as_str() {
-                "success" | "failure" => {
-                    let expected_state = match verdict {
-                        ReviewVerdict::Pass => "success",
-                        ReviewVerdict::Fail => "failure",
-                    };
-                    if normalized_state != expected_state {
-                        reasons.push(format!(
-                            "Status mismatch for {}: context `{context}` is `{normalized_state}` but authoritative verdict requires `{expected_state}`",
-                            category.display_name()
-                        ));
-                    }
-                },
-                _ => {
-                    reasons.push(format!(
-                        "Status context `{context}` must be success/failure, got `{normalized_state}`"
-                    ));
-                },
-            }
-        }
     }
 
     CategoryEvaluation {
         pass: reasons.is_empty(),
         authoritative_verdict,
         authoritative_comment_id,
-        status_state,
         reasons,
     }
-}
-
-fn latest_status_for_context<'a>(
-    statuses: &'a [NormalizedStatus],
-    context: &str,
-) -> Option<&'a NormalizedStatus> {
-    statuses
-        .iter()
-        .filter(|status| status.context == context)
-        .max_by_key(|status| status.created_at)
 }
 
 fn collect_category_artifacts(
@@ -581,13 +514,6 @@ enum ReviewCategory {
 }
 
 impl ReviewCategory {
-    const fn status_context(self) -> &'static str {
-        match self {
-            Self::Security => SECURITY_CONTEXT,
-            Self::CodeQuality => QUALITY_CONTEXT,
-        }
-    }
-
     const fn display_name(self) -> &'static str {
         match self {
             Self::Security => "security",
@@ -778,46 +704,6 @@ struct PullRequestHead {
     sha: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct CommitStatusResponse {
-    statuses: Vec<CommitStatus>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CommitStatus {
-    context: String,
-    state: String,
-    created_at: String,
-}
-
-#[derive(Debug, Clone)]
-struct NormalizedStatus {
-    context: String,
-    state: String,
-    created_at: DateTime<Utc>,
-}
-
-impl TryFrom<CommitStatus> for NormalizedStatus {
-    type Error = anyhow::Error;
-
-    fn try_from(status: CommitStatus) -> Result<Self> {
-        let created_at = DateTime::parse_from_rfc3339(&status.created_at)
-            .map(|datetime| datetime.with_timezone(&Utc))
-            .with_context(|| {
-                format!(
-                    "Invalid commit status timestamp `{}` for context `{}`",
-                    status.created_at, status.context
-                )
-            })?;
-
-        Ok(Self {
-            context: status.context,
-            state: status.state,
-            created_at,
-        })
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct IssueComment {
     id: u64,
@@ -836,7 +722,6 @@ struct IssueCommentUser {
 struct GateEvaluationInput<'a> {
     pr_number: u64,
     head_sha: &'a str,
-    statuses: &'a [NormalizedStatus],
     comments: &'a [IssueComment],
     trusted_reviewers: &'a TrustedReviewerMap,
 }
@@ -854,7 +739,6 @@ struct CategoryEvaluation {
     pass: bool,
     authoritative_verdict: Option<ReviewVerdict>,
     authoritative_comment_id: Option<u64>,
-    status_state: Option<String>,
     reasons: Vec<String>,
 }
 
@@ -878,16 +762,8 @@ mod tests {
         name: String,
         pr_number: u64,
         head_sha: String,
-        statuses: Vec<FixtureStatus>,
         comments: Vec<FixtureComment>,
         expected: FixtureExpected,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct FixtureStatus {
-        context: String,
-        state: String,
-        created_at: String,
     }
 
     #[derive(Debug, Deserialize)]
@@ -921,23 +797,6 @@ mod tests {
         );
 
         for fixture in fixtures {
-            let statuses = fixture
-                .statuses
-                .iter()
-                .map(|status| NormalizedStatus {
-                    context: status.context.clone(),
-                    state: status.state.clone(),
-                    created_at: DateTime::parse_from_rfc3339(&status.created_at)
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "Fixture `{}` has invalid status timestamp `{}`: {}",
-                                fixture.name, status.created_at, error
-                            )
-                        })
-                        .with_timezone(&Utc),
-                })
-                .collect::<Vec<_>>();
-
             let comments = fixture
                 .comments
                 .iter()
@@ -955,7 +814,6 @@ mod tests {
             let input = GateEvaluationInput {
                 pr_number: fixture.pr_number,
                 head_sha: &fixture.head_sha,
-                statuses: &statuses,
                 comments: &comments,
                 trusted_reviewers: &trusted_reviewers,
             };
