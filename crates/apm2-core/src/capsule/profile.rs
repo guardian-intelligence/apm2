@@ -19,10 +19,12 @@
 //! broker (`PathRatchet`). The ratchet verifies that broker, capability,
 //! context firewall, and capsule admission checks have all been performed
 //! before allowing tool actuation at Tier2+. **Note**: Capsule admission
-//! is not yet wired at runtime; the ratchet reports it as `Unavailable`
-//! and denies Tier2+ until a future ticket integrates
-//! `AdmissionGate::check` into the broker path. Capsule admission logic
-//! is validated in unit tests only.
+//! is not yet wired at runtime; the ratchet reports it as `Unavailable`.
+//! At Tier2 this produces a warning only (capsule is recommended but not
+//! mandatory). At Tier3+ the ratchet denies actuation when capsule
+//! admission is unavailable (per REQ-0028). A future ticket will
+//! integrate `AdmissionGate::check` into the broker path. Capsule
+//! admission logic is validated in unit tests only.
 
 use std::collections::BTreeSet;
 
