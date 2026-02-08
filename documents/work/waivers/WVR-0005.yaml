@@ -62,8 +62,8 @@ waiver:
 
   references:
     pr_url: "https://github.com/guardian-intelligence/apm2/pull/502"
-    commit_sha: "33bd37a49bf68d969711e967b967c5cccb628122"
-    commit_message: "ci: comment-only review gate + split ai reviewers"
+    commit_sha: "47fb25b4bf45c6782e70f9f91a30a17f7c8eb77d"
+    commit_message: "reviews: remove gh api from RoleSpecs; clarify waiver sha"
     related_ticket: "TCK-00410"
 
   approval:
@@ -77,4 +77,3 @@ waiver:
 
   created_date: "2026-02-08"
   last_updated: "2026-02-08"
-
