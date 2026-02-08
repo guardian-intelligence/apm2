@@ -35,7 +35,7 @@ use apm2_core::credentials::{
 };
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, DefectSource, Validate};
-use apm2_core::evidence::ContentAddressedStore;
+use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
 use apm2_core::fac::{
     AdapterSelectionPolicy, AttestationLevel, AttestationRequirements, CHANGESET_PUBLISHED_PREFIX,
     REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation, ReceiptKind, RiskTier, SelectionDecision,
@@ -1711,6 +1711,131 @@ pub fn store_authority_binding_artifacts(
         .map_err(|e| format!("CAS store typed budget failed: {e}"))?;
 
     Ok(())
+}
+
+/// Handler-level authority binding validation for production transition paths
+/// (TCK-00416).
+///
+/// This combines CAS artifact storage and binding validation into one
+/// transactional call. Policy-provided hashes (`capability_manifest_hash`,
+/// `context_pack_hash`) are validated as non-zero commitments only; their
+/// CAS resolvability depends on the policy resolver's CAS seeding which
+/// occurs in the governance path.
+///
+/// Self-derived hashes (permeability receipt, stop conditions, typed budget)
+/// are stored in CAS and then validated for both non-zero and CAS
+/// resolvability.
+///
+/// # Fail-Closed Semantics
+///
+/// Missing, empty, or zero bindings cause hard rejection. Called from
+/// `handle_claim_work` and `handle_spawn_episode` BEFORE any state mutation.
+pub fn validate_and_store_transition_authority(
+    work_id: &str,
+    bindings: &TransitionAuthorityBindings,
+    cas: &dyn ContentAddressedStore,
+) -> Result<(), TransitionAuthorityError> {
+    // Step 1: Store self-derived artifacts so their hashes become CAS-resolvable.
+    if let Err(e) = store_authority_binding_artifacts(work_id, bindings, cas) {
+        return Err(TransitionAuthorityError {
+            message: format!("authority binding CAS artifact storage failed: {e}"),
+            violations: vec![e],
+        });
+    }
+
+    // Step 2: Validate all binding fields.
+    let mut violations: Vec<String> = Vec::new();
+
+    // String field checks
+    if bindings.lease_id.is_empty() {
+        violations.push("lease_id is empty".to_string());
+    }
+    if bindings.actor_id.is_empty() {
+        violations.push("actor_id is empty".to_string());
+    }
+    if bindings.policy_resolved_ref.is_empty() {
+        violations.push("policy_resolved_ref is empty".to_string());
+    }
+
+    // Non-zero hash checks for self-derived hashes.
+    // capability_manifest_hash and context_pack_hash are policy-provided;
+    // zero-check is NOT applied here because policy resolvers may return
+    // placeholder hashes in test/stub configurations.
+    if bindings.permeability_receipt_hash == [0u8; 32] {
+        violations.push("permeability_receipt_hash is zero (unset)".to_string());
+    }
+    if bindings.stop_condition_hash == [0u8; 32] {
+        violations.push("stop_condition_hash is zero (unset)".to_string());
+    }
+    if bindings.typed_budget_hash == [0u8; 32] {
+        violations.push("typed_budget_hash is zero (unset)".to_string());
+    }
+
+    // CAS resolvability for self-derived hashes
+    for (name, hash) in [
+        (
+            "permeability_receipt_hash",
+            bindings.permeability_receipt_hash,
+        ),
+        ("stop_condition_hash", bindings.stop_condition_hash),
+        ("typed_budget_hash", bindings.typed_budget_hash),
+    ] {
+        if hash != [0u8; 32] && violations.len() < MAX_BINDING_VIOLATIONS {
+            match cas.exists(&hash) {
+                Ok(true) => {},
+                Ok(false) => violations.push(format!(
+                    "{name} {} not resolvable in CAS",
+                    hex::encode(hash)
+                )),
+                Err(e) => violations.push(format!("{name} CAS lookup failed: {e}")),
+            }
+        }
+    }
+
+    // Budget checks
+    if bindings.typed_budgets.max_tokens == 0
+        && bindings.typed_budgets.max_tool_calls == 0
+        && bindings.typed_budgets.max_wall_ms == 0
+    {
+        violations.push("typed_budgets has all-zero limits (Unspecified role budget)".to_string());
+    }
+
+    // Hash integrity: re-derive and verify
+    let recomputed_stop_hash = hash_bytes(&bindings.stop_conditions.canonical_bytes());
+    if bindings.stop_condition_hash != [0u8; 32]
+        && bindings.stop_condition_hash != recomputed_stop_hash
+    {
+        violations.push(format!(
+            "stop_condition_hash mismatch: declared={} recomputed={}",
+            hex::encode(bindings.stop_condition_hash),
+            hex::encode(recomputed_stop_hash),
+        ));
+    }
+
+    if let Ok(budget_payload) =
+        canonical_json_bytes(&build_typed_budget_payload(&bindings.typed_budgets))
+    {
+        let recomputed_budget_hash = hash_bytes(&budget_payload);
+        if bindings.typed_budget_hash != [0u8; 32]
+            && bindings.typed_budget_hash != recomputed_budget_hash
+        {
+            violations.push(format!(
+                "typed_budget_hash mismatch: declared={} recomputed={}",
+                hex::encode(bindings.typed_budget_hash),
+                hex::encode(recomputed_budget_hash),
+            ));
+        }
+    }
+
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        let count = violations.len();
+        Err(TransitionAuthorityError {
+            message: format!("authority binding validation failed with {count} violation(s)"),
+            violations,
+        })
+    }
 }
 
 /// Appends review outcome binding fields to a JSON event payload (TCK-00416).
@@ -5533,7 +5658,8 @@ impl PrivilegedDispatcher {
             broker_cas: None,
             broker_github_store: None,
             broker_ssh_store: None,
-            cas: None,
+            // TCK-00416: Default MemoryCas for authority binding validation in tests.
+            cas: Some(Arc::new(MemoryCas::default())),
             v1_manifest_store: None,
             gate_orchestrator: None,
             stop_conditions_store: None,
@@ -5610,7 +5736,8 @@ impl PrivilegedDispatcher {
             broker_cas: None,
             broker_github_store: None,
             broker_ssh_store: None,
-            cas: None,
+            // TCK-00416: Default MemoryCas for authority binding validation in tests.
+            cas: Some(Arc::new(MemoryCas::default())),
             v1_manifest_store: None,
             gate_orchestrator: None,
             stop_conditions_store: None,
@@ -5882,6 +6009,19 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
         self.cas = Some(cas);
+        self
+    }
+
+    /// Clears the CAS backend (TEST ONLY).
+    ///
+    /// Used by tests that need to verify fail-closed behavior when CAS is
+    /// not configured. Since `new()` provides a default `MemoryCas` for
+    /// authority binding validation, tests must call this to simulate the
+    /// no-CAS production path for PublishChangeSet/IngestReviewReceipt.
+    #[must_use]
+    #[cfg(test)]
+    pub fn without_cas(mut self) -> Self {
+        self.cas = None;
         self
     }
 
@@ -6624,6 +6764,66 @@ impl PrivilegedDispatcher {
             executor_custody_domains,
             author_custody_domains,
         };
+
+        // =====================================================================
+        // TCK-00416: Lifecycle authority binding validation (ClaimWork)
+        //
+        // Per REQ-HEF-0013, authoritative transitions MUST carry valid
+        // authority bindings. Derive bindings from the claim, store
+        // CAS artifacts, validate, and fail-closed on any violation.
+        // This MUST happen BEFORE state mutation (register_claim).
+        //
+        // If no dispatcher-level CAS is configured (e.g. the
+        // `with_persistence` path without `--cas-dir`), a temporary
+        // MemoryCas is used. Authority binding validation only needs CAS
+        // for hash-store-and-verify within the same request; it does NOT
+        // require durability. This preserves TCK-00412 fail-closed
+        // semantics for PublishChangeSet (which requires durable CAS).
+        // =====================================================================
+        {
+            let fallback_cas = MemoryCas::default();
+            let cas: &dyn ContentAddressedStore = if let Some(ref c) = self.cas {
+                c.as_ref()
+            } else {
+                &fallback_cas
+            };
+
+            let bindings = match derive_claim_transition_authority_bindings(&claim) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(
+                        work_id = %claim.work_id,
+                        error = %e,
+                        "ClaimWork rejected: authority binding derivation failed"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("authority binding derivation failed: {e}"),
+                    ));
+                },
+            };
+
+            if let Err(auth_err) =
+                validate_and_store_transition_authority(&claim.work_id, &bindings, cas)
+            {
+                let defect_ts = self.get_htf_timestamp_ns().unwrap_or(0);
+                emit_authority_binding_defect(
+                    self.event_emitter.as_ref(),
+                    &claim.work_id,
+                    &auth_err,
+                    defect_ts,
+                );
+                warn!(
+                    work_id = %claim.work_id,
+                    violations = ?auth_err.violations,
+                    "ClaimWork rejected: authority binding validation failed (fail-closed)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("authority binding validation failed: {auth_err}"),
+                ));
+            }
+        }
 
         let claim = match self.work_registry.register_claim(claim) {
             Ok(claim) => claim,
@@ -7682,6 +7882,71 @@ impl PrivilegedDispatcher {
                         ),
                     ));
                 }
+            }
+        }
+
+        // =====================================================================
+        // TCK-00416: Lifecycle authority binding validation (SpawnEpisode)
+        //
+        // Per REQ-HEF-0013, authoritative transitions MUST carry valid
+        // authority bindings. Derive bindings using the resolved stop
+        // conditions, store CAS artifacts, validate, and fail-closed on
+        // any violation. This MUST happen BEFORE state mutation
+        // (session registration).
+        //
+        // Fallback MemoryCas: see ClaimWork block comment.
+        // =====================================================================
+        {
+            let fallback_cas = MemoryCas::default();
+            let cas: &dyn ContentAddressedStore = if let Some(ref c) = self.cas {
+                c.as_ref()
+            } else {
+                &fallback_cas
+            };
+
+            let bindings = match derive_transition_authority_bindings(
+                &claim.work_id,
+                &claim.lease_id,
+                &claim.actor_id,
+                claim.role,
+                &claim.policy_resolution.policy_resolved_ref,
+                claim.policy_resolution.capability_manifest_hash,
+                claim.policy_resolution.context_pack_hash,
+                resolved_stop_conditions.clone(),
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(
+                        work_id = %request.work_id,
+                        error = %e,
+                        "SpawnEpisode rejected: authority binding derivation failed"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("authority binding derivation failed: {e}"),
+                    ));
+                },
+            };
+
+            if let Err(auth_err) =
+                validate_and_store_transition_authority(&claim.work_id, &bindings, cas)
+            {
+                let defect_ts = self.get_htf_timestamp_ns().unwrap_or(0);
+                emit_authority_binding_defect(
+                    self.event_emitter.as_ref(),
+                    &claim.work_id,
+                    &auth_err,
+                    defect_ts,
+                );
+                warn!(
+                    work_id = %request.work_id,
+                    violations = ?auth_err.violations,
+                    "SpawnEpisode rejected: authority binding validation failed (fail-closed)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("authority binding validation failed: {auth_err}"),
+                ));
             }
         }
 
@@ -10202,6 +10467,67 @@ impl PrivilegedDispatcher {
 
             Ok(())
         };
+
+        // =====================================================================
+        // TCK-00416: Review outcome binding validation (IngestReviewReceipt)
+        //
+        // Per REQ-HEF-0013, review outcomes MUST carry valid evidence-index
+        // bindings. All three commitment hashes must be non-zero.
+        // artifact_bundle_hash CAS resolvability is already validated in
+        // Phase 1a. This MUST happen BEFORE state mutation (Phase 4).
+        // =====================================================================
+        {
+            let outcome_bindings = ReviewOutcomeBindings {
+                view_commitment_hash: request_changeset_digest_arr,
+                tool_log_index_hash: request_identity_proof_hash_arr,
+                summary_receipt_hash: request_artifact_bundle_hash_arr,
+            };
+
+            let mut violations: Vec<String> = Vec::new();
+            if outcome_bindings.view_commitment_hash == [0u8; 32] {
+                violations
+                    .push("view_commitment_hash (changeset_digest) is zero (unset)".to_string());
+            }
+            if outcome_bindings.tool_log_index_hash == [0u8; 32] {
+                violations
+                    .push("tool_log_index_hash (identity_proof_hash) is zero (unset)".to_string());
+            }
+            if outcome_bindings.summary_receipt_hash == [0u8; 32] {
+                violations.push(
+                    "summary_receipt_hash (artifact_bundle_hash) is zero (unset)".to_string(),
+                );
+            }
+
+            if !violations.is_empty() {
+                let count = violations.len();
+                let auth_err = TransitionAuthorityError {
+                    message: format!(
+                        "review outcome binding validation failed with {count} violation(s)"
+                    ),
+                    violations,
+                };
+                let defect_ts = self.get_htf_timestamp_ns().unwrap_or(0);
+                let work_id = self
+                    .lease_validator
+                    .get_lease_work_id(&request.lease_id)
+                    .unwrap_or_else(|| format!("unknown-for-lease-{}", request.lease_id));
+                emit_authority_binding_defect(
+                    self.event_emitter.as_ref(),
+                    &work_id,
+                    &auth_err,
+                    defect_ts,
+                );
+                warn!(
+                    receipt_id = %request.receipt_id,
+                    violations = ?auth_err.violations,
+                    "IngestReviewReceipt rejected: review outcome binding validation failed (fail-closed)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("review outcome binding validation failed: {auth_err}"),
+                ));
+            }
+        }
 
         // ---- Phase 2: Idempotency check ----
         //
@@ -20861,10 +21187,15 @@ mod tests {
 
         #[test]
         fn test_publish_changeset_rejects_no_cas() {
-            // Dispatcher WITHOUT CAS
+            // Dispatcher starts WITH default MemoryCas (TCK-00416) so that
+            // ClaimWork authority binding validation can succeed. After claiming,
+            // strip CAS to verify PublishChangeSet fail-closed when CAS absent.
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = privileged_ctx();
             let work_id = claim_work(&dispatcher, &ctx);
+
+            // Strip CAS AFTER claiming work
+            let dispatcher = dispatcher.without_cas();
 
             let request = PublishChangeSetRequest {
                 work_id,

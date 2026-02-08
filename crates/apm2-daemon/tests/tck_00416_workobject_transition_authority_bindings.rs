@@ -12,7 +12,6 @@
 //! - AC-3: All required hashes are CAS-resolvable at validation time (not
 //!   deferred).
 #![allow(clippy::doc_markdown)]
-//!
 //! # Verification Commands
 //!
 //! ```sh

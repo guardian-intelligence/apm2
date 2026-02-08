@@ -206,6 +206,7 @@ pub use dispatch::{
     generate_work_id,
     store_authority_binding_artifacts,
     typed_budgets_for_role,
+    validate_and_store_transition_authority,
     validate_review_outcome_bindings,
     validate_transition_authority_bindings,
 };
