@@ -215,6 +215,7 @@ done
 log_info "Starting bounded command in transient user unit: ${UNIT}"
 systemd-run \
     --user \
+    --pipe \
     --quiet \
     --wait \
     --collect \
