@@ -1,17 +1,16 @@
-# Unified AI Review projection workflow
-# Runs in PR-branch context (push semantics) so prompt/evaluator changes in the
-# PR apply immediately.
-# Primary execution substrate is FAC on VPS; GitHub is a thin projection layer.
+# Unified FAC-first AI review projection workflow
+# Runs trusted base-branch workflow logic (`pull_request_target`) and treats
+# GitHub as a projection surface over VPS-executed FAC review agents.
 
 name: AI Review
 
 on:
-  push:
-    branches-ignore: [main]
-  workflow_dispatch: {}
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize, ready_for_review]
 
 concurrency:
-  group: ai-review-${{ github.ref }}
+  group: ai-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 permissions:
@@ -29,10 +28,12 @@ jobs:
   fac-review:
     name: FAC Review
     runs-on: [self-hosted, linux, x64, fac-ovh]
-    timeout-minutes: 45
+    timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # pull_request_target executes workflow code from base-branch context.
+      - name: Checkout trusted base branch code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
         with:
@@ -48,58 +49,40 @@ jobs:
             echo "${HOME}/.cargo/bin" >> "$GITHUB_PATH"
           fi
 
-      - name: Resolve PR context from branch
+      - name: Resolve PR context
         id: pr
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          echo "pr_url=${{ github.event.pull_request.html_url }}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          echo "base_ref=${{ github.event.pull_request.base.ref }}" >> "$GITHUB_OUTPUT"
+          echo "author_login=${{ github.event.pull_request.user.login }}" >> "$GITHUB_OUTPUT"
+          echo "author_assoc=${{ github.event.pull_request.author_association }}" >> "$GITHUB_OUTPUT"
 
-          OWNER_REPO="${{ github.repository }}"
-          OWNER="${OWNER_REPO%%/*}"
-          BRANCH="${{ github.ref_name }}"
-
-          PR_DATA=$(gh api "/repos/${OWNER_REPO}/pulls?head=${OWNER}:${BRANCH}&state=open&per_page=10")
-          PR_NUMBER=$(echo "$PR_DATA" | jq -r '.[0].number // empty')
-          if [[ -z "$PR_NUMBER" ]]; then
-            echo "No open PR found for ${OWNER}:${BRANCH}; skipping."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          HEAD_SHA=$(echo "$PR_DATA" | jq -r '.[0].head.sha')
-          BASE_REF=$(echo "$PR_DATA" | jq -r '.[0].base.ref')
-          HEAD_REPO=$(echo "$PR_DATA" | jq -r '.[0].head.repo.full_name')
-
-          if [[ "$HEAD_REPO" != "$OWNER_REPO" ]]; then
-            echo "Refusing to run on non-local head repo: ${HEAD_REPO}"
-            exit 1
-          fi
-
-          if [[ -z "$BASE_REF" ]]; then
-            echo "::error::Could not resolve PR base ref; refusing to evaluate with mutable PR-branch policy."
-            exit 1
-          fi
-
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
-          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
-          echo "base_ref=${BASE_REF}" >> "$GITHUB_OUTPUT"
-          echo "pr_url=https://github.com/${OWNER_REPO}/pull/${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+      - name: Authorize PR author identity (fail closed)
+        run: |
+          set -euo pipefail
+          AUTHOR_LOGIN='${{ steps.pr.outputs.author_login }}'
+          AUTHOR_ASSOC='${{ steps.pr.outputs.author_assoc }}'
+          case "${AUTHOR_ASSOC}" in
+            OWNER|MEMBER|COLLABORATOR)
+              echo "Authorized PR author: ${AUTHOR_LOGIN} (${AUTHOR_ASSOC})"
+              ;;
+            *)
+              echo "::error::Unauthorized PR author identity: ${AUTHOR_LOGIN} (${AUTHOR_ASSOC})"
+              exit 1
+              ;;
+          esac
 
       - name: Fetch trusted reviewers from base branch
-        if: steps.pr.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           git fetch origin "${{ steps.pr.outputs.base_ref }}" --depth=1
           git show "origin/${{ steps.pr.outputs.base_ref }}:.github/review-gate/trusted-reviewers.json" \
             > /tmp/trusted-reviewers-base.json
 
-      - name: Validate review bot identity is allowlisted
-        if: steps.pr.outputs.skip != 'true'
+      - name: Validate reviewer identity is allowlisted
         run: |
           set -euo pipefail
 
@@ -109,7 +92,7 @@ jobs:
           fi
 
           BOT_LOGIN=$(gh api user --jq '.login')
-          echo "Using review bot login: ${BOT_LOGIN}"
+          echo "Using reviewer login: ${BOT_LOGIN}"
 
           jq -e --arg login "$BOT_LOGIN" \
             '[.reviewers.security[].github_logins[] | ascii_downcase] | index($login|ascii_downcase) != null' \
@@ -119,43 +102,11 @@ jobs:
             '[.reviewers.code_quality[].github_logins[] | ascii_downcase] | index($login|ascii_downcase) != null' \
             /tmp/trusted-reviewers-base.json >/dev/null
 
-      - name: Delete prior review artifacts for this head (dedupe)
-        if: steps.pr.outputs.skip != 'true'
-        run: |
-          set -euo pipefail
+      - name: Build apm2 CLI
+        run: cargo build --locked -p apm2-cli
 
-          if ! gh auth status >/dev/null 2>&1; then
-            echo "::error::No gh authentication available on runner; cannot prune prior reviewer comments."
-            exit 1
-          fi
-
-          OWNER_REPO="${{ github.repository }}"
-          PR_NUMBER="${{ steps.pr.outputs.pr_number }}"
-          HEAD_SHA="${{ steps.pr.outputs.head_sha }}"
-          BOT_LOGIN=$(gh api user --jq '.login')
-
-          MARKERS=(
-            "<!-- apm2-review-metadata:v1:security -->"
-            "<!-- apm2-review-metadata:v1:code-quality -->"
-          )
-
-          for marker in "${MARKERS[@]}"; do
-            IDS=$(gh api "/repos/${OWNER_REPO}/issues/${PR_NUMBER}/comments?per_page=100" --paginate --jq \
-              "[.[] | select(.user.login == \"${BOT_LOGIN}\") | select((.body // \"\") | contains(\"${marker}\")) | select((.body // \"\") | contains(\"${HEAD_SHA}\")) | .id] | .[]")
-
-            if [[ -z "${IDS:-}" ]]; then
-              continue
-            fi
-
-            while IFS= read -r id; do
-              if [[ -n "${id}" ]]; then
-                gh api --method DELETE "/repos/${OWNER_REPO}/issues/comments/${id}"
-              fi
-            done <<< "$IDS"
-          done
-
-      - name: Dispatch FAC reviews asynchronously with 1Hz projection window
-        if: steps.pr.outputs.skip != 'true'
+      - name: Dispatch FAC reviewers (idempotent start-or-join)
+        id: dispatch
         run: |
           set -euo pipefail
 
@@ -164,183 +115,64 @@ jobs:
             exit 1
           fi
 
-          if ! command -v jq >/dev/null 2>&1; then
-            echo "::error::jq is required for FAC review status projection."
+          FAC_BIN="${PWD}/target/debug/apm2"
+          PR_URL='${{ steps.pr.outputs.pr_url }}'
+          HEAD_SHA='${{ steps.pr.outputs.head_sha }}'
+
+          DISPATCH_JSON=$("${FAC_BIN}" fac --json review dispatch "${PR_URL}" --type all --expected-head-sha "${HEAD_SHA}")
+          echo "dispatch_json<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$DISPATCH_JSON" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          DISPATCH_EPOCH=$(jq -r '.dispatch_epoch // 0' <<<"${DISPATCH_JSON}")
+          if [[ "${DISPATCH_EPOCH}" == "0" ]]; then
+            echo "::error::FAC dispatch did not return a valid dispatch_epoch"
             exit 1
           fi
+          echo "dispatch_epoch=${DISPATCH_EPOCH}" >> "$GITHUB_OUTPUT"
 
-          PR_URL="${{ steps.pr.outputs.pr_url }}"
-          PR_NUMBER="${{ steps.pr.outputs.pr_number }}"
-          HEAD_SHA="${{ steps.pr.outputs.head_sha }}"
+          jq -r '.results[] | "dispatch review_type=\(.review_type) mode=\(.mode)" +
+            (if .unit then " unit=\(.unit)" else "" end) +
+            (if .pid then " pid=\(.pid|tostring)" else "" end)' <<<"${DISPATCH_JSON}"
 
-          cargo build --locked -p apm2-cli
-          FAC_BIN=("${PWD}/target/debug/apm2")
-          DISPATCH_EPOCH=$(date -u +%s)
-          HEAD_SHA_LOWER="${HEAD_SHA,,}"
+      - name: Project 1Hz reviewer health window
+        run: |
+          set -euo pipefail
 
-          DISPATCH_DIR="${HOME}/.apm2/review_dispatch"
-          mkdir -p "${DISPATCH_DIR}"
-
-          STATUS_JSON=$("${FAC_BIN[@]}" fac --json review status --pr "${PR_NUMBER}" 2>/dev/null || echo '{}')
-
-          launch_review_async() {
-            local review_type="$1"
-            if command -v systemctl >/dev/null 2>&1; then
-              local active_units
-              active_units=$(systemctl --user list-units --type=service --state=running --plain --no-legend "apm2-review-pr${PR_NUMBER}-${review_type}-*.service" 2>/dev/null || true)
-              if [[ -n "${active_units//[[:space:]]/}" ]]; then
-                echo "dispatch review_type=${review_type} skipped=active-unit"
-                return 0
-              fi
-            fi
-
-            local active_count
-            active_count=$(jq -r --arg t "${review_type}" '
-              [.state_entries[]? | select(.review_type == $t and (.alive // false))] | length
-            ' <<<"${STATUS_JSON}")
-
-            if [[ "${active_count}" != "0" ]]; then
-              echo "dispatch review_type=${review_type} skipped=active"
-              return 0
-            fi
-
-            local ts
-            ts=$(date -u +"%Y%m%dT%H%M%SZ")
-            if command -v systemd-run >/dev/null 2>&1; then
-              local unit="apm2-review-pr${PR_NUMBER}-${review_type}-${HEAD_SHA:0:8}-${ts}"
-              systemd-run --user --collect \
-                --unit "${unit}" \
-                --property "WorkingDirectory=${PWD}" \
-                --setenv "PATH=${PATH}" \
-                --setenv "HOME=${HOME}" \
-                --setenv "CARGO_HOME=${CARGO_HOME:-${HOME}/.cargo}" \
-                "${FAC_BIN[@]}" fac review run "${PR_URL}" --type "${review_type}" --expected-head-sha "${HEAD_SHA}" \
-                >/dev/null
-              echo "dispatch review_type=${review_type} unit=${unit}"
-            else
-              local log_file="${DISPATCH_DIR}/pr${PR_NUMBER}-${review_type}-${HEAD_SHA:0:12}-${ts}.log"
-              nohup "${FAC_BIN[@]}" fac review run "${PR_URL}" --type "${review_type}" --expected-head-sha "${HEAD_SHA}" \
-                >"${log_file}" 2>&1 < /dev/null &
-              local pid=$!
-              echo "dispatch review_type=${review_type} pid=${pid} log=${log_file}"
-            fi
-          }
-
-          launch_review_async security
-          launch_review_async quality
+          FAC_BIN="${PWD}/target/debug/apm2"
+          PR_NUMBER='${{ steps.pr.outputs.pr_number }}'
+          HEAD_SHA='${{ steps.pr.outputs.head_sha }}'
+          DISPATCH_EPOCH='${{ steps.dispatch.outputs.dispatch_epoch }}'
 
           terminal_failure=0
-          declare -A SEEN_ERROR_KEYS=()
-
-          review_state_for_type() {
-            local review_type="$1"
-            jq -r --arg head "${HEAD_SHA_LOWER}" --arg t "${review_type}" --argjson start_epoch "${DISPATCH_EPOCH}" '
-              ([.state_entries[]?
-                | select(
-                    .review_type == $t
-                    and (.alive // false)
-                    and ((.head_sha // "" | ascii_downcase) == $head)
-                  )
-              ] | first) as $active
-              | if $active != null then
-                  "alive:" + ($active.model // "n/a") + "/" + ($active.backend // "n/a")
-                  + ":r" + (($active.restart_count // 0) | tostring)
-                  + ":" + (($active.head_sha // "-") | tostring | .[0:7])
-                else
-                  ([.recent_events[]?
-                    | select(.review_type == $t)
-                    | select((.head_sha // "" | ascii_downcase) == $head)
-                    | select((((.ts // "") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601?) // 0) >= $start_epoch)
-                  ] | sort_by(.seq // 0)) as $events
-                  | ($events | map(select(.event == "run_complete")) | last) as $done
-                  | ($events | map(select(.event == "run_start")) | last) as $start
-                  | ($events | map(select(.event == "run_crash")) | last) as $crash
-                  | if $done != null then
-                      "done:" + ($start.model // "n/a") + "/" + ($start.backend // "n/a")
-                      + ":r" + ((($done.restart_count // $start.restart_count // 0)) | tostring)
-                      + ":" + (($done.head_sha // "-") | tostring | .[0:7])
-                    elif $crash != null and (
-                      (($crash.restart_count // 0) >= 3)
-                      or (($crash.reason // "") == "comment_post_permission_denied")
-                    ) then
-                      "failed:" + (($crash.reason // "run_crash") | tostring)
-                    else
-                      "none"
-                    end
-                end
-            ' <<<"${STATUS_JSON}"
-          }
+          after_seq=0
 
           for _ in $(seq 1 30); do
-            NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            STATUS_JSON=$("${FAC_BIN[@]}" fac --json review status --pr "${PR_NUMBER}" 2>/dev/null || true)
+            PROJECT_JSON=$("${FAC_BIN}" fac --json review project \
+              --pr "${PR_NUMBER}" \
+              --head-sha "${HEAD_SHA}" \
+              --since-epoch "${DISPATCH_EPOCH}" \
+              --after-seq "${after_seq}")
 
-            if [[ -z "${STATUS_JSON}" ]] || ! jq -e . >/dev/null 2>&1 <<<"${STATUS_JSON}"; then
+            if [[ -z "${PROJECT_JSON}" ]] || ! jq -e . >/dev/null 2>&1 <<<"${PROJECT_JSON}"; then
+              NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
               echo "ts=${NOW} security=unknown quality=unknown events=-"
               sleep 1
               continue
             fi
 
-            SEC_STATE=$(review_state_for_type security)
-            QUAL_STATE=$(review_state_for_type quality)
+            NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            jq -r --arg now "${NOW}" '.line // ("ts=" + $now + " security=unknown quality=unknown events=-")' <<<"${PROJECT_JSON}"
+            jq -r '.errors[]? | "ERROR ts=\(.ts) event=\(.event) review=\(.review_type) seq=\(.seq) detail=\(.detail)"' <<<"${PROJECT_JSON}"
 
-            LAST_EVENTS=$(jq -r --arg head "${HEAD_SHA_LOWER}" --argjson start_epoch "${DISPATCH_EPOCH}" '
-              [.recent_events[]?
-                | select((.head_sha // "" | ascii_downcase) == $head)
-                | select((((.ts // "") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601?) // 0) >= $start_epoch)
-                | .event // empty
-              ]
-              | .[-2:]
-              | join(",")
-              | if . == "" then "-" else . end
-            ' <<<"${STATUS_JSON}")
+            next_seq=$(jq -r '.last_seq // 0' <<<"${PROJECT_JSON}")
+            if [[ "${next_seq}" =~ ^[0-9]+$ ]]; then
+              after_seq="${next_seq}"
+            fi
 
-            echo "ts=${NOW} security=${SEC_STATE} quality=${QUAL_STATE} events=${LAST_EVENTS}"
-
-            while IFS= read -r error_event; do
-              [[ -z "${error_event}" ]] && continue
-              error_key=$(jq -r '
-                [
-                  (.ts // "-"),
-                  (.event // "-"),
-                  (.review_type // "-"),
-                  ((.reason // .signal // .exit_code // .new_sha // "-") | tostring)
-                ] | join("|")
-              ' <<<"${error_event}")
-              if [[ -n "${SEEN_ERROR_KEYS[${error_key}]:-}" ]]; then
-                continue
-              fi
-              SEEN_ERROR_KEYS["${error_key}"]=1
-              jq -r '
-                "ERROR ts=\(.ts // "-") event=\(.event // "-") review=\(.review_type // "-") seq=\(.seq // 0) detail=\((.reason // .signal // .exit_code // .new_sha // "-") | tostring)"
-              ' <<<"${error_event}"
-            done < <(jq -c --arg head "${HEAD_SHA_LOWER}" --argjson start_epoch "${DISPATCH_EPOCH}" '
-              .recent_events[]?
-              | select((.head_sha // "" | ascii_downcase) == $head)
-              | select((((.ts // "") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601?) // 0) >= $start_epoch)
-              | select(
-                  .event == "run_crash"
-                  or .event == "stall_detected"
-                  or .event == "model_fallback"
-                  or .event == "sha_update"
-                )
-            ' <<<"${STATUS_JSON}")
-
-            if jq -e --arg head "${HEAD_SHA_LOWER}" --argjson start_epoch "${DISPATCH_EPOCH}" '
-              [
-                .recent_events[]?
-                | select((.head_sha // "" | ascii_downcase) == $head)
-                | select((((.ts // "") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601?) // 0) >= $start_epoch)
-                | select(
-                    .event == "run_crash"
-                    and (
-                      ((.restart_count // 0) >= 3)
-                      or ((.reason // "") == "comment_post_permission_denied")
-                    )
-                  )
-              ] | length > 0
-            ' <<<"${STATUS_JSON}" >/dev/null; then
+            if jq -e '.terminal_failure == true' >/dev/null 2>&1 <<<"${PROJECT_JSON}"; then
               terminal_failure=1
+              break
             fi
 
             sleep 1
@@ -353,5 +185,4 @@ jobs:
 
       # Review Gate Success status is posted exclusively by
       # .github/workflows/review-gate.yml (trusted base-branch evaluator).
-      # This workflow only posts review comments; review-gate re-evaluates on
-      # issue_comment and projects the required status.
+      # This workflow only projects FAC execution state and review comments.

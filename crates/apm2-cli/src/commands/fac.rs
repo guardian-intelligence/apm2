@@ -18,7 +18,9 @@
 //!   anchor
 //! - `apm2 fac review run <PR_URL>` - Run FAC review orchestration (parallel,
 //!   multi-model)
+//! - `apm2 fac review dispatch <PR_URL>` - Idempotent detached review dispatch
 //! - `apm2 fac review status` - Show FAC review state and recent events
+//! - `apm2 fac review project` - Render one projection status line
 //! - `apm2 fac review tail` - Tail FAC review NDJSON telemetry stream
 //!
 //! # Design
@@ -328,8 +330,12 @@ pub struct ReviewArgs {
 pub enum ReviewSubcommand {
     /// Run FAC review orchestration for a pull request URL.
     Run(ReviewRunArgs),
+    /// Idempotently dispatch detached FAC review workers.
+    Dispatch(ReviewDispatchArgs),
     /// Show FAC review state/events from local operational artifacts.
     Status(ReviewStatusArgs),
+    /// Render one condensed projection line for GitHub log surfaces.
+    Project(ReviewProjectArgs),
     /// Tail FAC review NDJSON event stream.
     Tail(ReviewTailArgs),
 }
@@ -355,6 +361,27 @@ pub struct ReviewRunArgs {
     pub expected_head_sha: Option<String>,
 }
 
+/// Arguments for `apm2 fac review dispatch`.
+#[derive(Debug, Args)]
+pub struct ReviewDispatchArgs {
+    /// GitHub pull request URL.
+    pub pr_url: String,
+
+    /// Review selection (`all`, `security`, or `quality`).
+    #[arg(
+        long = "type",
+        alias = "review-type",
+        value_enum,
+        default_value_t = fac_review::ReviewRunType::All
+    )]
+    pub review_type: fac_review::ReviewRunType,
+
+    /// Optional expected head SHA (40 hex) to fail closed on stale dispatch
+    /// start.
+    #[arg(long)]
+    pub expected_head_sha: Option<String>,
+}
+
 /// Arguments for `apm2 fac review status`.
 #[derive(Debug, Args)]
 pub struct ReviewStatusArgs {
@@ -365,6 +392,34 @@ pub struct ReviewStatusArgs {
     /// Optional pull request URL filter.
     #[arg(long)]
     pub pr_url: Option<String>,
+}
+
+/// Arguments for `apm2 fac review project`.
+#[derive(Debug, Args)]
+pub struct ReviewProjectArgs {
+    /// Pull request number to project.
+    #[arg(long)]
+    pub pr: u32,
+
+    /// Optional head SHA filter (40 hex).
+    #[arg(long)]
+    pub head_sha: Option<String>,
+
+    /// Optional minimum event timestamp (unix seconds).
+    #[arg(long)]
+    pub since_epoch: Option<u64>,
+
+    /// Emit only errors with seq greater than this value.
+    #[arg(long, default_value_t = 0)]
+    pub after_seq: u64,
+
+    /// Also print ERROR lines in text mode.
+    #[arg(long, default_value_t = false)]
+    pub emit_errors: bool,
+
+    /// Return non-zero when terminal failure is detected.
+    #[arg(long, default_value_t = false)]
+    pub fail_on_terminal: bool,
 }
 
 /// Arguments for `apm2 fac review tail`.
@@ -597,9 +652,24 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
                 run_args.expected_head_sha.as_deref(),
                 json_output,
             ),
+            ReviewSubcommand::Dispatch(dispatch_args) => fac_review::run_dispatch(
+                &dispatch_args.pr_url,
+                dispatch_args.review_type,
+                dispatch_args.expected_head_sha.as_deref(),
+                json_output,
+            ),
             ReviewSubcommand::Status(status_args) => {
                 fac_review::run_status(status_args.pr, status_args.pr_url.as_deref(), json_output)
             },
+            ReviewSubcommand::Project(project_args) => fac_review::run_project(
+                project_args.pr,
+                project_args.head_sha.as_deref(),
+                project_args.since_epoch,
+                project_args.after_seq,
+                project_args.emit_errors,
+                project_args.fail_on_terminal,
+                json_output,
+            ),
             ReviewSubcommand::Tail(tail_args) => {
                 fac_review::run_tail(tail_args.lines, tail_args.follow)
             },

@@ -90,13 +90,15 @@ review_prompt_required_payload[1]:
     requirement: "Provide PR_URL to SECURITY_REVIEW_PROMPT and CODE_QUALITY_PROMPT; each prompt should resolve reviewed SHA from PR_URL."
 
 runtime_review_protocol:
-  primary_entrypoint: "apm2 fac review run <PR_URL> --type all"
+  primary_entrypoint: "apm2 fac review dispatch <PR_URL> --type all"
   observability_surfaces:
     - "~/.apm2/review_events.ndjson (append-only lifecycle events)"
     - "~/.apm2/review_state.json (active review process/model/backend state)"
     - "~/.apm2/review_pulses/pr<PR>_review_pulse_{security|quality}.json (PR-scoped HEAD SHA pulse files)"
   required_semantics:
     - "Review runs execute security and quality in parallel when `--type all` is used."
+    - "Dispatch is idempotent start-or-join for duplicate PR/SHA requests."
+    - "Projection snapshots are emitted via `apm2 fac review project` for 1Hz GitHub-style status rendering."
     - "Mid-review SHA movement uses kill+resume flow with backend-native session resume."
     - "Stalls and crashes emit structured events and trigger bounded model fallback."
 

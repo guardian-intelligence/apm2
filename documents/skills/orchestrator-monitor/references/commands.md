@@ -40,7 +40,7 @@ commands[15]:
 
   - name: launch_reviews
     command: "timeout 900s bash <ROOT>/documents/skills/orchestrator-monitor/assets/launch-reviews.sh <PR_NUMBER|PR_URL> [SCRATCHPAD_DIR]"
-    purpose: "Launch FAC review orchestration (`apm2 fac review run ... --type all`) with NDJSON telemetry tailing."
+    purpose: "Launch FAC review dispatch (`apm2 fac review dispatch ... --type all`) and project 1Hz status via `apm2 fac review project`."
     side_effect: true
 
   - name: check_review_progress

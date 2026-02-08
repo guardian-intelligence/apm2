@@ -6,6 +6,7 @@
 //! - NDJSON lifecycle telemetry under `~/.apm2/review_events.ndjson`
 //! - Pulse-file based SHA freshness checks and resume flow
 //! - Liveness-based stall detection and bounded model fallback
+//! - Idempotent detached dispatch + projection snapshots for GitHub surfaces
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -171,6 +172,47 @@ struct ReviewRunSummary {
     total_secs: u64,
     security: Option<SingleReviewSummary>,
     quality: Option<SingleReviewSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DispatchReviewResult {
+    review_type: String,
+    mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DispatchSummary {
+    pr_url: String,
+    pr_number: u32,
+    head_sha: String,
+    dispatch_epoch: u64,
+    results: Vec<DispatchReviewResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProjectionError {
+    ts: String,
+    event: String,
+    review_type: String,
+    seq: u64,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProjectionStatus {
+    line: String,
+    security: String,
+    quality: String,
+    recent_events: String,
+    terminal_failure: bool,
+    last_seq: u64,
+    errors: Vec<ProjectionError>,
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +413,119 @@ pub fn run_status(pr_number: Option<u32>, pr_url: Option<&str>, json_output: boo
     }
 }
 
+pub fn run_dispatch(
+    pr_url: &str,
+    review_type: ReviewRunType,
+    expected_head_sha: Option<&str>,
+    json_output: bool,
+) -> u8 {
+    match run_dispatch_inner(pr_url, review_type, expected_head_sha) {
+        Ok(summary) => {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("FAC Review Dispatch");
+                println!("  PR:            {}", summary.pr_url);
+                println!("  PR Number:     {}", summary.pr_number);
+                println!("  Head SHA:      {}", summary.head_sha);
+                println!("  Dispatch Epoch {}", summary.dispatch_epoch);
+                for result in &summary.results {
+                    println!(
+                        "  - {}: {}{}{}{}",
+                        result.review_type,
+                        result.mode,
+                        result
+                            .unit
+                            .as_ref()
+                            .map_or_else(String::new, |value| format!(" unit={value}")),
+                        result
+                            .pid
+                            .map_or_else(String::new, |value| format!(" pid={value}")),
+                        result
+                            .log_file
+                            .as_ref()
+                            .map_or_else(String::new, |value| format!(" log={value}")),
+                    );
+                }
+            }
+            exit_codes::SUCCESS
+        },
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_dispatch_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_project(
+    pr_number: u32,
+    head_sha: Option<&str>,
+    since_epoch: Option<u64>,
+    after_seq: u64,
+    emit_errors: bool,
+    fail_on_terminal: bool,
+    json_output: bool,
+) -> u8 {
+    match run_project_inner(pr_number, head_sha, since_epoch, after_seq) {
+        Ok(status) => {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&status).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("{}", status.line);
+                if emit_errors {
+                    for error in &status.errors {
+                        println!(
+                            "ERROR ts={} event={} review={} seq={} detail={}",
+                            error.ts, error.event, error.review_type, error.seq, error.detail
+                        );
+                    }
+                }
+            }
+
+            if fail_on_terminal && status.terminal_failure {
+                exit_codes::GENERIC_ERROR
+            } else {
+                exit_codes::SUCCESS
+            }
+        },
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_project_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
 pub fn run_tail(lines: usize, follow: bool) -> u8 {
     match run_tail_inner(lines, follow) {
         Ok(()) => exit_codes::SUCCESS,
@@ -379,6 +534,529 @@ pub fn run_tail(lines: usize, follow: bool) -> u8 {
             exit_codes::GENERIC_ERROR
         },
     }
+}
+
+fn run_dispatch_inner(
+    pr_url: &str,
+    review_type: ReviewRunType,
+    expected_head_sha: Option<&str>,
+) -> Result<DispatchSummary, String> {
+    let (owner_repo, pr_number) = parse_pr_url(pr_url)?;
+    let current_head_sha = fetch_pr_head_sha(&owner_repo, pr_number)?;
+    if let Some(expected) = expected_head_sha {
+        validate_expected_head_sha(expected)?;
+        if !expected.eq_ignore_ascii_case(&current_head_sha) {
+            return Err(format!(
+                "PR head moved before review dispatch: expected {expected}, got {current_head_sha}"
+            ));
+        }
+    }
+
+    let dispatch_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+
+    let kinds = match review_type {
+        ReviewRunType::All => vec![ReviewKind::Security, ReviewKind::Quality],
+        ReviewRunType::Security => vec![ReviewKind::Security],
+        ReviewRunType::Quality => vec![ReviewKind::Quality],
+    };
+
+    let mut results = Vec::with_capacity(kinds.len());
+    for kind in kinds {
+        let result = dispatch_single_review(
+            pr_url,
+            &owner_repo,
+            pr_number,
+            kind,
+            &current_head_sha,
+            dispatch_epoch,
+        )?;
+        results.push(result);
+    }
+
+    Ok(DispatchSummary {
+        pr_url: pr_url.to_string(),
+        pr_number,
+        head_sha: current_head_sha,
+        dispatch_epoch,
+        results,
+    })
+}
+
+fn run_project_inner(
+    pr_number: u32,
+    head_sha: Option<&str>,
+    since_epoch: Option<u64>,
+    after_seq: u64,
+) -> Result<ProjectionStatus, String> {
+    let normalized_head = if let Some(head) = head_sha {
+        validate_expected_head_sha(head)?;
+        Some(head.to_ascii_lowercase())
+    } else {
+        None
+    };
+
+    let state = with_review_state_shared(|state| Ok(state.clone()))?;
+    let mut events = read_last_event_values(400)?
+        .into_iter()
+        .filter(|event| {
+            event
+                .get("pr_number")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|value| value == u64::from(pr_number))
+        })
+        .filter(|event| {
+            normalized_head.as_ref().is_none_or(|head| {
+                event
+                    .get("head_sha")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(head))
+            })
+        })
+        .filter(|event| {
+            since_epoch.is_none_or(|min_epoch| {
+                event
+                    .get("ts")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(event_timestamp_epoch)
+                    .is_some_and(|epoch| epoch >= min_epoch)
+            })
+        })
+        .collect::<Vec<_>>();
+    events.sort_by_key(event_seq);
+
+    let security = projection_state_for_type(
+        &state,
+        &events,
+        pr_number,
+        ReviewKind::Security,
+        normalized_head.as_deref(),
+    );
+    let quality = projection_state_for_type(
+        &state,
+        &events,
+        pr_number,
+        ReviewKind::Quality,
+        normalized_head.as_deref(),
+    );
+
+    let recent_events = events
+        .iter()
+        .rev()
+        .take(2)
+        .map(|event| {
+            event
+                .get("event")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    let recent_events = if recent_events.is_empty() {
+        "-".to_string()
+    } else {
+        recent_events
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+
+    let mut errors = Vec::new();
+    let mut terminal_failure = false;
+    let mut last_seq = after_seq;
+    for event in &events {
+        let seq = event_seq(event);
+        last_seq = last_seq.max(seq);
+        let event_name = event
+            .get("event")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if event_name == "run_crash" && event_is_terminal_crash(event) {
+            terminal_failure = true;
+        }
+        if seq <= after_seq {
+            continue;
+        }
+        if !matches!(
+            event_name.as_str(),
+            "run_crash" | "stall_detected" | "model_fallback" | "sha_update"
+        ) {
+            continue;
+        }
+
+        let detail = event
+            .get("reason")
+            .or_else(|| event.get("signal"))
+            .or_else(|| event.get("exit_code"))
+            .or_else(|| event.get("new_sha"))
+            .map_or_else(|| "\"-\"".to_string(), serde_json::Value::to_string)
+            .trim_matches('"')
+            .to_string();
+
+        errors.push(ProjectionError {
+            ts: event
+                .get("ts")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-")
+                .to_string(),
+            event: event_name,
+            review_type: event
+                .get("review_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-")
+                .to_string(),
+            seq,
+            detail,
+        });
+    }
+
+    let line = format!(
+        "ts={} security={} quality={} events={}",
+        Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        security,
+        quality,
+        recent_events
+    );
+
+    Ok(ProjectionStatus {
+        line,
+        security,
+        quality,
+        recent_events,
+        terminal_failure,
+        last_seq,
+        errors,
+    })
+}
+
+fn dispatch_single_review(
+    pr_url: &str,
+    owner_repo: &str,
+    pr_number: u32,
+    review_kind: ReviewKind,
+    head_sha: &str,
+    dispatch_epoch: u64,
+) -> Result<DispatchReviewResult, String> {
+    with_dispatch_lock(
+        owner_repo,
+        pr_number,
+        review_kind.as_str(),
+        head_sha,
+        || {
+            if let Some(existing) =
+                find_active_review_entry(pr_number, review_kind.as_str(), Some(head_sha))?
+            {
+                return Ok(DispatchReviewResult {
+                    review_type: review_kind.as_str().to_string(),
+                    mode: "joined".to_string(),
+                    pid: Some(existing.pid),
+                    unit: None,
+                    log_file: Some(existing.log_file.display().to_string()),
+                });
+            }
+            if let Some(existing) = find_active_review_entry(pr_number, review_kind.as_str(), None)?
+            {
+                return Ok(DispatchReviewResult {
+                    review_type: review_kind.as_str().to_string(),
+                    mode: "joined".to_string(),
+                    pid: Some(existing.pid),
+                    unit: None,
+                    log_file: Some(existing.log_file.display().to_string()),
+                });
+            }
+            spawn_detached_review(pr_url, pr_number, review_kind, head_sha, dispatch_epoch)
+        },
+    )
+}
+
+fn spawn_detached_review(
+    pr_url: &str,
+    pr_number: u32,
+    review_kind: ReviewKind,
+    expected_head_sha: &str,
+    dispatch_epoch: u64,
+) -> Result<DispatchReviewResult, String> {
+    let exe_path = std::env::current_exe()
+        .map_err(|err| format!("failed to resolve current executable: {err}"))?;
+    let cwd = std::env::current_dir().map_err(|err| format!("failed to resolve cwd: {err}"))?;
+    let head_short = &expected_head_sha[..expected_head_sha.len().min(8)];
+    let ts = Utc::now().format("%Y%m%dT%H%M%SZ");
+
+    if command_available("systemd-run") {
+        let unit = format!(
+            "apm2-review-pr{pr_number}-{}-{head_short}-{ts}",
+            review_kind.as_str()
+        );
+        let mut command = Command::new("systemd-run");
+        command
+            .arg("--user")
+            .arg("--collect")
+            .arg("--unit")
+            .arg(&unit)
+            .arg("--property")
+            .arg(format!("WorkingDirectory={}", cwd.display()));
+
+        for key in ["PATH", "HOME", "CARGO_HOME", "GH_TOKEN", "GITHUB_TOKEN"] {
+            if let Ok(value) = std::env::var(key) {
+                command.arg("--setenv").arg(format!("{key}={value}"));
+            }
+        }
+
+        let output = command
+            .arg(&exe_path)
+            .arg("fac")
+            .arg("review")
+            .arg("run")
+            .arg(pr_url)
+            .arg("--type")
+            .arg(review_kind.as_str())
+            .arg("--expected-head-sha")
+            .arg(expected_head_sha)
+            .output()
+            .map_err(|err| format!("failed to execute systemd-run: {err}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "systemd-run failed dispatching {} review: {}",
+                review_kind.as_str(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        return Ok(DispatchReviewResult {
+            review_type: review_kind.as_str().to_string(),
+            mode: "started".to_string(),
+            pid: None,
+            unit: Some(unit),
+            log_file: None,
+        });
+    }
+
+    let dispatch_dir = apm2_home_dir()?.join("review_dispatch");
+    fs::create_dir_all(&dispatch_dir).map_err(|err| {
+        format!(
+            "failed to create dispatch directory {}: {err}",
+            dispatch_dir.display()
+        )
+    })?;
+    let log_path = dispatch_dir.join(format!(
+        "pr{pr_number}-{}-{head_short}-{dispatch_epoch}.log",
+        review_kind.as_str()
+    ));
+    let stdout = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|err| format!("failed to open dispatch log {}: {err}", log_path.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .map_err(|err| format!("failed to clone dispatch log handle: {err}"))?;
+    let child = Command::new(&exe_path)
+        .arg("fac")
+        .arg("review")
+        .arg("run")
+        .arg(pr_url)
+        .arg("--type")
+        .arg(review_kind.as_str())
+        .arg("--expected-head-sha")
+        .arg(expected_head_sha)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::from(stderr))
+        .spawn()
+        .map_err(|err| format!("failed to spawn detached review process: {err}"))?;
+    let pid = child.id();
+    drop(child);
+
+    Ok(DispatchReviewResult {
+        review_type: review_kind.as_str().to_string(),
+        mode: "started".to_string(),
+        pid: Some(pid),
+        unit: None,
+        log_file: Some(log_path.display().to_string()),
+    })
+}
+
+fn command_available(command: &str) -> bool {
+    Command::new("sh")
+        .args(["-lc", &format!("command -v {command} >/dev/null 2>&1")])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn projection_state_for_type(
+    state: &ReviewStateFile,
+    events: &[serde_json::Value],
+    pr_number: u32,
+    review_kind: ReviewKind,
+    head_filter: Option<&str>,
+) -> String {
+    let mut active_entries = state
+        .reviewers
+        .values()
+        .filter(|entry| entry_pr_number(entry).is_some_and(|number| number == pr_number))
+        .filter(|entry| entry.review_type.eq_ignore_ascii_case(review_kind.as_str()))
+        .filter(|entry| is_process_alive(entry.pid))
+        .filter(|entry| head_filter.is_none_or(|head| entry.head_sha.eq_ignore_ascii_case(head)))
+        .collect::<Vec<_>>();
+    active_entries.sort_by_key(|entry| entry.started_at);
+    if let Some(active) = active_entries.last() {
+        return format!(
+            "alive:{}/{}:r{}:{}",
+            active.model,
+            active.backend.as_str(),
+            active.restart_count,
+            &active.head_sha[..active.head_sha.len().min(7)]
+        );
+    }
+
+    let mut events_for_kind = events
+        .iter()
+        .filter(|event| {
+            event
+                .get("review_type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case(review_kind.as_str()))
+        })
+        .collect::<Vec<_>>();
+    events_for_kind.sort_by_key(|event| event_seq(event));
+
+    let done = events_for_kind
+        .iter()
+        .rev()
+        .find(|event| event_name(event) == "run_complete");
+    let start = events_for_kind
+        .iter()
+        .rev()
+        .find(|event| event_name(event) == "run_start");
+    let crash = events_for_kind
+        .iter()
+        .rev()
+        .find(|event| event_name(event) == "run_crash" && event_is_terminal_crash(event));
+
+    if let Some(done) = done {
+        let model = start
+            .and_then(|value| value.get("model"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("n/a");
+        let backend = start
+            .and_then(|value| value.get("backend"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("n/a");
+        let restarts = done
+            .get("restart_count")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                start
+                    .and_then(|value| value.get("restart_count"))
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .unwrap_or(0);
+        let sha = done
+            .get("head_sha")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        return format!(
+            "done:{}/{backend}:r{}:{}",
+            model,
+            restarts,
+            &sha[..sha.len().min(7)]
+        );
+    }
+
+    if let Some(crash) = crash {
+        let reason = crash
+            .get("reason")
+            .or_else(|| crash.get("signal"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("run_crash");
+        return format!("failed:{reason}");
+    }
+
+    "none".to_string()
+}
+
+fn event_name(event: &serde_json::Value) -> &str {
+    event
+        .get("event")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+}
+
+fn event_seq(event: &serde_json::Value) -> u64 {
+    event
+        .get("seq")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn event_timestamp_epoch(raw: &str) -> Option<u64> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .and_then(|value| value.timestamp().try_into().ok())
+}
+
+fn event_is_terminal_crash(event: &serde_json::Value) -> bool {
+    let restart_count = event
+        .get("restart_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if restart_count >= u64::from(MAX_RESTART_ATTEMPTS) {
+        return true;
+    }
+    event
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|reason| reason == "comment_post_permission_denied")
+}
+
+fn review_dispatch_locks_dir_path() -> Result<PathBuf, String> {
+    Ok(apm2_home_dir()?.join("review_dispatch_locks"))
+}
+
+fn review_dispatch_lock_path(
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+    head_sha: &str,
+) -> Result<PathBuf, String> {
+    let safe_repo = sanitize_for_path(owner_repo);
+    let safe_type = sanitize_for_path(review_type);
+    let safe_head = sanitize_for_path(&head_sha[..head_sha.len().min(12)]);
+    Ok(review_dispatch_locks_dir_path()?.join(format!(
+        "{safe_repo}-pr{pr_number}-{safe_type}-{safe_head}.lock"
+    )))
+}
+
+fn with_dispatch_lock<T>(
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+    head_sha: &str,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let lock_path = review_dispatch_lock_path(owner_repo, pr_number, review_type, head_sha)?;
+    ensure_parent_dir(&lock_path)?;
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| {
+            format!(
+                "failed to open dispatch lock {}: {err}",
+                lock_path.display()
+            )
+        })?;
+    FileExt::lock_exclusive(&lock_file)
+        .map_err(|err| format!("failed to lock dispatch {}: {err}", lock_path.display()))?;
+    let result = operation();
+    drop(lock_file);
+    result
 }
 
 fn run_review_inner(
@@ -2621,5 +3299,73 @@ mod tests {
         assert_eq!(entry.pr_number, 0);
         assert_eq!(entry.model, default_model());
         assert_eq!(entry.backend, ReviewBackend::Codex);
+    }
+
+    #[test]
+    fn test_event_is_terminal_crash_conditions() {
+        let by_restart = serde_json::json!({
+            "event": "run_crash",
+            "restart_count": 3,
+            "reason": "run_crash"
+        });
+        assert!(event_is_terminal_crash(&by_restart));
+
+        let by_reason = serde_json::json!({
+            "event": "run_crash",
+            "restart_count": 0,
+            "reason": "comment_post_permission_denied"
+        });
+        assert!(event_is_terminal_crash(&by_reason));
+
+        let non_terminal = serde_json::json!({
+            "event": "run_crash",
+            "restart_count": 1,
+            "reason": "run_crash"
+        });
+        assert!(!event_is_terminal_crash(&non_terminal));
+    }
+
+    #[test]
+    fn test_projection_state_for_type_prefers_done_event() {
+        let state = ReviewStateFile::default();
+        let events = vec![
+            serde_json::json!({
+                "event": "run_start",
+                "review_type": "security",
+                "pr_number": 42,
+                "model": "gpt-5.3-codex",
+                "backend": "codex",
+                "restart_count": 1,
+                "head_sha": "abcdef1234567890",
+                "seq": 1
+            }),
+            serde_json::json!({
+                "event": "run_complete",
+                "review_type": "security",
+                "pr_number": 42,
+                "restart_count": 2,
+                "head_sha": "abcdef1234567890",
+                "seq": 2
+            }),
+        ];
+
+        let rendered = projection_state_for_type(&state, &events, 42, ReviewKind::Security, None);
+        assert_eq!(rendered, "done:gpt-5.3-codex/codex:r2:abcdef1");
+    }
+
+    #[test]
+    fn test_projection_state_for_type_terminal_crash() {
+        let state = ReviewStateFile::default();
+        let events = vec![serde_json::json!({
+            "event": "run_crash",
+            "review_type": "quality",
+            "pr_number": 17,
+            "restart_count": 0,
+            "reason": "comment_post_permission_denied",
+            "seq": 1
+        })];
+
+        let rendered = projection_state_for_type(&state, &events, 17, ReviewKind::Quality, None);
+        assert_eq!(rendered, "failed:comment_post_permission_denied");
     }
 }
