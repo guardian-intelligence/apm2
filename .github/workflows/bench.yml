@@ -31,7 +31,7 @@ jobs:
   check-comment:
     name: Check Comment
     if: github.event_name == 'issue_comment'
-    runs-on: &primary_runner [self-hosted, linux, x64, fac-rust-forge-01]
+    runs-on: &primary_runner [self-hosted, linux, x64, fac-ovh]
     outputs:
       triggered: ${{ steps.check.outputs.triggered }}
       pr_number: ${{ github.event.issue.number }}

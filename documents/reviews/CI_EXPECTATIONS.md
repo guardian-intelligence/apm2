@@ -23,10 +23,15 @@
         }
       }
     },
+    "execution_model": {
+      "github_surface": "single required workflow job `CI Success` on runner labels [self-hosted, linux, x64, fac-ovh]",
+      "local_executor": "./scripts/ci/run_local_ci_orchestrator.sh",
+      "note": "GitHub is projection/status surface; gate computation happens locally on the self-hosted machine."
+    },
     "checks": [
       {
-        "id": "format",
-        "name": "Format",
+        "id": "rustfmt",
+        "name": "Rustfmt",
         "command": "cargo fmt --all --check",
         "validates": "Code formatting matches rustfmt standards"
       },
@@ -37,22 +42,70 @@
         "validates": "No lint warnings or errors"
       },
       {
-        "id": "bounded-test-runner",
-        "name": "Bounded Test Runner",
-        "command": "./scripts/ci/run_bounded_tests.sh",
-        "validates": "All workspace tests pass under cgroup/systemd resource bounds (replaces bare cargo test)"
-      },
-      {
         "id": "test-safety-guard",
         "name": "Test Safety Guard",
         "command": "./scripts/ci/test_safety_guard.sh",
         "validates": "No destructive test patterns (rm -rf, unbounded shell, git clean -fdx) present in test code without allowlist approval"
       },
       {
+        "id": "legacy-ipc-guard",
+        "name": "Legacy IPC Guard",
+        "command": "./scripts/ci/legacy_ipc_guard.sh",
+        "validates": "Legacy JSON IPC patterns remain blocked"
+      },
+      {
+        "id": "evidence-refs-lint",
+        "name": "Evidence Refs Lint",
+        "command": "./scripts/ci/evidence_refs_lint.sh",
+        "validates": "Evidence/requirement references are internally consistent"
+      },
+      {
+        "id": "test-refs-lint",
+        "name": "Test Refs Lint",
+        "command": "./scripts/ci/test_refs_lint.sh",
+        "validates": "Evidence source_refs point to existing files"
+      },
+      {
+        "id": "proto-enum-drift",
+        "name": "Proto Enum Drift",
+        "command": "./scripts/ci/proto_enum_drift.sh",
+        "validates": "Proto enum definitions and generated Rust code stay in sync"
+      },
+      {
+        "id": "review-artifact-lint",
+        "name": "Review Artifact Lint",
+        "command": "./scripts/ci/review_artifact_lint.sh",
+        "validates": "Review prompts/artifacts preserve SHA and policy integrity"
+      },
+      {
+        "id": "status-write-command-lint",
+        "name": "Status Write Command Lint",
+        "command": "./scripts/lint/no_direct_status_write_commands.sh",
+        "validates": "Direct status-write drift is blocked (projection contract enforcement)"
+      },
+      {
         "id": "workspace-integrity-guard",
         "name": "Workspace Integrity Guard",
-        "command": "./scripts/ci/workspace_integrity_guard.sh -- cargo nextest run ...",
-        "validates": "Tracked repository state is unchanged after test execution"
+        "command": "./scripts/ci/workspace_integrity_guard.sh -- ./scripts/ci/run_bounded_tests.sh -- cargo nextest run --workspace --all-features --config-file .config/nextest.toml --profile ci",
+        "validates": "Tracked repository state is unchanged after bounded full-workspace test execution"
+      },
+      {
+        "id": "bounded-doctests",
+        "name": "Bounded Doctests",
+        "command": "./scripts/ci/run_bounded_tests.sh -- cargo test --doc --workspace --all-features",
+        "validates": "Workspace doctests pass under cgroup/systemd resource bounds"
+      },
+      {
+        "id": "test-vectors",
+        "name": "Test Vectors",
+        "command": "cargo test --package apm2-core --features test_vectors canonicalization",
+        "validates": "Canonicalization vectors remain valid"
+      },
+      {
+        "id": "msrv-check",
+        "name": "MSRV Check",
+        "command": "cargo +1.85 check --workspace --all-features",
+        "validates": "Workspace builds at MSRV"
       },
       {
         "id": "guardrail-fixtures",
