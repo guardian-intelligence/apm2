@@ -101,6 +101,7 @@ impl std::fmt::Display for StalenessAction {
 
 /// Per-tier freshness configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TierFreshnessConfig {
     /// Maximum head age in ticks before the action fires.
     /// A value of `0` means no staleness enforcement for this tier.
@@ -123,8 +124,10 @@ pub struct TierFreshnessConfig {
 ///
 /// - Tier2+ MUST use [`StalenessAction::Deny`] in the default policy.
 /// - Thresholds decrease as tier increases (higher tiers are stricter).
-/// - A threshold of `0` disables staleness enforcement for that tier.
+/// - A threshold of `0` disables staleness enforcement for that tier (only
+///   valid for Tier0/Tier1; Tier2+ MUST have non-zero thresholds).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FreshnessPolicyV1 {
     /// Per-tier configuration, indexed by tier ordinal (0 = Tier0, ..., 4 =
     /// Tier4).
@@ -180,6 +183,18 @@ pub enum FreshnessPolicyError {
         /// The configured (invalid) action.
         action: StalenessAction,
     },
+
+    /// Tier2+ must have a non-zero `max_head_age_ticks` threshold.
+    ///
+    /// A zero threshold disables staleness enforcement entirely, which
+    /// violates the fail-closed requirement for authoritative tiers.
+    #[error(
+        "Tier{tier} max_head_age_ticks must be > 0 for authoritative tiers (Tier2+): zero threshold disables enforcement"
+    )]
+    AuthoritativeTierZeroThreshold {
+        /// The offending tier ordinal.
+        tier: u8,
+    },
 }
 
 impl FreshnessPolicyV1 {
@@ -192,15 +207,20 @@ impl FreshnessPolicyV1 {
     /// [`StalenessAction::Deny`]. Authoritative tiers MUST deny on
     /// staleness (fail-closed).
     pub fn new(tiers: [TierFreshnessConfig; NUM_TIERS]) -> Result<Self, FreshnessPolicyError> {
-        // Validate: Tier2+ must use Deny as staleness action.
+        // Validate Tier2+ constraints (fail-closed):
+        // 1. max_head_age_ticks must be > 0 (enforcement cannot be disabled).
+        // 2. staleness_action must be Deny.
         for (tier_idx, config) in tiers.iter().enumerate().skip(2) {
-            // Only enforce when max_head_age_ticks > 0 (i.e., enforcement
-            // is active). A threshold of 0 disables enforcement entirely,
-            // so the action is irrelevant.
-            if config.max_head_age_ticks > 0 && config.staleness_action != StalenessAction::Deny {
-                #[allow(clippy::cast_possible_truncation)]
+            #[allow(clippy::cast_possible_truncation)]
+            let tier = tier_idx as u8;
+
+            if config.max_head_age_ticks == 0 {
+                return Err(FreshnessPolicyError::AuthoritativeTierZeroThreshold { tier });
+            }
+
+            if config.staleness_action != StalenessAction::Deny {
                 return Err(FreshnessPolicyError::NonDenyAuthoritativeTier {
-                    tier: tier_idx as u8,
+                    tier,
                     action: config.staleness_action,
                 });
             }
@@ -1268,9 +1288,10 @@ mod tests {
     }
 
     #[test]
-    fn custom_policy_allows_tier2_deny_with_zero_threshold() {
-        // Tier2 with threshold=0 disables enforcement, so any action
-        // is acceptable (the action is never applied).
+    fn custom_policy_rejects_tier2_zero_threshold() {
+        // Tier2+ with threshold=0 must be rejected (fail-closed):
+        // zero threshold disables enforcement entirely, which is
+        // forbidden for authoritative tiers.
         let result = FreshnessPolicyV1::new([
             TierFreshnessConfig {
                 max_head_age_ticks: 0,
@@ -1281,8 +1302,8 @@ mod tests {
                 staleness_action: StalenessAction::Warn,
             },
             TierFreshnessConfig {
-                max_head_age_ticks: 0,                    // disabled
-                staleness_action: StalenessAction::Allow, // OK when disabled
+                max_head_age_ticks: 0, // INVALID: zero disables enforcement
+                staleness_action: StalenessAction::Deny,
             },
             TierFreshnessConfig {
                 max_head_age_ticks: 10_000,
@@ -1293,7 +1314,70 @@ mod tests {
                 staleness_action: StalenessAction::Deny,
             },
         ]);
-        assert!(result.is_ok());
+        assert!(matches!(
+            result,
+            Err(FreshnessPolicyError::AuthoritativeTierZeroThreshold { tier: 2 })
+        ));
+    }
+
+    #[test]
+    fn custom_policy_rejects_tier3_zero_threshold() {
+        let result = FreshnessPolicyV1::new([
+            TierFreshnessConfig {
+                max_head_age_ticks: 0,
+                staleness_action: StalenessAction::Allow,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 1_000_000,
+                staleness_action: StalenessAction::Warn,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 100_000,
+                staleness_action: StalenessAction::Deny,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 0, // INVALID for Tier3
+                staleness_action: StalenessAction::Deny,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 1_000,
+                staleness_action: StalenessAction::Deny,
+            },
+        ]);
+        assert!(matches!(
+            result,
+            Err(FreshnessPolicyError::AuthoritativeTierZeroThreshold { tier: 3 })
+        ));
+    }
+
+    #[test]
+    fn custom_policy_rejects_tier4_zero_threshold() {
+        let result = FreshnessPolicyV1::new([
+            TierFreshnessConfig {
+                max_head_age_ticks: 0,
+                staleness_action: StalenessAction::Allow,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 1_000_000,
+                staleness_action: StalenessAction::Warn,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 100_000,
+                staleness_action: StalenessAction::Deny,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 10_000,
+                staleness_action: StalenessAction::Deny,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 0, // INVALID for Tier4
+                staleness_action: StalenessAction::Deny,
+            },
+        ]);
+        assert!(matches!(
+            result,
+            Err(FreshnessPolicyError::AuthoritativeTierZeroThreshold { tier: 4 })
+        ));
     }
 
     #[test]
@@ -1305,6 +1389,11 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("Tier2"));
         assert!(msg.contains("Deny"));
+
+        let err = FreshnessPolicyError::AuthoritativeTierZeroThreshold { tier: 3 };
+        let msg = err.to_string();
+        assert!(msg.contains("Tier3"));
+        assert!(msg.contains("zero threshold"));
     }
 
     // =========================================================================

@@ -23,7 +23,7 @@
 //!   seals.
 //! - **Monotonicity**: Epoch numbers must strictly increase per issuer.
 //! - **Anti-equivocation**: Two seals from the same issuer at the same epoch
-//!   with different root hashes are rejected.
+//!   with different root hashes or content hashes are rejected.
 //! - **Deterministic**: Given the same inputs, the verifier always produces the
 //!   same [`EpochSealVerdict`] and [`EpochSealAuditEvent`].
 //!
@@ -151,6 +151,13 @@ mod signature_serde {
 /// - `epoch_number`: Strictly increasing per issuer
 /// - `sealed_root_hash`: BLAKE3 hash of the sealed artifact tree
 /// - `issuer_cell_id`: Identity of the issuing cell
+/// - `cell_id`: Owning cell identity (RFC-required authority anchor)
+/// - `directory_epoch`: Directory head epoch bound to this seal
+/// - `receipt_batch_epoch`: Receipt-batch epoch bound to this seal
+/// - `htf_time_envelope_ref`: Content-hash reference to the HTF time envelope
+/// - `quorum_anchor`: Quorum-anchor hash for consensus binding
+/// - `authority_seal_hash`: Hash of the authority seal that authorized this
+///   epoch
 /// - `signature`: Cryptographic signature over the canonical content
 /// - `content_hash`: BLAKE3 hash for CAS addressability
 ///
@@ -159,7 +166,12 @@ mod signature_serde {
 /// - `epoch_number > 0` (epoch zero is reserved as "no seal")
 /// - `sealed_root_hash` and `content_hash` must be non-zero
 /// - `issuer_cell_id` must be non-empty and bounded
+/// - `cell_id` must be non-empty and bounded
+/// - `htf_time_envelope_ref` must be non-zero
+/// - `quorum_anchor` must be non-zero
+/// - `authority_seal_hash` must be non-zero
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EpochSealV1 {
     /// Monotonically increasing epoch number (must be > 0).
     epoch_number: u64,
@@ -169,6 +181,24 @@ pub struct EpochSealV1 {
 
     /// Identity of the issuing cell.
     issuer_cell_id: String,
+
+    /// Owning cell identity (RFC-required authority anchor).
+    cell_id: String,
+
+    /// Directory head epoch bound to this seal.
+    directory_epoch: u64,
+
+    /// Receipt-batch epoch bound to this seal.
+    receipt_batch_epoch: u64,
+
+    /// Content-hash reference to the HTF time envelope for this seal.
+    htf_time_envelope_ref: [u8; 32],
+
+    /// Quorum-anchor hash for consensus binding.
+    quorum_anchor: [u8; 32],
+
+    /// Hash of the authority seal that authorized this epoch.
+    authority_seal_hash: [u8; 32],
 
     /// Cryptographic signature over the canonical seal content.
     #[serde(with = "signature_serde")]
@@ -184,12 +214,19 @@ impl EpochSealV1 {
     /// # Errors
     ///
     /// Returns [`EpochSealError`] if any field violates invariants.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         epoch_number: u64,
         sealed_root_hash: [u8; 32],
         issuer_cell_id: impl Into<String>,
         signature: [u8; 64],
         content_hash: [u8; 32],
+        cell_id: impl Into<String>,
+        directory_epoch: u64,
+        receipt_batch_epoch: u64,
+        htf_time_envelope_ref: [u8; 32],
+        quorum_anchor: [u8; 32],
+        authority_seal_hash: [u8; 32],
     ) -> Result<Self, EpochSealError> {
         if epoch_number == 0 {
             return Err(EpochSealError::ZeroEpoch);
@@ -214,10 +251,39 @@ impl EpochSealV1 {
             });
         }
 
+        let cell_id = cell_id.into();
+        if cell_id.is_empty() {
+            return Err(EpochSealError::EmptyCellId);
+        }
+        if cell_id.len() > MAX_SEAL_STRING_LENGTH {
+            return Err(EpochSealError::CellIdTooLong {
+                length: cell_id.len(),
+                max: MAX_SEAL_STRING_LENGTH,
+            });
+        }
+
+        if htf_time_envelope_ref == [0u8; 32] {
+            return Err(EpochSealError::ZeroTimeEnvelopeRef);
+        }
+
+        if quorum_anchor == [0u8; 32] {
+            return Err(EpochSealError::ZeroQuorumAnchor);
+        }
+
+        if authority_seal_hash == [0u8; 32] {
+            return Err(EpochSealError::ZeroAuthoritySealHash);
+        }
+
         Ok(Self {
             epoch_number,
             sealed_root_hash,
             issuer_cell_id,
+            cell_id,
+            directory_epoch,
+            receipt_batch_epoch,
+            htf_time_envelope_ref,
+            quorum_anchor,
+            authority_seal_hash,
             signature,
             content_hash,
         })
@@ -253,6 +319,42 @@ impl EpochSealV1 {
         &self.content_hash
     }
 
+    /// Returns the owning cell identity.
+    #[must_use]
+    pub fn cell_id(&self) -> &str {
+        &self.cell_id
+    }
+
+    /// Returns the directory head epoch.
+    #[must_use]
+    pub const fn directory_epoch(&self) -> u64 {
+        self.directory_epoch
+    }
+
+    /// Returns the receipt-batch epoch.
+    #[must_use]
+    pub const fn receipt_batch_epoch(&self) -> u64 {
+        self.receipt_batch_epoch
+    }
+
+    /// Returns the HTF time envelope content-hash reference.
+    #[must_use]
+    pub const fn htf_time_envelope_ref(&self) -> &[u8; 32] {
+        &self.htf_time_envelope_ref
+    }
+
+    /// Returns the quorum-anchor hash.
+    #[must_use]
+    pub const fn quorum_anchor(&self) -> &[u8; 32] {
+        &self.quorum_anchor
+    }
+
+    /// Returns the authority seal hash.
+    #[must_use]
+    pub const fn authority_seal_hash(&self) -> &[u8; 32] {
+        &self.authority_seal_hash
+    }
+
     /// Validates that all constructor invariants hold on this seal.
     ///
     /// This is intended for use after deserialization, where the struct
@@ -281,17 +383,61 @@ impl EpochSealV1 {
                 max: MAX_SEAL_STRING_LENGTH,
             });
         }
+        if self.cell_id.is_empty() {
+            return Err(EpochSealError::EmptyCellId);
+        }
+        if self.cell_id.len() > MAX_SEAL_STRING_LENGTH {
+            return Err(EpochSealError::CellIdTooLong {
+                length: self.cell_id.len(),
+                max: MAX_SEAL_STRING_LENGTH,
+            });
+        }
+        if self.htf_time_envelope_ref == [0u8; 32] {
+            return Err(EpochSealError::ZeroTimeEnvelopeRef);
+        }
+        if self.quorum_anchor == [0u8; 32] {
+            return Err(EpochSealError::ZeroQuorumAnchor);
+        }
+        if self.authority_seal_hash == [0u8; 32] {
+            return Err(EpochSealError::ZeroAuthoritySealHash);
+        }
         Ok(())
     }
 
     /// Computes the canonical BLAKE3 hash of this seal for verification.
+    ///
+    /// The preimage includes all semantically significant fields using
+    /// length-prefixed framing to prevent ambiguity:
+    /// - Domain separator
+    /// - `epoch_number` (8 bytes LE)
+    /// - `sealed_root_hash` (32 bytes)
+    /// - `issuer_cell_id` (length-prefixed)
+    /// - `cell_id` (length-prefixed)
+    /// - `directory_epoch` (8 bytes LE)
+    /// - `receipt_batch_epoch` (8 bytes LE)
+    /// - `htf_time_envelope_ref` (32 bytes)
+    /// - `quorum_anchor` (32 bytes)
+    /// - `authority_seal_hash` (32 bytes)
+    /// - `content_hash` (32 bytes)
     #[must_use]
     pub fn canonical_hash(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"apm2:epoch_seal_v1:canonical:v1\0");
+        hasher.update(b"apm2:epoch_seal_v1:canonical:v2\0");
         hasher.update(&self.epoch_number.to_le_bytes());
         hasher.update(&self.sealed_root_hash);
-        hasher.update(self.issuer_cell_id.as_bytes());
+        // Length-prefixed string fields to prevent concatenation ambiguity.
+        let issuer_bytes = self.issuer_cell_id.as_bytes();
+        hasher.update(&(issuer_bytes.len() as u64).to_le_bytes());
+        hasher.update(issuer_bytes);
+        let cell_bytes = self.cell_id.as_bytes();
+        hasher.update(&(cell_bytes.len() as u64).to_le_bytes());
+        hasher.update(cell_bytes);
+        hasher.update(&self.directory_epoch.to_le_bytes());
+        hasher.update(&self.receipt_batch_epoch.to_le_bytes());
+        hasher.update(&self.htf_time_envelope_ref);
+        hasher.update(&self.quorum_anchor);
+        hasher.update(&self.authority_seal_hash);
+        hasher.update(&self.content_hash);
         *hasher.finalize().as_bytes()
     }
 }
@@ -300,10 +446,14 @@ impl std::fmt::Display for EpochSealV1 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "EpochSeal(epoch={}, issuer={}, root={}..)",
+            "EpochSeal(epoch={}, issuer={}, cell={}, root={}.., content={}.., dir_epoch={}, rcpt_epoch={})",
             self.epoch_number,
             self.issuer_cell_id,
-            hex::encode(&self.sealed_root_hash[..8])
+            self.cell_id,
+            hex::encode(&self.sealed_root_hash[..8]),
+            hex::encode(&self.content_hash[..8]),
+            self.directory_epoch,
+            self.receipt_batch_epoch,
         )
     }
 }
@@ -340,6 +490,31 @@ pub enum EpochSealError {
         /// Maximum allowed length.
         max: usize,
     },
+
+    /// Cell ID is empty.
+    #[error("cell ID must be non-empty")]
+    EmptyCellId,
+
+    /// Cell ID exceeds maximum length.
+    #[error("cell ID too long: {length} > {max}")]
+    CellIdTooLong {
+        /// Actual length.
+        length: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
+
+    /// HTF time envelope reference must be non-zero.
+    #[error("HTF time envelope reference must be non-zero")]
+    ZeroTimeEnvelopeRef,
+
+    /// Quorum anchor must be non-zero.
+    #[error("quorum anchor must be non-zero")]
+    ZeroQuorumAnchor,
+
+    /// Authority seal hash must be non-zero.
+    #[error("authority seal hash must be non-zero")]
+    ZeroAuthoritySealHash,
 }
 
 // =============================================================================
@@ -407,6 +582,12 @@ impl EpochSealIssuer {
     /// * `sealed_root_hash` - BLAKE3 hash of the artifact tree root
     /// * `signature` - Signature over the canonical seal content
     /// * `content_hash` - BLAKE3 content hash for CAS
+    /// * `cell_id` - Owning cell identity
+    /// * `directory_epoch` - Directory head epoch
+    /// * `receipt_batch_epoch` - Receipt-batch epoch
+    /// * `htf_time_envelope_ref` - Time envelope content-hash reference
+    /// * `quorum_anchor` - Quorum-anchor hash
+    /// * `authority_seal_hash` - Authority seal hash
     ///
     /// # Errors
     ///
@@ -414,11 +595,18 @@ impl EpochSealIssuer {
     /// counter would overflow `u64::MAX`.
     /// Returns [`EpochSealIssuanceError::Validation`] for field validation
     /// failures.
+    #[allow(clippy::too_many_arguments)]
     pub fn issue(
         &mut self,
         sealed_root_hash: [u8; 32],
         signature: [u8; 64],
         content_hash: [u8; 32],
+        cell_id: impl Into<String>,
+        directory_epoch: u64,
+        receipt_batch_epoch: u64,
+        htf_time_envelope_ref: [u8; 32],
+        quorum_anchor: [u8; 32],
+        authority_seal_hash: [u8; 32],
     ) -> Result<EpochSealV1, EpochSealIssuanceError> {
         let next_epoch = self
             .last_epoch
@@ -431,6 +619,12 @@ impl EpochSealIssuer {
             self.issuer_cell_id.clone(),
             signature,
             content_hash,
+            cell_id,
+            directory_epoch,
+            receipt_batch_epoch,
+            htf_time_envelope_ref,
+            quorum_anchor,
+            authority_seal_hash,
         )
         .map_err(EpochSealIssuanceError::Validation)?;
 
@@ -712,10 +906,13 @@ pub enum EpochSealVerificationError {
 #[derive(Debug, Clone)]
 struct IssuerState {
     /// The last accepted epoch number.
-    last_epoch: u64,
+    epoch: u64,
 
     /// The root hash of the last accepted seal.
-    last_root_hash: [u8; 32],
+    root_hash: [u8; 32],
+
+    /// The content hash of the last accepted seal.
+    content_hash: [u8; 32],
 }
 
 // =============================================================================
@@ -732,8 +929,8 @@ struct IssuerState {
 /// 2. **Signature**: Cryptographic authenticity via [`SignatureVerifier`].
 /// 3. **Monotonicity**: `seal.epoch_number > state[issuer].last_epoch`
 /// 4. **Anti-equivocation**: If `seal.epoch_number ==
-///    state[issuer].last_epoch`, the root hashes must match (duplicate
-///    acceptance is idempotent).
+///    state[issuer].last_epoch`, the root hashes AND content hashes must match
+///    (duplicate acceptance is idempotent).
 /// 5. **Fail-closed**: Tier2+ admissions require a valid seal. When no
 ///    [`SignatureVerifier`] is configured, ALL seals are rejected.
 #[derive(Debug)]
@@ -805,7 +1002,7 @@ impl EpochSealVerifier {
     /// if no seal has been accepted from this issuer.
     #[must_use]
     pub fn last_epoch_for(&self, issuer_cell_id: &str) -> Option<u64> {
-        self.issuers.get(issuer_cell_id).map(|s| s.last_epoch)
+        self.issuers.get(issuer_cell_id).map(|s| s.epoch)
     }
 
     /// Verifies and accepts an epoch seal, updating internal state.
@@ -884,7 +1081,7 @@ impl EpochSealVerifier {
     fn verify_monotonicity(&mut self, seal: &EpochSealV1, risk_tier: RiskTier) -> EpochSealVerdict {
         let issuer = seal.issuer_cell_id();
         if let Some(state) = self.issuers.get_mut(issuer) {
-            if seal.epoch_number() < state.last_epoch {
+            if seal.epoch_number() < state.epoch {
                 return EpochSealVerdict {
                     accepted: false,
                     risk_tier,
@@ -893,17 +1090,18 @@ impl EpochSealVerifier {
                     audit_event: EpochSealAuditEvent::RollbackRejected {
                         issuer_cell_id: issuer.to_string(),
                         epoch_number: seal.epoch_number(),
-                        last_accepted_epoch: state.last_epoch,
+                        last_accepted_epoch: state.epoch,
                     },
                 };
             }
-            if seal.epoch_number() == state.last_epoch {
+            if seal.epoch_number() == state.epoch {
                 return verify_same_epoch(seal, state, risk_tier);
             }
             // Monotonically increasing: accept and update.
-            let previous_epoch = state.last_epoch;
-            state.last_epoch = seal.epoch_number();
-            state.last_root_hash = *seal.sealed_root_hash();
+            let previous_epoch = state.epoch;
+            state.epoch = seal.epoch_number();
+            state.root_hash = *seal.sealed_root_hash();
+            state.content_hash = *seal.content_hash();
             EpochSealVerdict {
                 accepted: true,
                 risk_tier,
@@ -941,8 +1139,9 @@ impl EpochSealVerifier {
         self.issuers.insert(
             issuer.to_string(),
             IssuerState {
-                last_epoch: seal.epoch_number(),
-                last_root_hash: *seal.sealed_root_hash(),
+                epoch: seal.epoch_number(),
+                root_hash: *seal.sealed_root_hash(),
+                content_hash: *seal.content_hash(),
             },
         );
         EpochSealVerdict {
@@ -1043,14 +1242,18 @@ impl EpochSealVerifier {
 /// Handles the same-epoch case: idempotent re-acceptance or equivocation
 /// detection. Free function to avoid borrow-checker conflicts within
 /// `verify_monotonicity`.
+///
+/// Identity for same-epoch idempotence requires BOTH `sealed_root_hash`
+/// AND `content_hash` to match. Differing `content_hash` with the same
+/// root hash is treated as equivocation (distinct seals at the same epoch).
 fn verify_same_epoch(
     seal: &EpochSealV1,
     state: &IssuerState,
     risk_tier: RiskTier,
 ) -> EpochSealVerdict {
     let issuer = seal.issuer_cell_id();
-    if seal.sealed_root_hash() == &state.last_root_hash {
-        // Idempotent re-acceptance of same seal.
+    if seal.sealed_root_hash() == &state.root_hash && seal.content_hash() == &state.content_hash {
+        // Idempotent re-acceptance of same seal (root + content match).
         EpochSealVerdict {
             accepted: true,
             risk_tier,
@@ -1059,11 +1262,11 @@ fn verify_same_epoch(
             audit_event: EpochSealAuditEvent::Accepted {
                 issuer_cell_id: issuer.to_string(),
                 epoch_number: seal.epoch_number(),
-                previous_epoch: state.last_epoch,
+                previous_epoch: state.epoch,
             },
         }
     } else {
-        // Equivocation: same epoch, different root hash.
+        // Equivocation: same epoch, different root hash or content hash.
         EpochSealVerdict {
             accepted: false,
             risk_tier,
@@ -1072,7 +1275,7 @@ fn verify_same_epoch(
             audit_event: EpochSealAuditEvent::EquivocationDetected {
                 issuer_cell_id: issuer.to_string(),
                 epoch_number: seal.epoch_number(),
-                existing_root_hash: state.last_root_hash,
+                existing_root_hash: state.root_hash,
                 conflicting_root_hash: *seal.sealed_root_hash(),
             },
         }
@@ -1116,6 +1319,14 @@ mod tests {
         [seed; 32]
     }
 
+    fn test_anchor_hash(seed: u8) -> [u8; 32] {
+        let mut h = [seed; 32];
+        // Ensure non-zero by ORing the first byte with a nonzero value
+        // when seed is zero (test helpers should never produce zero hashes).
+        h[0] |= 0x01;
+        h
+    }
+
     fn make_seal(epoch: u64, issuer: &str, root_seed: u8) -> EpochSealV1 {
         EpochSealV1::new(
             epoch,
@@ -1123,6 +1334,36 @@ mod tests {
             issuer,
             test_signature(),
             test_content_hash(root_seed.wrapping_add(0x10)),
+            issuer, // cell_id mirrors issuer for tests
+            epoch,  // directory_epoch mirrors seal epoch
+            epoch,  // receipt_batch_epoch mirrors seal epoch
+            test_anchor_hash(root_seed.wrapping_add(0x20)),
+            test_anchor_hash(root_seed.wrapping_add(0x30)),
+            test_anchor_hash(root_seed.wrapping_add(0x40)),
+        )
+        .expect("valid seal")
+    }
+
+    /// Helper to build a seal with an explicit content hash (for
+    /// equivocation tests that need distinct content hashes).
+    fn make_seal_with_content(
+        epoch: u64,
+        issuer: &str,
+        root_seed: u8,
+        content_seed: u8,
+    ) -> EpochSealV1 {
+        EpochSealV1::new(
+            epoch,
+            test_root_hash(root_seed),
+            issuer,
+            test_signature(),
+            test_content_hash(content_seed),
+            issuer,
+            epoch,
+            epoch,
+            test_anchor_hash(root_seed.wrapping_add(0x20)),
+            test_anchor_hash(root_seed.wrapping_add(0x30)),
+            test_anchor_hash(root_seed.wrapping_add(0x40)),
         )
         .expect("valid seal")
     }
@@ -1182,6 +1423,12 @@ mod tests {
             "cell-alpha",
             test_signature(),
             test_content_hash(0x43),
+            "cell-alpha",
+            10,
+            20,
+            test_anchor_hash(0x50),
+            test_anchor_hash(0x60),
+            test_anchor_hash(0x70),
         )
         .unwrap();
 
@@ -1190,15 +1437,43 @@ mod tests {
         assert_eq!(seal.issuer_cell_id(), "cell-alpha");
         assert_eq!(seal.signature(), &test_signature());
         assert_eq!(seal.content_hash(), &test_content_hash(0x43));
+        assert_eq!(seal.cell_id(), "cell-alpha");
+        assert_eq!(seal.directory_epoch(), 10);
+        assert_eq!(seal.receipt_batch_epoch(), 20);
+        assert_eq!(seal.htf_time_envelope_ref(), &test_anchor_hash(0x50));
+        assert_eq!(seal.quorum_anchor(), &test_anchor_hash(0x60));
+        assert_eq!(seal.authority_seal_hash(), &test_anchor_hash(0x70));
+    }
+
+    /// Helper to construct a seal with all default anchor fields, customizing
+    /// only the fields under test.
+    fn new_seal_with_defaults(
+        epoch: u64,
+        root: [u8; 32],
+        issuer: &str,
+        content: [u8; 32],
+    ) -> Result<EpochSealV1, EpochSealError> {
+        EpochSealV1::new(
+            epoch,
+            root,
+            issuer,
+            test_signature(),
+            content,
+            "cell-default",
+            1,
+            1,
+            test_anchor_hash(0xA0),
+            test_anchor_hash(0xB0),
+            test_anchor_hash(0xC0),
+        )
     }
 
     #[test]
     fn seal_rejects_zero_epoch() {
-        let result = EpochSealV1::new(
+        let result = new_seal_with_defaults(
             0,
             test_root_hash(0x42),
             "cell-alpha",
-            test_signature(),
             test_content_hash(0x43),
         );
         assert!(matches!(result, Err(EpochSealError::ZeroEpoch)));
@@ -1206,54 +1481,103 @@ mod tests {
 
     #[test]
     fn seal_rejects_zero_root_hash() {
-        let result = EpochSealV1::new(
-            1,
-            [0u8; 32],
-            "cell-alpha",
-            test_signature(),
-            test_content_hash(0x43),
-        );
+        let result = new_seal_with_defaults(1, [0u8; 32], "cell-alpha", test_content_hash(0x43));
         assert!(matches!(result, Err(EpochSealError::ZeroRootHash)));
     }
 
     #[test]
     fn seal_rejects_zero_content_hash() {
-        let result = EpochSealV1::new(
-            1,
-            test_root_hash(0x42),
-            "cell-alpha",
-            test_signature(),
-            [0u8; 32],
-        );
+        let result = new_seal_with_defaults(1, test_root_hash(0x42), "cell-alpha", [0u8; 32]);
         assert!(matches!(result, Err(EpochSealError::ZeroContentHash)));
     }
 
     #[test]
     fn seal_rejects_empty_issuer() {
-        let result = EpochSealV1::new(
-            1,
-            test_root_hash(0x42),
-            "",
-            test_signature(),
-            test_content_hash(0x43),
-        );
+        let result = new_seal_with_defaults(1, test_root_hash(0x42), "", test_content_hash(0x43));
         assert!(matches!(result, Err(EpochSealError::EmptyIssuerId)));
     }
 
     #[test]
     fn seal_rejects_oversized_issuer() {
         let long_id = "x".repeat(MAX_SEAL_STRING_LENGTH + 1);
-        let result = EpochSealV1::new(
-            1,
-            test_root_hash(0x42),
-            long_id,
-            test_signature(),
-            test_content_hash(0x43),
-        );
+        let result =
+            new_seal_with_defaults(1, test_root_hash(0x42), &long_id, test_content_hash(0x43));
         assert!(matches!(
             result,
             Err(EpochSealError::IssuerIdTooLong { .. })
         ));
+    }
+
+    #[test]
+    fn seal_rejects_empty_cell_id() {
+        let result = EpochSealV1::new(
+            1,
+            test_root_hash(0x42),
+            "cell-alpha",
+            test_signature(),
+            test_content_hash(0x43),
+            "",
+            1,
+            1,
+            test_anchor_hash(0xA0),
+            test_anchor_hash(0xB0),
+            test_anchor_hash(0xC0),
+        );
+        assert!(matches!(result, Err(EpochSealError::EmptyCellId)));
+    }
+
+    #[test]
+    fn seal_rejects_zero_time_envelope_ref() {
+        let result = EpochSealV1::new(
+            1,
+            test_root_hash(0x42),
+            "cell-alpha",
+            test_signature(),
+            test_content_hash(0x43),
+            "cell-alpha",
+            1,
+            1,
+            [0u8; 32], // zero time envelope ref
+            test_anchor_hash(0xB0),
+            test_anchor_hash(0xC0),
+        );
+        assert!(matches!(result, Err(EpochSealError::ZeroTimeEnvelopeRef)));
+    }
+
+    #[test]
+    fn seal_rejects_zero_quorum_anchor() {
+        let result = EpochSealV1::new(
+            1,
+            test_root_hash(0x42),
+            "cell-alpha",
+            test_signature(),
+            test_content_hash(0x43),
+            "cell-alpha",
+            1,
+            1,
+            test_anchor_hash(0xA0),
+            [0u8; 32], // zero quorum anchor
+            test_anchor_hash(0xC0),
+        );
+        assert!(matches!(result, Err(EpochSealError::ZeroQuorumAnchor)));
+    }
+
+    #[test]
+    fn seal_rejects_zero_authority_seal_hash() {
+        let result = EpochSealV1::new(
+            1,
+            test_root_hash(0x42),
+            "cell-alpha",
+            test_signature(),
+            test_content_hash(0x43),
+            "cell-alpha",
+            1,
+            1,
+            test_anchor_hash(0xA0),
+            test_anchor_hash(0xB0),
+            [0u8; 32], // zero authority seal hash
+        );
+        assert!(matches!(result, Err(EpochSealError::ZeroAuthoritySealHash)));
     }
 
     #[test]
@@ -1262,6 +1586,8 @@ mod tests {
         let display = seal.to_string();
         assert!(display.contains("epoch=5"));
         assert!(display.contains("cell-alpha"));
+        assert!(display.contains("content="));
+        assert!(display.contains("dir_epoch=5"));
     }
 
     #[test]
@@ -1319,6 +1645,12 @@ mod tests {
                 test_root_hash(0x11),
                 test_signature(),
                 test_content_hash(0x21),
+                "cell-alpha",
+                10,
+                20,
+                test_anchor_hash(0xA1),
+                test_anchor_hash(0xB1),
+                test_anchor_hash(0xC1),
             )
             .unwrap();
         assert_eq!(seal1.epoch_number(), 1);
@@ -1329,6 +1661,12 @@ mod tests {
                 test_root_hash(0x22),
                 test_signature(),
                 test_content_hash(0x32),
+                "cell-alpha",
+                11,
+                21,
+                test_anchor_hash(0xA2),
+                test_anchor_hash(0xB2),
+                test_anchor_hash(0xC2),
             )
             .unwrap();
         assert_eq!(seal2.epoch_number(), 2);
@@ -1339,6 +1677,12 @@ mod tests {
                 test_root_hash(0x33),
                 test_signature(),
                 test_content_hash(0x43),
+                "cell-alpha",
+                12,
+                22,
+                test_anchor_hash(0xA3),
+                test_anchor_hash(0xB3),
+                test_anchor_hash(0xC3),
             )
             .unwrap();
         assert_eq!(seal3.epoch_number(), 3);
@@ -1348,7 +1692,17 @@ mod tests {
     #[test]
     fn issuer_rejects_zero_root_hash() {
         let mut issuer = EpochSealIssuer::new("cell-alpha").unwrap();
-        let result = issuer.issue([0u8; 32], test_signature(), test_content_hash(0x21));
+        let result = issuer.issue(
+            [0u8; 32],
+            test_signature(),
+            test_content_hash(0x21),
+            "cell-alpha",
+            1,
+            1,
+            test_anchor_hash(0xA0),
+            test_anchor_hash(0xB0),
+            test_anchor_hash(0xC0),
+        );
         assert!(matches!(
             result,
             Err(EpochSealIssuanceError::Validation(
@@ -1772,6 +2126,34 @@ mod tests {
             .to_string()
             .contains("5000")
         );
+        assert!(
+            EpochSealError::EmptyCellId
+                .to_string()
+                .contains("non-empty")
+        );
+        assert!(
+            EpochSealError::CellIdTooLong {
+                length: 5000,
+                max: 4096,
+            }
+            .to_string()
+            .contains("5000")
+        );
+        assert!(
+            EpochSealError::ZeroTimeEnvelopeRef
+                .to_string()
+                .contains("time envelope")
+        );
+        assert!(
+            EpochSealError::ZeroQuorumAnchor
+                .to_string()
+                .contains("quorum anchor")
+        );
+        assert!(
+            EpochSealError::ZeroAuthoritySealHash
+                .to_string()
+                .contains("authority seal hash")
+        );
     }
 
     #[test]
@@ -1973,10 +2355,20 @@ mod tests {
             ) {
                 prop_assume!(root_a != root_b);
 
-                let seal_a = EpochSealV1::new(epoch, root_a, "prop-issuer", sig, content_a)
-                    .unwrap();
-                let seal_b = EpochSealV1::new(epoch, root_b, "prop-issuer", sig, content_b)
-                    .unwrap();
+                let seal_a = EpochSealV1::new(
+                    epoch, root_a, "prop-issuer", sig, content_a,
+                    "prop-cell", epoch, epoch,
+                    super::test_anchor_hash(0xA0),
+                    super::test_anchor_hash(0xB0),
+                    super::test_anchor_hash(0xC0),
+                ).unwrap();
+                let seal_b = EpochSealV1::new(
+                    epoch, root_b, "prop-issuer", sig, content_b,
+                    "prop-cell", epoch, epoch,
+                    super::test_anchor_hash(0xA0),
+                    super::test_anchor_hash(0xB0),
+                    super::test_anchor_hash(0xC0),
+                ).unwrap();
 
                 let mut verifier = test_verifier();
                 let v1 = verifier.verify(&seal_a, RiskTier::Tier2);
@@ -2002,8 +2394,13 @@ mod tests {
                 sig in arb_signature(),
                 content in arb_content_hash(),
             ) {
-                let seal = EpochSealV1::new(epoch, root, "prop-issuer", sig, content)
-                    .unwrap();
+                let seal = EpochSealV1::new(
+                    epoch, root, "prop-issuer", sig, content,
+                    "prop-cell", epoch, epoch,
+                    super::test_anchor_hash(0xA0),
+                    super::test_anchor_hash(0xB0),
+                    super::test_anchor_hash(0xC0),
+                ).unwrap();
 
                 let mut verifier = test_verifier();
                 let v1 = verifier.verify(&seal, RiskTier::Tier2);
@@ -2282,5 +2679,294 @@ mod tests {
             reason: "invalid key".to_string(),
         };
         assert!(err.to_string().contains("invalid key"));
+    }
+
+    // =========================================================================
+    // BLOCKER 2 regression: content_hash in canonical binding + equivocation
+    // =========================================================================
+
+    #[test]
+    fn canonical_hash_includes_content_hash() {
+        // Two seals that differ ONLY in content_hash must produce
+        // different canonical hashes.
+        let seal_a = make_seal_with_content(5, "cell-alpha", 0x11, 0xAA);
+        let seal_b = make_seal_with_content(5, "cell-alpha", 0x11, 0xBB);
+
+        assert_ne!(
+            seal_a.canonical_hash(),
+            seal_b.canonical_hash(),
+            "differing content_hash must yield different canonical hashes"
+        );
+    }
+
+    #[test]
+    fn equivocation_detected_on_differing_content_hash_same_root() {
+        // Same (issuer, epoch, root) but different content_hash must be
+        // treated as equivocation, not idempotent re-acceptance.
+        let mut verifier = test_verifier();
+
+        let seal_a = make_seal_with_content(5, "cell-alpha", 0x11, 0xAA);
+        let verdict_a = verifier.verify(&seal_a, RiskTier::Tier2);
+        assert!(verdict_a.accepted, "first seal should be accepted");
+
+        let seal_b = make_seal_with_content(5, "cell-alpha", 0x11, 0xBB);
+        let verdict_b = verifier.verify(&seal_b, RiskTier::Tier2);
+        assert!(
+            !verdict_b.accepted,
+            "same root + different content_hash at same epoch must be equivocation"
+        );
+        assert!(matches!(
+            verdict_b.audit_event,
+            EpochSealAuditEvent::EquivocationDetected {
+                epoch_number: 5,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn idempotent_reaccept_requires_matching_content_hash() {
+        // Same (issuer, epoch, root, content_hash) = idempotent accept.
+        let mut verifier = test_verifier();
+
+        let seal = make_seal_with_content(5, "cell-alpha", 0x11, 0xAA);
+        assert!(verifier.verify(&seal, RiskTier::Tier2).accepted);
+
+        // Replay same seal: must be accepted idempotently.
+        let verdict = verifier.verify(&seal, RiskTier::Tier2);
+        assert!(
+            verdict.accepted,
+            "identical seal (including content_hash) must be idempotent"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR 1 regression: deny_unknown_fields on serde deserialization
+    // =========================================================================
+
+    #[test]
+    fn deny_unknown_fields_rejects_extra_json_field() {
+        let seal = make_seal(1, "cell-alpha", 0x11);
+        let mut json: serde_json::Value = serde_json::to_value(&seal).unwrap();
+
+        // Inject an unknown field.
+        json["unexpected_field"] = serde_json::Value::from("malicious");
+
+        let result: Result<EpochSealV1, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "deserialization must reject unknown fields"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unknown field"),
+            "error should mention unknown field, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn deny_unknown_fields_accepts_valid_json() {
+        let seal = make_seal(1, "cell-alpha", 0x11);
+        let json = serde_json::to_value(&seal).unwrap();
+        let result: Result<EpochSealV1, _> = serde_json::from_value(json);
+        assert!(result.is_ok(), "valid JSON must deserialize successfully");
+        assert_eq!(result.unwrap(), seal);
+    }
+
+    // =========================================================================
+    // CQ BLOCKER 2 regression: RFC-required schema fields
+    // =========================================================================
+
+    #[test]
+    fn seal_has_rfc_required_fields() {
+        let seal = make_seal(3, "cell-alpha", 0x42);
+        // All RFC-required fields must be accessible.
+        assert!(!seal.cell_id().is_empty());
+        assert!(seal.directory_epoch() > 0);
+        assert!(seal.receipt_batch_epoch() > 0);
+        assert_ne!(seal.htf_time_envelope_ref(), &[0u8; 32]);
+        assert_ne!(seal.quorum_anchor(), &[0u8; 32]);
+        assert_ne!(seal.authority_seal_hash(), &[0u8; 32]);
+    }
+
+    #[test]
+    fn canonical_hash_includes_all_rfc_fields() {
+        // Change each RFC field independently and verify the canonical
+        // hash changes, proving all fields are bound into the preimage.
+        let base = make_seal(3, "cell-alpha", 0x42);
+        let base_hash = base.canonical_hash();
+
+        // Different directory_epoch.
+        let different_dir = EpochSealV1::new(
+            3,
+            test_root_hash(0x42),
+            "cell-alpha",
+            test_signature(),
+            test_content_hash(0x42_u8.wrapping_add(0x10)),
+            "cell-alpha",
+            999, // different directory_epoch
+            3,
+            test_anchor_hash(0x42_u8.wrapping_add(0x20)),
+            test_anchor_hash(0x42_u8.wrapping_add(0x30)),
+            test_anchor_hash(0x42_u8.wrapping_add(0x40)),
+        )
+        .unwrap();
+        assert_ne!(
+            base_hash,
+            different_dir.canonical_hash(),
+            "directory_epoch must be in canonical preimage"
+        );
+
+        // Different quorum_anchor.
+        let different_qa = EpochSealV1::new(
+            3,
+            test_root_hash(0x42),
+            "cell-alpha",
+            test_signature(),
+            test_content_hash(0x42_u8.wrapping_add(0x10)),
+            "cell-alpha",
+            3,
+            3,
+            test_anchor_hash(0x42_u8.wrapping_add(0x20)),
+            test_anchor_hash(0xFF), // different quorum anchor
+            test_anchor_hash(0x42_u8.wrapping_add(0x40)),
+        )
+        .unwrap();
+        assert_ne!(
+            base_hash,
+            different_qa.canonical_hash(),
+            "quorum_anchor must be in canonical preimage"
+        );
+    }
+
+    // =========================================================================
+    // BLOCKER 3: Integration evidence (end-to-end seal verification flow)
+    // =========================================================================
+
+    // TODO(TCK-WIRING): Wire seal verification into the daemon admission
+    // path. The EpochSealVerifier API is production-ready; daemon integration
+    // is tracked separately.
+
+    #[test]
+    fn end_to_end_seal_issuance_and_verification_flow() {
+        // Demonstrates the complete seal lifecycle:
+        // 1. Issuer creates seals monotonically.
+        // 2. Verifier accepts monotonic seals.
+        // 3. Verifier rejects rollback, equivocation, and missing signatures.
+
+        // --- Phase 1: Issuance ---
+        let mut issuer = EpochSealIssuer::new("cell-authority").unwrap();
+
+        let seal1 = issuer
+            .issue(
+                test_root_hash(0x01),
+                test_signature(),
+                test_content_hash(0x11),
+                "cell-authority",
+                100,
+                200,
+                test_anchor_hash(0xA1),
+                test_anchor_hash(0xB1),
+                test_anchor_hash(0xC1),
+            )
+            .unwrap();
+        assert_eq!(seal1.epoch_number(), 1);
+
+        let seal2 = issuer
+            .issue(
+                test_root_hash(0x02),
+                test_signature(),
+                test_content_hash(0x12),
+                "cell-authority",
+                101,
+                201,
+                test_anchor_hash(0xA2),
+                test_anchor_hash(0xB2),
+                test_anchor_hash(0xC2),
+            )
+            .unwrap();
+        assert_eq!(seal2.epoch_number(), 2);
+
+        // --- Phase 2: Verification (accept monotonic) ---
+        let mut verifier = test_verifier();
+        let v1 = verifier.verify_or_reject(&seal1, RiskTier::Tier3);
+        assert!(v1.is_ok(), "first seal must be accepted");
+
+        let v2 = verifier.verify_or_reject(&seal2, RiskTier::Tier3);
+        assert!(v2.is_ok(), "second seal must be accepted (monotonic)");
+
+        // --- Phase 3: Rollback rejection ---
+        let rollback = verifier.verify_or_reject(&seal1, RiskTier::Tier3);
+        assert!(
+            matches!(rollback, Err(EpochSealVerificationError::Rollback { .. })),
+            "replaying old seal must be rejected as rollback"
+        );
+
+        // --- Phase 4: Fail-closed without signature verifier ---
+        let mut bare_verifier = EpochSealVerifier::new();
+        let bare_result = bare_verifier.verify_or_reject(&seal1, RiskTier::Tier3);
+        assert!(
+            matches!(
+                bare_result,
+                Err(EpochSealVerificationError::NoSignatureVerifier)
+            ),
+            "verifier without sig verifier must reject all seals"
+        );
+
+        // --- Phase 5: Tier2+ requires seal (fail-closed) ---
+        assert!(EpochSealVerifier::require_seal_for_tier(RiskTier::Tier3).is_err());
+        assert!(EpochSealVerifier::require_seal_for_tier(RiskTier::Tier0).is_ok());
+    }
+
+    // =========================================================================
+    // Validation of new anchor fields via deserialization bypass
+    // =========================================================================
+
+    #[test]
+    fn validate_rejects_zero_time_envelope_ref_via_serde() {
+        let valid_seal = make_seal(1, "cell-alpha", 0x11);
+        let mut json: serde_json::Value = serde_json::to_value(&valid_seal).unwrap();
+        json["htf_time_envelope_ref"] = serde_json::to_value(vec![0u8; 32]).unwrap();
+        let bad_seal: EpochSealV1 = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            bad_seal.validate(),
+            Err(EpochSealError::ZeroTimeEnvelopeRef)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_zero_quorum_anchor_via_serde() {
+        let valid_seal = make_seal(1, "cell-alpha", 0x11);
+        let mut json: serde_json::Value = serde_json::to_value(&valid_seal).unwrap();
+        json["quorum_anchor"] = serde_json::to_value(vec![0u8; 32]).unwrap();
+        let bad_seal: EpochSealV1 = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            bad_seal.validate(),
+            Err(EpochSealError::ZeroQuorumAnchor)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_zero_authority_seal_hash_via_serde() {
+        let valid_seal = make_seal(1, "cell-alpha", 0x11);
+        let mut json: serde_json::Value = serde_json::to_value(&valid_seal).unwrap();
+        json["authority_seal_hash"] = serde_json::to_value(vec![0u8; 32]).unwrap();
+        let bad_seal: EpochSealV1 = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            bad_seal.validate(),
+            Err(EpochSealError::ZeroAuthoritySealHash)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_empty_cell_id_via_serde() {
+        let valid_seal = make_seal(1, "cell-alpha", 0x11);
+        let mut json: serde_json::Value = serde_json::to_value(&valid_seal).unwrap();
+        json["cell_id"] = serde_json::Value::from("");
+        let bad_seal: EpochSealV1 = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            bad_seal.validate(),
+            Err(EpochSealError::EmptyCellId)
+        ));
     }
 }
