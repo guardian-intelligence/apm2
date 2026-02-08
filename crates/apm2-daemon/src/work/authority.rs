@@ -108,12 +108,10 @@ impl ProjectionWorkAuthority {
     }
 
     fn refresh_projection(&self) -> Result<(), WorkAuthorityError> {
-        let signed_events = self.event_emitter.get_all_events();
-        let current_count = signed_events.len();
+        // O(1) pre-check: query event count without fetching all rows.
+        // Only proceed to the full fetch when the count has changed.
+        let current_count = self.event_emitter.get_event_count();
 
-        // Check cached event count to avoid redundant rebuilds.
-        // Note: the `current_count > 0` guard was removed so that zero-event
-        // projections also benefit from the cache fast-path (MINOR fix).
         {
             let cached =
                 self.last_event_count
@@ -125,6 +123,9 @@ impl ProjectionWorkAuthority {
                 return Ok(());
             }
         }
+
+        // Count changed — fetch all events for full projection rebuild.
+        let signed_events = self.event_emitter.get_all_events();
 
         // SECURITY FIX (Blocker 1 & 2): Trust-on-persist model.
         //
@@ -161,13 +162,15 @@ impl ProjectionWorkAuthority {
     /// events with `event_type = "work_claimed"`, but those events would
     /// have been signed with the session domain prefix.
     ///
-    /// We distinguish work-domain events from session events by verifying
-    /// the signature against the work-domain prefix using the emitter's
-    /// verifying key. Events that fail domain-prefix signature verification
-    /// are silently skipped (they are not work-domain events). Events
-    /// without a known work-domain prefix (native `work.*` protobuf events)
-    /// are passed through unconditionally since `translate_signed_events`
-    /// filters them structurally.
+    /// We distinguish work-domain events from session events by structural
+    /// payload validation: work-domain events contain a top-level `work_id`
+    /// field and no `session_id` field, while session-wrapped events always
+    /// contain `session_id` and wrap payloads differently. Events that fail
+    /// this structural check are silently skipped (they are session events
+    /// masquerading as work events). Events without a known work-domain
+    /// prefix (native `work.*` protobuf events) are passed through
+    /// unconditionally since `translate_signed_events` filters them
+    /// structurally.
     fn filter_work_domain_events(events: &[SignedLedgerEvent]) -> Vec<SignedLedgerEvent> {
         use crate::protocol::dispatch::{
             WORK_CLAIMED_DOMAIN_PREFIX, WORK_TRANSITIONED_DOMAIN_PREFIX,

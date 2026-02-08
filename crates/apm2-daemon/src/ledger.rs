@@ -860,6 +860,22 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         rows.map_or_else(|_| Vec::new(), |iter| iter.filter_map(Result::ok).collect())
     }
 
+    fn get_event_count(&self) -> usize {
+        let Ok(conn) = self.conn.lock() else {
+            return 0;
+        };
+
+        let Ok(count) = conn.query_row("SELECT COUNT(*) FROM ledger_events", [], |row| {
+            row.get::<_, i64>(0)
+        }) else {
+            return 0;
+        };
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let count = count as usize;
+        count
+    }
+
     fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
         let conn = self.conn.lock().ok()?;
 

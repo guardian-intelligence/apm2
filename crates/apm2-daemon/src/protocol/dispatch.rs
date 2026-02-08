@@ -450,6 +450,15 @@ pub trait LedgerEventEmitter: Send + Sync {
         Vec::new()
     }
 
+    /// Returns the total number of persisted ledger events in O(1) time.
+    ///
+    /// Used by projection caching to determine whether the event set has
+    /// changed since the last rebuild, without fetching all rows. `SQLite`
+    /// implementations should use `SELECT COUNT(*) FROM ledger_events`.
+    fn get_event_count(&self) -> usize {
+        0
+    }
+
     /// Queries a signed event by `receipt_id` embedded in the payload.
     ///
     /// This searches for events of type `review_receipt_recorded` or
@@ -1726,6 +1735,11 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             .iter()
             .filter_map(|event_id| events.get(event_id).cloned())
             .collect()
+    }
+
+    fn get_event_count(&self) -> usize {
+        let guard = self.events.read().expect("lock poisoned");
+        guard.0.len()
     }
 
     fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
