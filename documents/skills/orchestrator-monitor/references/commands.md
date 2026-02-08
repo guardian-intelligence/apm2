@@ -7,7 +7,7 @@ notes:
   - "All commands that can hang should use timeout wrappers."
   - "Commands labeled side_effect=true modify external state."
 
-commands[15]:
+commands[17]:
   - name: resolve_repo_root
     command: "timeout 10s git rev-parse --show-toplevel"
     purpose: "Discover repository root for asset invocation."
@@ -35,17 +35,27 @@ commands[15]:
 
   - name: commit_statuses
     command: "timeout 30s gh api repos/guardian-intelligence/apm2/commits/<HEAD_SHA>/status"
-    purpose: "Fetch Review Gate Success status context for exact HEAD SHA binding."
+    purpose: "Fetch Forge Admission Cycle status context for exact HEAD SHA binding."
     side_effect: false
 
   - name: launch_reviews
-    command: "timeout 60s bash <ROOT>/documents/skills/orchestrator-monitor/assets/launch-reviews.sh <PR_NUMBER> <SCRATCHPAD_DIR>"
-    purpose: "Launch security + code-quality review jobs for one PR; PR_URL is injected into prompt templates."
+    command: "timeout 900s bash <ROOT>/documents/skills/orchestrator-monitor/assets/launch-reviews.sh <PR_NUMBER|PR_URL> [SCRATCHPAD_DIR]"
+    purpose: "Launch FAC review dispatch (`apm2 fac review dispatch ... --type all`) and project 1Hz status via `apm2 fac review project`."
+    side_effect: true
+
+  - name: retrigger_review_stream
+    command: "timeout 30s gh workflow run ai-review.yml --repo guardian-intelligence/apm2 -f pr_number=<PR_NUMBER> -f review_type=<all|security|quality> -f projection_seconds=30"
+    purpose: "Manual recovery path: retrigger a specific FAC review stream for current PR head SHA."
+    side_effect: true
+
+  - name: retrigger_gate_projection
+    command: "timeout 30s gh workflow run review-gate.yml --repo guardian-intelligence/apm2 -f pr_number=<PR_NUMBER>"
+    purpose: "Manual recovery path: force Forge Admission Cycle status re-evaluation/post for a PR head SHA."
     side_effect: true
 
   - name: check_review_progress
-    command: "timeout 30s bash <ROOT>/documents/skills/orchestrator-monitor/assets/check-review.sh <PR_NUMBER> <SCRATCHPAD_DIR>"
-    purpose: "Check review process/log progress and verdict indicators."
+    command: "timeout 30s bash <ROOT>/documents/skills/orchestrator-monitor/assets/check-review.sh [PR_NUMBER|PR_URL]"
+    purpose: "Read FAC review state/events/pulse files and print structured review progress."
     side_effect: false
 
   - name: enable_auto_merge
@@ -58,9 +68,9 @@ commands[15]:
     purpose: "Refresh local main after merges before next dispatch wave."
     side_effect: true
 
-  - name: list_codex_processes
-    command: "timeout 10s ps aux | rg 'codex exec'"
-    purpose: "Observe active review process count for saturation/backpressure checks."
+  - name: list_review_processes
+    command: "timeout 10s ps aux | rg '(codex exec|gemini -m|apm2 fac review)'"
+    purpose: "Observe active FAC review process count for saturation/backpressure checks."
     side_effect: false
 
   - name: fetch_main

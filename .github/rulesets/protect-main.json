@@ -27,7 +27,7 @@
             "context": "CI Success"
           },
           {
-            "context": "Review Gate Success"
+            "context": "Forge Admission Cycle"
           }
         ],
         "strict_required_status_checks_policy": true

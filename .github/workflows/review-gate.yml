@@ -1,6 +1,6 @@
 # Authoritative AI review gate workflow
 # Runs gate evaluation with trusted base-branch code and projects a single
-# status context (`Review Gate Success`) back to the PR head SHA.
+# status context (`Forge Admission Cycle`) back to the PR head SHA.
 
 name: Review Gate
 
@@ -9,9 +9,15 @@ on:
     branches: [main]
   issue_comment:
     types: [created, edited]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to evaluate"
+        required: true
+        type: string
 
 concurrency:
-  group: review-gate-${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || github.event.issue.number }}
+  group: review-gate-${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || github.event_name == 'issue_comment' && github.event.issue.number || github.event.inputs.pr_number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -33,6 +39,7 @@ jobs:
     name: Pre-filter
     if: >-
       github.event_name == 'pull_request_target' ||
+      github.event_name == 'workflow_dispatch' ||
       (
         github.event_name == 'issue_comment' &&
         github.event.issue.pull_request &&
@@ -98,6 +105,18 @@ jobs:
             echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
             echo "head_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
             echo "base_ref=${{ github.event.pull_request.base.ref }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PR_NUMBER="${{ github.event.inputs.pr_number }}"
+            if [[ -z "${PR_NUMBER}" ]] || ! [[ "${PR_NUMBER}" =~ ^[0-9]+$ ]]; then
+              echo "::error::workflow_dispatch requires numeric input pr_number"
+              exit 1
+            fi
+            PR_DATA=$(gh api "/repos/${{ github.repository }}/pulls/${PR_NUMBER}")
+            HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
+            BASE_REF=$(echo "$PR_DATA" | jq -r '.base.ref')
+            echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            echo "base_ref=${BASE_REF}" >> "$GITHUB_OUTPUT"
           else
             PR_NUMBER="${{ github.event.issue.number }}"
             PR_DATA=$(gh api "/repos/${{ github.repository }}/pulls/${PR_NUMBER}")
@@ -135,7 +154,7 @@ jobs:
           echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
 
   review-gate-success:
-    name: Review Gate Success
+    name: Forge Admission Cycle
     needs: [pre-filter, review-gate]
     if: always()
     runs-on: ubuntu-24.04
@@ -158,24 +177,16 @@ jobs:
           if [[ -z "${code}" ]]; then
             echo "state=failure" >> "$GITHUB_OUTPUT"
             echo "description=Review gate evaluator did not produce an exit code" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-
-          if [[ "${code}" -eq 0 ]]; then
+          elif [[ "${code}" -eq 0 ]]; then
             echo "state=success" >> "$GITHUB_OUTPUT"
-            echo "description=Review gate passed" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "description=Forge admission cycle passed" >> "$GITHUB_OUTPUT"
+          elif [[ "${code}" -eq 2 ]]; then
+            echo "state=failure" >> "$GITHUB_OUTPUT"
+            echo "description=AI reviews incomplete or failed" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=failure" >> "$GITHUB_OUTPUT"
+            echo "description=Forge admission cycle failed" >> "$GITHUB_OUTPUT"
           fi
-
-          if [[ "${code}" -eq 2 ]]; then
-            echo "state=pending" >> "$GITHUB_OUTPUT"
-            echo "description=Waiting for AI reviews" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "state=failure" >> "$GITHUB_OUTPUT"
-          echo "description=Review gate failed" >> "$GITHUB_OUTPUT"
-          exit 1
 
       # Resolve the PR head SHA so we can post a commit status to it.
       # Only resolve when the gate actually ran (avoids API calls on
@@ -189,6 +200,14 @@ jobs:
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request_target" ]; then
             echo "sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PR_NUMBER="${{ github.event.inputs.pr_number }}"
+            if [[ -z "${PR_NUMBER}" ]] || ! [[ "${PR_NUMBER}" =~ ^[0-9]+$ ]]; then
+              echo "::error::workflow_dispatch requires numeric input pr_number"
+              exit 1
+            fi
+            HEAD_SHA=$(gh api "/repos/${{ github.repository }}/pulls/${PR_NUMBER}" --jq '.head.sha')
+            echo "sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
           else
             PR_NUMBER="${{ github.event.issue.number }}"
             HEAD_SHA=$(gh api "/repos/${{ github.repository }}/pulls/${PR_NUMBER}" --jq '.head.sha')
@@ -210,5 +229,15 @@ jobs:
           set -euo pipefail
           gh api --method POST "/repos/${{ github.repository }}/statuses/${{ steps.head.outputs.sha }}" \
             -f state="${{ steps.gate.outputs.state || 'failure' }}" \
-            -f context="Review Gate Success" \
-            -f description="${{ steps.gate.outputs.description || 'Review gate evaluation failed' }}"
+            -f context="Forge Admission Cycle" \
+            -f description="${{ steps.gate.outputs.description || 'Forge admission cycle evaluation failed' }}"
+
+      - name: Fail workflow when gate is not success
+        if: >-
+          always() &&
+          steps.gate.outputs.should_post == 'true' &&
+          steps.gate.outputs.state != 'success'
+        run: |
+          set -euo pipefail
+          echo "::error::${{ steps.gate.outputs.description }}"
+          exit 1
