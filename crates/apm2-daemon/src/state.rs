@@ -2037,6 +2037,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = state
@@ -2170,6 +2171,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = state

@@ -1602,7 +1602,10 @@ impl EpisodeEnvelopeV1 {
 
         // Derive policy root hash from the envelope's pinned snapshot.
         // The policy_hash in the pinned snapshot IS the policy root.
-        let policy_root = self.derive_policy_root_hash();
+        // Fail-closed: if the envelope lacks a valid policy hash, deny
+        // the delegated spawn rather than falling back to a synthetic
+        // caller-controlled value.
+        let policy_root = self.derive_policy_root_hash()?;
 
         // Derive authority ceiling from the envelope's risk tier.
         let authority_ceiling = self.derive_authority_ceiling();
@@ -1627,21 +1630,31 @@ impl EpisodeEnvelopeV1 {
 
     /// Derives the policy root hash from the envelope's pinned snapshot.
     ///
-    /// Uses the `policy_hash` from the pinned snapshot if available,
-    /// otherwise falls back to hashing the envelope digest (ensuring
-    /// every envelope has a unique policy root binding).
-    fn derive_policy_root_hash(&self) -> [u8; 32] {
+    /// The policy root MUST come from the pinned snapshot's `policy_hash`.
+    /// If the snapshot lacks a valid 32-byte non-zero policy hash, this
+    /// function returns an error (fail-closed). A synthetic/fallback
+    /// value would make the compared root caller-controlled, defeating
+    /// cryptographic provenance verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeV1Error::MissingPolicyRootDerivation`] when the
+    /// envelope lacks a valid policy hash.
+    fn derive_policy_root_hash(&self) -> Result<[u8; 32], EnvelopeV1Error> {
         if let Some(ph) = self.inner.pinned_snapshot().policy_hash() {
             if ph.len() == 32 {
                 let mut hash = [0u8; 32];
                 hash.copy_from_slice(ph);
-                return hash;
+                if hash == [0u8; 32] {
+                    return Err(EnvelopeV1Error::MissingPolicyRootDerivation);
+                }
+                return Ok(hash);
             }
         }
-        // Fallback: hash the envelope digest itself to produce a
-        // deterministic policy root. This ensures fail-closed behavior
-        // even when no explicit policy_hash is set.
-        *blake3::hash(&self.inner.digest()).as_bytes()
+        // Fail-closed: no valid policy_hash means we cannot derive a
+        // trustworthy policy root. Returning a synthetic value would
+        // allow caller-controlled policy root bypass.
+        Err(EnvelopeV1Error::MissingPolicyRootDerivation)
     }
 
     /// Derives an authority ceiling from the envelope's risk tier.
@@ -1822,6 +1835,15 @@ pub enum EnvelopeV1Error {
     /// provide sufficient security for delegated mode. Fail-closed.
     #[error("delegated spawn requires consumption binding; use validate_delegated_spawn_gate")]
     DelegatedRequiresConsumptionBinding,
+
+    /// Policy root hash could not be derived from the envelope's pinned
+    /// snapshot because `policy_hash` is absent, not 32 bytes, or all
+    /// zeros. Fail-closed: a synthetic fallback would make the compared
+    /// root caller-controlled, defeating provenance verification.
+    #[error(
+        "policy root derivation failed: envelope lacks valid non-zero policy_hash in pinned snapshot"
+    )]
+    MissingPolicyRootDerivation,
 }
 
 /// Builder for [`EpisodeEnvelopeV1`].
@@ -4176,6 +4198,55 @@ mod tests {
         assert!(
             matches!(result, Err(EnvelopeV1Error::PermeabilityBindingFailure(_))),
             "policy root mismatch must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_delegated_spawn_rejects_missing_policy_hash() {
+        use apm2_core::policy::permeability::{
+            AuthorityVector, BudgetLevel, CapabilityLevel, ClassificationLevel,
+            PermeabilityReceiptBuilder, RiskLevel, StopPredicateLevel, TaintCeiling,
+        };
+
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::High,
+            CapabilityLevel::Full,
+            BudgetLevel::Capped(100),
+            StopPredicateLevel::Inherit,
+            TaintCeiling::Attested,
+            ClassificationLevel::Public,
+        );
+        let receipt = PermeabilityReceiptBuilder::new("test-no-policy", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("agent")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
+            .policy_root_hash(TEST_POLICY_ROOT)
+            .build()
+            .expect("valid receipt");
+        let hash = receipt.content_hash();
+
+        let required = AuthorityVector::bottom();
+        // Build envelope WITHOUT policy hash in pinned snapshot
+        let env = EpisodeEnvelopeV1::builder()
+            .episode_id("ep-no-policy")
+            .actor_id("agent")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(10))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .view_commitment_hash([0xcc; 32])
+            .freshness_pinset_hash([0xdd; 32])
+            .permeability_receipt_hash(hash)
+            .build()
+            .expect("valid delegated V1 envelope");
+
+        let result = env.validate_for_delegated_spawn_with_receipt(&receipt, &required, 2_000_000);
+        assert!(
+            matches!(result, Err(EnvelopeV1Error::MissingPolicyRootDerivation)),
+            "missing policy hash must fail with MissingPolicyRootDerivation, got: {result:?}"
         );
     }
 }
