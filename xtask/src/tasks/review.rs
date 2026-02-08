@@ -222,7 +222,7 @@ pub fn run_all(
 
     if emit_receipt_only {
         // Sequential: avoids concurrent env var mutation.
-        run_one_ai_review(
+        let sec = run_one_ai_review(
             ReviewType::Security,
             pr_url,
             &owner_repo,
@@ -230,8 +230,12 @@ pub fn run_all(
             &repo_root,
             emit_receipt_only,
             allow_github_write,
-        )?;
-        run_one_ai_review(
+        );
+        if let Err(e) = sec {
+            eprintln!("  Warning: Security review failed to run: {e:#}");
+        }
+
+        let qual = run_one_ai_review(
             ReviewType::Quality,
             pr_url,
             &owner_repo,
@@ -239,7 +243,10 @@ pub fn run_all(
             &repo_root,
             emit_receipt_only,
             allow_github_write,
-        )?;
+        );
+        if let Err(e) = qual {
+            eprintln!("  Warning: Code quality review failed to run: {e:#}");
+        }
     } else {
         // Parallel: higher throughput on beefy self-hosted runners.
         let pr_url_owned = pr_url.to_string();
@@ -283,8 +290,12 @@ pub fn run_all(
             .join()
             .map_err(|_| anyhow::anyhow!("Quality review thread panicked"))?;
 
-        sec_res?;
-        qual_res?;
+        if let Err(e) = sec_res {
+            eprintln!("  Warning: Security review failed to run: {e:#}");
+        }
+        if let Err(e) = qual_res {
+            eprintln!("  Warning: Code quality review failed to run: {e:#}");
+        }
     }
 
     // TCK-00295: Optionally emit internal receipt (non-blocking)
