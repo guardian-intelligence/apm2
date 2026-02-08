@@ -62,8 +62,8 @@ waiver:
 
   references:
     pr_url: "https://github.com/guardian-intelligence/apm2/pull/502"
-    commit_sha: "59be983295ced33f0d8b1e4845736734cec43331"
-    commit_message: "reviews: apply waiver semantics to code-quality"
+    commit_sha: "26687c54730bbc1c5464ccec393f710522202ef8"
+    commit_message: "ci: force-prepend cargo bin dir in bounded PATH"
     related_ticket: "TCK-00410"
 
   approval:
