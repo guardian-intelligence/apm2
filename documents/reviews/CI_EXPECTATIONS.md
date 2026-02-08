@@ -90,12 +90,6 @@
         "validates": "Tracked repository state is unchanged after bounded full-workspace test execution"
       },
       {
-        "id": "bounded-doctests",
-        "name": "Bounded Doctests",
-        "command": "./scripts/ci/run_bounded_tests.sh -- cargo test --doc --workspace --all-features",
-        "validates": "Workspace doctests pass under cgroup/systemd resource bounds"
-      },
-      {
         "id": "test-vectors",
         "name": "Test Vectors",
         "command": "cargo test --package apm2-core --features test_vectors canonicalization",

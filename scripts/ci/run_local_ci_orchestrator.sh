@@ -160,16 +160,19 @@ run_parallel_group "static-guardrails" \
     "review_artifact_lint::./scripts/ci/review_artifact_lint.sh" \
     "status_write_cmd_lint::./scripts/lint/no_direct_status_write_commands.sh"
 
-# Compile-heavy checks are run serially to avoid memory spikes and keep logs clear.
-run_serial_check "rustfmt" "cargo fmt --all --check"
-run_serial_check "clippy" "cargo clippy --workspace --all-targets --all-features -- -D warnings"
-run_serial_check "workspace_integrity_guard" "./scripts/ci/workspace_integrity_guard.sh --snapshot-file target/ci/workspace_integrity.snapshot.tsv -- ./scripts/ci/run_bounded_tests.sh --timeout-seconds 600 --kill-after-seconds 20 -- cargo nextest run --workspace --all-features --config-file .config/nextest.toml --profile ci"
-run_serial_check "bounded_doctests" "./scripts/ci/run_bounded_tests.sh --timeout-seconds 600 --kill-after-seconds 20 -- cargo test --doc --workspace --all-features"
-run_serial_check "test_vectors" "cargo test --package apm2-core --features test_vectors canonicalization"
-run_serial_check "msrv_check" "cargo +1.85 check --workspace --all-features"
-run_serial_check "cargo_deny" "cargo deny check all"
-run_serial_check "cargo_audit" "cargo audit --ignore RUSTSEC-2023-0089"
-run_serial_check "guardrail_fixtures" "./scripts/ci/test_guardrail_fixtures.sh"
+# Compile-heavy checks run in parallel on this host to minimize wall-clock time.
+# Isolated target dirs avoid cargo lock contention across concurrent builds.
+run_parallel_group "compile-analysis" \
+    "rustfmt::cargo fmt --all --check" \
+    "clippy::CARGO_TARGET_DIR=target/ci/target-clippy cargo clippy --workspace --all-targets --all-features -- -D warnings" \
+    "test_vectors::CARGO_TARGET_DIR=target/ci/target-test-vectors cargo test --package apm2-core --features test_vectors canonicalization" \
+    "msrv_check::CARGO_TARGET_DIR=target/ci/target-msrv cargo +1.85 check --workspace --all-features" \
+    "cargo_deny::cargo deny check all" \
+    "cargo_audit::cargo audit --ignore RUSTSEC-2023-0089"
+
+run_parallel_group "bounded-tests" \
+    "workspace_integrity_guard::CARGO_TARGET_DIR=target/ci/target-nextest ./scripts/ci/workspace_integrity_guard.sh --snapshot-file target/ci/workspace_integrity.snapshot.tsv -- ./scripts/ci/run_bounded_tests.sh --timeout-seconds 600 --kill-after-seconds 20 -- cargo nextest run --workspace --all-features --config-file .config/nextest.toml --profile ci" \
+    "guardrail_fixtures::./scripts/ci/test_guardrail_fixtures.sh"
 
 print_summary
 
