@@ -22,8 +22,8 @@
 # process substitution, base64 encoding, etc.).
 #
 # The hard security gate for review status integrity is the `Review Gate Success`
-# commit status context posted by authorized CI workflows (see
-# `.github/workflows/ai-review-*.yml`), which evaluate machine-readable comment
+# commit status context posted by the authorized CI workflow (see
+# `.github/workflows/review-gate.yml`), which evaluates machine-readable comment
 # artifacts via `cargo xtask review-gate`.
 #
 # Threat model: Review artifacts are authored by trusted CI processes
