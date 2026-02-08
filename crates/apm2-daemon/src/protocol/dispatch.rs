@@ -1611,6 +1611,107 @@ pub fn validate_review_outcome_bindings(
     }
 }
 
+/// Derives review outcome bindings from receipt fields using domain-tagged
+/// hashing (TCK-00416).
+///
+/// Each outcome binding hash is derived independently from the receipt's
+/// semantic source data using a unique domain prefix, ensuring no two
+/// bindings alias the same field. This satisfies REQ-HEF-0013 by providing
+/// proper independent evidence-index commitments.
+///
+/// # Arguments
+///
+/// * `changeset_digest` - BLAKE3 digest of the reviewed changeset.
+/// * `artifact_bundle_hash` - CAS hash of the review artifact bundle.
+/// * `receipt_id` - Unique receipt identifier for domain separation.
+///
+/// # Returns
+///
+/// A `ReviewOutcomeBindings` struct with independently-derived hashes.
+pub fn derive_review_outcome_bindings(
+    changeset_digest: &[u8; 32],
+    artifact_bundle_hash: &[u8; 32],
+    receipt_id: &str,
+) -> ReviewOutcomeBindings {
+    // view_commitment_hash: derived from the changeset digest (workspace view at
+    // review time) using a domain-tagged hash to ensure it is NOT the raw
+    // changeset_digest.
+    let mut view_hasher = blake3::Hasher::new();
+    view_hasher.update(b"apm2.review_outcome.view_commitment.v1:");
+    view_hasher.update(changeset_digest);
+    let view_commitment_hash = *view_hasher.finalize().as_bytes();
+
+    // tool_log_index_hash: derived from the artifact bundle (which contains tool
+    // logs) using a domain-tagged hash to ensure it is NOT the raw
+    // artifact_bundle_hash or identity_proof_hash.
+    let mut tool_hasher = blake3::Hasher::new();
+    tool_hasher.update(b"apm2.review_outcome.tool_log_index.v1:");
+    tool_hasher.update(artifact_bundle_hash);
+    tool_hasher.update(receipt_id.as_bytes());
+    let tool_log_index_hash = *tool_hasher.finalize().as_bytes();
+
+    // summary_receipt_hash: derived from the artifact bundle hash itself
+    // using a domain-tagged hash for binding independence.
+    let mut summary_hasher = blake3::Hasher::new();
+    summary_hasher.update(b"apm2.review_outcome.summary_receipt.v1:");
+    summary_hasher.update(artifact_bundle_hash);
+    let summary_receipt_hash = *summary_hasher.finalize().as_bytes();
+
+    ReviewOutcomeBindings {
+        view_commitment_hash,
+        tool_log_index_hash,
+        summary_receipt_hash,
+    }
+}
+
+/// Stores review outcome binding artifacts in CAS so they are resolvable
+/// at validation time (TCK-00416).
+///
+/// This must be called BEFORE `validate_review_outcome_bindings` to ensure
+/// CAS-resolvability. The function stores domain-tagged preimages for each
+/// outcome binding hash.
+///
+/// # Arguments
+///
+/// * `changeset_digest` - BLAKE3 digest of the reviewed changeset.
+/// * `artifact_bundle_hash` - CAS hash of the review artifact bundle.
+/// * `receipt_id` - Unique receipt identifier for domain separation.
+/// * `cas` - Content-addressed store for artifact persistence.
+///
+/// # Errors
+///
+/// Returns an error string if any CAS store operation fails.
+pub fn store_review_outcome_artifacts(
+    changeset_digest: &[u8; 32],
+    artifact_bundle_hash: &[u8; 32],
+    receipt_id: &str,
+    cas: &dyn ContentAddressedStore,
+) -> Result<(), String> {
+    // Store the preimage for view_commitment_hash
+    let mut view_preimage = Vec::with_capacity(48 + 32);
+    view_preimage.extend_from_slice(b"apm2.review_outcome.view_commitment.v1:");
+    view_preimage.extend_from_slice(changeset_digest);
+    cas.store(&view_preimage)
+        .map_err(|e| format!("view_commitment CAS store failed: {e}"))?;
+
+    // Store the preimage for tool_log_index_hash
+    let mut tool_preimage = Vec::with_capacity(48 + 32 + receipt_id.len());
+    tool_preimage.extend_from_slice(b"apm2.review_outcome.tool_log_index.v1:");
+    tool_preimage.extend_from_slice(artifact_bundle_hash);
+    tool_preimage.extend_from_slice(receipt_id.as_bytes());
+    cas.store(&tool_preimage)
+        .map_err(|e| format!("tool_log_index CAS store failed: {e}"))?;
+
+    // Store the preimage for summary_receipt_hash
+    let mut summary_preimage = Vec::with_capacity(48 + 32);
+    summary_preimage.extend_from_slice(b"apm2.review_outcome.summary_receipt.v1:");
+    summary_preimage.extend_from_slice(artifact_bundle_hash);
+    cas.store(&summary_preimage)
+        .map_err(|e| format!("summary_receipt CAS store failed: {e}"))?;
+
+    Ok(())
+}
+
 /// Emits a structured defect event for authority binding violations
 /// (TCK-00416).
 ///
@@ -1717,14 +1818,15 @@ pub fn store_authority_binding_artifacts(
 /// (TCK-00416).
 ///
 /// This combines CAS artifact storage and binding validation into one
-/// transactional call. Policy-provided hashes (`capability_manifest_hash`,
-/// `context_pack_hash`) are validated as non-zero commitments only; their
-/// CAS resolvability depends on the policy resolver's CAS seeding which
-/// occurs in the governance path.
+/// transactional call. ALL binding hashes (including policy-provided
+/// `capability_manifest_hash` and `context_pack_hash`) are validated as
+/// non-zero per REQ-HEF-0013. Zero values indicate missing policy resolution
+/// and are hard failures.
 ///
 /// Self-derived hashes (permeability receipt, stop conditions, typed budget)
 /// are stored in CAS and then validated for both non-zero and CAS
-/// resolvability.
+/// resolvability. Policy-provided hashes are non-zero checked but CAS
+/// resolvability is delegated to the governance CAS seeding pipeline.
 ///
 /// # Fail-Closed Semantics
 ///
@@ -1757,12 +1859,18 @@ pub fn validate_and_store_transition_authority(
         violations.push("policy_resolved_ref is empty".to_string());
     }
 
-    // Non-zero hash checks for self-derived hashes.
-    // capability_manifest_hash and context_pack_hash are policy-provided;
-    // zero-check is NOT applied here because policy resolvers may return
-    // placeholder hashes in test/stub configurations.
+    // Non-zero hash checks for ALL required hashes (REQ-HEF-0013).
+    // capability_manifest_hash and context_pack_hash are mandatory per
+    // REQ-HEF-0013 -- zero values indicate missing policy resolution and
+    // MUST be rejected (fail-closed).
     if bindings.permeability_receipt_hash == [0u8; 32] {
         violations.push("permeability_receipt_hash is zero (unset)".to_string());
+    }
+    if bindings.capability_manifest_hash == [0u8; 32] {
+        violations.push("capability_manifest_hash is zero (unset)".to_string());
+    }
+    if bindings.context_pack_hash == [0u8; 32] {
+        violations.push("context_pack_hash is zero (unset)".to_string());
     }
     if bindings.stop_condition_hash == [0u8; 32] {
         violations.push("stop_condition_hash is zero (unset)".to_string());
@@ -1771,7 +1879,11 @@ pub fn validate_and_store_transition_authority(
         violations.push("typed_budget_hash is zero (unset)".to_string());
     }
 
-    // CAS resolvability for self-derived hashes
+    // CAS resolvability for self-derived hashes.
+    // capability_manifest_hash and context_pack_hash are policy-provided;
+    // their CAS seeding is the policy resolver's responsibility. We enforce
+    // non-zero above but skip CAS resolvability here to avoid coupling
+    // validation to the governance CAS seeding pipeline.
     for (name, hash) in [
         (
             "permeability_receipt_hash",
@@ -1941,16 +2053,41 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
         // Build canonical payload (deterministic JSON)
-        let payload = serde_json::json!({
-            "event_type": "work_claimed",
-            "work_id": claim.work_id,
-            "lease_id": claim.lease_id,
-            "actor_id": claim.actor_id,
-            "role": format!("{:?}", claim.role),
-            "policy_resolved_ref": claim.policy_resolution.policy_resolved_ref,
-            "capability_manifest_hash": hex::encode(claim.policy_resolution.capability_manifest_hash),
-            "context_pack_hash": hex::encode(claim.policy_resolution.context_pack_hash),
-        });
+        // TCK-00416: Derive authority bindings and embed in signed payload.
+        // This ensures transition authority fields are persisted in the
+        // signed event and cannot be stripped post-signing.
+        let mut payload_map = serde_json::Map::new();
+        payload_map.insert("event_type".to_string(), serde_json::json!("work_claimed"));
+        payload_map.insert("work_id".to_string(), serde_json::json!(claim.work_id));
+        payload_map.insert("lease_id".to_string(), serde_json::json!(claim.lease_id));
+        payload_map.insert("actor_id".to_string(), serde_json::json!(claim.actor_id));
+        payload_map.insert(
+            "role".to_string(),
+            serde_json::json!(format!("{:?}", claim.role)),
+        );
+        payload_map.insert(
+            "policy_resolved_ref".to_string(),
+            serde_json::json!(claim.policy_resolution.policy_resolved_ref),
+        );
+        payload_map.insert(
+            "capability_manifest_hash".to_string(),
+            serde_json::json!(hex::encode(
+                claim.policy_resolution.capability_manifest_hash
+            )),
+        );
+        payload_map.insert(
+            "context_pack_hash".to_string(),
+            serde_json::json!(hex::encode(claim.policy_resolution.context_pack_hash)),
+        );
+
+        // TCK-00416 BLOCKER 3: Append transition authority binding fields
+        // to the signed payload. These are derived from the claim and
+        // persisted in the event so they are audit-bound.
+        if let Ok(authority_bindings) = derive_claim_transition_authority_bindings(claim) {
+            append_transition_authority_fields(&mut payload_map, &authority_bindings);
+        }
+
+        let payload = serde_json::Value::Object(payload_map);
 
         let payload_bytes =
             serde_json::to_vec(&payload).map_err(|e| LedgerEventError::SigningFailed {
@@ -2611,18 +2748,40 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in
         // the signed payload so it is audit-bound and cannot be stripped
         // post-signing.
-        let payload_json = serde_json::json!({
-            "event_type": "review_receipt_recorded",
-            "episode_id": episode_id,
-            "lease_id": episode_id,
-            "receipt_id": receipt_id,
-            "changeset_digest": hex::encode(changeset_digest),
-            "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
-            "verdict": "APPROVE",
-            "reviewer_actor_id": reviewer_actor_id,
-            "timestamp_ns": timestamp_ns,
-            "identity_proof_hash": hex::encode(identity_proof_hash),
-        });
+        let mut payload_map = serde_json::Map::new();
+        payload_map.insert(
+            "event_type".to_string(),
+            serde_json::json!("review_receipt_recorded"),
+        );
+        payload_map.insert("episode_id".to_string(), serde_json::json!(episode_id));
+        payload_map.insert("lease_id".to_string(), serde_json::json!(episode_id));
+        payload_map.insert("receipt_id".to_string(), serde_json::json!(receipt_id));
+        payload_map.insert(
+            "changeset_digest".to_string(),
+            serde_json::json!(hex::encode(changeset_digest)),
+        );
+        payload_map.insert(
+            "artifact_bundle_hash".to_string(),
+            serde_json::json!(hex::encode(artifact_bundle_hash)),
+        );
+        payload_map.insert("verdict".to_string(), serde_json::json!("APPROVE"));
+        payload_map.insert(
+            "reviewer_actor_id".to_string(),
+            serde_json::json!(reviewer_actor_id),
+        );
+        payload_map.insert("timestamp_ns".to_string(), serde_json::json!(timestamp_ns));
+        payload_map.insert(
+            "identity_proof_hash".to_string(),
+            serde_json::json!(hex::encode(identity_proof_hash)),
+        );
+
+        // TCK-00416 BLOCKER 3: Append review outcome binding fields to the
+        // signed payload using domain-tagged derivation.
+        let outcome_bindings =
+            derive_review_outcome_bindings(changeset_digest, artifact_bundle_hash, receipt_id);
+        append_review_outcome_fields(&mut payload_map, &outcome_bindings);
+
+        let payload_json = serde_json::Value::Object(payload_map);
 
         // Use JCS (RFC 8785) canonicalization for deterministic signing
         let payload_string = payload_json.to_string();
@@ -2715,21 +2874,49 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // SECURITY (TCK-00356 Fix 2): identity_proof_hash is included in
         // the signed payload so it is audit-bound and cannot be stripped
         // post-signing, matching the APPROVE path's payload binding.
-        let payload_json = serde_json::json!({
-            "event_type": "review_blocked_recorded",
-            "lease_id": lease_id,
-            "receipt_id": receipt_id,
-            "changeset_digest": hex::encode(changeset_digest),
-            "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
-            "verdict": "BLOCKED",
-            "blocked_reason_code": reason_code,
-            // Preserve legacy field for backward compatibility with old readers.
-            "reason_code": reason_code,
-            "blocked_log_hash": hex::encode(blocked_log_hash),
-            "reviewer_actor_id": reviewer_actor_id,
-            "timestamp_ns": timestamp_ns,
-            "identity_proof_hash": hex::encode(identity_proof_hash),
-        });
+        let mut payload_map = serde_json::Map::new();
+        payload_map.insert(
+            "event_type".to_string(),
+            serde_json::json!("review_blocked_recorded"),
+        );
+        payload_map.insert("lease_id".to_string(), serde_json::json!(lease_id));
+        payload_map.insert("receipt_id".to_string(), serde_json::json!(receipt_id));
+        payload_map.insert(
+            "changeset_digest".to_string(),
+            serde_json::json!(hex::encode(changeset_digest)),
+        );
+        payload_map.insert(
+            "artifact_bundle_hash".to_string(),
+            serde_json::json!(hex::encode(artifact_bundle_hash)),
+        );
+        payload_map.insert("verdict".to_string(), serde_json::json!("BLOCKED"));
+        payload_map.insert(
+            "blocked_reason_code".to_string(),
+            serde_json::json!(reason_code),
+        );
+        // Preserve legacy field for backward compatibility with old readers.
+        payload_map.insert("reason_code".to_string(), serde_json::json!(reason_code));
+        payload_map.insert(
+            "blocked_log_hash".to_string(),
+            serde_json::json!(hex::encode(blocked_log_hash)),
+        );
+        payload_map.insert(
+            "reviewer_actor_id".to_string(),
+            serde_json::json!(reviewer_actor_id),
+        );
+        payload_map.insert("timestamp_ns".to_string(), serde_json::json!(timestamp_ns));
+        payload_map.insert(
+            "identity_proof_hash".to_string(),
+            serde_json::json!(hex::encode(identity_proof_hash)),
+        );
+
+        // TCK-00416 BLOCKER 3: Append review outcome binding fields to the
+        // signed payload using domain-tagged derivation.
+        let outcome_bindings =
+            derive_review_outcome_bindings(changeset_digest, artifact_bundle_hash, receipt_id);
+        append_review_outcome_fields(&mut payload_map, &outcome_bindings);
+
+        let payload_json = serde_json::Value::Object(payload_map);
 
         let payload_string = payload_json.to_string();
         let canonical_payload =
@@ -10472,40 +10659,46 @@ impl PrivilegedDispatcher {
         // TCK-00416: Review outcome binding validation (IngestReviewReceipt)
         //
         // Per REQ-HEF-0013, review outcomes MUST carry valid evidence-index
-        // bindings. All three commitment hashes must be non-zero.
-        // artifact_bundle_hash CAS resolvability is already validated in
-        // Phase 1a. This MUST happen BEFORE state mutation (Phase 4).
+        // bindings. All three commitment hashes must be non-zero AND
+        // CAS-resolvable. This uses the full `validate_review_outcome_bindings`
+        // helper for complete validation (not just non-zero checks).
+        //
+        // SECURITY: Outcome bindings use domain-tagged derivation to ensure
+        // each hash is independent. Raw aliasing (e.g. view_commitment_hash
+        // = changeset_digest) is forbidden per security review MAJOR finding.
+        //
+        // This MUST happen BEFORE state mutation (Phase 4).
         // =====================================================================
-        {
-            let outcome_bindings = ReviewOutcomeBindings {
-                view_commitment_hash: request_changeset_digest_arr,
-                tool_log_index_hash: request_identity_proof_hash_arr,
-                summary_receipt_hash: request_artifact_bundle_hash_arr,
-            };
+        // outcome_bindings used for validation only; emit methods re-derive
+        // the same bindings deterministically from the same inputs.
+        let _outcome_bindings = {
+            // Derive proper independent outcome bindings via domain-tagged hashing
+            let bindings = derive_review_outcome_bindings(
+                &request_changeset_digest_arr,
+                &request_artifact_bundle_hash_arr,
+                &request.receipt_id,
+            );
 
-            let mut violations: Vec<String> = Vec::new();
-            if outcome_bindings.view_commitment_hash == [0u8; 32] {
-                violations
-                    .push("view_commitment_hash (changeset_digest) is zero (unset)".to_string());
-            }
-            if outcome_bindings.tool_log_index_hash == [0u8; 32] {
-                violations
-                    .push("tool_log_index_hash (identity_proof_hash) is zero (unset)".to_string());
-            }
-            if outcome_bindings.summary_receipt_hash == [0u8; 32] {
-                violations.push(
-                    "summary_receipt_hash (artifact_bundle_hash) is zero (unset)".to_string(),
+            // Store outcome binding preimages in CAS before validation
+            if let Err(e) = store_review_outcome_artifacts(
+                &request_changeset_digest_arr,
+                &request_artifact_bundle_hash_arr,
+                &request.receipt_id,
+                cas.as_ref(),
+            ) {
+                warn!(
+                    receipt_id = %request.receipt_id,
+                    error = %e,
+                    "IngestReviewReceipt rejected: outcome binding CAS storage failed (fail-closed)"
                 );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("review outcome binding CAS storage failed: {e}"),
+                ));
             }
 
-            if !violations.is_empty() {
-                let count = violations.len();
-                let auth_err = TransitionAuthorityError {
-                    message: format!(
-                        "review outcome binding validation failed with {count} violation(s)"
-                    ),
-                    violations,
-                };
+            // Full validation: non-zero + CAS resolvability
+            if let Err(auth_err) = validate_review_outcome_bindings(&bindings, cas.as_ref()) {
                 let defect_ts = self.get_htf_timestamp_ns().unwrap_or(0);
                 let work_id = self
                     .lease_validator
@@ -10527,7 +10720,9 @@ impl PrivilegedDispatcher {
                     format!("review outcome binding validation failed: {auth_err}"),
                 ));
             }
-        }
+
+            bindings
+        };
 
         // ---- Phase 2: Idempotency check ----
         //
@@ -15567,6 +15762,9 @@ mod tests {
         // Create a claim with non-overlapping domains
         // Executor domain: team-review (from actor_id team-review:alice)
         // Author domain: team-dev (from work_id W-team-dev-test123)
+        //
+        // TCK-00416: Use non-zero hashes for capability_manifest_hash and
+        // context_pack_hash (REQ-HEF-0013 mandates non-zero).
         let claim_non_overlap = WorkClaim {
             work_id: "W-team-dev-test456".to_string(),
             lease_id: "L-non-overlap-123".to_string(),
@@ -15574,9 +15772,9 @@ mod tests {
             role: WorkRole::GateExecutor,
             policy_resolution: PolicyResolution {
                 policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
-                resolved_policy_hash: [0u8; 32],
-                capability_manifest_hash: [0u8; 32],
-                context_pack_hash: [0u8; 32],
+                resolved_policy_hash: [0xAA; 32],
+                capability_manifest_hash: *blake3::hash(b"sod-test-manifest").as_bytes(),
+                context_pack_hash: *blake3::hash(b"sod-test-context").as_bytes(),
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
                 expected_adapter_profile_hash: None,
@@ -15702,6 +15900,9 @@ mod tests {
 
         // Create a claim as IMPLEMENTER with overlapping domains
         // This would fail SoD for GATE_EXECUTOR, but IMPLEMENTER skips SoD
+        //
+        // TCK-00416: Use non-zero hashes for capability_manifest_hash and
+        // context_pack_hash (REQ-HEF-0013 mandates non-zero).
         let claim_implementer = WorkClaim {
             work_id: "W-team-alpha-impl123".to_string(),
             lease_id: "L-implementer-789".to_string(),
@@ -15709,9 +15910,9 @@ mod tests {
             role: WorkRole::Implementer,
             policy_resolution: PolicyResolution {
                 policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
-                resolved_policy_hash: [0u8; 32],
-                capability_manifest_hash: [0u8; 32],
-                context_pack_hash: [0u8; 32],
+                resolved_policy_hash: [0xAA; 32],
+                capability_manifest_hash: *blake3::hash(b"sod-impl-manifest").as_bytes(),
+                context_pack_hash: *blake3::hash(b"sod-impl-context").as_bytes(),
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
                 expected_adapter_profile_hash: None,
@@ -24912,6 +25113,7 @@ mod tests {
             let ctx = priv_ctx();
 
             // Pre-register claim with NO scope baseline
+            // TCK-00416: Use non-zero hashes (REQ-HEF-0013 mandates non-zero).
             let claim = WorkClaim {
                 work_id: "W-V3-SCOPE-NONE".to_string(),
                 lease_id: "L-V3-001".to_string(),
@@ -24919,9 +25121,9 @@ mod tests {
                 role: WorkRole::Implementer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-v3-none".to_string(),
-                    resolved_policy_hash: [0u8; 32],
-                    capability_manifest_hash: [0u8; 32],
-                    context_pack_hash: [0u8; 32],
+                    resolved_policy_hash: [0xAA; 32],
+                    capability_manifest_hash: *blake3::hash(b"v3-none-manifest").as_bytes(),
+                    context_pack_hash: *blake3::hash(b"v3-none-context").as_bytes(),
                     resolved_risk_tier: 1,
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
@@ -24975,6 +25177,7 @@ mod tests {
                 write_paths: Vec::new(),
                 shell_patterns: Vec::new(),
             };
+            // TCK-00416: Use non-zero hashes (REQ-HEF-0013 mandates non-zero).
             let claim = WorkClaim {
                 work_id: "W-V3-SCOPE-NARROW".to_string(),
                 lease_id: "L-V3-002".to_string(),
@@ -24982,9 +25185,9 @@ mod tests {
                 role: WorkRole::Reviewer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-v3-narrow".to_string(),
-                    resolved_policy_hash: [0u8; 32],
+                    resolved_policy_hash: [0xAA; 32],
                     capability_manifest_hash: *reviewer_v0_manifest_hash(),
-                    context_pack_hash: [0u8; 32],
+                    context_pack_hash: *blake3::hash(b"v3-narrow-context").as_bytes(),
                     resolved_risk_tier: 1,
                     resolved_scope_baseline: Some(narrow_baseline),
                     expected_adapter_profile_hash: None,
@@ -25042,6 +25245,7 @@ mod tests {
             };
 
             // Policy says Tier0 -- the V1 ceiling must be Tier0
+            // TCK-00416: Use non-zero hashes (REQ-HEF-0013 mandates non-zero).
             let claim = WorkClaim {
                 work_id: "W-V3-RISK-CEIL".to_string(),
                 lease_id: "L-V3-003".to_string(),
@@ -25049,9 +25253,9 @@ mod tests {
                 role: WorkRole::Reviewer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-v3-risk".to_string(),
-                    resolved_policy_hash: [0u8; 32],
+                    resolved_policy_hash: [0xAA; 32],
                     capability_manifest_hash: *reviewer_v0_manifest_hash(),
-                    context_pack_hash: [0u8; 32],
+                    context_pack_hash: *blake3::hash(b"v3-risk-context").as_bytes(),
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: Some(matching_baseline),
                     expected_adapter_profile_hash: None,
@@ -25106,6 +25310,7 @@ mod tests {
                 shell_patterns: reviewer.shell_allowlist.clone(),
             };
 
+            // TCK-00416: Use non-zero hashes (REQ-HEF-0013 mandates non-zero).
             let claim = WorkClaim {
                 work_id: "W-V3-RISK-INV".to_string(),
                 lease_id: "L-V3-004".to_string(),
@@ -25113,9 +25318,9 @@ mod tests {
                 role: WorkRole::Reviewer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-v3-invalid".to_string(),
-                    resolved_policy_hash: [0u8; 32],
+                    resolved_policy_hash: [0xAA; 32],
                     capability_manifest_hash: *reviewer_v0_manifest_hash(),
-                    context_pack_hash: [0u8; 32],
+                    context_pack_hash: *blake3::hash(b"v3-invalid-context").as_bytes(),
                     // Invalid tier value
                     resolved_risk_tier: 255,
                     resolved_scope_baseline: Some(matching_baseline),

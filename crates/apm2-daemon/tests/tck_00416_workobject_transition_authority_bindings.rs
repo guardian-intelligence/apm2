@@ -24,8 +24,10 @@ use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
 use apm2_daemon::episode::envelope::StopConditions;
 use apm2_daemon::protocol::dispatch::{
     PolicyResolution, ReviewOutcomeBindings, TransitionAuthorityBindings, TypedBudgetBindings,
-    WorkClaim, derive_claim_transition_authority_bindings, derive_transition_authority_bindings,
-    store_authority_binding_artifacts, typed_budgets_for_role, validate_review_outcome_bindings,
+    WorkClaim, derive_claim_transition_authority_bindings, derive_review_outcome_bindings,
+    derive_transition_authority_bindings, store_authority_binding_artifacts,
+    store_review_outcome_artifacts, typed_budgets_for_role,
+    validate_and_store_transition_authority, validate_review_outcome_bindings,
     validate_transition_authority_bindings,
 };
 use apm2_daemon::protocol::messages::WorkRole;
@@ -900,5 +902,403 @@ fn test_outcome_bindings_serde_round_trip() {
     assert_eq!(
         bindings, deserialized,
         "serde round-trip must preserve all outcome binding fields"
+    );
+}
+
+// ============================================================================
+// Round 2: BLOCKER 1 - validate_and_store_transition_authority enforces
+// non-zero capability_manifest_hash and context_pack_hash
+// ============================================================================
+
+/// IT-00416-31: `validate_and_store_transition_authority` rejects zero
+/// `capability_manifest_hash`.
+#[test]
+fn test_validate_and_store_rejects_zero_capability_manifest_hash() {
+    let work_id = "W-416-STORE-NOCAP";
+    let mut bindings = valid_bindings(work_id);
+    let cas = cas_with_stored_bindings(work_id, &valid_bindings(work_id));
+
+    bindings.capability_manifest_hash = [0u8; 32];
+
+    let result = validate_and_store_transition_authority(work_id, &bindings, cas.as_ref());
+    assert!(
+        result.is_err(),
+        "zero capability_manifest_hash must be rejected by validate_and_store_transition_authority"
+    );
+
+    let err = result.unwrap_err();
+    assert!(
+        err.violations
+            .iter()
+            .any(|v| v.contains("capability_manifest_hash")),
+        "violation must mention capability_manifest_hash: {err:?}"
+    );
+}
+
+/// IT-00416-32: `validate_and_store_transition_authority` rejects zero
+/// `context_pack_hash`.
+#[test]
+fn test_validate_and_store_rejects_zero_context_pack_hash() {
+    let work_id = "W-416-STORE-NOCTX";
+    let mut bindings = valid_bindings(work_id);
+    let cas = cas_with_stored_bindings(work_id, &valid_bindings(work_id));
+
+    bindings.context_pack_hash = [0u8; 32];
+
+    let result = validate_and_store_transition_authority(work_id, &bindings, cas.as_ref());
+    assert!(
+        result.is_err(),
+        "zero context_pack_hash must be rejected by validate_and_store_transition_authority"
+    );
+
+    let err = result.unwrap_err();
+    assert!(
+        err.violations
+            .iter()
+            .any(|v| v.contains("context_pack_hash")),
+        "violation must mention context_pack_hash: {err:?}"
+    );
+}
+
+/// IT-00416-33: `validate_and_store_transition_authority` passes with valid
+/// bindings (including non-zero capability_manifest_hash and
+/// context_pack_hash).
+#[test]
+fn test_validate_and_store_passes_with_valid_bindings() {
+    let work_id = "W-416-STORE-VALID";
+    let bindings = valid_bindings(work_id);
+    let cas = cas_with_stored_bindings(work_id, &bindings);
+
+    let result = validate_and_store_transition_authority(work_id, &bindings, cas.as_ref());
+    assert!(
+        result.is_ok(),
+        "valid bindings must pass validate_and_store_transition_authority, got: {result:?}"
+    );
+}
+
+// ============================================================================
+// Round 2: BLOCKER 2 + MAJOR - domain-tagged outcome binding derivation
+// ============================================================================
+
+/// IT-00416-34: `derive_review_outcome_bindings` produces three non-zero
+/// independent hashes.
+#[test]
+fn test_derive_review_outcome_bindings_nonzero() {
+    let changeset_digest = [0xAA; 32];
+    let artifact_bundle_hash = [0xBB; 32];
+    let receipt_id = "receipt-test-001";
+
+    let bindings =
+        derive_review_outcome_bindings(&changeset_digest, &artifact_bundle_hash, receipt_id);
+
+    assert_ne!(
+        bindings.view_commitment_hash, [0u8; 32],
+        "view_commitment_hash must be non-zero"
+    );
+    assert_ne!(
+        bindings.tool_log_index_hash, [0u8; 32],
+        "tool_log_index_hash must be non-zero"
+    );
+    assert_ne!(
+        bindings.summary_receipt_hash, [0u8; 32],
+        "summary_receipt_hash must be non-zero"
+    );
+}
+
+/// IT-00416-35: `derive_review_outcome_bindings` produces independent hashes
+/// (no two are the same, no raw aliasing).
+#[test]
+fn test_derive_review_outcome_bindings_independent() {
+    let changeset_digest = [0xAA; 32];
+    let artifact_bundle_hash = [0xBB; 32];
+    let receipt_id = "receipt-test-002";
+
+    let bindings =
+        derive_review_outcome_bindings(&changeset_digest, &artifact_bundle_hash, receipt_id);
+
+    // All three hashes must be distinct (no aliasing)
+    assert_ne!(
+        bindings.view_commitment_hash, bindings.tool_log_index_hash,
+        "view_commitment_hash and tool_log_index_hash must be independent"
+    );
+    assert_ne!(
+        bindings.view_commitment_hash, bindings.summary_receipt_hash,
+        "view_commitment_hash and summary_receipt_hash must be independent"
+    );
+    assert_ne!(
+        bindings.tool_log_index_hash, bindings.summary_receipt_hash,
+        "tool_log_index_hash and summary_receipt_hash must be independent"
+    );
+
+    // None should be raw changeset_digest
+    assert_ne!(
+        bindings.view_commitment_hash, changeset_digest,
+        "view_commitment_hash must NOT be raw changeset_digest (MAJOR fix)"
+    );
+
+    // None should be raw artifact_bundle_hash
+    assert_ne!(
+        bindings.summary_receipt_hash, artifact_bundle_hash,
+        "summary_receipt_hash must NOT be raw artifact_bundle_hash (MAJOR fix)"
+    );
+}
+
+/// IT-00416-36: `derive_review_outcome_bindings` is deterministic.
+#[test]
+fn test_derive_review_outcome_bindings_deterministic() {
+    let changeset_digest = [0xCC; 32];
+    let artifact_bundle_hash = [0xDD; 32];
+    let receipt_id = "receipt-det-001";
+
+    let a = derive_review_outcome_bindings(&changeset_digest, &artifact_bundle_hash, receipt_id);
+    let b = derive_review_outcome_bindings(&changeset_digest, &artifact_bundle_hash, receipt_id);
+
+    assert_eq!(a, b, "same inputs must produce identical outcome bindings");
+}
+
+/// IT-00416-37: `store_review_outcome_artifacts` enables CAS resolution for
+/// derived outcome bindings.
+#[test]
+fn test_store_review_outcome_artifacts_enables_cas_resolution() {
+    let changeset_digest = [0xEE; 32];
+    let artifact_bundle_hash = [0xFF; 32];
+    let receipt_id = "receipt-cas-001";
+
+    let cas = Arc::new(MemoryCas::new());
+    store_review_outcome_artifacts(
+        &changeset_digest,
+        &artifact_bundle_hash,
+        receipt_id,
+        cas.as_ref(),
+    )
+    .expect("CAS store should succeed");
+
+    let bindings =
+        derive_review_outcome_bindings(&changeset_digest, &artifact_bundle_hash, receipt_id);
+
+    // All three derived hashes must now be CAS-resolvable
+    assert!(
+        cas.exists(&bindings.view_commitment_hash)
+            .expect("CAS exists"),
+        "view_commitment_hash must be CAS-resolvable after store"
+    );
+    assert!(
+        cas.exists(&bindings.tool_log_index_hash)
+            .expect("CAS exists"),
+        "tool_log_index_hash must be CAS-resolvable after store"
+    );
+    assert!(
+        cas.exists(&bindings.summary_receipt_hash)
+            .expect("CAS exists"),
+        "summary_receipt_hash must be CAS-resolvable after store"
+    );
+
+    // Full validation must pass
+    let result = validate_review_outcome_bindings(&bindings, cas.as_ref());
+    assert!(
+        result.is_ok(),
+        "derived + stored outcome bindings must pass full validation, got: {result:?}"
+    );
+}
+
+// ============================================================================
+// Round 2: BLOCKER 3 - authority fields persisted in signed event payloads
+// ============================================================================
+
+/// IT-00416-38: `emit_work_claimed` includes transition authority binding
+/// fields in the signed event payload.
+#[test]
+fn test_emit_work_claimed_includes_authority_fields() {
+    use apm2_daemon::protocol::dispatch::{LedgerEventEmitter, StubLedgerEventEmitter};
+
+    let cap_hash = *blake3::hash(b"capability-manifest-content").as_bytes();
+    let ctx_hash = *blake3::hash(b"context-pack-content").as_bytes();
+
+    let claim = WorkClaim {
+        work_id: "W-416-EMIT-CLAIM".to_string(),
+        lease_id: "lease-emit-001".to_string(),
+        actor_id: "actor:emit-test".to_string(),
+        role: WorkRole::Implementer,
+        policy_resolution: PolicyResolution {
+            policy_resolved_ref: "policy-emit-001".to_string(),
+            resolved_policy_hash: [0xAA; 32],
+            capability_manifest_hash: cap_hash,
+            context_pack_hash: ctx_hash,
+            resolved_risk_tier: 1,
+            resolved_scope_baseline: None,
+            expected_adapter_profile_hash: None,
+        },
+        executor_custody_domains: vec![],
+        author_custody_domains: vec![],
+    };
+
+    let emitter = StubLedgerEventEmitter::new();
+    let event = emitter
+        .emit_work_claimed(&claim, 1_000_000)
+        .expect("emit_work_claimed should succeed");
+
+    // Parse the payload and verify authority binding fields are present
+    let payload_str = std::str::from_utf8(&event.payload).expect("payload should be valid UTF-8");
+    let payload_json: serde_json::Value =
+        serde_json::from_str(payload_str).expect("payload should be valid JSON");
+
+    let required_authority_fields = [
+        "lease_id",
+        "permeability_receipt_hash",
+        "capability_manifest_hash",
+        "context_pack_hash",
+        "stop_condition_hash",
+        "typed_budgets",
+        "typed_budget_hash",
+        "policy_resolved_ref",
+    ];
+
+    for field in &required_authority_fields {
+        assert!(
+            payload_json.get(field).is_some(),
+            "signed event payload must contain authority field '{field}' \
+             (TCK-00416 BLOCKER 3). Payload: {payload_str}"
+        );
+    }
+}
+
+/// IT-00416-39: `emit_review_receipt` includes review outcome binding
+/// fields in the signed event payload.
+#[test]
+fn test_emit_review_receipt_includes_outcome_fields() {
+    use apm2_daemon::protocol::dispatch::{LedgerEventEmitter, StubLedgerEventEmitter};
+
+    let changeset_digest = [0x11; 32];
+    let artifact_bundle_hash = [0x22; 32];
+    let identity_proof_hash = [0x33; 32];
+    let receipt_id = "receipt-emit-001";
+
+    let emitter = StubLedgerEventEmitter::new();
+    let event = emitter
+        .emit_review_receipt(
+            "episode-001",
+            receipt_id,
+            &changeset_digest,
+            &artifact_bundle_hash,
+            "actor:reviewer",
+            2_000_000,
+            &identity_proof_hash,
+        )
+        .expect("emit_review_receipt should succeed");
+
+    // Parse the payload and verify outcome binding fields are present
+    let payload_str = std::str::from_utf8(&event.payload).expect("payload should be valid UTF-8");
+    let payload_json: serde_json::Value =
+        serde_json::from_str(payload_str).expect("payload should be valid JSON");
+
+    let required_outcome_fields = [
+        "view_commitment_hash",
+        "tool_log_index_hash",
+        "summary_receipt_hash",
+    ];
+
+    for field in &required_outcome_fields {
+        assert!(
+            payload_json.get(field).is_some(),
+            "signed review receipt payload must contain outcome field '{field}' \
+             (TCK-00416 BLOCKER 3). Payload: {payload_str}"
+        );
+    }
+
+    // Verify outcome fields are non-zero hex strings (not aliased to raw source
+    // fields)
+    let view_hash = payload_json["view_commitment_hash"]
+        .as_str()
+        .expect("view_commitment_hash must be a string");
+    let changeset_hex = hex::encode(changeset_digest);
+    assert_ne!(
+        view_hash, changeset_hex,
+        "view_commitment_hash must NOT be raw changeset_digest (MAJOR aliasing fix)"
+    );
+}
+
+/// IT-00416-40: `emit_review_blocked_receipt` includes review outcome binding
+/// fields in the signed event payload.
+#[test]
+fn test_emit_review_blocked_receipt_includes_outcome_fields() {
+    use apm2_daemon::protocol::dispatch::{LedgerEventEmitter, StubLedgerEventEmitter};
+
+    let changeset_digest = [0x44; 32];
+    let artifact_bundle_hash = [0x55; 32];
+    let blocked_log_hash = [0x66; 32];
+    let identity_proof_hash = [0x77; 32];
+    let receipt_id = "receipt-blocked-001";
+
+    let emitter = StubLedgerEventEmitter::new();
+    let event = emitter
+        .emit_review_blocked_receipt(
+            "lease-blocked-001",
+            receipt_id,
+            &changeset_digest,
+            &artifact_bundle_hash,
+            1, // reason_code
+            &blocked_log_hash,
+            "actor:reviewer",
+            3_000_000,
+            &identity_proof_hash,
+        )
+        .expect("emit_review_blocked_receipt should succeed");
+
+    // Parse the payload and verify outcome binding fields are present
+    let payload_str = std::str::from_utf8(&event.payload).expect("payload should be valid UTF-8");
+    let payload_json: serde_json::Value =
+        serde_json::from_str(payload_str).expect("payload should be valid JSON");
+
+    let required_outcome_fields = [
+        "view_commitment_hash",
+        "tool_log_index_hash",
+        "summary_receipt_hash",
+    ];
+
+    for field in &required_outcome_fields {
+        assert!(
+            payload_json.get(field).is_some(),
+            "signed blocked receipt payload must contain outcome field '{field}' \
+             (TCK-00416 BLOCKER 3). Payload: {payload_str}"
+        );
+    }
+}
+
+/// IT-00416-41: `validate_and_store_transition_authority` enforces non-zero
+/// for capability_manifest_hash and context_pack_hash. CAS resolvability for
+/// these policy-provided fields is delegated to the governance CAS seeding
+/// pipeline, but the standalone `validate_transition_authority_bindings`
+/// does check CAS resolvability for all hashes.
+#[test]
+fn test_standalone_validator_checks_cas_for_manifest_and_context() {
+    let work_id = "W-416-CAS-CHECK";
+    let bindings = valid_bindings(work_id);
+
+    // Create CAS with only the self-derived artifacts (permeability, stop, budget)
+    // but NOT the policy-provided ones (manifest, context).
+    let cas = Arc::new(MemoryCas::new());
+    store_authority_binding_artifacts(work_id, &bindings, cas.as_ref())
+        .expect("self-derived CAS store should succeed");
+
+    // The standalone validator (not handler-level) checks CAS resolvability
+    // for ALL hashes including policy-provided ones.
+    let result = validate_transition_authority_bindings(&bindings, cas.as_ref());
+    assert!(
+        result.is_err(),
+        "missing manifest/context CAS artifacts must be rejected by standalone validator"
+    );
+
+    let err = result.unwrap_err();
+    assert!(
+        err.violations
+            .iter()
+            .any(|v| v.contains("capability_manifest_hash") && v.contains("not resolvable")),
+        "violation must mention capability_manifest_hash CAS resolvability: {err:?}"
+    );
+    assert!(
+        err.violations
+            .iter()
+            .any(|v| v.contains("context_pack_hash") && v.contains("not resolvable")),
+        "violation must mention context_pack_hash CAS resolvability: {err:?}"
     );
 }
