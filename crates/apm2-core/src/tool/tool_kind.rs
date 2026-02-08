@@ -459,6 +459,39 @@ impl GitOpKind {
         }
     }
 
+    /// Returns `true` if this operation accepts ref-like positional arguments
+    /// that should be validated with [`validate_git_ref`].
+    ///
+    /// Operations like `checkout`, `merge`, `branch`, `push`, `pull`, `fetch`,
+    /// `rebase`, `tag`, `reset`, `show`, and `clone` accept branch/tag/ref
+    /// arguments. Read-only operations like `diff`, `log`, `status`, and `add`
+    /// accept pathspecs or revision ranges that may contain characters
+    /// forbidden in strict ref validation (e.g., `~`, `^`), so they are
+    /// excluded.
+    #[must_use]
+    pub const fn accepts_ref_args(&self) -> bool {
+        match self {
+            Self::Checkout
+            | Self::Merge
+            | Self::Branch
+            | Self::Push
+            | Self::Pull
+            | Self::Fetch
+            | Self::Rebase
+            | Self::Tag
+            | Self::Reset
+            | Self::Clone
+            | Self::Remote => true,
+            Self::Diff
+            | Self::Log
+            | Self::Status
+            | Self::Show
+            | Self::Add
+            | Self::Commit
+            | Self::Stash => false,
+        }
+    }
+
     /// Returns the canonical operation name.
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
@@ -640,6 +673,15 @@ pub fn validate_git_arg(arg: &str, index: usize) -> Result<ValidatedArg, ToolKin
 /// Per RFC-0020 Section 6.1.2, side-effectful `ToolKinds` must support
 /// precondition guards. If a precondition fails, the tool returns a
 /// denial/failure receipt without partial execution.
+///
+/// # Runtime Enforcement
+///
+/// TODO(TCK-runtime-integration): Precondition enforcement is declared here
+/// but deferred to the runtime integration ticket. The runtime evaluator
+/// must check each precondition variant (e.g., `FileHashMatch` by reading
+/// current file content, `GitRefAtCommit` by resolving the ref) **before**
+/// executing the side-effectful operation. Until that integration is
+/// complete, preconditions are informational only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum IdempotencyPrecondition {
@@ -805,9 +847,13 @@ impl ShellBridgePolicy {
     /// Returns [`ToolKindError::RawShellRejected`] if the command is not
     /// permitted.
     pub fn check(&self, executable: &str, is_tier2_plus: bool) -> Result<(), ToolKindError> {
-        if is_tier2_plus && !self.tier2_plus_allowed {
+        // Tier2+ shell execution is unconditionally denied regardless of the
+        // `tier2_plus_allowed` policy flag. Per CQ review: authoritative-route
+        // raw shell denial must be unconditional for Tier2+. The policy flag
+        // only governs Tier0-1 routes.
+        if is_tier2_plus {
             return Err(ToolKindError::RawShellRejected {
-                reason: "shell execution is not permitted on Tier2+ routes".to_string(),
+                reason: "shell execution is unconditionally denied on Tier2+ routes".to_string(),
             });
         }
 
@@ -850,23 +896,39 @@ impl Default for ShellBridgePolicy {
 ///
 /// # Security
 ///
-/// This is a best-effort parse for the shell bridge policy check. The actual
-/// execution still happens through the shell, so the allowlist is
-/// defense-in-depth.
-fn parse_shell_command(command: &str) -> Option<(&str, Vec<&str>)> {
+/// Path-qualified executables (e.g., `/usr/bin/cargo`, `./cargo`) are
+/// rejected to prevent basename-collapsing bypass attacks where an
+/// adversary uses a path-qualified binary that resolves to a different
+/// file than the allowlisted basename. Only bare executable names are
+/// accepted for authoritative route enforcement.
+fn parse_shell_command(command: &str) -> Result<(&str, Vec<&str>), ToolKindError> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
-        return None;
+        return Err(ToolKindError::RawShellRejected {
+            reason: "empty command string".to_string(),
+        });
     }
 
     let mut parts = trimmed.split_whitespace();
-    let executable = parts.next()?;
+    let executable = parts
+        .next()
+        .ok_or_else(|| ToolKindError::RawShellRejected {
+            reason: "empty command string".to_string(),
+        })?;
 
-    // Extract basename from path
-    let basename = executable.rsplit('/').next().unwrap_or(executable);
-    let basename = basename.rsplit('\\').next().unwrap_or(basename);
+    // Reject path-qualified executables: only bare basenames are allowed.
+    // This prevents basename-collapsing bypass attacks where e.g.
+    // `/tmp/cargo` or `./cargo` would match an allowlisted "cargo" entry.
+    if executable.contains('/') || executable.contains('\\') {
+        return Err(ToolKindError::RawShellRejected {
+            reason: format!(
+                "path-qualified executable '{executable}' is not permitted; \
+                 use bare executable name only"
+            ),
+        });
+    }
 
-    Some((basename, parts.collect()))
+    Ok((executable, parts.collect()))
 }
 
 /// Convert a proto-level `tool_request::Tool` into a typed [`ToolKind`].
@@ -905,6 +967,16 @@ fn from_file_write(req: &FileWrite) -> Result<ToolKind, ToolKindError> {
     let path = ValidatedPath::new(&req.path)?;
     let content_hash = blake3::hash(&req.content).into();
 
+    // Defense-in-depth: reject contradictory flags at the typed conversion
+    // layer. The structural validator in validation.rs also checks this,
+    // but typed constructors must enforce their own invariants to prevent
+    // bypass if called from alternate entry points.
+    if req.create_only && req.append {
+        return Err(ToolKindError::PreconditionFailed {
+            reason: "create_only and append are mutually exclusive".to_string(),
+        });
+    }
+
     let precondition = if req.create_only {
         Some(IdempotencyPrecondition::FileNotExists)
     } else if req.append {
@@ -939,11 +1011,30 @@ fn from_git_op(req: &GitOperation) -> Result<ToolKind, ToolKindError> {
     let operation = GitOpKind::parse(&req.operation)?;
 
     let mut args = Vec::with_capacity(req.args.len());
+    let mut past_double_dash = false;
     for (i, arg) in req.args.iter().enumerate() {
         // All git args are validated for shell metacharacter injection.
         // The same validation applies regardless of whether the arg is a
         // flag or a ref-like positional argument.
         let validated = validate_git_arg(arg, i)?;
+
+        // Track `--` separator: arguments after `--` are pathspecs, not refs.
+        if arg == "--" {
+            past_double_dash = true;
+        }
+
+        // Apply git ref validation to non-flag, non-pathspec positional
+        // arguments for ref-accepting operations. Arguments starting with
+        // `-` are flags. Arguments after `--` are pathspecs. Everything
+        // else is a potential ref name that must be validated.
+        if !past_double_dash
+            && !arg.starts_with('-')
+            && !arg.is_empty()
+            && operation.accepts_ref_args()
+        {
+            validate_git_ref(arg)?;
+        }
+
         args.push(validated);
     }
 
@@ -961,10 +1052,22 @@ fn from_git_op(req: &GitOperation) -> Result<ToolKind, ToolKindError> {
 }
 
 fn from_shell_exec(req: &ShellExec) -> Result<ToolKind, ToolKindError> {
-    let (executable, args) =
-        parse_shell_command(&req.command).ok_or_else(|| ToolKindError::RawShellRejected {
-            reason: "empty command string".to_string(),
-        })?;
+    let (executable, args) = parse_shell_command(&req.command)?;
+
+    // Reject shell metacharacters in the raw command string. The typed
+    // ToolKind path splits commands into executable + args, so compound
+    // commands (pipes, chaining, subshells) are not representable. Reject
+    // them at conversion time to prevent bypass via raw `sh -c` execution.
+    for ch in SHELL_METACHARACTERS {
+        if req.command.contains(*ch) {
+            return Err(ToolKindError::RawShellRejected {
+                reason: format!(
+                    "shell metacharacter '{ch}' is not permitted in typed ShellExec commands; \
+                     use structured arguments instead of compound shell expressions"
+                ),
+            });
+        }
+    }
 
     let cwd = if req.cwd.is_empty() {
         None
@@ -984,6 +1087,46 @@ fn from_shell_exec(req: &ShellExec) -> Result<ToolKind, ToolKindError> {
 // Authoritative Route Guard
 // =============================================================================
 
+/// Shell metacharacters that MUST be rejected in raw command strings to
+/// prevent allowlist bypass via compound shell expressions.
+///
+/// This is the deny-list checked by [`reject_shell_metacharacters`].
+/// It is intentionally a superset of `SHELL_METACHARACTERS` with the same
+/// entries, but defined as a public constant so downstream callers can
+/// reference it in documentation and policy specifications.
+pub const SHELL_METACHAR_DENY_LIST: &[char] = &[
+    '|', '&', ';', '$', '`', '(', ')', '{', '}', '<', '>', '!', '\n', '\r', '\0',
+];
+
+/// Reject a raw command string that contains shell metacharacters.
+///
+/// This is a fail-closed guard that prevents shell injection in raw
+/// command strings. It is used by [`guard_authoritative_route`] to
+/// prevent allowlist bypass via compound commands like:
+///
+/// - `allowed_cmd ; rm -rf /`
+/// - `allowed_cmd && malicious_cmd`
+/// - `allowed_cmd | evil`
+/// - `echo $(whoami)`
+/// - `` echo `whoami` ``
+///
+/// # Errors
+///
+/// Returns [`ToolKindError::RawShellRejected`] if any metacharacter is found.
+pub fn reject_shell_metacharacters(command: &str) -> Result<(), ToolKindError> {
+    for ch in SHELL_METACHAR_DENY_LIST {
+        if command.contains(*ch) {
+            return Err(ToolKindError::RawShellRejected {
+                reason: format!(
+                    "shell metacharacter '{ch}' is forbidden in command strings; \
+                     compound shell expressions are not permitted on authoritative routes"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Reject raw shell command strings on authoritative (Tier2+) routes.
 ///
 /// Per RFC-0020 CTR-0008:
@@ -1001,15 +1144,80 @@ pub fn guard_authoritative_route(
     policy: &ShellBridgePolicy,
     is_tier2_plus: bool,
 ) -> Result<(), ToolKindError> {
-    if let tool_request::Tool::ShellExec(req) = tool {
-        let (executable, _args) =
-            parse_shell_command(&req.command).ok_or_else(|| ToolKindError::RawShellRejected {
-                reason: "empty command string".to_string(),
-            })?;
+    // For ToolKind-covered variants, run full typed validation (which
+    // includes metacharacter rejection, path traversal, git ref safety).
+    // This ensures the authoritative route enforces typed validation
+    // before any policy/execution decision.
+    match tool {
+        tool_request::Tool::ShellExec(req) => {
+            // Reject shell metacharacters in the raw command string BEFORE
+            // checking the allowlist. This prevents allowlist bypass via
+            // compound commands like `allowed_cmd ; malicious_cmd` where
+            // only the first token passes the allowlist check.
+            reject_shell_metacharacters(&req.command)?;
 
-        policy.check(executable, is_tier2_plus)?;
+            let (executable, _args) = parse_shell_command(&req.command)?;
+
+            // Tier2+ raw shell denial is unconditional — the
+            // `tier2_plus_allowed` policy flag only governs Tier0-1.
+            if is_tier2_plus {
+                return Err(ToolKindError::RawShellRejected {
+                    reason: "raw shell execution is unconditionally denied on \
+                             Tier2+ authoritative routes"
+                        .to_string(),
+                });
+            }
+
+            policy.check(executable, is_tier2_plus)?;
+        },
+        tool_request::Tool::FileRead(_)
+        | tool_request::Tool::FileWrite(_)
+        | tool_request::Tool::FileEdit(_)
+        | tool_request::Tool::GitOp(_) => {
+            // Run typed validation for non-shell ToolKind variants.
+            // Conversion failures are security rejections.
+            tool_kind_from_proto(tool)?;
+        },
+        // Other tool types (Inference, Artifact, ListFiles, Search) are
+        // not in scope for ToolKind-level typed hardening.
+        _ => {},
     }
 
+    Ok(())
+}
+
+/// Guard a raw shell command string for authoritative route safety.
+///
+/// This is a convenience function for call sites that have only a command
+/// string (e.g., the broker's `BrokerToolRequest::shell_command`) rather
+/// than the full proto `tool_request::Tool`.  It performs the same checks
+/// as [`guard_authoritative_route`] for the `ShellExec` variant:
+///
+/// 1. Rejects shell metacharacters in the command string.
+/// 2. Parses the command into executable + args.
+/// 3. Checks the executable against the shell bridge policy.
+///
+/// # Errors
+///
+/// Returns [`ToolKindError`] if any check fails.
+pub fn guard_authoritative_route_command(
+    command: &str,
+    policy: &ShellBridgePolicy,
+    is_tier2_plus: bool,
+) -> Result<(), ToolKindError> {
+    reject_shell_metacharacters(command)?;
+
+    let (executable, _args) = parse_shell_command(command)?;
+
+    if is_tier2_plus {
+        return Err(ToolKindError::RawShellRejected {
+            reason: "raw shell execution is unconditionally denied on \
+                     Tier2+ authoritative routes"
+                .to_string(),
+        });
+    }
+
+    policy.check(executable, is_tier2_plus)?;
     Ok(())
 }
 
@@ -1340,14 +1548,25 @@ mod tests {
     }
 
     #[test]
-    fn test_shell_policy_tier2_allowed() {
+    fn test_shell_policy_tier2_unconditionally_denied() {
+        // Tier2+ shell execution is now unconditionally denied regardless
+        // of the `tier2_plus_allowed` policy flag (CQ MAJOR fix).
         let policy = ShellBridgePolicy::new(
             vec!["cargo".to_string()],
-            true, // tier2+ allowed
+            true, // tier2+ allowed flag — should be ignored for Tier2+
         )
         .unwrap();
 
-        assert!(policy.check("cargo", true).is_ok());
+        assert!(
+            policy.check("cargo", true).is_err(),
+            "Tier2+ shell must be unconditionally denied even with tier2_plus_allowed=true"
+        );
+
+        // But Tier0-1 should still work
+        assert!(
+            policy.check("cargo", false).is_ok(),
+            "Tier0-1 shell with allowed executable should be permitted"
+        );
     }
 
     #[test]
@@ -1569,16 +1788,26 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_shell_command_with_path() {
-        let (exe, args) = parse_shell_command("/usr/bin/cargo build").unwrap();
-        assert_eq!(exe, "cargo"); // basename extraction
-        assert_eq!(args, vec!["build"]);
+    fn test_parse_shell_command_rejects_path_qualified() {
+        // Path-qualified executables must be rejected to prevent
+        // basename-collapsing bypass attacks.
+        let err = parse_shell_command("/usr/bin/cargo build").unwrap_err();
+        assert!(
+            matches!(err, ToolKindError::RawShellRejected { .. }),
+            "path-qualified executable should be rejected: {err:?}"
+        );
+
+        let err = parse_shell_command("./cargo build").unwrap_err();
+        assert!(matches!(err, ToolKindError::RawShellRejected { .. }));
+
+        let err = parse_shell_command("..\\..\\cargo build").unwrap_err();
+        assert!(matches!(err, ToolKindError::RawShellRejected { .. }));
     }
 
     #[test]
     fn test_parse_shell_command_empty() {
-        assert!(parse_shell_command("").is_none());
-        assert!(parse_shell_command("   ").is_none());
+        assert!(parse_shell_command("").is_err());
+        assert!(parse_shell_command("   ").is_err());
     }
 
     #[test]
@@ -1778,5 +2007,473 @@ mod tests {
             },
             _ => panic!("expected WriteFile"),
         }
+    }
+
+    // =========================================================================
+    // Shell metacharacter rejection in typed ShellExec (BLOCKER fix)
+    // =========================================================================
+
+    #[test]
+    fn test_shell_exec_rejects_pipe() {
+        let tool = tool_request::Tool::ShellExec(ShellExec {
+            command: "cat /etc/passwd | grep root".to_string(),
+            cwd: String::new(),
+            timeout_ms: 1000,
+            network_access: false,
+            env: vec![],
+        });
+        let err = tool_kind_from_proto(&tool).unwrap_err();
+        assert!(
+            matches!(err, ToolKindError::RawShellRejected { .. }),
+            "expected RawShellRejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_shell_exec_rejects_semicolon() {
+        let tool = tool_request::Tool::ShellExec(ShellExec {
+            command: "echo hello; rm -rf /".to_string(),
+            cwd: String::new(),
+            timeout_ms: 1000,
+            network_access: false,
+            env: vec![],
+        });
+        let err = tool_kind_from_proto(&tool).unwrap_err();
+        assert!(matches!(err, ToolKindError::RawShellRejected { .. }));
+    }
+
+    #[test]
+    fn test_shell_exec_rejects_ampersand() {
+        let tool = tool_request::Tool::ShellExec(ShellExec {
+            command: "sleep 100 & echo bg".to_string(),
+            cwd: String::new(),
+            timeout_ms: 1000,
+            network_access: false,
+            env: vec![],
+        });
+        let err = tool_kind_from_proto(&tool).unwrap_err();
+        assert!(matches!(err, ToolKindError::RawShellRejected { .. }));
+    }
+
+    #[test]
+    fn test_shell_exec_rejects_dollar_subshell() {
+        let tool = tool_request::Tool::ShellExec(ShellExec {
+            command: "echo $(whoami)".to_string(),
+            cwd: String::new(),
+            timeout_ms: 1000,
+            network_access: false,
+            env: vec![],
+        });
+        let err = tool_kind_from_proto(&tool).unwrap_err();
+        assert!(matches!(err, ToolKindError::RawShellRejected { .. }));
+    }
+
+    #[test]
+    fn test_shell_exec_rejects_backtick() {
+        let tool = tool_request::Tool::ShellExec(ShellExec {
+            command: "echo `whoami`".to_string(),
+            cwd: String::new(),
+            timeout_ms: 1000,
+            network_access: false,
+            env: vec![],
+        });
+        let err = tool_kind_from_proto(&tool).unwrap_err();
+        assert!(matches!(err, ToolKindError::RawShellRejected { .. }));
+    }
+
+    #[test]
+    fn test_shell_exec_rejects_redirect() {
+        let tool = tool_request::Tool::ShellExec(ShellExec {
+            command: "echo secret > /tmp/leak".to_string(),
+            cwd: String::new(),
+            timeout_ms: 1000,
+            network_access: false,
+            env: vec![],
+        });
+        let err = tool_kind_from_proto(&tool).unwrap_err();
+        assert!(matches!(err, ToolKindError::RawShellRejected { .. }));
+    }
+
+    #[test]
+    fn test_shell_exec_allows_clean_command() {
+        let tool = tool_request::Tool::ShellExec(ShellExec {
+            command: "cargo test --release --workspace".to_string(),
+            cwd: String::new(),
+            timeout_ms: 60_000,
+            network_access: false,
+            env: vec![],
+        });
+        let kind = tool_kind_from_proto(&tool).unwrap();
+        assert!(matches!(kind, ToolKind::ShellExec { .. }));
+    }
+
+    // =========================================================================
+    // Git ref validation in from_git_op (MAJOR fix)
+    // =========================================================================
+
+    #[test]
+    fn test_git_op_checkout_validates_ref() {
+        // Valid ref
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "CHECKOUT".to_string(),
+            args: vec!["main".to_string()],
+            cwd: String::new(),
+        });
+        assert!(tool_kind_from_proto(&tool).is_ok());
+
+        // Invalid ref with shell metacharacter injection
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "CHECKOUT".to_string(),
+            args: vec!["branch;evil".to_string()],
+            cwd: String::new(),
+        });
+        assert!(tool_kind_from_proto(&tool).is_err());
+    }
+
+    #[test]
+    fn test_git_op_merge_validates_ref() {
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "MERGE".to_string(),
+            args: vec!["feature/my-branch".to_string()],
+            cwd: String::new(),
+        });
+        assert!(tool_kind_from_proto(&tool).is_ok());
+
+        // Ref starting with dash (flag injection)
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "MERGE".to_string(),
+            args: vec!["--upload-pack=evil".to_string()],
+            cwd: String::new(),
+        });
+        // This is a flag arg (starts with -), so ref validation is skipped
+        assert!(tool_kind_from_proto(&tool).is_ok());
+    }
+
+    #[test]
+    fn test_git_op_checkout_rejects_traversal_ref() {
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "CHECKOUT".to_string(),
+            args: vec!["refs/../HEAD".to_string()],
+            cwd: String::new(),
+        });
+        assert!(tool_kind_from_proto(&tool).is_err());
+    }
+
+    #[test]
+    fn test_git_op_checkout_rejects_lock_ref() {
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "CHECKOUT".to_string(),
+            args: vec!["refs/heads/main.lock".to_string()],
+            cwd: String::new(),
+        });
+        assert!(tool_kind_from_proto(&tool).is_err());
+    }
+
+    #[test]
+    fn test_git_op_diff_skips_ref_validation() {
+        // DIFF does not accept ref args, so tilde notation is allowed
+        // (it's a revision range, not a strict ref name)
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "DIFF".to_string(),
+            args: vec!["HEAD~1".to_string()],
+            cwd: String::new(),
+        });
+        assert!(
+            tool_kind_from_proto(&tool).is_ok(),
+            "DIFF should not apply strict ref validation to revision args"
+        );
+    }
+
+    #[test]
+    fn test_git_op_log_skips_ref_validation() {
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "LOG".to_string(),
+            args: vec!["HEAD^".to_string()],
+            cwd: String::new(),
+        });
+        assert!(
+            tool_kind_from_proto(&tool).is_ok(),
+            "LOG should not apply strict ref validation"
+        );
+    }
+
+    #[test]
+    fn test_git_op_checkout_pathspec_after_double_dash() {
+        // Arguments after `--` are pathspecs, not refs
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "CHECKOUT".to_string(),
+            args: vec![
+                "main".to_string(),
+                "--".to_string(),
+                "file with spaces.txt".to_string(),
+            ],
+            cwd: String::new(),
+        });
+        // "file with spaces.txt" contains a space which is forbidden in refs,
+        // but after `--` it's a pathspec so ref validation should not apply.
+        // However, the space is in GIT_REF_FORBIDDEN so validate_git_arg
+        // would catch it... Actually validate_git_arg doesn't check for
+        // spaces, only SHELL_METACHARACTERS. And space is in GIT_REF_FORBIDDEN,
+        // not SHELL_METACHARACTERS. So this should pass validate_git_arg but
+        // would fail validate_git_ref. After `--` we skip ref validation.
+        assert!(tool_kind_from_proto(&tool).is_ok());
+    }
+
+    #[test]
+    fn test_git_op_push_validates_ref() {
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "PUSH".to_string(),
+            args: vec!["origin".to_string(), "main".to_string()],
+            cwd: String::new(),
+        });
+        assert!(tool_kind_from_proto(&tool).is_ok());
+    }
+
+    #[test]
+    fn test_git_op_accepts_ref_args_coverage() {
+        // Ensure all ref-accepting operations are covered
+        assert!(GitOpKind::Checkout.accepts_ref_args());
+        assert!(GitOpKind::Merge.accepts_ref_args());
+        assert!(GitOpKind::Branch.accepts_ref_args());
+        assert!(GitOpKind::Push.accepts_ref_args());
+        assert!(GitOpKind::Pull.accepts_ref_args());
+        assert!(GitOpKind::Fetch.accepts_ref_args());
+        assert!(GitOpKind::Rebase.accepts_ref_args());
+        assert!(GitOpKind::Tag.accepts_ref_args());
+        assert!(GitOpKind::Reset.accepts_ref_args());
+        assert!(GitOpKind::Clone.accepts_ref_args());
+        assert!(GitOpKind::Remote.accepts_ref_args());
+
+        // Non-ref operations
+        assert!(!GitOpKind::Diff.accepts_ref_args());
+        assert!(!GitOpKind::Log.accepts_ref_args());
+        assert!(!GitOpKind::Status.accepts_ref_args());
+        assert!(!GitOpKind::Show.accepts_ref_args());
+        assert!(!GitOpKind::Add.accepts_ref_args());
+        assert!(!GitOpKind::Commit.accepts_ref_args());
+        assert!(!GitOpKind::Stash.accepts_ref_args());
+    }
+
+    // =========================================================================
+    // Shell metacharacter bypass regression tests (SECURITY BLOCKER fix)
+    // =========================================================================
+
+    #[test]
+    fn test_guard_rejects_semicolon_bypass() {
+        // `allowed_cmd ; rm -rf /` must NOT pass the guard
+        let tool = tool_request::Tool::ShellExec(ShellExec {
+            command: "cargo test ; rm -rf /".to_string(),
+            cwd: String::new(),
+            timeout_ms: 0,
+            network_access: false,
+            env: vec![],
+        });
+        let policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        let err = guard_authoritative_route(&tool, &policy, false).unwrap_err();
+        assert!(
+            matches!(err, ToolKindError::RawShellRejected { .. }),
+            "semicolon bypass must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_guard_rejects_ampersand_bypass() {
+        // `allowed_cmd && malicious` must NOT pass the guard
+        let tool = tool_request::Tool::ShellExec(ShellExec {
+            command: "cargo test && malicious".to_string(),
+            cwd: String::new(),
+            timeout_ms: 0,
+            network_access: false,
+            env: vec![],
+        });
+        let policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        let err = guard_authoritative_route(&tool, &policy, false).unwrap_err();
+        assert!(
+            matches!(err, ToolKindError::RawShellRejected { .. }),
+            "ampersand bypass must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_guard_rejects_pipe_bypass() {
+        // `allowed_cmd | evil` must NOT pass the guard
+        let tool = tool_request::Tool::ShellExec(ShellExec {
+            command: "cargo test | evil".to_string(),
+            cwd: String::new(),
+            timeout_ms: 0,
+            network_access: false,
+            env: vec![],
+        });
+        let policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        let err = guard_authoritative_route(&tool, &policy, false).unwrap_err();
+        assert!(
+            matches!(err, ToolKindError::RawShellRejected { .. }),
+            "pipe bypass must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_guard_rejects_backtick_bypass() {
+        let tool = tool_request::Tool::ShellExec(ShellExec {
+            command: "cargo `whoami`".to_string(),
+            cwd: String::new(),
+            timeout_ms: 0,
+            network_access: false,
+            env: vec![],
+        });
+        let policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        assert!(guard_authoritative_route(&tool, &policy, false).is_err());
+    }
+
+    #[test]
+    fn test_guard_rejects_dollar_subshell_bypass() {
+        let tool = tool_request::Tool::ShellExec(ShellExec {
+            command: "cargo $(rm -rf /)".to_string(),
+            cwd: String::new(),
+            timeout_ms: 0,
+            network_access: false,
+            env: vec![],
+        });
+        let policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        assert!(guard_authoritative_route(&tool, &policy, false).is_err());
+    }
+
+    #[test]
+    fn test_guard_rejects_redirect_bypass() {
+        let tool = tool_request::Tool::ShellExec(ShellExec {
+            command: "cargo test > /tmp/leak".to_string(),
+            cwd: String::new(),
+            timeout_ms: 0,
+            network_access: false,
+            env: vec![],
+        });
+        let policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        assert!(guard_authoritative_route(&tool, &policy, false).is_err());
+    }
+
+    #[test]
+    fn test_guard_allows_clean_command_tier1() {
+        let tool = tool_request::Tool::ShellExec(ShellExec {
+            command: "cargo test --release".to_string(),
+            cwd: String::new(),
+            timeout_ms: 0,
+            network_access: false,
+            env: vec![],
+        });
+        let policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        assert!(
+            guard_authoritative_route(&tool, &policy, false).is_ok(),
+            "clean command on Tier0-1 with allowlisted executable should pass"
+        );
+    }
+
+    #[test]
+    fn test_guard_unconditional_tier2_denial() {
+        // Even with tier2_plus_allowed=true in policy, Tier2+ must be denied
+        let tool = tool_request::Tool::ShellExec(ShellExec {
+            command: "cargo test".to_string(),
+            cwd: String::new(),
+            timeout_ms: 0,
+            network_access: false,
+            env: vec![],
+        });
+        let policy = ShellBridgePolicy::new(vec!["cargo".to_string()], true).unwrap();
+        assert!(
+            guard_authoritative_route(&tool, &policy, true).is_err(),
+            "Tier2+ must be unconditionally denied even with tier2_plus_allowed=true"
+        );
+    }
+
+    // =========================================================================
+    // guard_authoritative_route_command tests
+    // =========================================================================
+
+    #[test]
+    fn test_guard_command_rejects_metachar() {
+        let policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        assert!(guard_authoritative_route_command("cargo test ; evil", &policy, false).is_err());
+        assert!(guard_authoritative_route_command("cargo test && evil", &policy, false).is_err());
+        assert!(guard_authoritative_route_command("cargo test | evil", &policy, false).is_err());
+    }
+
+    #[test]
+    fn test_guard_command_allows_clean() {
+        let policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        assert!(guard_authoritative_route_command("cargo test --release", &policy, false).is_ok());
+    }
+
+    #[test]
+    fn test_guard_command_denies_tier2() {
+        let policy = ShellBridgePolicy::new(vec!["cargo".to_string()], true).unwrap();
+        assert!(guard_authoritative_route_command("cargo test", &policy, true).is_err());
+    }
+
+    // =========================================================================
+    // FileWrite contradictory flags regression test (MAJOR fix)
+    // =========================================================================
+
+    #[test]
+    fn test_file_write_create_only_and_append_rejected() {
+        let tool = tool_request::Tool::FileWrite(FileWrite {
+            path: "/workspace/file.txt".to_string(),
+            content: b"data".to_vec(),
+            create_only: true,
+            append: true,
+        });
+        let err = tool_kind_from_proto(&tool).unwrap_err();
+        assert!(
+            matches!(err, ToolKindError::PreconditionFailed { .. }),
+            "create_only + append must be rejected: {err:?}"
+        );
+    }
+
+    // =========================================================================
+    // reject_shell_metacharacters tests
+    // =========================================================================
+
+    #[test]
+    fn test_reject_metachar_clean() {
+        assert!(reject_shell_metacharacters("cargo test --release").is_ok());
+    }
+
+    #[test]
+    fn test_reject_metachar_semicolon() {
+        assert!(reject_shell_metacharacters("cargo ; evil").is_err());
+    }
+
+    #[test]
+    fn test_reject_metachar_pipe() {
+        assert!(reject_shell_metacharacters("cargo | evil").is_err());
+    }
+
+    #[test]
+    fn test_reject_metachar_ampersand() {
+        assert!(reject_shell_metacharacters("cargo && evil").is_err());
+    }
+
+    #[test]
+    fn test_reject_metachar_backtick() {
+        assert!(reject_shell_metacharacters("echo `whoami`").is_err());
+    }
+
+    #[test]
+    fn test_reject_metachar_dollar() {
+        assert!(reject_shell_metacharacters("echo $(whoami)").is_err());
+    }
+
+    #[test]
+    fn test_reject_metachar_redirect() {
+        assert!(reject_shell_metacharacters("echo > /tmp/leak").is_err());
+        assert!(reject_shell_metacharacters("cat < /etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_reject_metachar_newline() {
+        assert!(reject_shell_metacharacters("echo\nevil").is_err());
+    }
+
+    #[test]
+    fn test_reject_metachar_null() {
+        assert!(reject_shell_metacharacters("echo\0evil").is_err());
     }
 }

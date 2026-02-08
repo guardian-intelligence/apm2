@@ -45,6 +45,7 @@ use apm2_core::context::firewall::{
     RiskTierFirewallPolicy, ToctouVerifier, ValidationResult,
 };
 use apm2_core::policy::{Decision as CoreDecision, LoadedPolicy, PolicyEngine};
+use apm2_core::tool::ShellBridgePolicy;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, instrument, warn};
@@ -704,6 +705,21 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// Maps risk tiers to firewall enforcement modes. Tier3+ violations
     /// ALWAYS use `HardFail` (mandatory session termination) per REQ-0029.
     firewall_policy: RiskTierFirewallPolicy,
+
+    /// Shell bridge policy for `ToolKinds` typed enforcement (TCK-00377).
+    ///
+    /// Per REQ-0031, authoritative routes must not accept raw untyped
+    /// command strings. This policy gates shell execution through an
+    /// explicit allowlist. Currently, the broker enforces metacharacter
+    /// rejection directly via `reject_shell_metacharacters`; the full
+    /// allowlist integration will use this field once the daemon runtime
+    /// surfaces risk-tier context to the proto-level tool request path.
+    ///
+    /// TODO(TCK-runtime-integration): Wire this into
+    /// `guard_authoritative_route` once `BrokerToolRequest` carries the
+    /// original `tool_request::Tool` proto variant.
+    #[allow(dead_code)]
+    shell_bridge_policy: ShellBridgePolicy,
 }
 
 impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
@@ -724,6 +740,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             ssh_store: None,
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
+            shell_bridge_policy: ShellBridgePolicy::deny_all(),
         }
     }
 
@@ -744,6 +761,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             ssh_store: None,
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
+            shell_bridge_policy: ShellBridgePolicy::deny_all(),
         }
     }
 
@@ -770,6 +788,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             ssh_store: None,
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
+            shell_bridge_policy: ShellBridgePolicy::deny_all(),
         }
     }
 
@@ -797,6 +816,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             ssh_store: Some(ssh_store),
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
+            shell_bridge_policy: ShellBridgePolicy::deny_all(),
         }
     }
 
@@ -825,6 +845,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             ssh_store: Some(ssh_store),
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
+            shell_bridge_policy: ShellBridgePolicy::deny_all(),
         }
     }
 
@@ -1870,6 +1891,64 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
 
         // Step 1: Validate request structure
         request.validate()?;
+
+        // Step 1b: ToolKind typed safety guard (TCK-00377).
+        //
+        // Enforce shell metacharacter rejection and unconditional Tier2+
+        // raw-shell denial at the broker layer.  This is defense-in-depth:
+        // the proto-level `Validator` (in `validation.rs`) already calls
+        // `tool_kind_from_proto` which performs the same metacharacter
+        // check, but the broker operates on `BrokerToolRequest` which is
+        // constructed independently.  We guard here to close any path
+        // that bypasses proto-level validation.
+        //
+        // NOTE: The shell bridge *allowlist* check is NOT performed here.
+        // The allowlist is an orthogonal concern handled by the context
+        // firewall (`shell_allowlist` on `ContextPackManifest`).  This
+        // guard focuses strictly on:
+        //   1. Shell metacharacter injection (all tiers)
+        //   2. Unconditional Tier2+ raw-shell denial
+        if request.tool_class == super::tool_class::ToolClass::Execute {
+            // Tier2+ raw shell execution is unconditionally denied.
+            if request.risk_tier.tier() >= 2 {
+                warn!(
+                    request_id = %request.request_id,
+                    risk_tier = request.risk_tier.tier(),
+                    "TCK-00377: Tier2+ raw shell execution unconditionally denied"
+                );
+                respond!(ToolDecision::Deny {
+                    request_id: request.request_id.clone(),
+                    reason: DenyReason::PolicyDenied {
+                        rule_id: "TOOL_KIND_GUARD".to_string(),
+                        reason: "raw shell execution is unconditionally denied on \
+                                 Tier2+ authoritative routes"
+                            .to_string(),
+                    },
+                    rule_id: Some("TOOL_KIND_GUARD".to_string()),
+                    policy_hash: self.policy.policy_hash(),
+                });
+            }
+
+            // Reject shell metacharacters in shell commands.
+            if let Some(ref command) = request.shell_command {
+                if let Err(e) = apm2_core::tool::reject_shell_metacharacters(command) {
+                    warn!(
+                        request_id = %request.request_id,
+                        error = %e,
+                        "TCK-00377: shell metacharacter injection rejected"
+                    );
+                    respond!(ToolDecision::Deny {
+                        request_id: request.request_id.clone(),
+                        reason: DenyReason::PolicyDenied {
+                            rule_id: "TOOL_KIND_GUARD".to_string(),
+                            reason: e.to_string(),
+                        },
+                        rule_id: Some("TOOL_KIND_GUARD".to_string()),
+                        policy_hash: self.policy.policy_hash(),
+                    });
+                }
+            }
+        }
 
         // Step 2: Validate against context firewall (TCK-00261, TCK-00286)
         // This must happen before capability checks because a firewall violation
