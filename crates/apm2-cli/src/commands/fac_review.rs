@@ -833,6 +833,61 @@ fn run_single_review(
                 )?;
                 last_liveness_report = Instant::now();
 
+                if detect_http_400_or_rate_limit(&log_path) {
+                    emit_event(
+                        event_ctx,
+                        "run_crash",
+                        review_kind.as_str(),
+                        &current_head_sha,
+                        serde_json::json!({
+                            "exit_code": -1,
+                            "signal": "provider_backpressure",
+                            "duration_secs": run_started.elapsed().as_secs(),
+                            "restart_count": restart_count,
+                            "reason": "http_400_or_rate_limit_live",
+                        }),
+                    )?;
+
+                    terminate_child(&mut child)?;
+                    restart_count = restart_count.saturating_add(1);
+                    if restart_count > MAX_RESTART_ATTEMPTS {
+                        state.reviewers.remove(review_kind.as_str());
+                        state.save()?;
+                        return Ok(SingleReviewResult {
+                            summary: SingleReviewSummary {
+                                review_type: review_kind.as_str().to_string(),
+                                success: false,
+                                verdict: "UNKNOWN".to_string(),
+                                model: current_model.model,
+                                backend: current_model.backend.as_str().to_string(),
+                                duration_secs: review_started.elapsed().as_secs(),
+                                restart_count,
+                            },
+                            final_head_sha: current_head_sha,
+                        });
+                    }
+
+                    let fallback = select_cross_family_fallback(&current_model.model)
+                        .or_else(|| select_fallback_model(&current_model.model))
+                        .ok_or_else(|| {
+                            "no fallback model available after provider backpressure".to_string()
+                        })?;
+                    emit_event(
+                        event_ctx,
+                        "model_fallback",
+                        review_kind.as_str(),
+                        &current_head_sha,
+                        serde_json::json!({
+                            "from_model": current_model.model,
+                            "to_model": fallback.model,
+                            "reason": "http_400_or_rate_limit_live",
+                        }),
+                    )?;
+                    current_model = ensure_model_backend_available(fallback)?;
+                    spawn_mode = SpawnMode::Initial;
+                    continue 'restart_loop;
+                }
+
                 if last_progress_at.elapsed() >= STALL_THRESHOLD {
                     emit_event(
                         event_ctx,
@@ -1397,7 +1452,12 @@ fn detect_http_400_or_rate_limit(log_path: &Path) -> bool {
         return false;
     };
     let lower = tail.to_ascii_lowercase();
-    lower.contains("400") || lower.contains("rate limit")
+    lower.contains("rate limit")
+        || lower.contains("exhausted your capacity")
+        || lower.contains("quota will reset")
+        || lower.contains("modelnotfounderror")
+        || lower.contains("\"status\":400")
+        || lower.contains("http 400")
 }
 
 fn read_tail(path: &Path, max_lines: usize) -> Result<String, String> {
@@ -1802,6 +1862,22 @@ mod tests {
         assert!(rotated.exists(), "rotated file should exist");
         let lines = read_last_lines(&path, 10).expect("read lines");
         assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn test_detect_http_400_or_rate_limit_markers() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("review.log");
+
+        fs::write(
+            &path,
+            r#"{"message":"You have exhausted your capacity on this model. Your quota will reset after 2s."}"#,
+        )
+        .expect("write rate-limit log");
+        assert!(detect_http_400_or_rate_limit(&path));
+
+        fs::write(&path, r#"{"message":"normal progress"}"#).expect("write normal log");
+        assert!(!detect_http_400_or_rate_limit(&path));
     }
 
     #[test]
