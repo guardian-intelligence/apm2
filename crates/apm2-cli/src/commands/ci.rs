@@ -6,7 +6,7 @@
 //! artifacts.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,6 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand, ValueEnum};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::exit_codes::codes as exit_codes;
@@ -2161,108 +2162,109 @@ fn build_plan(profile: CiProfileArg, repo_root: &Path) -> Plan {
     });
 
     let script = |relative: &str| -> String { repo_root.join(relative).display().to_string() };
+    if !matches!(profile, CiProfileArg::GithubSlowLane) {
+        let static_guardrails = vec![
+            ("test_safety_guard", "scripts/ci/test_safety_guard.sh"),
+            ("legacy_ipc_guard", "scripts/ci/legacy_ipc_guard.sh"),
+            ("evidence_refs_lint", "scripts/ci/evidence_refs_lint.sh"),
+            ("test_refs_lint", "scripts/ci/test_refs_lint.sh"),
+            ("proto_enum_drift", "scripts/ci/proto_enum_drift.sh"),
+            ("review_artifact_lint", "scripts/ci/review_artifact_lint.sh"),
+            (
+                "status_write_cmd_lint",
+                "scripts/lint/no_direct_status_write_commands.sh",
+            ),
+            (
+                "safety_proof_coverage",
+                "scripts/ci/safety_proof_coverage.sh",
+            ),
+        ];
 
-    let static_guardrails = vec![
-        ("test_safety_guard", "scripts/ci/test_safety_guard.sh"),
-        ("legacy_ipc_guard", "scripts/ci/legacy_ipc_guard.sh"),
-        ("evidence_refs_lint", "scripts/ci/evidence_refs_lint.sh"),
-        ("test_refs_lint", "scripts/ci/test_refs_lint.sh"),
-        ("proto_enum_drift", "scripts/ci/proto_enum_drift.sh"),
-        ("review_artifact_lint", "scripts/ci/review_artifact_lint.sh"),
-        (
-            "status_write_cmd_lint",
-            "scripts/lint/no_direct_status_write_commands.sh",
-        ),
-        (
-            "safety_proof_coverage",
-            "scripts/ci/safety_proof_coverage.sh",
-        ),
-    ];
+        for (id, relative_path) in static_guardrails {
+            tasks.push(TaskSpec {
+                id: id.to_string(),
+                lane: "static_guardrails".to_string(),
+                class: TaskClass::CheapParallel,
+                deps: vec!["bootstrap".to_string()],
+                declared_inputs: vec![relative_path.to_string()],
+                kind: TaskKind::Command(CommandSpec {
+                    program: script(relative_path),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                }),
+            });
+        }
 
-    for (id, relative_path) in static_guardrails {
+        tasks.push(cargo_task(
+            "rustfmt",
+            "format",
+            vec!["fmt", "--all", "--check"],
+            vec!["bootstrap"],
+        ));
+
         tasks.push(TaskSpec {
-            id: id.to_string(),
-            lane: "static_guardrails".to_string(),
+            id: "workspace_integrity_snapshot".to_string(),
+            lane: "tests".to_string(),
             class: TaskClass::CheapParallel,
             deps: vec!["bootstrap".to_string()],
-            declared_inputs: vec![relative_path.to_string()],
+            declared_inputs: vec!["scripts/ci/workspace_integrity_guard.sh".to_string()],
             kind: TaskKind::Command(CommandSpec {
-                program: script(relative_path),
+                program: script("scripts/ci/workspace_integrity_guard.sh"),
+                args: vec![
+                    "snapshot".to_string(),
+                    "--snapshot-file".to_string(),
+                    "target/ci/workspace_integrity.snapshot.tsv".to_string(),
+                ],
+                env: BTreeMap::new(),
+            }),
+        });
+
+        tasks.push(cargo_task(
+            "bounded_test_runner",
+            "tests",
+            vec![
+                "nextest",
+                "run",
+                "--workspace",
+                "--all-features",
+                "--config-file",
+                ".config/nextest.toml",
+                "--profile",
+                "ci",
+            ],
+            vec!["workspace_integrity_snapshot", "test_safety_guard"],
+        ));
+
+        tasks.push(TaskSpec {
+            id: "workspace_integrity_guard".to_string(),
+            lane: "tests".to_string(),
+            class: TaskClass::CheapParallel,
+            deps: vec!["bounded_test_runner".to_string()],
+            declared_inputs: vec!["scripts/ci/workspace_integrity_guard.sh".to_string()],
+            kind: TaskKind::Command(CommandSpec {
+                program: script("scripts/ci/workspace_integrity_guard.sh"),
+                args: vec![
+                    "verify".to_string(),
+                    "--snapshot-file".to_string(),
+                    "target/ci/workspace_integrity.snapshot.tsv".to_string(),
+                ],
+                env: BTreeMap::new(),
+            }),
+        });
+
+        tasks.push(TaskSpec {
+            id: "guardrail_fixtures".to_string(),
+            lane: "fixtures".to_string(),
+            class: TaskClass::CheapParallel,
+            deps: vec!["bootstrap".to_string(), "test_safety_guard".to_string()],
+            declared_inputs: vec!["scripts/ci/test_guardrail_fixtures.sh".to_string()],
+            kind: TaskKind::Command(CommandSpec {
+                program: script("scripts/ci/test_guardrail_fixtures.sh"),
                 args: Vec::new(),
                 env: BTreeMap::new(),
             }),
         });
     }
-
-    tasks.push(cargo_task(
-        "rustfmt",
-        "format",
-        vec!["fmt", "--all", "--check"],
-        vec!["bootstrap"],
-    ));
-
-    tasks.push(TaskSpec {
-        id: "workspace_integrity_snapshot".to_string(),
-        lane: "tests".to_string(),
-        class: TaskClass::CheapParallel,
-        deps: vec!["bootstrap".to_string()],
-        declared_inputs: vec!["scripts/ci/workspace_integrity_guard.sh".to_string()],
-        kind: TaskKind::Command(CommandSpec {
-            program: script("scripts/ci/workspace_integrity_guard.sh"),
-            args: vec![
-                "snapshot".to_string(),
-                "--snapshot-file".to_string(),
-                "target/ci/workspace_integrity.snapshot.tsv".to_string(),
-            ],
-            env: BTreeMap::new(),
-        }),
-    });
-
-    tasks.push(cargo_task(
-        "bounded_test_runner",
-        "tests",
-        vec![
-            "nextest",
-            "run",
-            "--workspace",
-            "--all-features",
-            "--config-file",
-            ".config/nextest.toml",
-            "--profile",
-            "ci",
-        ],
-        vec!["workspace_integrity_snapshot"],
-    ));
-
-    tasks.push(TaskSpec {
-        id: "workspace_integrity_guard".to_string(),
-        lane: "tests".to_string(),
-        class: TaskClass::CheapParallel,
-        deps: vec!["bounded_test_runner".to_string()],
-        declared_inputs: vec!["scripts/ci/workspace_integrity_guard.sh".to_string()],
-        kind: TaskKind::Command(CommandSpec {
-            program: script("scripts/ci/workspace_integrity_guard.sh"),
-            args: vec![
-                "verify".to_string(),
-                "--snapshot-file".to_string(),
-                "target/ci/workspace_integrity.snapshot.tsv".to_string(),
-            ],
-            env: BTreeMap::new(),
-        }),
-    });
-
-    tasks.push(TaskSpec {
-        id: "guardrail_fixtures".to_string(),
-        lane: "fixtures".to_string(),
-        class: TaskClass::CheapParallel,
-        deps: vec!["bootstrap".to_string()],
-        declared_inputs: vec!["scripts/ci/test_guardrail_fixtures.sh".to_string()],
-        kind: TaskKind::Command(CommandSpec {
-            program: script("scripts/ci/test_guardrail_fixtures.sh"),
-            args: Vec::new(),
-            env: BTreeMap::new(),
-        }),
-    });
 
     if matches!(profile, CiProfileArg::GithubDeep | CiProfileArg::LocalFull) {
         tasks.push(cargo_task(
@@ -2328,7 +2330,7 @@ fn build_plan(profile: CiProfileArg, repo_root: &Path) -> Plan {
             "bounded_doctests",
             "docs",
             vec!["test", "--doc", "--workspace", "--all-features"],
-            vec!["bootstrap"],
+            vec!["bootstrap", "test_safety_guard"],
         ));
 
         tasks.push(cargo_task(
@@ -2342,7 +2344,7 @@ fn build_plan(profile: CiProfileArg, repo_root: &Path) -> Plan {
                 "test_vectors",
                 "canonicalization",
             ],
-            vec!["bootstrap"],
+            vec!["bootstrap", "test_safety_guard"],
         ));
 
         tasks.push(TaskSpec {
@@ -2397,7 +2399,7 @@ fn build_plan(profile: CiProfileArg, repo_root: &Path) -> Plan {
             id: "coverage".to_string(),
             lane: "coverage".to_string(),
             class: TaskClass::CargoHeavy,
-            deps: vec!["bootstrap".to_string()],
+            deps: vec!["bootstrap".to_string(), "test_safety_guard".to_string()],
             declared_inputs: Vec::new(),
             kind: TaskKind::Command(CommandSpec {
                 program: "cargo".to_string(),
@@ -2460,9 +2462,28 @@ fn validate_plan(plan: &Plan) -> Result<(), String> {
                 ));
             }
         }
+        if task_requires_test_safety_guard(task)
+            && !task.deps.iter().any(|dep| dep == "test_safety_guard")
+        {
+            return Err(format!(
+                "task '{}' must depend on 'test_safety_guard' (fail-closed test safety contract)",
+                task.id
+            ));
+        }
     }
 
     Ok(())
+}
+
+fn task_requires_test_safety_guard(task: &TaskSpec) -> bool {
+    matches!(
+        task.id.as_str(),
+        "bounded_test_runner"
+            | "bounded_doctests"
+            | "test_vectors"
+            | "coverage"
+            | "guardrail_fixtures"
+    )
 }
 
 fn clone_task(task: &TaskSpec) -> TaskSpec {
@@ -3008,7 +3029,35 @@ fn countermetric_history_path(run_ctx: &RunContext) -> PathBuf {
         .join("countermetrics-history.v2.ndjson")
 }
 
+fn countermetric_history_lock_path(run_ctx: &RunContext) -> PathBuf {
+    run_ctx
+        .artifacts_root
+        .join("countermetrics-history.v2.lock")
+}
+
 fn persist_countermetric_history(
+    run_ctx: &RunContext,
+    countermetrics: &mut CountermetricsV2,
+    profile: CiProfileArg,
+) -> Result<(), String> {
+    let lock_path = countermetric_history_lock_path(run_ctx);
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| format!("failed to open history lock {}: {err}", lock_path.display()))?;
+    lock_file
+        .lock_exclusive()
+        .map_err(|err| format!("failed to lock history {}: {err}", lock_path.display()))?;
+
+    let persist_result = persist_countermetric_history_locked(run_ctx, countermetrics, profile);
+    drop(lock_file);
+    persist_result
+}
+
+fn persist_countermetric_history_locked(
     run_ctx: &RunContext,
     countermetrics: &mut CountermetricsV2,
     profile: CiProfileArg,
@@ -3244,5 +3293,46 @@ mod tests {
     fn test_build_plan_slow_lane_contains_release() {
         let plan = build_plan(CiProfileArg::GithubSlowLane, Path::new("/tmp/repo"));
         assert!(plan.tasks.iter().any(|task| task.id == "release_build"));
+    }
+
+    #[test]
+    fn test_build_plan_slow_lane_excludes_fast_and_test_surface() {
+        let plan = build_plan(CiProfileArg::GithubSlowLane, Path::new("/tmp/repo"));
+        for excluded in [
+            "test_safety_guard",
+            "bounded_test_runner",
+            "bounded_doctests",
+            "test_vectors",
+            "coverage",
+            "guardrail_fixtures",
+            "rustfmt",
+        ] {
+            assert!(
+                !plan.tasks.iter().any(|task| task.id == excluded),
+                "slow-lane profile should not include {excluded}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_test_tasks_depend_on_test_safety_guard() {
+        let plan = build_plan(CiProfileArg::GithubDeep, Path::new("/tmp/repo"));
+        for guarded in [
+            "bounded_test_runner",
+            "bounded_doctests",
+            "test_vectors",
+            "coverage",
+            "guardrail_fixtures",
+        ] {
+            let task = plan
+                .tasks
+                .iter()
+                .find(|task| task.id == guarded)
+                .unwrap_or_else(|| panic!("expected task {guarded} in github-deep profile"));
+            assert!(
+                task.deps.iter().any(|dep| dep == "test_safety_guard"),
+                "task {guarded} must depend on test_safety_guard",
+            );
+        }
     }
 }
