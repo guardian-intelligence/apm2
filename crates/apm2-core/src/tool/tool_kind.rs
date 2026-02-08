@@ -713,12 +713,13 @@ pub fn validate_git_arg(arg: &str, index: usize) -> Result<ValidatedArg, ToolKin
 ///
 /// # Runtime Enforcement
 ///
-/// TODO(TCK-runtime-integration): Precondition enforcement is declared here
-/// but deferred to the runtime integration ticket. The runtime evaluator
-/// must check each precondition variant (e.g., `FileHashMatch` by reading
-/// current file content, `GitRefAtCommit` by resolving the ref) **before**
-/// executing the side-effectful operation. Until that integration is
-/// complete, preconditions are informational only.
+/// Preconditions are enforced at runtime when a [`PreconditionEvaluator`] is
+/// configured on the broker.  The evaluator checks each precondition variant
+/// (e.g., `FileHashMatch` by reading current file content,
+/// `GitCleanWorkingTree` by inspecting index/worktree state) **before**
+/// executing the side-effectful operation.  When no evaluator is configured,
+/// preconditions are advisory: the broker logs a warning and allows the
+/// request to proceed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum IdempotencyPrecondition {
@@ -1252,11 +1253,17 @@ fn from_git_op(req: &GitOperation) -> Result<ToolKind, ToolKindError> {
             | GitOpKind::Merge
             | GitOpKind::Rebase
             | GitOpKind::Checkout
-            | GitOpKind::Reset => {
+            | GitOpKind::Reset
+            | GitOpKind::Stash
+            | GitOpKind::Tag => {
                 vec![IdempotencyPrecondition::GitCleanWorkingTree]
             },
-            // Other side-effectful ops (commit, add, fetch, pull, clone, etc.)
-            // do not require a clean tree by default.
+            // Additive / remote-only side-effectful ops (commit, add, fetch,
+            // pull, clone, branch, remote) do not require a clean working tree:
+            //  - commit/add: intentionally stage/record dirty-tree changes
+            //  - fetch/clone/remote: only touch remote-tracking refs / new dirs
+            //  - pull: handled via merge/rebase precondition when those run
+            //  - branch: ref manipulation that does not touch the working tree
             _ => Vec::new(),
         }
     } else {
@@ -2950,9 +2957,11 @@ mod tests {
 
     #[test]
     fn test_git_op_side_effectful_has_preconditions() {
-        // Side-effectful Git ops (push, merge, rebase, checkout, reset) must
+        // Side-effectful Git ops that mutate the working tree or refs must
         // carry GitCleanWorkingTree preconditions.
-        for op in &["PUSH", "MERGE", "REBASE", "CHECKOUT", "RESET"] {
+        for op in &[
+            "PUSH", "MERGE", "REBASE", "CHECKOUT", "RESET", "STASH", "TAG",
+        ] {
             let tool = tool_request::Tool::GitOp(GitOperation {
                 operation: op.to_string(),
                 args: vec![],
