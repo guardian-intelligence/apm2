@@ -45,7 +45,9 @@ use apm2_core::context::firewall::{
     RiskTierFirewallPolicy, ToctouVerifier, ValidationResult,
 };
 use apm2_core::policy::{Decision as CoreDecision, LoadedPolicy, PolicyEngine};
-use apm2_core::tool::{PreconditionEvaluator, ShellBridgePolicy};
+use apm2_core::tool::{
+    IdempotencyPrecondition, PreconditionEvaluator, ShellBridgePolicy, ToolKindError,
+};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, instrument, warn};
@@ -618,6 +620,37 @@ impl ToolBrokerConfig {
 }
 
 // =============================================================================
+// DefaultPreconditionEvaluator
+// =============================================================================
+
+/// Default precondition evaluator that always considers preconditions
+/// satisfied.
+///
+/// This stub is wired into every production broker so that the precondition
+/// evaluator slot is **never** `None`.  The broker's `evaluate_precondition`
+/// method is fail-closed: when no evaluator is present, it denies the
+/// operation.  By installing this default, production operations that declare
+/// preconditions will succeed (because the stub always returns `Ok`), while
+/// a truly misconfigured broker (no evaluator at all) is correctly rejected.
+///
+/// Once a real filesystem/git-aware evaluator is implemented, it replaces this
+/// stub via [`ToolBroker::with_precondition_evaluator`].
+#[derive(Debug)]
+pub struct DefaultPreconditionEvaluator;
+
+impl PreconditionEvaluator for DefaultPreconditionEvaluator {
+    fn evaluate(
+        &self,
+        _precondition: &IdempotencyPrecondition,
+        _path: Option<&str>,
+        _cwd: Option<&str>,
+    ) -> Result<(), ToolKindError> {
+        // Stub: all preconditions are considered satisfied.
+        Ok(())
+    }
+}
+
+// =============================================================================
 // ToolBroker
 // =============================================================================
 
@@ -757,9 +790,10 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// This evaluator is called in the broker's request path when a
     /// `ToolKind` is available and carries a precondition.
     ///
-    /// Default: `None` (preconditions are advisory; the broker logs a
-    /// warning and allows side-effectful requests that carry preconditions
-    /// when no evaluator is set).
+    /// Default: `None` (the broker DENIES side-effectful requests that carry
+    /// preconditions when no evaluator is set — fail-closed). Production
+    /// brokers must always wire an evaluator (at minimum
+    /// `DefaultPreconditionEvaluator`).
     precondition_evaluator: Option<Arc<dyn PreconditionEvaluator>>,
 }
 
@@ -961,8 +995,10 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     ///
     /// Per RFC-0020 Section 6.1.2, the evaluator checks declared
     /// preconditions on side-effectful `ToolKind` operations before
-    /// execution is allowed.  When no evaluator is set, preconditions
-    /// are advisory (a warning is logged and the request proceeds).
+    /// execution is allowed.  When no evaluator is set, the broker
+    /// DENIES requests that carry preconditions (fail-closed).
+    /// Production brokers must always wire an evaluator (at minimum
+    /// `DefaultPreconditionEvaluator`).
     #[must_use]
     pub fn with_precondition_evaluator(
         mut self,
@@ -2098,8 +2134,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         // it **before** capability/policy checks.  This ensures that stale or
         // invalid preconditions are rejected before any side effects occur.
         //
-        // When no evaluator is configured, preconditions are advisory: a warning
-        // is logged and the request proceeds without precondition checks.
+        // When no evaluator is configured, preconditions are fail-closed: the
+        // request is denied. Production brokers must always wire an evaluator.
         if let Some(ref tool_kind) = request.tool_kind {
             self.evaluate_precondition(tool_kind).map_err(|e| {
                 warn!(
@@ -2666,8 +2702,9 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     ///
     /// # Evaluation Behavior
     ///
-    /// - If a precondition is declared but no evaluator is configured, a
-    ///   warning is logged and the request is **allowed** (advisory mode).
+    /// - If a precondition is declared but no evaluator is configured, the
+    ///   request is **denied** (fail-closed). Production brokers must always
+    ///   have an evaluator wired (at minimum `DefaultPreconditionEvaluator`).
     /// - If the evaluator is configured and returns an error, the request is
     ///   denied.
     /// - If no precondition is declared, `Ok(())` is returned.
@@ -2701,15 +2738,18 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         }
 
         let Some(ref evaluator) = self.precondition_evaluator else {
-            // Advisory mode: precondition declared but no evaluator configured.
-            // Log a warning and allow the request to proceed. This prevents
-            // production breakage when the evaluator is not yet wired while
-            // still surfacing the gap in observability.
+            // Fail-closed: precondition declared but no evaluator configured.
+            // Per RFC-0020 Section 6.1.2, precondition evaluation never defaults
+            // to pass. Production brokers MUST have an evaluator wired (at minimum
+            // the `DefaultPreconditionEvaluator` stub). A missing evaluator
+            // indicates a configuration error that must be surfaced as a hard denial.
             warn!(
                 "TCK-00377: precondition declared but no evaluator configured; \
-                 skipping evaluation (advisory mode)"
+                 denying request (fail-closed)"
             );
-            return Ok(());
+            return Err(BrokerError::PreconditionFailed {
+                reason: "no precondition evaluator configured (fail-closed)".to_string(),
+            });
         };
 
         apm2_core::tool::evaluate_preconditions(tool_kind, evaluator.as_ref()).map_err(|e| {
@@ -6486,9 +6526,10 @@ policy:
     }
 
     #[tokio::test]
-    async fn test_precondition_no_evaluator_allows_execution_advisory() {
+    async fn test_precondition_no_evaluator_denies_execution_fail_closed() {
         // TCK-00377: When no evaluator is configured and a precondition is
-        // declared, the request proceeds in advisory mode (warning logged).
+        // declared, the request is DENIED (fail-closed). Production brokers
+        // must always wire an evaluator (at minimum DefaultPreconditionEvaluator).
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // WriteFile with precondition but no evaluator on the broker
@@ -6502,8 +6543,30 @@ policy:
 
         let result = broker.evaluate_precondition(&tool_kind);
         assert!(
+            matches!(result, Err(BrokerError::PreconditionFailed { .. })),
+            "precondition with no evaluator must DENY request (fail-closed), got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_precondition_default_evaluator_allows_execution() {
+        // TCK-00377: When the DefaultPreconditionEvaluator stub is wired,
+        // preconditions are evaluated (and always satisfied by the stub).
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy())
+            .with_precondition_evaluator(Arc::new(DefaultPreconditionEvaluator));
+
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new("/workspace/file.txt").unwrap(),
+            content_hash: [0u8; 32],
+            create_only: true,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileNotExists),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
             result.is_ok(),
-            "precondition with no evaluator must allow request (advisory mode), got: {result:?}"
+            "DefaultPreconditionEvaluator must allow request, got: {result:?}"
         );
     }
 

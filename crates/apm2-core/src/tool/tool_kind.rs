@@ -701,6 +701,67 @@ pub fn validate_git_arg(arg: &str, index: usize) -> Result<ValidatedArg, ToolKin
     ValidatedArg::new(arg, &field)
 }
 
+/// Validate a URL or refspec argument for safety.
+///
+/// URL/refspec arguments (used by `clone`, `fetch`, `push`, `pull`, `remote`)
+/// contain characters (`://`, `:`, `@`) that are forbidden in strict git ref
+/// validation but are legitimate in URLs and refspecs. This function applies
+/// targeted safety checks instead of full ref validation:
+///
+/// - Shell metacharacter injection (same as `validate_git_arg`)
+/// - Null byte injection
+/// - Flag injection (args starting with `-`)
+/// - Path traversal via `..` components
+/// - Backtick / dollar-sign subshell patterns
+/// - Excessive length (same limit as ref names)
+///
+/// # Errors
+///
+/// Returns [`ToolKindError::InvalidGitRef`] if the argument contains
+/// injection patterns, or [`ToolKindError::ShellMetacharacterInjection`]
+/// for shell metacharacter violations.
+fn validate_refspec_or_url(arg: &str, index: usize) -> Result<(), ToolKindError> {
+    let field = format!("git_op.args[{index}]");
+
+    // Null byte check
+    if arg.contains('\0') {
+        return Err(ToolKindError::ShellMetacharacterInjection { field, ch: '\0' });
+    }
+
+    // Shell metacharacter check (pipes, semicolons, backticks, etc.)
+    for ch in SHELL_METACHARACTERS {
+        if arg.contains(*ch) {
+            return Err(ToolKindError::ShellMetacharacterInjection { field, ch: *ch });
+        }
+    }
+
+    // Flag injection in URL/refspec position
+    if arg.starts_with('-') {
+        return Err(ToolKindError::InvalidGitRef {
+            value: arg.to_string(),
+            reason: "URL/refspec must not start with '-' (flag injection)".to_string(),
+        });
+    }
+
+    // Path traversal prevention
+    if arg.contains("..") {
+        return Err(ToolKindError::InvalidGitRef {
+            value: arg.to_string(),
+            reason: "URL/refspec must not contain '..' (traversal)".to_string(),
+        });
+    }
+
+    // Length limit (same as ref names)
+    if arg.len() > MAX_GIT_REF_LEN {
+        return Err(ToolKindError::InvalidGitRef {
+            value: arg.chars().take(64).collect::<String>() + "...",
+            reason: format!("URL/refspec exceeds maximum length of {MAX_GIT_REF_LEN}"),
+        });
+    }
+
+    Ok(())
+}
+
 // =============================================================================
 // IdempotencyPrecondition
 // =============================================================================
@@ -1211,26 +1272,36 @@ fn from_git_op(req: &GitOperation) -> Result<ToolKind, ToolKindError> {
             past_double_dash = true;
         }
 
-        // Apply git ref validation to non-flag, non-pathspec positional
-        // arguments for ref-accepting operations. Arguments starting with
-        // `-` are flags. Arguments after `--` are pathspecs. Everything
-        // else is a potential ref name that must be validated.
+        // Apply git ref validation to non-pathspec positional arguments for
+        // ref-accepting operations. Arguments after `--` are pathspecs, not
+        // refs, and are exempt from ref validation.
+        //
+        // Per RFC §6.1.1/§6.2.1, args starting with `-` in ref positions are
+        // rejected as potential flag injection. Flags must be identified
+        // structurally, not passed through ref validation paths.
         //
         // Exception: operations that accept URLs or refspecs (clone, fetch,
-        // push, pull, remote) skip ref validation for arguments that look
-        // like URLs or refspecs. These are still validated for shell
-        // metacharacters via `validate_git_arg` above.
-        if !past_double_dash
-            && !arg.starts_with('-')
-            && !arg.is_empty()
-            && operation.accepts_ref_args()
-        {
-            // Skip ref validation for URL-like or refspec-like args when
-            // the operation accepts them.
-            let skip_ref_validation = operation.accepts_url_or_refspec_args()
-                && (looks_like_url(arg) || looks_like_refspec(arg));
+        // push, pull, remote) route URL/refspec-shaped args through
+        // `validate_refspec_or_url` for metacharacter safety instead of
+        // strict ref validation.
+        if !past_double_dash && !arg.is_empty() && operation.accepts_ref_args() {
+            // Flag-like args in ref positions are flag injection.
+            if arg.starts_with('-') {
+                return Err(ToolKindError::InvalidGitRef {
+                    value: arg.clone(),
+                    reason: "flag-like argument in ref position rejected \
+                             (potential flag injection per RFC §6.1.1)"
+                        .to_string(),
+                });
+            }
 
-            if !skip_ref_validation {
+            // URL/refspec-shaped args get targeted validation instead of
+            // strict ref validation (which would reject `://`, `:`, `@`).
+            if operation.accepts_url_or_refspec_args()
+                && (looks_like_url(arg) || looks_like_refspec(arg))
+            {
+                validate_refspec_or_url(arg, i)?;
+            } else {
                 validate_git_ref(arg)?;
             }
         }
@@ -2366,14 +2437,17 @@ mod tests {
         });
         assert!(tool_kind_from_proto(&tool).is_ok());
 
-        // Ref starting with dash (flag injection)
+        // Ref starting with dash (flag injection) — must be REJECTED per
+        // RFC §6.1.1: flag-like arguments in ref positions are denied.
         let tool = tool_request::Tool::GitOp(GitOperation {
             operation: "MERGE".to_string(),
             args: vec!["--upload-pack=evil".to_string()],
             cwd: String::new(),
         });
-        // This is a flag arg (starts with -), so ref validation is skipped
-        assert!(tool_kind_from_proto(&tool).is_ok());
+        assert!(
+            tool_kind_from_proto(&tool).is_err(),
+            "flag-like arg in ref position must be rejected"
+        );
     }
 
     #[test]
@@ -2605,6 +2679,84 @@ mod tests {
         assert!(!GitOpKind::Rebase.accepts_url_or_refspec_args());
         assert!(!GitOpKind::Tag.accepts_url_or_refspec_args());
         assert!(!GitOpKind::Reset.accepts_url_or_refspec_args());
+    }
+
+    // =========================================================================
+    // TCK-00377 BLOCKER: Flag-like args rejected in ref positions
+    // =========================================================================
+
+    #[test]
+    fn test_git_op_rejects_flag_in_ref_position_checkout() {
+        // Per RFC §6.1.1, flag-like args in ref positions are rejected.
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "CHECKOUT".to_string(),
+            args: vec!["-b".to_string()],
+            cwd: String::new(),
+        });
+        assert!(
+            tool_kind_from_proto(&tool).is_err(),
+            "flag-like arg '-b' in ref position must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_git_op_rejects_flag_in_ref_position_push() {
+        // Push also accepts refs; flag-like args must be rejected.
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "PUSH".to_string(),
+            args: vec!["--force".to_string()],
+            cwd: String::new(),
+        });
+        assert!(
+            tool_kind_from_proto(&tool).is_err(),
+            "flag-like arg '--force' in ref position must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_git_op_rejects_flag_in_ref_position_clone() {
+        // Clone accepts refs; flag-like args must be rejected.
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "CLONE".to_string(),
+            args: vec!["--upload-pack=evil".to_string()],
+            cwd: String::new(),
+        });
+        assert!(
+            tool_kind_from_proto(&tool).is_err(),
+            "flag-like arg in clone ref position must be rejected"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00377 MAJOR: URL/refspec strict validation
+    // =========================================================================
+
+    #[test]
+    fn test_git_clone_url_with_traversal_rejected() {
+        // URL with path traversal `..` must be rejected.
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "CLONE".to_string(),
+            args: vec!["https://evil.com/../etc/passwd".to_string()],
+            cwd: String::new(),
+        });
+        assert!(
+            tool_kind_from_proto(&tool).is_err(),
+            "URL with path traversal must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_git_push_refspec_with_traversal_rejected() {
+        // Refspec with `..` must be rejected.
+        let tool = tool_request::Tool::GitOp(GitOperation {
+            operation: "PUSH".to_string(),
+            args: vec!["origin".to_string(), "main:refs/../HEAD".to_string()],
+            cwd: String::new(),
+        });
+        assert!(
+            tool_kind_from_proto(&tool).is_err(),
+            "refspec with path traversal must be rejected"
+        );
     }
 
     // =========================================================================
