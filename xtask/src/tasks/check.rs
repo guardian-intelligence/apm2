@@ -1059,6 +1059,10 @@ fn count_file_references(text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
+    use tempfile::NamedTempFile;
+
     use super::*;
 
     #[test]
@@ -1429,5 +1433,139 @@ mod tests {
     fn test_exit_timeout_constant() {
         // Verify the timeout exit code is 2 as required
         assert_eq!(EXIT_TIMEOUT, 2);
+    }
+
+    #[test]
+    fn test_parse_pr_url_for_check_accepts_valid_urls() {
+        assert_eq!(
+            parse_pr_url_for_check("https://github.com/guardian-intelligence/apm2/pull/502"),
+            Some(("guardian-intelligence/apm2".to_string(), 502))
+        );
+        assert_eq!(
+            parse_pr_url_for_check("http://github.com/guardian-intelligence/apm2/pull/1"),
+            Some(("guardian-intelligence/apm2".to_string(), 1))
+        );
+        assert_eq!(
+            parse_pr_url_for_check("github.com/guardian-intelligence/apm2/pull/999"),
+            Some(("guardian-intelligence/apm2".to_string(), 999))
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_url_for_check_rejects_invalid_urls() {
+        assert_eq!(parse_pr_url_for_check(""), None);
+        assert_eq!(
+            parse_pr_url_for_check("https://example.com/x/y/pull/1"),
+            None
+        );
+        assert_eq!(
+            parse_pr_url_for_check("https://github.com/guardian-intelligence/apm2/issues/1"),
+            None
+        );
+        assert_eq!(
+            parse_pr_url_for_check(
+                "https://github.com/guardian-intelligence/apm2/pull/not-a-number"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_count_file_references_counts_paths_and_line_numbers() {
+        let text = r"
+Some findings:
+- crates/apm2-cli/src/commands/ci.rs:42
+- .github/workflows/ci.yml:12:3
+- documents/reviews/CI_EXPECTATIONS.md
+- scripts/ci/run_bounded_tests.sh:216
+- proto/kernel_events.proto:1
+";
+        assert_eq!(count_file_references(text), 5);
+    }
+
+    #[test]
+    fn test_validate_reviewer_last_message_quality_happy_path() {
+        let sha = "a".repeat(40);
+        let mut file = NamedTempFile::new().expect("temp file");
+
+        // Ensure output is large enough to avoid "too short" restarts.
+        let filler = "x".repeat(900);
+        let body = format!(
+            r#"## Code Quality Review: PASS
+
+Summary
+This is a synthetic review body for testing.
+
+Quality Analysis
+Notes.
+
+Lenses Applied
+Notes.
+
+Machine-Readable Metadata
+
+Evidence references:
+- crates/apm2-cli/src/commands/ci.rs:42
+- .github/workflows/ci.yml:12
+- documents/reviews/CI_EXPECTATIONS.md:31
+- scripts/ci/run_bounded_tests.sh:216
+- proto/kernel_events.proto:1
+
+{sha}
+
+<!-- apm2-review-metadata:v1:code-quality -->
+```json
+{{"schema":"apm2.review.metadata.v1","review_type":"code-quality","pr_number":1,"head_sha":"{sha}","verdict":"PASS","severity_counts":{{"blocker":0,"major":0,"minor":0,"nit":0}},"reviewer_id":"apm2-codex-quality"}}
+```
+
+{filler}
+"#
+        );
+        file.write_all(body.as_bytes()).expect("write body");
+
+        let result = validate_reviewer_last_message("quality", &sha, file.path());
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn test_validate_reviewer_last_message_quality_missing_sections() {
+        let sha = "b".repeat(40);
+        let mut file = NamedTempFile::new().expect("temp file");
+
+        let body = format!(
+            r#"## Code Quality Review: PASS
+
+Summary
+Only summary present.
+
+{sha}
+
+<!-- apm2-review-metadata:v1:code-quality -->
+```json
+{{"schema":"apm2.review.metadata.v1","review_type":"code-quality","pr_number":1,"head_sha":"{sha}","verdict":"PASS","severity_counts":{{"blocker":0,"major":0,"minor":0,"nit":0}},"reviewer_id":"apm2-codex-quality"}}
+```
+
+crates/apm2-cli/src/commands/ci.rs:42
+.github/workflows/ci.yml:12
+documents/reviews/CI_EXPECTATIONS.md:31
+scripts/ci/run_bounded_tests.sh:216
+proto/kernel_events.proto:1
+
+{}
+"#,
+            "x".repeat(900)
+        );
+        file.write_all(body.as_bytes()).expect("write body");
+
+        let result = validate_reviewer_last_message("quality", &sha, file.path());
+        let Err(reasons) = result else {
+            panic!("expected Err for missing sections");
+        };
+
+        // We should detect missing key sections.
+        let joined = reasons.join("\n");
+        assert!(joined.contains("Missing required section keyword `Quality Analysis`"));
+        assert!(joined.contains("Missing required section keyword `Lenses Applied`"));
+        assert!(joined.contains("Missing required section keyword `Machine-Readable Metadata`"));
     }
 }

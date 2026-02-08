@@ -68,6 +68,7 @@ jobs:
           fi
 
           HEAD_SHA=$(echo "$PR_DATA" | jq -r '.[0].head.sha')
+          BASE_REF=$(echo "$PR_DATA" | jq -r '.[0].base.ref')
           HEAD_REPO=$(echo "$PR_DATA" | jq -r '.[0].head.repo.full_name')
 
           if [[ "$HEAD_REPO" != "$OWNER_REPO" ]]; then
@@ -75,10 +76,46 @@ jobs:
             exit 1
           fi
 
+          if [[ -z "$BASE_REF" ]]; then
+            echo "::error::Could not resolve PR base ref; refusing to evaluate with mutable PR-branch policy."
+            exit 1
+          fi
+
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
           echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "base_ref=${BASE_REF}" >> "$GITHUB_OUTPUT"
           echo "pr_url=https://github.com/${OWNER_REPO}/pull/${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch trusted reviewers from base branch
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin "${{ steps.pr.outputs.base_ref }}" --depth=1
+          git show "origin/${{ steps.pr.outputs.base_ref }}:.github/review-gate/trusted-reviewers.json" \
+            > /tmp/trusted-reviewers-base.json
+
+      - name: Validate review bot identity is allowlisted
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          REVIEW_BOT_TOKEN: ${{ secrets.AUTO_APPROVE_PAT }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${REVIEW_BOT_TOKEN:-}" ]]; then
+            echo "::error::Missing required secret AUTO_APPROVE_PAT (must map to an allowlisted reviewer identity)."
+            exit 1
+          fi
+
+          BOT_LOGIN=$(GH_TOKEN="${REVIEW_BOT_TOKEN}" gh api user --jq '.login')
+          echo "Using review bot login: ${BOT_LOGIN}"
+
+          jq -e --arg login "$BOT_LOGIN" \
+            '[.reviewers.code_quality[].github_logins[] | ascii_downcase] | index($login|ascii_downcase) != null' \
+            /tmp/trusted-reviewers-base.json >/dev/null
 
       - name: Post pending review gate status (early)
         if: steps.pr.outputs.skip != 'true'
@@ -93,8 +130,12 @@ jobs:
       - name: Run code quality review
         if: steps.pr.outputs.skip != 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.AUTO_APPROVE_PAT }}
         run: |
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::Missing required secret AUTO_APPROVE_PAT (authoritative reviewer identity token)."
+            exit 1
+          fi
           cargo xtask review quality "${{ steps.pr.outputs.pr_url }}"
 
       - name: Evaluate and post review gate status
@@ -119,7 +160,7 @@ jobs:
             --repo "${{ github.repository }}" \
             --pr-number "${PR_NUMBER}" \
             --head-sha "${EXPECTED_HEAD_SHA}" \
-            --trusted-reviewers ".github/review-gate/trusted-reviewers.json" \
+            --trusted-reviewers "/tmp/trusted-reviewers-base.json" \
             | tee /tmp/review-gate-evaluation.json
           code=${PIPESTATUS[0]}
           set -e
@@ -151,4 +192,3 @@ jobs:
             -f description="${description}"
 
           exit "$exit_code"
-
