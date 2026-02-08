@@ -1264,11 +1264,9 @@ fn test_emit_review_blocked_receipt_includes_outcome_fields() {
     }
 }
 
-/// IT-00416-41: `validate_and_store_transition_authority` enforces non-zero
-/// for capability_manifest_hash and context_pack_hash. CAS resolvability for
-/// these policy-provided fields is delegated to the governance CAS seeding
-/// pipeline, but the standalone `validate_transition_authority_bindings`
-/// does check CAS resolvability for all hashes.
+/// IT-00416-41: Both standalone and handler-level validators enforce CAS
+/// resolvability for capability_manifest_hash and context_pack_hash
+/// (REQ-HEF-0013).
 #[test]
 fn test_standalone_validator_checks_cas_for_manifest_and_context() {
     let work_id = "W-416-CAS-CHECK";
@@ -1280,8 +1278,8 @@ fn test_standalone_validator_checks_cas_for_manifest_and_context() {
     store_authority_binding_artifacts(work_id, &bindings, cas.as_ref())
         .expect("self-derived CAS store should succeed");
 
-    // The standalone validator (not handler-level) checks CAS resolvability
-    // for ALL hashes including policy-provided ones.
+    // The standalone validator checks CAS resolvability for ALL hashes
+    // including policy-provided ones.
     let result = validate_transition_authority_bindings(&bindings, cas.as_ref());
     assert!(
         result.is_err(),
@@ -1300,5 +1298,117 @@ fn test_standalone_validator_checks_cas_for_manifest_and_context() {
             .iter()
             .any(|v| v.contains("context_pack_hash") && v.contains("not resolvable")),
         "violation must mention context_pack_hash CAS resolvability: {err:?}"
+    );
+}
+
+// ============================================================================
+// Handler-path negative tests: validate_and_store_transition_authority
+// rejects non-zero hashes absent from CAS (REQ-HEF-0013)
+// ============================================================================
+
+/// IT-00416-42: `validate_and_store_transition_authority` rejects
+/// `capability_manifest_hash` that is non-zero but absent from CAS.
+///
+/// This exercises the handler-level validator used by both `ClaimWork`
+/// and `SpawnEpisode`. Self-derived hashes are stored by the function
+/// itself, but policy-provided hashes MUST be pre-seeded by the caller.
+/// When the manifest hash is absent, validation must fail.
+#[test]
+fn test_handler_validator_rejects_manifest_hash_absent_from_cas() {
+    let work_id = "W-416-HANDLER-NOCAP";
+    let bindings = valid_bindings(work_id);
+
+    // Store ONLY self-derived artifacts + context_pack preimage,
+    // but NOT the capability_manifest preimage.
+    let cas = Arc::new(MemoryCas::new());
+    store_authority_binding_artifacts(work_id, &bindings, cas.as_ref())
+        .expect("self-derived CAS store should succeed");
+
+    // Store context_pack preimage so it passes, isolating the manifest failure.
+    let context_payload = b"context-pack-content";
+    cas.store(context_payload).expect("context pack CAS store");
+
+    let result = validate_and_store_transition_authority(work_id, &bindings, cas.as_ref());
+    assert!(
+        result.is_err(),
+        "handler-level validator must reject when capability_manifest_hash is absent from CAS"
+    );
+
+    let err = result.unwrap_err();
+    assert!(
+        err.violations
+            .iter()
+            .any(|v| v.contains("capability_manifest_hash") && v.contains("not resolvable")),
+        "violation must mention capability_manifest_hash CAS absence: {err:?}"
+    );
+}
+
+/// IT-00416-43: `validate_and_store_transition_authority` rejects
+/// `context_pack_hash` that is non-zero but absent from CAS.
+///
+/// Same handler-level validator path. Capability manifest preimage IS
+/// stored; only the context pack is missing.
+#[test]
+fn test_handler_validator_rejects_context_pack_hash_absent_from_cas() {
+    let work_id = "W-416-HANDLER-NOCTX";
+    let bindings = valid_bindings(work_id);
+
+    // Store self-derived artifacts + capability_manifest preimage,
+    // but NOT the context_pack preimage.
+    let cas = Arc::new(MemoryCas::new());
+    store_authority_binding_artifacts(work_id, &bindings, cas.as_ref())
+        .expect("self-derived CAS store should succeed");
+
+    // Store capability_manifest preimage so it passes.
+    let manifest_payload = b"capability-manifest-content";
+    cas.store(manifest_payload)
+        .expect("capability manifest CAS store");
+
+    let result = validate_and_store_transition_authority(work_id, &bindings, cas.as_ref());
+    assert!(
+        result.is_err(),
+        "handler-level validator must reject when context_pack_hash is absent from CAS"
+    );
+
+    let err = result.unwrap_err();
+    assert!(
+        err.violations
+            .iter()
+            .any(|v| v.contains("context_pack_hash") && v.contains("not resolvable")),
+        "violation must mention context_pack_hash CAS absence: {err:?}"
+    );
+}
+
+/// IT-00416-44: `validate_and_store_transition_authority` rejects when
+/// BOTH `capability_manifest_hash` and `context_pack_hash` are non-zero
+/// but absent from CAS. Both violations must be reported.
+#[test]
+fn test_handler_validator_rejects_both_policy_hashes_absent_from_cas() {
+    let work_id = "W-416-HANDLER-BOTH";
+    let bindings = valid_bindings(work_id);
+
+    // Only store self-derived artifacts; no policy artifacts.
+    let cas = Arc::new(MemoryCas::new());
+    store_authority_binding_artifacts(work_id, &bindings, cas.as_ref())
+        .expect("self-derived CAS store should succeed");
+
+    let result = validate_and_store_transition_authority(work_id, &bindings, cas.as_ref());
+    assert!(
+        result.is_err(),
+        "handler-level validator must reject when both policy hashes are absent from CAS"
+    );
+
+    let err = result.unwrap_err();
+    assert!(
+        err.violations
+            .iter()
+            .any(|v| v.contains("capability_manifest_hash") && v.contains("not resolvable")),
+        "must report capability_manifest_hash CAS absence: {err:?}"
+    );
+    assert!(
+        err.violations
+            .iter()
+            .any(|v| v.contains("context_pack_hash") && v.contains("not resolvable")),
+        "must report context_pack_hash CAS absence: {err:?}"
     );
 }

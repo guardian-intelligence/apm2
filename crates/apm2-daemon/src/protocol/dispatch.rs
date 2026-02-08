@@ -1814,19 +1814,112 @@ pub fn store_authority_binding_artifacts(
     Ok(())
 }
 
+/// Builds the deterministic context pack manifest used by policy resolvers.
+///
+/// Both [`StubPolicyResolver`] and
+/// [`GovernancePolicyResolver`](crate::governance::GovernancePolicyResolver)
+/// derive the context pack from `(work_id, actor_id)` using this shared
+/// logic.  Extracting it into a helper ensures that
+/// [`seed_policy_artifacts_in_cas`] reproduces the exact same preimage.
+pub fn build_policy_context_pack(
+    work_id: &str,
+    actor_id: &str,
+) -> apm2_core::context::ContextPackManifest {
+    use apm2_core::context::{AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder};
+
+    let content_hash = blake3::hash(format!("content:{work_id}:{actor_id}").as_bytes());
+
+    ContextPackManifestBuilder::new(format!("manifest:{work_id}"), format!("profile:{actor_id}"))
+        .add_entry(
+            ManifestEntryBuilder::new(
+                format!("/work/{work_id}/context.yaml"),
+                *content_hash.as_bytes(),
+            )
+            .stable_id("work-context")
+            .access_level(AccessLevel::Read)
+            .build(),
+        )
+        .build()
+}
+
+/// Returns the `capability_manifest_hash` that [`seed_policy_artifacts_in_cas`]
+/// will store for the given `(work_id, actor_id, role)`.
+///
+/// Tests that construct `PolicyResolution` directly MUST use this hash
+/// so that the CAS-seeded preimage matches.
+pub fn policy_capability_manifest_hash(work_id: &str, actor_id: &str, role: WorkRole) -> [u8; 32] {
+    if role == WorkRole::Reviewer {
+        *crate::episode::reviewer_manifest::reviewer_v0_manifest_hash()
+    } else {
+        let preimage = format!("manifest:{work_id}:{actor_id}");
+        *blake3::hash(preimage.as_bytes()).as_bytes()
+    }
+}
+
+/// Returns the `context_pack_hash` that [`seed_policy_artifacts_in_cas`]
+/// will store for the given `(work_id, actor_id)`.
+///
+/// Tests that construct `PolicyResolution` directly MUST use this hash
+/// so that the CAS-seeded preimage matches.
+pub fn policy_context_pack_hash(work_id: &str, actor_id: &str) -> [u8; 32] {
+    let context_pack = build_policy_context_pack(work_id, actor_id);
+    context_pack.manifest_hash()
+}
+
+/// Seeds CAS with the preimages of policy-provided hashes so they become
+/// CAS-resolvable at validation time (REQ-HEF-0013).
+///
+/// MUST be called before [`validate_and_store_transition_authority`] in
+/// handler paths (`handle_claim_work`, `handle_spawn_episode`).
+///
+/// For the **capability manifest**, the preimage is either:
+/// - Reviewer role: the canonical bytes of the reviewer v0 manifest.
+/// - Other roles: `format!("manifest:{work_id}:{actor_id}")`.
+///
+/// For the **context pack**, the preimage is the
+/// [`canonical_seal_bytes`](apm2_core::context::ContextPackManifest::canonical_seal_bytes)
+/// of the deterministic context pack built from `(work_id, actor_id)`.
+pub fn seed_policy_artifacts_in_cas(
+    work_id: &str,
+    actor_id: &str,
+    role: WorkRole,
+    cas: &dyn ContentAddressedStore,
+) -> Result<(), String> {
+    // ---- capability manifest preimage ----
+    if role == WorkRole::Reviewer {
+        let manifest = crate::episode::reviewer_manifest::reviewer_v0_manifest();
+        let canonical = manifest.canonical_bytes();
+        cas.store(&canonical)
+            .map_err(|e| format!("CAS store reviewer manifest failed: {e}"))?;
+    } else {
+        let preimage = format!("manifest:{work_id}:{actor_id}");
+        cas.store(preimage.as_bytes())
+            .map_err(|e| format!("CAS store capability manifest failed: {e}"))?;
+    }
+
+    // ---- context pack preimage ----
+    let context_pack = build_policy_context_pack(work_id, actor_id);
+    let seal_bytes = context_pack.canonical_seal_bytes();
+    cas.store(&seal_bytes)
+        .map_err(|e| format!("CAS store context pack failed: {e}"))?;
+
+    Ok(())
+}
+
 /// Handler-level authority binding validation for production transition paths
 /// (TCK-00416).
 ///
 /// This combines CAS artifact storage and binding validation into one
 /// transactional call. ALL binding hashes (including policy-provided
 /// `capability_manifest_hash` and `context_pack_hash`) are validated as
-/// non-zero per REQ-HEF-0013. Zero values indicate missing policy resolution
-/// and are hard failures.
+/// non-zero AND CAS-resolvable per REQ-HEF-0013. Zero values indicate
+/// missing policy resolution and are hard failures.
 ///
 /// Self-derived hashes (permeability receipt, stop conditions, typed budget)
-/// are stored in CAS and then validated for both non-zero and CAS
-/// resolvability. Policy-provided hashes are non-zero checked but CAS
-/// resolvability is delegated to the governance CAS seeding pipeline.
+/// are stored in CAS by [`store_authority_binding_artifacts`] in Step 1.
+/// Policy-provided hashes (`capability_manifest_hash`, `context_pack_hash`)
+/// MUST be seeded in CAS by the caller before invoking this function (see
+/// [`seed_policy_artifacts_in_cas`]).
 ///
 /// # Fail-Closed Semantics
 ///
@@ -1879,16 +1972,22 @@ pub fn validate_and_store_transition_authority(
         violations.push("typed_budget_hash is zero (unset)".to_string());
     }
 
-    // CAS resolvability for self-derived hashes.
-    // capability_manifest_hash and context_pack_hash are policy-provided;
-    // their CAS seeding is the policy resolver's responsibility. We enforce
-    // non-zero above but skip CAS resolvability here to avoid coupling
-    // validation to the governance CAS seeding pipeline.
+    // CAS resolvability for ALL required hashes (REQ-HEF-0013).
+    // Both self-derived hashes (permeability, stop, budget) and
+    // policy-provided hashes (capability_manifest, context_pack) MUST
+    // be CAS-resolvable at validation time. Callers are responsible for
+    // storing policy-provided preimages in CAS before invoking this
+    // function (see `seed_policy_artifacts_in_cas`).
     for (name, hash) in [
         (
             "permeability_receipt_hash",
             bindings.permeability_receipt_hash,
         ),
+        (
+            "capability_manifest_hash",
+            bindings.capability_manifest_hash,
+        ),
+        ("context_pack_hash", bindings.context_pack_hash),
         ("stop_condition_hash", bindings.stop_condition_hash),
         ("typed_budget_hash", bindings.typed_budget_hash),
     ] {
@@ -3654,8 +3753,6 @@ impl PolicyResolver for StubPolicyResolver {
         role: WorkRole,
         actor_id: &str,
     ) -> Result<PolicyResolution, PolicyResolutionError> {
-        use apm2_core::context::{AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder};
-
         use crate::episode::reviewer_manifest::reviewer_v0_manifest_hash;
 
         // Generate deterministic hash for policy
@@ -3698,24 +3795,9 @@ impl PolicyResolver for StubPolicyResolver {
         };
 
         // TCK-00255: Create and seal a context pack manifest
-        // In production, this would be populated with actual file entries from
-        // the work definition. For the stub, we create a deterministic manifest
-        // based on work_id and actor_id.
-        let content_hash = blake3::hash(format!("content:{work_id}:{actor_id}").as_bytes());
-        let context_pack = ContextPackManifestBuilder::new(
-            format!("manifest:{work_id}"),
-            format!("profile:{actor_id}"),
-        )
-        .add_entry(
-            ManifestEntryBuilder::new(
-                format!("/work/{work_id}/context.yaml"),
-                *content_hash.as_bytes(),
-            )
-            .stable_id("work-context")
-            .access_level(AccessLevel::Read)
-            .build(),
-        )
-        .build();
+        // Uses the shared `build_policy_context_pack` helper so that
+        // `seed_policy_artifacts_in_cas` can reproduce the same preimage.
+        let context_pack = build_policy_context_pack(work_id, actor_id);
 
         // TCK-00255: Call seal() to get the context pack hash
         // This ensures the hash is deterministic and verifiable.
@@ -6990,6 +7072,23 @@ impl PrivilegedDispatcher {
                 },
             };
 
+            // REQ-HEF-0013: Seed policy-provided CAS artifacts so
+            // capability_manifest_hash and context_pack_hash are
+            // CAS-resolvable during validation.
+            if let Err(e) =
+                seed_policy_artifacts_in_cas(&claim.work_id, &claim.actor_id, claim.role, cas)
+            {
+                warn!(
+                    work_id = %claim.work_id,
+                    error = %e,
+                    "ClaimWork rejected: policy CAS artifact seeding failed"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("policy CAS artifact seeding failed: {e}"),
+                ));
+            }
+
             if let Err(auth_err) =
                 validate_and_store_transition_authority(&claim.work_id, &bindings, cas)
             {
@@ -8114,6 +8213,23 @@ impl PrivilegedDispatcher {
                     ));
                 },
             };
+
+            // REQ-HEF-0013: Seed policy-provided CAS artifacts so
+            // capability_manifest_hash and context_pack_hash are
+            // CAS-resolvable during validation.
+            if let Err(e) =
+                seed_policy_artifacts_in_cas(&claim.work_id, &claim.actor_id, claim.role, cas)
+            {
+                warn!(
+                    work_id = %request.work_id,
+                    error = %e,
+                    "SpawnEpisode rejected: policy CAS artifact seeding failed"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("policy CAS artifact seeding failed: {e}"),
+                ));
+            }
 
             if let Err(auth_err) =
                 validate_and_store_transition_authority(&claim.work_id, &bindings, cas)
@@ -15773,8 +15889,15 @@ mod tests {
             policy_resolution: PolicyResolution {
                 policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
                 resolved_policy_hash: [0xAA; 32],
-                capability_manifest_hash: *blake3::hash(b"sod-test-manifest").as_bytes(),
-                context_pack_hash: *blake3::hash(b"sod-test-context").as_bytes(),
+                capability_manifest_hash: policy_capability_manifest_hash(
+                    "W-team-dev-test456",
+                    "team-review:alice",
+                    WorkRole::GateExecutor,
+                ),
+                context_pack_hash: policy_context_pack_hash(
+                    "W-team-dev-test456",
+                    "team-review:alice",
+                ),
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
                 expected_adapter_profile_hash: None,
@@ -15911,8 +16034,15 @@ mod tests {
             policy_resolution: PolicyResolution {
                 policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
                 resolved_policy_hash: [0xAA; 32],
-                capability_manifest_hash: *blake3::hash(b"sod-impl-manifest").as_bytes(),
-                context_pack_hash: *blake3::hash(b"sod-impl-context").as_bytes(),
+                capability_manifest_hash: policy_capability_manifest_hash(
+                    "W-team-alpha-impl123",
+                    "team-alpha:developer",
+                    WorkRole::Implementer,
+                ),
+                context_pack_hash: policy_context_pack_hash(
+                    "W-team-alpha-impl123",
+                    "team-alpha:developer",
+                ),
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
                 expected_adapter_profile_hash: None,
@@ -25092,7 +25222,7 @@ mod tests {
 
         use super::*;
         use crate::episode::capability::ScopeBaseline;
-        use crate::episode::reviewer_manifest::{reviewer_v0_manifest, reviewer_v0_manifest_hash};
+        use crate::episode::reviewer_manifest::reviewer_v0_manifest;
         use crate::episode::tool_class::ToolClass;
         use crate::protocol::session_dispatch::V1ManifestStore;
 
@@ -25122,8 +25252,15 @@ mod tests {
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-v3-none".to_string(),
                     resolved_policy_hash: [0xAA; 32],
-                    capability_manifest_hash: *blake3::hash(b"v3-none-manifest").as_bytes(),
-                    context_pack_hash: *blake3::hash(b"v3-none-context").as_bytes(),
+                    capability_manifest_hash: policy_capability_manifest_hash(
+                        "W-V3-SCOPE-NONE",
+                        "actor:test-impl",
+                        WorkRole::Implementer,
+                    ),
+                    context_pack_hash: policy_context_pack_hash(
+                        "W-V3-SCOPE-NONE",
+                        "actor:test-impl",
+                    ),
                     resolved_risk_tier: 1,
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
@@ -25186,8 +25323,15 @@ mod tests {
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-v3-narrow".to_string(),
                     resolved_policy_hash: [0xAA; 32],
-                    capability_manifest_hash: *reviewer_v0_manifest_hash(),
-                    context_pack_hash: *blake3::hash(b"v3-narrow-context").as_bytes(),
+                    capability_manifest_hash: policy_capability_manifest_hash(
+                        "W-V3-SCOPE-NARROW",
+                        "actor:test-reviewer",
+                        WorkRole::Reviewer,
+                    ),
+                    context_pack_hash: policy_context_pack_hash(
+                        "W-V3-SCOPE-NARROW",
+                        "actor:test-reviewer",
+                    ),
                     resolved_risk_tier: 1,
                     resolved_scope_baseline: Some(narrow_baseline),
                     expected_adapter_profile_hash: None,
@@ -25254,8 +25398,15 @@ mod tests {
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-v3-risk".to_string(),
                     resolved_policy_hash: [0xAA; 32],
-                    capability_manifest_hash: *reviewer_v0_manifest_hash(),
-                    context_pack_hash: *blake3::hash(b"v3-risk-context").as_bytes(),
+                    capability_manifest_hash: policy_capability_manifest_hash(
+                        "W-V3-RISK-CEIL",
+                        "actor:test-reviewer",
+                        WorkRole::Reviewer,
+                    ),
+                    context_pack_hash: policy_context_pack_hash(
+                        "W-V3-RISK-CEIL",
+                        "actor:test-reviewer",
+                    ),
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: Some(matching_baseline),
                     expected_adapter_profile_hash: None,
@@ -25319,8 +25470,15 @@ mod tests {
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-v3-invalid".to_string(),
                     resolved_policy_hash: [0xAA; 32],
-                    capability_manifest_hash: *reviewer_v0_manifest_hash(),
-                    context_pack_hash: *blake3::hash(b"v3-invalid-context").as_bytes(),
+                    capability_manifest_hash: policy_capability_manifest_hash(
+                        "W-V3-RISK-INV",
+                        "actor:test-reviewer",
+                        WorkRole::Reviewer,
+                    ),
+                    context_pack_hash: policy_context_pack_hash(
+                        "W-V3-RISK-INV",
+                        "actor:test-reviewer",
+                    ),
                     // Invalid tier value
                     resolved_risk_tier: 255,
                     resolved_scope_baseline: Some(matching_baseline),
