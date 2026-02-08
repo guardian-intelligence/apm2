@@ -52,8 +52,10 @@
 //! Until the daemon-layer wiring lands, the API is library-only and must be
 //! called explicitly by consumers.
 
+use std::collections::HashSet;
 use std::fmt;
 
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -83,6 +85,77 @@ const MAX_SIGNATURE_SIZE: usize = 256;
 /// Receipts whose `expires_at_ms - issued_at_ms` exceeds this window are
 /// rejected even if not yet expired. This bounds replay risk.
 const MAX_RECEIPT_LIFETIME_MS: u64 = 3_600_000;
+
+/// Maximum length for a receipt ID (nonce / unique identifier).
+const MAX_RECEIPT_ID_LEN: usize = 256;
+
+/// Maximum length for a payload hash or envelope hash in a receipt.
+const MAX_EFFECT_HASH_LEN: usize = 64;
+
+/// Maximum number of consumed receipt IDs tracked for anti-replay.
+/// Once this limit is reached, further declassification attempts are
+/// denied (fail-closed) to prevent unbounded memory growth.
+const MAX_CONSUMED_RECEIPTS: usize = 100_000;
+
+/// Maximum length for any individual `String` field when deserializing
+/// a [`DeclassificationReceipt`]. Used by the bounded deserialization
+/// helper to reject oversized payloads during deserialization before
+/// allocation completes.
+const MAX_DESERIALIZE_STRING_LEN: usize = 2048;
+
+// =============================================================================
+// Bounded deserialization helpers
+// =============================================================================
+
+/// Serde deserializer that rejects strings exceeding
+/// [`MAX_DESERIALIZE_STRING_LEN`] during deserialization, preventing
+/// memory allocation of oversized payloads before the receipt is even
+/// fully constructed.
+fn deserialize_bounded_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s.len() > MAX_DESERIALIZE_STRING_LEN {
+        return Err(serde::de::Error::custom(format!(
+            "string field length {} exceeds maximum {MAX_DESERIALIZE_STRING_LEN}",
+            s.len()
+        )));
+    }
+    Ok(s)
+}
+
+/// Serde deserializer that rejects byte vectors exceeding
+/// [`MAX_EFFECT_HASH_LEN`] during deserialization.
+fn deserialize_bounded_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Vec::<u8>::deserialize(deserializer)?;
+    if v.len() > MAX_EFFECT_HASH_LEN {
+        return Err(serde::de::Error::custom(format!(
+            "bytes field length {} exceeds maximum {MAX_EFFECT_HASH_LEN}",
+            v.len()
+        )));
+    }
+    Ok(v)
+}
+
+/// Serde deserializer that rejects signature byte vectors exceeding
+/// [`MAX_SIGNATURE_SIZE`] during deserialization.
+fn deserialize_bounded_signature<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Vec::<u8>::deserialize(deserializer)?;
+    if v.len() > MAX_SIGNATURE_SIZE {
+        return Err(serde::de::Error::custom(format!(
+            "signature field length {} exceeds maximum {MAX_SIGNATURE_SIZE}",
+            v.len()
+        )));
+    }
+    Ok(v)
+}
 
 // =============================================================================
 // Errors
@@ -176,6 +249,30 @@ pub enum TaintError {
     #[error("receipt expired or invalid timestamps: {reason}")]
     ReceiptExpired {
         /// Why the receipt was rejected.
+        reason: String,
+    },
+
+    /// A receipt has already been consumed (anti-replay).
+    #[error("receipt already consumed: {receipt_id}")]
+    ReceiptAlreadyConsumed {
+        /// The receipt ID that was already consumed.
+        receipt_id: String,
+    },
+
+    /// The consumed-receipt anti-replay set has reached its capacity limit.
+    /// New declassification attempts are denied (fail-closed) until the set
+    /// is cleared or compacted.
+    #[error("consumed receipt set is full (capacity {capacity})")]
+    ConsumedReceiptSetFull {
+        /// The maximum capacity of the anti-replay set.
+        capacity: usize,
+    },
+
+    /// Effect binding mismatch: the receipt's payload or envelope hash
+    /// does not match the expected values at consumption time.
+    #[error("receipt effect binding mismatch: {reason}")]
+    EffectBindingMismatch {
+        /// Why the effect binding check failed.
         reason: String,
     },
 }
@@ -275,9 +372,10 @@ impl fmt::Display for TaintLevel {
 /// Confidentiality level in the classification lattice.
 ///
 /// Confidentiality tracks information sensitivity. Higher values indicate
-/// more sensitive data. At boundary crossings, confidentiality propagates
-/// via [`ConfidentialityLevel::meet`] (greatest lower bound) to enforce
-/// the principle that outbound data cannot exceed the boundary's clearance.
+/// more sensitive data. At boundary crossings, confidentiality is checked
+/// strictly: data whose level exceeds the boundary's clearance is
+/// **denied** unless an explicit [`DeclassificationReceipt`] is presented.
+/// There is no implicit meet-based clamping at boundaries.
 ///
 /// Lattice ordering: `Public < Internal < Confidential < Secret < TopSecret`
 ///
@@ -779,16 +877,35 @@ pub struct DeclassificationReceipt {
     from_level: ConfidentialityLevel,
     /// The confidentiality level after declassification.
     to_level: ConfidentialityLevel,
+    /// Unique receipt identifier / nonce for anti-replay enforcement.
+    /// Each receipt MUST have a globally unique `receipt_id`. The
+    /// [`DualLatticePolicy`] tracks consumed IDs and rejects duplicates.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
+    receipt_id: String,
     /// Reference to the policy rule that authorized this declassification.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     policy_ref: String,
     /// Human-readable justification for audit trail.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     justification: String,
     /// Identifier of the authority (principal) that authorized the
     /// declassification.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     authority_id: String,
     /// Identifier of the boundary this receipt is scoped to. The receipt is
     /// only valid when crossing this specific boundary.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     boundary_id: String,
+    /// BLAKE3 hash of the payload / request that this receipt is bound to.
+    /// Verified at consumption time to ensure the receipt is not replayed
+    /// for a different effect.
+    #[serde(default, deserialize_with = "deserialize_bounded_bytes")]
+    payload_hash: Vec<u8>,
+    /// BLAKE3 hash of the episode envelope that this receipt is bound to.
+    /// Verified at consumption time to ensure the receipt is not replayed
+    /// across episodes.
+    #[serde(default, deserialize_with = "deserialize_bounded_bytes")]
+    envelope_hash: Vec<u8>,
     /// Millisecond-precision UTC timestamp when this receipt was issued.
     issued_at_ms: u64,
     /// Millisecond-precision UTC timestamp when this receipt expires.
@@ -802,7 +919,7 @@ pub struct DeclassificationReceipt {
     /// Verified at consumption time via a caller-supplied
     /// [`SignatureVerifier`]. Receipts without a valid signature are
     /// rejected (fail-closed). Bounded to [`MAX_SIGNATURE_SIZE`] bytes.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bounded_signature")]
     authority_signature: Vec<u8>,
 }
 
@@ -817,6 +934,12 @@ impl DeclassificationReceipt {
     #[must_use]
     pub const fn to_level(&self) -> ConfidentialityLevel {
         self.to_level
+    }
+
+    /// Returns the unique receipt identifier / nonce.
+    #[must_use]
+    pub fn receipt_id(&self) -> &str {
+        &self.receipt_id
     }
 
     /// Returns the policy rule reference that authorized this.
@@ -841,6 +964,18 @@ impl DeclassificationReceipt {
     #[must_use]
     pub fn boundary_id(&self) -> &str {
         &self.boundary_id
+    }
+
+    /// Returns the payload hash this receipt is bound to.
+    #[must_use]
+    pub fn payload_hash(&self) -> &[u8] {
+        &self.payload_hash
+    }
+
+    /// Returns the envelope hash this receipt is bound to.
+    #[must_use]
+    pub fn envelope_hash(&self) -> &[u8] {
+        &self.envelope_hash
     }
 
     /// Returns the issuance timestamp in milliseconds (UTC).
@@ -984,6 +1119,10 @@ pub struct DualLatticePolicy {
     boundaries: Vec<BoundaryPolicy>,
     /// Declassification rules.
     declassification_rules: Vec<DeclassificationPolicy>,
+    /// Anti-replay set of consumed receipt IDs. A receipt can only be
+    /// consumed once; subsequent attempts are rejected. Bounded to
+    /// [`MAX_CONSUMED_RECEIPTS`] entries to prevent unbounded growth.
+    consumed_receipts: HashSet<String>,
 }
 
 impl DualLatticePolicy {
@@ -1024,16 +1163,18 @@ impl DualLatticePolicy {
         Ok(Self {
             boundaries,
             declassification_rules,
+            consumed_receipts: HashSet::new(),
         })
     }
 
     /// Create an empty (deny-all) policy. No boundaries are configured,
     /// so all crossings are denied.
     #[must_use]
-    pub const fn deny_all() -> Self {
+    pub fn deny_all() -> Self {
         Self {
             boundaries: Vec::new(),
             declassification_rules: Vec::new(),
+            consumed_receipts: HashSet::new(),
         }
     }
 
@@ -1090,42 +1231,93 @@ impl DualLatticePolicy {
         Ok(())
     }
 
+    /// Validate all string/bytes input fields for a declassification request.
+    /// Extracted to keep `declassify()` under clippy's line limit.
+    #[allow(clippy::too_many_arguments)]
+    fn validate_declassify_inputs(
+        receipt_id: &str,
+        policy_ref: &str,
+        justification: &str,
+        authority_id: &str,
+        boundary_id: &str,
+        payload_hash: &[u8],
+        envelope_hash: &[u8],
+        authority_signature: &[u8],
+    ) -> Result<(), TaintError> {
+        Self::validate_nonempty_bounded(receipt_id, "receipt_id", MAX_RECEIPT_ID_LEN)?;
+        Self::validate_nonempty_bounded(policy_ref, "policy reference", MAX_POLICY_REF_LEN)?;
+        Self::validate_nonempty_bounded(authority_id, "authority_id", MAX_AUTHORITY_ID_LEN)?;
+        Self::validate_nonempty_bounded(boundary_id, "boundary_id", MAX_BOUNDARY_ID_LEN)?;
+        if justification.len() > MAX_JUSTIFICATION_LEN {
+            return Err(TaintError::InvalidPolicyRef {
+                reason: format!("justification exceeds maximum length of {MAX_JUSTIFICATION_LEN}"),
+            });
+        }
+        Self::validate_bytes_bounded(payload_hash, "payload_hash", MAX_EFFECT_HASH_LEN)?;
+        Self::validate_bytes_bounded(envelope_hash, "envelope_hash", MAX_EFFECT_HASH_LEN)?;
+        Self::validate_bytes_bounded(
+            authority_signature,
+            "authority_signature",
+            MAX_SIGNATURE_SIZE,
+        )?;
+        Ok(())
+    }
+
+    /// Validate that a string field is non-empty and within a length limit.
+    fn validate_nonempty_bounded(
+        value: &str,
+        name: &str,
+        max_len: usize,
+    ) -> Result<(), TaintError> {
+        if value.is_empty() {
+            return Err(TaintError::InvalidPolicyRef {
+                reason: format!("{name} must be non-empty"),
+            });
+        }
+        if value.len() > max_len {
+            return Err(TaintError::InvalidPolicyRef {
+                reason: format!("{name} exceeds maximum length of {max_len}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate that a byte-slice field is within a length limit.
+    fn validate_bytes_bounded(value: &[u8], name: &str, max_len: usize) -> Result<(), TaintError> {
+        if value.len() > max_len {
+            return Err(TaintError::ReceiptFieldSizeExceeded {
+                reason: format!("{name} length {} exceeds maximum {max_len}", value.len()),
+            });
+        }
+        Ok(())
+    }
+
     /// Request a declassification, producing a receipt if authorized.
-    ///
-    /// The caller must specify which policy rule authorizes the downgrade,
-    /// the `authority_id` of the principal requesting the declassification,
-    /// the `boundary_id` that the receipt will be scoped to, the
-    /// `authority_signature` (the authority's cryptographic signature over
-    /// the receipt's content hash), and a freshness window
-    /// (`issued_at_ms`, `expires_at_ms`).
-    ///
-    /// The signature is stored opaquely and verified at consumption time
-    /// via a caller-supplied [`SignatureVerifier`].
     ///
     /// # Errors
     ///
     /// Returns [`TaintError::DeclassificationDenied`] if no matching rule
-    /// is found or the requested range is not covered.
-    /// Returns [`TaintError::InvalidPolicyRef`] if the justification,
-    /// authority, or boundary identifiers are invalid.
-    /// Returns [`TaintError::ReceiptExpired`] if the timestamp window is
-    /// invalid (e.g., `expires_at_ms <= issued_at_ms` or lifetime exceeds
-    /// the maximum receipt lifetime).
+    /// is found. Returns [`TaintError::InvalidPolicyRef`] if any identifier
+    /// is invalid. Returns [`TaintError::ReceiptExpired`] if the timestamp
+    /// window is invalid.
     // TODO(RFC-0020): Wire into daemon actuation path
     #[allow(clippy::too_many_arguments)] // All params are semantically distinct security inputs
     pub fn declassify(
         &self,
         from: ConfidentialityLevel,
         to: ConfidentialityLevel,
+        receipt_id: &str,
         policy_ref: &str,
         justification: &str,
         authority_id: &str,
         boundary_id: &str,
+        payload_hash: &[u8],
+        envelope_hash: &[u8],
         authority_signature: &[u8],
         issued_at_ms: u64,
         expires_at_ms: u64,
     ) -> Result<DeclassificationReceipt, TaintError> {
-        // Validate inputs.
+        // Validate level ordering.
         if from.ordinal() <= to.ordinal() {
             return Err(TaintError::DeclassificationDenied {
                 from,
@@ -1134,57 +1326,17 @@ impl DualLatticePolicy {
             });
         }
 
-        if justification.len() > MAX_JUSTIFICATION_LEN {
-            return Err(TaintError::InvalidPolicyRef {
-                reason: format!("justification exceeds maximum length of {MAX_JUSTIFICATION_LEN}"),
-            });
-        }
-
-        if policy_ref.is_empty() {
-            return Err(TaintError::InvalidPolicyRef {
-                reason: "policy reference must be non-empty".to_string(),
-            });
-        }
-
-        if policy_ref.len() > MAX_POLICY_REF_LEN {
-            return Err(TaintError::InvalidPolicyRef {
-                reason: format!("policy reference exceeds maximum length of {MAX_POLICY_REF_LEN}"),
-            });
-        }
-
-        if authority_id.is_empty() {
-            return Err(TaintError::InvalidPolicyRef {
-                reason: "authority_id must be non-empty".to_string(),
-            });
-        }
-
-        if authority_id.len() > MAX_AUTHORITY_ID_LEN {
-            return Err(TaintError::InvalidPolicyRef {
-                reason: format!("authority_id exceeds maximum length of {MAX_AUTHORITY_ID_LEN}"),
-            });
-        }
-
-        if boundary_id.is_empty() {
-            return Err(TaintError::InvalidPolicyRef {
-                reason: "boundary_id must be non-empty".to_string(),
-            });
-        }
-
-        if boundary_id.len() > MAX_BOUNDARY_ID_LEN {
-            return Err(TaintError::InvalidPolicyRef {
-                reason: format!("boundary_id exceeds maximum length of {MAX_BOUNDARY_ID_LEN}"),
-            });
-        }
-
-        // Validate authority_signature size.
-        if authority_signature.len() > MAX_SIGNATURE_SIZE {
-            return Err(TaintError::ReceiptFieldSizeExceeded {
-                reason: format!(
-                    "authority_signature length {} exceeds maximum {MAX_SIGNATURE_SIZE}",
-                    authority_signature.len()
-                ),
-            });
-        }
+        // Validate all string/bytes input fields.
+        Self::validate_declassify_inputs(
+            receipt_id,
+            policy_ref,
+            justification,
+            authority_id,
+            boundary_id,
+            payload_hash,
+            envelope_hash,
+            authority_signature,
+        )?;
 
         // Validate freshness window.
         if expires_at_ms <= issued_at_ms {
@@ -1217,18 +1369,17 @@ impl DualLatticePolicy {
                 ),
             })?;
 
-        // Compute content hash over ALL receipt fields using length-prefixed
-        // canonical hashing. Each variable-length field is preceded by its
-        // length as a little-endian u64, preventing delimiter-boundary
-        // collision attacks where different field tuples share identical
-        // concatenated preimage bytes.
+        // Compute content hash (length-prefixed canonical hashing).
         let content_hash = Self::compute_receipt_hash(
             from,
             to,
+            receipt_id,
             rule.rule_id(),
             justification,
             authority_id,
             boundary_id,
+            payload_hash,
+            envelope_hash,
             issued_at_ms,
             expires_at_ms,
         );
@@ -1236,10 +1387,13 @@ impl DualLatticePolicy {
         Ok(DeclassificationReceipt {
             from_level: from,
             to_level: to,
+            receipt_id: receipt_id.to_string(),
             policy_ref: policy_ref.to_string(),
             justification: justification.to_string(),
             authority_id: authority_id.to_string(),
             boundary_id: boundary_id.to_string(),
+            payload_hash: payload_hash.to_vec(),
+            envelope_hash: envelope_hash.to_vec(),
             issued_at_ms,
             expires_at_ms,
             content_hash,
@@ -1252,28 +1406,40 @@ impl DualLatticePolicy {
     /// Uses domain-separated, length-prefixed hashing to prevent
     /// delimiter-boundary collision attacks. Each variable-length field
     /// is preceded by its byte length as a little-endian `u64`.
+    ///
+    /// The hash preimage includes effect-binding fields (`receipt_id`,
+    /// `payload_hash`, `envelope_hash`) to prevent receipt replay across
+    /// unrelated effects.
     #[allow(clippy::too_many_arguments)] // All params are semantically distinct hash inputs
     fn compute_receipt_hash(
         from: ConfidentialityLevel,
         to: ConfidentialityLevel,
+        receipt_id: &str,
         rule_id: &str,
         justification: &str,
         authority_id: &str,
         boundary_id: &str,
+        payload_hash: &[u8],
+        envelope_hash: &[u8],
         issued_at_ms: u64,
         expires_at_ms: u64,
     ) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         // Domain separation tag to bind this hash to receipt semantics.
-        hasher.update(b"apm2.declassification-receipt.v2");
+        // Bumped to v3 to reflect effect-binding fields.
+        hasher.update(b"apm2.declassification-receipt.v3");
         // Fixed-length fields: from and to ordinals.
         hasher.update(&[from.ordinal()]);
         hasher.update(&[to.ordinal()]);
         // Length-prefixed variable-length fields.
+        Self::hash_length_prefixed(&mut hasher, receipt_id.as_bytes());
         Self::hash_length_prefixed(&mut hasher, rule_id.as_bytes());
         Self::hash_length_prefixed(&mut hasher, justification.as_bytes());
         Self::hash_length_prefixed(&mut hasher, authority_id.as_bytes());
         Self::hash_length_prefixed(&mut hasher, boundary_id.as_bytes());
+        // Effect-binding fields (length-prefixed byte slices).
+        Self::hash_length_prefixed(&mut hasher, payload_hash);
+        Self::hash_length_prefixed(&mut hasher, envelope_hash);
         // Fixed-length timestamp fields.
         hasher.update(&issued_at_ms.to_le_bytes());
         hasher.update(&expires_at_ms.to_le_bytes());
@@ -1295,10 +1461,13 @@ impl DualLatticePolicy {
         let expected = Self::compute_receipt_hash(
             receipt.from_level(),
             receipt.to_level(),
+            receipt.receipt_id(),
             receipt.policy_ref(),
             receipt.justification(),
             receipt.authority_id(),
             receipt.boundary_id(),
+            receipt.payload_hash(),
+            receipt.envelope_hash(),
             receipt.issued_at_ms(),
             receipt.expires_at_ms(),
         );
@@ -1312,6 +1481,14 @@ impl DualLatticePolicy {
     /// configured `MAX_*` size limits. This catches oversized receipts
     /// that may have been injected via deserialization.
     fn validate_receipt_field_sizes(receipt: &DeclassificationReceipt) -> Result<(), TaintError> {
+        if receipt.receipt_id().len() > MAX_RECEIPT_ID_LEN {
+            return Err(TaintError::ReceiptFieldSizeExceeded {
+                reason: format!(
+                    "receipt_id length {} exceeds maximum {MAX_RECEIPT_ID_LEN}",
+                    receipt.receipt_id().len()
+                ),
+            });
+        }
         if receipt.policy_ref().len() > MAX_POLICY_REF_LEN {
             return Err(TaintError::ReceiptFieldSizeExceeded {
                 reason: format!(
@@ -1341,6 +1518,22 @@ impl DualLatticePolicy {
                 reason: format!(
                     "boundary_id length {} exceeds maximum {MAX_BOUNDARY_ID_LEN}",
                     receipt.boundary_id().len()
+                ),
+            });
+        }
+        if receipt.payload_hash().len() > MAX_EFFECT_HASH_LEN {
+            return Err(TaintError::ReceiptFieldSizeExceeded {
+                reason: format!(
+                    "payload_hash length {} exceeds maximum {MAX_EFFECT_HASH_LEN}",
+                    receipt.payload_hash().len()
+                ),
+            });
+        }
+        if receipt.envelope_hash().len() > MAX_EFFECT_HASH_LEN {
+            return Err(TaintError::ReceiptFieldSizeExceeded {
+                reason: format!(
+                    "envelope_hash length {} exceeds maximum {MAX_EFFECT_HASH_LEN}",
+                    receipt.envelope_hash().len()
                 ),
             });
         }
@@ -1446,71 +1639,38 @@ impl DualLatticePolicy {
         Ok(*label)
     }
 
-    /// Propagate a label through a boundary crossing with an explicit
-    /// declassification receipt.
-    ///
-    /// The receipt must:
-    /// 1. Have field sizes within the configured `MAX_*` limits (re-validated
-    ///    at consumption time to reject oversized deserialized receipts).
-    /// 2. Have a valid content hash (recomputed and verified against the
-    ///    receipt's claimed hash to detect forged/tampered receipts).
-    /// 3. Have a valid authority signature verified via the supplied
-    ///    [`SignatureVerifier`]. If `verifier` is `None`, the receipt is
-    ///    **rejected** (fail-closed).
-    /// 4. Not be expired: `now_ms` must be within `[issued_at_ms,
-    ///    expires_at_ms)`.
-    /// 5. Reference a `policy_ref` that maps to an active declassification rule
-    ///    authorizing the `from_level -> to_level` transition.
-    /// 6. Be scoped to the same `boundary_id` being crossed.
-    /// 7. Declassify from at least `label.confidentiality` down to at most
-    ///    `boundary.max_confidentiality`.
-    ///
-    /// If the label already fits within the boundary clearance the receipt
-    /// is still fully validated (size limits, hash, signature, freshness,
-    /// `policy_ref`, boundary binding) but the label passes through unchanged.
-    ///
-    /// # Errors
-    ///
-    /// - [`TaintError::ReceiptFieldSizeExceeded`] if any receipt field exceeds
-    ///   its maximum allowed size.
-    /// - [`TaintError::ReceiptExpired`] if the receipt is expired or `now_ms`
-    ///   is before `issued_at_ms`.
-    /// - [`TaintError::BoundaryCrossingDenied`] if the boundary is unknown
-    ///   (fail-closed), the receipt content hash is invalid, the receipt's
-    ///   `policy_ref` does not map to an active rule authorizing the
-    ///   transition, the receipt is not scoped to this boundary, or the receipt
-    ///   does not cover the required downgrade range.
-    /// - [`TaintError::SignatureVerificationFailed`] if the authority signature
-    ///   is invalid or no verifier is provided (fail-closed).
-    /// - [`TaintError::TaintCeilingExceeded`] if taint exceeds the boundary
-    ///   ceiling.
-    // TODO(RFC-0020): Wire into daemon actuation path
-    pub fn propagate_with_declassification(
-        &self,
-        boundary_id: &str,
-        label: &DataLabel,
+    /// Validate receipt lifetime, integrity, authority signature, and freshness
+    /// at consumption time. Extracted to keep `propagate_with_declassification`
+    /// under clippy's line limit.
+    fn validate_receipt_at_consumption(
         receipt: &DeclassificationReceipt,
+        boundary_id: &str,
         verifier: Option<&dyn SignatureVerifier>,
         now_ms: u64,
-    ) -> Result<DataLabel, TaintError> {
-        let boundary = self
-            .boundaries
-            .iter()
-            .find(|b| b.boundary_id() == boundary_id)
-            .ok_or_else(|| TaintError::BoundaryCrossingDenied {
-                boundary: boundary_id.to_string(),
-                reason: "no boundary policy configured (fail-closed)".to_string(),
-            })?;
-
-        // ---- Receipt field-size validation (MAJOR fix) ----
-        // Re-validate field sizes at consumption time to reject oversized
-        // receipts that may have been crafted via deserialization.
-        Self::validate_receipt_field_sizes(receipt)?;
-
-        // ---- Receipt integrity verification ----
-        // 1. Recompute the content hash and verify it matches the receipt's claimed
-        //    hash. This rejects forged or deserialized receipts whose fields have been
-        //    tampered with.
+    ) -> Result<(), TaintError> {
+        // MAX_RECEIPT_LIFETIME_MS enforcement at consumption.
+        let receipt_lifetime = receipt
+            .expires_at_ms()
+            .saturating_sub(receipt.issued_at_ms());
+        if receipt_lifetime > MAX_RECEIPT_LIFETIME_MS {
+            return Err(TaintError::ReceiptExpired {
+                reason: format!(
+                    "receipt lifetime {receipt_lifetime}ms exceeds maximum \
+                     {MAX_RECEIPT_LIFETIME_MS}ms (enforced at consumption)"
+                ),
+            });
+        }
+        if receipt.expires_at_ms() <= receipt.issued_at_ms() {
+            return Err(TaintError::ReceiptExpired {
+                reason: format!(
+                    "receipt expires_at_ms ({}) must be strictly after issued_at_ms ({}) \
+                     (enforced at consumption)",
+                    receipt.expires_at_ms(),
+                    receipt.issued_at_ms()
+                ),
+            });
+        }
+        // Receipt integrity verification.
         if !Self::verify_receipt_hash(receipt) {
             return Err(TaintError::BoundaryCrossingDenied {
                 boundary: boundary_id.to_string(),
@@ -1518,13 +1678,9 @@ impl DualLatticePolicy {
                     .to_string(),
             });
         }
-
-        // ---- Authority signature verification (BLOCKER fix) ----
-        // Verify the receipt's authority signature using the caller-supplied
-        // verifier. If no verifier is provided, fail-closed.
+        // Authority signature verification (fail-closed).
         Self::verify_authority_signature(receipt, verifier)?;
-
-        // ---- Freshness / replay-protection check ----
+        // Freshness check.
         if now_ms < receipt.issued_at_ms() {
             return Err(TaintError::ReceiptExpired {
                 reason: format!(
@@ -1541,8 +1697,83 @@ impl DualLatticePolicy {
                 ),
             });
         }
+        Ok(())
+    }
 
-        // 2. Verify that the receipt's policy_ref maps to an active declassification
+    /// Verify that the receipt's effect-binding hashes match the expected
+    /// values. Uses constant-time comparison.
+    fn verify_effect_binding(
+        receipt: &DeclassificationReceipt,
+        expected_payload_hash: &[u8],
+        expected_envelope_hash: &[u8],
+    ) -> Result<(), TaintError> {
+        if !bool::from(receipt.payload_hash().ct_eq(expected_payload_hash)) {
+            return Err(TaintError::EffectBindingMismatch {
+                reason: "receipt payload_hash does not match expected payload hash".to_string(),
+            });
+        }
+        if !bool::from(receipt.envelope_hash().ct_eq(expected_envelope_hash)) {
+            return Err(TaintError::EffectBindingMismatch {
+                reason: "receipt envelope_hash does not match expected envelope hash".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Propagate a label through a boundary crossing with an explicit
+    /// declassification receipt. Validates field sizes, lifetime, integrity,
+    /// signature, freshness, anti-replay, effect binding, policy authorization,
+    /// boundary scoping, and downgrade coverage.
+    ///
+    /// # Errors
+    ///
+    /// Returns the appropriate [`TaintError`] variant on any validation failure
+    /// (fail-closed).
+    // TODO(RFC-0020): Wire into daemon actuation path
+    #[allow(clippy::too_many_arguments)]
+    pub fn propagate_with_declassification(
+        &mut self,
+        boundary_id: &str,
+        label: &DataLabel,
+        receipt: &DeclassificationReceipt,
+        verifier: Option<&dyn SignatureVerifier>,
+        now_ms: u64,
+        expected_payload_hash: &[u8],
+        expected_envelope_hash: &[u8],
+    ) -> Result<DataLabel, TaintError> {
+        let boundary = self
+            .boundaries
+            .iter()
+            .find(|b| b.boundary_id() == boundary_id)
+            .ok_or_else(|| TaintError::BoundaryCrossingDenied {
+                boundary: boundary_id.to_string(),
+                reason: "no boundary policy configured (fail-closed)".to_string(),
+            })?;
+
+        // ---- Receipt field-size validation (MAJOR fix) ----
+        // Re-validate field sizes at consumption time to reject oversized
+        // receipts that may have been crafted via deserialization.
+        Self::validate_receipt_field_sizes(receipt)?;
+
+        // Validate receipt lifetime, integrity, signature, freshness.
+        Self::validate_receipt_at_consumption(receipt, boundary_id, verifier, now_ms)?;
+
+        // ---- Anti-replay: one-time consumption check ----
+        if self.consumed_receipts.contains(receipt.receipt_id()) {
+            return Err(TaintError::ReceiptAlreadyConsumed {
+                receipt_id: receipt.receipt_id().to_string(),
+            });
+        }
+        if self.consumed_receipts.len() >= MAX_CONSUMED_RECEIPTS {
+            return Err(TaintError::ConsumedReceiptSetFull {
+                capacity: MAX_CONSUMED_RECEIPTS,
+            });
+        }
+
+        // ---- Effect-binding verification ----
+        Self::verify_effect_binding(receipt, expected_payload_hash, expected_envelope_hash)?;
+
+        // Verify that the receipt's policy_ref maps to an active declassification
         //    rule that authorizes the from -> to transition. This prevents attackers
         //    from crafting receipts referencing nonexistent or unauthorized policy
         //    rules.
@@ -1587,10 +1818,13 @@ impl DualLatticePolicy {
 
         // If confidentiality already fits, pass through unchanged.
         // Note: receipt is still fully validated above even in this case.
+        // The receipt is consumed to prevent replay.
         if label
             .confidentiality
             .within_clearance(boundary.max_confidentiality())
         {
+            self.consumed_receipts
+                .insert(receipt.receipt_id().to_string());
             return Ok(*label);
         }
 
@@ -1622,6 +1856,13 @@ impl DualLatticePolicy {
             });
         }
 
+        // ---- Mark receipt as consumed (anti-replay) ----
+        // Insert into the consumed set AFTER all validation passes but
+        // BEFORE returning success, so a failed validation does not
+        // consume the receipt.
+        self.consumed_receipts
+            .insert(receipt.receipt_id().to_string());
+
         // Apply the declassification: set confidentiality to the receipt's
         // target level.
         Ok(DataLabel::new(label.taint, receipt.to_level()))
@@ -1643,6 +1884,14 @@ impl DualLatticePolicy {
 impl Default for DualLatticePolicy {
     fn default() -> Self {
         Self::deny_all()
+    }
+}
+
+impl DualLatticePolicy {
+    /// Returns the number of consumed receipt IDs currently tracked.
+    #[must_use]
+    pub fn consumed_receipt_count(&self) -> usize {
+        self.consumed_receipts.len()
     }
 }
 
@@ -1685,6 +1934,19 @@ mod tests {
 
     /// Test "now" timestamp (midway in the validity window).
     const TEST_NOW_MS: u64 = TEST_ISSUED_AT_MS + 1_800_000;
+
+    /// Test payload hash for effect binding.
+    const TEST_PAYLOAD_HASH: &[u8] = b"test-payload-hash-32bytes-padded";
+
+    /// Test envelope hash for effect binding.
+    const TEST_ENVELOPE_HASH: &[u8] = b"test-envelope-hash-32bytes-pad00";
+
+    /// Atomic counter for generating unique receipt IDs in tests.
+    fn unique_receipt_id() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        format!("test-receipt-{}", CTR.fetch_add(1, Ordering::Relaxed))
+    }
 
     // =========================================================================
     // TaintLevel lattice tests
@@ -2261,10 +2523,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "Approved by security review SR-2026-042",
                 "security-officer-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2287,14 +2552,19 @@ mod tests {
     #[test]
     fn declassification_receipt_hash_is_deterministic() {
         let policy = test_policy();
+        // Use the same receipt_id for both calls to prove determinism.
+        let same_rid = "deterministic-receipt-id";
         let r1 = policy
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                same_rid,
                 "DECLASS-SECRET-TO-INTERNAL",
                 "same justification",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2304,10 +2574,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                same_rid,
                 "DECLASS-SECRET-TO-INTERNAL",
                 "same justification",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2323,10 +2596,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "justification A",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2336,10 +2612,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "justification B",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2355,10 +2634,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "same justification",
                 "authority-A",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2368,10 +2650,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "same justification",
                 "authority-B",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2387,10 +2672,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "same justification",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2400,10 +2688,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "same justification",
                 "authority-1",
                 "tier3-actuator",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2419,10 +2710,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::TopSecret,
                 ConfidentialityLevel::Public,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "trying to leak",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2438,10 +2732,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "NONEXISTENT-RULE",
                 "no such rule",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2457,10 +2754,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Public,
                 ConfidentialityLevel::Secret,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "upgrade attempt",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2476,10 +2776,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Secret,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "no-op attempt",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2495,10 +2798,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "",
                 "missing ref",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2515,10 +2821,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 &long_just,
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2534,10 +2843,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "valid justification",
                 "",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2553,10 +2865,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "valid justification",
                 "authority-1",
                 "",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2573,10 +2888,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "valid justification",
                 &long_auth,
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2593,10 +2911,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "valid justification",
                 "authority-1",
                 &long_bnd,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2614,10 +2935,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "step 1",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2629,10 +2953,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Internal,
                 ConfidentialityLevel::Public,
+                &unique_receipt_id(),
                 "DECLASS-INTERNAL-TO-PUBLIC",
                 "step 2",
                 "authority-1",
                 "tier4-actuator",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2665,17 +2992,20 @@ mod tests {
         // With a valid receipt scoped to the correct boundary, the crossing
         // succeeds and the label's confidentiality is set to the receipt's
         // to_level.
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
 
         let receipt = policy
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "Approved for external release",
                 "security-officer-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2689,6 +3019,8 @@ mod tests {
                 &receipt,
                 Some(&TestVerifier),
                 TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap();
         assert_eq!(result.taint, TaintLevel::Untainted);
@@ -2698,7 +3030,7 @@ mod tests {
     #[test]
     fn propagation_with_receipt_rejects_wrong_boundary() {
         // A receipt scoped to a different boundary must be rejected.
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
 
         // Receipt scoped to "tier3-actuator", not "external-api".
@@ -2706,10 +3038,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "wrong boundary",
                 "security-officer-1",
                 "tier3-actuator",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2723,6 +3058,8 @@ mod tests {
                 &receipt,
                 Some(&TestVerifier),
                 TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap_err();
         assert!(
@@ -2736,17 +3073,20 @@ mod tests {
         // If the label is already within the boundary clearance, the receipt
         // is validated (boundary_id must still match) but the label passes
         // through unchanged.
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Public);
 
         let receipt = policy
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "not needed but valid",
                 "security-officer-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2760,6 +3100,8 @@ mod tests {
                 &receipt,
                 Some(&TestVerifier),
                 TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap();
         assert_eq!(result, label);
@@ -2768,7 +3110,7 @@ mod tests {
     #[test]
     fn propagation_with_receipt_rejects_insufficient_downgrade() {
         // Receipt's to_level is still above the boundary's max_confidentiality.
-        let policy = test_policy();
+        let mut policy = test_policy();
         // tier4-actuator max_confidentiality = Public
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
 
@@ -2777,10 +3119,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "insufficient downgrade",
                 "security-officer-1",
                 "tier4-actuator",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2794,6 +3139,8 @@ mod tests {
                 &receipt,
                 Some(&TestVerifier),
                 TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap_err();
         assert!(
@@ -2901,10 +3248,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Public,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "trying to skip levels",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2920,10 +3270,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Internal,
                 ConfidentialityLevel::TopSecret,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "reverse declassification attempt",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -2951,10 +3304,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Public,
+                &unique_receipt_id(),
                 "ANY-RULE",
                 "no rules exist",
                 "authority-1",
                 "some-boundary",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3124,7 +3480,7 @@ mod tests {
     fn forged_receipt_wrong_content_hash_rejected() {
         // An attacker crafts a receipt via deserialization with a wrong
         // content hash. The propagation MUST reject it.
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
 
         // Create a legitimate receipt first, then forge the hash.
@@ -3132,10 +3488,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "legitimate",
                 "security-officer-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3146,10 +3505,13 @@ mod tests {
         let forged_json = serde_json::json!({
             "from_level": "Secret",
             "to_level": "Internal",
+            "receipt_id": unique_receipt_id(),
             "policy_ref": legit.policy_ref(),
             "justification": "FORGED justification",
             "authority_id": legit.authority_id(),
             "boundary_id": legit.boundary_id(),
+            "payload_hash": TEST_PAYLOAD_HASH,
+            "envelope_hash": TEST_ENVELOPE_HASH,
             "issued_at_ms": TEST_ISSUED_AT_MS,
             "expires_at_ms": TEST_EXPIRES_AT_MS,
             "content_hash": vec![0u8; 32],
@@ -3163,6 +3525,8 @@ mod tests {
                 &forged,
                 Some(&TestVerifier),
                 TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap_err();
         assert!(
@@ -3179,17 +3543,20 @@ mod tests {
     fn forged_receipt_tampered_fields_rejected() {
         // Attacker takes a legitimate receipt, modifies the to_level to
         // a more permissive value, but keeps the original hash.
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
 
         let legit = policy
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "legitimate",
                 "security-officer-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3200,10 +3567,13 @@ mod tests {
         let tampered_json = serde_json::json!({
             "from_level": "Secret",
             "to_level": "Public",
+            "receipt_id": unique_receipt_id(),
             "policy_ref": legit.policy_ref(),
             "justification": legit.justification(),
             "authority_id": legit.authority_id(),
             "boundary_id": legit.boundary_id(),
+            "payload_hash": TEST_PAYLOAD_HASH,
+            "envelope_hash": TEST_ENVELOPE_HASH,
             "issued_at_ms": TEST_ISSUED_AT_MS,
             "expires_at_ms": TEST_EXPIRES_AT_MS,
             "content_hash": legit.content_hash(),
@@ -3217,6 +3587,8 @@ mod tests {
                 &tampered,
                 Some(&TestVerifier),
                 TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap_err();
         assert!(
@@ -3229,17 +3601,21 @@ mod tests {
     fn forged_receipt_invalid_policy_ref_rejected() {
         // Attacker constructs a receipt with a nonexistent policy_ref
         // but correct hash. The policy_ref authorization check must reject.
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
 
         // Compute a valid hash for a nonexistent rule.
+        let forged_rid = unique_receipt_id();
         let hash = DualLatticePolicy::compute_receipt_hash(
             ConfidentialityLevel::Secret,
             ConfidentialityLevel::Internal,
+            &forged_rid,
             "NONEXISTENT-RULE",
             "trying to bypass",
             "attacker",
             "external-api",
+            TEST_PAYLOAD_HASH,
+            TEST_ENVELOPE_HASH,
             TEST_ISSUED_AT_MS,
             TEST_EXPIRES_AT_MS,
         );
@@ -3247,10 +3623,13 @@ mod tests {
         let forged_json = serde_json::json!({
             "from_level": "Secret",
             "to_level": "Internal",
+            "receipt_id": forged_rid,
             "policy_ref": "NONEXISTENT-RULE",
             "justification": "trying to bypass",
             "authority_id": "attacker",
             "boundary_id": "external-api",
+            "payload_hash": TEST_PAYLOAD_HASH,
+            "envelope_hash": TEST_ENVELOPE_HASH,
             "issued_at_ms": TEST_ISSUED_AT_MS,
             "expires_at_ms": TEST_EXPIRES_AT_MS,
             "content_hash": hash,
@@ -3265,6 +3644,8 @@ mod tests {
                 &forged,
                 Some(&TestVerifier),
                 TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap_err();
         assert!(
@@ -3282,16 +3663,20 @@ mod tests {
         // Receipt references a real rule but the transition is not
         // authorized by that rule (e.g., TopSecret -> Public via a
         // rule that only allows Secret -> Internal).
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::TopSecret);
 
+        let forged_rid = unique_receipt_id();
         let hash = DualLatticePolicy::compute_receipt_hash(
             ConfidentialityLevel::TopSecret,
             ConfidentialityLevel::Public,
+            &forged_rid,
             "DECLASS-SECRET-TO-INTERNAL",
             "level skip",
             "attacker",
             "external-api",
+            TEST_PAYLOAD_HASH,
+            TEST_ENVELOPE_HASH,
             TEST_ISSUED_AT_MS,
             TEST_EXPIRES_AT_MS,
         );
@@ -3299,10 +3684,13 @@ mod tests {
         let forged_json = serde_json::json!({
             "from_level": "TopSecret",
             "to_level": "Public",
+            "receipt_id": forged_rid,
             "policy_ref": "DECLASS-SECRET-TO-INTERNAL",
             "justification": "level skip",
             "authority_id": "attacker",
             "boundary_id": "external-api",
+            "payload_hash": TEST_PAYLOAD_HASH,
+            "envelope_hash": TEST_ENVELOPE_HASH,
             "issued_at_ms": TEST_ISSUED_AT_MS,
             "expires_at_ms": TEST_EXPIRES_AT_MS,
             "content_hash": hash,
@@ -3317,6 +3705,8 @@ mod tests {
                 &forged,
                 Some(&TestVerifier),
                 TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap_err();
         assert!(
@@ -3332,16 +3722,19 @@ mod tests {
     #[test]
     fn signature_rejected_when_no_verifier_provided() {
         // Fail-closed: if no verifier is supplied, receipts must be rejected.
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
         let receipt = policy
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "valid request",
                 "security-officer-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3349,7 +3742,15 @@ mod tests {
             .unwrap();
 
         let err = policy
-            .propagate_with_declassification("external-api", &label, &receipt, None, TEST_NOW_MS)
+            .propagate_with_declassification(
+                "external-api",
+                &label,
+                &receipt,
+                None,
+                TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+            )
             .unwrap_err();
         assert!(
             matches!(err, TaintError::SignatureVerificationFailed { .. }),
@@ -3364,16 +3765,19 @@ mod tests {
     #[test]
     fn signature_rejected_when_empty() {
         // Empty signature must be rejected even with a verifier.
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
         let receipt = policy
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "valid request",
                 "security-officer-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 &[], // empty signature
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3387,6 +3791,8 @@ mod tests {
                 &receipt,
                 Some(&TestVerifier),
                 TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap_err();
         assert!(
@@ -3402,16 +3808,19 @@ mod tests {
     #[test]
     fn signature_rejected_when_invalid() {
         // Invalid signature (wrong first byte) must be rejected.
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
         let receipt = policy
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "valid request",
                 "security-officer-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 INVALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3425,6 +3834,8 @@ mod tests {
                 &receipt,
                 Some(&TestVerifier),
                 TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap_err();
         assert!(
@@ -3441,16 +3852,19 @@ mod tests {
     #[test]
     fn signature_accepted_when_valid() {
         // Valid signature (correct first byte) must be accepted.
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
         let receipt = policy
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "approved release",
                 "security-officer-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3464,6 +3878,8 @@ mod tests {
                 &receipt,
                 Some(&TestVerifier),
                 TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap();
         assert_eq!(result.confidentiality, ConfidentialityLevel::Internal);
@@ -3475,7 +3891,7 @@ mod tests {
 
     #[test]
     fn oversized_policy_ref_rejected_at_consumption() {
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
 
         // Create a receipt with an oversized policy_ref via deserialization.
@@ -3483,10 +3899,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "valid",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3497,10 +3916,13 @@ mod tests {
         let forged_json = serde_json::json!({
             "from_level": "Secret",
             "to_level": "Internal",
+            "receipt_id": unique_receipt_id(),
             "policy_ref": oversized_ref,
             "justification": legit.justification(),
             "authority_id": legit.authority_id(),
             "boundary_id": legit.boundary_id(),
+            "payload_hash": TEST_PAYLOAD_HASH,
+            "envelope_hash": TEST_ENVELOPE_HASH,
             "issued_at_ms": TEST_ISSUED_AT_MS,
             "expires_at_ms": TEST_EXPIRES_AT_MS,
             "content_hash": legit.content_hash(),
@@ -3515,6 +3937,8 @@ mod tests {
                 &forged,
                 Some(&TestVerifier),
                 TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap_err();
         assert!(
@@ -3525,17 +3949,20 @@ mod tests {
 
     #[test]
     fn oversized_justification_rejected_at_consumption() {
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
 
         let legit = policy
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "valid",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3546,10 +3973,13 @@ mod tests {
         let forged_json = serde_json::json!({
             "from_level": "Secret",
             "to_level": "Internal",
+            "receipt_id": unique_receipt_id(),
             "policy_ref": legit.policy_ref(),
             "justification": oversized_just,
             "authority_id": legit.authority_id(),
             "boundary_id": legit.boundary_id(),
+            "payload_hash": TEST_PAYLOAD_HASH,
+            "envelope_hash": TEST_ENVELOPE_HASH,
             "issued_at_ms": TEST_ISSUED_AT_MS,
             "expires_at_ms": TEST_EXPIRES_AT_MS,
             "content_hash": legit.content_hash(),
@@ -3564,6 +3994,8 @@ mod tests {
                 &forged,
                 Some(&TestVerifier),
                 TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap_err();
         assert!(
@@ -3574,17 +4006,20 @@ mod tests {
 
     #[test]
     fn oversized_authority_id_rejected_at_consumption() {
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
 
         let legit = policy
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "valid",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3595,10 +4030,13 @@ mod tests {
         let forged_json = serde_json::json!({
             "from_level": "Secret",
             "to_level": "Internal",
+            "receipt_id": unique_receipt_id(),
             "policy_ref": legit.policy_ref(),
             "justification": legit.justification(),
             "authority_id": oversized_auth,
             "boundary_id": legit.boundary_id(),
+            "payload_hash": TEST_PAYLOAD_HASH,
+            "envelope_hash": TEST_ENVELOPE_HASH,
             "issued_at_ms": TEST_ISSUED_AT_MS,
             "expires_at_ms": TEST_EXPIRES_AT_MS,
             "content_hash": legit.content_hash(),
@@ -3613,6 +4051,8 @@ mod tests {
                 &forged,
                 Some(&TestVerifier),
                 TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap_err();
         assert!(
@@ -3623,17 +4063,20 @@ mod tests {
 
     #[test]
     fn oversized_boundary_id_rejected_at_consumption() {
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
 
         let legit = policy
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "valid",
                 "authority-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3644,10 +4087,13 @@ mod tests {
         let forged_json = serde_json::json!({
             "from_level": "Secret",
             "to_level": "Internal",
+            "receipt_id": unique_receipt_id(),
             "policy_ref": legit.policy_ref(),
             "justification": legit.justification(),
             "authority_id": legit.authority_id(),
             "boundary_id": oversized_bnd,
+            "payload_hash": TEST_PAYLOAD_HASH,
+            "envelope_hash": TEST_ENVELOPE_HASH,
             "issued_at_ms": TEST_ISSUED_AT_MS,
             "expires_at_ms": TEST_EXPIRES_AT_MS,
             "content_hash": legit.content_hash(),
@@ -3662,6 +4108,8 @@ mod tests {
                 &forged,
                 Some(&TestVerifier),
                 TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap_err();
         assert!(
@@ -3700,10 +4148,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "same-justification",
                 "ab",
                 "cd",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3714,10 +4165,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "same-justification",
                 "abc",
                 "d",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3765,10 +4219,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "RULE",
                 "JUST",
                 "auth",
                 "boundary",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3778,10 +4235,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "RULEJ",
                 "UST",
                 "auth",
                 "boundary",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3934,16 +4394,19 @@ mod tests {
 
     #[test]
     fn expired_receipt_rejected() {
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
         let receipt = policy
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "approved release",
                 "security-officer-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3958,6 +4421,8 @@ mod tests {
                 &receipt,
                 Some(&TestVerifier),
                 TEST_EXPIRES_AT_MS, // exactly at expiry
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap_err();
         assert!(
@@ -3972,16 +4437,19 @@ mod tests {
 
     #[test]
     fn receipt_before_issuance_rejected() {
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
         let receipt = policy
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "approved release",
                 "security-officer-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -3996,6 +4464,8 @@ mod tests {
                 &receipt,
                 Some(&TestVerifier),
                 TEST_ISSUED_AT_MS - 1, // before issuance
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap_err();
         assert!(
@@ -4011,10 +4481,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "too long lifetime",
                 "security-officer-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_ISSUED_AT_MS + MAX_RECEIPT_LIFETIME_MS + 1,
@@ -4034,10 +4507,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "bad timestamps",
                 "security-officer-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_ISSUED_AT_MS, // same as issued = invalid
@@ -4051,16 +4527,19 @@ mod tests {
 
     #[test]
     fn receipt_well_after_expiry_rejected() {
-        let policy = test_policy();
+        let mut policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
         let receipt = policy
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "approved release",
                 "security-officer-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 VALID_TEST_SIG,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -4075,6 +4554,8 @@ mod tests {
                 &receipt,
                 Some(&TestVerifier),
                 TEST_EXPIRES_AT_MS + 86_400_000, // 1 day later
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
             )
             .unwrap_err();
         assert!(
@@ -4188,10 +4669,13 @@ mod tests {
             .declassify(
                 ConfidentialityLevel::Secret,
                 ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
                 "DECLASS-SECRET-TO-INTERNAL",
                 "valid justification",
                 "security-officer-1",
                 "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
                 &oversized_sig,
                 TEST_ISSUED_AT_MS,
                 TEST_EXPIRES_AT_MS,
@@ -4204,51 +4688,36 @@ mod tests {
     }
 
     #[test]
-    fn oversized_signature_rejected_at_consumption() {
-        let policy = test_policy();
-        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
-
-        let legit = policy
-            .declassify(
-                ConfidentialityLevel::Secret,
-                ConfidentialityLevel::Internal,
-                "DECLASS-SECRET-TO-INTERNAL",
-                "valid",
-                "authority-1",
-                "external-api",
-                VALID_TEST_SIG,
-                TEST_ISSUED_AT_MS,
-                TEST_EXPIRES_AT_MS,
-            )
-            .unwrap();
-
+    fn oversized_signature_rejected_at_deserialization() {
+        // With bounded deserialization, an oversized signature is rejected
+        // during deserialization itself -- before the receipt object is
+        // even fully constructed. This prevents memory allocation of
+        // oversized payloads.
         let oversized_sig: Vec<u8> = vec![0xAA; MAX_SIGNATURE_SIZE + 1];
         let forged_json = serde_json::json!({
             "from_level": "Secret",
             "to_level": "Internal",
-            "policy_ref": legit.policy_ref(),
-            "justification": legit.justification(),
-            "authority_id": legit.authority_id(),
-            "boundary_id": legit.boundary_id(),
+            "receipt_id": unique_receipt_id(),
+            "policy_ref": "DECLASS-SECRET-TO-INTERNAL",
+            "justification": "valid",
+            "authority_id": "authority-1",
+            "boundary_id": "external-api",
+            "payload_hash": TEST_PAYLOAD_HASH,
+            "envelope_hash": TEST_ENVELOPE_HASH,
             "issued_at_ms": TEST_ISSUED_AT_MS,
             "expires_at_ms": TEST_EXPIRES_AT_MS,
-            "content_hash": legit.content_hash(),
+            "content_hash": vec![0u8; 32],
             "authority_signature": oversized_sig,
         });
-        let forged: DeclassificationReceipt = serde_json::from_value(forged_json).unwrap();
-
-        let err = policy
-            .propagate_with_declassification(
-                "external-api",
-                &label,
-                &forged,
-                Some(&TestVerifier),
-                TEST_NOW_MS,
-            )
-            .unwrap_err();
+        let result: Result<DeclassificationReceipt, _> = serde_json::from_value(forged_json);
         assert!(
-            matches!(err, TaintError::ReceiptFieldSizeExceeded { .. }),
-            "oversized signature must be rejected at consumption, got {err:?}"
+            result.is_err(),
+            "oversized signature must be rejected at deserialization, got {result:?}"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("exceeds maximum"),
+            "error should mention size limit, got: {err_msg}"
         );
     }
 
@@ -4261,10 +4730,13 @@ mod tests {
         let result = policy.declassify(
             ConfidentialityLevel::Secret,
             ConfidentialityLevel::Internal,
+            &unique_receipt_id(),
             "DECLASS-SECRET-TO-INTERNAL",
             "valid justification",
             "security-officer-1",
             "external-api",
+            TEST_PAYLOAD_HASH,
+            TEST_ENVELOPE_HASH,
             &max_sig,
             TEST_ISSUED_AT_MS,
             TEST_EXPIRES_AT_MS,
@@ -4272,6 +4744,468 @@ mod tests {
         assert!(
             result.is_ok(),
             "signature at exactly MAX_SIGNATURE_SIZE should be accepted"
+        );
+    }
+
+    // =========================================================================
+    // BLOCKER: Anti-replay (one-time consumption) tests
+    // =========================================================================
+
+    #[test]
+    fn replayed_receipt_rejected() {
+        // A receipt consumed once must be rejected on second use.
+        let mut policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "approved release",
+                "security-officer-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+
+        // First use: should succeed.
+        let result = policy
+            .propagate_with_declassification(
+                "external-api",
+                &label,
+                &receipt,
+                Some(&TestVerifier),
+                TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+            )
+            .unwrap();
+        assert_eq!(result.confidentiality, ConfidentialityLevel::Internal);
+
+        // Second use of the SAME receipt: must be rejected (anti-replay).
+        let err = policy
+            .propagate_with_declassification(
+                "external-api",
+                &label,
+                &receipt,
+                Some(&TestVerifier),
+                TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::ReceiptAlreadyConsumed { .. }),
+            "replayed receipt must be rejected, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(receipt.receipt_id()),
+            "error should contain the receipt ID, got: {err}"
+        );
+    }
+
+    #[test]
+    fn consumed_receipt_count_tracks_usage() {
+        let mut policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        assert_eq!(policy.consumed_receipt_count(), 0);
+
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "first",
+                "security-officer-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+
+        let _ = policy
+            .propagate_with_declassification(
+                "external-api",
+                &label,
+                &receipt,
+                Some(&TestVerifier),
+                TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+            )
+            .unwrap();
+
+        assert_eq!(policy.consumed_receipt_count(), 1);
+    }
+
+    // =========================================================================
+    // BLOCKER: Effect-binding verification tests
+    // =========================================================================
+
+    #[test]
+    fn receipt_payload_hash_mismatch_rejected() {
+        let mut policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "approved",
+                "security-officer-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+
+        // Present a different payload hash at consumption time.
+        let wrong_payload = b"wrong-payload-hash-32bytes-padXX";
+        let err = policy
+            .propagate_with_declassification(
+                "external-api",
+                &label,
+                &receipt,
+                Some(&TestVerifier),
+                TEST_NOW_MS,
+                wrong_payload,
+                TEST_ENVELOPE_HASH,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::EffectBindingMismatch { .. }),
+            "payload hash mismatch must be rejected, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("payload_hash"),
+            "error should mention payload_hash, got: {err}"
+        );
+    }
+
+    #[test]
+    fn receipt_envelope_hash_mismatch_rejected() {
+        let mut policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "approved",
+                "security-officer-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+
+        // Present a different envelope hash at consumption time.
+        let wrong_envelope = b"wrong-envelope-hash-32bytes-padX";
+        let err = policy
+            .propagate_with_declassification(
+                "external-api",
+                &label,
+                &receipt,
+                Some(&TestVerifier),
+                TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                wrong_envelope,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::EffectBindingMismatch { .. }),
+            "envelope hash mismatch must be rejected, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("envelope_hash"),
+            "error should mention envelope_hash, got: {err}"
+        );
+    }
+
+    // =========================================================================
+    // CQ BLOCKER: MAX_RECEIPT_LIFETIME_MS enforced at consumption
+    // =========================================================================
+
+    #[test]
+    fn over_long_lifetime_receipt_rejected_at_consumption() {
+        // An externally-constructed receipt with lifetime exceeding
+        // MAX_RECEIPT_LIFETIME_MS must be rejected at consumption time,
+        // even though it bypassed the issuance-time check.
+        let mut policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        // Manually construct a receipt with an over-long lifetime via
+        // deserialization (bypassing the issuance-time check in declassify).
+        let over_long_expires = TEST_ISSUED_AT_MS + MAX_RECEIPT_LIFETIME_MS + 1;
+        let rid = unique_receipt_id();
+
+        // Compute the correct hash for this over-long receipt.
+        let hash = DualLatticePolicy::compute_receipt_hash(
+            ConfidentialityLevel::Secret,
+            ConfidentialityLevel::Internal,
+            &rid,
+            "DECLASS-SECRET-TO-INTERNAL",
+            "over-long lifetime",
+            "security-officer-1",
+            "external-api",
+            TEST_PAYLOAD_HASH,
+            TEST_ENVELOPE_HASH,
+            TEST_ISSUED_AT_MS,
+            over_long_expires,
+        );
+
+        let forged_json = serde_json::json!({
+            "from_level": "Secret",
+            "to_level": "Internal",
+            "receipt_id": rid,
+            "policy_ref": "DECLASS-SECRET-TO-INTERNAL",
+            "justification": "over-long lifetime",
+            "authority_id": "security-officer-1",
+            "boundary_id": "external-api",
+            "payload_hash": TEST_PAYLOAD_HASH,
+            "envelope_hash": TEST_ENVELOPE_HASH,
+            "issued_at_ms": TEST_ISSUED_AT_MS,
+            "expires_at_ms": over_long_expires,
+            "content_hash": hash,
+            "authority_signature": VALID_TEST_SIG,
+        });
+        let forged: DeclassificationReceipt = serde_json::from_value(forged_json).unwrap();
+
+        let err = policy
+            .propagate_with_declassification(
+                "external-api",
+                &label,
+                &forged,
+                Some(&TestVerifier),
+                TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::ReceiptExpired { .. }),
+            "over-long lifetime must be rejected at consumption, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("exceeds maximum"),
+            "error should mention exceeding maximum, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("at consumption"),
+            "error should indicate this is a consumption-time check, got: {err}"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR: Bounded deserialization tests
+    // =========================================================================
+
+    #[test]
+    fn oversized_string_field_rejected_at_deserialization() {
+        // A string field exceeding MAX_DESERIALIZE_STRING_LEN must be
+        // rejected during deserialization itself, before the receipt
+        // object is fully constructed.
+        let oversized_justification = "X".repeat(MAX_DESERIALIZE_STRING_LEN + 1);
+        let forged_json = serde_json::json!({
+            "from_level": "Secret",
+            "to_level": "Internal",
+            "receipt_id": unique_receipt_id(),
+            "policy_ref": "DECLASS-SECRET-TO-INTERNAL",
+            "justification": oversized_justification,
+            "authority_id": "authority-1",
+            "boundary_id": "external-api",
+            "payload_hash": TEST_PAYLOAD_HASH,
+            "envelope_hash": TEST_ENVELOPE_HASH,
+            "issued_at_ms": TEST_ISSUED_AT_MS,
+            "expires_at_ms": TEST_EXPIRES_AT_MS,
+            "content_hash": vec![0u8; 32],
+        });
+        let result: Result<DeclassificationReceipt, _> = serde_json::from_value(forged_json);
+        assert!(
+            result.is_err(),
+            "oversized string field must be rejected at deserialization, got {result:?}"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("exceeds maximum"),
+            "error should mention size limit, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn oversized_bytes_field_rejected_at_deserialization() {
+        // A bytes field (payload_hash) exceeding MAX_EFFECT_HASH_LEN must
+        // be rejected during deserialization.
+        let oversized_hash = vec![0u8; MAX_EFFECT_HASH_LEN + 1];
+        let forged_json = serde_json::json!({
+            "from_level": "Secret",
+            "to_level": "Internal",
+            "receipt_id": unique_receipt_id(),
+            "policy_ref": "DECLASS-SECRET-TO-INTERNAL",
+            "justification": "valid",
+            "authority_id": "authority-1",
+            "boundary_id": "external-api",
+            "payload_hash": oversized_hash,
+            "envelope_hash": TEST_ENVELOPE_HASH,
+            "issued_at_ms": TEST_ISSUED_AT_MS,
+            "expires_at_ms": TEST_EXPIRES_AT_MS,
+            "content_hash": vec![0u8; 32],
+        });
+        let result: Result<DeclassificationReceipt, _> = serde_json::from_value(forged_json);
+        assert!(
+            result.is_err(),
+            "oversized bytes field must be rejected at deserialization, got {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // Receipt hash includes effect-binding fields
+    // =========================================================================
+
+    #[test]
+    fn receipt_hash_varies_with_payload_hash() {
+        let policy = test_policy();
+        let r1 = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "rid-ph-1",
+                "DECLASS-SECRET-TO-INTERNAL",
+                "same",
+                "authority-1",
+                "external-api",
+                b"payload-A-padded-to-32-bytes-pad",
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+        let r2 = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "rid-ph-2",
+                "DECLASS-SECRET-TO-INTERNAL",
+                "same",
+                "authority-1",
+                "external-api",
+                b"payload-B-padded-to-32-bytes-pad",
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+        assert_ne!(
+            r1.content_hash(),
+            r2.content_hash(),
+            "different payload hashes must produce different receipt hashes"
+        );
+    }
+
+    #[test]
+    fn receipt_hash_varies_with_envelope_hash() {
+        let policy = test_policy();
+        let r1 = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "rid-eh-1",
+                "DECLASS-SECRET-TO-INTERNAL",
+                "same",
+                "authority-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                b"envelope-A-padded-to-32bytes-pad",
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+        let r2 = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "rid-eh-2",
+                "DECLASS-SECRET-TO-INTERNAL",
+                "same",
+                "authority-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                b"envelope-B-padded-to-32bytes-pad",
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+        assert_ne!(
+            r1.content_hash(),
+            r2.content_hash(),
+            "different envelope hashes must produce different receipt hashes"
+        );
+    }
+
+    #[test]
+    fn receipt_hash_varies_with_receipt_id() {
+        let policy = test_policy();
+        let r1 = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "receipt-id-A",
+                "DECLASS-SECRET-TO-INTERNAL",
+                "same",
+                "authority-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+        let r2 = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "receipt-id-B",
+                "DECLASS-SECRET-TO-INTERNAL",
+                "same",
+                "authority-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+        assert_ne!(
+            r1.content_hash(),
+            r2.content_hash(),
+            "different receipt_ids must produce different receipt hashes"
         );
     }
 }
