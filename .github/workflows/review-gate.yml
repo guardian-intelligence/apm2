@@ -41,7 +41,7 @@ jobs:
           github.event.comment.author_association == 'COLLABORATOR'
         )
       )
-    runs-on: &primary_runner [self-hosted, linux, x64, fac-ovh]
+    runs-on: &primary_runner [self-hosted, linux, x64, fac-rust-forge-01]
     steps:
       - run: echo "Pre-filter passed"
 

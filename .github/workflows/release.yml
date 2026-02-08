@@ -25,7 +25,7 @@ jobs:
   # Promote artifacts from beta (or dev) and sign
   release:
     name: Promote and Sign
-    runs-on: &primary_runner [self-hosted, linux, x64, fac-ovh]
+    runs-on: &primary_runner [self-hosted, linux, x64, fac-rust-forge-01]
     outputs:
       hashes: ${{ steps.hash.outputs.hashes }}
     steps:

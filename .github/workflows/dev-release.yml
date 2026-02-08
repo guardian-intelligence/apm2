@@ -26,7 +26,7 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main') }}
-    runs-on: &primary_runner [self-hosted, linux, x64, fac-ovh]
+    runs-on: &primary_runner [self-hosted, linux, x64, fac-rust-forge-01]
     strategy:
       fail-fast: false
       matrix:
