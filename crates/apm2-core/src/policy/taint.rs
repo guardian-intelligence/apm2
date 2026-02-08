@@ -29,6 +29,15 @@
 //! - `REQ-0032`: Dual lattice taint/classification propagation
 //! - `EVID-0032`: Taint propagation correctness evidence
 //! - `EVID-0308`: Declassification receipt evidence
+//!
+//! # Runtime Integration
+//!
+//! **Note**: This module provides the dual-lattice policy primitives (types,
+//! propagation, declassification). Integration with the daemon runtime
+//! (injecting labels into work-object flows, wiring boundary checks into
+//! protocol dispatch, persisting receipts to the ledger) is planned for a
+//! follow-on ticket. Until then the API is library-only and must be called
+//! explicitly by consumers.
 
 use std::fmt;
 
@@ -47,6 +56,9 @@ const MAX_JUSTIFICATION_LEN: usize = 1024;
 
 /// Maximum length for a boundary identifier.
 const MAX_BOUNDARY_ID_LEN: usize = 256;
+
+/// Maximum length for an authority identifier in a declassification receipt.
+const MAX_AUTHORITY_ID_LEN: usize = 256;
 
 // =============================================================================
 // Errors
@@ -532,13 +544,22 @@ impl BoundaryPolicy {
 /// level. It requires:
 /// 1. An explicit policy rule authorizing the downgrade.
 /// 2. A justification string for audit.
-/// 3. The receipt is content-addressed (BLAKE3 hash) for tamper evidence.
+/// 3. An authority binding (who authorized the declassification).
+/// 4. A boundary binding (which boundary the receipt applies to).
+/// 5. The receipt is content-addressed (BLAKE3 hash) for tamper evidence.
 ///
 /// # Security Properties
 ///
 /// - Receipts are immutable once created.
 /// - The policy reference must name a real, active declassification rule.
-/// - The content hash covers all fields to prevent tampering.
+/// - The `authority_id` binds the receipt to the principal that authorized the
+///   declassification. Full cryptographic signature verification is a future
+///   concern (separate ticket).
+/// - The `boundary_id` scopes the receipt to a specific boundary crossing.
+///   [`DualLatticePolicy::propagate_with_declassification`] validates that the
+///   receipt's boundary matches the boundary being crossed.
+/// - The content hash covers **all** fields (including authority and boundary)
+///   to prevent tampering or replay across boundaries.
 /// - Receipts are logged to the ledger for post-hoc audit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeclassificationReceipt {
@@ -550,6 +571,13 @@ pub struct DeclassificationReceipt {
     policy_ref: String,
     /// Human-readable justification for audit trail.
     justification: String,
+    /// Identifier of the authority (principal) that authorized the
+    /// declassification. Structural binding only; cryptographic signature
+    /// verification is a future concern.
+    authority_id: String,
+    /// Identifier of the boundary this receipt is scoped to. The receipt is
+    /// only valid when crossing this specific boundary.
+    boundary_id: String,
     /// BLAKE3 hash of the receipt content for tamper evidence.
     content_hash: [u8; 32],
 }
@@ -577,6 +605,18 @@ impl DeclassificationReceipt {
     #[must_use]
     pub fn justification(&self) -> &str {
         &self.justification
+    }
+
+    /// Returns the authority that authorized this declassification.
+    #[must_use]
+    pub fn authority_id(&self) -> &str {
+        &self.authority_id
+    }
+
+    /// Returns the boundary this receipt is scoped to.
+    #[must_use]
+    pub fn boundary_id(&self) -> &str {
+        &self.boundary_id
     }
 
     /// Returns the BLAKE3 content hash of this receipt.
@@ -781,23 +821,25 @@ impl DualLatticePolicy {
 
     /// Request a declassification, producing a receipt if authorized.
     ///
-    /// The caller must specify which policy rule authorizes the downgrade.
-    /// If the rule exists and covers the requested range, a
-    /// [`DeclassificationReceipt`] is produced. Otherwise the request is
-    /// denied.
+    /// The caller must specify which policy rule authorizes the downgrade,
+    /// the `authority_id` of the principal requesting the declassification,
+    /// and the `boundary_id` that the receipt will be scoped to. The receipt
+    /// is only valid at the named boundary.
     ///
     /// # Errors
     ///
     /// Returns [`TaintError::DeclassificationDenied`] if no matching rule
     /// is found or the requested range is not covered.
-    /// Returns [`TaintError::InvalidPolicyRef`] if the justification is
-    /// too long.
+    /// Returns [`TaintError::InvalidPolicyRef`] if the justification,
+    /// authority, or boundary identifiers are invalid.
     pub fn declassify(
         &self,
         from: ConfidentialityLevel,
         to: ConfidentialityLevel,
         policy_ref: &str,
         justification: &str,
+        authority_id: &str,
+        boundary_id: &str,
     ) -> Result<DeclassificationReceipt, TaintError> {
         // Validate inputs.
         if from.ordinal() <= to.ordinal() {
@@ -826,6 +868,30 @@ impl DualLatticePolicy {
             });
         }
 
+        if authority_id.is_empty() {
+            return Err(TaintError::InvalidPolicyRef {
+                reason: "authority_id must be non-empty".to_string(),
+            });
+        }
+
+        if authority_id.len() > MAX_AUTHORITY_ID_LEN {
+            return Err(TaintError::InvalidPolicyRef {
+                reason: format!("authority_id exceeds maximum length of {MAX_AUTHORITY_ID_LEN}"),
+            });
+        }
+
+        if boundary_id.is_empty() {
+            return Err(TaintError::InvalidPolicyRef {
+                reason: "boundary_id must be non-empty".to_string(),
+            });
+        }
+
+        if boundary_id.len() > MAX_BOUNDARY_ID_LEN {
+            return Err(TaintError::InvalidPolicyRef {
+                reason: format!("boundary_id exceeds maximum length of {MAX_BOUNDARY_ID_LEN}"),
+            });
+        }
+
         // Find a matching declassification rule.
         let rule = self
             .declassification_rules
@@ -839,12 +905,16 @@ impl DualLatticePolicy {
                 ),
             })?;
 
-        // Compute content hash over all receipt fields.
+        // Compute content hash over ALL receipt fields, including authority
+        // and boundary bindings, to prevent replay across principals or
+        // boundaries.
         let mut hasher = blake3::Hasher::new();
         hasher.update(&[from.ordinal()]);
         hasher.update(&[to.ordinal()]);
         hasher.update(rule.rule_id().as_bytes());
         hasher.update(justification.as_bytes());
+        hasher.update(authority_id.as_bytes());
+        hasher.update(boundary_id.as_bytes());
         let content_hash: [u8; 32] = hasher.finalize().into();
 
         Ok(DeclassificationReceipt {
@@ -852,20 +922,28 @@ impl DualLatticePolicy {
             to_level: to,
             policy_ref: policy_ref.to_string(),
             justification: justification.to_string(),
+            authority_id: authority_id.to_string(),
+            boundary_id: boundary_id.to_string(),
             content_hash,
         })
     }
 
-    /// Propagate a label through a boundary crossing, applying the meet
-    /// on confidentiality.
+    /// Propagate a label through a boundary crossing **without** implicit
+    /// declassification.
     ///
-    /// Returns the label with confidentiality clamped to the boundary's
-    /// clearance. The taint dimension is unchanged (it only grows via join).
+    /// If the label's confidentiality exceeds the boundary's clearance, the
+    /// crossing is **denied** rather than silently clamped. To cross a
+    /// boundary that requires a confidentiality downgrade, use
+    /// [`Self::propagate_with_declassification`] with a valid receipt.
     ///
     /// # Errors
     ///
-    /// Returns the appropriate error if the label's taint exceeds the
-    /// boundary ceiling (taint violations are never auto-clamped).
+    /// - [`TaintError::BoundaryCrossingDenied`] if no boundary with the given
+    ///   ID is configured (fail-closed).
+    /// - [`TaintError::TaintCeilingExceeded`] if taint exceeds the boundary
+    ///   ceiling.
+    /// - [`TaintError::ConfidentialityFloorViolation`] if confidentiality
+    ///   exceeds the boundary clearance (requires explicit declassification).
     pub fn propagate_through_boundary(
         &self,
         boundary_id: &str,
@@ -889,10 +967,114 @@ impl DualLatticePolicy {
             });
         }
 
-        // Confidentiality propagates via meet (clamp down).
-        let clamped_conf = label.confidentiality.meet(boundary.max_confidentiality());
+        // Confidentiality is checked strictly: no implicit declassification.
+        if !label
+            .confidentiality
+            .within_clearance(boundary.max_confidentiality())
+        {
+            return Err(TaintError::ConfidentialityFloorViolation {
+                actual: label.confidentiality,
+                max_allowed: boundary.max_confidentiality(),
+                boundary: boundary_id.to_string(),
+            });
+        }
 
-        Ok(DataLabel::new(label.taint, clamped_conf))
+        Ok(*label)
+    }
+
+    /// Propagate a label through a boundary crossing with an explicit
+    /// declassification receipt.
+    ///
+    /// The receipt must:
+    /// 1. Be scoped to the same `boundary_id` being crossed.
+    /// 2. Declassify from at least `label.confidentiality` down to at most
+    ///    `boundary.max_confidentiality`.
+    ///
+    /// If the label already fits within the boundary clearance the receipt
+    /// is not consumed and the label passes through unchanged (but the
+    /// receipt is still validated for binding correctness).
+    ///
+    /// # Errors
+    ///
+    /// - [`TaintError::BoundaryCrossingDenied`] if the boundary is unknown
+    ///   (fail-closed), or the receipt is not scoped to this boundary, or the
+    ///   receipt does not cover the required downgrade range.
+    /// - [`TaintError::TaintCeilingExceeded`] if taint exceeds the boundary
+    ///   ceiling.
+    pub fn propagate_with_declassification(
+        &self,
+        boundary_id: &str,
+        label: &DataLabel,
+        receipt: &DeclassificationReceipt,
+    ) -> Result<DataLabel, TaintError> {
+        let boundary = self
+            .boundaries
+            .iter()
+            .find(|b| b.boundary_id() == boundary_id)
+            .ok_or_else(|| TaintError::BoundaryCrossingDenied {
+                boundary: boundary_id.to_string(),
+                reason: "no boundary policy configured (fail-closed)".to_string(),
+            })?;
+
+        // Taint is checked strictly: never auto-lowered.
+        if !label.taint.within_ceiling(boundary.max_taint()) {
+            return Err(TaintError::TaintCeilingExceeded {
+                actual: label.taint,
+                max_allowed: boundary.max_taint(),
+                tier: boundary.tier(),
+            });
+        }
+
+        // Validate that the receipt is scoped to this boundary.
+        if receipt.boundary_id() != boundary_id {
+            return Err(TaintError::BoundaryCrossingDenied {
+                boundary: boundary_id.to_string(),
+                reason: format!(
+                    "receipt is scoped to boundary '{}', not '{boundary_id}'",
+                    receipt.boundary_id()
+                ),
+            });
+        }
+
+        // If confidentiality already fits, pass through unchanged.
+        if label
+            .confidentiality
+            .within_clearance(boundary.max_confidentiality())
+        {
+            return Ok(*label);
+        }
+
+        // Validate that the receipt covers the required downgrade range:
+        // from_level must be >= label.confidentiality (covers the source),
+        // to_level must be <= boundary.max_confidentiality (reaches the target).
+        if receipt.from_level() < label.confidentiality {
+            return Err(TaintError::BoundaryCrossingDenied {
+                boundary: boundary_id.to_string(),
+                reason: format!(
+                    "receipt from_level ({}) does not cover label confidentiality ({})",
+                    receipt.from_level(),
+                    label.confidentiality
+                ),
+            });
+        }
+
+        if !receipt
+            .to_level()
+            .within_clearance(boundary.max_confidentiality())
+        {
+            return Err(TaintError::BoundaryCrossingDenied {
+                boundary: boundary_id.to_string(),
+                reason: format!(
+                    "receipt to_level ({}) exceeds boundary max_confidentiality ({})",
+                    receipt.to_level(),
+                    boundary.max_confidentiality()
+                ),
+            });
+        }
+
+        // Apply the declassification: set confidentiality to the receipt's
+        // target level.
+        Ok(DataLabel::new(label.taint, receipt.to_level()))
     }
 
     /// Returns the configured boundaries.
@@ -1499,6 +1681,8 @@ mod tests {
                 ConfidentialityLevel::Internal,
                 "DECLASS-SECRET-TO-INTERNAL",
                 "Approved by security review SR-2026-042",
+                "security-officer-1",
+                "external-api",
             )
             .unwrap();
 
@@ -1509,6 +1693,8 @@ mod tests {
             receipt.justification(),
             "Approved by security review SR-2026-042"
         );
+        assert_eq!(receipt.authority_id(), "security-officer-1");
+        assert_eq!(receipt.boundary_id(), "external-api");
         assert!(!receipt.content_hash_hex().is_empty());
         assert_eq!(receipt.content_hash_hex().len(), 64); // 32 bytes hex
     }
@@ -1522,6 +1708,8 @@ mod tests {
                 ConfidentialityLevel::Internal,
                 "DECLASS-SECRET-TO-INTERNAL",
                 "same justification",
+                "authority-1",
+                "external-api",
             )
             .unwrap();
         let r2 = policy
@@ -1530,6 +1718,8 @@ mod tests {
                 ConfidentialityLevel::Internal,
                 "DECLASS-SECRET-TO-INTERNAL",
                 "same justification",
+                "authority-1",
+                "external-api",
             )
             .unwrap();
         assert_eq!(r1.content_hash(), r2.content_hash());
@@ -1544,6 +1734,8 @@ mod tests {
                 ConfidentialityLevel::Internal,
                 "DECLASS-SECRET-TO-INTERNAL",
                 "justification A",
+                "authority-1",
+                "external-api",
             )
             .unwrap();
         let r2 = policy
@@ -1552,6 +1744,60 @@ mod tests {
                 ConfidentialityLevel::Internal,
                 "DECLASS-SECRET-TO-INTERNAL",
                 "justification B",
+                "authority-1",
+                "external-api",
+            )
+            .unwrap();
+        assert_ne!(r1.content_hash(), r2.content_hash());
+    }
+
+    #[test]
+    fn declassification_receipt_hash_varies_with_authority() {
+        let policy = test_policy();
+        let r1 = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "same justification",
+                "authority-A",
+                "external-api",
+            )
+            .unwrap();
+        let r2 = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "same justification",
+                "authority-B",
+                "external-api",
+            )
+            .unwrap();
+        assert_ne!(r1.content_hash(), r2.content_hash());
+    }
+
+    #[test]
+    fn declassification_receipt_hash_varies_with_boundary() {
+        let policy = test_policy();
+        let r1 = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "same justification",
+                "authority-1",
+                "external-api",
+            )
+            .unwrap();
+        let r2 = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "same justification",
+                "authority-1",
+                "tier3-actuator",
             )
             .unwrap();
         assert_ne!(r1.content_hash(), r2.content_hash());
@@ -1566,6 +1812,8 @@ mod tests {
                 ConfidentialityLevel::Public,
                 "DECLASS-SECRET-TO-INTERNAL",
                 "trying to leak",
+                "authority-1",
+                "external-api",
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::DeclassificationDenied { .. }));
@@ -1580,6 +1828,8 @@ mod tests {
                 ConfidentialityLevel::Internal,
                 "NONEXISTENT-RULE",
                 "no such rule",
+                "authority-1",
+                "external-api",
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::DeclassificationDenied { .. }));
@@ -1594,6 +1844,8 @@ mod tests {
                 ConfidentialityLevel::Secret,
                 "DECLASS-SECRET-TO-INTERNAL",
                 "upgrade attempt",
+                "authority-1",
+                "external-api",
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::DeclassificationDenied { .. }));
@@ -1608,6 +1860,8 @@ mod tests {
                 ConfidentialityLevel::Secret,
                 "DECLASS-SECRET-TO-INTERNAL",
                 "no-op attempt",
+                "authority-1",
+                "external-api",
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::DeclassificationDenied { .. }));
@@ -1622,6 +1876,8 @@ mod tests {
                 ConfidentialityLevel::Internal,
                 "",
                 "missing ref",
+                "authority-1",
+                "external-api",
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::InvalidPolicyRef { .. }));
@@ -1637,6 +1893,74 @@ mod tests {
                 ConfidentialityLevel::Internal,
                 "DECLASS-SECRET-TO-INTERNAL",
                 &long_just,
+                "authority-1",
+                "external-api",
+            )
+            .unwrap_err();
+        assert!(matches!(err, TaintError::InvalidPolicyRef { .. }));
+    }
+
+    #[test]
+    fn declassification_denied_empty_authority_id() {
+        let policy = test_policy();
+        let err = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "valid justification",
+                "",
+                "external-api",
+            )
+            .unwrap_err();
+        assert!(matches!(err, TaintError::InvalidPolicyRef { .. }));
+    }
+
+    #[test]
+    fn declassification_denied_empty_boundary_id() {
+        let policy = test_policy();
+        let err = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "valid justification",
+                "authority-1",
+                "",
+            )
+            .unwrap_err();
+        assert!(matches!(err, TaintError::InvalidPolicyRef { .. }));
+    }
+
+    #[test]
+    fn declassification_denied_long_authority_id() {
+        let policy = test_policy();
+        let long_auth = "x".repeat(MAX_AUTHORITY_ID_LEN + 1);
+        let err = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "valid justification",
+                &long_auth,
+                "external-api",
+            )
+            .unwrap_err();
+        assert!(matches!(err, TaintError::InvalidPolicyRef { .. }));
+    }
+
+    #[test]
+    fn declassification_denied_long_boundary_id() {
+        let policy = test_policy();
+        let long_bnd = "x".repeat(MAX_BOUNDARY_ID_LEN + 1);
+        let err = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "valid justification",
+                "authority-1",
+                &long_bnd,
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::InvalidPolicyRef { .. }));
@@ -1653,6 +1977,8 @@ mod tests {
                 ConfidentialityLevel::Internal,
                 "DECLASS-SECRET-TO-INTERNAL",
                 "step 1",
+                "authority-1",
+                "external-api",
             )
             .unwrap();
         assert_eq!(r1.to_level(), ConfidentialityLevel::Internal);
@@ -1663,6 +1989,8 @@ mod tests {
                 ConfidentialityLevel::Public,
                 "DECLASS-INTERNAL-TO-PUBLIC",
                 "step 2",
+                "authority-1",
+                "tier4-actuator",
             )
             .unwrap();
         assert_eq!(r2.to_level(), ConfidentialityLevel::Public);
@@ -1673,14 +2001,124 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn propagation_clamps_confidentiality() {
+    fn propagation_denies_over_confidential_without_receipt() {
+        // propagate_through_boundary must DENY when confidentiality exceeds
+        // the boundary's clearance. No implicit clamping allowed.
         let policy = test_policy();
         let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
-        let result = policy
+        let err = policy
             .propagate_through_boundary("external-api", &label)
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::ConfidentialityFloorViolation { .. }),
+            "expected ConfidentialityFloorViolation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn propagation_with_receipt_allows_declassified_crossing() {
+        // With a valid receipt scoped to the correct boundary, the crossing
+        // succeeds and the label's confidentiality is set to the receipt's
+        // to_level.
+        let policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "Approved for external release",
+                "security-officer-1",
+                "external-api",
+            )
+            .unwrap();
+
+        let result = policy
+            .propagate_with_declassification("external-api", &label, &receipt)
             .unwrap();
         assert_eq!(result.taint, TaintLevel::Untainted);
         assert_eq!(result.confidentiality, ConfidentialityLevel::Internal);
+    }
+
+    #[test]
+    fn propagation_with_receipt_rejects_wrong_boundary() {
+        // A receipt scoped to a different boundary must be rejected.
+        let policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        // Receipt scoped to "tier3-actuator", not "external-api".
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "wrong boundary",
+                "security-officer-1",
+                "tier3-actuator",
+            )
+            .unwrap();
+
+        let err = policy
+            .propagate_with_declassification("external-api", &label, &receipt)
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::BoundaryCrossingDenied { .. }),
+            "expected BoundaryCrossingDenied, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn propagation_with_receipt_passes_when_already_within_clearance() {
+        // If the label is already within the boundary clearance, the receipt
+        // is validated (boundary_id must still match) but the label passes
+        // through unchanged.
+        let policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Public);
+
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "not needed but valid",
+                "security-officer-1",
+                "external-api",
+            )
+            .unwrap();
+
+        let result = policy
+            .propagate_with_declassification("external-api", &label, &receipt)
+            .unwrap();
+        assert_eq!(result, label);
+    }
+
+    #[test]
+    fn propagation_with_receipt_rejects_insufficient_downgrade() {
+        // Receipt's to_level is still above the boundary's max_confidentiality.
+        let policy = test_policy();
+        // tier4-actuator max_confidentiality = Public
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        // Receipt only goes down to Internal, but tier4 requires Public.
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "insufficient downgrade",
+                "security-officer-1",
+                "tier4-actuator",
+            )
+            .unwrap();
+
+        let err = policy
+            .propagate_with_declassification("tier4-actuator", &label, &receipt)
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::BoundaryCrossingDenied { .. }),
+            "expected BoundaryCrossingDenied for insufficient downgrade, got {err:?}"
+        );
     }
 
     #[test]
@@ -1784,6 +2222,8 @@ mod tests {
                 ConfidentialityLevel::Public,
                 "DECLASS-SECRET-TO-INTERNAL",
                 "trying to skip levels",
+                "authority-1",
+                "external-api",
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::DeclassificationDenied { .. }));
@@ -1798,6 +2238,8 @@ mod tests {
                 ConfidentialityLevel::TopSecret,
                 "DECLASS-SECRET-TO-INTERNAL",
                 "reverse declassification attempt",
+                "authority-1",
+                "external-api",
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::DeclassificationDenied { .. }));
@@ -1824,9 +2266,48 @@ mod tests {
                 ConfidentialityLevel::Public,
                 "ANY-RULE",
                 "no rules exist",
+                "authority-1",
+                "some-boundary",
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::DeclassificationDenied { .. }));
+    }
+
+    #[test]
+    fn adversarial_propagation_denies_implicit_declassification() {
+        // Verify that propagate_through_boundary never silently lowers
+        // confidentiality. This is the core fix for the implicit
+        // declassification vulnerability.
+        let policy = test_policy();
+
+        // Secret data must be blocked at external-api (max_conf = Internal)
+        // without an explicit receipt.
+        let secret = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+        assert!(
+            policy
+                .propagate_through_boundary("external-api", &secret)
+                .is_err(),
+            "propagation must not silently declassify"
+        );
+
+        // TopSecret data must be blocked at tier3-actuator (max_conf = Internal).
+        let top_secret = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::TopSecret);
+        assert!(
+            policy
+                .propagate_through_boundary("tier3-actuator", &top_secret)
+                .is_err(),
+            "propagation must not silently declassify"
+        );
+
+        // Confidential data must be blocked at tier4-actuator (max_conf = Public).
+        let confidential =
+            DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Confidential);
+        assert!(
+            policy
+                .propagate_through_boundary("tier4-actuator", &confidential)
+                .is_err(),
+            "propagation must not silently declassify"
+        );
     }
 
     // =========================================================================
