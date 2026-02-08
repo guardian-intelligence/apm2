@@ -16,6 +16,10 @@
 //!   context
 //! - `apm2 fac resume <work_id>` - Show crash-only resume helpers from ledger
 //!   anchor
+//! - `apm2 fac review run <PR_URL>` - Run FAC review orchestration (sequential,
+//!   multi-model)
+//! - `apm2 fac review status` - Show FAC review state and recent events
+//! - `apm2 fac review tail` - Tail FAC review NDJSON telemetry stream
 //!
 //! # Design
 //!
@@ -56,6 +60,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
+use crate::commands::fac_review;
 use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
 // =============================================================================
@@ -145,6 +150,13 @@ pub enum FacSubcommand {
     /// Analyzes ledger to determine restart point for interrupted work.
     /// Returns the last committed anchor and pending operations.
     Resume(ResumeArgs),
+
+    /// Run and observe FAC review orchestration for pull requests.
+    ///
+    /// Provides VPS-oriented review execution and observability with
+    /// sequential `security -> quality` orchestration, model fallback, and
+    /// NDJSON telemetry under `~/.apm2`.
+    Review(ReviewArgs),
 }
 
 /// Arguments for `apm2 fac check`.
@@ -302,6 +314,69 @@ pub struct ResumeArgs {
     /// Maximum number of events to scan from the end of the ledger.
     #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
     pub limit: u64,
+}
+
+/// Arguments for `apm2 fac review`.
+#[derive(Debug, Args)]
+pub struct ReviewArgs {
+    #[command(subcommand)]
+    pub subcommand: ReviewSubcommand,
+}
+
+/// Review subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ReviewSubcommand {
+    /// Run FAC review orchestration for a pull request URL.
+    Run(ReviewRunArgs),
+    /// Show FAC review state/events from local operational artifacts.
+    Status(ReviewStatusArgs),
+    /// Tail FAC review NDJSON event stream.
+    Tail(ReviewTailArgs),
+}
+
+/// Arguments for `apm2 fac review run`.
+#[derive(Debug, Args)]
+pub struct ReviewRunArgs {
+    /// GitHub pull request URL.
+    pub pr_url: String,
+
+    /// Review selection (`all`, `security`, or `quality`).
+    #[arg(
+        long = "type",
+        alias = "review-type",
+        value_enum,
+        default_value_t = fac_review::ReviewRunType::All
+    )]
+    pub review_type: fac_review::ReviewRunType,
+
+    /// Optional expected head SHA (40 hex) to fail closed on stale review
+    /// start.
+    #[arg(long)]
+    pub expected_head_sha: Option<String>,
+}
+
+/// Arguments for `apm2 fac review status`.
+#[derive(Debug, Args)]
+pub struct ReviewStatusArgs {
+    /// Optional pull request number filter.
+    #[arg(long)]
+    pub pr: Option<u32>,
+
+    /// Optional pull request URL filter.
+    #[arg(long)]
+    pub pr_url: Option<String>,
+}
+
+/// Arguments for `apm2 fac review tail`.
+#[derive(Debug, Args)]
+pub struct ReviewTailArgs {
+    /// Number of lines to show from the end of the event stream.
+    #[arg(long, default_value_t = 20)]
+    pub lines: usize,
+
+    /// Follow mode (stream appended events).
+    #[arg(long, default_value_t = false)]
+    pub follow: bool,
 }
 
 // =============================================================================
@@ -515,6 +590,20 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
             },
         },
         FacSubcommand::Resume(args) => run_resume(args, &ledger_path, json_output),
+        FacSubcommand::Review(args) => match &args.subcommand {
+            ReviewSubcommand::Run(run_args) => fac_review::run_review(
+                &run_args.pr_url,
+                run_args.review_type,
+                run_args.expected_head_sha.as_deref(),
+                json_output,
+            ),
+            ReviewSubcommand::Status(status_args) => {
+                fac_review::run_status(status_args.pr, status_args.pr_url.as_deref(), json_output)
+            },
+            ReviewSubcommand::Tail(tail_args) => {
+                fac_review::run_tail(tail_args.lines, tail_args.follow)
+            },
+        },
     }
 }
 

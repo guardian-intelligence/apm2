@@ -39,13 +39,13 @@ commands[15]:
     side_effect: false
 
   - name: launch_reviews
-    command: "timeout 60s bash <ROOT>/documents/skills/orchestrator-monitor/assets/launch-reviews.sh <PR_NUMBER> <SCRATCHPAD_DIR>"
-    purpose: "Launch security + code-quality review jobs for one PR; PR_URL is injected into prompt templates."
+    command: "timeout 900s bash <ROOT>/documents/skills/orchestrator-monitor/assets/launch-reviews.sh <PR_NUMBER|PR_URL> [SCRATCHPAD_DIR]"
+    purpose: "Launch FAC review orchestration (`apm2 fac review run ... --type all`) with NDJSON telemetry tailing."
     side_effect: true
 
   - name: check_review_progress
-    command: "timeout 30s bash <ROOT>/documents/skills/orchestrator-monitor/assets/check-review.sh <PR_NUMBER> <SCRATCHPAD_DIR>"
-    purpose: "Check review process/log progress and verdict indicators."
+    command: "timeout 30s bash <ROOT>/documents/skills/orchestrator-monitor/assets/check-review.sh [PR_NUMBER|PR_URL]"
+    purpose: "Read FAC review state/events/pulse files and print structured review progress."
     side_effect: false
 
   - name: enable_auto_merge
@@ -58,9 +58,9 @@ commands[15]:
     purpose: "Refresh local main after merges before next dispatch wave."
     side_effect: true
 
-  - name: list_codex_processes
-    command: "timeout 10s ps aux | rg 'codex exec'"
-    purpose: "Observe active review process count for saturation/backpressure checks."
+  - name: list_review_processes
+    command: "timeout 10s ps aux | rg '(codex exec|gemini -m|apm2 fac review)'"
+    purpose: "Observe active FAC review process count for saturation/backpressure checks."
     side_effect: false
 
   - name: fetch_main

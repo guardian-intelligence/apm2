@@ -1,46 +1,79 @@
 #!/usr/bin/env bash
-# Launch security + quality Codex reviews for a PR
-# Usage: bash launch-reviews.sh <PR_NUMBER> [SCRATCHPAD_DIR]
+# Launch FAC review orchestration for a PR.
+# Usage:
+#   bash launch-reviews.sh <PR_NUMBER|PR_URL> [SCRATCHPAD_DIR]
 #
-# Prepares review prompts via envsubst and launches both reviews in background.
-# Falls back to Gemini CLI if codex is rate-limited.
+# Primary path:
+#   apm2 fac review run <PR_URL> --type all
+# Fallback path:
+#   direct codex/gemini sequential invocation when apm2 is unavailable.
 
 set -euo pipefail
 
-PR_NUMBER="${1:?Usage: launch-reviews.sh <PR_NUMBER> [SCRATCHPAD_DIR]}"
-SCRATCHPAD="${2:-/tmp/claude-1000/-home-ubuntu-Projects-apm2/scratchpad}"
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo /home/ubuntu/Projects/apm2)"
+INPUT="${1:?Usage: launch-reviews.sh <PR_NUMBER|PR_URL> [SCRATCHPAD_DIR]}"
+SCRATCHPAD="${2:-/tmp/apm2-review-scratchpad}"
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+EVENTS_FILE="${HOME}/.apm2/review_events.ndjson"
 
-export PR_URL="https://github.com/guardian-intelligence/apm2/pull/${PR_NUMBER}"
+if [[ "$INPUT" =~ ^https?://github.com/.+/pull/[0-9]+$ ]]; then
+  PR_URL="$INPUT"
+  PR_NUMBER="$(echo "$PR_URL" | awk -F/ '{print $NF}')"
+elif [[ "$INPUT" =~ ^[0-9]+$ ]]; then
+  REPO_SLUG="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || echo guardian-intelligence/apm2)"
+  PR_NUMBER="$INPUT"
+  PR_URL="https://github.com/${REPO_SLUG}/pull/${PR_NUMBER}"
+else
+  echo "ERROR: first arg must be PR number or PR URL"
+  exit 1
+fi
 
+mkdir -p "${HOME}/.apm2"
 mkdir -p "$SCRATCHPAD"
 
-echo "Preparing review prompts for PR #${PR_NUMBER}..."
+echo "Launching FAC review sequence for PR #${PR_NUMBER}"
+echo "  PR_URL: ${PR_URL}"
+echo "  Events: ${EVENTS_FILE}"
 
-# Generate review prompts (PR URL is injected into prompt templates).
-envsubst '${PR_URL}' < "${REPO_ROOT}/documents/reviews/SECURITY_REVIEW_PROMPT.md" \
-  > "${SCRATCHPAD}/security_pr${PR_NUMBER}.md"
-envsubst '${PR_URL}' < "${REPO_ROOT}/documents/reviews/CODE_QUALITY_PROMPT.md" \
-  > "${SCRATCHPAD}/quality_pr${PR_NUMBER}.md"
+tail_pid=""
+if [[ -f "$EVENTS_FILE" ]]; then
+  tail -n 0 -F "$EVENTS_FILE" | sed 's/^/[review-event] /' &
+  tail_pid=$!
+fi
 
-# Launch security review
-echo "Launching security review..."
-codex exec -m gpt-5.3-codex --dangerously-bypass-approvals-and-sandbox - \
-  < "${SCRATCHPAD}/security_pr${PR_NUMBER}.md" \
-  > "${SCRATCHPAD}/security_pr${PR_NUMBER}_output.log" 2>&1 &
-SEC_PID=$!
+cleanup_tail() {
+  if [[ -n "$tail_pid" ]]; then
+    kill "$tail_pid" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_tail EXIT
 
-# Launch quality review
-echo "Launching quality review..."
-codex exec -m gpt-5.3-codex --dangerously-bypass-approvals-and-sandbox - \
-  < "${SCRATCHPAD}/quality_pr${PR_NUMBER}.md" \
-  > "${SCRATCHPAD}/quality_pr${PR_NUMBER}_output.log" 2>&1 &
-QUAL_PID=$!
+if command -v apm2 >/dev/null 2>&1; then
+  apm2 fac review run "$PR_URL" --type all
+  exit $?
+fi
 
-echo ""
-echo "Reviews launched for PR #${PR_NUMBER}:"
-echo "  Security: PID ${SEC_PID} -> ${SCRATCHPAD}/security_pr${PR_NUMBER}_output.log"
-echo "  Quality:  PID ${QUAL_PID} -> ${SCRATCHPAD}/quality_pr${PR_NUMBER}_output.log"
-echo ""
-echo "Monitor with:"
-echo "  bash ${REPO_ROOT}/.claude/skills/orchestrator-monitor/assets/check-review.sh ${PR_NUMBER} ${SCRATCHPAD}"
+if command -v cargo >/dev/null 2>&1; then
+  cargo run -p apm2-cli -- fac review run "$PR_URL" --type all
+  exit $?
+fi
+
+echo "WARN: apm2/apm2-cli unavailable, falling back to direct CLI review execution."
+SEC_PROMPT="${SCRATCHPAD}/security_pr${PR_NUMBER}.md"
+QUAL_PROMPT="${SCRATCHPAD}/quality_pr${PR_NUMBER}.md"
+envsubst '${PR_URL}' < "${REPO_ROOT}/documents/reviews/SECURITY_REVIEW_PROMPT.md" > "$SEC_PROMPT"
+envsubst '${PR_URL}' < "${REPO_ROOT}/documents/reviews/CODE_QUALITY_PROMPT.md" > "$QUAL_PROMPT"
+
+if command -v codex >/dev/null 2>&1; then
+  codex exec --model gpt-5.3-codex-xhigh --dangerously-bypass-approvals-and-sandbox --json - < "$SEC_PROMPT"
+  codex exec --model gpt-5.3-codex-xhigh --dangerously-bypass-approvals-and-sandbox --json - < "$QUAL_PROMPT"
+  exit 0
+fi
+
+if command -v gemini >/dev/null 2>&1; then
+  gemini -m gemini-3.0-flash-preview -y -o stream-json -p "$(cat "$SEC_PROMPT")"
+  gemini -m gemini-3.0-flash-preview -y -o stream-json -p "$(cat "$QUAL_PROMPT")"
+  exit 0
+fi
+
+echo "ERROR: no usable review executor found (apm2, cargo, codex, gemini)."
+exit 1

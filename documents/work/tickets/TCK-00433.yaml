@@ -1,0 +1,94 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00433"
+    title: "FAC-first unified AI review executor with parallel projection, multi-model orchestration, and NDJSON telemetry"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0018"
+    requirements:
+      - requirement_id: "REQ-HEF-0016"
+        requirement_ref: "documents/rfcs/RFC-0018/requirements/REQ-HEF-0016.yaml#rfc_requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-HEF-0017"
+        artifact_ref: "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0017.yaml#rfc_evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+      - "AGENT_REVIEWER"
+      - "AGENT_QA"
+    responsibility_domains:
+      - "DOMAIN_RUNTIME"
+      - "DOMAIN_BUILD_RELEASE"
+      - "DOMAIN_OBSERVABILITY"
+      - "DOMAIN_SECURITY"
+      - "DOMAIN_INFRA"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00419"
+        reason: "Stage-2 lifecycle cutover and instruction-plane lockstep to FAC is prerequisite context for removing xtask review authority."
+      - ticket_id: "TCK-00415"
+        reason: "WorkObject projection authority baseline is prerequisite for FAC-first operational flow."
+      - ticket_id: "TCK-00416"
+        reason: "Lifecycle authority bindings and fail-closed posture must be preserved while adding FAC review orchestration."
+  scope:
+    in_scope:
+      - "Add `apm2 fac review` command surface (`run`, `status`, `tail`) in apm2-cli; no xtask review orchestration changes."
+      - "Implement sequential execution for `apm2 fac review run --type all` with strict `security -> quality` ordering."
+      - "Cut over GitHub AI review projection to a unified workflow (`.github/workflows/ai-review.yml`) that uses `apm2 fac review`."
+      - "Launch `security` and `quality` FAC reviewers in parallel from GitHub workflow execution."
+      - "Emit one condensed reviewer-fleet status line per second in GitHub logs and print explicit error lines for crash/stall/fallback/SHA-update events."
+      - "Implement uniform random model selection across `gemini-3.0-flash-preview`, `gemini-3.0-pro-preview`, and `gpt-5.3-codex-xhigh`."
+      - "Implement backend-aware command dispatch for Codex and Gemini initial spawn and resume paths."
+      - "Emit append-only review lifecycle telemetry to `~/.apm2/review_events.ndjson` with rotation at 10MB."
+      - "Implement pulse files for SHA freshness (`review_pulse_security.json`, `review_pulse_quality.json`) and kill+resume on head movement."
+      - "Implement liveness-based stall detection (event-stream primary, log-growth fallback) and bounded fallback restart policy."
+      - "Persist active run metadata in FAC review state (`~/.apm2/review_state.json`) including PID, model, backend, and restart count."
+      - "Update `documents/skills/orchestrator-monitor` scripts/docs to use FAC review commands and NDJSON/pulse telemetry."
+      - "Keep GitHub review-gate authority semantics unchanged; this ticket only changes review execution orchestration."
+    out_of_scope:
+      - "Any modifications to xtask review/push/check implementation paths."
+      - "Daemon-side authoritative receipt ingestion for FAC review runs in this phase."
+      - "Changes to `.github/workflows/review-gate.yml` merge gate evaluation logic."
+      - "Redesign of FAC policy-resolution, lease issuance, or merge executor internals."
+  plan:
+    steps:
+      - "Create a dedicated implementation worktree and keep all edits scoped to that worktree."
+      - "Extend apm2-cli FAC subcommands to include `review` with `run/status/tail` flows and JSON/text output support."
+      - "Add a FAC review module encapsulating model pool selection, backend routing, lifecycle state machine, and event emission."
+      - "Implement sequential `run --type all` orchestration and per-review type execution loops with restart caps."
+      - "Implement pulse monitor loop (`gh pr view --json headRefOid` polling) and session resume on SHA drift."
+      - "Implement liveness monitor with 90s stall threshold and fallback model rotation on stall/crash/HTTP400-rate-limit signals."
+      - "Add tests for model selection, fallback cycling, command builder dispatch, NDJSON append/rotation, pulse round-trip, and state compatibility."
+      - "Rewrite orchestrator-monitor launch/check/poll assets to call `apm2 fac review` and parse FAC review telemetry/state files."
+      - "Replace split AI-review workflows with unified `.github/workflows/ai-review.yml`, launching security and quality reviews in parallel via FAC."
+      - "Implement 1Hz projection logging in GitHub workflow using `apm2 fac --json review status --pr <N>` and explicit error-event lines."
+      - "Run `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo doc --workspace --no-deps`, and `cargo test -p apm2-cli`."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-HEF-0017"
+    criteria:
+      - "`apm2 fac review run --type all <PR_URL>` executes security and quality sequentially and records deterministic event ordering."
+      - "Unified GitHub AI review workflow launches `security` and `quality` FAC review runs in parallel for the same PR head SHA."
+      - "GitHub run logs show one condensed status line per second with current reviewer-agent state and surface explicit error lines when faults appear."
+      - "Review runs are observable through NDJSON lifecycle events and pulse/state files without relying on ad-hoc mtime/process greps."
+      - "On SHA drift, active review sessions are terminated and resumed with preserved context via backend-native resume commands."
+      - "On stall or crash, fallback model selection is applied with bounded restart attempts and explicit telemetry."
+      - "orchestrator-monitor scripts are FAC-first and no longer depend on xtask review entrypoints."
+      - "No xtask source files are modified by this ticket implementation."
+  notes:
+    security: |
+      Enforce fail-closed behavior for ambiguous reviewer execution states.
+      Pulse and telemetry artifacts are non-authoritative operational signals;
+      merge authority remains review-gate based.
+    verification: |
+      Validate both unit-level command/state correctness and manual end-to-end
+      behavior across normal, stall, crash, and SHA-move scenarios. Validate
+      workflow-level parallel launch by pushing a PR branch and observing both
+      reviewer agents start concurrently with 1Hz projection logs.
+    general: |
+      Implementation must remain FAC-first and worktree-scoped. The migration
+      goal is to stop expanding xtask review orchestration and consolidate on
+      `apm2 fac` runtime surfaces.
