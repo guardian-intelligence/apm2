@@ -35,6 +35,8 @@ const LIVENESS_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 const STALL_THRESHOLD: Duration = Duration::from_secs(90);
 const TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOOP_SLEEP: Duration = Duration::from_millis(1000);
+const COMMENT_CONFIRM_MAX_PAGES: usize = 20;
+const COMMENT_PERMISSION_SCAN_LINES: usize = 200;
 
 const SECURITY_PROMPT_PATH: &str = "documents/reviews/SECURITY_REVIEW_PROMPT.md";
 const QUALITY_PROMPT_PATH: &str = "documents/reviews/CODE_QUALITY_PROMPT.md";
@@ -559,6 +561,7 @@ fn run_single_review(
     let mut restart_count: u32 = 0;
     let review_started = Instant::now();
     let review_type = review_kind.as_str();
+    let expected_comment_author = resolve_authenticated_gh_login();
 
     let Some(_lease) = try_acquire_review_lease(owner_repo, pr_number, review_type)? else {
         let existing = find_active_review_entry(pr_number, review_type, Some(&current_head_sha))?;
@@ -681,6 +684,7 @@ fn run_single_review(
                         pr_number,
                         review_kind.marker(),
                         &current_head_sha,
+                        expected_comment_author.as_deref(),
                     )?;
                     let is_valid_completion = verdict != "UNKNOWN" && comment_id.is_some();
 
@@ -1417,6 +1421,18 @@ fn fetch_pr_head_sha(owner_repo: &str, pr_number: u32) -> Result<String, String>
     Ok(sha)
 }
 
+fn resolve_authenticated_gh_login() -> Option<String> {
+    let output = Command::new("gh")
+        .args(["api", "user", "--jq", ".login"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let login = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if login.is_empty() { None } else { Some(login) }
+}
+
 fn resolve_repo_root() -> Result<PathBuf, String> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -1576,30 +1592,54 @@ fn confirm_review_posted(
     pr_number: u32,
     marker: &str,
     head_sha: &str,
+    expected_author_login: Option<&str>,
 ) -> Result<Option<u64>, String> {
-    let endpoint = format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100");
-    let output = Command::new("gh")
-        .args(["api", &endpoint])
-        .output()
-        .map_err(|err| format!("failed to execute gh api for comments: {err}"))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|err| format!("failed to parse comments response: {err}"))?;
-    let comments = payload
-        .as_array()
-        .ok_or_else(|| "comments response was not an array".to_string())?;
-    for comment in comments.iter().rev() {
-        let body = comment
-            .get("body")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        if body.contains(marker)
-            && body
-                .to_ascii_lowercase()
-                .contains(&head_sha.to_ascii_lowercase())
-        {
+    let marker_lower = marker.to_ascii_lowercase();
+    let head_sha_lower = head_sha.to_ascii_lowercase();
+    let expected_author_lower = expected_author_login.map(str::to_ascii_lowercase);
+
+    for page in 1..=COMMENT_CONFIRM_MAX_PAGES {
+        let endpoint =
+            format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100&page={page}");
+        let output = Command::new("gh")
+            .args(["api", &endpoint])
+            .output()
+            .map_err(|err| format!("failed to execute gh api for comments: {err}"))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|err| format!("failed to parse comments response: {err}"))?;
+        let comments = payload
+            .as_array()
+            .ok_or_else(|| "comments response was not an array".to_string())?;
+        if comments.is_empty() {
+            break;
+        }
+
+        for comment in comments.iter().rev() {
+            let body = comment
+                .get("body")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let body_lower = body.to_ascii_lowercase();
+            if !(body_lower.contains(&marker_lower) && body_lower.contains(&head_sha_lower)) {
+                continue;
+            }
+
+            if let Some(expected_author) = expected_author_lower.as_deref() {
+                let author = comment
+                    .get("user")
+                    .and_then(|value| value.get("login"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if author != expected_author {
+                    continue;
+                }
+            }
+
             let id = comment
                 .get("id")
                 .and_then(serde_json::Value::as_u64)
@@ -1617,10 +1657,17 @@ fn confirm_review_posted_with_retry(
     pr_number: u32,
     marker: &str,
     head_sha: &str,
+    expected_author_login: Option<&str>,
 ) -> Result<Option<u64>, String> {
     const MAX_ATTEMPTS: usize = 5;
     for attempt in 0..MAX_ATTEMPTS {
-        let maybe_id = confirm_review_posted(owner_repo, pr_number, marker, head_sha)?;
+        let maybe_id = confirm_review_posted(
+            owner_repo,
+            pr_number,
+            marker,
+            head_sha,
+            expected_author_login,
+        )?;
         if maybe_id.is_some() {
             return Ok(maybe_id);
         }
@@ -1645,14 +1692,43 @@ fn detect_http_400_or_rate_limit(log_path: &Path) -> bool {
 }
 
 fn detect_comment_permission_denied(log_path: &Path) -> bool {
-    let Ok(tail) = read_tail(log_path, 40) else {
+    let Ok(lines) = read_last_lines(log_path, COMMENT_PERMISSION_SCAN_LINES) else {
         return false;
     };
-    let lower = tail.to_ascii_lowercase();
-    lower.contains("resource not accessible by personal access token (addcomment)")
-        || lower.contains("resource not accessible by personal access token")
+    lines
+        .iter()
+        .rev()
+        .any(|line| line_indicates_comment_permission_denied(line))
+}
+
+fn line_indicates_comment_permission_denied(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let has_permission_marker = lower.contains("resource not accessible by personal access token")
         || lower.contains("http 403 resource not accessible by personal access token")
-        || lower.contains("insufficient permissions")
+        || lower.contains("insufficient permissions");
+    if !has_permission_marker {
+        return false;
+    }
+
+    let is_diff_blob = lower.contains("\"aggregated_output\":\"diff --git")
+        || lower.contains("diff --git a/")
+        || lower.contains("gh pr diff ");
+    if is_diff_blob {
+        return false;
+    }
+
+    let has_output_context = lower.contains("\"output\":")
+        || lower.contains("\"aggregated_output\":")
+        || lower.contains("\"error\":")
+        || lower.contains("gh: resource not accessible by personal access token");
+    if !has_output_context {
+        return false;
+    }
+
+    lower.contains("gh pr comment")
+        || (lower.contains("/issues/") && lower.contains("/comments"))
+        || lower.contains("addcomment")
+        || lower.contains("create-an-issue-comment")
 }
 
 fn read_tail(path: &Path, max_lines: usize) -> Result<String, String> {
@@ -2284,10 +2360,43 @@ mod tests {
             "GraphQL: Resource not accessible by personal access token (addComment)",
         )
         .expect("write denied log");
+        assert!(!detect_comment_permission_denied(&path));
+
+        fs::write(
+            &path,
+            r#"{"type":"tool_result","output":"GraphQL: Resource not accessible by personal access token (addComment)"}"#,
+        )
+        .expect("write structured denied log");
         assert!(detect_comment_permission_denied(&path));
 
         fs::write(&path, r#"{"message":"normal progress"}"#).expect("write normal log");
         assert!(!detect_comment_permission_denied(&path));
+    }
+
+    #[test]
+    fn test_detect_comment_permission_denied_ignores_diff_output() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("review.log");
+
+        fs::write(
+            &path,
+            r#"{"type":"item.completed","item":{"command":"/bin/bash -lc 'gh pr diff https://github.com/guardian-intelligence/apm2/pull/508'","aggregated_output":"diff --git a/.github/workflows/ai-review.yml b/.github/workflows/ai-review.yml\nGraphQL: Resource not accessible by personal access token (addComment)"}}"#,
+        )
+        .expect("write diff-like denied marker log");
+        assert!(!detect_comment_permission_denied(&path));
+    }
+
+    #[test]
+    fn test_detect_comment_permission_denied_requires_comment_context() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("review.log");
+
+        fs::write(
+            &path,
+            r#"{"type":"item.completed","item":{"command":"/bin/bash -lc 'gh pr comment https://github.com/guardian-intelligence/apm2/pull/508 --body-file review.md'","aggregated_output":"GraphQL: Resource not accessible by personal access token (addComment)"}}"#,
+        )
+        .expect("write comment denied log");
+        assert!(detect_comment_permission_denied(&path));
     }
 
     #[test]
