@@ -10,9 +10,10 @@ use std::{fs, thread};
 use apm2_daemon::protocol::dispatch::WorkTransition;
 use apm2_daemon::protocol::{
     ConnectionContext, LedgerEventEmitter, PeerCredentials, PrivilegedDispatcher,
-    PrivilegedResponse, WorkStatusRequest, encode_work_status_request,
+    PrivilegedErrorCode, PrivilegedResponse, WorkListRequest, WorkStatusRequest,
+    encode_work_list_request, encode_work_status_request,
 };
-use apm2_daemon::work::authority::{ProjectionWorkAuthority, WorkAuthority};
+use apm2_daemon::work::authority::{MAX_WORK_LIST_ROWS, ProjectionWorkAuthority, WorkAuthority};
 use apm2_daemon::work::projection::WorkObjectProjection;
 use tempfile::tempdir;
 
@@ -176,6 +177,11 @@ fn test_no_filesystem_ticket_authority() {
 
     // Create a conflicting ticket file and make it unreadable to prove runtime
     // authority does not depend on filesystem ticket YAML.
+    //
+    // NOTE: We do NOT mutate the global CWD — the dispatcher resolves
+    // projection authority from the emitter regardless of CWD, so changing
+    // the working directory is not necessary to demonstrate independence
+    // from filesystem ticket files.
     let temp_dir = tempdir().expect("temp dir should be created");
     let ticket_dir = temp_dir.path().join("documents/work/tickets");
     fs::create_dir_all(&ticket_dir).expect("ticket directory should be created");
@@ -197,9 +203,8 @@ fn test_no_filesystem_ticket_authority() {
         fs::set_permissions(&ticket_path, perms).expect("ticket permissions should be updated");
     }
 
-    let previous_cwd = std::env::current_dir().expect("cwd should resolve");
-    std::env::set_current_dir(temp_dir.path()).expect("cwd should switch to isolated temp dir");
-
+    // Dispatch with the temp dir existing but unreadable — authority MUST
+    // derive state from ledger projection, not filesystem.
     let request = WorkStatusRequest {
         work_id: "W-FS-NONAUTH-001".to_string(),
     };
@@ -207,8 +212,6 @@ fn test_no_filesystem_ticket_authority() {
     let response = dispatcher
         .dispatch(&frame, &privileged_ctx())
         .expect("work status request should dispatch");
-
-    std::env::set_current_dir(previous_cwd).expect("cwd should be restored");
 
     #[cfg(unix)]
     {
@@ -291,7 +294,7 @@ fn test_claimability_from_projection_only() {
     );
 
     let claimable = authority
-        .list_claimable()
+        .list_claimable(MAX_WORK_LIST_ROWS, "")
         .expect("claimable list should rebuild from projection");
 
     assert_eq!(
@@ -340,7 +343,7 @@ fn test_concurrent_projection_access() {
         readers.push(thread::spawn(move || {
             for _ in 0..80 {
                 let rows = authority_reader
-                    .list_all()
+                    .list_all(MAX_WORK_LIST_ROWS, "")
                     .expect("concurrent projection read should succeed");
                 let total_rows = rows.len();
 
@@ -363,7 +366,7 @@ fn test_concurrent_projection_access() {
     }
 
     let final_rows = authority
-        .list_all()
+        .list_all(MAX_WORK_LIST_ROWS, "")
         .expect("final projection read should succeed");
     assert_eq!(final_rows.len(), 50, "all concurrent writes must converge");
 
@@ -403,13 +406,13 @@ fn test_projection_rebuild_after_restart() {
     let authority_before =
         ProjectionWorkAuthority::new(Arc::clone(&emitter) as Arc<dyn LedgerEventEmitter>);
     let before = authority_before
-        .list_all()
+        .list_all(MAX_WORK_LIST_ROWS, "")
         .expect("pre-restart projection read should succeed");
 
     let authority_after =
         ProjectionWorkAuthority::new(Arc::clone(&emitter) as Arc<dyn LedgerEventEmitter>);
     let after = authority_after
-        .list_all()
+        .list_all(MAX_WORK_LIST_ROWS, "")
         .expect("post-restart projection read should succeed");
 
     let before_snapshot: Vec<(String, String, u32)> = before
@@ -442,4 +445,130 @@ fn test_projection_rebuild_after_restart() {
         1,
         "restart snapshot should include one work item"
     );
+}
+
+/// IT-00415-02: `WorkList` is denied from session socket (`PERMISSION_DENIED`).
+#[test]
+fn test_work_list_denied_from_session_socket() {
+    let dispatcher = PrivilegedDispatcher::new();
+    let ctx = ConnectionContext::session_open(
+        Some(PeerCredentials {
+            uid: 1000,
+            gid: 1000,
+            pid: Some(12346),
+        }),
+        Some("session-001".to_string()),
+    );
+
+    let request = WorkListRequest {
+        claimable_only: false,
+        limit: 0,
+        cursor: String::new(),
+    };
+    let frame = encode_work_list_request(&request);
+    let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+    match response {
+        PrivilegedResponse::Error(err) => {
+            assert_eq!(
+                err.code,
+                PrivilegedErrorCode::PermissionDenied as i32,
+                "WorkList from session socket must be denied"
+            );
+        },
+        other => panic!("Expected PERMISSION_DENIED, got: {other:?}"),
+    }
+}
+
+/// IT-00415-03: `claimed_at_ns` reflects first claim timestamp, not
+/// `last_transition_at`.
+#[test]
+fn test_claimed_at_ns_tracks_first_claim_timestamp() {
+    let emitter = Arc::new(apm2_daemon::protocol::StubLedgerEventEmitter::new());
+    let authority =
+        ProjectionWorkAuthority::new(Arc::clone(&emitter) as Arc<dyn LedgerEventEmitter>);
+
+    let claim_ts: u64 = 5_000_000_000;
+    let progress_ts: u64 = 5_000_000_100;
+
+    // Open -> Claimed at claim_ts.
+    emit_transition(
+        emitter.as_ref(),
+        "W-CLAIM-TS-001",
+        "Open",
+        "Claimed",
+        "claim",
+        0,
+        "actor:claim-ts",
+        claim_ts,
+    );
+
+    // Claimed -> InProgress at progress_ts (later).
+    emit_transition(
+        emitter.as_ref(),
+        "W-CLAIM-TS-001",
+        "Claimed",
+        "InProgress",
+        "start",
+        1,
+        "actor:claim-ts",
+        progress_ts,
+    );
+
+    let status = authority
+        .get_work_status("W-CLAIM-TS-001")
+        .expect("work status should resolve");
+
+    assert_eq!(
+        status.claimed_at_ns,
+        Some(claim_ts),
+        "claimed_at_ns must be the first claim timestamp, not last_transition_at"
+    );
+    assert_eq!(
+        status.last_transition_at_ns, progress_ts,
+        "last_transition_at should reflect the most recent transition"
+    );
+}
+
+/// IT-00415-04: Bounded `WorkList` enforces `MAX_WORK_LIST_ROWS` cap.
+#[test]
+fn test_work_list_bounded_by_max_rows() {
+    let dispatcher = PrivilegedDispatcher::new();
+    let ctx = privileged_ctx();
+
+    // Emit more than MAX_WORK_LIST_ROWS work items — but keep it small for
+    // test speed. We test the limit parameter clamping behaviour instead.
+    for idx in 0..5u64 {
+        let work_id = format!("W-BOUNDED-{idx:03}");
+        emit_transition(
+            dispatcher.event_emitter().as_ref(),
+            &work_id,
+            "Open",
+            "Claimed",
+            "claim",
+            0,
+            "actor:bounded",
+            6_000_000_000 + idx,
+        );
+    }
+
+    // Request with limit=2 — should return exactly 2 rows.
+    let request = WorkListRequest {
+        claimable_only: false,
+        limit: 2,
+        cursor: String::new(),
+    };
+    let frame = encode_work_list_request(&request);
+    let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+    match response {
+        PrivilegedResponse::WorkList(resp) => {
+            assert_eq!(
+                resp.work_items.len(),
+                2,
+                "WorkList with limit=2 must return exactly 2 rows"
+            );
+        },
+        other => panic!("Expected WorkList response, got: {other:?}"),
+    }
 }

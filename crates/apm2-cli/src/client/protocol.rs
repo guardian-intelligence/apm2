@@ -1135,7 +1135,11 @@ impl OperatorClient {
         &mut self,
         claimable_only: bool,
     ) -> Result<WorkListResponse, ProtocolClientError> {
-        let request = WorkListRequest { claimable_only };
+        let request = WorkListRequest {
+            claimable_only,
+            limit: 0,
+            cursor: String::new(),
+        };
         let request_bytes = encode_work_list_request(&request);
 
         // Send request

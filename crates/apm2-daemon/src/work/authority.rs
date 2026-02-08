@@ -6,6 +6,12 @@ use thiserror::Error;
 use super::projection::{WorkObjectProjection, WorkProjectionError};
 use crate::protocol::dispatch::LedgerEventEmitter;
 
+/// Hard server-side cap on the number of rows returned by `WorkList`.
+///
+/// Enforced regardless of the client-requested `limit` to prevent unbounded
+/// full-ledger replay on the request path.
+pub const MAX_WORK_LIST_ROWS: usize = 500;
+
 /// Projection-derived authority view for a single work item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkAuthorityStatus {
@@ -53,11 +59,25 @@ pub trait WorkAuthority: Send + Sync {
     /// Returns projection-derived status for a single work item.
     fn get_work_status(&self, work_id: &str) -> Result<WorkAuthorityStatus, WorkAuthorityError>;
 
-    /// Returns all claimable work items.
-    fn list_claimable(&self) -> Result<Vec<WorkAuthorityStatus>, WorkAuthorityError>;
+    /// Returns claimable work items, bounded by `limit` and `cursor`.
+    ///
+    /// `limit` is clamped to `MAX_WORK_LIST_ROWS`. `cursor` is the last
+    /// `work_id` from a previous page (exclusive start).
+    fn list_claimable(
+        &self,
+        limit: usize,
+        cursor: &str,
+    ) -> Result<Vec<WorkAuthorityStatus>, WorkAuthorityError>;
 
-    /// Returns all known work items.
-    fn list_all(&self) -> Result<Vec<WorkAuthorityStatus>, WorkAuthorityError>;
+    /// Returns all known work items, bounded by `limit` and `cursor`.
+    ///
+    /// `limit` is clamped to `MAX_WORK_LIST_ROWS`. `cursor` is the last
+    /// `work_id` from a previous page (exclusive start).
+    fn list_all(
+        &self,
+        limit: usize,
+        cursor: &str,
+    ) -> Result<Vec<WorkAuthorityStatus>, WorkAuthorityError>;
 
     /// Returns whether the work item is claimable.
     fn is_claimable(&self, work_id: &str) -> Result<bool, WorkAuthorityError>;
@@ -66,10 +86,14 @@ pub trait WorkAuthority: Send + Sync {
 /// Projection-backed `WorkAuthority` implementation.
 ///
 /// Authority is rebuilt from ledger events only; filesystem state is never
-/// consulted.
+/// consulted. The projection is cached and only rebuilt when the event count
+/// changes, avoiding O(N) full replay on every request.
 pub struct ProjectionWorkAuthority {
     event_emitter: Arc<dyn LedgerEventEmitter>,
     projection: Arc<RwLock<WorkObjectProjection>>,
+    /// Cached event count from the last successful rebuild. When the emitter
+    /// reports a different count the projection is refreshed.
+    last_event_count: Arc<RwLock<usize>>,
 }
 
 impl ProjectionWorkAuthority {
@@ -79,18 +103,43 @@ impl ProjectionWorkAuthority {
         Self {
             event_emitter,
             projection: Arc::new(RwLock::new(WorkObjectProjection::new())),
+            last_event_count: Arc::new(RwLock::new(0)),
         }
     }
 
     fn refresh_projection(&self) -> Result<(), WorkAuthorityError> {
         let signed_events = self.event_emitter.get_all_events();
+        let current_count = signed_events.len();
+
+        // Check cached event count to avoid redundant rebuilds.
+        {
+            let cached =
+                self.last_event_count
+                    .read()
+                    .map_err(|err| WorkAuthorityError::ProjectionLock {
+                        message: err.to_string(),
+                    })?;
+            if *cached == current_count && current_count > 0 {
+                return Ok(());
+            }
+        }
+
+        // Verify signatures before projection admission (fail-closed).
+        let verified_events =
+            super::projection::verify_signed_events(&signed_events, &self.event_emitter)?;
+
         let mut projection =
             self.projection
                 .write()
                 .map_err(|err| WorkAuthorityError::ProjectionLock {
                     message: err.to_string(),
                 })?;
-        projection.rebuild_from_signed_events(&signed_events)?;
+        projection.rebuild_from_signed_events(&verified_events)?;
+
+        // Update cached event count after successful rebuild.
+        if let Ok(mut cached) = self.last_event_count.write() {
+            *cached = current_count;
+        }
         Ok(())
     }
 
@@ -102,12 +151,33 @@ impl ProjectionWorkAuthority {
             created_at_ns: work.opened_at,
             last_transition_at_ns: work.last_transition_at,
             transition_count: work.transition_count,
-            claimed_at_ns: if work.transition_count > 0 {
-                Some(work.last_transition_at)
-            } else {
-                None
-            },
+            claimed_at_ns: work.claimed_at,
         }
+    }
+
+    /// Clamps `limit` to `MAX_WORK_LIST_ROWS` and applies cursor-based
+    /// pagination over a deterministically-ordered iterator.
+    fn bounded_collect<'a, I>(iter: I, limit: usize, cursor: &str) -> Vec<WorkAuthorityStatus>
+    where
+        I: Iterator<Item = &'a Work>,
+    {
+        let effective_limit = if limit == 0 {
+            MAX_WORK_LIST_ROWS
+        } else {
+            limit.min(MAX_WORK_LIST_ROWS)
+        };
+
+        let skip_past_cursor = !cursor.is_empty();
+
+        let mut items: Vec<WorkAuthorityStatus> = iter
+            .skip_while(|work| skip_past_cursor && work.work_id.as_str() <= cursor)
+            .take(effective_limit)
+            .map(Self::status_from_work)
+            .collect();
+
+        // Ensure deterministic ordering by work_id (BTreeMap already sorted).
+        items.sort_by(|a, b| a.work_id.cmp(&b.work_id));
+        items
     }
 }
 
@@ -132,7 +202,11 @@ impl WorkAuthority for ProjectionWorkAuthority {
         Ok(Self::status_from_work(work))
     }
 
-    fn list_claimable(&self) -> Result<Vec<WorkAuthorityStatus>, WorkAuthorityError> {
+    fn list_claimable(
+        &self,
+        limit: usize,
+        cursor: &str,
+    ) -> Result<Vec<WorkAuthorityStatus>, WorkAuthorityError> {
         self.refresh_projection()?;
 
         let projection =
@@ -142,14 +216,18 @@ impl WorkAuthority for ProjectionWorkAuthority {
                     message: err.to_string(),
                 })?;
 
-        Ok(projection
-            .claimable_work()
-            .into_iter()
-            .map(Self::status_from_work)
-            .collect())
+        Ok(Self::bounded_collect(
+            projection.claimable_work().into_iter(),
+            limit,
+            cursor,
+        ))
     }
 
-    fn list_all(&self) -> Result<Vec<WorkAuthorityStatus>, WorkAuthorityError> {
+    fn list_all(
+        &self,
+        limit: usize,
+        cursor: &str,
+    ) -> Result<Vec<WorkAuthorityStatus>, WorkAuthorityError> {
         self.refresh_projection()?;
 
         let projection =
@@ -159,11 +237,11 @@ impl WorkAuthority for ProjectionWorkAuthority {
                     message: err.to_string(),
                 })?;
 
-        Ok(projection
-            .list_work()
-            .into_iter()
-            .map(Self::status_from_work)
-            .collect())
+        Ok(Self::bounded_collect(
+            projection.list_work().into_iter(),
+            limit,
+            cursor,
+        ))
     }
 
     fn is_claimable(&self, work_id: &str) -> Result<bool, WorkAuthorityError> {

@@ -1978,6 +1978,10 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
         Ok(signed_event)
     }
+
+    fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+        self.signing_key.verifying_key()
+    }
 }
 
 /// Durable work registry backed by `SQLite`.

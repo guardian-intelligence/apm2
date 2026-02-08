@@ -476,11 +476,19 @@ pub struct WorkStatusResponse {
 }
 /// IPC-PRIV-019: WorkList (TCK-00415)
 /// List all work items known to projection authority.
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WorkListRequest {
     /// If true, return only claimable work items.
     #[prost(bool, tag = "1")]
     pub claimable_only: bool,
+    /// Maximum number of rows to return. Server enforces a hard cap of 500
+    /// regardless of this value. 0 means use the server default (500).
+    #[prost(uint32, tag = "2")]
+    pub limit: u32,
+    /// Pagination cursor: work_id to start after (exclusive).
+    /// Empty string means start from the beginning.
+    #[prost(string, tag = "3")]
+    pub cursor: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WorkListResponse {

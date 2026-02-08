@@ -1,13 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use apm2_core::events::{WorkEvent, work_event};
 use apm2_core::ledger::EventRecord;
 use apm2_core::reducer::{Reducer, ReducerContext};
 use apm2_core::work::{Work, WorkError, WorkReducer, helpers};
+use ed25519_dalek::Verifier;
 use prost::Message;
 use thiserror::Error;
 
-use crate::protocol::dispatch::SignedLedgerEvent;
+use crate::protocol::dispatch::{
+    LedgerEventEmitter, SignedLedgerEvent, WORK_CLAIMED_DOMAIN_PREFIX,
+    WORK_TRANSITIONED_DOMAIN_PREFIX,
+};
 
 const DEFAULT_SYNTHETIC_WORK_TYPE: &str = "TICKET";
 
@@ -35,6 +40,15 @@ pub enum WorkProjectionError {
         event_type: String,
         /// Value that could not be represented as `u32`.
         value: u64,
+    },
+
+    /// Signature verification failed (fail-closed).
+    #[error("signature verification failed for event {event_id}: {reason}")]
+    SignatureVerificationFailed {
+        /// Event ID that failed verification.
+        event_id: String,
+        /// Why verification failed.
+        reason: String,
     },
 }
 
@@ -410,4 +424,66 @@ fn build_event_record(
 
 fn next_seq_id(events: &[EventRecord]) -> u64 {
     events.last().and_then(|event| event.seq_id).unwrap_or(0) + 1
+}
+
+/// Resolves the domain-separation prefix for signature verification.
+///
+/// Returns `None` for event types that are not work-relevant (these are
+/// skipped during projection rebuild anyway).
+fn domain_prefix_for_event_type(event_type: &str) -> Option<&'static [u8]> {
+    match event_type {
+        "work_claimed" => Some(WORK_CLAIMED_DOMAIN_PREFIX),
+        "work_transitioned" => Some(WORK_TRANSITIONED_DOMAIN_PREFIX),
+        // Native protobuf work events do not carry JCS signatures; they
+        // are verified structurally by the reducer.
+        _ => None,
+    }
+}
+
+/// Verifies Ed25519 signatures on signed ledger events.
+///
+/// Returns the input events unchanged on success, or fails closed with
+/// `WorkProjectionError::SignatureVerificationFailed`. Only events with
+/// domain-bound signatures (`work_claimed`, `work_transitioned`) are
+/// verified. Events without a known domain prefix are passed through
+/// (they are filtered by `translate_signed_events` anyway).
+pub fn verify_signed_events(
+    events: &[SignedLedgerEvent],
+    emitter: &Arc<dyn LedgerEventEmitter>,
+) -> Result<Vec<SignedLedgerEvent>, WorkProjectionError> {
+    let vk = emitter.verifying_key();
+    let mut verified = Vec::with_capacity(events.len());
+
+    for event in events {
+        if let Some(prefix) = domain_prefix_for_event_type(&event.event_type) {
+            // Reconstruct canonical bytes: domain prefix + payload.
+            let mut canonical_bytes = Vec::with_capacity(prefix.len() + event.payload.len());
+            canonical_bytes.extend_from_slice(prefix);
+            canonical_bytes.extend_from_slice(&event.payload);
+
+            // Parse signature bytes into Ed25519 signature.
+            let sig_bytes: [u8; 64] = event.signature.as_slice().try_into().map_err(|_| {
+                WorkProjectionError::SignatureVerificationFailed {
+                    event_id: event.event_id.clone(),
+                    reason: format!(
+                        "invalid signature length: expected 64, got {}",
+                        event.signature.len()
+                    ),
+                }
+            })?;
+            let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+            // Fail-closed: reject events with invalid signatures.
+            vk.verify(&canonical_bytes, &signature).map_err(|e| {
+                WorkProjectionError::SignatureVerificationFailed {
+                    event_id: event.event_id.clone(),
+                    reason: format!("Ed25519 verification failed: {e}"),
+                }
+            })?;
+        }
+
+        verified.push(event.clone());
+    }
+
+    Ok(verified)
 }

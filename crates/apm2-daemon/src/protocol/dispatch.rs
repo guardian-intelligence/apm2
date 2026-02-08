@@ -412,6 +412,13 @@ pub trait LedgerEventEmitter: Send + Sync {
         true
     }
 
+    /// Returns the Ed25519 verifying (public) key for signature verification.
+    ///
+    /// Used by projection rebuilds to verify event signatures before
+    /// admission. Implementations must return the key corresponding to the
+    /// signing key used by this emitter instance.
+    fn verifying_key(&self) -> ed25519_dalek::VerifyingKey;
+
     /// Emits a signed `StopFlagsMutated` event to the ledger (TCK-00351).
     ///
     /// This records runtime stop-flag mutations performed by the privileged
@@ -2546,6 +2553,10 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         }
 
         Ok(signed_event)
+    }
+
+    fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+        self.signing_key.verifying_key()
     }
 }
 
@@ -8532,12 +8543,15 @@ impl PrivilegedDispatcher {
 
     /// Handles `WorkList` requests (IPC-PRIV-019, TCK-00415).
     ///
-    /// Lists all work items known to projection authority.
+    /// Lists work items known to projection authority with bounded pagination.
+    /// Server enforces `MAX_WORK_LIST_ROWS` regardless of client `limit`.
     fn handle_work_list(
         &self,
         payload: &[u8],
         _ctx: &ConnectionContext,
     ) -> ProtocolResult<PrivilegedResponse> {
+        use crate::work::authority::MAX_WORK_LIST_ROWS;
+
         let request =
             WorkListRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
                 ProtocolError::Serialization {
@@ -8545,16 +8559,24 @@ impl PrivilegedDispatcher {
                 }
             })?;
 
+        let limit = if request.limit == 0 {
+            MAX_WORK_LIST_ROWS
+        } else {
+            (request.limit as usize).min(MAX_WORK_LIST_ROWS)
+        };
+
         debug!(
             claimable_only = request.claimable_only,
+            limit = limit,
+            cursor = %request.cursor,
             "Processing WorkList request via projection authority"
         );
 
         let authority = self.projection_work_authority();
         let statuses = if request.claimable_only {
-            authority.list_claimable()
+            authority.list_claimable(limit, &request.cursor)
         } else {
-            authority.list_all()
+            authority.list_all(limit, &request.cursor)
         };
 
         match statuses {
@@ -15707,6 +15729,8 @@ mod tests {
 
             let request = WorkListRequest {
                 claimable_only: false,
+                limit: 0,
+                cursor: String::new(),
             };
             let frame = encode_work_list_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
