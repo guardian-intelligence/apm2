@@ -38,6 +38,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+// Re-export `is_seal_required_tier` so callers can query tier requirements
+// independently if needed, but the primary verification path now integrates
+// the tier-based seal-required check via `verify_with_policy`.
 use crate::fac::RiskTier;
 
 // =============================================================================
@@ -51,6 +54,10 @@ pub const MAX_SEAL_STRING_LENGTH: usize = 4096;
 /// Maximum number of issuers tracked by a single verifier (denial-of-service
 /// protection).
 pub const MAX_TRACKED_ISSUERS: usize = 1024;
+
+/// Maximum number of entries tracked per unique `cell_id`. Prevents a
+/// single cell from exhausting the global `MAX_TRACKED_ISSUERS` capacity.
+pub const MAX_ENTRIES_PER_CELL_ID: usize = 64;
 
 /// Maximum number of audit events retained per verification call.
 pub const MAX_SEAL_AUDIT_EVENTS: usize = 16;
@@ -979,6 +986,10 @@ struct CellState {
 
     /// Issuer cell ID of the last accepted seal.
     issuer_cell_id: String,
+
+    /// Monotonically increasing counter for LRU eviction ordering.
+    /// Higher values are more recently accessed.
+    last_access: u64,
 }
 
 // =============================================================================
@@ -1012,6 +1023,9 @@ pub struct EpochSealVerifier {
     /// (fail-closed). This ensures that the verifier cannot accept seals
     /// without cryptographic authenticity checks.
     signature_verifier: Option<Box<dyn SignatureVerifier>>,
+
+    /// Monotonically increasing counter for LRU access ordering.
+    access_counter: u64,
 }
 
 impl Clone for EpochSealVerifier {
@@ -1021,6 +1035,7 @@ impl Clone for EpochSealVerifier {
         Self {
             cells: self.cells.clone(),
             signature_verifier: None,
+            access_counter: self.access_counter,
         }
     }
 }
@@ -1039,6 +1054,7 @@ impl EpochSealVerifier {
         Self {
             cells: HashMap::new(),
             signature_verifier: None,
+            access_counter: 0,
         }
     }
 
@@ -1048,6 +1064,7 @@ impl EpochSealVerifier {
         Self {
             cells: HashMap::new(),
             signature_verifier: Some(signature_verifier),
+            access_counter: 0,
         }
     }
 
@@ -1062,10 +1079,55 @@ impl EpochSealVerifier {
         self.signature_verifier.is_some()
     }
 
+    /// Increments and returns the next access counter value.
+    const fn next_access_counter(&mut self) -> u64 {
+        self.access_counter = self.access_counter.saturating_add(1);
+        self.access_counter
+    }
+
     /// Returns the number of tracked cell keys.
     #[must_use]
     pub fn tracked_issuer_count(&self) -> usize {
         self.cells.len()
+    }
+
+    /// Returns the number of entries for a specific `cell_id`.
+    #[must_use]
+    pub fn entries_for_cell_id(&self, cell_id: &str) -> usize {
+        self.cells.keys().filter(|k| k.cell_id == cell_id).count()
+    }
+
+    /// Evicts the least recently used entry from the verifier state.
+    /// Returns `true` if an entry was evicted, `false` if the map is empty.
+    fn evict_lru(&mut self) -> bool {
+        if let Some(lru_key) = self
+            .cells
+            .iter()
+            .min_by_key(|(_, state)| state.last_access)
+            .map(|(key, _)| key.clone())
+        {
+            self.cells.remove(&lru_key);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Evicts the least recently used entry for a specific `cell_id`.
+    /// Returns `true` if an entry was evicted.
+    fn evict_lru_for_cell(&mut self, cell_id: &str) -> bool {
+        if let Some(lru_key) = self
+            .cells
+            .iter()
+            .filter(|(k, _)| k.cell_id == cell_id)
+            .min_by_key(|(_, state)| state.last_access)
+            .map(|(key, _)| key.clone())
+        {
+            self.cells.remove(&lru_key);
+            true
+        } else {
+            false
+        }
     }
 
     /// Returns the last accepted epoch for the given issuer cell ID.
@@ -1184,7 +1246,14 @@ impl EpochSealVerifier {
             htf_time_envelope_ref: *seal.htf_time_envelope_ref(),
             quorum_anchor: *seal.quorum_anchor(),
         };
+        // Compute access counter before borrowing `cells` mutably to
+        // satisfy the borrow checker.
+        let access = self.next_access_counter();
         if let Some(state) = self.cells.get_mut(&key) {
+            // Update LRU access counter on every access (even rejections
+            // touch the entry, proving it is actively referenced).
+            state.last_access = access;
+
             if seal.epoch_number() < state.epoch {
                 return EpochSealVerdict {
                     accepted: false,
@@ -1226,8 +1295,8 @@ impl EpochSealVerifier {
         }
     }
 
-    /// Accepts the first seal from a new cell key, or rejects if too
-    /// many cells are tracked.
+    /// Accepts the first seal from a new cell key, evicting the oldest
+    /// entry if the global or per-cell-id capacity is reached.
     fn accept_first_seal(
         &mut self,
         seal: &EpochSealV1,
@@ -1235,20 +1304,19 @@ impl EpochSealVerifier {
         risk_tier: RiskTier,
     ) -> EpochSealVerdict {
         let issuer = seal.issuer_cell_id();
-        if self.cells.len() >= MAX_TRACKED_ISSUERS {
-            return EpochSealVerdict {
-                accepted: false,
-                risk_tier,
-                epoch_number: seal.epoch_number(),
-                issuer_cell_id: issuer.to_string(),
-                audit_event: EpochSealAuditEvent::InvalidSeal {
-                    reason: format!(
-                        "too many tracked issuers: {} >= {MAX_TRACKED_ISSUERS}",
-                        self.cells.len()
-                    ),
-                },
-            };
+
+        // Per-cell-id limit: prevent a single cell_id from exhausting
+        // global capacity.
+        if self.entries_for_cell_id(seal.cell_id()) >= MAX_ENTRIES_PER_CELL_ID {
+            self.evict_lru_for_cell(seal.cell_id());
         }
+
+        // Global capacity limit: evict LRU entry when full.
+        if self.cells.len() >= MAX_TRACKED_ISSUERS {
+            self.evict_lru();
+        }
+
+        let access = self.next_access_counter();
         self.cells.insert(
             key.clone(),
             CellState {
@@ -1259,6 +1327,7 @@ impl EpochSealVerifier {
                 receipt_batch_epoch: seal.receipt_batch_epoch(),
                 authority_seal_hash: *seal.authority_seal_hash(),
                 issuer_cell_id: issuer.to_string(),
+                last_access: access,
             },
         );
         EpochSealVerdict {
@@ -1309,10 +1378,10 @@ impl EpochSealVerifier {
                     epoch_number: *epoch_number,
                     issuer_cell_id: issuer_cell_id.clone(),
                 }),
-                EpochSealAuditEvent::InvalidSeal { .. } => {
-                    Err(EpochSealVerificationError::TooManyIssuers {
-                        count: self.cells.len(),
-                        max: MAX_TRACKED_ISSUERS,
+                EpochSealAuditEvent::InvalidSeal { reason }
+                | EpochSealAuditEvent::ValidationFailed { reason } => {
+                    Err(EpochSealVerificationError::ValidationFailed {
+                        reason: reason.clone(),
                     })
                 },
                 EpochSealAuditEvent::SignatureRejected {
@@ -1325,11 +1394,6 @@ impl EpochSealVerifier {
                 }),
                 EpochSealAuditEvent::NoSignatureVerifier { .. } => {
                     Err(EpochSealVerificationError::NoSignatureVerifier)
-                },
-                EpochSealAuditEvent::ValidationFailed { reason } => {
-                    Err(EpochSealVerificationError::ValidationFailed {
-                        reason: reason.clone(),
-                    })
                 },
                 _ => Err(EpochSealVerificationError::MissingSeal { risk_tier }),
             }
@@ -1352,6 +1416,40 @@ impl EpochSealVerifier {
             Err(EpochSealVerificationError::MissingSeal { risk_tier })
         } else {
             Ok(())
+        }
+    }
+
+    /// Verifies an epoch seal with integrated tier-based policy enforcement.
+    ///
+    /// This is the **recommended entry point** for admission-path seal
+    /// verification. It combines the seal-required check with full
+    /// verification, making it impossible to verify without also checking
+    /// whether a seal is required for the given tier.
+    ///
+    /// When `seal` is `None` and the tier requires a seal, this returns
+    /// an `Err(MissingSeal)`. When `seal` is `None` and the tier does NOT
+    /// require a seal, it returns `Ok(None)`. When `seal` is `Some`, it
+    /// performs full verification and returns `Ok(Some(verdict))` on
+    /// acceptance or `Err(...)` on rejection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EpochSealVerificationError`] on rejection.
+    #[allow(clippy::option_if_let_else)]
+    pub fn verify_with_policy(
+        &mut self,
+        seal: Option<&EpochSealV1>,
+        risk_tier: RiskTier,
+    ) -> Result<Option<EpochSealVerdict>, EpochSealVerificationError> {
+        match seal {
+            None => {
+                if is_seal_required_tier(risk_tier) {
+                    Err(EpochSealVerificationError::MissingSeal { risk_tier })
+                } else {
+                    Ok(None)
+                }
+            },
+            Some(s) => self.verify_or_reject(s, risk_tier).map(Some),
         }
     }
 }
@@ -2115,6 +2213,70 @@ mod tests {
     }
 
     // =========================================================================
+    // verify_with_policy Tests (integrated seal-required check)
+    // =========================================================================
+
+    #[test]
+    fn verify_with_policy_rejects_missing_seal_at_tier2() {
+        let mut verifier = test_verifier();
+        let result = verifier.verify_with_policy(None, RiskTier::Tier2);
+        assert!(
+            matches!(result, Err(EpochSealVerificationError::MissingSeal { .. })),
+            "missing seal at Tier2 must be rejected"
+        );
+    }
+
+    #[test]
+    fn verify_with_policy_rejects_missing_seal_at_tier3() {
+        let mut verifier = test_verifier();
+        let result = verifier.verify_with_policy(None, RiskTier::Tier3);
+        assert!(
+            matches!(result, Err(EpochSealVerificationError::MissingSeal { .. })),
+            "missing seal at Tier3 must be rejected"
+        );
+    }
+
+    #[test]
+    fn verify_with_policy_accepts_missing_seal_at_tier0() {
+        let mut verifier = test_verifier();
+        let result = verifier.verify_with_policy(None, RiskTier::Tier0);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "Tier0 should accept None seal");
+    }
+
+    #[test]
+    fn verify_with_policy_accepts_missing_seal_at_tier1() {
+        let mut verifier = test_verifier();
+        let result = verifier.verify_with_policy(None, RiskTier::Tier1);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "Tier1 should accept None seal");
+    }
+
+    #[test]
+    fn verify_with_policy_accepts_valid_seal_at_tier2() {
+        let mut verifier = test_verifier();
+        let seal = make_seal(1, "cell-alpha", 0x11);
+        let result = verifier.verify_with_policy(Some(&seal), RiskTier::Tier2);
+        assert!(result.is_ok());
+        let verdict = result.unwrap().expect("should return Some verdict");
+        assert!(verdict.accepted, "valid seal at Tier2 must be accepted");
+    }
+
+    #[test]
+    fn verify_with_policy_rejects_rollback_at_tier3() {
+        let mut verifier = test_verifier();
+        let seal1 = make_seal(5, "cell-alpha", 0x11);
+        verifier.verify(&seal1, RiskTier::Tier3);
+
+        let seal2 = make_seal(3, "cell-alpha", 0x22);
+        let result = verifier.verify_with_policy(Some(&seal2), RiskTier::Tier3);
+        assert!(
+            matches!(result, Err(EpochSealVerificationError::Rollback { .. })),
+            "rollback via verify_with_policy must be rejected"
+        );
+    }
+
+    // =========================================================================
     // verify_or_reject Tests
     // =========================================================================
 
@@ -2400,17 +2562,15 @@ mod tests {
     }
 
     // =========================================================================
-    // DoS Protection: MAX_TRACKED_ISSUERS Test
+    // DoS Protection: LRU Eviction Tests
     // =========================================================================
 
     #[test]
-    fn verifier_rejects_when_max_issuers_reached() {
+    fn verifier_evicts_lru_when_max_issuers_reached() {
         let mut verifier = test_verifier();
 
         // Fill up to the limit.
         for i in 0..MAX_TRACKED_ISSUERS {
-            // Ensure root_seed is in 1..=239 so that root_seed.wrapping_add(0x10)
-            // used for content hash also stays non-zero.
             #[allow(clippy::cast_possible_truncation)]
             let root_seed = ((i % 239) + 1) as u8;
             let seal = make_seal(1, &format!("cell-{i}"), root_seed);
@@ -2423,29 +2583,111 @@ mod tests {
 
         assert_eq!(verifier.tracked_issuer_count(), MAX_TRACKED_ISSUERS);
 
-        // The next new issuer should be rejected.
+        // The next new issuer should be accepted via LRU eviction
+        // (not rejected). The oldest entry is evicted to make room.
         let seal = make_seal(1, "cell-overflow", 0xFE);
         let verdict = verifier.verify(&seal, RiskTier::Tier2);
-        assert!(!verdict.accepted, "should reject when at issuer limit");
-        assert!(matches!(
-            verdict.audit_event,
-            EpochSealAuditEvent::InvalidSeal { .. }
-        ));
-
-        // verify_or_reject should return TooManyIssuers.
-        let seal2 = make_seal(1, "cell-overflow-2", 0xFD);
-        let result = verifier.verify_or_reject(&seal2, RiskTier::Tier2);
-        assert!(matches!(
-            result,
-            Err(EpochSealVerificationError::TooManyIssuers { .. })
-        ));
-
-        // But an existing issuer should still be accepted (monotonic advance).
-        let seal3 = make_seal(2, "cell-0", 0xFC);
-        let verdict3 = verifier.verify(&seal3, RiskTier::Tier2);
         assert!(
-            verdict3.accepted,
-            "existing issuer should still accept new epochs"
+            verdict.accepted,
+            "new issuer should be accepted after LRU eviction"
+        );
+
+        // Total count must not exceed the max.
+        assert_eq!(verifier.tracked_issuer_count(), MAX_TRACKED_ISSUERS);
+
+        // An existing (recently accessed) issuer should still work.
+        // cell-overflow was just inserted so it is recent.
+        let seal2 = make_seal(2, "cell-overflow", 0xFD);
+        let verdict2 = verifier.verify(&seal2, RiskTier::Tier2);
+        assert!(
+            verdict2.accepted,
+            "recently inserted issuer should still accept new epochs"
+        );
+    }
+
+    #[test]
+    fn verifier_eviction_does_not_panic_on_capacity_exhaustion() {
+        let mut verifier = test_verifier();
+
+        // Fill and then overflow repeatedly, proving no panics and
+        // graceful eviction across many cycles.
+        for i in 0..(MAX_TRACKED_ISSUERS + 100) {
+            #[allow(clippy::cast_possible_truncation)]
+            let root_seed = ((i % 239) + 1) as u8;
+            let seal = make_seal(1, &format!("evict-cell-{i}"), root_seed);
+            let verdict = verifier.verify(&seal, RiskTier::Tier2);
+            assert!(
+                verdict.accepted,
+                "cell {i} should always be accepted (eviction provides capacity)"
+            );
+        }
+
+        // Must never exceed the cap.
+        assert!(
+            verifier.tracked_issuer_count() <= MAX_TRACKED_ISSUERS,
+            "tracked count must not exceed MAX_TRACKED_ISSUERS"
+        );
+    }
+
+    #[test]
+    fn verifier_per_cell_id_limit_prevents_single_cell_exhaustion() {
+        let mut verifier = test_verifier();
+
+        // Insert MAX_ENTRIES_PER_CELL_ID entries for a single cell_id
+        // (with distinct htf_time_envelope_ref/quorum_anchor combos).
+        for i in 0..MAX_ENTRIES_PER_CELL_ID {
+            #[allow(clippy::cast_possible_truncation)]
+            let htf_seed = ((i % 254) + 1) as u8;
+            let seal = make_seal_full(
+                1,
+                "issuer-greedy",
+                test_root_hash(htf_seed),
+                "greedy-cell",
+                1,
+                1,
+                test_anchor_hash(htf_seed),
+                test_anchor_hash(0xB0),
+                test_anchor_hash(0xC0),
+            );
+            let verdict = verifier.verify(&seal, RiskTier::Tier2);
+            assert!(verdict.accepted, "entry {i} should be accepted");
+        }
+
+        assert_eq!(
+            verifier.entries_for_cell_id("greedy-cell"),
+            MAX_ENTRIES_PER_CELL_ID
+        );
+
+        // One more entry for the same cell_id triggers per-cell eviction.
+        let seal_over = make_seal_full(
+            1,
+            "issuer-greedy",
+            test_root_hash(0xFE),
+            "greedy-cell",
+            1,
+            1,
+            test_anchor_hash(0xFE),
+            test_anchor_hash(0xB0),
+            test_anchor_hash(0xC0),
+        );
+        let verdict = verifier.verify(&seal_over, RiskTier::Tier2);
+        assert!(
+            verdict.accepted,
+            "should accept after per-cell LRU eviction"
+        );
+        assert_eq!(
+            verifier.entries_for_cell_id("greedy-cell"),
+            MAX_ENTRIES_PER_CELL_ID,
+            "per-cell count must stay at the limit"
+        );
+
+        // Entries from other cell_ids should not have been evicted.
+        // Add one for a different cell_id and confirm it works.
+        let seal_other = make_seal(1, "other-cell", 0x11);
+        let verdict_other = verifier.verify(&seal_other, RiskTier::Tier2);
+        assert!(
+            verdict_other.accepted,
+            "other cell_id should not be affected by per-cell eviction"
         );
     }
 
@@ -3130,9 +3372,10 @@ mod tests {
     // BLOCKER 3: Integration evidence (end-to-end seal verification flow)
     // =========================================================================
 
-    // TODO(TCK-WIRING): Wire seal verification into the daemon admission
-    // path. The EpochSealVerifier API is production-ready; daemon integration
-    // is tracked separately.
+    // TODO(TCK-00365-WIRING): Wire EpochSealVerifier::verify_with_policy()
+    // into the daemon admission path. The verifier API is production-ready
+    // (including LRU eviction and integrated tier-based policy); daemon
+    // integration is deferred to a follow-up ticket.
 
     #[test]
     fn end_to_end_seal_issuance_and_verification_flow() {

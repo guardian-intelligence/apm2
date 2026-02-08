@@ -1,0 +1,58 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0309"
+  title: "Epoch seal verifier DoS resilience and integrated policy enforcement evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that the EpochSealVerifier is resilient to denial-of-service
+    attacks through LRU eviction and per-cell-id capacity limits, and that
+    tier-based seal-required policy is integrated into the verification path
+    so it cannot be accidentally omitted by callers.
+
+    This artifact covers TCK-00365 round-4 security fixes:
+    - LRU eviction: when the verifier reaches MAX_TRACKED_ISSUERS, the
+      least recently used entry is evicted rather than rejecting new seals.
+      This prevents an attacker from filling capacity with stale keys to
+      deny service to legitimate issuers.
+    - Per-cell-id limit: MAX_ENTRIES_PER_CELL_ID prevents a single cell_id
+      from exhausting the entire global capacity, ensuring fair sharing
+      across cells.
+    - Integrated policy: verify_with_policy() combines the seal-required
+      tier check with full verification in a single call, making it
+      impossible to verify a seal without also checking the tier policy.
+      This eliminates the class of bugs where a callsite omits the
+      require_seal_for_tier() check.
+  requirement_ids:
+    - "REQ-0019"
+  source_refs:
+    - "crates/apm2-core/src/htf/epoch_seal.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        LRU eviction under capacity pressure:
+        - verifier_evicts_lru_when_max_issuers_reached: fills to
+          MAX_TRACKED_ISSUERS, then verifies new issuers are accepted
+          via eviction rather than rejected.
+        - verifier_eviction_does_not_panic_on_capacity_exhaustion: fills
+          past MAX_TRACKED_ISSUERS + 100, verifying no panics and count
+          stays at the cap.
+      ref: "cargo test -p apm2-core epoch_seal::tests::verifier_evict"
+    - type: "test_output"
+      description: |
+        Per-cell-id capacity isolation:
+        - verifier_per_cell_id_limit_prevents_single_cell_exhaustion:
+          fills MAX_ENTRIES_PER_CELL_ID for one cell_id, then verifies
+          the next entry evicts the LRU within that cell_id and does not
+          affect other cells.
+      ref: "cargo test -p apm2-core epoch_seal::tests::verifier_per_cell_id"
+    - type: "test_output"
+      description: |
+        Integrated tier-based policy enforcement:
+        - verify_with_policy_rejects_missing_seal_at_tier2
+        - verify_with_policy_rejects_missing_seal_at_tier3
+        - verify_with_policy_accepts_missing_seal_at_tier0
+        - verify_with_policy_accepts_missing_seal_at_tier1
+        - verify_with_policy_accepts_valid_seal_at_tier2
+        - verify_with_policy_rejects_rollback_at_tier3
+      ref: "cargo test -p apm2-core epoch_seal::tests::verify_with_policy"

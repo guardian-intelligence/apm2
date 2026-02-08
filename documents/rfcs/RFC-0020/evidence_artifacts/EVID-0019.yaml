@@ -1,0 +1,96 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0019"
+  title: "Epoch seal monotonicity, equivocation, and fail-closed verification evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that EpochSealV1 construction, monotonicity enforcement,
+    equivocation detection, and fail-closed signature verification are
+    correctly implemented per RFC-0020 requirements.
+
+    This artifact covers TCK-00365 epoch seal implementation:
+    - Seal construction rejects invalid fields (zero epoch, empty issuer,
+      zero hashes, oversized strings)
+    - Verifier enforces strict monotonicity per (cell_id,
+      htf_time_envelope_ref, quorum_anchor) key
+    - Rollback attempts are rejected with audit events
+    - Same-epoch replay with identical fields is idempotent
+    - Same-epoch replay with differing fields is equivocation
+    - Missing signature verifier causes fail-closed rejection
+    - Content hash recomputation detects tampered seals
+    - LRU eviction prevents capacity exhaustion DoS
+    - Per-cell-id limits prevent single-cell capacity exhaustion
+    - Tier2+ admissions fail-closed on missing seals via
+      verify_with_policy()
+  requirement_ids:
+    - "REQ-0019"
+  source_refs:
+    - "crates/apm2-core/src/htf/epoch_seal.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        Seal construction invariants:
+        - seal_construction_valid
+        - seal_rejects_zero_epoch
+        - seal_rejects_zero_root_hash
+        - seal_rejects_zero_content_hash
+        - seal_rejects_empty_issuer
+        - seal_rejects_oversized_issuer
+        - seal_rejects_empty_cell_id
+        - seal_rejects_zero_time_envelope_ref
+        - seal_rejects_zero_quorum_anchor
+        - seal_rejects_zero_authority_seal_hash
+      ref: "cargo test -p apm2-core epoch_seal::tests::seal_"
+    - type: "test_output"
+      description: |
+        Monotonicity and rollback enforcement:
+        - verifier_accepts_first_seal
+        - verifier_accepts_monotonic_sequence
+        - verifier_accepts_non_consecutive_monotonic
+        - verifier_rejects_rollback
+        - verifier_rejects_rollback_to_epoch_1
+        - monotonicity_keyed_on_cell_id_not_issuer
+        - monotonicity_includes_quorum_anchor_in_key
+        - monotonicity_includes_htf_time_envelope_ref_in_key
+        - rollback_detected_for_same_cell_id_and_anchors
+      ref: "cargo test -p apm2-core epoch_seal::tests::verifier_"
+    - type: "test_output"
+      description: |
+        Equivocation detection and idempotent replay:
+        - verifier_detects_equivocation
+        - verifier_idempotent_same_seal
+        - equivocation_detected_on_differing_directory_epoch
+        - equivocation_detected_on_differing_receipt_batch_epoch
+        - equivocation_detected_on_differing_authority_seal_hash
+        - idempotent_reaccept_requires_all_fields_matching
+      ref: "cargo test -p apm2-core epoch_seal::tests::equivocation"
+    - type: "test_output"
+      description: |
+        Signature verification fail-closed:
+        - verifier_without_signature_verifier_rejects_all_seals
+        - verifier_with_reject_all_rejects_forged_seal
+        - verifier_with_accept_all_accepts_valid_seal
+        - set_signature_verifier_enables_acceptance
+      ref: "cargo test -p apm2-core epoch_seal::tests::verifier_with"
+    - type: "test_output"
+      description: |
+        LRU eviction and DoS protection:
+        - verifier_evicts_lru_when_max_issuers_reached
+        - verifier_eviction_does_not_panic_on_capacity_exhaustion
+        - verifier_per_cell_id_limit_prevents_single_cell_exhaustion
+      ref: "cargo test -p apm2-core epoch_seal::tests::verifier_evict"
+    - type: "test_output"
+      description: |
+        Integrated tier-based policy verification:
+        - verify_with_policy_rejects_missing_seal_at_tier2
+        - verify_with_policy_rejects_missing_seal_at_tier3
+        - verify_with_policy_accepts_missing_seal_at_tier0
+        - verify_with_policy_accepts_missing_seal_at_tier1
+        - verify_with_policy_accepts_valid_seal_at_tier2
+        - verify_with_policy_rejects_rollback_at_tier3
+      ref: "cargo test -p apm2-core epoch_seal::tests::verify_with_policy"
+    - type: "test_output"
+      description: |
+        Full epoch seal test suite.
+      ref: "cargo test -p apm2-core epoch_seal"
