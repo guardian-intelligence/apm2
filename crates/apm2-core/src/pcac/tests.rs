@@ -615,6 +615,23 @@ fn valid_join_input_passes_validation() {
 }
 
 #[test]
+fn zero_freshness_witness_tick_denied_by_validator() {
+    let mut input = valid_join_input();
+    input.freshness_witness_tick = 0;
+    let err = input.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::NonPositiveTick { field } if field == "freshness_witness_tick")
+    );
+}
+
+#[test]
+fn positive_freshness_witness_tick_passes_validation() {
+    let mut input = valid_join_input();
+    input.freshness_witness_tick = 1;
+    assert!(input.validate().is_ok());
+}
+
+#[test]
 fn zero_intent_digest_denied_by_validator() {
     let mut input = valid_join_input();
     input.intent_digest = zero_hash();

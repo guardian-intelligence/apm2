@@ -102,7 +102,7 @@ impl std::fmt::Display for IdentityEvidenceLevel {
 ///
 /// - `intent_digest` binds the specific effect being authorized.
 /// - `capability_manifest_hash` pins the capability set at join time.
-/// - `freshness_witness_hash` ensures authority is current.
+/// - `freshness_witness_tick` ensures authority is current.
 /// - `stop_budget_profile_digest` captures stop/budget constraints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -395,6 +395,11 @@ impl AuthorityJoinInputV1 {
         if self.freshness_policy_hash == ZERO_HASH {
             return Err(PcacValidationError::ZeroHash {
                 field: "freshness_policy_hash",
+            });
+        }
+        if self.freshness_witness_tick == 0 {
+            return Err(PcacValidationError::NonPositiveTick {
+                field: "freshness_witness_tick",
             });
         }
         if self.stop_budget_profile_digest == ZERO_HASH {
