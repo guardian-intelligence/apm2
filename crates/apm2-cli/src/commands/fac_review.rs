@@ -42,6 +42,12 @@ const COMMENT_CONFIRM_MAX_ATTEMPTS: usize = 20;
 const COMMENT_PERMISSION_SCAN_LINES: usize = 200;
 const DISPATCH_PENDING_TTL: Duration = Duration::from_secs(120);
 const MAX_EVENT_PAYLOAD_BYTES: u64 = 1024 * 1024;
+const DEFAULT_PROVIDER_SLOT_COUNT: usize = 10;
+const PROVIDER_SLOT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const PROVIDER_SLOT_WAIT_JITTER_MS: u64 = 250;
+const PROVIDER_BACKOFF_BASE_SECS: u64 = 2;
+const PROVIDER_BACKOFF_MAX_SECS: u64 = 30;
+const PROVIDER_BACKOFF_JITTER_MS: u64 = 750;
 
 const SECURITY_PROMPT_PATH: &str = "documents/reviews/SECURITY_REVIEW_PROMPT.md";
 const QUALITY_PROMPT_PATH: &str = "documents/reviews/CODE_QUALITY_PROMPT.md";
@@ -318,13 +324,18 @@ struct PostedReview {
     verdict: Option<String>,
 }
 
+#[derive(Debug)]
+struct ProviderSlotLease {
+    _lock_file: File,
+}
+
 const MODEL_POOL: [ModelPoolEntry; 3] = [
     ModelPoolEntry {
-        model: "gemini-3.0-flash-preview",
+        model: "gemini-3-flash-preview",
         backend: ReviewBackend::Gemini,
     },
     ModelPoolEntry {
-        model: "gemini-3.0-pro-preview",
+        model: "gemini-3-pro-preview",
         backend: ReviewBackend::Gemini,
     },
     ModelPoolEntry {
@@ -383,6 +394,28 @@ fn select_cross_family_fallback(failed: &str) -> Option<ReviewModelSelection> {
         }
     }
     select_fallback_model(failed)
+}
+
+fn provider_slot_count(backend: ReviewBackend) -> usize {
+    let key = match backend {
+        ReviewBackend::Codex => "APM2_FAC_CODEX_SLOTS",
+        ReviewBackend::Gemini => "APM2_FAC_GEMINI_SLOTS",
+    };
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or(DEFAULT_PROVIDER_SLOT_COUNT)
+}
+
+fn backoff_before_cross_family_fallback(restart_count: u32) {
+    let exponent = restart_count.min(6);
+    let scale = 1_u64 << exponent;
+    let backoff_secs = PROVIDER_BACKOFF_BASE_SECS
+        .saturating_mul(scale)
+        .min(PROVIDER_BACKOFF_MAX_SECS);
+    let jitter_millis = rand::thread_rng().gen_range(0..=PROVIDER_BACKOFF_JITTER_MS);
+    thread::sleep(Duration::from_secs(backoff_secs) + Duration::from_millis(jitter_millis));
 }
 
 pub fn run_review(
@@ -2272,6 +2305,7 @@ fn run_single_review(
             ),
         };
 
+        let _provider_slot_lease = acquire_provider_slot(current_model.backend)?;
         let mut child = Command::new("sh")
             .args(["-lc", &command])
             .spawn()
@@ -2496,6 +2530,9 @@ fn run_single_review(
                         });
                     }
 
+                    if reason_is_http {
+                        backoff_before_cross_family_fallback(restart_count);
+                    }
                     let fallback = if reason_is_http {
                         select_cross_family_fallback(&current_model.model)
                     } else {
@@ -2538,6 +2575,9 @@ fn run_single_review(
                 }
 
                 let reason_is_http = detect_http_400_or_rate_limit(&log_path);
+                if reason_is_http {
+                    backoff_before_cross_family_fallback(restart_count);
+                }
                 let fallback = if reason_is_http {
                     select_cross_family_fallback(&current_model.model)
                 } else {
@@ -3624,6 +3664,15 @@ fn review_lock_path(
     Ok(review_locks_dir_path()?.join(format!("{safe_repo}-pr{pr_number}-{safe_type}.lock")))
 }
 
+fn review_provider_slots_dir_path() -> Result<PathBuf, String> {
+    Ok(apm2_home_dir()?.join("review_provider_slots"))
+}
+
+fn provider_slot_lock_path(backend: ReviewBackend, slot_index: usize) -> Result<PathBuf, String> {
+    let backend_name = backend.as_str();
+    Ok(review_provider_slots_dir_path()?.join(format!("{backend_name}-{slot_index}.lock")))
+}
+
 fn review_pulses_dir_path() -> Result<PathBuf, String> {
     Ok(apm2_home_dir()?.join("review_pulses"))
 }
@@ -3882,6 +3931,45 @@ fn try_acquire_review_lease(
     }
 }
 
+fn acquire_provider_slot(backend: ReviewBackend) -> Result<ProviderSlotLease, String> {
+    let slots = provider_slot_count(backend);
+    loop {
+        for slot_index in 0..slots {
+            let path = provider_slot_lock_path(backend, slot_index)?;
+            ensure_parent_dir(&path)?;
+            let lock_file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(|err| {
+                    format!(
+                        "failed to open provider slot lock {}: {err}",
+                        path.display()
+                    )
+                })?;
+            match FileExt::try_lock_exclusive(&lock_file) {
+                Ok(()) => {
+                    return Ok(ProviderSlotLease {
+                        _lock_file: lock_file,
+                    });
+                },
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {},
+                Err(err) => {
+                    return Err(format!(
+                        "failed to acquire provider slot lock {}: {err}",
+                        path.display()
+                    ));
+                },
+            }
+        }
+
+        let jitter_millis = rand::thread_rng().gen_range(0..=PROVIDER_SLOT_WAIT_JITTER_MS);
+        thread::sleep(PROVIDER_SLOT_POLL_INTERVAL + Duration::from_millis(jitter_millis));
+    }
+}
+
 fn upsert_review_state_entry(run_key: &str, entry: ReviewStateEntry) -> Result<(), String> {
     with_review_state_exclusive(|state| {
         state.reviewers.insert(run_key.to_string(), entry);
@@ -3967,17 +4055,17 @@ mod tests {
 
     #[test]
     fn test_select_fallback_model_cycles() {
-        let next = select_fallback_model("gemini-3.0-flash-preview")
+        let next = select_fallback_model("gemini-3-flash-preview")
             .expect("known model should produce fallback");
-        assert_eq!(next.model, "gemini-3.0-pro-preview");
+        assert_eq!(next.model, "gemini-3-pro-preview");
 
-        let next = select_fallback_model("gemini-3.0-pro-preview")
+        let next = select_fallback_model("gemini-3-pro-preview")
             .expect("known model should produce fallback");
         assert_eq!(next.model, "gpt-5.3-codex");
 
         let next =
             select_fallback_model("gpt-5.3-codex").expect("known model should produce fallback");
-        assert_eq!(next.model, "gemini-3.0-flash-preview");
+        assert_eq!(next.model, "gemini-3-flash-preview");
     }
 
     #[test]
@@ -4027,7 +4115,7 @@ mod tests {
     fn test_build_gemini_script_command_syntax() {
         let prompt = Path::new("/tmp/prompt.md");
         let log = Path::new("/tmp/review.log");
-        let cmd = build_gemini_script_command(prompt, log, "gemini-3.0-flash-preview");
+        let cmd = build_gemini_script_command(prompt, log, "gemini-3-flash-preview");
         assert!(cmd.contains("script -q"));
         assert!(cmd.contains("gemini -m"));
         assert!(cmd.contains("-o stream-json"));
@@ -4054,7 +4142,7 @@ mod tests {
             ReviewBackend::Gemini,
             prompt,
             log,
-            "gemini-3.0-flash-preview",
+            "gemini-3-flash-preview",
             None,
         );
         assert!(gemini.contains("gemini -m"));
