@@ -17,15 +17,7 @@ concurrency:
 
 permissions:
   contents: read
-  pull-requests: write
-  issues: write
-  statuses: write
-
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
-  RUSTFLAGS: -D warnings
-  RUST_BACKTRACE: 1
+  issues: read
 
 jobs:
   dispatch-auth:
@@ -88,19 +80,9 @@ jobs:
            needs.dispatch-auth.result == 'success')
         )
       }}
-    runs-on: [self-hosted, linux, x64, fac-ovh]
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
-        with:
-          toolchain: stable
-
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
-
       - name: Resolve PR context
         id: pr-context
         env:
@@ -114,106 +96,87 @@ jobs:
               echo "ERROR: could not resolve PR number from commit ${head_sha}" >&2
               exit 1
             fi
-            event_name="pull_request_target"
           else
             pr_number="${{ github.event.inputs.pr_number }}"
-            head_sha="${{ github.sha }}"
-            event_name="workflow_dispatch"
+            head_sha="$(gh api "repos/${{ github.repository }}/pulls/${pr_number}" --jq '.head.sha')"
           fi
           echo "pr_number=${pr_number}" >> "$GITHUB_OUTPUT"
           echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
-          echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
-          echo "fac-context: pr=${pr_number} sha=${head_sha} event=${event_name}"
+          echo "fac-context: pr=${pr_number} sha=${head_sha}"
 
-      - name: Synthesize event payload
-        id: event-payload
-        run: |
-          set -euo pipefail
-          event_file="$(mktemp)"
-          if [[ "${{ steps.pr-context.outputs.event_name }}" == "pull_request_target" ]]; then
-            # Build a minimal pull_request_target event payload for fac kickoff
-            gh api "repos/${{ github.repository }}/pulls/${{ steps.pr-context.outputs.pr_number }}" \
-              | jq '{pull_request: .}' > "${event_file}"
-          else
-            # Use the original event payload for workflow_dispatch
-            cp "${{ github.event_path }}" "${event_file}"
-          fi
-          echo "path=${event_file}" >> "$GITHUB_OUTPUT"
+      - name: Poll review gate
         env:
           GH_TOKEN: ${{ github.token }}
-
-      - name: Kick off FAC and project health
-        env:
-          GITHUB_ACTOR: ${{ github.actor }}
-          GITHUB_REF: ${{ github.ref }}
-          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          # SECURITY-CRITICAL LOGGING BOUNDARY:
-          # GitHub Actions logs are a public projection surface. Treat stdout as
-          # untrusted egress and fail closed if any non-health line appears.
-          private_log_dir="${HOME}/.apm2/private/fac"
-          mkdir -p "${private_log_dir}"
-          chmod 700 "${private_log_dir}"
-          private_log="${private_log_dir}/github-run-${GITHUB_RUN_ID:-unknown}-${GITHUB_RUN_ATTEMPT:-0}.log"
-          : >"${private_log}"
-          chmod 600 "${private_log}"
 
-          health_line_re='^ts=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z sha=[^[:space:]]+ current_head_sha=[^[:space:]]+ security=[^[:space:]]+ quality=[^[:space:]]+ events=.*$'
-          evidence_line_re='^ts=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z sha=[^[:space:]]+ gate=[^[:space:]]+ status=(PASS|FAIL) duration_secs=[0-9]+ log=[^[:space:]]+.*$'
-          terminal_line_re='^ts=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z sha=[^[:space:]]+ terminal=(success|failure).*$'
+          repo="${{ github.repository }}"
+          pr_number="${{ steps.pr-context.outputs.pr_number }}"
+          head_sha="${{ steps.pr-context.outputs.head_sha }}"
+          max_wait=4800
+          poll_interval=30
 
-          set +e
-          cargo run --locked --quiet -p apm2-cli -- fac kickoff \
-            --repo "${{ github.repository }}" \
-            --event "${{ steps.event-payload.outputs.path }}" \
-            --event-name "${{ steps.pr-context.outputs.event_name }}" \
-            --max-wait-seconds 3600 \
-            --public-projection-only \
-            2>>"${private_log}" | \
-            awk -v health_line_re="${health_line_re}" \
-                -v evidence_line_re="${evidence_line_re}" \
-                -v terminal_line_re="${terminal_line_re}" '
-              $0 ~ terminal_line_re {
-                print $0
-                fflush(stdout)
-                if ($0 ~ /terminal=success/) exit 0
-                exit 1
-              }
-              $0 ~ health_line_re {
-                print $0
-                fflush(stdout)
-                next
-              }
-              $0 ~ evidence_line_re {
-                print $0
-                fflush(stdout)
-                next
-              }
-              {
-                # SECURITY-CRITICAL: never echo rejected lines (possible secret egress).
-                print "ERROR: FAC output boundary violation (non-health line blocked)." > "/dev/stderr"
-                exit 42
-              }
-            '
-          pipe_status=("${PIPESTATUS[@]}")
-          fac_rc="${pipe_status[0]:-1}"
-          filter_rc="${pipe_status[1]:-1}"
-          set -e
+          # Load trusted reviewer logins from repo
+          trusted_json="$(gh api "repos/${repo}/contents/.github/review-gate/trusted-reviewers.json" \
+            --jq '.content' | base64 -d)"
+          security_logins="$(echo "$trusted_json" | jq -r '[.reviewers.security[].github_logins[]] | join("|")')"
+          quality_logins="$(echo "$trusted_json" | jq -r '[.reviewers.code_quality[].github_logins[]] | join("|")')"
 
-          if [[ "${filter_rc}" -ne 0 ]]; then
-            echo "ERROR: FAC projection boundary violation. See private runner log: ${private_log}" >&2
-            exit 1
-          fi
-          if [[ "${fac_rc}" -ne 0 ]]; then
-            echo "ERROR: FAC failed. See private runner log: ${private_log}" >&2
-            exit "${fac_rc}"
-          fi
+          # Extract the latest review verdict for a given type from PR comments.
+          # Validates: trusted author, correct head_sha, correct pr_number.
+          # Prints one of: PASS, FAIL, or pending.
+          check_verdict() {
+            local review_type="$1"
+            local trusted_re="$2"
+            local marker="apm2-review-metadata:v1:${review_type}"
 
-      - name: Clean up build artifacts
-        if: always()
-        run: |
-          cargo clean 2>/dev/null || true
-          rm -rf target/ci target/fac_check_receipts 2>/dev/null || true
-          # Rotate old projection logs (keep last 7 days)
-          find "${HOME}/.apm2/projection/" -name "*.log" -mtime +7 -delete 2>/dev/null || true
+            # Get body of the latest comment from a trusted author containing the marker
+            local body
+            body="$(gh api "repos/${repo}/issues/${pr_number}/comments" --paginate --jq "
+              [.[] |
+               select(.user.login | test(\"^(${trusted_re})$\")) |
+               select(.body | test(\"${marker}\"))
+              ] | last | .body // empty")"
+
+            [[ -n "$body" ]] || { echo "pending"; return; }
+
+            # Extract the JSON metadata block following the marker
+            local json_block
+            json_block="$(echo "$body" | \
+              sed -n "/${marker}/,\$p" | \
+              sed -n '/```json/,/```/p' | sed '1d;$d')"
+
+            [[ -n "$json_block" ]] || { echo "pending"; return; }
+
+            # Validate SHA + PR binding, return verdict
+            echo "$json_block" | jq -r \
+              --arg sha "$head_sha" \
+              --argjson pr "$pr_number" \
+              'if .head_sha == $sha and .pr_number == $pr then .verdict
+               else "pending" end'
+          }
+
+          deadline=$((SECONDS + max_wait))
+          echo "fac-gate: polling pr=${pr_number} sha=${head_sha} deadline=${max_wait}s"
+
+          while [[ $SECONDS -lt $deadline ]]; do
+            sec_v="$(check_verdict "security" "$security_logins")"
+            qual_v="$(check_verdict "code-quality" "$quality_logins")"
+
+            ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "ts=${ts} sha=${head_sha} security=${sec_v} quality=${qual_v}"
+
+            if [[ "$sec_v" == "FAIL" || "$qual_v" == "FAIL" ]]; then
+              echo "fac-gate: FAIL security=${sec_v} quality=${qual_v}"
+              exit 1
+            fi
+            if [[ "$sec_v" == "PASS" && "$qual_v" == "PASS" ]]; then
+              echo "fac-gate: PASS security=PASS quality=PASS"
+              exit 0
+            fi
+
+            sleep "$poll_interval"
+          done
+
+          echo "fac-gate: FAIL reason=timeout after ${max_wait}s"
+          exit 1

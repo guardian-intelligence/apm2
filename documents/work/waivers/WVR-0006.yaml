@@ -65,7 +65,7 @@ waiver:
     rfc_id: "RFC-0018"
     barrier_workflow: ".github/workflows/forge-admission-barrier.yml"
     cycle_workflow: ".github/workflows/forge-admission-cycle.yml"
-    superseded_by_commit: "pending"
+    superseded_by_commit: "7fa539dbd023e4b354939bd388c43897e49309ae"
 
   approval:
     approver: "repository_owner"
