@@ -266,3 +266,145 @@ impl ThrottledUpdater {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── CiStatus data model ─────────────────────────────────────────────
+
+    #[test]
+    fn test_ci_status_new_is_empty() {
+        let s = CiStatus::new("abc123", 42);
+        assert_eq!(s.sha, "abc123");
+        assert_eq!(s.pr, 42);
+        assert!(s.gates.is_empty());
+    }
+
+    #[test]
+    fn test_set_running() {
+        let mut s = CiStatus::new("abc", 1);
+        s.set_running("clippy");
+        let g = s.gates.get("clippy").expect("gate should exist");
+        assert_eq!(g.status, "RUNNING");
+        assert!(g.duration_secs.is_none());
+    }
+
+    #[test]
+    fn test_set_result_pass() {
+        let mut s = CiStatus::new("abc", 1);
+        s.set_result("fmt", true, 3);
+        let g = s.gates.get("fmt").unwrap();
+        assert_eq!(g.status, "PASS");
+        assert_eq!(g.duration_secs, Some(3));
+    }
+
+    #[test]
+    fn test_set_result_fail() {
+        let mut s = CiStatus::new("abc", 1);
+        s.set_result("test", false, 120);
+        let g = s.gates.get("test").unwrap();
+        assert_eq!(g.status, "FAIL");
+        assert_eq!(g.duration_secs, Some(120));
+    }
+
+    #[test]
+    fn test_set_review_status_with_tokens_and_model() {
+        let mut s = CiStatus::new("abc", 1);
+        s.set_review_status("security", "PASS", Some(45), Some(8000), Some("opus-4"));
+        let g = s.gates.get("security").unwrap();
+        assert_eq!(g.status, "PASS");
+        assert_eq!(g.tokens_used, Some(8000));
+        assert_eq!(g.model.as_deref(), Some("opus-4"));
+    }
+
+    // ── Comment body format ─────────────────────────────────────────────
+
+    #[test]
+    fn test_comment_body_contains_marker() {
+        let s = CiStatus::new("deadbeef", 99);
+        let body = s.to_comment_body();
+        assert!(
+            body.contains("<!-- apm2-ci-status:v1 -->"),
+            "must contain HTML marker"
+        );
+        assert!(
+            body.contains("# apm2-ci-status:v1"),
+            "must contain YAML comment marker"
+        );
+    }
+
+    #[test]
+    fn test_comment_body_roundtrip_via_extract_yaml() {
+        let mut s = CiStatus::new("abc123full", 7);
+        s.set_result("fmt", true, 2);
+        s.set_result("clippy", false, 30);
+
+        let body = s.to_comment_body();
+        let yaml_str = extract_yaml_block(&body).expect("should find YAML block");
+        let restored: CiStatus = serde_yaml::from_str(yaml_str).expect("should parse YAML");
+
+        assert_eq!(restored.sha, "abc123full");
+        assert_eq!(restored.pr, 7);
+        assert_eq!(restored.gates.len(), 2);
+        assert_eq!(restored.gates["fmt"].status, "PASS");
+        assert_eq!(restored.gates["clippy"].status, "FAIL");
+    }
+
+    // ── extract_yaml_block ──────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_yaml_block_returns_none_for_empty() {
+        assert!(extract_yaml_block("").is_none());
+        assert!(extract_yaml_block("no yaml here").is_none());
+    }
+
+    #[test]
+    fn test_extract_yaml_block_skips_comment_line() {
+        let body = "<!-- m -->\n```yaml\n# apm2-ci-status:v1\nsha: abc\npr: 1\n```\n";
+        let yaml = extract_yaml_block(body).unwrap();
+        assert!(yaml.starts_with("sha:"), "should skip # comment line");
+    }
+
+    // ── ThrottledUpdater contract ───────────────────────────────────────
+
+    #[test]
+    fn test_update_never_makes_api_call() {
+        // update() must always return false (no-op).
+        let updater = ThrottledUpdater::new("owner/repo", 1);
+        let s = CiStatus::new("abc", 1);
+        assert!(!updater.update(&s), "update() must be a no-op");
+        assert!(
+            !updater.update(&s),
+            "update() must remain a no-op on repeat"
+        );
+    }
+
+    #[test]
+    fn test_update_is_idempotent_no_side_effects() {
+        // Call update() many times — must never panic or change behavior.
+        let updater = ThrottledUpdater::new("owner/repo", 42);
+        let mut s = CiStatus::new("sha123", 42);
+        for i in 0..100 {
+            s.set_result(&format!("gate_{i}"), true, i);
+            assert!(!updater.update(&s));
+        }
+    }
+
+    // ── Security boundary: no sensitive data in comment body ────────────
+
+    #[test]
+    fn test_comment_body_contains_no_paths() {
+        let mut s = CiStatus::new("abc", 1);
+        s.set_result("test", true, 5);
+        let body = s.to_comment_body();
+        assert!(
+            !body.contains("/home"),
+            "comment must not contain local paths"
+        );
+        assert!(
+            !body.contains(".apm2"),
+            "comment must not contain private dir references"
+        );
+    }
+}
