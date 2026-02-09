@@ -39,6 +39,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
 
+      - name: Ensure protoc is available
+        run: |
+          set -euo pipefail
+          if command -v protoc >/dev/null 2>&1; then
+            protoc --version
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
+
       - name: Validate trigger trust boundary
         env:
           GH_TOKEN: ${{ github.token }}
@@ -65,6 +76,17 @@ jobs:
           toolchain: stable
 
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+
+      - name: Ensure protoc is available
+        run: |
+          set -euo pipefail
+          if command -v protoc >/dev/null 2>&1; then
+            protoc --version
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
 
       - name: Kick off FAC and project health
         env:
