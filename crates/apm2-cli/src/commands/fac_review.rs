@@ -4029,6 +4029,8 @@ fn read_last_event_values(max_lines: usize) -> Result<Vec<serde_json::Value>, St
 fn is_process_alive(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
 }
