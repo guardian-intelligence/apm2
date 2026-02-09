@@ -1,12 +1,9 @@
 name: Forge Admission Cycle
 
 on:
-  pull_request_target:
-    branches: [main]
-    types: [opened, reopened, synchronize, ready_for_review]
-  pull_request:
-    branches: [main]
-    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_run:
+    workflows: ["Forge Admission Barrier"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -15,7 +12,7 @@ on:
         type: string
 
 concurrency:
-  group: forge-admission-cycle-${{ (github.event_name == 'pull_request_target' || github.event_name == 'pull_request') && github.event.pull_request.number || github.event.inputs.pr_number || github.run_id }}
+  group: forge-admission-cycle-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.event.inputs.pr_number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -31,42 +28,6 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  barrier:
-    name: Guardian Intelligence / Barrier
-    if: ${{ github.event_name == 'pull_request_target' || github.event_name == 'pull_request' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Validate trigger trust boundary (fast path)
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_ACTOR: ${{ github.actor }}
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          GITHUB_EVENT_PATH: ${{ github.event_path }}
-          GITHUB_REF_NAME: ${{ github.ref_name }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-
-          fail() {
-            echo "barrier: $1" >&2
-            exit 1
-          }
-
-          event_name="$GITHUB_EVENT_NAME"
-          [[ "$event_name" == "pull_request_target" || "$event_name" == "pull_request" ]] || fail "barrier only supports pull_request_target or pull_request"
-
-          pr_number="$(jq -r '.pull_request.number // 0' "$GITHUB_EVENT_PATH")"
-          association="$(jq -r '.pull_request.author_association // ""' "$GITHUB_EVENT_PATH")"
-          [[ "$pr_number" != "0" ]] || fail "missing pull_request.number in event payload"
-          case "$association" in
-            OWNER|MEMBER|COLLABORATOR) ;;
-            *)
-              fail "unauthorized pull_request_target author_association=$association for PR #$pr_number"
-              ;;
-          esac
-          echo "barrier: authorized pull_request_target pr=$pr_number association=$association"
-
   dispatch-auth:
     name: Guardian Intelligence / Dispatch Auth
     if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -115,26 +76,71 @@ jobs:
 
   forge-admission-cycle:
     name: apm2 / Forge Admission Cycle
-    needs: [barrier, dispatch-auth]
+    needs: [dispatch-auth]
     if: >
       ${{
         always() &&
         (
-          (github.event_name == 'pull_request_target' && needs.barrier.result == 'success') ||
-          (github.event_name == 'pull_request' && needs.barrier.result == 'success') ||
-          (github.event_name == 'workflow_dispatch' && needs.dispatch-auth.result == 'success')
+          (github.event_name == 'workflow_run' &&
+           github.event.workflow_run.conclusion == 'success' &&
+           github.event.workflow_run.event == 'pull_request_target') ||
+          (github.event_name == 'workflow_dispatch' &&
+           needs.dispatch-auth.result == 'success')
         )
       }}
     runs-on: [self-hosted, linux, x64, fac-ovh]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
         with:
           toolchain: stable
 
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+
+      - name: Resolve PR context
+        id: pr-context
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            head_sha="${{ github.event.workflow_run.head_sha }}"
+            pr_number="$(gh api "repos/${{ github.repository }}/commits/${head_sha}/pulls" --jq '.[0].number' 2>/dev/null || echo '')"
+            if [[ -z "$pr_number" || "$pr_number" == "null" ]]; then
+              echo "ERROR: could not resolve PR number from commit ${head_sha}" >&2
+              exit 1
+            fi
+            event_name="pull_request_target"
+          else
+            pr_number="${{ github.event.inputs.pr_number }}"
+            head_sha="${{ github.sha }}"
+            event_name="workflow_dispatch"
+          fi
+          echo "pr_number=${pr_number}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
+          echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
+          echo "fac-context: pr=${pr_number} sha=${head_sha} event=${event_name}"
+
+      - name: Synthesize event payload
+        id: event-payload
+        run: |
+          set -euo pipefail
+          event_file="$(mktemp)"
+          if [[ "${{ steps.pr-context.outputs.event_name }}" == "pull_request_target" ]]; then
+            # Build a minimal pull_request_target event payload for fac kickoff
+            gh api "repos/${{ github.repository }}/pulls/${{ steps.pr-context.outputs.pr_number }}" \
+              | jq '{pull_request: .}' > "${event_file}"
+          else
+            # Use the original event payload for workflow_dispatch
+            cp "${{ github.event_path }}" "${event_file}"
+          fi
+          echo "path=${event_file}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Kick off FAC and project health
         env:
@@ -160,8 +166,8 @@ jobs:
           set +e
           cargo run --locked --quiet -p apm2-cli -- fac kickoff \
             --repo "${{ github.repository }}" \
-            --event "${{ github.event_path }}" \
-            --event-name "${{ github.event_name }}" \
+            --event "${{ steps.event-payload.outputs.path }}" \
+            --event-name "${{ steps.pr-context.outputs.event_name }}" \
             --max-wait-seconds 3600 \
             --public-projection-only \
             2>>"${private_log}" | \
