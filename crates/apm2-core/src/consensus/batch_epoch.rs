@@ -566,6 +566,12 @@ impl EpochAntiEntropyPointer {
         if batch_count == 0 {
             return Err(BatchEpochError::ZeroPointerBatchCount);
         }
+        if batch_count as usize > MAX_EPOCH_BATCH_ROOTS {
+            return Err(BatchEpochError::TooManyBatchRoots {
+                count: batch_count as usize,
+                max: MAX_EPOCH_BATCH_ROOTS,
+            });
+        }
         Ok(Self {
             epoch,
             epoch_root_hash,
@@ -1311,6 +1317,49 @@ mod tck_00371_unit_tests {
             matches!(result, Err(BatchEpochError::ZeroPointerBatchCount)),
             "pointer should reject zero batch_count, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn pointer_new_rejects_batch_count_exceeding_max() {
+        // MAX_EPOCH_BATCH_ROOTS + 1 must be rejected.
+        let over_by_one = u32::try_from(MAX_EPOCH_BATCH_ROOTS + 1)
+            .expect("MAX_EPOCH_BATCH_ROOTS + 1 fits in u32");
+        let result = EpochAntiEntropyPointer::new(0, test_hash(1), over_by_one);
+        assert!(
+            matches!(
+                result,
+                Err(BatchEpochError::TooManyBatchRoots { count, max })
+                    if count == MAX_EPOCH_BATCH_ROOTS + 1 && max == MAX_EPOCH_BATCH_ROOTS
+            ),
+            "batch_count == MAX+1 must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn pointer_new_rejects_u32_max_batch_count() {
+        let result = EpochAntiEntropyPointer::new(0, test_hash(1), u32::MAX);
+        assert!(
+            matches!(
+                result,
+                Err(BatchEpochError::TooManyBatchRoots { count, max })
+                    if count == u32::MAX as usize && max == MAX_EPOCH_BATCH_ROOTS
+            ),
+            "batch_count == u32::MAX must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn pointer_new_accepts_exactly_max_batch_count() {
+        let exactly_max =
+            u32::try_from(MAX_EPOCH_BATCH_ROOTS).expect("MAX_EPOCH_BATCH_ROOTS fits in u32");
+        let result = EpochAntiEntropyPointer::new(0, test_hash(1), exactly_max);
+        assert!(
+            result.is_ok(),
+            "batch_count == MAX_EPOCH_BATCH_ROOTS must be accepted, got: {result:?}"
+        );
+        let pointer = result.unwrap();
+        assert_eq!(pointer.batch_count(), exactly_max);
+        assert_eq!(pointer.epoch(), 0);
     }
 
     #[test]
