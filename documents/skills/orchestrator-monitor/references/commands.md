@@ -6,10 +6,12 @@ notes:
   - "NOTE_VARIABLE_SUBSTITUTION: references do not interpolate variables. Replace <...> placeholders before running commands."
   - "All commands that can hang should use timeout wrappers."
   - "Commands labeled side_effect=true modify external state."
+  - "Use `apm2 fac push` as the canonical push workflow — it pushes, creates/updates the PR, enables auto-merge, and reviews auto-start via CI."
   - "Prefer FAC-native `apm2 fac review ...` commands for reviewer lifecycle state and retrigger operations."
   - "Use direct `gh` commands only for surfaces that FAC does not yet expose (for example full review comment bodies)."
+  - "Do NOT manually dispatch reviews after pushing — the Forge Admission Cycle CI workflow auto-dispatches them."
 
-commands[20]:
+commands[21]:
   - name: resolve_repo_root
     command: "timeout 10s git rev-parse --show-toplevel"
     purpose: "Discover repository root for asset invocation."
@@ -55,9 +57,14 @@ commands[20]:
     purpose: "Projection-native FAC retrigger path that dispatches Forge Admission Cycle from apm2 CLI."
     side_effect: true
 
+  - name: fac_push
+    command: "timeout 120s apm2 fac push --ticket <TICKET_YAML>"
+    purpose: "Canonical push workflow: pushes branch, creates/updates PR from ticket YAML, enables auto-merge. Reviews auto-start via CI. Use this instead of raw git push + manual review dispatch."
+    side_effect: true
+
   - name: launch_reviews
     command: "timeout 900s bash <ROOT>/documents/skills/orchestrator-monitor/assets/launch-reviews.sh <PR_NUMBER|PR_URL> [SCRATCHPAD_DIR]"
-    purpose: "Launch FAC review dispatch (`apm2 fac review dispatch ... --type all`) and project 1Hz status via `apm2 fac review project`."
+    purpose: "FALLBACK ONLY: Launch FAC review dispatch when CI auto-dispatch has failed. Prefer `apm2 fac push` for normal workflow — reviews auto-start on push."
     side_effect: true
 
   - name: retrigger_review_stream

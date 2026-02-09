@@ -41,12 +41,17 @@ decision_tree:
       steps[6]:
         - id: READY_TO_MERGE_ACTION
           action: "For READY_TO_MERGE PRs, run enable_auto_merge."
-        - id: REVIEW_LAUNCH_ACTION
-          action: "For REVIEW_MISSING PRs with available review slots, run launch_reviews and pass PR_URL into review prompts."
+        - id: REVIEW_MONITOR_ACTION
+          action: |
+            For REVIEW_MISSING PRs: reviews auto-start via the Forge Admission Cycle CI workflow on push.
+            Do NOT manually dispatch reviews. Instead, monitor with `apm2 fac review project --pr <N> --emit-errors`.
+            If reviews have not started within 2 minutes of the push, use `apm2 fac review retrigger` as recovery.
+            Only use `launch_reviews` as a last-resort fallback if retrigger also fails.
         - id: FIX_AGENT_ACTION
           action: |
             For CI_FAILED, REVIEW_FAILED, or PR_CONFLICTING PRs with implementor slots, dispatch one fresh fix agent.
             Inject references/common-review-findings.md and references/daemon-implementation-patterns.md in its context.
+            Fix agents should use `apm2 fac push` to push their changes — this auto-creates/updates the PR and triggers reviews.
         - id: REVIEW_PROGRESS_ACTION
           action: "For PRs with active reviews, run check_review_progress and fac_review_project; the Forge Admission Cycle workflow remains the GitHub projection path."
         - id: NO_DUPLICATE_OWNERSHIP

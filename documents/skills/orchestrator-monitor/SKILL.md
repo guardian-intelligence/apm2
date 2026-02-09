@@ -27,8 +27,10 @@ bootstrap:
     when: "FIRST — before invoking any `apm2 fac` command."
 
 notes:
-  - "Use `apm2 fac review` as the primary authority path for reviewer lifecycle actions (`dispatch`, `status`, `project`, `retrigger`)."
-  - "Use direct `gh` commands only when FAC has no equivalent (for now: PR metadata, merge actions, and full comment-body retrieval)."
+  - "Use `apm2 fac push` as the canonical push workflow — it pushes, creates/updates the PR, and enables auto-merge. Reviews auto-start via CI."
+  - "Use `apm2 fac review project --pr <N> --emit-errors` to monitor all gate states (CI gates + reviews) after a push."
+  - "Use `apm2 fac review` for reviewer lifecycle actions (`status`, `project`, `retrigger`). Manual `dispatch` is recovery-only."
+  - "Use direct `gh` commands only when FAC has no equivalent (for now: PR metadata and full comment-body retrieval)."
 
 references[10]:
   - path: "@documents/theory/glossary/glossary.json"
@@ -98,13 +100,28 @@ review_prompt_required_payload[1]:
   - field: pr_url
     requirement: "Provide PR_URL to SECURITY_REVIEW_PROMPT and CODE_QUALITY_PROMPT; each prompt should resolve reviewed SHA from PR_URL."
 
+push_workflow:
+  canonical_command: "apm2 fac push --ticket <TICKET_YAML>"
+  behavior:
+    - "Pushes the current branch to remote."
+    - "Creates or updates the PR from ticket YAML metadata (title, body)."
+    - "Enables auto-merge (squash) and exits immediately."
+    - "The Forge Admission Cycle CI workflow auto-triggers on the new HEAD and dispatches reviews."
+  implication: "Agents MUST NOT manually dispatch reviews after pushing. Reviews start automatically via CI."
+
 runtime_review_protocol:
-  primary_entrypoint: "apm2 fac review dispatch <PR_URL> --type all"
+  automatic_trigger: "Reviews are auto-dispatched by the Forge Admission Cycle CI workflow on every push. Agents do NOT need to manually call `apm2 fac review dispatch` after pushing."
+  manual_dispatch: "apm2 fac review dispatch <PR_URL> --type all (use ONLY when CI auto-dispatch has failed or for recovery)"
   recovery_entrypoint: "apm2 fac review retrigger --repo guardian-intelligence/apm2 --pr <PR_NUMBER>"
+  monitoring:
+    primary: "apm2 fac review project --pr <PR_NUMBER> --emit-errors (1Hz projection of review + CI gate states)"
+    secondary: "apm2 fac review status --pr <PR_NUMBER> (snapshot of reviewer process state)"
+    ci_status_comment: "PR comment with marker `apm2-ci-status:v1` containing YAML gate statuses (rustfmt, clippy, doc, test, security_review, quality_review)"
   observability_surfaces:
     - "~/.apm2/review_events.ndjson (append-only lifecycle events)"
     - "~/.apm2/review_state.json (active review process/model/backend state)"
     - "~/.apm2/review_pulses/pr<PR>_review_pulse_{security|quality}.json (PR-scoped HEAD SHA pulse files)"
+    - "PR comment `apm2-ci-status:v1` (machine-readable YAML with all gate statuses and token counts)"
   required_semantics:
     - "Review runs execute security and quality in parallel when `--type all` is used."
     - "Dispatch is idempotent start-or-join for duplicate PR/SHA requests."
