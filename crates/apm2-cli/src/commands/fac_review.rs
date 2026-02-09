@@ -41,6 +41,7 @@ const COMMENT_CONFIRM_MAX_PAGES: usize = 20;
 const COMMENT_CONFIRM_MAX_ATTEMPTS: usize = 20;
 const COMMENT_PERMISSION_SCAN_LINES: usize = 200;
 const DISPATCH_PENDING_TTL: Duration = Duration::from_secs(120);
+const MAX_EVENT_PAYLOAD_BYTES: u64 = 1024 * 1024;
 
 const SECURITY_PROMPT_PATH: &str = "documents/reviews/SECURITY_REVIEW_PROMPT.md";
 const QUALITY_PROMPT_PATH: &str = "documents/reviews/CODE_QUALITY_PROMPT.md";
@@ -576,6 +577,14 @@ pub fn run_barrier(repo: &str, event_path: &Path, event_name: &str, json_output:
     match resolve_fac_event_context(repo, event_path, event_name) {
         Ok(ctx) => {
             if let Err(err) = enforce_barrier(&ctx) {
+                let _ = emit_barrier_decision_event(
+                    "barrier",
+                    repo,
+                    event_name,
+                    Some(&ctx),
+                    false,
+                    Some(&err),
+                );
                 if json_output {
                     let payload = serde_json::json!({
                         "error": "fac_barrier_failed",
@@ -590,6 +599,8 @@ pub fn run_barrier(repo: &str, event_path: &Path, event_name: &str, json_output:
                 }
                 return exit_codes::GENERIC_ERROR;
             }
+            let _ =
+                emit_barrier_decision_event("barrier", repo, event_name, Some(&ctx), true, None);
 
             let summary = BarrierSummary {
                 repo: ctx.repo,
@@ -633,6 +644,8 @@ pub fn run_barrier(repo: &str, event_path: &Path, event_name: &str, json_output:
             exit_codes::SUCCESS
         },
         Err(err) => {
+            let _ =
+                emit_barrier_decision_event("barrier", repo, event_name, None, false, Some(&err));
             if json_output {
                 let payload = serde_json::json!({
                     "error": "fac_barrier_failed",
@@ -864,8 +877,20 @@ fn run_kickoff_inner(
         return Err("max_wait_seconds must be greater than zero".to_string());
     }
 
-    let ctx = resolve_fac_event_context(repo, event_path, event_name)?;
-    enforce_barrier(&ctx)?;
+    let ctx = match resolve_fac_event_context(repo, event_path, event_name) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            let _ =
+                emit_barrier_decision_event("kickoff", repo, event_name, None, false, Some(&err));
+            return Err(err);
+        },
+    };
+    if let Err(err) = enforce_barrier(&ctx) {
+        let _ =
+            emit_barrier_decision_event("kickoff", repo, event_name, Some(&ctx), false, Some(&err));
+        return Err(err);
+    }
+    let _ = emit_barrier_decision_event("kickoff", repo, event_name, Some(&ctx), true, None);
     ensure_gh_cli_ready()?;
 
     let started = Instant::now();
@@ -1009,12 +1034,7 @@ fn resolve_fac_event_context(
     event_name: &str,
 ) -> Result<FacEventContext, String> {
     let _ = split_owner_repo(repo)?;
-    let payload_text = fs::read_to_string(event_path).map_err(|err| {
-        format!(
-            "failed to read event payload {}: {err}",
-            event_path.display()
-        )
-    })?;
+    let payload_text = read_event_payload_bounded(event_path, MAX_EVENT_PAYLOAD_BYTES)?;
     let payload: serde_json::Value =
         serde_json::from_str(&payload_text).map_err(|err| format!("invalid event JSON: {err}"))?;
 
@@ -1025,6 +1045,93 @@ fn resolve_fac_event_context(
             "unsupported event_name `{other}`; expected pull_request_target or workflow_dispatch"
         )),
     }
+}
+
+fn read_event_payload_bounded(path: &Path, max_bytes: u64) -> Result<String, String> {
+    let mut file = File::open(path)
+        .map_err(|err| format!("failed to open event payload {}: {err}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| format!("failed to stat event payload {}: {err}", path.display()))?;
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "event payload {} is too large ({} bytes > {} byte limit)",
+            path.display(),
+            metadata.len(),
+            max_bytes
+        ));
+    }
+
+    let mut reader = (&mut file).take(max_bytes.saturating_add(1));
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("failed to read event payload {}: {err}", path.display()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(format!(
+            "event payload {} exceeds {} byte limit",
+            path.display(),
+            max_bytes
+        ));
+    }
+
+    String::from_utf8(bytes)
+        .map_err(|err| format!("event payload {} is not valid UTF-8: {err}", path.display()))
+}
+
+fn emit_barrier_decision_event(
+    source: &str,
+    repo: &str,
+    event_name: &str,
+    ctx: Option<&FacEventContext>,
+    passed: bool,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let event = build_barrier_decision_event(source, repo, event_name, ctx, passed, reason);
+    emit_review_event(&event)
+}
+
+fn build_barrier_decision_event(
+    source: &str,
+    repo: &str,
+    event_name: &str,
+    ctx: Option<&FacEventContext>,
+    passed: bool,
+    reason: Option<&str>,
+) -> serde_json::Value {
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("ts".to_string(), serde_json::json!(now_iso8601_millis()));
+    envelope.insert("event".to_string(), serde_json::json!("barrier_decision"));
+    envelope.insert("phase".to_string(), serde_json::json!(source));
+    envelope.insert(
+        "result".to_string(),
+        serde_json::json!(if passed { "pass" } else { "fail" }),
+    );
+    envelope.insert("repo".to_string(), serde_json::json!(repo));
+    envelope.insert("event_name".to_string(), serde_json::json!(event_name));
+    envelope.insert(
+        "pr_number".to_string(),
+        serde_json::json!(ctx.map_or(0, |value| value.pr_number)),
+    );
+    envelope.insert(
+        "head_sha".to_string(),
+        serde_json::json!(ctx.map_or("-", |value| value.head_sha.as_str())),
+    );
+    envelope.insert(
+        "author_association".to_string(),
+        serde_json::json!(ctx.map_or("-", |value| value.author_association.as_str())),
+    );
+    envelope.insert(
+        "actor_login".to_string(),
+        serde_json::json!(ctx.map_or("-", |value| value.actor_login.as_str())),
+    );
+    if let Some(value) = ctx.and_then(|value| value.actor_permission.as_deref()) {
+        envelope.insert("actor_permission".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = reason {
+        envelope.insert("reason".to_string(), serde_json::json!(value));
+    }
+    serde_json::Value::Object(envelope)
 }
 
 fn resolve_pull_request_target_context(
@@ -4259,5 +4366,67 @@ mod tests {
 
         assert_eq!(security, "failed:sequence_fail");
         assert_eq!(quality, "failed:sequence_unknown");
+    }
+
+    #[test]
+    fn test_read_event_payload_bounded_rejects_oversized_payload() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("event.json");
+        fs::write(&path, "0123456789abcdef").expect("write oversized payload");
+
+        let err = read_event_payload_bounded(&path, 8).expect_err("payload should be rejected");
+        assert!(err.contains("too large"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_build_barrier_decision_event_contains_reason() {
+        let event = build_barrier_decision_event(
+            "barrier",
+            "guardian-intelligence/apm2",
+            "workflow_dispatch",
+            None,
+            false,
+            Some("missing actor permission"),
+        );
+        assert_eq!(event["event"], "barrier_decision");
+        assert_eq!(event["phase"], "barrier");
+        assert_eq!(event["result"], "fail");
+        assert_eq!(event["repo"], "guardian-intelligence/apm2");
+        assert_eq!(event["reason"], "missing actor permission");
+        assert_eq!(event["pr_number"], 0);
+        assert_eq!(event["head_sha"], "-");
+    }
+
+    #[test]
+    fn test_build_barrier_decision_event_with_context() {
+        let ctx = FacEventContext {
+            repo: "guardian-intelligence/apm2".to_string(),
+            event_name: "pull_request_target".to_string(),
+            pr_number: 509,
+            pr_url: "https://github.com/guardian-intelligence/apm2/pull/509".to_string(),
+            head_sha: "0c662aab51571e9a5d0ff7ab11bde9457cef23e1".to_string(),
+            base_ref: "main".to_string(),
+            default_branch: "main".to_string(),
+            author_login: "Anveio".to_string(),
+            author_association: "MEMBER".to_string(),
+            actor_login: "Anveio".to_string(),
+            actor_permission: Some("admin".to_string()),
+        };
+        let event = build_barrier_decision_event(
+            "kickoff",
+            &ctx.repo,
+            &ctx.event_name,
+            Some(&ctx),
+            true,
+            None,
+        );
+        assert_eq!(event["result"], "pass");
+        assert_eq!(event["pr_number"], 509);
+        assert_eq!(
+            event["head_sha"],
+            "0c662aab51571e9a5d0ff7ab11bde9457cef23e1"
+        );
+        assert_eq!(event["actor_permission"], "admin");
+        assert!(event.get("reason").is_none());
     }
 }
