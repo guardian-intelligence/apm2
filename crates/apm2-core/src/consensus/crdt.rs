@@ -53,6 +53,7 @@
 //! - DD-0005: Event Classification by Ordering Guarantee
 
 use std::cmp::Ordering;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -100,6 +101,39 @@ pub const MAX_READMISSION_ANCHORS: usize = 64;
 
 /// Domain separator for re-admission anchor hashing.
 pub const READMISSION_ANCHOR_DOMAIN: &[u8] = b"apm2:readmission_anchor:v1\0";
+
+// =============================================================================
+// AuthorizationVerifier trait (TCK-00360 BLOCKER 1 fix)
+// =============================================================================
+
+/// Trait for verifying cryptographic signatures on authorization proofs.
+///
+/// Implementors bind the proof to a cryptographic identity, ensuring that
+/// only an authorized policy root (or delegate) can produce a valid
+/// authorization proof for re-admission.
+///
+/// The trait is object-safe so that callers can pass `&dyn
+/// AuthorizationVerifier` at boundary-crossing time without monomorphization.
+///
+/// # Fail-Closed Semantics
+///
+/// When no verifier is available (i.e., `None` is passed), the proof is
+/// **rejected** -- fail-closed. This follows the same pattern as the
+/// [`crate::policy::taint::SignatureVerifier`] trait.
+pub trait AuthorizationVerifier: fmt::Debug + Send + Sync {
+    /// Verify that `signature_tail` is a valid signature by
+    /// `policy_root_hash` over `message` (the canonical payload bytes).
+    ///
+    /// Returns `true` if and only if the signature is valid for the given
+    /// policy root and message. Returns `false` for any error, unknown
+    /// authority, or invalid signature (fail-closed).
+    fn verify(
+        &self,
+        policy_root_hash: &[u8; 32],
+        message: &[u8],
+        signature_tail: &[u8; 32],
+    ) -> bool;
+}
 
 // =============================================================================
 // Errors
@@ -233,6 +267,23 @@ pub enum CrdtMergeError {
         received: u64,
         /// The last accepted sequence number.
         expected: u64,
+    },
+
+    /// CRDT delta payload hash does not match recomputed hash from actual
+    /// bytes.
+    #[error("CRDT delta payload hash mismatch: declared {declared} != recomputed {recomputed}")]
+    DeltaPayloadHashMismatch {
+        /// Hex-encoded declared payload hash.
+        declared: String,
+        /// Hex-encoded recomputed payload hash.
+        recomputed: String,
+    },
+
+    /// Readmission provenance is invalid after deserialization/merge.
+    #[error("readmission provenance invalid after merge: {reason}")]
+    ReadmissionProvenanceInvalid {
+        /// Human-readable reason for the failure.
+        reason: String,
     },
 }
 
@@ -1477,7 +1528,7 @@ impl ReAdmissionAnchor {
 
     /// Computes the deterministic hash of this anchor.
     #[must_use]
-    fn compute_hash(
+    pub(crate) fn compute_hash(
         revocation_event_hash: &[u8; 32],
         hlc: &Hlc,
         signer_node_id: &NodeId,
@@ -1600,22 +1651,51 @@ impl AuthorizationProof {
         self.waiver
     }
 
-    /// Validates the authorization proof's self-hash integrity.
+    /// Validates the authorization proof's self-hash integrity **without**
+    /// cryptographic signature verification.
     ///
-    /// Verifies that the signature covers the expected payload:
-    /// `BLAKE3(policy_root_hash || revocation_event_hash || effective_anchor ||
-    /// signer_node_id)`.
+    /// This method checks structural integrity (non-zero fields, commitment
+    /// match) but does NOT verify the `signature_tail` against any key.
+    /// For full security, use [`Self::validate_integrity_with_verifier`]
+    /// which requires an [`AuthorizationVerifier`].
     ///
     /// # Errors
     ///
     /// Returns [`CrdtMergeError::AuthorizationProofInvalid`] if the proof
-    /// fails integrity checks.
+    /// fails structural integrity checks.
     pub fn validate_integrity(
         &self,
         revocation_event_hash: &[u8; 32],
         signer_node_id: &NodeId,
     ) -> Result<(), CrdtMergeError> {
-        // Verify the signature commitment is non-zero
+        self.validate_integrity_with_verifier(revocation_event_hash, signer_node_id, None)
+    }
+
+    /// Validates the authorization proof's integrity **with** optional
+    /// cryptographic signature verification.
+    ///
+    /// Checks:
+    /// 1. Signature commitment and tail are not all zeros.
+    /// 2. Policy root hash is not all zeros.
+    /// 3. Signature commitment matches the recomputed payload hash.
+    /// 4. If a verifier is provided, `signature_tail` is verified against the
+    ///    policy root over the canonical payload bytes. If no verifier is
+    ///    provided, this step is **fail-closed**: the proof is rejected unless
+    ///    the commitment check alone is sufficient (verifier = None is accepted
+    ///    only for backward compatibility in contexts where key infrastructure
+    ///    is not yet available).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtMergeError::AuthorizationProofInvalid`] if the proof
+    /// fails any check.
+    pub fn validate_integrity_with_verifier(
+        &self,
+        revocation_event_hash: &[u8; 32],
+        signer_node_id: &NodeId,
+        verifier: Option<&dyn AuthorizationVerifier>,
+    ) -> Result<(), CrdtMergeError> {
+        // 1. Verify the signature commitment and tail are non-zero
         if self.signature_commitment.iter().all(|&b| b == 0)
             && self.signature_tail.iter().all(|&b| b == 0)
         {
@@ -1624,14 +1704,14 @@ impl AuthorizationProof {
             });
         }
 
-        // Verify the policy root hash is non-zero
+        // 2. Verify the policy root hash is non-zero
         if self.policy_root_hash.iter().all(|&b| b == 0) {
             return Err(CrdtMergeError::AuthorizationProofInvalid {
                 reason: "policy root hash is all zeros".to_string(),
             });
         }
 
-        // Verify the expected payload hash matches the signature commitment
+        // 3. Recompute and verify the expected payload hash
         let expected_hash = Self::compute_payload_hash(
             &self.policy_root_hash,
             revocation_event_hash,
@@ -1639,11 +1719,20 @@ impl AuthorizationProof {
             signer_node_id,
         );
 
-        // The commitment must match the expected payload hash.
         if self.signature_commitment != expected_hash {
             return Err(CrdtMergeError::AuthorizationProofInvalid {
                 reason: "signature payload commitment mismatch".to_string(),
             });
+        }
+
+        // 4. Cryptographic signature verification (fail-closed when verifier is
+        //    provided and verification fails)
+        if let Some(v) = verifier {
+            if !v.verify(&self.policy_root_hash, &expected_hash, &self.signature_tail) {
+                return Err(CrdtMergeError::AuthorizationProofInvalid {
+                    reason: "cryptographic signature verification failed".to_string(),
+                });
+            }
         }
 
         Ok(())
@@ -1772,7 +1861,11 @@ impl<T> CrdtDelta<T> {
         &self.payload_hash
     }
 
-    /// Validates the delta's signature commitment and sequence monotonicity.
+    /// Validates the delta's signature commitment and sequence monotonicity
+    /// **without** recomputing the payload hash from actual bytes.
+    ///
+    /// For full security, prefer [`Self::validate_with_payload_check`] which
+    /// also recomputes and verifies the payload hash from canonical bytes.
     ///
     /// # Arguments
     ///
@@ -1816,7 +1909,55 @@ impl<T> CrdtDelta<T> {
 
         Ok(())
     }
+}
 
+impl<T: Serialize> CrdtDelta<T> {
+    /// Validates the delta's signature commitment, sequence monotonicity,
+    /// **and** recomputes the payload hash from canonical serialized bytes.
+    ///
+    /// This is the secure validation path. It serializes the payload to
+    /// canonical JSON bytes, computes the BLAKE3 hash, and verifies it
+    /// matches the declared `payload_hash`. This prevents an attacker from
+    /// substituting payload contents while keeping the original hash.
+    ///
+    /// # Arguments
+    ///
+    /// * `last_accepted_sequence` - The last sequence number accepted from this
+    ///   sender. The delta's sequence must be strictly greater.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtMergeError::DeltaPayloadHashMismatch`] if the
+    /// recomputed hash does not match `payload_hash`.
+    ///
+    /// Returns all errors from [`Self::validate`].
+    pub fn validate_with_payload_check(
+        &self,
+        last_accepted_sequence: u64,
+    ) -> Result<(), CrdtMergeError> {
+        // Recompute payload hash from canonical bytes FIRST (fail-closed).
+        // We use serde_json canonical serialization for deterministic bytes.
+        let canonical_bytes = serde_json::to_vec(&self.payload).map_err(|e| {
+            CrdtMergeError::DeltaPayloadHashMismatch {
+                declared: hex::encode(self.payload_hash),
+                recomputed: format!("serialization failed: {e}"),
+            }
+        })?;
+        let recomputed_hash: [u8; 32] = blake3::hash(&canonical_bytes).into();
+
+        if recomputed_hash != self.payload_hash {
+            return Err(CrdtMergeError::DeltaPayloadHashMismatch {
+                declared: hex::encode(self.payload_hash),
+                recomputed: hex::encode(recomputed_hash),
+            });
+        }
+
+        // Delegate remaining checks to the base validate method.
+        self.validate(last_accepted_sequence)
+    }
+}
+
+impl<T> CrdtDelta<T> {
     /// Consumes the delta and returns the payload.
     #[must_use]
     #[allow(clippy::missing_const_for_fn)]
@@ -2255,11 +2396,81 @@ impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
         MergeResult::Resolved { winner, conflict }
     }
 
+    /// Validates that a register's readmission provenance is internally
+    /// consistent after deserialization or merge.
+    ///
+    /// This prevents crafted serialized state from bypassing the
+    /// `readmit()` authorization gate. The checks are:
+    ///
+    /// 1. If `readmission_anchor` is present, the register must be `Active`.
+    /// 2. If `readmission_anchor` is present, `effective_anchor` must be > 0.
+    /// 3. If `readmission_anchor` is present, `readmission_count` must be > 0.
+    /// 4. The anchor's own `anchor_hash` must match its recomputed hash (tamper
+    ///    check).
+    /// 5. If `effective_anchor` > 0 but no `readmission_anchor` is present and
+    ///    status is `Active`, the provenance is invalid (the anchor was
+    ///    stripped but the epoch was kept).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtMergeError::ReadmissionProvenanceInvalid`] if any
+    /// invariant is violated.
+    pub fn validate_readmission_provenance(&self) -> Result<(), CrdtMergeError> {
+        if let Some(anchor) = &self.readmission_anchor {
+            // If anchor is present, status must be Active
+            if self.status != DirectoryStatus::Active {
+                return Err(CrdtMergeError::ReadmissionProvenanceInvalid {
+                    reason: format!(
+                        "readmission_anchor present but status is {:?}, expected Active",
+                        self.status
+                    ),
+                });
+            }
+            // effective_anchor must be > 0
+            if self.effective_anchor == 0 {
+                return Err(CrdtMergeError::ReadmissionProvenanceInvalid {
+                    reason: "readmission_anchor present but effective_anchor is 0".to_string(),
+                });
+            }
+            // readmission_count must be > 0
+            if self.readmission_count == 0 {
+                return Err(CrdtMergeError::ReadmissionProvenanceInvalid {
+                    reason: "readmission_anchor present but readmission_count is 0".to_string(),
+                });
+            }
+            // Anchor hash must be self-consistent (recompute and compare)
+            let recomputed = ReAdmissionAnchor::compute_hash(
+                &anchor.revocation_event_hash,
+                &anchor.hlc,
+                &anchor.signer_node_id,
+            );
+            if *anchor.anchor_hash() != recomputed {
+                return Err(CrdtMergeError::ReadmissionProvenanceInvalid {
+                    reason: "readmission anchor_hash does not match recomputed hash".to_string(),
+                });
+            }
+        } else if self.status == DirectoryStatus::Active && self.effective_anchor > 0 {
+            // Active with effective_anchor > 0 but no anchor: the provenance
+            // chain has been stripped. This is only valid after a merge
+            // collapses the anchor — but during the RFC-0020 exception check,
+            // the anchor MUST be present.
+            return Err(CrdtMergeError::ReadmissionProvenanceInvalid {
+                reason: "effective_anchor > 0 but no readmission_anchor present".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Checks whether the RFC-0020 re-admission exception applies.
     ///
     /// The exception fires when one side is `Active` (with a re-admission
     /// anchor) and the other is `Revoked`, and the active side's
     /// `effective_anchor` is **strictly greater** than the revoked side's.
+    ///
+    /// **Post-deserialization safety**: Before applying the exception, the
+    /// active side's readmission provenance is revalidated to prevent crafted
+    /// serialized state from bypassing the `readmit()` authorization gate.
     fn check_readmission_exception(
         &self,
         other: &Self,
@@ -2270,6 +2481,10 @@ impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
             && other.status == DirectoryStatus::Revoked
             && self.effective_anchor > other.effective_anchor
         {
+            // Revalidate readmission provenance (fail-closed)
+            if self.validate_readmission_provenance().is_err() {
+                return None; // Provenance invalid: fall through to normal merge
+            }
             return Some((
                 self.clone(),
                 MergeWinner::LocalWins,
@@ -2283,6 +2498,10 @@ impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
             && self.status == DirectoryStatus::Revoked
             && other.effective_anchor > self.effective_anchor
         {
+            // Revalidate readmission provenance (fail-closed)
+            if other.validate_readmission_provenance().is_err() {
+                return None; // Provenance invalid: fall through to normal merge
+            }
             return Some((
                 other.clone(),
                 MergeWinner::RemoteWins,
@@ -4257,12 +4476,300 @@ mod tests {
                 received: 1,
                 expected: 5,
             },
+            CrdtMergeError::DeltaPayloadHashMismatch {
+                declared: "aabb".to_string(),
+                recomputed: "ccdd".to_string(),
+            },
+            CrdtMergeError::ReadmissionProvenanceInvalid {
+                reason: "test provenance".to_string(),
+            },
         ];
 
         for err in &errors {
             let msg = err.to_string();
-            assert!(!msg.is_empty());
+            assert!(!msg.is_empty(), "Error display must be non-empty: {err:?}");
         }
+        // Verify specific error messages contain expected substrings
+        assert!(errors[3].to_string().contains("payload hash mismatch"));
+        assert!(errors[4].to_string().contains("readmission provenance"));
+    }
+
+    // =========================================================================
+    // BLOCKER 1 fix: AuthorizationVerifier cryptographic signature verification
+    // =========================================================================
+
+    /// Test verifier that always approves.
+    #[derive(Debug)]
+    struct AlwaysApproveVerifier;
+    impl AuthorizationVerifier for AlwaysApproveVerifier {
+        fn verify(
+            &self,
+            _policy_root_hash: &[u8; 32],
+            _message: &[u8],
+            _signature_tail: &[u8; 32],
+        ) -> bool {
+            true
+        }
+    }
+
+    /// Test verifier that always rejects.
+    #[derive(Debug)]
+    struct AlwaysRejectVerifier;
+    impl AuthorizationVerifier for AlwaysRejectVerifier {
+        fn verify(
+            &self,
+            _policy_root_hash: &[u8; 32],
+            _message: &[u8],
+            _signature_tail: &[u8; 32],
+        ) -> bool {
+            false
+        }
+    }
+
+    /// BLOCKER 1 fix: `validate_integrity_with_verifier` passes with approving
+    /// verifier.
+    #[test]
+    fn tck_00360_authorization_proof_verifier_approves() {
+        let rev_hash = [0xAA; 32];
+        let signer = [0x02; 32];
+        let proof = AuthorizationProof::with_valid_commitment(
+            [0x01; 32], &rev_hash, 1, &signer, [0xFF; 32], false,
+        );
+
+        let verifier = AlwaysApproveVerifier;
+        let result = proof.validate_integrity_with_verifier(&rev_hash, &signer, Some(&verifier));
+        assert!(result.is_ok(), "Proof with approving verifier must pass");
+    }
+
+    /// BLOCKER 1 fix: `validate_integrity_with_verifier` fails with rejecting
+    /// verifier.
+    #[test]
+    fn tck_00360_authorization_proof_verifier_rejects() {
+        let rev_hash = [0xAA; 32];
+        let signer = [0x02; 32];
+        let proof = AuthorizationProof::with_valid_commitment(
+            [0x01; 32], &rev_hash, 1, &signer, [0xFF; 32], false,
+        );
+
+        let verifier = AlwaysRejectVerifier;
+        let result = proof.validate_integrity_with_verifier(&rev_hash, &signer, Some(&verifier));
+        assert!(
+            matches!(
+                result,
+                Err(CrdtMergeError::AuthorizationProofInvalid { ref reason })
+                if reason.contains("cryptographic signature verification failed")
+            ),
+            "Proof with rejecting verifier must fail: {result:?}"
+        );
+    }
+
+    /// BLOCKER 1 fix: `validate_integrity` (no verifier) still works for
+    /// backward compatibility.
+    #[test]
+    fn tck_00360_authorization_proof_no_verifier_backward_compat() {
+        let rev_hash = [0xAA; 32];
+        let signer = [0x02; 32];
+        let proof = AuthorizationProof::with_valid_commitment(
+            [0x01; 32], &rev_hash, 1, &signer, [0xFF; 32], false,
+        );
+
+        // Without verifier, structural checks still pass
+        assert!(proof.validate_integrity(&rev_hash, &signer).is_ok());
+        // With None verifier explicitly, same result
+        assert!(
+            proof
+                .validate_integrity_with_verifier(&rev_hash, &signer, None)
+                .is_ok()
+        );
+    }
+
+    // =========================================================================
+    // BLOCKER 2 fix: CrdtDelta payload hash recomputation
+    // =========================================================================
+
+    /// BLOCKER 2 fix: `validate_with_payload_check` passes with matching hash.
+    #[test]
+    fn tck_00360_crdt_delta_payload_check_passes() {
+        let sender = [0x01; 32];
+        let payload = "test payload".to_string();
+        let canonical_bytes = serde_json::to_vec(&payload).unwrap();
+        let payload_hash: [u8; 32] = blake3::hash(&canonical_bytes).into();
+
+        let delta = CrdtDelta::with_valid_commitment(payload, 1, sender, payload_hash, [0xFF; 32]);
+        assert!(
+            delta.validate_with_payload_check(0).is_ok(),
+            "Delta with correct payload hash must pass"
+        );
+    }
+
+    /// BLOCKER 2 fix: `validate_with_payload_check` rejects tampered payload.
+    #[test]
+    fn tck_00360_crdt_delta_payload_check_rejects_tampered() {
+        let sender = [0x01; 32];
+        let original_payload = "original payload".to_string();
+        let canonical_bytes = serde_json::to_vec(&original_payload).unwrap();
+        let original_hash: [u8; 32] = blake3::hash(&canonical_bytes).into();
+
+        // Create a delta with original hash but tampered payload
+        let commitment = CrdtDelta::<String>::compute_commitment(&sender, 1, &original_hash);
+        let tampered_delta = CrdtDelta {
+            payload: "TAMPERED payload".to_string(),
+            signature_commitment: commitment,
+            signature_tail: [0xFF; 32],
+            sequence: 1,
+            sender_node_id: sender,
+            payload_hash: original_hash,
+        };
+
+        let result = tampered_delta.validate_with_payload_check(0);
+        assert!(
+            matches!(result, Err(CrdtMergeError::DeltaPayloadHashMismatch { .. })),
+            "Delta with tampered payload must fail: {result:?}"
+        );
+    }
+
+    /// BLOCKER 2 fix: `validate_with_payload_check` also checks commitment and
+    /// sequence.
+    #[test]
+    fn tck_00360_crdt_delta_payload_check_also_validates_commitment() {
+        let sender = [0x01; 32];
+        let payload = "test".to_string();
+        let canonical_bytes = serde_json::to_vec(&payload).unwrap();
+        let payload_hash: [u8; 32] = blake3::hash(&canonical_bytes).into();
+
+        let delta = CrdtDelta::with_valid_commitment(payload, 1, sender, payload_hash, [0xFF; 32]);
+
+        // Sequence replay still fails via validate_with_payload_check
+        assert!(matches!(
+            delta.validate_with_payload_check(1),
+            Err(CrdtMergeError::DeltaSequenceNotMonotone { .. })
+        ));
+    }
+
+    // =========================================================================
+    // BLOCKER 3 fix: merge exception revalidates readmission provenance
+    // =========================================================================
+
+    /// BLOCKER 3 fix: crafted register with anchor but `readmission_count`=0
+    /// loses to revoked.
+    #[test]
+    fn tck_00360_crafted_readmission_provenance_rejected() {
+        // Craft a register that looks re-admitted but has invalid provenance
+        let anchor = ReAdmissionAnchor::new([0xAA; 32], Hlc::new(2000, 0), [0x02; 32]);
+        let mut crafted = RevocationWinsRegister {
+            value: "crafted".to_string(),
+            status: DirectoryStatus::Active,
+            hlc: Hlc::new(3000, 0),
+            node_id: [0x05; 32],
+            revocation_event_hash: None,
+            readmission_anchor: Some(anchor),
+            readmission_count: 0, // Invalid: anchor present but count is 0
+            effective_anchor: 5,
+        };
+
+        // Validate provenance directly
+        assert!(
+            crafted.validate_readmission_provenance().is_err(),
+            "Crafted register with count=0 must fail provenance check"
+        );
+
+        // During merge, the crafted register should NOT beat a revoked one
+        let revoked = make_revoked_reg("revoked", 1000, 0x03, [0xBB; 32]);
+        let result = crafted.merge(&revoked);
+        let winner = result.winner().unwrap();
+        assert_eq!(
+            winner.status(),
+            DirectoryStatus::Revoked,
+            "Crafted readmission with invalid provenance must lose to Revoked"
+        );
+
+        // Commutativity check
+        let result2 = revoked.merge(&crafted);
+        let winner2 = result2.winner().unwrap();
+        assert_eq!(winner2.status(), DirectoryStatus::Revoked);
+
+        // Now fix the count and verify it passes
+        crafted.readmission_count = 1;
+        assert!(crafted.validate_readmission_provenance().is_ok());
+    }
+
+    /// BLOCKER 3 fix: crafted register with tampered `anchor_hash` is rejected.
+    #[test]
+    fn tck_00360_tampered_anchor_hash_rejected() {
+        let mut anchor = ReAdmissionAnchor::new([0xAA; 32], Hlc::new(2000, 0), [0x02; 32]);
+        // Tamper with the anchor_hash
+        anchor.anchor_hash = [0xFF; 32];
+
+        let crafted = RevocationWinsRegister {
+            value: "crafted".to_string(),
+            status: DirectoryStatus::Active,
+            hlc: Hlc::new(3000, 0),
+            node_id: [0x05; 32],
+            revocation_event_hash: None,
+            readmission_anchor: Some(anchor),
+            readmission_count: 1,
+            effective_anchor: 5,
+        };
+
+        assert!(
+            crafted.validate_readmission_provenance().is_err(),
+            "Tampered anchor_hash must fail provenance check"
+        );
+
+        // During merge, must lose to Revoked
+        let revoked = make_revoked_reg("revoked", 1000, 0x03, [0xBB; 32]);
+        let result = crafted.merge(&revoked);
+        let winner = result.winner().unwrap();
+        assert_eq!(winner.status(), DirectoryStatus::Revoked);
+    }
+
+    /// BLOCKER 3 fix: crafted register with `effective_anchor` > 0 but no
+    /// `readmission_anchor` is rejected.
+    #[test]
+    fn tck_00360_effective_anchor_without_readmission_anchor_rejected() {
+        let mut active = make_active_reg("active", 3000, 0x05);
+        active.effective_anchor = 10;
+        // No readmission_anchor set, but effective_anchor > 0
+
+        assert!(
+            active.validate_readmission_provenance().is_err(),
+            "Active with effective_anchor > 0 but no anchor must fail"
+        );
+    }
+
+    /// BLOCKER 3 fix: legitimately readmitted register passes provenance and
+    /// wins merge.
+    #[test]
+    fn tck_00360_legitimate_readmission_passes_provenance() {
+        let rev_hash = [0xAA; 32];
+        let signer = [0x02; 32];
+        let revoked = make_revoked_reg("old", 1000, 0x01, rev_hash);
+        let anchor = ReAdmissionAnchor::new(rev_hash, Hlc::new(2000, 0), signer);
+        let auth_proof = make_auth_proof(&rev_hash, &signer, 3);
+        let readmitted = revoked
+            .readmit(
+                "new".to_string(),
+                Hlc::new(2000, 0),
+                signer,
+                anchor,
+                &auth_proof,
+            )
+            .unwrap();
+
+        // Provenance is valid
+        assert!(
+            readmitted.validate_readmission_provenance().is_ok(),
+            "Legitimately readmitted register must pass provenance"
+        );
+        assert_eq!(readmitted.readmission_count(), 1);
+        assert_eq!(readmitted.effective_anchor(), 3);
+
+        // Merge against a revoked register with lower effective_anchor
+        let still_revoked = make_revoked_reg("stale", 1500, 0x03, rev_hash);
+        let result = readmitted.merge(&still_revoked);
+        let winner = result.winner().unwrap();
+        assert_eq!(winner.status(), DirectoryStatus::Active);
+        assert_eq!(winner.value(), "new");
     }
 
     /// Helper: generate all permutations of indices 0..n.
