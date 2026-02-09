@@ -257,6 +257,8 @@ struct ProjectionError {
 #[derive(Debug, Clone, Serialize)]
 struct ProjectionStatus {
     line: String,
+    sha: String,
+    current_head_sha: String,
     security: String,
     quality: String,
     recent_events: String,
@@ -1009,6 +1011,69 @@ fn projection_state_from_sequence_verdict(verdict: Option<&str>, head_short: &st
     }
 }
 
+fn resolve_projection_sha(
+    pr_number: u32,
+    state: &ReviewStateFile,
+    events: &[serde_json::Value],
+    head_filter: Option<&str>,
+) -> String {
+    if let Some(head) = head_filter {
+        return head.to_string();
+    }
+    latest_state_head_sha(state, pr_number)
+        .or_else(|| latest_event_head_sha(events))
+        .or_else(|| latest_pulse_head_sha(pr_number))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn resolve_current_head_sha(
+    pr_number: u32,
+    state: &ReviewStateFile,
+    events: &[serde_json::Value],
+    fallback_sha: &str,
+) -> String {
+    latest_pulse_head_sha(pr_number)
+        .or_else(|| latest_state_head_sha(state, pr_number))
+        .or_else(|| latest_event_head_sha(events))
+        .unwrap_or_else(|| fallback_sha.to_string())
+}
+
+fn latest_state_head_sha(state: &ReviewStateFile, pr_number: u32) -> Option<String> {
+    state
+        .reviewers
+        .values()
+        .filter(|entry| entry_pr_number(entry).is_some_and(|value| value == pr_number))
+        .max_by_key(|entry| entry.started_at)
+        .map(|entry| entry.head_sha.clone())
+}
+
+fn latest_event_head_sha(events: &[serde_json::Value]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        event
+            .get("head_sha")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty() && *value != "-")
+            .map(ToString::to_string)
+    })
+}
+
+fn latest_pulse_head_sha(pr_number: u32) -> Option<String> {
+    let security = read_pulse_file(pr_number, "security").ok().flatten();
+    let quality = read_pulse_file(pr_number, "quality").ok().flatten();
+    match (security, quality) {
+        (Some(sec), Some(qual)) => {
+            if sec.written_at >= qual.written_at {
+                Some(sec.head_sha)
+            } else {
+                Some(qual.head_sha)
+            }
+        },
+        (Some(sec), None) => Some(sec.head_sha),
+        (None, Some(qual)) => Some(qual.head_sha),
+        (None, None) => None,
+    }
+}
+
 fn ensure_gh_cli_ready() -> Result<(), String> {
     let output = Command::new("gh")
         .args(["auth", "status"])
@@ -1039,10 +1104,12 @@ fn resolve_fac_event_context(
         serde_json::from_str(&payload_text).map_err(|err| format!("invalid event JSON: {err}"))?;
 
     match event_name {
-        "pull_request_target" => resolve_pull_request_target_context(repo, &payload),
+        "pull_request" | "pull_request_target" => {
+            resolve_pull_request_context(repo, event_name, &payload)
+        },
         "workflow_dispatch" => resolve_workflow_dispatch_context(repo, &payload),
         other => Err(format!(
-            "unsupported event_name `{other}`; expected pull_request_target or workflow_dispatch"
+            "unsupported event_name `{other}`; expected pull_request, pull_request_target, or workflow_dispatch"
         )),
     }
 }
@@ -1134,8 +1201,9 @@ fn build_barrier_decision_event(
     serde_json::Value::Object(envelope)
 }
 
-fn resolve_pull_request_target_context(
+fn resolve_pull_request_context(
     repo: &str,
+    event_name: &str,
     payload: &serde_json::Value,
 ) -> Result<FacEventContext, String> {
     let event_repo = payload
@@ -1189,7 +1257,7 @@ fn resolve_pull_request_target_context(
 
     Ok(FacEventContext {
         repo: repo.to_string(),
-        event_name: "pull_request_target".to_string(),
+        event_name: event_name.to_string(),
         pr_number,
         pr_url,
         head_sha,
@@ -1460,6 +1528,8 @@ fn run_project_inner(
         normalized_head.as_deref(),
     );
     apply_sequence_done_fallback(&events, &mut security, &mut quality);
+    let sha = resolve_projection_sha(pr_number, &state, &events, normalized_head.as_deref());
+    let current_head_sha = resolve_current_head_sha(pr_number, &state, &events, &sha);
 
     let recent_events = events
         .iter()
@@ -1534,8 +1604,10 @@ fn run_project_inner(
     }
 
     let line = format!(
-        "ts={} security={} quality={} events={}",
+        "ts={} sha={} current_head_sha={} security={} quality={} events={}",
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        sha,
+        current_head_sha,
         security,
         quality,
         recent_events
@@ -1543,6 +1615,8 @@ fn run_project_inner(
 
     Ok(ProjectionStatus {
         line,
+        sha,
+        current_head_sha,
         security,
         quality,
         recent_events,
@@ -2842,6 +2916,8 @@ fn run_status_inner(
             })
         })
         .collect::<Vec<_>>();
+    let current_head_sha =
+        filter_pr.map(|number| resolve_current_head_sha(number, &state, &filtered_events, "-"));
 
     if json_output {
         let payload = serde_json::json!({
@@ -2849,6 +2925,7 @@ fn run_status_inner(
             "recent_events": filtered_events,
             "pulse_security": pulse_security,
             "pulse_quality": pulse_quality,
+            "current_head_sha": current_head_sha,
         });
         println!(
             "{}",
@@ -2861,6 +2938,10 @@ fn run_status_inner(
     println!("FAC Review Status");
     if let Some(number) = filter_pr {
         println!("  Filter PR: #{number}");
+        println!(
+            "  Current Head SHA: {}",
+            current_head_sha.as_deref().unwrap_or("-")
+        );
     }
     if filtered_state.is_empty() {
         println!("  Active Runs: none");
@@ -2868,7 +2949,7 @@ fn run_status_inner(
         println!("  Active Runs:");
         for entry in filtered_state {
             println!(
-                "    - {} | pid={} alive={} model={} backend={} sha={} restarts={}",
+                "    - {} | pid={} alive={} model={} backend={} reviewed_sha={} restarts={}",
                 entry["review_type"].as_str().unwrap_or("unknown"),
                 entry["pid"].as_u64().unwrap_or(0),
                 entry["alive"].as_bool().unwrap_or(false),
@@ -2886,7 +2967,7 @@ fn run_status_inner(
     } else {
         for event in filtered_events.iter().rev().take(20).rev() {
             println!(
-                "    [{}] {} {} pr=#{} sha={}",
+                "    [{}] {} {} pr=#{} event_sha={}",
                 event["ts"].as_str().unwrap_or("-"),
                 event["event"].as_str().unwrap_or("-"),
                 event["review_type"].as_str().unwrap_or("-"),

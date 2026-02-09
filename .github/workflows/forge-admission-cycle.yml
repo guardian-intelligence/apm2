@@ -1,7 +1,9 @@
 name: Forge Admission Cycle
 
 on:
-  pull_request_target:
+  # TEMPORARY WAIVER (WVR-0006, expires 2026-03-11):
+  # Run FAC from pull_request while a full FAC security hardening audit is deferred.
+  pull_request:
     branches: [main]
     types: [opened, reopened, synchronize, ready_for_review]
   workflow_dispatch:
@@ -12,7 +14,7 @@ on:
         type: string
 
 concurrency:
-  group: forge-admission-cycle-${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || github.event.inputs.pr_number || github.run_id }}
+  group: forge-admission-cycle-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event.inputs.pr_number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -53,17 +55,17 @@ jobs:
           actor="$GITHUB_ACTOR"
 
           case "$event_name" in
-            pull_request_target)
+            pull_request)
               pr_number="$(jq -r '.pull_request.number // 0' "$GITHUB_EVENT_PATH")"
               association="$(jq -r '.pull_request.author_association // ""' "$GITHUB_EVENT_PATH")"
               [[ "$pr_number" != "0" ]] || fail "missing pull_request.number in event payload"
               case "$association" in
                 OWNER|MEMBER|COLLABORATOR) ;;
                 *)
-                  fail "unauthorized pull_request_target author_association=$association for PR #$pr_number"
+                  fail "unauthorized pull_request author_association=$association for PR #$pr_number"
                   ;;
               esac
-              echo "barrier: authorized pull_request_target pr=$pr_number association=$association"
+              echo "barrier: authorized pull_request pr=$pr_number association=$association"
               ;;
             workflow_dispatch)
               pr_number="$(jq -r '.inputs.pr_number // .client_payload.pr_number // empty' "$GITHUB_EVENT_PATH")"
