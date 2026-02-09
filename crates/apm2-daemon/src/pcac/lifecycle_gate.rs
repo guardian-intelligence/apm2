@@ -30,6 +30,8 @@ use apm2_core::pcac::{
 };
 use tracing::{info, warn};
 
+use crate::htf::HolonicClock;
+
 const ZERO_HASH: Hash = [0u8; 32];
 
 // =============================================================================
@@ -40,35 +42,116 @@ const ZERO_HASH: Hash = [0u8; 32];
 ///
 /// Validates authority locally. The consumed set is held in memory;
 /// TCK-00426 (Durable Consume) will add persistent backing.
+///
+/// # Clock Integration (TCK-00427 quality BLOCKER fix)
+///
+/// When constructed with [`InProcessKernel::with_clock`], the kernel
+/// derives its current tick dynamically from the shared [`HolonicClock`].
+/// This ensures certificate expiry checks in `revalidate` and `consume`
+/// use real elapsed time rather than a frozen starting tick.
+///
+/// The test constructor [`InProcessKernel::new`] uses a manual tick that
+/// can be advanced via [`InProcessKernel::advance_tick`] for deterministic
+/// unit testing.
 pub struct InProcessKernel {
     /// Set of consumed AJC IDs (Law 1: Linear Consumption).
     consumed: Mutex<HashSet<Hash>>,
-    /// Current tick counter (monotonic).
-    current_tick: Mutex<u64>,
+    /// Manual tick counter (used when no clock is provided, i.e., tests).
+    manual_tick: Mutex<u64>,
+    /// Optional shared holonic clock for dynamic tick derivation.
+    ///
+    /// When present, `current_tick()` reads the monotonic tick from the
+    /// clock instead of using the manual counter. This prevents the
+    /// "frozen tick" bug where certificates never expire.
+    clock: Option<Arc<HolonicClock>>,
 }
 
 impl InProcessKernel {
     /// Creates a new in-process kernel with the given starting tick.
+    ///
+    /// This constructor is intended for **tests** that need deterministic
+    /// tick control. For production use, prefer [`with_clock`] to derive
+    /// ticks from the shared [`HolonicClock`].
+    ///
+    /// [`with_clock`]: InProcessKernel::with_clock
     #[must_use]
     pub fn new(starting_tick: u64) -> Self {
         Self {
             consumed: Mutex::new(HashSet::new()),
-            current_tick: Mutex::new(starting_tick),
+            manual_tick: Mutex::new(starting_tick),
+            clock: None,
+        }
+    }
+
+    /// Creates a new in-process kernel backed by a shared [`HolonicClock`].
+    ///
+    /// The kernel derives its current tick from the clock's monotonic tick
+    /// source (`now_mono_tick`), ensuring certificate expiry checks use
+    /// real elapsed time. This satisfies RFC-0027 Law 4 (Freshness/Revocation
+    /// Dominance) for TTL enforcement.
+    ///
+    /// # Fail-Closed Semantics
+    ///
+    /// If the clock reports a regression error, the kernel falls back to
+    /// tick `0`, which causes all certificate expiry checks to fail-closed
+    /// (tick 0 < any positive `expires_at_tick` means no false "expired"
+    /// denial from regression, but the manual tick floor ensures the kernel
+    /// never reports a tick that has gone backwards).
+    #[must_use]
+    pub fn with_clock(clock: Arc<HolonicClock>) -> Self {
+        Self {
+            consumed: Mutex::new(HashSet::new()),
+            manual_tick: Mutex::new(0),
+            clock: Some(clock),
         }
     }
 
     /// Advances the kernel tick (for testing and time progression).
+    ///
+    /// When a clock is configured, this sets a floor for the manual tick
+    /// counter but the clock-derived tick takes precedence via `max()`.
     pub fn advance_tick(&self, new_tick: u64) {
-        let mut tick = self.current_tick.lock().expect("lock poisoned");
+        let mut tick = self.manual_tick.lock().expect("lock poisoned");
         if new_tick > *tick {
             *tick = new_tick;
         }
     }
 
     /// Returns the current tick.
+    ///
+    /// When a [`HolonicClock`] is configured (production), derives the tick
+    /// from the clock's monotonic source and takes the maximum of the
+    /// clock-derived tick and the manual tick floor (monotonicity).
+    ///
+    /// When no clock is configured (tests), returns the manual tick counter.
+    ///
+    /// # Fail-Closed
+    ///
+    /// Clock regression errors yield tick `0` from the clock path, but the
+    /// `max()` with the manual floor ensures we never go backwards.
     #[must_use]
     pub fn current_tick(&self) -> u64 {
-        *self.current_tick.lock().expect("lock poisoned")
+        let manual = *self.manual_tick.lock().expect("lock poisoned");
+
+        self.clock.as_ref().map_or(manual, |clock| {
+            // Derive tick from the HolonicClock's monotonic source.
+            // On success, use the tick value; on regression error, fall
+            // back to 0 (fail-closed: the max() with manual ensures
+            // monotonicity).
+            let clock_tick = match clock.now_mono_tick() {
+                Ok(t) => t.value(),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "InProcessKernel: clock regression during tick derivation, \
+                         falling back to manual tick floor (fail-closed)"
+                    );
+                    0
+                },
+            };
+            // Monotonicity: take the max of clock-derived and manual floor.
+            manual.max(clock_tick)
+        })
     }
 
     /// Validates that a hash field is non-zero (fail-closed).

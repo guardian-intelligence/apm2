@@ -1713,3 +1713,102 @@ fn kernel_zero_anchor_denies_have_positive_tick() {
         "deny for zero as_of_ledger_anchor must have positive tick"
     );
 }
+
+// =============================================================================
+// TCK-00427 quality BLOCKER: Clock-backed kernel tick derivation
+// =============================================================================
+
+/// Proves that `InProcessKernel::with_clock` derives its tick from the
+/// provided `HolonicClock` rather than remaining frozen. After a short
+/// sleep, the clock-derived tick must advance beyond zero, confirming that
+/// certificate expiry checks will use real elapsed time.
+#[test]
+fn clock_backed_kernel_tick_advances() {
+    use crate::htf::{ClockConfig, HolonicClock};
+
+    let clock =
+        Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock creation failed"));
+    let kernel = InProcessKernel::with_clock(Arc::clone(&clock));
+
+    // The clock's monotonic source starts from an Instant epoch. After
+    // construction, now_mono_tick() should already be > 0 (or at least 0
+    // for a very fast machine). Sleep briefly to guarantee advancement.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    let tick = kernel.current_tick();
+    assert!(
+        tick > 0,
+        "clock-backed kernel tick must advance beyond 0 after 10ms sleep, got: {tick}"
+    );
+}
+
+/// Proves that a certificate issued by a clock-backed kernel will expire
+/// as real time passes (the kernel tick advances beyond `expires_at_tick`),
+/// unlike the old frozen-tick kernel where certificates never expired.
+/// This validates RFC-0027 Law 4 (Freshness Dominance) for TTL enforcement.
+#[test]
+fn clock_backed_kernel_certificates_can_expire() {
+    use apm2_core::pcac::AuthorityJoinKernel;
+
+    use crate::htf::{ClockConfig, HolonicClock};
+
+    let clock =
+        Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock creation failed"));
+    let kernel = InProcessKernel::with_clock(Arc::clone(&clock));
+
+    let input = valid_input();
+    let cert = kernel.join(&input).expect("join should succeed");
+
+    // At the default 1 GHz tick rate, the 300-tick TTL expires in ~300ns.
+    // After even a brief sleep, the kernel tick will have far exceeded the
+    // certificate's expires_at_tick, causing revalidation to fail.
+    std::thread::sleep(std::time::Duration::from_millis(1));
+
+    let current = kernel.current_tick();
+    assert!(
+        current > cert.expires_at_tick,
+        "clock-backed kernel tick ({current}) must exceed certificate \
+         expires_at_tick ({}) after 1ms sleep (proves TTL is enforced)",
+        cert.expires_at_tick,
+    );
+
+    // Revalidation must now fail with CertificateExpired.
+    let err = kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            cert.revocation_head_hash,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.deny_class,
+            apm2_core::pcac::AuthorityDenyClass::CertificateExpired { .. }
+        ),
+        "clock-backed kernel must deny expired certificate on revalidate, got: {:?}",
+        err.deny_class
+    );
+}
+
+/// Proves that `advance_tick` on a clock-backed kernel sets a floor that
+/// the clock-derived tick must exceed. This ensures monotonicity: the
+/// kernel never reports a tick lower than previously observed.
+#[test]
+fn clock_backed_kernel_advance_tick_sets_floor() {
+    use crate::htf::{ClockConfig, HolonicClock};
+
+    let clock =
+        Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock creation failed"));
+    let kernel = InProcessKernel::with_clock(Arc::clone(&clock));
+
+    // Set a very high manual floor.
+    let high_floor = u64::MAX / 2;
+    kernel.advance_tick(high_floor);
+
+    let tick = kernel.current_tick();
+    assert!(
+        tick >= high_floor,
+        "clock-backed kernel tick ({tick}) must be >= manual floor ({high_floor})"
+    );
+}

@@ -806,6 +806,13 @@ impl DispatcherState {
         // Capture the verifying key bytes for sovereignty checker wiring.
         let sovereignty_trusted_signer_key = daemon_signing_key.verifying_key().to_bytes();
 
+        // TCK-00427 quality BLOCKER fix: Hoist clock creation before the
+        // privileged dispatcher branch so it can be shared with the PCAC
+        // kernel via `InProcessKernel::with_clock`. This ensures certificate
+        // expiry checks use real elapsed time (RFC-0027 Law 4).
+        let clock =
+            Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock failed"));
+
         let privileged_dispatcher = if let Some(conn) = sqlite_conn {
             // Use real implementations
             // Security Review v5 MAJOR 2: Reuse the daemon-lifecycle signing key
@@ -864,8 +871,6 @@ impl DispatcherState {
                 .with_session_registry(session_registry_for_runtime);
 
             let episode_runtime = Arc::new(episode_runtime);
-            let clock =
-                Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock failed"));
 
             // TCK-00399: Create adapter registry so SpawnEpisode can spawn
             // adapter processes (fail-closed: registry is required).
@@ -900,7 +905,7 @@ impl DispatcherState {
                 episode_runtime,
                 session_registry,
                 lease_validator,
-                clock,
+                Arc::clone(&clock),
                 token_minter.clone(),
                 manifest_store.clone(),
                 // TCK-00317: Pre-seed CAS with reviewer v0 manifest
@@ -927,15 +932,11 @@ impl DispatcherState {
             )
         } else {
             // Use stubs
-            let clock = Arc::new(
-                HolonicClock::new(ClockConfig::default(), None)
-                    .expect("failed to create default clock"),
-            );
             PrivilegedDispatcher::with_shared_state(
                 token_minter.clone(),
                 manifest_store.clone(),
                 session_registry,
-                clock,
+                Arc::clone(&clock),
                 Arc::clone(&subscription_registry),
             )
         }
@@ -992,7 +993,9 @@ impl DispatcherState {
         // TCK-00427 security review BLOCKER 1: Wire StopAuthority into the
         // lifecycle gate so sovereignty freeze recommendations are actuated
         // to persistent runtime stop controls.
-        let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+        // TCK-00427 quality BLOCKER fix: Use clock-backed kernel so
+        // certificate expiry checks use real elapsed time (Law 4).
+        let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::with_clock(Arc::clone(&clock)));
         // TCK-00427 quality BLOCKER fix: Use the daemon's signing key
         // verifying key as the trusted sovereignty signer (instead of
         // hardcoded [0u8; 32]). This ensures valid signed epochs can
@@ -1351,7 +1354,9 @@ impl DispatcherState {
         // TCK-00427 security review BLOCKER 1: Wire StopAuthority into the
         // lifecycle gate so sovereignty freeze recommendations are actuated
         // to persistent runtime stop controls.
-        let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+        // TCK-00427 quality BLOCKER fix: Use clock-backed kernel so
+        // certificate expiry checks use real elapsed time (Law 4).
+        let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::with_clock(Arc::clone(&clock)));
         // TCK-00427 quality BLOCKER fix: Use daemon's signing key verifying
         // key as sovereignty trusted signer (not hardcoded zeros).
         let sovereignty_checker =
