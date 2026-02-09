@@ -617,8 +617,10 @@ pub struct AuthorityConsumedV1 {
 ///
 /// Signatures are Ed25519 signatures over a domain-separated message:
 /// `b"apm2-sovereignty-epoch-v1" || epoch_id || freshness_tick`.
-/// The signature field stores raw 64-byte signature bytes. Zero signatures and
-/// verification failures both produce `SovereigntyUncertainty` denials.
+/// The signature field stores raw 64-byte signature bytes.
+///
+/// Runtime validators MUST also bind `signer_public_key` to a trusted
+/// authority key source. A signer/key mismatch is fail-closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SovereigntyEpoch {
     /// Unique epoch identifier.

@@ -489,15 +489,14 @@ pub struct DispatcherState {
 }
 
 impl DispatcherState {
-    /// Builds a bootstrap sovereignty state for production dispatcher wiring.
-    ///
-    /// TODO(TCK-00427): replace this bootstrap state with a live sovereignty
-    /// provider backed by authenticated epoch/revocation sources.
+    /// Builds a bootstrap sovereignty state for test-only wiring.
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn bootstrap_sovereignty_state() -> Arc<crate::pcac::SovereigntyState> {
         let signing_key_seed = *blake3::hash(uuid::Uuid::new_v4().as_bytes()).as_bytes();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&signing_key_seed);
-        // Use max tick to avoid immediate staleness until a live provider is
-        // wired. Verification remains fail-closed if state is absent.
+        // Use max tick to avoid immediate staleness in tests that are not
+        // asserting epoch freshness behavior.
         let freshness_tick = u64::MAX;
         let epoch_id = "bootstrap-sovereignty-epoch-v1";
         let signature =
@@ -976,8 +975,7 @@ impl DispatcherState {
         // checker into production dispatcher so the gate is active in real
         // daemon paths (not just tests).
         let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
-        let sovereignty_checker = crate::pcac::SovereigntyChecker::new();
-        let sovereignty_state = Self::bootstrap_sovereignty_state();
+        let sovereignty_checker = crate::pcac::SovereigntyChecker::new([0u8; 32]);
         let pcac_gate = Arc::new(crate::pcac::LifecycleGate::with_sovereignty_checker(
             pcac_kernel,
             sovereignty_checker,
@@ -992,8 +990,7 @@ impl DispatcherState {
                 .with_stop_authority(Arc::clone(&stop_authority))
                 .with_stop_conditions_store(stop_conditions_store)
                 .with_v1_manifest_store(v1_manifest_store)
-                .with_pcac_lifecycle_gate(pcac_gate)
-                .with_sovereignty_state(sovereignty_state);
+                .with_pcac_lifecycle_gate(pcac_gate);
 
         Ok(Self {
             privileged_dispatcher,
@@ -1321,8 +1318,7 @@ impl DispatcherState {
         // checker into production dispatcher so the gate is active in real
         // daemon paths (not just tests).
         let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
-        let sovereignty_checker = crate::pcac::SovereigntyChecker::new();
-        let sovereignty_state = Self::bootstrap_sovereignty_state();
+        let sovereignty_checker = crate::pcac::SovereigntyChecker::new([0u8; 32]);
         let pcac_gate = Arc::new(crate::pcac::LifecycleGate::with_sovereignty_checker(
             pcac_kernel,
             sovereignty_checker,
@@ -1342,8 +1338,7 @@ impl DispatcherState {
                 .with_stop_authority(Arc::clone(&stop_authority))
                 .with_stop_conditions_store(stop_conditions_store)
                 .with_v1_manifest_store(v1_manifest_store)
-                .with_pcac_lifecycle_gate(pcac_gate)
-                .with_sovereignty_state(sovereignty_state);
+                .with_pcac_lifecycle_gate(pcac_gate);
 
         Ok(Self {
             privileged_dispatcher,
@@ -2196,7 +2191,7 @@ mod tests {
     }
 
     #[test]
-    fn production_constructor_wires_sovereignty_state() {
+    fn production_constructor_leaves_sovereignty_state_unset() {
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
         let state = DispatcherState::with_persistence(session_registry, None, None, None)
             .expect("test dispatcher state initialization must succeed");
@@ -2205,13 +2200,13 @@ mod tests {
             state
                 .session_dispatcher()
                 .sovereignty_state_for_test()
-                .is_some(),
-            "production constructor must wire sovereignty state for Tier2+ PCAC checks"
+                .is_none(),
+            "production constructor must not synthesize sovereignty state"
         );
     }
 
     #[test]
-    fn persistent_constructor_wires_sovereignty_state() {
+    fn persistent_constructor_leaves_sovereignty_state_unset() {
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
         let conn = Connection::open_in_memory().expect("sqlite in-memory should open");
         SqliteLedgerEventEmitter::init_schema(&conn).expect("ledger schema init should succeed");
@@ -2243,8 +2238,8 @@ mod tests {
             state
                 .session_dispatcher()
                 .sovereignty_state_for_test()
-                .is_some(),
-            "persistent constructor must wire sovereignty state for Tier2+ PCAC checks"
+                .is_none(),
+            "persistent constructor must not synthesize sovereignty state"
         );
     }
 

@@ -19,6 +19,23 @@ fn zero_hash() -> Hash {
     [0u8; 32]
 }
 
+fn trusted_signer_key() -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(&[0xCC; 32])
+        .verifying_key()
+        .to_bytes()
+}
+
+fn checker() -> super::sovereignty::SovereigntyChecker {
+    super::sovereignty::SovereigntyChecker::new(trusted_signer_key())
+}
+
+fn checker_with_staleness_threshold(threshold: u64) -> super::sovereignty::SovereigntyChecker {
+    super::sovereignty::SovereigntyChecker::with_staleness_threshold(
+        trusted_signer_key(),
+        threshold,
+    )
+}
+
 /// Builds a `SovereigntyEpoch` with a valid Ed25519 signature.
 fn signed_epoch(
     epoch_id: &str,
@@ -490,10 +507,10 @@ fn pre_actuation_receipt_binding() {
 fn lifecycle_gate_with_sovereignty_passes_tier2_valid_state() {
     use apm2_core::pcac::{AutonomyCeiling, FreezeAction};
 
-    use super::sovereignty::{SovereigntyChecker, SovereigntyState};
+    use super::sovereignty::SovereigntyState;
 
     let kernel = Arc::new(InProcessKernel::new(100));
-    let checker = SovereigntyChecker::new();
+    let checker = checker();
     let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
 
     let mut input = valid_input();
@@ -528,10 +545,10 @@ fn lifecycle_gate_with_sovereignty_passes_tier2_valid_state() {
 fn lifecycle_gate_with_sovereignty_denies_tier2_stale_epoch() {
     use apm2_core::pcac::{AutonomyCeiling, FreezeAction};
 
-    use super::sovereignty::{SovereigntyChecker, SovereigntyState};
+    use super::sovereignty::SovereigntyState;
 
     let kernel = Arc::new(InProcessKernel::new(100));
-    let checker = SovereigntyChecker::with_staleness_threshold(50);
+    let checker = checker_with_staleness_threshold(50);
     let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
 
     let mut input = valid_input();
@@ -576,10 +593,10 @@ fn lifecycle_gate_with_sovereignty_denies_tier2_stale_epoch() {
 fn lifecycle_gate_with_sovereignty_denies_tier2_frozen() {
     use apm2_core::pcac::{AutonomyCeiling, FreezeAction};
 
-    use super::sovereignty::{SovereigntyChecker, SovereigntyState};
+    use super::sovereignty::SovereigntyState;
 
     let kernel = Arc::new(InProcessKernel::new(100));
-    let checker = SovereigntyChecker::new();
+    let checker = checker();
     let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
 
     let mut input = valid_input();
@@ -619,10 +636,10 @@ fn lifecycle_gate_with_sovereignty_denies_tier2_frozen() {
 fn lifecycle_gate_with_sovereignty_tier1_bypasses_bad_state() {
     use apm2_core::pcac::FreezeAction;
 
-    use super::sovereignty::{SovereigntyChecker, SovereigntyState};
+    use super::sovereignty::SovereigntyState;
 
     let kernel = Arc::new(InProcessKernel::new(100));
-    let checker = SovereigntyChecker::new();
+    let checker = checker();
     let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
 
     let input = valid_input(); // risk_tier is Tier1
@@ -657,10 +674,8 @@ fn lifecycle_gate_with_sovereignty_tier1_bypasses_bad_state() {
 fn lifecycle_gate_without_sovereignty_state_denies_tier2() {
     use apm2_core::pcac::FreezeAction;
 
-    use super::sovereignty::SovereigntyChecker;
-
     let kernel = Arc::new(InProcessKernel::new(100));
-    let checker = SovereigntyChecker::new();
+    let checker = checker();
     let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
 
     let mut input = valid_input();
@@ -697,10 +712,8 @@ fn lifecycle_gate_without_sovereignty_state_denies_tier2() {
 /// Tier1, the gate should pass (sovereignty checks only apply to Tier2+).
 #[test]
 fn lifecycle_gate_without_sovereignty_state_passes_tier1() {
-    use super::sovereignty::SovereigntyChecker;
-
     let kernel = Arc::new(InProcessKernel::new(100));
-    let checker = SovereigntyChecker::new();
+    let checker = checker();
     let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
 
     let input = valid_input(); // risk_tier is Tier1
@@ -724,10 +737,10 @@ fn lifecycle_gate_without_sovereignty_state_passes_tier1() {
 fn lifecycle_gate_with_sovereignty_denies_incompatible_ceiling() {
     use apm2_core::pcac::{AutonomyCeiling, FreezeAction};
 
-    use super::sovereignty::{SovereigntyChecker, SovereigntyState};
+    use super::sovereignty::SovereigntyState;
 
     let kernel = Arc::new(InProcessKernel::new(100));
-    let checker = SovereigntyChecker::new();
+    let checker = checker();
     let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
 
     let mut input = valid_input();
@@ -773,10 +786,10 @@ fn lifecycle_gate_with_sovereignty_denies_incompatible_ceiling() {
 fn lifecycle_gate_sovereignty_uncertainty_carries_freeze_signal() {
     use apm2_core::pcac::{AutonomyCeiling, FreezeAction};
 
-    use super::sovereignty::{SovereigntyChecker, SovereigntyState};
+    use super::sovereignty::SovereigntyState;
 
     let kernel = Arc::new(InProcessKernel::new(100));
-    let checker = SovereigntyChecker::new();
+    let checker = checker();
     let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
 
     let mut input = valid_input();
@@ -1006,10 +1019,10 @@ fn consume_denies_expired_certificate() {
 fn sovereignty_consume_failure_does_not_mark_consumed() {
     use apm2_core::pcac::{AutonomyCeiling, FreezeAction};
 
-    use super::sovereignty::{SovereigntyChecker, SovereigntyState};
+    use super::sovereignty::SovereigntyState;
 
     let kernel = Arc::new(InProcessKernel::new(100));
-    let checker = SovereigntyChecker::new();
+    let checker = checker();
     let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
 
     let mut input = valid_input();
@@ -1082,10 +1095,10 @@ fn sovereignty_consume_failure_does_not_mark_consumed() {
 fn epoch_with_invalid_signature_denied() {
     use apm2_core::pcac::{AutonomyCeiling, FreezeAction, SovereigntyEpoch};
 
-    use super::sovereignty::{SovereigntyChecker, SovereigntyState};
+    use super::sovereignty::SovereigntyState;
 
     let kernel = Arc::new(InProcessKernel::new(100));
-    let checker = SovereigntyChecker::new();
+    let checker = checker();
     let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
 
     let mut input = valid_input();
@@ -1127,6 +1140,57 @@ fn epoch_with_invalid_signature_denied() {
                 if reason.contains("signature verification failed")
         ),
         "expected SovereigntyUncertainty (signature failed), got: {:?}",
+        err.deny_class
+    );
+}
+
+#[test]
+fn epoch_with_untrusted_signer_denied() {
+    use apm2_core::pcac::{AutonomyCeiling, FreezeAction};
+
+    use super::sovereignty::SovereigntyState;
+
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let checker = checker();
+    let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
+
+    let mut input = valid_input();
+    input.risk_tier = RiskTier::Tier2Plus;
+
+    let untrusted_signer_key = ed25519_dalek::SigningKey::from_bytes(&[0xDD; 32])
+        .verifying_key()
+        .to_bytes();
+    let sov_state = SovereigntyState {
+        epoch: Some(signed_epoch("epoch-untrusted", 100, 0xDD)),
+        principal_id: "principal-001".to_string(),
+        revocation_head_known: true,
+        autonomy_ceiling: Some(AutonomyCeiling {
+            max_risk_tier: RiskTier::Tier2Plus,
+            policy_binding_hash: test_hash(0xDD),
+        }),
+        active_freeze: FreezeAction::NoAction,
+    };
+
+    let err = gate
+        .execute_with_sovereignty(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+            Some(&sov_state),
+            100,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.deny_class,
+            AuthorityDenyClass::UntrustedSovereigntySigner {
+                expected_signer_key,
+                actual_signer_key,
+            } if expected_signer_key == trusted_signer_key()
+                && actual_signer_key == untrusted_signer_key
+        ),
+        "expected UntrustedSovereigntySigner, got: {:?}",
         err.deny_class
     );
 }

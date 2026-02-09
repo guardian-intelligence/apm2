@@ -20,6 +20,7 @@ use apm2_core::pcac::{
     RiskTier, SovereigntyEpoch,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use subtle::ConstantTimeEq;
 
 const ZERO_HASH: Hash = [0u8; 32];
 const ZERO_SIGNATURE: [u8; 64] = [0u8; 64];
@@ -56,23 +57,29 @@ pub struct SovereigntyState {
 /// All checks are fail-closed: missing or ambiguous state produces a denial.
 /// Tier0/1 operations (identified by `cert.risk_tier`) bypass all checks.
 pub struct SovereigntyChecker {
+    /// Trusted sovereignty authority signer public key (Ed25519).
+    trusted_signer_key: [u8; 32],
     /// Staleness threshold for epoch freshness checks.
     epoch_staleness_threshold: u64,
 }
 
 impl SovereigntyChecker {
-    /// Creates a new sovereignty checker with default thresholds.
+    /// Creates a new sovereignty checker with a trusted signer key and
+    /// default thresholds.
     #[must_use]
-    pub const fn new() -> Self {
+    pub const fn new(trusted_signer_key: [u8; 32]) -> Self {
         Self {
+            trusted_signer_key,
             epoch_staleness_threshold: DEFAULT_EPOCH_STALENESS_THRESHOLD,
         }
     }
 
-    /// Creates a new sovereignty checker with a custom staleness threshold.
+    /// Creates a new sovereignty checker with a trusted signer key and custom
+    /// staleness threshold.
     #[must_use]
-    pub const fn with_staleness_threshold(threshold: u64) -> Self {
+    pub const fn with_staleness_threshold(trusted_signer_key: [u8; 32], threshold: u64) -> Self {
         Self {
+            trusted_signer_key,
             epoch_staleness_threshold: threshold,
         }
     }
@@ -277,6 +284,27 @@ impl SovereigntyChecker {
             }));
         }
 
+        // Fail-closed: signer key embedded in the epoch MUST match the trusted
+        // sovereignty authority key configured for this checker.
+        if epoch
+            .signer_public_key
+            .ct_eq(&self.trusted_signer_key)
+            .unwrap_u8()
+            == 0
+        {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: AuthorityDenyClass::UntrustedSovereigntySigner {
+                    expected_signer_key: self.trusted_signer_key,
+                    actual_signer_key: epoch.signer_public_key,
+                },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: current_ledger_anchor,
+                denied_at_tick: current_tick,
+                containment_action: Some(FreezeAction::HardFreeze),
+            }));
+        }
+
         // Verify Ed25519 signature over domain-separated message.
         let Ok(verifying_key) = VerifyingKey::from_bytes(&epoch.signer_public_key) else {
             return Err(Box::new(AuthorityDenyV1 {
@@ -422,7 +450,7 @@ impl SovereigntyChecker {
 
 impl Default for SovereigntyChecker {
     fn default() -> Self {
-        Self::new()
+        Self::new(ZERO_HASH)
     }
 }
 
@@ -456,6 +484,20 @@ mod tests {
 
     fn signing_key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    const TRUSTED_SIGNER_SEED: u8 = 0xCC;
+
+    fn trusted_signer_key() -> [u8; 32] {
+        signing_key(TRUSTED_SIGNER_SEED).verifying_key().to_bytes()
+    }
+
+    fn checker() -> SovereigntyChecker {
+        SovereigntyChecker::new(trusted_signer_key())
+    }
+
+    fn checker_with_staleness_threshold(threshold: u64) -> SovereigntyChecker {
+        SovereigntyChecker::with_staleness_threshold(trusted_signer_key(), threshold)
     }
 
     fn tier2_cert() -> AuthorityJoinCertificateV1 {
@@ -492,7 +534,7 @@ mod tests {
 
     fn valid_sovereignty_state() -> SovereigntyState {
         SovereigntyState {
-            epoch: Some(signed_epoch("epoch-001", 100, 0xCC)),
+            epoch: Some(signed_epoch("epoch-001", 100, TRUSTED_SIGNER_SEED)),
             principal_id: "principal-001".to_string(),
             revocation_head_known: true,
             autonomy_ceiling: Some(AutonomyCeiling {
@@ -509,7 +551,7 @@ mod tests {
 
     #[test]
     fn tier1_bypasses_revalidate_sovereignty_checks() {
-        let checker = SovereigntyChecker::new();
+        let checker = checker();
         let cert = tier1_cert();
         // Even with completely invalid sovereignty state, Tier1 passes.
         let state = SovereigntyState {
@@ -526,7 +568,7 @@ mod tests {
 
     #[test]
     fn tier1_bypasses_consume_sovereignty_checks() {
-        let checker = SovereigntyChecker::new();
+        let checker = checker();
         let cert = tier1_cert();
         let state = SovereigntyState {
             epoch: None,
@@ -546,7 +588,7 @@ mod tests {
 
     #[test]
     fn stale_sovereignty_epoch_denied_on_revalidate() {
-        let checker = SovereigntyChecker::with_staleness_threshold(50);
+        let checker = checker_with_staleness_threshold(50);
         let cert = tier2_cert();
         let state = valid_sovereignty_state();
 
@@ -570,7 +612,7 @@ mod tests {
 
     #[test]
     fn stale_sovereignty_epoch_denied_on_consume() {
-        let checker = SovereigntyChecker::with_staleness_threshold(50);
+        let checker = checker_with_staleness_threshold(50);
         let cert = tier2_cert();
         let state = valid_sovereignty_state();
 
@@ -585,7 +627,7 @@ mod tests {
 
     #[test]
     fn fresh_epoch_passes() {
-        let checker = SovereigntyChecker::with_staleness_threshold(100);
+        let checker = checker_with_staleness_threshold(100);
         let cert = tier2_cert();
         let state = valid_sovereignty_state();
 
@@ -600,7 +642,7 @@ mod tests {
 
     #[test]
     fn unknown_revocation_head_denied_on_revalidate() {
-        let checker = SovereigntyChecker::new();
+        let checker = checker();
         let cert = tier2_cert();
         let mut state = valid_sovereignty_state();
         state.revocation_head_known = false;
@@ -626,7 +668,7 @@ mod tests {
 
     #[test]
     fn unknown_revocation_head_denied_on_consume() {
-        let checker = SovereigntyChecker::new();
+        let checker = checker();
         let cert = tier2_cert();
         let mut state = valid_sovereignty_state();
         state.revocation_head_known = false;
@@ -646,7 +688,7 @@ mod tests {
 
     #[test]
     fn incompatible_autonomy_ceiling_denied_on_consume() {
-        let checker = SovereigntyChecker::new();
+        let checker = checker();
         let cert = tier2_cert(); // requests Tier2Plus
         let mut state = valid_sovereignty_state();
         // Set ceiling to Tier1 -- Tier2Plus > Tier1, so denied.
@@ -673,7 +715,7 @@ mod tests {
 
     #[test]
     fn compatible_autonomy_ceiling_passes() {
-        let checker = SovereigntyChecker::new();
+        let checker = checker();
         let cert = tier2_cert(); // Tier2Plus
         let state = valid_sovereignty_state(); // ceiling is Tier2Plus
 
@@ -683,7 +725,7 @@ mod tests {
 
     #[test]
     fn missing_autonomy_ceiling_denied_on_consume() {
-        let checker = SovereigntyChecker::new();
+        let checker = checker();
         let cert = tier2_cert();
         let mut state = valid_sovereignty_state();
         state.autonomy_ceiling = None;
@@ -703,7 +745,7 @@ mod tests {
 
     #[test]
     fn active_soft_freeze_denied() {
-        let checker = SovereigntyChecker::new();
+        let checker = checker();
         let cert = tier2_cert();
         let mut state = valid_sovereignty_state();
         state.active_freeze = FreezeAction::SoftFreeze;
@@ -721,7 +763,7 @@ mod tests {
 
     #[test]
     fn active_hard_freeze_denied() {
-        let checker = SovereigntyChecker::new();
+        let checker = checker();
         let cert = tier2_cert();
         let mut state = valid_sovereignty_state();
         state.active_freeze = FreezeAction::HardFreeze;
@@ -739,7 +781,7 @@ mod tests {
 
     #[test]
     fn no_freeze_passes() {
-        let checker = SovereigntyChecker::new();
+        let checker = checker();
         let cert = tier2_cert();
         let state = valid_sovereignty_state(); // NoAction
 
@@ -807,7 +849,7 @@ mod tests {
 
     #[test]
     fn missing_epoch_denied_as_uncertainty() {
-        let checker = SovereigntyChecker::new();
+        let checker = checker();
         let cert = tier2_cert();
         let mut state = valid_sovereignty_state();
         state.epoch = None;
@@ -833,7 +875,7 @@ mod tests {
 
     #[test]
     fn zero_signature_epoch_denied_as_uncertainty() {
-        let checker = SovereigntyChecker::new();
+        let checker = checker();
         let cert = tier2_cert();
         let mut state = valid_sovereignty_state();
         state.epoch = Some(SovereigntyEpoch {
@@ -852,13 +894,38 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn untrusted_signer_epoch_denied() {
+        let checker = checker();
+        let cert = tier2_cert();
+        let mut state = valid_sovereignty_state();
+        let untrusted_key = signing_key(0xDD).verifying_key().to_bytes();
+        state.epoch = Some(signed_epoch("epoch-untrusted", 100, 0xDD));
+
+        let err = checker
+            .check_revalidate(&cert, &state, 110, test_hash(0x07), test_hash(0x08))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.deny_class,
+                AuthorityDenyClass::UntrustedSovereigntySigner {
+                    expected_signer_key,
+                    actual_signer_key,
+                } if expected_signer_key == trusted_signer_key()
+                    && actual_signer_key == untrusted_key
+            ),
+            "expected UntrustedSovereigntySigner, got: {:?}",
+            err.deny_class
+        );
+    }
+
     // =========================================================================
     // Full lifecycle integration
     // =========================================================================
 
     #[test]
     fn valid_tier2_passes_all_checks() {
-        let checker = SovereigntyChecker::new();
+        let checker = checker();
         let cert = tier2_cert();
         let state = valid_sovereignty_state();
 
@@ -876,7 +943,7 @@ mod tests {
 
     #[test]
     fn tier0_bypasses_all_checks() {
-        let checker = SovereigntyChecker::new();
+        let checker = checker();
         let mut cert = tier2_cert();
         cert.risk_tier = RiskTier::Tier0;
         let state = SovereigntyState {

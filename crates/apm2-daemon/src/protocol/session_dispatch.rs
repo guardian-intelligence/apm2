@@ -2094,16 +2094,29 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             };
 
             // Build AuthorityJoinInputV1 from the request context.
+            //
+            // Identity evidence in this path is session-bound pointer material,
+            // not a full verified identity proof. We therefore bind a stable,
+            // non-zero pointer hash and mark the evidence level as PointerOnly.
+            // Tier2+ is denied fail-closed by the PCAC kernel for PointerOnly.
+            let identity_proof_hash = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"pcac_identity_pointer:session_token:");
+                hasher.update(token.session_id.as_bytes());
+                hasher.update(token.lease_id.as_bytes());
+                hasher.update(token.mac.as_bytes());
+                *hasher.finalize().as_bytes()
+            };
             let pcac_input = apm2_core::pcac::AuthorityJoinInputV1 {
                 session_id: token.session_id.clone(),
                 holon_id: None,
                 intent_digest: *blake3::hash(&request.arguments).as_bytes(),
                 capability_manifest_hash,
                 scope_witness_hashes: vec![],
-                lease_id: token.session_id.clone(),
+                lease_id: token.lease_id.clone(),
                 permeability_receipt_hash: None,
-                identity_proof_hash: *blake3::hash(token.session_id.as_bytes()).as_bytes(),
-                identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
+                identity_proof_hash,
+                identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::PointerOnly,
                 directory_head_hash,
                 freshness_policy_hash,
                 freshness_witness_tick: hlc.wall_ns / 1_000_000_000,
@@ -4186,6 +4199,133 @@ mod tests {
             gid: 1000,
             pid: Some(12345),
         }))
+    }
+
+    #[test]
+    fn tier2_request_denied_without_sovereignty_state_when_pcac_gate_enabled() {
+        use apm2_core::pcac::{
+            AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyV1,
+            AuthorityJoinCertificateV1, AuthorityJoinInputV1, AuthorityJoinKernel,
+            IdentityEvidenceLevel, RiskTier,
+        };
+
+        use crate::episode::InMemorySessionRegistry;
+        use crate::htf::{ClockConfig, HolonicClock};
+        use crate::session::{SessionRegistry, SessionState};
+
+        struct AllowingKernel;
+
+        impl AuthorityJoinKernel for AllowingKernel {
+            fn join(
+                &self,
+                input: &AuthorityJoinInputV1,
+            ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
+                Ok(AuthorityJoinCertificateV1 {
+                    ajc_id: [0xAA; 32],
+                    authority_join_hash: [0xBB; 32],
+                    intent_digest: input.intent_digest,
+                    risk_tier: RiskTier::Tier2Plus,
+                    issued_time_envelope_ref: input.time_envelope_ref,
+                    as_of_ledger_anchor: input.as_of_ledger_anchor,
+                    expires_at_tick: u64::MAX,
+                    revocation_head_hash: input.directory_head_hash,
+                    identity_evidence_level: IdentityEvidenceLevel::Verified,
+                    admission_capacity_token: None,
+                })
+            }
+
+            fn revalidate(
+                &self,
+                _cert: &AuthorityJoinCertificateV1,
+                _current_time_envelope_ref: [u8; 32],
+                _current_ledger_anchor: [u8; 32],
+                _current_revocation_head_hash: [u8; 32],
+            ) -> Result<(), Box<AuthorityDenyV1>> {
+                Ok(())
+            }
+
+            fn consume(
+                &self,
+                cert: &AuthorityJoinCertificateV1,
+                intent_digest: [u8; 32],
+                current_time_envelope_ref: [u8; 32],
+            ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>
+            {
+                Ok((
+                    AuthorityConsumedV1 {
+                        ajc_id: cert.ajc_id,
+                        intent_digest,
+                        consumed_time_envelope_ref: current_time_envelope_ref,
+                        consumed_at_tick: 1,
+                    },
+                    AuthorityConsumeRecordV1 {
+                        ajc_id: cert.ajc_id,
+                        consumed_time_envelope_ref: current_time_envelope_ref,
+                        consumed_at_tick: 1,
+                        effect_selector_digest: [0xCC; 32],
+                    },
+                ))
+            }
+        }
+
+        let minter = test_minter();
+        let registry = Arc::new(InMemorySessionRegistry::new());
+        registry
+            .register_session(SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-PCAC-NO-SOV".to_string(),
+                role: crate::protocol::messages::WorkRole::Implementer.into(),
+                ephemeral_handle: "handle-pcac-no-sov".to_string(),
+                lease_id: "lease-001".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![0xAB; 32],
+                episode_id: Some("E-PCAC-NO-SOV".to_string()),
+            })
+            .expect("session registration should succeed");
+
+        let clock = Arc::new(
+            HolonicClock::new(ClockConfig::default(), None)
+                .expect("default ClockConfig should succeed"),
+        );
+        let pcac_gate = Arc::new(crate::pcac::LifecycleGate::with_sovereignty_checker(
+            Arc::new(AllowingKernel),
+            crate::pcac::SovereigntyChecker::new([0u8; 32]),
+        ));
+
+        let dispatcher = SessionDispatcher::new(minter.clone())
+            .with_session_registry(registry as Arc<dyn SessionRegistry>)
+            .with_clock(clock)
+            .with_pcac_lifecycle_gate(pcac_gate);
+
+        let token = test_token(&minter);
+        let request = RequestToolRequest {
+            session_token: serde_json::to_string(&token).expect("token should serialize"),
+            tool_id: "read".to_string(),
+            arguments: br#"{"path":"README.md"}"#.to_vec(),
+            dedupe_key: "pcac-no-sovereignty".to_string(),
+            epoch_seal: None,
+        };
+        let frame = encode_request_tool_request(&request);
+        let response = dispatcher
+            .dispatch(&frame, &make_session_ctx())
+            .expect("dispatch should succeed");
+
+        match response {
+            SessionResponse::Error(err) => {
+                assert_eq!(
+                    err.code,
+                    SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                    "Tier2+ request must be denied when sovereignty state is unavailable"
+                );
+                assert!(
+                    err.message
+                        .contains("sovereignty state not available for Tier2+"),
+                    "expected sovereignty-state denial, got: {}",
+                    err.message
+                );
+            },
+            other => panic!("expected RequestTool denial, got: {other:?}"),
+        }
     }
 
     // ========================================================================

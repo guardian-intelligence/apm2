@@ -159,6 +159,14 @@ pub enum AuthorityDenyClass {
         freeze_action: super::types::FreezeAction,
     },
 
+    /// Sovereignty epoch signer key does not match trusted authority key.
+    UntrustedSovereigntySigner {
+        /// Trusted signer public key configured for this checker.
+        expected_signer_key: Hash,
+        /// Signer public key embedded in the sovereignty epoch.
+        actual_signer_key: Hash,
+    },
+
     /// Sovereignty uncertainty triggered a freeze action.
     SovereigntyUncertainty {
         /// Reason for the sovereignty uncertainty.
@@ -255,6 +263,9 @@ impl std::fmt::Display for AuthorityDenyClass {
             ),
             Self::ActiveSovereignFreeze { freeze_action } => {
                 write!(f, "active sovereign freeze: {freeze_action}")
+            },
+            Self::UntrustedSovereigntySigner { .. } => {
+                write!(f, "untrusted sovereignty epoch signer")
             },
             Self::SovereigntyUncertainty { reason } => {
                 write!(f, "sovereignty uncertainty: {reason}")

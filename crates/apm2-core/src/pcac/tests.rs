@@ -416,6 +416,10 @@ fn deny_class_serde_roundtrip() {
         AuthorityDenyClass::ActiveSovereignFreeze {
             freeze_action: types::FreezeAction::HardFreeze,
         },
+        AuthorityDenyClass::UntrustedSovereigntySigner {
+            expected_signer_key: test_hash(0xA1),
+            actual_signer_key: test_hash(0xA2),
+        },
         AuthorityDenyClass::DelegationWidening,
         AuthorityDenyClass::PointerOnlyDeniedAtTier2Plus,
         AuthorityDenyClass::PolicyDeny {
@@ -868,6 +872,10 @@ fn deny_taxonomy_covers_all_lifecycle_failures() {
         },
         AuthorityDenyClass::ActiveSovereignFreeze {
             freeze_action: types::FreezeAction::HardFreeze,
+        },
+        AuthorityDenyClass::UntrustedSovereigntySigner {
+            expected_signer_key: zero_hash(),
+            actual_signer_key: zero_hash(),
         },
         AuthorityDenyClass::SovereigntyUncertainty {
             reason: "test".to_string(),
