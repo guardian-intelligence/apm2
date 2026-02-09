@@ -92,11 +92,10 @@ impl InProcessKernel {
     ///
     /// # Fail-Closed Semantics
     ///
-    /// If the clock reports a regression error, the kernel falls back to
-    /// tick `0`, which causes all certificate expiry checks to fail-closed
-    /// (tick 0 < any positive `expires_at_tick` means no false "expired"
-    /// denial from regression, but the manual tick floor ensures the kernel
-    /// never reports a tick that has gone backwards).
+    /// If the clock reports a regression error, `current_tick()` returns an
+    /// `Err` denial rather than falling back to a tick value. This prevents
+    /// time-based security checks (certificate expiry, sovereignty staleness)
+    /// from failing open.
     #[must_use]
     pub fn with_clock(clock: Arc<HolonicClock>) -> Self {
         Self {
@@ -125,32 +124,62 @@ impl InProcessKernel {
     ///
     /// When no clock is configured (tests), returns the manual tick counter.
     ///
-    /// # Fail-Closed
+    /// # Fail-Closed (Security)
     ///
-    /// Clock regression errors yield tick `0` from the clock path, but the
-    /// `max()` with the manual floor ensures we never go backwards.
-    #[must_use]
-    pub fn current_tick(&self) -> u64 {
+    /// Clock regression errors return `Err` instead of a fallback value.
+    /// Falling back to tick `0` would cause time-based security checks
+    /// (certificate expiry, sovereignty staleness) to **fail-open**, because
+    /// `0 > any_positive_threshold` is always `false`. Callers must
+    /// construct an appropriate `AuthorityDenyV1` with their available
+    /// context (time envelope ref, ledger anchor, AJC ID).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `String` describing the clock error. Callers are responsible
+    /// for wrapping this into an `AuthorityDenyV1` with appropriate context.
+    pub fn current_tick(&self) -> Result<u64, String> {
         let manual = *self.manual_tick.lock().expect("lock poisoned");
 
-        self.clock.as_ref().map_or(manual, |clock| {
-            // Derive tick from the HolonicClock's monotonic source.
-            // On success, use the tick value; on regression error, fall
-            // back to 0 (fail-closed: the max() with manual ensures
-            // monotonicity).
-            let clock_tick = match clock.now_mono_tick() {
-                Ok(t) => t.value(),
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "InProcessKernel: clock regression during tick derivation, \
-                         falling back to manual tick floor (fail-closed)"
-                    );
-                    0
-                },
-            };
-            // Monotonicity: take the max of clock-derived and manual floor.
-            manual.max(clock_tick)
+        match self.clock.as_ref() {
+            None => Ok(manual),
+            Some(clock) => {
+                let clock_tick = match clock.now_mono_tick() {
+                    Ok(t) => t.value(),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "InProcessKernel: clock regression during tick derivation \
+                             — denying authority operation (fail-closed)"
+                        );
+                        return Err(format!("clock regression during tick derivation: {e}"));
+                    },
+                };
+                // Monotonicity: take the max of clock-derived and manual floor.
+                Ok(manual.max(clock_tick))
+            },
+        }
+    }
+
+    /// Converts a clock error from [`current_tick`] into an authority denial
+    /// with the provided context.
+    ///
+    /// [`current_tick`]: InProcessKernel::current_tick
+    pub(crate) fn clock_error_to_deny(
+        reason: String,
+        ajc_id: Option<Hash>,
+        time_envelope_ref: Hash,
+        ledger_anchor: Hash,
+    ) -> Box<AuthorityDenyV1> {
+        Box::new(AuthorityDenyV1 {
+            deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty { reason },
+            ajc_id,
+            time_envelope_ref,
+            ledger_anchor,
+            // denied_at_tick is 0 because we cannot determine the current
+            // tick. This is acceptable for clock-error denials — the denial
+            // itself is the critical safety property.
+            denied_at_tick: 0,
+            containment_action: None,
         })
     }
 
@@ -290,7 +319,14 @@ impl AuthorityJoinKernel for InProcessKernel {
         &self,
         input: &AuthorityJoinInputV1,
     ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
-        let tick = self.current_tick();
+        let tick = self.current_tick().map_err(|reason| {
+            Self::clock_error_to_deny(
+                reason,
+                None,
+                input.time_envelope_ref,
+                input.as_of_ledger_anchor,
+            )
+        })?;
 
         // Validate required string fields.
         if input.session_id.is_empty() {
@@ -453,7 +489,14 @@ impl AuthorityJoinKernel for InProcessKernel {
         current_ledger_anchor: Hash,
         current_revocation_head_hash: Hash,
     ) -> Result<(), Box<AuthorityDenyV1>> {
-        let tick = self.current_tick();
+        let tick = self.current_tick().map_err(|reason| {
+            Self::clock_error_to_deny(
+                reason,
+                Some(cert.ajc_id),
+                current_time_envelope_ref,
+                current_ledger_anchor,
+            )
+        })?;
 
         // Law 4: Certificate expiry check.
         if tick > cert.expires_at_tick {
@@ -507,7 +550,14 @@ impl AuthorityJoinKernel for InProcessKernel {
         current_time_envelope_ref: Hash,
         current_revocation_head_hash: Hash,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
-        let tick = self.current_tick();
+        let tick = self.current_tick().map_err(|reason| {
+            Self::clock_error_to_deny(
+                reason,
+                Some(cert.ajc_id),
+                current_time_envelope_ref,
+                cert.as_of_ledger_anchor,
+            )
+        })?;
 
         // MAJOR 3 FIX: Certificate expiry check in consume — the trait
         // contract documents this as a required check, and time can advance

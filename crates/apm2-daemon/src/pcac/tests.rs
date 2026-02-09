@@ -1735,7 +1735,9 @@ fn clock_backed_kernel_tick_advances() {
     // for a very fast machine). Sleep briefly to guarantee advancement.
     std::thread::sleep(std::time::Duration::from_millis(10));
 
-    let tick = kernel.current_tick();
+    let tick = kernel
+        .current_tick()
+        .expect("current_tick should succeed (no clock regression)");
     assert!(
         tick > 0,
         "clock-backed kernel tick must advance beyond 0 after 10ms sleep, got: {tick}"
@@ -1764,7 +1766,9 @@ fn clock_backed_kernel_certificates_can_expire() {
     // certificate's expires_at_tick, causing revalidation to fail.
     std::thread::sleep(std::time::Duration::from_millis(1));
 
-    let current = kernel.current_tick();
+    let current = kernel
+        .current_tick()
+        .expect("current_tick should succeed (no clock regression)");
     assert!(
         current > cert.expires_at_tick,
         "clock-backed kernel tick ({current}) must exceed certificate \
@@ -1806,9 +1810,92 @@ fn clock_backed_kernel_advance_tick_sets_floor() {
     let high_floor = u64::MAX / 2;
     kernel.advance_tick(high_floor);
 
-    let tick = kernel.current_tick();
+    let tick = kernel
+        .current_tick()
+        .expect("current_tick should succeed (no clock regression)");
     assert!(
         tick >= high_floor,
         "clock-backed kernel tick ({tick}) must be >= manual floor ({high_floor})"
+    );
+}
+
+/// Proves that `InProcessKernel::current_tick()` returns `Result` (not a
+/// raw `u64`), ensuring callers cannot silently ignore clock regression
+/// errors. This is the structural guarantee that prevents fail-open on
+/// clock regression: the error MUST be handled at each call site.
+///
+/// TCK-00427 security BLOCKER fix: Previously, `current_tick()` returned
+/// `u64` and fell back to `0` on clock regression. Tick `0` caused
+/// certificate expiry checks (`0 > expires_at_tick`) to evaluate `false`,
+/// accepting expired certificates (fail-open). By returning `Result`,
+/// clock errors now propagate as authority denials (fail-closed).
+#[test]
+fn current_tick_returns_result_not_raw_u64() {
+    let kernel = InProcessKernel::new(42);
+
+    // Manual-tick kernels (no clock) always succeed.
+    let result = kernel.current_tick();
+    assert!(result.is_ok(), "manual-tick kernel should return Ok");
+    assert_eq!(result.unwrap(), 42);
+
+    // The return type is Result<u64, String>, which forces callers to
+    // handle clock errors explicitly. This is verified at compile time.
+    let _: Result<u64, String> = kernel.current_tick();
+}
+
+/// Proves that clock errors in `join` produce an authority denial with
+/// `SovereigntyUncertainty` deny class (fail-closed), NOT a fallback
+/// that would allow expired certificates to pass.
+///
+/// TCK-00427 security BLOCKER fix: This test verifies the integration
+/// between `current_tick()` error propagation and the `join` call site.
+/// Since we cannot easily simulate a real clock regression with
+/// `HolonicClock` (which wraps `Instant`), we verify the deny class
+/// used by `clock_error_to_deny` and the structural property that
+/// `current_tick()` returns `Result`.
+#[test]
+fn clock_error_deny_uses_sovereignty_uncertainty_class() {
+    // Verify the helper produces the correct deny class.
+    let deny = InProcessKernel::clock_error_to_deny(
+        "test clock regression".to_string(),
+        None,
+        test_hash(0x07),
+        test_hash(0x08),
+    );
+
+    assert!(
+        matches!(
+            deny.deny_class,
+            AuthorityDenyClass::SovereigntyUncertainty { ref reason }
+            if reason.contains("test clock regression")
+        ),
+        "clock error deny must use SovereigntyUncertainty class, got: {:?}",
+        deny.deny_class
+    );
+    assert_eq!(deny.time_envelope_ref, test_hash(0x07));
+    assert_eq!(deny.ledger_anchor, test_hash(0x08));
+    assert!(deny.ajc_id.is_none());
+}
+
+/// Proves that `clock_error_to_deny` carries the AJC ID when provided
+/// (used by `revalidate` and `consume` call sites).
+#[test]
+fn clock_error_deny_carries_ajc_id_when_provided() {
+    let ajc_id = test_hash(0xAA);
+    let deny = InProcessKernel::clock_error_to_deny(
+        "regression in revalidate".to_string(),
+        Some(ajc_id),
+        test_hash(0x07),
+        test_hash(0x08),
+    );
+
+    assert_eq!(deny.ajc_id, Some(ajc_id));
+    assert!(
+        matches!(
+            deny.deny_class,
+            AuthorityDenyClass::SovereigntyUncertainty { .. }
+        ),
+        "deny class must be SovereigntyUncertainty, got: {:?}",
+        deny.deny_class
     );
 }
