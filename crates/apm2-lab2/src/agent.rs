@@ -143,8 +143,8 @@ impl AgentBackend for MockBackend {
 }
 
 #[must_use]
-pub fn new_session_id(role_id: &str) -> String {
-    format!("{}-{}", role_id, Uuid::new_v4())
+pub fn new_session_id(_role_id: &str) -> String {
+    Uuid::new_v4().to_string()
 }
 
 #[must_use]
