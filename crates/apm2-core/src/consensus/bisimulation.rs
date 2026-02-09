@@ -304,9 +304,12 @@ impl ObservableSemantics {
     /// Validates the observable semantics after deserialization.
     ///
     /// Enforces:
+    /// - `depth <= MAX_RECURSION_DEPTH`
+    /// - `initial_state` exists in `states`
     /// - `states.len() <= MAX_TOTAL_STATES`
     /// - Transitions per state `<= MAX_TRANSITIONS_PER_STATE`
     /// - All string fields within transitions `<= MAX_STRING_LEN`
+    /// - All transition targets exist in `states`
     ///
     /// This **must** be called immediately after deserializing an
     /// `ObservableSemantics` to prevent denial-of-service via arbitrarily
@@ -316,6 +319,22 @@ impl ObservableSemantics {
     ///
     /// Returns an error if any bound is exceeded.
     pub fn validate(&self) -> Result<(), BisimulationError> {
+        // Check recursion depth bound.
+        if self.depth > MAX_RECURSION_DEPTH {
+            return Err(BisimulationError::DepthExceeded {
+                depth: self.depth,
+                max: MAX_RECURSION_DEPTH,
+            });
+        }
+
+        // Check that initial_state exists in the states map.
+        if !self.states.contains_key(&self.initial_state) {
+            return Err(BisimulationError::InvalidComposition(format!(
+                "initial_state {} does not exist in states map",
+                self.initial_state
+            )));
+        }
+
         // Check total state count.
         if self.states.len() > MAX_TOTAL_STATES {
             return Err(BisimulationError::CollectionTooLarge {
@@ -325,7 +344,7 @@ impl ObservableSemantics {
             });
         }
 
-        // Check per-state transition count and string fields within each transition.
+        // Check per-state transition count, string fields, and target validity.
         for (&state_id, transitions) in &self.states {
             if transitions.len() > MAX_TRANSITIONS_PER_STATE {
                 return Err(BisimulationError::TransitionsPerStateExceeded {
@@ -336,6 +355,13 @@ impl ObservableSemantics {
             }
             for transition in transitions {
                 transition.operation.validate()?;
+                // Validate that the transition target exists in the states map.
+                if !self.states.contains_key(&transition.target) {
+                    return Err(BisimulationError::InvalidComposition(format!(
+                        "transition from state {} targets non-existent state {}",
+                        state_id, transition.target
+                    )));
+                }
             }
         }
 

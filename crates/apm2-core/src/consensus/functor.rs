@@ -65,6 +65,13 @@ pub const MAX_PROOF_REF_LEN: usize = 256;
 /// deserialized `RewriteRule` instances.
 pub const MAX_DESCRIPTION_LEN: usize = 4096;
 
+/// Maximum length of a string field within a [`ProofStatus`] variant.
+///
+/// Prevents denial-of-service via arbitrarily large strings in
+/// deserialized `ProofStatus` values (e.g., `Verified { artifact_ref }`,
+/// `Rejected { reason }`).
+pub const MAX_PROOF_STATUS_REASON_LEN: usize = 1024;
+
 /// Maximum number of observation points to check per rewrite rule.
 ///
 /// Each observation point is an HSI operation whose output is compared
@@ -185,6 +192,18 @@ pub enum FunctorError {
         /// The maximum allowed count.
         max: usize,
     },
+
+    /// A string field within a `ProofStatus` variant exceeds the maximum
+    /// length.
+    #[error("proof status string too long in {field}: length {actual} exceeds maximum {max}")]
+    ProofStatusStringTooLong {
+        /// Which field exceeded its bound (e.g., `artifact_ref` or `reason`).
+        field: &'static str,
+        /// The actual length.
+        actual: usize,
+        /// The maximum allowed length.
+        max: usize,
+    },
 }
 
 // ============================================================================
@@ -206,6 +225,45 @@ pub enum ProofStatus {
         /// The reason the proof was rejected.
         reason: String,
     },
+}
+
+impl ProofStatus {
+    /// Validates that all string fields within this proof status are within
+    /// bounds.
+    ///
+    /// This must be called after deserialization to prevent denial-of-service
+    /// via arbitrarily large strings in `Verified { artifact_ref }` or
+    /// `Rejected { reason }`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FunctorError::ProofStatusStringTooLong`] if any string
+    /// field exceeds `MAX_PROOF_STATUS_REASON_LEN`.
+    pub fn validate(&self) -> Result<(), FunctorError> {
+        match self {
+            Self::Pending => Ok(()),
+            Self::Verified { artifact_ref } => {
+                if artifact_ref.len() > MAX_PROOF_STATUS_REASON_LEN {
+                    return Err(FunctorError::ProofStatusStringTooLong {
+                        field: "artifact_ref",
+                        actual: artifact_ref.len(),
+                        max: MAX_PROOF_STATUS_REASON_LEN,
+                    });
+                }
+                Ok(())
+            },
+            Self::Rejected { reason } => {
+                if reason.len() > MAX_PROOF_STATUS_REASON_LEN {
+                    return Err(FunctorError::ProofStatusStringTooLong {
+                        field: "reason",
+                        actual: reason.len(),
+                        max: MAX_PROOF_STATUS_REASON_LEN,
+                    });
+                }
+                Ok(())
+            },
+        }
+    }
 }
 
 impl fmt::Display for ProofStatus {
@@ -261,6 +319,13 @@ impl RewriteRule {
             });
         }
 
+        if description.len() > MAX_DESCRIPTION_LEN {
+            return Err(FunctorError::DescriptionTooLong {
+                len: description.len(),
+                max: MAX_DESCRIPTION_LEN,
+            });
+        }
+
         Ok(Self {
             id,
             description,
@@ -299,6 +364,9 @@ impl RewriteRule {
                 max: MAX_DESCRIPTION_LEN,
             });
         }
+
+        // Validate proof status string fields against OOM attacks.
+        self.proof_status.validate()?;
 
         self.source_pattern.validate().map_err(|e| match e {
             BisimulationError::CollectionTooLarge { actual, max, .. } => {
@@ -884,6 +952,7 @@ impl RewritePromotionGate {
     /// Evaluates the promotion gate for a catalog of rewrite rules.
     ///
     /// Checks every rule in the catalog. A rule blocks promotion if:
+    /// - Its `ProofStatus` contains unbounded strings (validation failure)
     /// - It has `ProofStatus::Rejected` (always blocks)
     /// - It has `ProofStatus::Pending` and the gate is in strict mode
     #[must_use]
@@ -892,6 +961,16 @@ impl RewritePromotionGate {
         let mut blocking_defects = Vec::new();
 
         for rule in catalog.all_rules() {
+            // Validate proof status string lengths before processing.
+            if let Err(e) = rule.proof_status().validate() {
+                blocking_defects.push(RewriteBlockingDefect {
+                    rule_id: rule.id().to_string(),
+                    kind: RewriteDefectKind::LawViolation,
+                    description: format!("Rule {} has invalid proof status: {e}", rule.id()),
+                });
+                continue;
+            }
+
             match rule.proof_status() {
                 ProofStatus::Verified { .. } => {
                     passed_rules.push(rule.id().to_string());

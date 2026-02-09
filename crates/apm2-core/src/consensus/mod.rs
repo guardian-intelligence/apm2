@@ -146,9 +146,9 @@ pub use fact_root::{
 // Functorial observation law checks for admitted rewrites (TCK-00368)
 pub use functor::{
     AdmittedRewriteCatalog, FunctorError, FunctorLawChecker, FunctorLawResult, MAX_CATALOG_RULES,
-    MAX_DESCRIPTION_LEN, MAX_OBSERVATION_POINTS, MAX_PROOF_REF_LEN, MAX_RULE_ID_LEN, ProofStatus,
-    RewriteBlockingDefect, RewriteDefectKind, RewriteGateResult, RewritePromotionGate, RewriteRule,
-    deserialize_and_validate_rule,
+    MAX_DESCRIPTION_LEN, MAX_OBSERVATION_POINTS, MAX_PROOF_REF_LEN, MAX_PROOF_STATUS_REASON_LEN,
+    MAX_RULE_ID_LEN, ProofStatus, RewriteBlockingDefect, RewriteDefectKind, RewriteGateResult,
+    RewritePromotionGate, RewriteRule, deserialize_and_validate_rule,
 };
 pub use genesis::{
     Genesis, GenesisConfig, GenesisConfigBuilder, GenesisError, GenesisValidator, InvitationToken,
