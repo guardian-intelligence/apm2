@@ -389,6 +389,14 @@ impl ReceiptAuthentication {
                         max: MAX_MERKLE_PROOF_STEPS,
                     });
                 }
+                // Per-element zero-hash check for proof steps (fail-closed).
+                for step in merkle_inclusion_proof {
+                    if *step == ZERO_HASH {
+                        return Err(PcacValidationError::ZeroHash {
+                            field: "merkle_inclusion_proof[step]",
+                        });
+                    }
+                }
             },
         }
         Ok(())
@@ -586,6 +594,15 @@ impl AuthorityConsumeReceiptV1 {
                 field: "effect_selector_digest",
             });
         }
+        // Optional hash field: pre_actuation_receipt_hash must be non-zero
+        // when present (authority-critical binding).
+        if let Some(ref parh) = self.pre_actuation_receipt_hash {
+            if *parh == ZERO_HASH {
+                return Err(PcacValidationError::ZeroHash {
+                    field: "pre_actuation_receipt_hash",
+                });
+            }
+        }
         if let Some(ref bindings) = self.authoritative_bindings {
             bindings.validate()?;
         }
@@ -598,8 +615,10 @@ impl AuthorityDenyReceiptV1 {
     ///
     /// Checks:
     /// - Digest metadata is valid (non-empty canonicalizer, non-zero digest).
+    /// - `deny_class` embedded string fields are within bounds.
     /// - `time_envelope_ref` is non-zero.
     /// - `ledger_anchor` is non-zero.
+    /// - `ajc_id`, when present, is non-zero.
     ///
     /// # Errors
     ///
@@ -607,6 +626,7 @@ impl AuthorityDenyReceiptV1 {
     /// (fail-closed).
     pub fn validate(&self) -> Result<(), PcacValidationError> {
         self.digest_meta.validate()?;
+        self.deny_class.validate()?;
         if self.time_envelope_ref == ZERO_HASH {
             return Err(PcacValidationError::ZeroHash {
                 field: "time_envelope_ref",
@@ -616,6 +636,11 @@ impl AuthorityDenyReceiptV1 {
             return Err(PcacValidationError::ZeroHash {
                 field: "ledger_anchor",
             });
+        }
+        if let Some(ref ajc) = self.ajc_id {
+            if *ajc == ZERO_HASH {
+                return Err(PcacValidationError::ZeroHash { field: "ajc_id" });
+            }
         }
         Ok(())
     }

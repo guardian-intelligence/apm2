@@ -264,18 +264,8 @@ impl std::error::Error for PcacValidationError {}
 const ZERO_HASH: Hash = [0u8; 32];
 
 impl AuthorityJoinInputV1 {
-    /// Validate all boundary constraints on this join input.
-    ///
-    /// Checks that:
-    /// - Required string fields are non-empty and within length bounds.
-    /// - Required hash fields are non-zero.
-    /// - Collection fields are within cardinality bounds.
-    ///
-    /// # Errors
-    ///
-    /// Returns `PcacValidationError` on the first violation found
-    /// (fail-closed).
-    pub fn validate(&self) -> Result<(), PcacValidationError> {
+    /// Validate string field constraints (non-empty, within length bounds).
+    fn validate_strings(&self) -> Result<(), PcacValidationError> {
         // String field: session_id
         if self.session_id.is_empty() {
             return Err(PcacValidationError::EmptyRequiredField {
@@ -312,6 +302,24 @@ impl AuthorityJoinInputV1 {
                 max: MAX_STRING_LENGTH,
             });
         }
+        Ok(())
+    }
+
+    /// Validate all boundary constraints on this join input.
+    ///
+    /// Checks that:
+    /// - Required string fields are non-empty and within length bounds.
+    /// - Required hash fields are non-zero.
+    /// - Collection fields are within cardinality bounds.
+    /// - Per-element hash vectors contain no zero-hash entries.
+    /// - Optional hash fields, when present, are non-zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError` on the first violation found
+    /// (fail-closed).
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        self.validate_strings()?;
 
         // Required hash fields — must not be zero
         if self.intent_digest == ZERO_HASH {
@@ -369,6 +377,31 @@ impl AuthorityJoinInputV1 {
                 count: self.pre_actuation_receipt_hashes.len(),
                 max: MAX_PRE_ACTUATION_RECEIPT_HASHES,
             });
+        }
+
+        // Per-element zero-hash checks for hash vectors (fail-closed).
+        for h in &self.scope_witness_hashes {
+            if *h == ZERO_HASH {
+                return Err(PcacValidationError::ZeroHash {
+                    field: "scope_witness_hashes[element]",
+                });
+            }
+        }
+        for h in &self.pre_actuation_receipt_hashes {
+            if *h == ZERO_HASH {
+                return Err(PcacValidationError::ZeroHash {
+                    field: "pre_actuation_receipt_hashes[element]",
+                });
+            }
+        }
+
+        // Optional hash field: permeability_receipt_hash must be non-zero when present.
+        if let Some(ref prh) = self.permeability_receipt_hash {
+            if *prh == ZERO_HASH {
+                return Err(PcacValidationError::ZeroHash {
+                    field: "permeability_receipt_hash",
+                });
+            }
         }
 
         Ok(())

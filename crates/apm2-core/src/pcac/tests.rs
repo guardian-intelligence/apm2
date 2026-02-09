@@ -1975,3 +1975,301 @@ fn valid_revalidate_receipt_passes_validation() {
     };
     assert!(receipt.validate().is_ok());
 }
+
+// =============================================================================
+// Per-element zero-hash rejection in AuthorityJoinInputV1 (Security BLOCKER)
+// =============================================================================
+
+#[test]
+fn join_input_zero_hash_in_scope_witness_hashes_rejected() {
+    let mut input = valid_join_input();
+    input.scope_witness_hashes = vec![test_hash(0x01), zero_hash(), test_hash(0x03)];
+    let err = input.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "scope_witness_hashes[element]")
+    );
+}
+
+#[test]
+fn join_input_zero_hash_in_pre_actuation_receipt_hashes_rejected() {
+    let mut input = valid_join_input();
+    input.pre_actuation_receipt_hashes = vec![zero_hash()];
+    let err = input.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "pre_actuation_receipt_hashes[element]")
+    );
+}
+
+#[test]
+fn join_input_zero_permeability_receipt_hash_rejected() {
+    let mut input = valid_join_input();
+    input.permeability_receipt_hash = Some(zero_hash());
+    let err = input.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "permeability_receipt_hash")
+    );
+}
+
+#[test]
+fn join_input_valid_permeability_receipt_hash_passes() {
+    let mut input = valid_join_input();
+    input.permeability_receipt_hash = Some(test_hash(0x42));
+    assert!(input.validate().is_ok());
+}
+
+#[test]
+fn join_input_valid_scope_witness_hashes_passes() {
+    let mut input = valid_join_input();
+    input.scope_witness_hashes = vec![test_hash(0x01), test_hash(0x02)];
+    assert!(input.validate().is_ok());
+}
+
+#[test]
+fn join_input_valid_pre_actuation_receipt_hashes_passes() {
+    let mut input = valid_join_input();
+    input.pre_actuation_receipt_hashes = vec![test_hash(0x10), test_hash(0x11)];
+    assert!(input.validate().is_ok());
+}
+
+// =============================================================================
+// AuthorityDenyV1::validate() zero-hash rejection (Security MAJOR)
+// =============================================================================
+
+#[test]
+fn deny_v1_zero_time_envelope_ref_rejected() {
+    let deny = AuthorityDenyV1 {
+        deny_class: AuthorityDenyClass::InvalidSessionId,
+        ajc_id: None,
+        time_envelope_ref: zero_hash(),
+        ledger_anchor: test_hash(0x08),
+        denied_at_tick: 500,
+    };
+    let err = deny.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "time_envelope_ref")
+    );
+}
+
+#[test]
+fn deny_v1_zero_ledger_anchor_rejected() {
+    let deny = AuthorityDenyV1 {
+        deny_class: AuthorityDenyClass::InvalidSessionId,
+        ajc_id: None,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: zero_hash(),
+        denied_at_tick: 500,
+    };
+    let err = deny.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "ledger_anchor")
+    );
+}
+
+#[test]
+fn deny_v1_zero_ajc_id_rejected() {
+    let deny = AuthorityDenyV1 {
+        deny_class: AuthorityDenyClass::InvalidSessionId,
+        ajc_id: Some(zero_hash()),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        denied_at_tick: 500,
+    };
+    let err = deny.validate().unwrap_err();
+    assert!(matches!(err, types::PcacValidationError::ZeroHash { field } if field == "ajc_id"));
+}
+
+#[test]
+fn deny_v1_valid_ajc_id_passes() {
+    let deny = AuthorityDenyV1 {
+        deny_class: AuthorityDenyClass::InvalidSessionId,
+        ajc_id: Some(test_hash(0xAA)),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        denied_at_tick: 500,
+    };
+    assert!(deny.validate().is_ok());
+}
+
+// =============================================================================
+// AuthorityDenyReceiptV1::validate() deny_class and ajc_id checks (Quality
+// MAJOR 2)
+// =============================================================================
+
+#[test]
+fn deny_receipt_validates_deny_class_strings() {
+    let receipt = AuthorityDenyReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        deny_class: AuthorityDenyClass::MissingRequiredField {
+            field_name: "x".repeat(types::MAX_FIELD_NAME_LENGTH + 1),
+        },
+        ajc_id: None,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        denied_at_tick: 500,
+        denied_at_stage: LifecycleStage::Join,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::StringTooLong { field, .. } if field == "field_name")
+    );
+}
+
+#[test]
+fn deny_receipt_oversize_description_rejected() {
+    let receipt = AuthorityDenyReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        deny_class: AuthorityDenyClass::UnknownState {
+            description: "x".repeat(types::MAX_DESCRIPTION_LENGTH + 1),
+        },
+        ajc_id: None,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        denied_at_tick: 500,
+        denied_at_stage: LifecycleStage::Join,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::StringTooLong { field, .. } if field == "description")
+    );
+}
+
+#[test]
+fn deny_receipt_oversize_reason_rejected() {
+    let receipt = AuthorityDenyReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        deny_class: AuthorityDenyClass::PolicyDeny {
+            reason: "x".repeat(types::MAX_REASON_LENGTH + 1),
+        },
+        ajc_id: None,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        denied_at_tick: 500,
+        denied_at_stage: LifecycleStage::Join,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::StringTooLong { field, .. } if field == "reason")
+    );
+}
+
+#[test]
+fn deny_receipt_zero_ajc_id_rejected() {
+    let receipt = AuthorityDenyReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        deny_class: AuthorityDenyClass::AlreadyConsumed {
+            ajc_id: test_hash(0xAA),
+        },
+        ajc_id: Some(zero_hash()),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        denied_at_tick: 500,
+        denied_at_stage: LifecycleStage::Consume,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(matches!(err, types::PcacValidationError::ZeroHash { field } if field == "ajc_id"));
+}
+
+#[test]
+fn deny_receipt_valid_ajc_id_passes() {
+    let receipt = AuthorityDenyReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        deny_class: AuthorityDenyClass::AlreadyConsumed {
+            ajc_id: test_hash(0xAA),
+        },
+        ajc_id: Some(test_hash(0xAA)),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        denied_at_tick: 500,
+        denied_at_stage: LifecycleStage::Consume,
+    };
+    assert!(receipt.validate().is_ok());
+}
+
+// =============================================================================
+// AuthorityConsumeReceiptV1 pre_actuation_receipt_hash zero-hash (Quality MAJOR
+// 5)
+// =============================================================================
+
+#[test]
+fn consume_receipt_zero_pre_actuation_receipt_hash_rejected() {
+    let receipt = AuthorityConsumeReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        intent_digest: test_hash(0x01),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        consumed_at_tick: 1500,
+        effect_selector_digest: test_hash(0xEE),
+        pre_actuation_receipt_hash: Some(zero_hash()),
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "pre_actuation_receipt_hash")
+    );
+}
+
+#[test]
+fn consume_receipt_valid_pre_actuation_receipt_hash_passes() {
+    let receipt = AuthorityConsumeReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        intent_digest: test_hash(0x01),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        consumed_at_tick: 1500,
+        effect_selector_digest: test_hash(0xEE),
+        pre_actuation_receipt_hash: Some(test_hash(0xBB)),
+        authoritative_bindings: None,
+    };
+    assert!(receipt.validate().is_ok());
+}
+
+// =============================================================================
+// Merkle proof step zero-hash rejection (Quality MAJOR 4)
+// =============================================================================
+
+#[test]
+fn batched_pointer_zero_hash_merkle_step_rejected() {
+    use super::receipts::*;
+
+    let auth = ReceiptAuthentication::PointerBatched {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: test_hash(0xE2),
+        merkle_inclusion_proof: vec![test_hash(0xE3), zero_hash(), test_hash(0xE4)],
+        receipt_batch_root_hash: test_hash(0xE5),
+    };
+    let err = auth.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "merkle_inclusion_proof[step]")
+    );
+}
+
+#[test]
+fn batched_pointer_single_zero_hash_merkle_step_rejected() {
+    use super::receipts::*;
+
+    let auth = ReceiptAuthentication::PointerBatched {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: test_hash(0xE2),
+        merkle_inclusion_proof: vec![zero_hash()],
+        receipt_batch_root_hash: test_hash(0xE5),
+    };
+    let err = auth.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "merkle_inclusion_proof[step]")
+    );
+}
+
+#[test]
+fn batched_pointer_all_valid_merkle_steps_passes() {
+    use super::receipts::*;
+
+    let auth = ReceiptAuthentication::PointerBatched {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: test_hash(0xE2),
+        merkle_inclusion_proof: vec![test_hash(0xE3), test_hash(0xE4), test_hash(0xE5)],
+        receipt_batch_root_hash: test_hash(0xE6),
+    };
+    assert!(auth.validate().is_ok());
+}

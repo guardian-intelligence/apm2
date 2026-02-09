@@ -337,16 +337,40 @@ impl AuthorityDenyClass {
     }
 }
 
+/// Zero hash constant for comparison.
+const ZERO_HASH: Hash = [0u8; 32];
+
 impl AuthorityDenyV1 {
     /// Validate all boundary constraints on this deny record.
     ///
-    /// Delegates to [`AuthorityDenyClass::validate`] for embedded string
-    /// field bounds.
+    /// Checks:
+    /// - Embedded deny class string fields are within bounds (via
+    ///   [`AuthorityDenyClass::validate`]).
+    /// - `time_envelope_ref` is non-zero (replay-critical binding).
+    /// - `ledger_anchor` is non-zero (replay-critical binding).
+    /// - `ajc_id`, when present, is non-zero.
     ///
     /// # Errors
     ///
-    /// Returns `PcacValidationError` on the first violation found.
+    /// Returns `PcacValidationError` on the first violation found
+    /// (fail-closed).
     pub fn validate(&self) -> Result<(), PcacValidationError> {
-        self.deny_class.validate()
+        self.deny_class.validate()?;
+        if self.time_envelope_ref == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "time_envelope_ref",
+            });
+        }
+        if self.ledger_anchor == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "ledger_anchor",
+            });
+        }
+        if let Some(ref ajc) = self.ajc_id {
+            if *ajc == ZERO_HASH {
+                return Err(PcacValidationError::ZeroHash { field: "ajc_id" });
+            }
+        }
+        Ok(())
     }
 }
