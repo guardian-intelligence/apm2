@@ -19,6 +19,8 @@
 //! - `apm2 fac review run <PR_URL>` - Run FAC review orchestration (parallel,
 //!   multi-model)
 //! - `apm2 fac review dispatch <PR_URL>` - Idempotent detached review dispatch
+//! - `apm2 fac review retrigger --pr <PR_NUMBER>` - Dispatch FAC workflow
+//!   projection from local CLI
 //! - `apm2 fac review status` - Show FAC review state and recent events
 //! - `apm2 fac review project` - Render one projection status line
 //! - `apm2 fac review tail` - Tail FAC review NDJSON telemetry stream
@@ -332,6 +334,8 @@ pub enum ReviewSubcommand {
     Run(ReviewRunArgs),
     /// Idempotently dispatch detached FAC review workers.
     Dispatch(ReviewDispatchArgs),
+    /// Retrigger FAC GitHub projection workflow via `workflow_dispatch`.
+    Retrigger(ReviewRetriggerArgs),
     /// Show FAC review state/events from local operational artifacts.
     Status(ReviewStatusArgs),
     /// Render one condensed projection line for GitHub log surfaces.
@@ -380,6 +384,35 @@ pub struct ReviewDispatchArgs {
     /// start.
     #[arg(long)]
     pub expected_head_sha: Option<String>,
+}
+
+/// Arguments for `apm2 fac review retrigger`.
+#[derive(Debug, Args)]
+pub struct ReviewRetriggerArgs {
+    /// Repository in owner/repo format.
+    #[arg(long, default_value = "guardian-intelligence/apm2")]
+    pub repo: String,
+
+    /// Pull request number.
+    #[arg(long)]
+    pub pr: u32,
+
+    /// Retrigger mode (`dispatch_and_gate` or `gate_only`).
+    #[arg(long, value_enum, default_value_t = fac_review::ReviewRetriggerMode::DispatchAndGate)]
+    pub mode: fac_review::ReviewRetriggerMode,
+
+    /// Review selection (`all`, `security`, or `quality`).
+    #[arg(
+        long = "type",
+        alias = "review-type",
+        value_enum,
+        default_value_t = fac_review::ReviewRunType::All
+    )]
+    pub review_type: fac_review::ReviewRunType,
+
+    /// Seconds to stream 1Hz workflow projection logs (5-600).
+    #[arg(long, default_value_t = 30)]
+    pub projection_seconds: u64,
 }
 
 /// Arguments for `apm2 fac review status`.
@@ -656,6 +689,14 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
                 &dispatch_args.pr_url,
                 dispatch_args.review_type,
                 dispatch_args.expected_head_sha.as_deref(),
+                json_output,
+            ),
+            ReviewSubcommand::Retrigger(retrigger_args) => fac_review::run_retrigger(
+                &retrigger_args.repo,
+                retrigger_args.pr,
+                retrigger_args.mode,
+                retrigger_args.review_type,
+                retrigger_args.projection_seconds,
                 json_output,
             ),
             ReviewSubcommand::Status(status_args) => {

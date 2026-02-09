@@ -19,6 +19,10 @@ protocol:
 variables:
   TICKET_ID_OPTIONAL: "$1"
 
+notes:
+  - "Required merge gate contexts are `Guardian Intelligence - Barrier` and `Forge Admission Cycle`, both bound to the current PR head SHA."
+  - "Use `apm2 fac review retrigger` as the primary recovery command; keep direct workflow_dispatch commands as fallback when needed."
+
 references[20]:
   - path: "@documents/theory/glossary/glossary.json"
     purpose: "REQUIRED READING: APM2 terminology and ontology."

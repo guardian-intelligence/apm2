@@ -7,7 +7,7 @@ notes:
   - "All commands that can hang should use timeout wrappers."
   - "Commands labeled side_effect=true modify external state."
 
-commands[17]:
+commands[19]:
   - name: resolve_repo_root
     command: "timeout 10s git rev-parse --show-toplevel"
     purpose: "Discover repository root for asset invocation."
@@ -35,8 +35,18 @@ commands[17]:
 
   - name: commit_statuses
     command: "timeout 30s gh api repos/guardian-intelligence/apm2/commits/<HEAD_SHA>/status"
-    purpose: "Fetch Forge Admission Cycle status context for exact HEAD SHA binding."
+    purpose: "Fetch Barrier + Forge Admission Cycle status contexts for exact HEAD SHA binding."
     side_effect: false
+
+  - name: retrigger_barrier
+    command: "timeout 30s gh workflow run guardian-intelligence-barrier.yml --repo guardian-intelligence/apm2 -f pr_number=<PR_NUMBER>"
+    purpose: "Manual recovery path: force barrier re-evaluation for a PR head SHA."
+    side_effect: true
+
+  - name: retrigger_fac_via_apm2
+    command: "timeout 30s apm2 fac review retrigger --repo guardian-intelligence/apm2 --pr <PR_NUMBER> --mode <dispatch_and_gate|gate_only> --type <all|security|quality> --projection-seconds 30"
+    purpose: "Projection-native FAC retrigger path that dispatches Forge Admission Cycle from apm2 CLI."
+    side_effect: true
 
   - name: launch_reviews
     command: "timeout 900s bash <ROOT>/documents/skills/orchestrator-monitor/assets/launch-reviews.sh <PR_NUMBER|PR_URL> [SCRATCHPAD_DIR]"
@@ -44,12 +54,12 @@ commands[17]:
     side_effect: true
 
   - name: retrigger_review_stream
-    command: "timeout 30s gh workflow run ai-review.yml --repo guardian-intelligence/apm2 -f pr_number=<PR_NUMBER> -f review_type=<all|security|quality> -f projection_seconds=30"
+    command: "timeout 30s gh workflow run forge-admission-cycle.yml --repo guardian-intelligence/apm2 -f pr_number=<PR_NUMBER> -f mode=dispatch_and_gate -f review_type=<all|security|quality> -f projection_seconds=30"
     purpose: "Manual recovery path: retrigger a specific FAC review stream for current PR head SHA."
     side_effect: true
 
   - name: retrigger_gate_projection
-    command: "timeout 30s gh workflow run review-gate.yml --repo guardian-intelligence/apm2 -f pr_number=<PR_NUMBER>"
+    command: "timeout 30s gh workflow run forge-admission-cycle.yml --repo guardian-intelligence/apm2 -f pr_number=<PR_NUMBER> -f mode=gate_only -f review_type=all -f projection_seconds=30"
     purpose: "Manual recovery path: force Forge Admission Cycle status re-evaluation/post for a PR head SHA."
     side_effect: true
 

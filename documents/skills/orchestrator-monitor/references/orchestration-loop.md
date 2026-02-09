@@ -130,6 +130,8 @@ decision_tree:
         - id: GATE_RULE
           action: |
             READY_TO_MERGE iff all are true on current HEAD SHA:
-            (1) CI checks pass, (2) Forge Admission Cycle=success,
-            (3) PR mergeable state is not CONFLICTING, (4) PR is open and non-draft.
+            (1) Guardian Intelligence - Barrier=success,
+            (2) Forge Admission Cycle=success,
+            (3) PR mergeable state is not CONFLICTING,
+            (4) PR is open and non-draft.
       next: HEARTBEAT_LOOP

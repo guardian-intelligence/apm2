@@ -24,7 +24,7 @@
       "parameters": {
         "required_status_checks": [
           {
-            "context": "CI Success"
+            "context": "Guardian Intelligence - Barrier"
           },
           {
             "context": "Forge Admission Cycle"

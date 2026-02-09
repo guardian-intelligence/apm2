@@ -7,6 +7,7 @@
 //! - Pulse-file based SHA freshness checks and resume flow
 //! - Liveness-based stall detection and bounded model fallback
 //! - Idempotent detached dispatch + projection snapshots for GitHub surfaces
+//! - GitHub projection retrigger (`forge-admission-cycle.yml`) from local CLI
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -68,6 +69,33 @@ pub enum ReviewRunType {
     All,
     Security,
     Quality,
+}
+
+impl ReviewRunType {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Security => "security",
+            Self::Quality => "quality",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[value(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewRetriggerMode {
+    DispatchAndGate,
+    GateOnly,
+}
+
+impl ReviewRetriggerMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DispatchAndGate => "dispatch_and_gate",
+            Self::GateOnly => "gate_only",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +221,17 @@ struct DispatchSummary {
     head_sha: String,
     dispatch_epoch: u64,
     results: Vec<DispatchReviewResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RetriggerSummary {
+    workflow: String,
+    repo: String,
+    pr_number: u32,
+    mode: String,
+    review_type: String,
+    projection_seconds: u64,
+    dispatched_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -472,6 +511,52 @@ pub fn run_dispatch(
     }
 }
 
+pub fn run_retrigger(
+    repo: &str,
+    pr_number: u32,
+    mode: ReviewRetriggerMode,
+    review_type: ReviewRunType,
+    projection_seconds: u64,
+    json_output: bool,
+) -> u8 {
+    match run_retrigger_inner(repo, pr_number, mode, review_type, projection_seconds) {
+        Ok(summary) => {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("FAC Review Retrigger");
+                println!("  Workflow:          {}", summary.workflow);
+                println!("  Repo:              {}", summary.repo);
+                println!("  PR Number:         {}", summary.pr_number);
+                println!("  Mode:              {}", summary.mode);
+                println!("  Review Type:       {}", summary.review_type);
+                println!("  Projection Seconds {}", summary.projection_seconds);
+                println!("  Dispatched At:     {}", summary.dispatched_at);
+            }
+            exit_codes::SUCCESS
+        },
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_retrigger_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_project(
     pr_number: u32,
@@ -583,6 +668,69 @@ fn run_dispatch_inner(
         dispatch_epoch,
         results,
     })
+}
+
+fn run_retrigger_inner(
+    repo: &str,
+    pr_number: u32,
+    mode: ReviewRetriggerMode,
+    review_type: ReviewRunType,
+    projection_seconds: u64,
+) -> Result<RetriggerSummary, String> {
+    if pr_number == 0 {
+        return Err("invalid PR number: must be > 0".to_string());
+    }
+    if !(5..=600).contains(&projection_seconds) {
+        return Err("projection_seconds must be between 5 and 600".to_string());
+    }
+    let _ = split_owner_repo(repo)?;
+
+    let args =
+        build_retrigger_workflow_args(repo, pr_number, mode, review_type, projection_seconds);
+    let output = Command::new("gh")
+        .args(&args)
+        .output()
+        .map_err(|err| format!("failed to execute gh workflow run: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh workflow run failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(RetriggerSummary {
+        workflow: "forge-admission-cycle.yml".to_string(),
+        repo: repo.to_string(),
+        pr_number,
+        mode: mode.as_str().to_string(),
+        review_type: review_type.as_str().to_string(),
+        projection_seconds,
+        dispatched_at: now_iso8601_millis(),
+    })
+}
+
+fn build_retrigger_workflow_args(
+    repo: &str,
+    pr_number: u32,
+    mode: ReviewRetriggerMode,
+    review_type: ReviewRunType,
+    projection_seconds: u64,
+) -> Vec<String> {
+    vec![
+        "workflow".to_string(),
+        "run".to_string(),
+        "forge-admission-cycle.yml".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "-f".to_string(),
+        format!("pr_number={pr_number}"),
+        "-f".to_string(),
+        format!("mode={}", mode.as_str()),
+        "-f".to_string(),
+        format!("review_type={}", review_type.as_str()),
+        "-f".to_string(),
+        format!("projection_seconds={projection_seconds}"),
+    ]
 }
 
 fn run_project_inner(
@@ -758,16 +906,6 @@ fn dispatch_single_review(
                     log_file: Some(existing.log_file.display().to_string()),
                 });
             }
-            if let Some(existing) = find_active_review_entry(pr_number, review_kind.as_str(), None)?
-            {
-                return Ok(DispatchReviewResult {
-                    review_type: review_kind.as_str().to_string(),
-                    mode: "joined".to_string(),
-                    pid: Some(existing.pid),
-                    unit: None,
-                    log_file: Some(existing.log_file.display().to_string()),
-                });
-            }
             spawn_detached_review(pr_url, pr_number, review_kind, head_sha, dispatch_epoch)
         },
     )
@@ -786,7 +924,9 @@ fn spawn_detached_review(
     let head_short = &expected_head_sha[..expected_head_sha.len().min(8)];
     let ts = Utc::now().format("%Y%m%dT%H%M%SZ");
 
-    if command_available("systemd-run") {
+    let has_sensitive_token_env =
+        std::env::var_os("GH_TOKEN").is_some() || std::env::var_os("GITHUB_TOKEN").is_some();
+    if command_available("systemd-run") && !has_sensitive_token_env {
         let unit = format!(
             "apm2-review-pr{pr_number}-{}-{head_short}-{ts}",
             review_kind.as_str()
@@ -800,7 +940,7 @@ fn spawn_detached_review(
             .arg("--property")
             .arg(format!("WorkingDirectory={}", cwd.display()));
 
-        for key in ["PATH", "HOME", "CARGO_HOME", "GH_TOKEN", "GITHUB_TOKEN"] {
+        for key in ["PATH", "HOME", "CARGO_HOME"] {
             if let Ok(value) = std::env::var(key) {
                 command.arg("--setenv").arg(format!("{key}={value}"));
             }
@@ -3058,6 +3198,37 @@ mod tests {
     #[test]
     fn test_select_fallback_model_unknown_returns_none() {
         assert!(select_fallback_model("unknown-model").is_none());
+    }
+
+    #[test]
+    fn test_review_type_and_mode_as_str() {
+        assert_eq!(ReviewRunType::All.as_str(), "all");
+        assert_eq!(ReviewRunType::Security.as_str(), "security");
+        assert_eq!(ReviewRunType::Quality.as_str(), "quality");
+        assert_eq!(
+            ReviewRetriggerMode::DispatchAndGate.as_str(),
+            "dispatch_and_gate"
+        );
+        assert_eq!(ReviewRetriggerMode::GateOnly.as_str(), "gate_only");
+    }
+
+    #[test]
+    fn test_build_retrigger_workflow_args() {
+        let args = build_retrigger_workflow_args(
+            "guardian-intelligence/apm2",
+            508,
+            ReviewRetriggerMode::DispatchAndGate,
+            ReviewRunType::Quality,
+            45,
+        );
+        assert_eq!(args[0], "workflow");
+        assert_eq!(args[1], "run");
+        assert!(args.contains(&"forge-admission-cycle.yml".to_string()));
+        assert!(args.contains(&"guardian-intelligence/apm2".to_string()));
+        assert!(args.contains(&"pr_number=508".to_string()));
+        assert!(args.contains(&"mode=dispatch_and_gate".to_string()));
+        assert!(args.contains(&"review_type=quality".to_string()));
+        assert!(args.contains(&"projection_seconds=45".to_string()));
     }
 
     #[test]

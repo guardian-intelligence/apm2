@@ -37,13 +37,14 @@ ticket_meta:
     in_scope:
       - "Add `apm2 fac review` command surface (`run`, `dispatch`, `status`, `project`, `tail`) in apm2-cli; no xtask review orchestration changes."
       - "Implement parallel execution for `apm2 fac review run --type all` with independent `security` and `quality` workers."
-      - "Cut over GitHub AI review projection to a unified workflow (`.github/workflows/ai-review.yml`) that uses `apm2 fac review` as the primary execution entrypoint."
+      - "Cut over GitHub FAC projection to `.github/workflows/forge-admission-cycle.yml`, using `apm2 fac review` as the primary execution entrypoint."
       - "Run AI review projection in trusted `pull_request_target` context (base-branch workflow code) to avoid executing PR-branch code with write-capable tokens."
       - "Launch `security` and `quality` FAC reviewers in parallel from GitHub workflow execution."
       - "Emit one condensed reviewer-fleet status line per second in GitHub logs and print explicit error lines for crash/stall/fallback/SHA-update events."
       - "Use asynchronous workflow dispatch semantics: GitHub workflow launches detached FAC review processes and exits after a bounded 1Hz projection window."
       - "Run PR authorization and reviewer-identity allowlist checks on a GitHub-hosted preflight job before any self-hosted FAC dispatch."
       - "Use `apm2 fac review dispatch` for idempotent start-or-join dispatch and `apm2 fac review project` for projection snapshots."
+      - "Add `apm2 fac review retrigger` to project FAC retrigger commands back into GitHub workflow_dispatch."
       - "Support workflow-level manual retrigger controls: workflow_dispatch with `pr_number` and `review_type` (`all|security|quality`) for targeted recovery."
       - "Support high concurrency (target up to 100 concurrent FAC review runs) without cross-PR state/pulse collisions."
       - "Implement idempotent review dispatch per `(repo, pr_number, review_type)` so duplicate requests for the same SHA do not spawn duplicate reviewers."
@@ -56,11 +57,14 @@ ticket_meta:
       - "Implement liveness-based stall detection (event-stream primary, log-growth fallback) and bounded fallback restart policy."
       - "Persist active run metadata in FAC review state (`~/.apm2/review_state.json`) including PID, model, backend, and restart count."
       - "Update `documents/skills/orchestrator-monitor` scripts/docs to use FAC review commands and NDJSON/pulse telemetry."
-      - "Keep GitHub review-gate as the authoritative admission evaluator while adding workflow_dispatch re-evaluation support and renaming projected context to `Forge Admission Cycle`."
+      - "Consolidate authoritative admission evaluation into `forge-admission-cycle.yml` while preserving `cargo xtask review-gate` semantics and status context `Forge Admission Cycle`."
+      - "Add fast trust-gating workflow `.github/workflows/guardian-intelligence-barrier.yml` and require it for merge admission."
+      - "Fail closed when workflow_dispatch is invoked from a non-trusted branch ref for the PR base."
+      - "Prevent reviewer token exposure in process argv by avoiding `systemd-run --setenv` for sensitive token variables."
     out_of_scope:
       - "Any modifications to xtask review/push/check implementation paths."
       - "Daemon-side authoritative receipt ingestion for FAC review runs in this phase."
-      - "Changes to `.github/workflows/review-gate.yml` merge gate evaluation logic."
+      - "Changes to review-gate verdict semantics implemented in `cargo xtask review-gate`."
       - "Redesign of FAC policy-resolution, lease issuance, or merge executor internals."
   plan:
     steps:
@@ -72,14 +76,14 @@ ticket_meta:
       - "Implement liveness monitor with 90s stall threshold and fallback model rotation on stall/crash/HTTP400-rate-limit signals."
       - "Add tests for model selection, fallback cycling, command builder dispatch, NDJSON append/rotation, pulse round-trip, and state compatibility."
       - "Rewrite orchestrator-monitor launch/check/poll assets to call `apm2 fac review` and parse FAC review telemetry/state files."
-      - "Replace split AI-review workflows with unified `.github/workflows/ai-review.yml`, launching security and quality reviews in parallel via FAC."
+      - "Replace split projection workflows with `.github/workflows/forge-admission-cycle.yml` and `.github/workflows/guardian-intelligence-barrier.yml`."
       - "Implement 1Hz projection logging in GitHub workflow via `apm2 fac review project` with explicit error-event lines."
       - "Change workflow execution from synchronous wait-until-complete to asynchronous detached dispatch with short projection loop to minimize runner occupancy and queue pressure."
       - "Split AI review workflow into GitHub-hosted authorization preflight and self-hosted FAC projection jobs."
       - "Add trusted PR-author association gate (OWNER|MEMBER|COLLABORATOR) and fail closed when unauthorized."
       - "Add workflow_dispatch retrigger inputs for targeted review stream dispatch (`all|security|quality`) and bounded projection duration."
-      - "Add workflow_dispatch support to review-gate workflow to force re-evaluation/posting for a specific PR without requiring a new push."
-      - "Rename required gate status context to `Forge Admission Cycle` and update branch-protection ruleset source."
+      - "Support `mode=gate_only` workflow_dispatch in `forge-admission-cycle.yml` to force re-evaluation/posting for a specific PR without requiring a new push."
+      - "Set required status contexts to `Guardian Intelligence - Barrier` and `Forge Admission Cycle` in branch-protection ruleset source."
       - "Run `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo doc --workspace --no-deps`, and `cargo test -p apm2-cli`."
   definition_of_done:
     evidence_ids:
@@ -92,7 +96,8 @@ ticket_meta:
       - "GitHub run logs show one condensed status line per second with current reviewer-agent state and surface explicit error lines when faults appear."
       - "FAC projection exits with a terminal failure in GitHub when reviewer execution reaches non-recoverable failure; no indefinite pending state."
       - "Manual workflow_dispatch retrigger can target `security` or `quality` review only for a given PR."
-      - "Manual review-gate workflow_dispatch for a PR posts an updated `Forge Admission Cycle` status to the current head SHA."
+      - "Manual `forge-admission-cycle.yml` workflow_dispatch with `mode=gate_only` posts an updated `Forge Admission Cycle` status to the current head SHA."
+      - "`apm2 fac review retrigger` dispatches `forge-admission-cycle.yml` with parity inputs (`pr_number`, `mode`, `review_type`, `projection_seconds`) so local recovery projects to GitHub."
       - "Concurrent duplicate dispatches for the same `(repo, PR, review_type, head_sha)` are deduplicated (idempotent), not queued."
       - "Review runs are observable through NDJSON lifecycle events and pulse/state files without relying on ad-hoc mtime/process greps."
       - "On SHA drift, active review sessions are terminated and resumed with preserved context via backend-native resume commands."
@@ -103,7 +108,7 @@ ticket_meta:
     security: |
       Enforce fail-closed behavior for ambiguous reviewer execution states.
       Pulse and telemetry artifacts are non-authoritative operational signals;
-      merge authority remains review-gate based.
+      merge authority remains FAC workflow + review-gate evaluator based.
     verification: |
       Validate both unit-level command/state correctness and manual end-to-end
       behavior across normal, stall, crash, and SHA-move scenarios. Validate
