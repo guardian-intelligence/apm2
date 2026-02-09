@@ -346,14 +346,14 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
         ),
         Box<apm2_core::pcac::AuthorityDenyV1>,
     > {
-        // MAJOR 1 FIX: validate -> durable-commit -> finalize.
+        // MAJOR 3 FIX: DurableKernel replaces inner kernel's consume entirely.
+        // This eliminates double-consume and ordering issues where durable state
+        // was committed before the inner kernel validated.
         //
-        // Step 1: Validate via inner kernel FIRST, but use a validation-only
-        // check (intent equality) to confirm the consume would succeed.
-        // This prevents burning durable state on a doomed consume.
-        //
-        // We check intent digest equality here (the primary validation that
-        // can fail) before committing durably.
+        // Sequence: validate intent -> durable commit -> construct witnesses.
+        // The inner kernel is NOT called for consume.
+
+        // Step 1: Validate intent digest equality (Law 2).
         if intent_digest != cert.intent_digest {
             return Err(Box::new(apm2_core::pcac::AuthorityDenyV1 {
                 deny_class: apm2_core::pcac::AuthorityDenyClass::IntentDigestMismatch {
@@ -368,7 +368,8 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
         }
 
         // Step 2: Commit durably. The durable index enforces single-use
-        // (AlreadyConsumed) and persists before returning Ok.
+        // (AlreadyConsumed) and persists (fsync) before returning Ok.
+        // This is the pre-effect durability barrier.
         if let Err(e) = self.durable_index.record_consume(cert.ajc_id) {
             let denied_at_tick = 0u64;
             match e {
@@ -407,10 +408,36 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
             }
         }
 
-        // Step 3: Finalize — durable record committed, now produce the
-        // consume witnesses via the inner kernel.
-        self.inner
-            .consume(cert, intent_digest, current_time_envelope_ref)
+        // Step 3: Construct consume witnesses directly (same logic as
+        // InProcessKernel::consume but WITHOUT calling inner.consume()).
+        // The durable record is already committed, so this is pure
+        // witness construction with no state mutation.
+        let effect_selector_digest = {
+            use blake3::Hasher;
+            let mut hasher = Hasher::new();
+            hasher.update(&cert.ajc_id);
+            hasher.update(&intent_digest);
+            // Use 0 for tick since DurableKernel does not track ticks;
+            // the durable index is the authoritative single-use record.
+            hasher.update(&0u64.to_le_bytes());
+            *hasher.finalize().as_bytes()
+        };
+
+        let consumed_witness = apm2_core::pcac::AuthorityConsumedV1 {
+            ajc_id: cert.ajc_id,
+            intent_digest,
+            consumed_time_envelope_ref: current_time_envelope_ref,
+            consumed_at_tick: 0,
+        };
+
+        let consume_record = apm2_core::pcac::AuthorityConsumeRecordV1 {
+            ajc_id: cert.ajc_id,
+            consumed_time_envelope_ref: current_time_envelope_ref,
+            consumed_at_tick: 0,
+            effect_selector_digest,
+        };
+
+        Ok((consumed_witness, consume_record))
     }
 }
 

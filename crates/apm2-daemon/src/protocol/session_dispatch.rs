@@ -1950,7 +1950,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // silent None bypass in the authoritative path. The Option remains
         // so non-authoritative test paths still compile, but production
         // constructors always wire it.
-        let _pcac_receipts = if let Some(ref pcac_gate) = self.pcac_lifecycle_gate {
+        // MAJOR 2 FIX: Capture receipts (not discarded) for logging and audit.
+        let pcac_receipts = if let Some(ref pcac_gate) = self.pcac_lifecycle_gate {
             // BLOCKER 2 FIX: Derive ALL PCAC fields from authoritative sources.
             // If any required source is unavailable, DENY (fail-closed).
 
@@ -2017,9 +2018,23 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 *blake3::hash(session_state.capability_manifest_hash.as_slice()).as_bytes()
             };
 
-            // Derive directory_head_hash from authoritative session state.
-            let directory_head_hash =
-                *blake3::hash(session_state.capability_manifest_hash.as_slice()).as_bytes();
+            // BLOCKER 2 FIX: Derive directory_head_hash from governance/directory
+            // source (policy_resolved_ref), NOT from capability_manifest_hash.
+            // Using capability_manifest_hash creates data aliasing where
+            // directory_head_hash == capability_manifest_hash, defeating
+            // domain separation.
+            let directory_head_hash = if session_state.policy_resolved_ref.is_empty() {
+                // Phase 1 fallback: derive from session_id + work_id to maintain
+                // domain separation from capability_manifest_hash.
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"directory_head:");
+                hasher.update(session_state.session_id.as_bytes());
+                hasher.update(b":");
+                hasher.update(session_state.work_id.as_bytes());
+                *hasher.finalize().as_bytes()
+            } else {
+                *blake3::hash(session_state.policy_resolved_ref.as_bytes()).as_bytes()
+            };
 
             // Derive identity_proof_hash from session ID (HMAC-validated).
             let identity_proof_hash = *blake3::hash(token.session_id.as_bytes()).as_bytes();
@@ -2133,10 +2148,55 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 as_of_ledger_anchor,
             };
 
-            // Derive current state for revalidation from authoritative sources.
-            let current_time_envelope_ref = pcac_input.time_envelope_ref;
-            let current_ledger_anchor = pcac_input.as_of_ledger_anchor;
-            let current_revocation_head = pcac_input.directory_head_hash;
+            // BLOCKER 2 FIX: Re-derive revalidation parameters from FRESH
+            // authoritative sources. Using pcac_input values would be tautological
+            // (comparing the AJC against itself). We re-read the clock for a fresh
+            // time envelope, re-derive the ledger anchor, and re-read the directory
+            // head from session state.
+            let revalidation_hlc = match clock.now_hlc() {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(
+                        session_id = %token.session_id,
+                        error = %e,
+                        "PCAC revalidation denied: fresh clock read failed (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("PCAC revalidation denied: clock read failed: {e}"),
+                    ));
+                },
+            };
+            let current_time_envelope_ref =
+                *blake3::hash(&revalidation_hlc.wall_ns.to_le_bytes()).as_bytes();
+            // Re-derive ledger anchor from fresh clock state.
+            let current_ledger_anchor = if self.ledger.is_some() {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"ledger_anchor:");
+                hasher.update(token.session_id.as_bytes());
+                hasher.update(&revalidation_hlc.wall_ns.to_le_bytes());
+                *hasher.finalize().as_bytes()
+            } else {
+                // Ledger unavailable at revalidation: fail-closed.
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC revalidation denied: ledger unavailable (fail-closed)",
+                ));
+            };
+            // Re-read directory head from authoritative session state (governance source).
+            let current_revocation_head = {
+                let fresh_session = reg.get_session(&token.session_id);
+                match fresh_session {
+                    Some(s) if !s.policy_resolved_ref.is_empty() => {
+                        *blake3::hash(s.policy_resolved_ref.as_bytes()).as_bytes()
+                    },
+                    _ => {
+                        // Fall back to capability manifest hash for Phase 1,
+                        // but derive from a governance-adjacent field.
+                        *blake3::hash(session_state.policy_resolved_ref.as_bytes()).as_bytes()
+                    },
+                }
+            };
 
             match pcac_gate.execute(
                 &pcac_input,
@@ -2145,10 +2205,22 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 current_revocation_head,
             ) {
                 Ok(receipts) => {
+                    // MAJOR 2 FIX: Log receipts at info level with AJC ID and
+                    // consume record hash for audit trail.
+                    let consume_record_hash = {
+                        let mut hasher = blake3::Hasher::new();
+                        hasher.update(&receipts.consume_record.ajc_id);
+                        hasher.update(&receipts.consume_record.consumed_time_envelope_ref);
+                        hasher.update(&receipts.consume_record.consumed_at_tick.to_le_bytes());
+                        hasher.update(&receipts.consume_record.effect_selector_digest);
+                        hex::encode(hasher.finalize().as_bytes())
+                    };
                     info!(
                         session_id = %token.session_id,
                         ajc_id = %hex::encode(receipts.certificate.ajc_id),
-                        "PCAC lifecycle gate passed: authority consumed"
+                        consume_record_hash = %consume_record_hash,
+                        consumed_at_tick = receipts.consume_record.consumed_at_tick,
+                        "PCAC lifecycle gate passed: authority consumed with receipts"
                     );
                     Some(receipts)
                 },
@@ -2164,9 +2236,34 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     ));
                 },
             }
+        } else if self.ledger.is_some() || self.cas.is_some() {
+            // MAJOR 1 FIX: Authoritative mode (ledger or CAS wired) requires the
+            // PCAC gate — fail-closed per CTR-2617.
+            warn!(
+                session_id = %token.session_id,
+                "RequestTool denied: PCAC authority gate not wired in authoritative mode (fail-closed)"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                "PCAC authority gate not wired in authoritative mode (fail-closed)",
+            ));
         } else {
             None
         };
+
+        // MAJOR 2 FIX (continued): Log receipts summary after PCAC gate.
+        // The full receipts are captured above; ensure they are not silently
+        // dropped. In Phase 2, these will be attached to response metadata.
+        if let Some(receipts) = pcac_receipts {
+            tracing::debug!(
+                ajc_id = %hex::encode(receipts.certificate.ajc_id),
+                effect_selector_digest = %hex::encode(receipts.consume_record.effect_selector_digest),
+                "PCAC receipts captured for tool request"
+            );
+            // Phase 2 TODO: attach receipts to response metadata.
+            // For now the receipts are consumed by the debug log above.
+            let _ = receipts;
+        }
 
         // TCK-00290: Use ToolBroker for request validation and execution
         // Per DOD: "RequestTool executes via ToolBroker and returns ToolResult or Deny"
@@ -5655,8 +5752,10 @@ mod tests {
                     role: crate::protocol::messages::WorkRole::Implementer.into(),
                     lease_id: "L-TCK-00375".to_string(),
                     ephemeral_handle: "handle-tck-00375".to_string(),
-                    policy_resolved_ref: String::new(),
-                    capability_manifest_hash: vec![],
+                    // TCK-00426: PCAC gate requires non-empty manifest hash
+                    // and policy_resolved_ref in authoritative mode.
+                    policy_resolved_ref: "test-policy-ref".to_string(),
+                    capability_manifest_hash: blake3::hash(b"test-manifest").as_bytes().to_vec(),
                     episode_id: Some(session_id.to_string()),
                 })
                 .expect("session registration should succeed");
@@ -5828,6 +5927,10 @@ mod tests {
                 let ledger = Arc::new(StubLedgerEventEmitter::new());
                 let ledger_dyn: Arc<dyn LedgerEventEmitter> = ledger.clone();
 
+                // TCK-00426: Wire PCAC gate — required in authoritative mode (fail-closed).
+                let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                    Arc::new(crate::pcac::InProcessKernel::new(1));
+                let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
                 let dispatcher =
                     SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
                         .with_broker(broker)
@@ -5837,7 +5940,8 @@ mod tests {
                         .with_session_registry(registry_dyn)
                         .with_telemetry_store(Arc::clone(&telemetry_store))
                         .with_preactuation_gate(preactuation_gate)
-                        .with_stop_authority(stop_authority);
+                        .with_stop_authority(stop_authority)
+                        .with_pcac_lifecycle_gate(pcac_gate);
 
                 let spawn_time = std::time::SystemTime::now();
                 let token = minter
@@ -6050,6 +6154,10 @@ mod tests {
                 let ledger_dyn: Arc<dyn LedgerEventEmitter> =
                     Arc::new(StubLedgerEventEmitter::new());
 
+                // TCK-00426: Wire PCAC gate — required in authoritative mode (fail-closed).
+                let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                    Arc::new(crate::pcac::InProcessKernel::new(1));
+                let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
                 let dispatcher =
                     SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
                         .with_broker(broker)
@@ -6059,7 +6167,8 @@ mod tests {
                         .with_session_registry(registry_dyn)
                         .with_telemetry_store(Arc::clone(&telemetry_store))
                         .with_preactuation_gate(preactuation_gate)
-                        .with_stop_authority(stop_authority);
+                        .with_stop_authority(stop_authority)
+                        .with_pcac_lifecycle_gate(pcac_gate);
 
                 let spawn_time = std::time::SystemTime::now();
                 let token = minter
@@ -7027,8 +7136,12 @@ mod tests {
                     role: crate::protocol::messages::WorkRole::Implementer.into(),
                     lease_id: "L-E2E-001".to_string(),
                     ephemeral_handle: "handle-e2e".to_string(),
-                    policy_resolved_ref: String::new(),
-                    capability_manifest_hash: vec![],
+                    // TCK-00426: PCAC gate requires non-empty manifest hash and
+                    // policy_resolved_ref in authoritative mode.
+                    policy_resolved_ref: "test-policy-ref".to_string(),
+                    capability_manifest_hash: blake3::hash(b"e2e-read-manifest")
+                        .as_bytes()
+                        .to_vec(),
                     episode_id: Some(session_id.clone()),
                 };
                 registry
@@ -7059,6 +7172,10 @@ mod tests {
                         None,
                     ),
                 );
+                // TCK-00426: Wire PCAC gate — required in authoritative mode (fail-closed).
+                let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                    Arc::new(crate::pcac::InProcessKernel::new(1));
+                let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
                 let dispatcher =
                     SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
                         .with_broker(broker)
@@ -7068,7 +7185,8 @@ mod tests {
                         .with_session_registry(Arc::clone(&registry))
                         .with_telemetry_store(Arc::clone(&telemetry_store))
                         .with_preactuation_gate(preactuation_gate)
-                        .with_stop_authority(stop_authority);
+                        .with_stop_authority(stop_authority)
+                        .with_pcac_lifecycle_gate(pcac_gate);
 
                 // Mint token with the episode-derived session_id
                 let spawn_time = std::time::SystemTime::now();

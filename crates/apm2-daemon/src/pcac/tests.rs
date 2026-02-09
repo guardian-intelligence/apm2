@@ -9,6 +9,7 @@ use apm2_core::pcac::{
     IdentityEvidenceLevel, RiskTier,
 };
 
+use super::durable_consume::DurableConsumeIndex;
 use super::lifecycle_gate::{InProcessKernel, LifecycleGate};
 
 fn test_hash(byte: u8) -> Hash {
@@ -462,4 +463,253 @@ fn pre_actuation_receipt_binding() {
         input.directory_head_hash,
     );
     assert!(result.is_ok());
+}
+
+// =============================================================================
+// TCK-00426 BLOCKER 1: DurableKernel in production constructor tests
+// =============================================================================
+
+#[test]
+fn durable_kernel_lifecycle_gate_integration() {
+    // BLOCKER 1 regression: Verify that a LifecycleGate wrapping a
+    // DurableKernel + FileBackedConsumeIndex produces valid receipts
+    // and enforces single-use consumption across the full lifecycle.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("consume.log");
+    let index = super::durable_consume::FileBackedConsumeIndex::open(&path, None).unwrap();
+    let inner = InProcessKernel::new(100);
+    let durable = super::durable_consume::DurableKernel::new(inner, Box::new(index));
+    let gate = LifecycleGate::new(Arc::new(durable));
+
+    let input = valid_input();
+    let receipts = gate
+        .execute(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("durable lifecycle gate should succeed");
+
+    assert_ne!(receipts.certificate.ajc_id, zero_hash());
+    assert_eq!(receipts.consume_record.ajc_id, receipts.certificate.ajc_id);
+
+    // Verify durable log was written.
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        contents.contains(&hex::encode(receipts.certificate.ajc_id)),
+        "durable consume log must contain the AJC ID after lifecycle gate"
+    );
+
+    // Second lifecycle execution at same tick must be denied (durable single-use).
+    let err = gate
+        .execute(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::AlreadyConsumed { .. }),
+        "durable lifecycle gate must deny duplicate at same tick"
+    );
+}
+
+// =============================================================================
+// TCK-00426 BLOCKER 2: Revalidation expiry test
+// =============================================================================
+
+#[test]
+fn revalidation_denies_when_tick_advanced_past_ajc_expiry() {
+    // BLOCKER 2 regression: Construct kernel, join to get AJC, advance tick
+    // past expiry, verify revalidation DENIES. This tests the kernel-level
+    // revalidation that the LifecycleGate calls between join and consume.
+    //
+    // Note: LifecycleGate.execute() calls join() which creates a NEW AJC
+    // at the current tick, so the AJC is never immediately expired. The
+    // meaningful test is that revalidation of an EXISTING AJC fails when
+    // time has progressed past its expiry — which is what happens in
+    // production between the join and a later revalidation-before-execution.
+    let kernel = InProcessKernel::new(100);
+    let input = valid_input();
+
+    // Join to get an AJC with expires_at_tick = 100 + 300 = 400.
+    let cert = kernel.join(&input).unwrap();
+    assert_eq!(cert.expires_at_tick, 400);
+
+    // Revalidation succeeds while tick is within expiry.
+    kernel.advance_tick(399);
+    kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            cert.revocation_head_hash,
+        )
+        .expect("revalidation at tick 399 should succeed");
+
+    // Advance tick past AJC expiry (tick > expires_at_tick).
+    kernel.advance_tick(401);
+
+    // Revalidation must now DENY with CertificateExpired.
+    let err = kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            cert.revocation_head_hash,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.deny_class,
+            AuthorityDenyClass::CertificateExpired {
+                expired_at: 400,
+                current_tick: 401
+            }
+        ),
+        "revalidation must deny expired AJC, got: {:?}",
+        err.deny_class
+    );
+}
+
+#[test]
+fn revalidation_denies_with_different_revocation_head() {
+    // BLOCKER 2 regression: Verify that revalidation detects revocation
+    // frontier advancement (a governance change between join and revalidate).
+    let kernel = InProcessKernel::new(100);
+    let input = valid_input();
+    let cert = kernel.join(&input).unwrap();
+
+    // Original revocation head matches — succeeds.
+    kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            cert.revocation_head_hash,
+        )
+        .expect("original revocation head should pass");
+
+    // Changed revocation head — denied (governance state changed).
+    let err = kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            test_hash(0xDE), // Different revocation head
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.deny_class,
+            AuthorityDenyClass::RevocationFrontierAdvanced
+        ),
+        "revalidation must deny when revocation frontier has advanced"
+    );
+}
+
+// =============================================================================
+// TCK-00426 MAJOR 3: DurableKernel does not double-consume
+// =============================================================================
+
+#[test]
+fn durable_kernel_consume_does_not_double_consume_inner() {
+    // MAJOR 3 regression: After DurableKernel::consume succeeds, the inner
+    // kernel's consumed set should NOT contain the AJC ID — because
+    // DurableKernel now constructs witnesses directly without calling
+    // inner.consume(). This eliminates the double-consume ordering issue.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("consume.log");
+    let index = super::durable_consume::FileBackedConsumeIndex::open(&path, None).unwrap();
+    let inner = InProcessKernel::new(100);
+    let durable = super::durable_consume::DurableKernel::new(inner, Box::new(index));
+
+    let input = valid_input();
+    let cert = durable.join(&input).unwrap();
+
+    // Consume through the durable kernel.
+    let (witness, record) = durable
+        .consume(&cert, input.intent_digest, input.time_envelope_ref)
+        .unwrap();
+
+    // Verify witnesses are correct.
+    assert_eq!(witness.ajc_id, cert.ajc_id);
+    assert_eq!(record.ajc_id, cert.ajc_id);
+    assert_eq!(witness.intent_digest, input.intent_digest);
+    assert_ne!(record.effect_selector_digest, zero_hash());
+
+    // Verify durable index recorded the consume.
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        contents.contains(&hex::encode(cert.ajc_id)),
+        "durable log must contain the AJC ID"
+    );
+
+    // Second consume through durable kernel must be denied by durable index.
+    let err = durable
+        .consume(&cert, input.intent_digest, input.time_envelope_ref)
+        .unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::AlreadyConsumed { .. }),
+        "durable kernel must deny double consume"
+    );
+}
+
+#[test]
+fn durable_kernel_crash_replay_lifecycle_gate() {
+    // MAJOR 3 + BLOCKER 1 combined regression: Verify that after crash-replay,
+    // a new DurableKernel wrapping the same consume log denies previously
+    // consumed AJC IDs through the LifecycleGate.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("consume.log");
+    let input = valid_input();
+    let ajc_id;
+
+    // Session 1: Consume via lifecycle gate.
+    {
+        let index = super::durable_consume::FileBackedConsumeIndex::open(&path, None).unwrap();
+        let inner = InProcessKernel::new(100);
+        let durable = super::durable_consume::DurableKernel::new(inner, Box::new(index));
+        let gate = LifecycleGate::new(Arc::new(durable));
+
+        let receipts = gate
+            .execute(
+                &input,
+                input.time_envelope_ref,
+                input.as_of_ledger_anchor,
+                input.directory_head_hash,
+            )
+            .unwrap();
+        ajc_id = receipts.certificate.ajc_id;
+    }
+    // Drop = simulated crash.
+
+    // Session 2: Reopen and verify denial.
+    {
+        let index = super::durable_consume::FileBackedConsumeIndex::open(&path, None).unwrap();
+        assert!(
+            index.is_consumed(&ajc_id),
+            "crash-replayed index must contain previously consumed AJC ID"
+        );
+
+        let inner = InProcessKernel::new(100);
+        let durable = super::durable_consume::DurableKernel::new(inner, Box::new(index));
+        let gate = LifecycleGate::new(Arc::new(durable));
+
+        // Same input at same tick produces same AJC ID.
+        let err = gate
+            .execute(
+                &input,
+                input.time_envelope_ref,
+                input.as_of_ledger_anchor,
+                input.directory_head_hash,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err.deny_class, AuthorityDenyClass::AlreadyConsumed { .. }),
+            "crash-replayed lifecycle gate must deny previously consumed AJC"
+        );
+    }
 }

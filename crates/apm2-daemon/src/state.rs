@@ -941,8 +941,39 @@ impl DispatcherState {
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         // TCK-00351: Wire pre-actuation gate, stop authority, and stop conditions store
         // TCK-00352: Wire V1 manifest store for scope enforcement
-        // TCK-00426 BLOCKER 4: Wire PCAC lifecycle gate in production path.
-        let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+        // TCK-00426 BLOCKER 1 FIX: Wire DurableKernel in with_persistence path.
+        // Without a CAS path, we use a temporary directory. This is logged as a
+        // warning because durable consume state will not survive daemon restarts.
+        let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> = {
+            let instance_id = uuid::Uuid::new_v4();
+            let consume_log_dir = std::env::temp_dir().join(format!("apm2_pcac_{instance_id}"));
+            if let Err(e) = std::fs::create_dir_all(&consume_log_dir) {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to create PCAC consume log directory; falling back to InProcessKernel"
+                );
+                Arc::new(crate::pcac::InProcessKernel::new(1))
+            } else {
+                let consume_log_path = consume_log_dir.join("pcac_consume.log");
+                tracing::warn!(
+                    path = %consume_log_path.display(),
+                    "Using temporary consume log path — durable state will not survive restarts"
+                );
+                match crate::pcac::FileBackedConsumeIndex::open(&consume_log_path, None) {
+                    Ok(index) => {
+                        let inner = crate::pcac::InProcessKernel::new(1);
+                        Arc::new(crate::pcac::DurableKernel::new(inner, Box::new(index)))
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to open durable consume index; falling back to InProcessKernel"
+                        );
+                        Arc::new(crate::pcac::InProcessKernel::new(1))
+                    },
+                }
+            }
+        };
         let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
@@ -1277,8 +1308,20 @@ impl DispatcherState {
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         // TCK-00351: Wire pre-actuation gate, stop authority, stop conditions store
         // TCK-00352: Wire V1 manifest store for scope enforcement
-        // TCK-00426 BLOCKER 4: Wire PCAC lifecycle gate in production path.
-        let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+        // TCK-00426 BLOCKER 1 FIX: Wire DurableKernel + FileBackedConsumeIndex
+        // in production constructor. The consume log path is co-located inside
+        // the CAS directory to ensure per-instance isolation.
+        let consume_log_path = cas_path.as_ref().join("pcac_consume.log");
+        let durable_index = crate::pcac::FileBackedConsumeIndex::open(&consume_log_path, None)
+            .map_err(|e| crate::cas::DurableCasError::InitializationFailed {
+                message: format!(
+                    "failed to open durable consume index at {}: {e}",
+                    consume_log_path.display()
+                ),
+            })?;
+        let inner_kernel = crate::pcac::InProcessKernel::new(1);
+        let durable_kernel = crate::pcac::DurableKernel::new(inner_kernel, Box::new(durable_index));
+        let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> = Arc::new(durable_kernel);
         let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
