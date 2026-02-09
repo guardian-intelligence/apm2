@@ -6,6 +6,7 @@ use apm2_core::events::alias_reconcile::{
     SnapshotSunsetCriteria, TicketAliasBinding, evaluate_sunset, promotion_gate, reconcile_aliases,
 };
 use apm2_core::work::{Work, WorkState};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::warn;
 
@@ -369,6 +370,20 @@ pub const DEFAULT_MIN_RECONCILED_TICKS: u64 = 50;
 ///   mismatches.
 /// - [CTR-ALIAS-004] Runtime authority decisions remain `work_id`-centric;
 ///   alias reconciliation is advisory but promotion-blocking.
+///
+/// # Current Limitation: Identity-Mapped Aliases
+///
+/// In the current implementation, alias registration requires explicit
+/// `register_alias()` calls from an operator layer. The default `ClaimWork`
+/// wire-protocol path registers only identity mappings (`work_id` ->
+/// `work_id`), meaning the reconciliation gate validates that a `work_id`
+/// resolves to itself in the projection -- a structural placeholder that
+/// verifies projection wiring and staleness enforcement but does not check
+/// real `TCK-*` alias-to-`work_id` mappings.
+///
+/// Real alias bindings require the operator layer or policy resolver to
+/// supply the `ticket_alias` field. See `TODO(TCK-00425)` for the planned
+/// follow-up to wire real aliases through policy resolution.
 pub trait AliasReconciliationGate: Send + Sync {
     /// Runs alias reconciliation against the current projection state and
     /// returns whether promotion is permitted (zero defects).
@@ -380,13 +395,21 @@ pub trait AliasReconciliationGate: Send + Sync {
     ///
     /// # Returns
     ///
-    /// `Ok(true)` if promotion is permitted (zero defects), `Ok(false)` if
-    /// any defects were found (fail-closed). `Err` on infrastructure failure.
+    /// `Ok(result)` with zero unresolved defects if promotion is permitted,
+    /// or non-empty defects if any were found (fail-closed). `Err` on
+    /// infrastructure failure.
     fn check_promotion(
         &self,
         bindings: &[TicketAliasBinding],
         current_tick: u64,
     ) -> Result<AliasReconciliationResult, WorkAuthorityError>;
+
+    /// Returns the observation window configuration used by this gate.
+    ///
+    /// Callers use this to populate `TicketAliasBinding` fields
+    /// (`observation_window_start`, `observation_window_end`) from the
+    /// gate's actual configuration rather than hardcoded values.
+    fn observation_window(&self) -> &ObservationWindow;
 
     /// Evaluates snapshot-emitter sunset status based on reconciliation
     /// history.
@@ -457,13 +480,15 @@ impl ProjectionAliasReconciliationGate {
         }
     }
 
-    /// Returns the observation window configuration.
-    #[must_use]
-    pub const fn observation_window(&self) -> &ObservationWindow {
-        &self.observation_window
-    }
-
     /// Refreshes the projection from ledger events if the event count changed.
+    ///
+    /// Lock failures are propagated as `ProjectionLock` errors (fail-closed).
+    /// Projection rebuild failures (e.g., individual work item reducer errors)
+    /// are logged at warning level and the gate retains the last successfully
+    /// built projection state. This means the gate will check against a
+    /// possibly-stale (but internally consistent) projection rather than
+    /// failing outright. Staleness is enforced separately by the observation
+    /// window's `max_staleness_ticks` configuration.
     fn refresh_projection(&self) -> Result<(), WorkAuthorityError> {
         let current_count = self.event_emitter.get_event_count();
 
@@ -491,10 +516,25 @@ impl ProjectionAliasReconciliationGate {
                 .map_err(|err| WorkAuthorityError::ProjectionLock {
                     message: err.to_string(),
                 })?;
-        projection.rebuild_from_signed_events(&work_events)?;
 
-        if let Ok(mut cached) = self.last_event_count.write() {
-            *cached = current_count;
+        match projection.rebuild_from_signed_events(&work_events) {
+            Ok(()) => {
+                if let Ok(mut cached) = self.last_event_count.write() {
+                    *cached = current_count;
+                }
+            },
+            Err(e) => {
+                // Projection rebuild failed for some work items, but the
+                // gate retains the last successfully built state. Staleness
+                // enforcement via observation_window.max_staleness_ticks
+                // ensures that bindings checked against a stale projection
+                // are still caught by the DefectClass::Stale path.
+                warn!(
+                    error = %e,
+                    "Alias reconciliation gate: projection rebuild warning; \
+                     retaining last consistent projection state"
+                );
+            },
         }
         Ok(())
     }
@@ -597,6 +637,10 @@ impl AliasReconciliationGate for ProjectionAliasReconciliationGate {
         Ok(result)
     }
 
+    fn observation_window(&self) -> &ObservationWindow {
+        &self.observation_window
+    }
+
     fn evaluate_emitter_sunset(
         &self,
         consecutive_clean_ticks: u64,
@@ -606,16 +650,30 @@ impl AliasReconciliationGate for ProjectionAliasReconciliationGate {
     }
 }
 
+/// Domain-separation prefix for `work_id` hashing.
+///
+/// This prefix ensures that `work_id_to_hash` outputs cannot collide with
+/// hashes derived from other domain contexts (e.g., session tokens, envelope
+/// digests).
+const ALIAS_RECONCILE_DOMAIN_PREFIX: &[u8] = b"apm2.alias_reconcile.work_id:";
+
 /// Converts a `work_id` string to a 32-byte hash for the alias reconciliation
-/// module's `Hash` type. Uses a simple deterministic hash (first 32 bytes of
-/// SHA-256 equivalent via byte spreading).
+/// module's `Hash` type. Uses domain-separated SHA-256 to produce a
+/// collision-resistant canonical identity token.
+///
+/// # Domain Separation
+///
+/// The hash is computed as `SHA-256(ALIAS_RECONCILE_DOMAIN_PREFIX || work_id)`,
+/// ensuring that identical `work_id` bytes in different contexts produce
+/// distinct hashes.
 #[must_use]
 pub fn work_id_to_hash(work_id: &str) -> alias_reconcile::Hash {
-    let bytes = work_id.as_bytes();
+    let mut hasher = Sha256::new();
+    hasher.update(ALIAS_RECONCILE_DOMAIN_PREFIX);
+    hasher.update(work_id.as_bytes());
+    let result = hasher.finalize();
     let mut hash = [0u8; 32];
-    for (i, byte) in bytes.iter().enumerate() {
-        hash[i % 32] ^= byte;
-    }
+    hash.copy_from_slice(&result);
     hash
 }
 
@@ -635,6 +693,67 @@ mod tests {
         let h1 = work_id_to_hash("work-123");
         let h2 = work_id_to_hash("work-456");
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn work_id_to_hash_is_sha256_not_xor() {
+        // Verify the hash is a proper SHA-256 digest, not XOR folding.
+        // XOR folding would produce [0; 32] for two identical 32-byte
+        // blocks, so a 64-byte input of all 'A's would XOR to [0; 32].
+        let long_input = "A".repeat(64);
+        let hash = work_id_to_hash(&long_input);
+        assert_ne!(
+            hash, [0u8; 32],
+            "SHA-256 hash must not be zero for non-empty input"
+        );
+
+        // Also verify against a known SHA-256 property: hash length is 32 bytes
+        // and different inputs of similar shape produce different outputs.
+        let hash_a = work_id_to_hash(&"A".repeat(33));
+        let hash_b = work_id_to_hash(&"B".repeat(33));
+        assert_ne!(
+            hash_a, hash_b,
+            "distinct inputs must produce distinct SHA-256 outputs"
+        );
+    }
+
+    #[test]
+    fn work_id_to_hash_adversarial_collision_resistance() {
+        // Under XOR folding, "A" repeated 33 times and "B" + "A"*31 + "B"
+        // would collide because XOR(A[0]^B[0], A[32]^B[32]) cancels out.
+        // SHA-256 must NOT produce a collision for these adversarial inputs.
+        let input_a = "A".repeat(33);
+        let mut input_b_bytes = vec![b'B'];
+        input_b_bytes.extend_from_slice(&[b'A'; 31]);
+        input_b_bytes.push(b'B');
+        let input_b = String::from_utf8(input_b_bytes).unwrap();
+
+        let hash_a = work_id_to_hash(&input_a);
+        let hash_b = work_id_to_hash(&input_b);
+        assert_ne!(
+            hash_a, hash_b,
+            "adversarial inputs must not collide under SHA-256"
+        );
+    }
+
+    #[test]
+    fn work_id_to_hash_domain_separated() {
+        // Verify domain separation: the raw SHA-256 of a work_id (without
+        // prefix) must differ from work_id_to_hash output.
+        let work_id = "W-DOMAIN-TEST-001";
+        let hash_with_domain = work_id_to_hash(work_id);
+
+        // Compute SHA-256 without domain prefix
+        let mut hasher = Sha256::new();
+        hasher.update(work_id.as_bytes());
+        let raw_result = hasher.finalize();
+        let mut raw_hash = [0u8; 32];
+        raw_hash.copy_from_slice(&raw_result);
+
+        assert_ne!(
+            hash_with_domain, raw_hash,
+            "domain-separated hash must differ from raw SHA-256 of same input"
+        );
     }
 
     #[test]

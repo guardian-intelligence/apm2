@@ -8869,14 +8869,18 @@ impl PrivilegedDispatcher {
                 },
             };
 
+            // Read observation window from the gate's configuration rather
+            // than using hardcoded values.
+            let obs_window = self.alias_reconciliation_gate.observation_window();
+
             let binding = TicketAliasBinding {
                 // Identity mapping: ticket_alias == work_id for now.
                 // TODO(TCK-00425): Use real ticket alias from policy resolution.
                 ticket_alias: request.work_id.clone(),
                 canonical_work_id: work_id_to_hash(&request.work_id),
                 observed_at_tick: current_tick,
-                observation_window_start: 0,
-                observation_window_end: current_tick.saturating_add(1),
+                observation_window_start: obs_window.start_tick,
+                observation_window_end: obs_window.end_tick,
             };
 
             match self
@@ -8932,44 +8936,23 @@ impl PrivilegedDispatcher {
                     );
                 },
                 Err(e) => {
-                    // BLOCKER 3 fix: Infrastructure errors fail-closed
-                    // (CTR-2617).
+                    // Infrastructure errors fail-closed per CTR-2617
+                    // (Distributed Capabilities Are Fail-Closed).
                     //
-                    // Lock failures are true infrastructure errors that MUST
-                    // block promotion -- the projection state is unknown.
-                    //
-                    // Projection rebuild errors can occur when the event stream
-                    // contains events that don't form a consistent projection
-                    // (e.g., transition events without matching open events).
-                    // Since the claim existence and authority bindings are
-                    // already validated upstream by work_registry.get_claim()
-                    // and derive_transition_authority_bindings(), projection
-                    // rebuild errors are logged at warning level and treated as
-                    // "gate passed with warning" rather than hard rejections.
-                    // This prevents false-positive rejections from unrelated
-                    // event stream inconsistencies while maintaining fail-closed
-                    // for actual infrastructure failures (lock poisoning).
-                    use crate::work::authority::WorkAuthorityError;
-                    match e {
-                        WorkAuthorityError::ProjectionLock { .. } => {
-                            warn!(
-                                error = %e,
-                                work_id = %request.work_id,
-                                "SpawnEpisode rejected: alias reconciliation lock failure (fail-closed)"
-                            );
-                            return Ok(PrivilegedResponse::error(
-                                PrivilegedErrorCode::CapabilityRequestRejected,
-                                format!("alias reconciliation gate lock failure: {e}"),
-                            ));
-                        },
-                        _ => {
-                            warn!(
-                                error = %e,
-                                work_id = %request.work_id,
-                                "Alias reconciliation gate: projection rebuild warning (non-blocking)"
-                            );
-                        },
-                    }
+                    // The gate's refresh_projection() handles projection
+                    // rebuild errors internally (retaining last good state),
+                    // so errors reaching this point are true infrastructure
+                    // failures (lock poisoning) where the gate state is
+                    // unknown and promotion MUST be rejected.
+                    warn!(
+                        error = %e,
+                        work_id = %request.work_id,
+                        "SpawnEpisode rejected: alias reconciliation infrastructure failure (fail-closed)"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("alias reconciliation gate infrastructure failure: {e}"),
+                    ));
                 },
             }
         }
