@@ -242,23 +242,54 @@ impl SovereigntyChecker {
         }
     }
 
-    /// Builds the domain-separated signing payload for sovereignty epochs.
+    /// Computes the BLAKE3 digest of a principal ID for scope binding.
     #[must_use]
-    pub fn epoch_signing_message(epoch_id: &str, freshness_tick: u64) -> Vec<u8> {
+    pub fn principal_scope_hash(principal_id: &str) -> Hash {
+        *blake3::hash(principal_id.as_bytes()).as_bytes()
+    }
+
+    /// Builds the domain-separated signing payload for sovereignty epochs.
+    ///
+    /// The payload includes the principal scope hash to cryptographically
+    /// bind the epoch to a specific principal, preventing cross-principal
+    /// replay attacks.
+    #[must_use]
+    pub fn epoch_signing_message(
+        principal_scope_hash: &Hash,
+        epoch_id: &str,
+        freshness_tick: u64,
+    ) -> Vec<u8> {
         let mut message = Vec::with_capacity(
-            EPOCH_DOMAIN_SEPARATOR.len() + epoch_id.len() + std::mem::size_of::<u64>(),
+            EPOCH_DOMAIN_SEPARATOR.len()
+                + 32 // principal_scope_hash
+                + epoch_id.len()
+                + std::mem::size_of::<u64>(),
         );
         message.extend_from_slice(EPOCH_DOMAIN_SEPARATOR);
+        message.extend_from_slice(principal_scope_hash);
         message.extend_from_slice(epoch_id.as_bytes());
         message.extend_from_slice(&freshness_tick.to_le_bytes());
         message
     }
 
     /// Signs a sovereignty epoch with Ed25519 and domain separation.
+    ///
+    /// The signature commits to the `principal_scope_hash`, preventing
+    /// cross-principal replay of signed epochs.
     #[must_use]
-    pub fn sign_epoch(signing_key: &SigningKey, epoch_id: &str, freshness_tick: u64) -> [u8; 64] {
+    pub fn sign_epoch(
+        signing_key: &SigningKey,
+        principal_id: &str,
+        epoch_id: &str,
+        freshness_tick: u64,
+    ) -> [u8; 64] {
+        let scope_hash = Self::principal_scope_hash(principal_id);
         signing_key
-            .sign(&Self::epoch_signing_message(epoch_id, freshness_tick))
+            .sign(&Self::epoch_signing_message(
+                &scope_hash,
+                epoch_id,
+                freshness_tick,
+            ))
             .to_bytes()
     }
 
@@ -334,6 +365,28 @@ impl SovereigntyChecker {
             }));
         }
 
+        // Verify principal scope binding: the epoch's principal_scope_hash
+        // MUST match the runtime principal_id. This prevents cross-principal
+        // replay attacks where an epoch signed for principal A is presented
+        // as evidence for principal B.
+        let expected_scope_hash = Self::principal_scope_hash(&state.principal_id);
+        if epoch.principal_scope_hash != expected_scope_hash {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: AuthorityDenyClass::SovereigntyUncertainty {
+                    reason: format!(
+                        "sovereignty epoch principal_scope_hash mismatch: \
+                         epoch bound to different principal scope than runtime state '{}'",
+                        state.principal_id,
+                    ),
+                },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: current_ledger_anchor,
+                denied_at_tick: current_tick,
+                containment_action: Some(FreezeAction::HardFreeze),
+            }));
+        }
+
         // Verify Ed25519 signature over domain-separated message.
         let Ok(verifying_key) = VerifyingKey::from_bytes(&epoch.signer_public_key) else {
             return Err(Box::new(AuthorityDenyV1 {
@@ -349,7 +402,11 @@ impl SovereigntyChecker {
         };
 
         let signature = Signature::from_bytes(&epoch.signature);
-        let signing_message = Self::epoch_signing_message(&epoch.epoch_id, epoch.freshness_tick);
+        let signing_message = Self::epoch_signing_message(
+            &epoch.principal_scope_hash,
+            &epoch.epoch_id,
+            epoch.freshness_tick,
+        );
 
         if verifying_key
             .verify_strict(&signing_message, &signature)
@@ -570,21 +627,40 @@ mod tests {
         cert
     }
 
-    /// Builds a `SovereigntyEpoch` with a valid Ed25519 signature.
-    fn signed_epoch(epoch_id: &str, freshness_tick: u64, key_seed: u8) -> SovereigntyEpoch {
+    /// Builds a `SovereigntyEpoch` with a valid Ed25519 signature bound to
+    /// a principal scope.
+    fn signed_epoch(
+        epoch_id: &str,
+        freshness_tick: u64,
+        key_seed: u8,
+        principal_id: &str,
+    ) -> SovereigntyEpoch {
         let signing_key = signing_key(key_seed);
         SovereigntyEpoch {
             epoch_id: epoch_id.to_string(),
             freshness_tick,
+            principal_scope_hash: SovereigntyChecker::principal_scope_hash(principal_id),
             signer_public_key: signing_key.verifying_key().to_bytes(),
-            signature: SovereigntyChecker::sign_epoch(&signing_key, epoch_id, freshness_tick),
+            signature: SovereigntyChecker::sign_epoch(
+                &signing_key,
+                principal_id,
+                epoch_id,
+                freshness_tick,
+            ),
         }
     }
 
+    const TEST_PRINCIPAL_ID: &str = "principal-001";
+
     fn valid_sovereignty_state() -> SovereigntyState {
         SovereigntyState {
-            epoch: Some(signed_epoch("epoch-001", 100, TRUSTED_SIGNER_SEED)),
-            principal_id: "principal-001".to_string(),
+            epoch: Some(signed_epoch(
+                "epoch-001",
+                100,
+                TRUSTED_SIGNER_SEED,
+                TEST_PRINCIPAL_ID,
+            )),
+            principal_id: TEST_PRINCIPAL_ID.to_string(),
             revocation_head_known: true,
             autonomy_ceiling: Some(AutonomyCeiling {
                 max_risk_tier: RiskTier::Tier2Plus,
@@ -930,6 +1006,7 @@ mod tests {
         state.epoch = Some(SovereigntyEpoch {
             epoch_id: "epoch-bad".to_string(),
             freshness_tick: 100,
+            principal_scope_hash: SovereigntyChecker::principal_scope_hash(TEST_PRINCIPAL_ID),
             signer_public_key: test_hash(0xCC),
             signature: ZERO_SIGNATURE,
         });
@@ -949,7 +1026,12 @@ mod tests {
         let cert = tier2_cert();
         let mut state = valid_sovereignty_state();
         let untrusted_key = signing_key(0xDD).verifying_key().to_bytes();
-        state.epoch = Some(signed_epoch("epoch-untrusted", 100, 0xDD));
+        state.epoch = Some(signed_epoch(
+            "epoch-untrusted",
+            100,
+            0xDD,
+            TEST_PRINCIPAL_ID,
+        ));
 
         let err = checker
             .check_revalidate(&cert, &state, 110, test_hash(0x07), test_hash(0x08))
@@ -979,7 +1061,12 @@ mod tests {
         let cert = tier2_cert();
         // Epoch freshness_tick is 1000, current_tick is 100. Skew = 900 > 300.
         let mut state = valid_sovereignty_state();
-        state.epoch = Some(signed_epoch("epoch-future", 1000, TRUSTED_SIGNER_SEED));
+        state.epoch = Some(signed_epoch(
+            "epoch-future",
+            1000,
+            TRUSTED_SIGNER_SEED,
+            TEST_PRINCIPAL_ID,
+        ));
 
         let err = checker
             .check_revalidate(&cert, &state, 100, test_hash(0x07), test_hash(0x08))
@@ -1006,7 +1093,12 @@ mod tests {
         let cert = tier2_cert();
         let mut state = valid_sovereignty_state();
         // freshness_tick=500, current_tick=100, skew=400 > 300
-        state.epoch = Some(signed_epoch("epoch-future-2", 500, TRUSTED_SIGNER_SEED));
+        state.epoch = Some(signed_epoch(
+            "epoch-future-2",
+            500,
+            TRUSTED_SIGNER_SEED,
+            TEST_PRINCIPAL_ID,
+        ));
 
         let err = checker
             .check_consume(&cert, &state, 100, test_hash(0x07), test_hash(0x08))
@@ -1032,6 +1124,7 @@ mod tests {
             "epoch-slight-future",
             350,
             TRUSTED_SIGNER_SEED,
+            TEST_PRINCIPAL_ID,
         ));
 
         let result = checker.check_revalidate(&cert, &state, 100, test_hash(0x07), test_hash(0x08));
@@ -1048,7 +1141,12 @@ mod tests {
         let mut state = valid_sovereignty_state();
         // freshness_tick=400, current_tick=100, skew=300 == max_future_skew.
         // At the boundary, should pass (boundary is exclusive: > not >=).
-        state.epoch = Some(signed_epoch("epoch-boundary", 400, TRUSTED_SIGNER_SEED));
+        state.epoch = Some(signed_epoch(
+            "epoch-boundary",
+            400,
+            TRUSTED_SIGNER_SEED,
+            TEST_PRINCIPAL_ID,
+        ));
 
         let result = checker.check_revalidate(&cert, &state, 100, test_hash(0x07), test_hash(0x08));
         assert!(
@@ -1067,6 +1165,7 @@ mod tests {
             "epoch-past-boundary",
             401,
             TRUSTED_SIGNER_SEED,
+            TEST_PRINCIPAL_ID,
         ));
 
         let err = checker
@@ -1091,6 +1190,7 @@ mod tests {
             "epoch-adversarial",
             u64::MAX - 1,
             TRUSTED_SIGNER_SEED,
+            TEST_PRINCIPAL_ID,
         ));
 
         let err = checker
@@ -1120,6 +1220,7 @@ mod tests {
             "epoch-future-tier1",
             99999,
             TRUSTED_SIGNER_SEED,
+            TEST_PRINCIPAL_ID,
         ));
 
         let result = checker.check_revalidate(&cert, &state, 100, test_hash(0x07), test_hash(0x08));
@@ -1145,6 +1246,87 @@ mod tests {
             checker
                 .check_consume(&cert, &state, 110, test_hash(0x07), test_hash(0x08))
                 .is_ok()
+        );
+    }
+
+    // =========================================================================
+    // Cross-principal replay adversarial test (Security BLOCKER fix)
+    // =========================================================================
+
+    /// Proves that a sovereignty epoch signed for principal A is rejected
+    /// when presented for principal B. This prevents cross-principal replay
+    /// attacks where an attacker reuses epoch evidence across scopes.
+    #[test]
+    fn cross_principal_replay_denied() {
+        let checker = checker();
+        let cert = tier2_cert();
+
+        // Sign an epoch for principal-A.
+        let epoch_for_a = signed_epoch("epoch-001", 100, TRUSTED_SIGNER_SEED, "principal-A");
+
+        // Present it as sovereignty evidence for principal-B.
+        let state = SovereigntyState {
+            epoch: Some(epoch_for_a),
+            principal_id: "principal-B".to_string(),
+            revocation_head_known: true,
+            autonomy_ceiling: Some(AutonomyCeiling {
+                max_risk_tier: RiskTier::Tier2Plus,
+                policy_binding_hash: test_hash(0xDD),
+            }),
+            active_freeze: FreezeAction::NoAction,
+        };
+
+        // Must be denied: epoch is bound to principal-A, runtime says
+        // principal-B.
+        let err = checker
+            .check_revalidate(&cert, &state, 110, test_hash(0x07), test_hash(0x08))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.deny_class,
+                AuthorityDenyClass::SovereigntyUncertainty { ref reason }
+                    if reason.contains("principal_scope_hash mismatch")
+            ),
+            "cross-principal replay must be denied with scope mismatch, got: {:?}",
+            err.deny_class
+        );
+        assert_eq!(
+            err.containment_action,
+            Some(FreezeAction::HardFreeze),
+            "cross-principal replay must carry hard-freeze containment"
+        );
+    }
+
+    /// Proves that cross-principal replay is also denied in the consume path.
+    #[test]
+    fn cross_principal_replay_denied_on_consume() {
+        let checker = checker();
+        let cert = tier2_cert();
+
+        let epoch_for_a = signed_epoch("epoch-001", 100, TRUSTED_SIGNER_SEED, "principal-A");
+
+        let state = SovereigntyState {
+            epoch: Some(epoch_for_a),
+            principal_id: "principal-B".to_string(),
+            revocation_head_known: true,
+            autonomy_ceiling: Some(AutonomyCeiling {
+                max_risk_tier: RiskTier::Tier2Plus,
+                policy_binding_hash: test_hash(0xDD),
+            }),
+            active_freeze: FreezeAction::NoAction,
+        };
+
+        let err = checker
+            .check_consume(&cert, &state, 110, test_hash(0x07), test_hash(0x08))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.deny_class,
+                AuthorityDenyClass::SovereigntyUncertainty { ref reason }
+                    if reason.contains("principal_scope_hash mismatch")
+            ),
+            "cross-principal replay on consume must be denied, got: {:?}",
+            err.deny_class
         );
     }
 

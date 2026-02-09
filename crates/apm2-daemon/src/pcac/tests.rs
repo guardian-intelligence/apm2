@@ -36,11 +36,15 @@ fn checker_with_staleness_threshold(threshold: u64) -> super::sovereignty::Sover
     )
 }
 
-/// Builds a `SovereigntyEpoch` with a valid Ed25519 signature.
+const TEST_PRINCIPAL_ID: &str = "principal-001";
+
+/// Builds a `SovereigntyEpoch` with a valid Ed25519 signature bound to
+/// a principal scope.
 fn signed_epoch(
     epoch_id: &str,
     freshness_tick: u64,
     key_seed: u8,
+    principal_id: &str,
 ) -> apm2_core::pcac::SovereigntyEpoch {
     use ed25519_dalek::SigningKey;
 
@@ -49,8 +53,14 @@ fn signed_epoch(
     apm2_core::pcac::SovereigntyEpoch {
         epoch_id: epoch_id.to_string(),
         freshness_tick,
+        principal_scope_hash: SovereigntyChecker::principal_scope_hash(principal_id),
         signer_public_key: signing_key.verifying_key().to_bytes(),
-        signature: SovereigntyChecker::sign_epoch(&signing_key, epoch_id, freshness_tick),
+        signature: SovereigntyChecker::sign_epoch(
+            &signing_key,
+            principal_id,
+            epoch_id,
+            freshness_tick,
+        ),
     }
 }
 
@@ -537,7 +547,7 @@ fn lifecycle_gate_with_sovereignty_passes_tier2_valid_state() {
     input.risk_tier = RiskTier::Tier2Plus;
 
     let sov_state = SovereigntyState {
-        epoch: Some(signed_epoch("epoch-001", 100, 0xCC)),
+        epoch: Some(signed_epoch("epoch-001", 100, 0xCC, TEST_PRINCIPAL_ID)),
         principal_id: "principal-001".to_string(),
         revocation_head_known: true,
         autonomy_ceiling: Some(AutonomyCeiling {
@@ -575,7 +585,7 @@ fn lifecycle_gate_with_sovereignty_denies_tier2_stale_epoch() {
     input.risk_tier = RiskTier::Tier2Plus;
 
     let sov_state = SovereigntyState {
-        epoch: Some(signed_epoch("epoch-001", 10, 0xCC)), // Very stale
+        epoch: Some(signed_epoch("epoch-001", 10, 0xCC, TEST_PRINCIPAL_ID)), // Very stale
         principal_id: "principal-001".to_string(),
         revocation_head_known: true,
         autonomy_ceiling: Some(AutonomyCeiling {
@@ -623,7 +633,7 @@ fn lifecycle_gate_with_sovereignty_denies_tier2_frozen() {
     input.risk_tier = RiskTier::Tier2Plus;
 
     let sov_state = SovereigntyState {
-        epoch: Some(signed_epoch("epoch-001", 100, 0xCC)),
+        epoch: Some(signed_epoch("epoch-001", 100, 0xCC, TEST_PRINCIPAL_ID)),
         principal_id: "principal-001".to_string(),
         revocation_head_known: true,
         autonomy_ceiling: Some(AutonomyCeiling {
@@ -768,7 +778,7 @@ fn lifecycle_gate_with_sovereignty_denies_incompatible_ceiling() {
 
     // Ceiling allows only Tier1, but request is Tier2Plus.
     let sov_state = SovereigntyState {
-        epoch: Some(signed_epoch("epoch-001", 100, 0xCC)),
+        epoch: Some(signed_epoch("epoch-001", 100, 0xCC, TEST_PRINCIPAL_ID)),
         principal_id: "principal-001".to_string(),
         revocation_head_known: true,
         autonomy_ceiling: Some(AutonomyCeiling {
@@ -1055,7 +1065,7 @@ fn sovereignty_consume_failure_does_not_mark_consumed() {
 
     // Sovereignty state with incompatible ceiling — will fail at consume stage.
     let sov_state = SovereigntyState {
-        epoch: Some(signed_epoch("epoch-001", 100, 0xCC)),
+        epoch: Some(signed_epoch("epoch-001", 100, 0xCC, TEST_PRINCIPAL_ID)),
         principal_id: "principal-001".to_string(),
         revocation_head_known: true,
         autonomy_ceiling: Some(AutonomyCeiling {
@@ -1088,7 +1098,7 @@ fn sovereignty_consume_failure_does_not_mark_consumed() {
     // Now fix sovereignty state and retry — if consume-set was mutated
     // prematurely, this would fail with AlreadyConsumed.
     let good_sov_state = SovereigntyState {
-        epoch: Some(signed_epoch("epoch-001", 100, 0xCC)),
+        epoch: Some(signed_epoch("epoch-001", 100, 0xCC, TEST_PRINCIPAL_ID)),
         principal_id: "principal-001".to_string(),
         revocation_head_known: true,
         autonomy_ceiling: Some(AutonomyCeiling {
@@ -1134,6 +1144,9 @@ fn epoch_with_invalid_signature_denied() {
         epoch: Some(SovereigntyEpoch {
             epoch_id: "epoch-001".to_string(),
             freshness_tick: 100,
+            principal_scope_hash: super::sovereignty::SovereigntyChecker::principal_scope_hash(
+                TEST_PRINCIPAL_ID,
+            ),
             signer_public_key: ed25519_dalek::SigningKey::from_bytes(&[0xCC; 32])
                 .verifying_key()
                 .to_bytes(),
@@ -1186,7 +1199,12 @@ fn epoch_with_untrusted_signer_denied() {
         .verifying_key()
         .to_bytes();
     let sov_state = SovereigntyState {
-        epoch: Some(signed_epoch("epoch-untrusted", 100, 0xDD)),
+        epoch: Some(signed_epoch(
+            "epoch-untrusted",
+            100,
+            0xDD,
+            TEST_PRINCIPAL_ID,
+        )),
         principal_id: "principal-001".to_string(),
         revocation_head_known: true,
         autonomy_ceiling: Some(AutonomyCeiling {
@@ -1319,7 +1337,7 @@ fn sovereignty_soft_freeze_actuates_governance_stop() {
 
     // Sovereignty state with unknown revocation head triggers SoftFreeze.
     let sov_state = SovereigntyState {
-        epoch: Some(signed_epoch("epoch-001", 100, 0xCC)),
+        epoch: Some(signed_epoch("epoch-001", 100, 0xCC, TEST_PRINCIPAL_ID)),
         principal_id: "principal-001".to_string(),
         revocation_head_known: false,
         autonomy_ceiling: Some(AutonomyCeiling {
@@ -1432,7 +1450,7 @@ fn post_hard_freeze_blocks_subsequent_valid_requests() {
     // stop. The gate's own check will also see the active freeze state
     // because the stop authority is shared.
     let _valid_state = SovereigntyState {
-        epoch: Some(signed_epoch("epoch-002", 100, 0xCC)),
+        epoch: Some(signed_epoch("epoch-002", 100, 0xCC, TEST_PRINCIPAL_ID)),
         principal_id: "principal-001".to_string(),
         revocation_head_known: true,
         autonomy_ceiling: Some(AutonomyCeiling {
@@ -1479,7 +1497,7 @@ fn lifecycle_gate_denies_future_dated_epoch() {
 
     // Epoch freshness_tick=1000, current_tick=100, skew=900 > 300
     let sov_state = SovereigntyState {
-        epoch: Some(signed_epoch("epoch-future", 1000, 0xCC)),
+        epoch: Some(signed_epoch("epoch-future", 1000, 0xCC, TEST_PRINCIPAL_ID)),
         principal_id: "principal-001".to_string(),
         revocation_head_known: true,
         autonomy_ceiling: Some(AutonomyCeiling {
@@ -1518,5 +1536,180 @@ fn lifecycle_gate_denies_future_dated_epoch() {
     assert!(
         stop_authority.emergency_stop_active(),
         "emergency stop must be set after future-dated epoch denial"
+    );
+}
+
+// =============================================================================
+// TCK-00427 quality BLOCKER: Production-constructor signer gate test
+// =============================================================================
+
+/// Proves that a sovereignty checker constructed with the daemon's actual
+/// signing key (as done in production constructors) accepts a correctly
+/// signed epoch. This validates that production wiring with a real key
+/// (instead of the old hardcoded `[0u8; 32]`) enables valid Tier2+ authority.
+#[test]
+fn production_signer_key_accepts_valid_epoch() {
+    use apm2_core::pcac::{AutonomyCeiling, FreezeAction};
+    use ed25519_dalek::SigningKey;
+
+    use super::sovereignty::{SovereigntyChecker, SovereigntyState};
+
+    // Simulate production key derivation: generate a daemon signing key
+    // and extract its verifying key (same as production constructors do).
+    let daemon_signing_key = SigningKey::from_bytes(&[0xEE; 32]);
+    let sovereignty_trusted_signer_key = daemon_signing_key.verifying_key().to_bytes();
+
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let checker = SovereigntyChecker::new(sovereignty_trusted_signer_key);
+    let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
+
+    let principal_id = "production-principal";
+    let epoch_id = "epoch-production";
+    let freshness_tick = 100;
+
+    // Sign the epoch with the same daemon signing key (production wiring).
+    let epoch = apm2_core::pcac::SovereigntyEpoch {
+        epoch_id: epoch_id.to_string(),
+        freshness_tick,
+        principal_scope_hash: SovereigntyChecker::principal_scope_hash(principal_id),
+        signer_public_key: daemon_signing_key.verifying_key().to_bytes(),
+        signature: SovereigntyChecker::sign_epoch(
+            &daemon_signing_key,
+            principal_id,
+            epoch_id,
+            freshness_tick,
+        ),
+    };
+
+    let sov_state = SovereigntyState {
+        epoch: Some(epoch),
+        principal_id: principal_id.to_string(),
+        revocation_head_known: true,
+        autonomy_ceiling: Some(AutonomyCeiling {
+            max_risk_tier: RiskTier::Tier2Plus,
+            policy_binding_hash: test_hash(0xDD),
+        }),
+        active_freeze: FreezeAction::NoAction,
+    };
+
+    let mut input = valid_input();
+    input.risk_tier = RiskTier::Tier2Plus;
+
+    let result = gate.execute_with_sovereignty(
+        &input,
+        input.time_envelope_ref,
+        input.as_of_ledger_anchor,
+        input.directory_head_hash,
+        Some(&sov_state),
+        100,
+    );
+    assert!(
+        result.is_ok(),
+        "production-keyed sovereignty checker must accept correctly signed epoch: {:?}",
+        result.err()
+    );
+}
+
+// =============================================================================
+// TCK-00427 quality MAJOR: Kernel-emitted deny records pass validation
+// =============================================================================
+
+/// Proves that `AuthorityDenyV1` records emitted by `InProcessKernel::join`
+/// for zero-hash fields pass `AuthorityDenyV1::validate`, confirming that
+/// deny records carry valid replay-binding context.
+#[test]
+fn kernel_zero_hash_deny_passes_validation() {
+    use apm2_core::pcac::AuthorityDenyClass;
+
+    let kernel = InProcessKernel::new(100);
+
+    // Zero intent_digest triggers require_nonzero denial.
+    let mut input = valid_input();
+    input.intent_digest = zero_hash();
+
+    let deny = kernel.join(&input).unwrap_err();
+    assert!(
+        matches!(
+            deny.deny_class,
+            AuthorityDenyClass::ZeroHash { ref field_name }
+                if field_name == "intent_digest"
+        ),
+        "expected ZeroHash denial for intent_digest, got: {:?}",
+        deny.deny_class
+    );
+    // The deny record MUST pass validation (non-zero replay bindings, positive
+    // tick).
+    assert!(
+        deny.validate().is_ok(),
+        "kernel-emitted deny for zero intent_digest must pass AuthorityDenyV1::validate: {:?}",
+        deny.validate().err()
+    );
+}
+
+/// Proves that deny records emitted for all `require_nonzero` fields pass
+/// validation, covering the full set of zero-hash denial paths.
+#[test]
+fn kernel_all_zero_hash_denies_pass_validation() {
+    let kernel = InProcessKernel::new(100);
+
+    // Test each zero-hash field individually.
+    let fields = [
+        "intent_digest",
+        "capability_manifest_hash",
+        "identity_proof_hash",
+        "directory_head_hash",
+        "freshness_policy_hash",
+        "stop_budget_profile_digest",
+    ];
+
+    for field_name in &fields {
+        let mut input = valid_input();
+        match *field_name {
+            "intent_digest" => input.intent_digest = zero_hash(),
+            "capability_manifest_hash" => input.capability_manifest_hash = zero_hash(),
+            "identity_proof_hash" => input.identity_proof_hash = zero_hash(),
+            "directory_head_hash" => input.directory_head_hash = zero_hash(),
+            "freshness_policy_hash" => input.freshness_policy_hash = zero_hash(),
+            "stop_budget_profile_digest" => input.stop_budget_profile_digest = zero_hash(),
+            _ => unreachable!(),
+        }
+
+        let deny = kernel.join(&input).unwrap_err();
+        assert!(
+            deny.validate().is_ok(),
+            "kernel-emitted deny for zero {field_name} must pass AuthorityDenyV1::validate: {:?}",
+            deny.validate().err()
+        );
+        assert!(
+            deny.denied_at_tick > 0,
+            "deny for {field_name} must have positive denied_at_tick"
+        );
+    }
+}
+
+/// Proves that deny records for zero `time_envelope_ref` and
+/// `as_of_ledger_anchor` have positive tick and best-available anchor
+/// bindings (they cannot be fully valid since the field itself is zero,
+/// but they must have positive tick and non-zero cross-bindings).
+#[test]
+fn kernel_zero_anchor_denies_have_positive_tick() {
+    let kernel = InProcessKernel::new(100);
+
+    // Zero time_envelope_ref
+    let mut input = valid_input();
+    input.time_envelope_ref = zero_hash();
+    let deny = kernel.join(&input).unwrap_err();
+    assert!(
+        deny.denied_at_tick > 0,
+        "deny for zero time_envelope_ref must have positive tick"
+    );
+
+    // Zero as_of_ledger_anchor
+    let mut input = valid_input();
+    input.as_of_ledger_anchor = zero_hash();
+    let deny = kernel.join(&input).unwrap_err();
+    assert!(
+        deny.denied_at_tick > 0,
+        "deny for zero as_of_ledger_anchor must have positive tick"
     );
 }

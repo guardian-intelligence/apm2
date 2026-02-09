@@ -72,16 +72,26 @@ impl InProcessKernel {
     }
 
     /// Validates that a hash field is non-zero (fail-closed).
-    fn require_nonzero(hash: &Hash, field_name: &str) -> Result<(), Box<AuthorityDenyV1>> {
+    ///
+    /// TCK-00427 quality MAJOR fix: Deny records now carry contextual
+    /// `time_envelope_ref`, `ledger_anchor`, and `denied_at_tick` so they
+    /// pass `AuthorityDenyV1::validate` replay-binding invariants.
+    fn require_nonzero(
+        hash: &Hash,
+        field_name: &str,
+        time_envelope_ref: Hash,
+        ledger_anchor: Hash,
+        denied_at_tick: u64,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
         if *hash == ZERO_HASH {
             return Err(Box::new(AuthorityDenyV1 {
                 deny_class: apm2_core::pcac::AuthorityDenyClass::ZeroHash {
                     field_name: field_name.to_string(),
                 },
                 ajc_id: None,
-                time_envelope_ref: ZERO_HASH,
-                ledger_anchor: ZERO_HASH,
-                denied_at_tick: 0,
+                time_envelope_ref,
+                ledger_anchor,
+                denied_at_tick,
                 containment_action: None,
             }));
         }
@@ -221,17 +231,82 @@ impl AuthorityJoinKernel for InProcessKernel {
             }));
         }
 
-        // Validate required hash fields are non-zero.
-        Self::require_nonzero(&input.intent_digest, "intent_digest")?;
-        Self::require_nonzero(&input.capability_manifest_hash, "capability_manifest_hash")?;
-        Self::require_nonzero(&input.identity_proof_hash, "identity_proof_hash")?;
-        Self::require_nonzero(&input.time_envelope_ref, "time_envelope_ref")?;
-        Self::require_nonzero(&input.as_of_ledger_anchor, "as_of_ledger_anchor")?;
-        Self::require_nonzero(&input.directory_head_hash, "directory_head_hash")?;
-        Self::require_nonzero(&input.freshness_policy_hash, "freshness_policy_hash")?;
+        // TCK-00427 quality MAJOR fix: Validate time_envelope_ref and
+        // as_of_ledger_anchor first so they can be threaded as context into
+        // subsequent require_nonzero calls, producing deny records that pass
+        // AuthorityDenyV1::validate replay-binding invariants.
+        if input.time_envelope_ref == ZERO_HASH {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::ZeroHash {
+                    field_name: "time_envelope_ref".to_string(),
+                },
+                ajc_id: None,
+                // time_envelope_ref itself is zero, but as_of_ledger_anchor
+                // may be valid. Use the best-available context.
+                time_envelope_ref: input.as_of_ledger_anchor,
+                ledger_anchor: input.as_of_ledger_anchor,
+                denied_at_tick: tick,
+                containment_action: None,
+            }));
+        }
+        if input.as_of_ledger_anchor == ZERO_HASH {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::ZeroHash {
+                    field_name: "as_of_ledger_anchor".to_string(),
+                },
+                ajc_id: None,
+                time_envelope_ref: input.time_envelope_ref,
+                // ledger_anchor itself is zero; use time_envelope_ref as
+                // best-available anchor binding.
+                ledger_anchor: input.time_envelope_ref,
+                denied_at_tick: tick,
+                containment_action: None,
+            }));
+        }
+
+        // Both time_envelope_ref and as_of_ledger_anchor are now validated
+        // non-zero and can be threaded into remaining require_nonzero calls.
+        Self::require_nonzero(
+            &input.intent_digest,
+            "intent_digest",
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
+        )?;
+        Self::require_nonzero(
+            &input.capability_manifest_hash,
+            "capability_manifest_hash",
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
+        )?;
+        Self::require_nonzero(
+            &input.identity_proof_hash,
+            "identity_proof_hash",
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
+        )?;
+        Self::require_nonzero(
+            &input.directory_head_hash,
+            "directory_head_hash",
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
+        )?;
+        Self::require_nonzero(
+            &input.freshness_policy_hash,
+            "freshness_policy_hash",
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
+        )?;
         Self::require_nonzero(
             &input.stop_budget_profile_digest,
             "stop_budget_profile_digest",
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
         )?;
 
         // Law 3 (partial): Freshness witness must be non-stale at join.

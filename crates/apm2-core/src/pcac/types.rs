@@ -616,7 +616,10 @@ pub struct AuthorityConsumedV1 {
 /// # Signature Verification
 ///
 /// Signatures are Ed25519 signatures over a domain-separated message:
-/// `b"apm2-sovereignty-epoch-v1" || epoch_id || freshness_tick`.
+/// `b"apm2-sovereignty-epoch-v1" || principal_scope_hash || epoch_id ||
+/// freshness_tick`. The `principal_scope_hash` is a BLAKE3 digest of the
+/// principal ID, cryptographically binding the epoch to a specific principal
+/// scope and preventing cross-principal replay attacks.
 /// The signature field stores raw 64-byte signature bytes.
 ///
 /// Runtime validators MUST also bind `signer_public_key` to a trusted
@@ -628,6 +631,12 @@ pub struct SovereigntyEpoch {
 
     /// The freshness tick at which this epoch was last observed.
     pub freshness_tick: u64,
+
+    /// BLAKE3 digest of the principal ID this epoch is bound to.
+    ///
+    /// Signatures commit to this hash, preventing cross-principal replay.
+    /// Validators MUST verify that this matches the runtime principal scope.
+    pub principal_scope_hash: Hash,
 
     /// Public key of the signer that produced this epoch's signature.
     pub signer_public_key: Hash,

@@ -499,17 +499,25 @@ impl DispatcherState {
         // asserting epoch freshness behavior.
         let freshness_tick = u64::MAX;
         let epoch_id = "bootstrap-sovereignty-epoch-v1";
-        let signature =
-            crate::pcac::SovereigntyChecker::sign_epoch(&signing_key, epoch_id, freshness_tick);
+        let principal_id = "bootstrap-principal";
+        let signature = crate::pcac::SovereigntyChecker::sign_epoch(
+            &signing_key,
+            principal_id,
+            epoch_id,
+            freshness_tick,
+        );
 
         Arc::new(crate::pcac::SovereigntyState {
             epoch: Some(apm2_core::pcac::SovereigntyEpoch {
                 epoch_id: epoch_id.to_string(),
                 freshness_tick,
+                principal_scope_hash: crate::pcac::SovereigntyChecker::principal_scope_hash(
+                    principal_id,
+                ),
                 signer_public_key: signing_key.verifying_key().to_bytes(),
                 signature,
             }),
-            principal_id: "bootstrap-principal".to_string(),
+            principal_id: principal_id.to_string(),
             revocation_head_known: true,
             autonomy_ceiling: Some(apm2_core::pcac::AutonomyCeiling {
                 max_risk_tier: apm2_core::pcac::RiskTier::Tier2Plus,
@@ -788,15 +796,22 @@ impl DispatcherState {
         // TCK-00352: Create shared V1 manifest store for scope enforcement
         let v1_manifest_store = Arc::new(V1ManifestStore::new());
 
+        // TCK-00427 quality BLOCKER fix: Resolve the daemon-lifecycle signing
+        // key BEFORE the privileged dispatcher branch so we can derive the
+        // sovereignty trusted signer key from it (instead of hardcoded zeros).
+        let daemon_signing_key = ledger_signing_key.unwrap_or_else(|| {
+            use rand::rngs::OsRng;
+            ed25519_dalek::SigningKey::generate(&mut OsRng)
+        });
+        // Capture the verifying key bytes for sovereignty checker wiring.
+        let sovereignty_trusted_signer_key = daemon_signing_key.verifying_key().to_bytes();
+
         let privileged_dispatcher = if let Some(conn) = sqlite_conn {
             // Use real implementations
             // Security Review v5 MAJOR 2: Reuse the daemon-lifecycle signing key
             // if provided, otherwise generate a new one. This ensures recovery
             // and dispatcher events are signed with the same key.
-            let signing_key = ledger_signing_key.unwrap_or_else(|| {
-                use rand::rngs::OsRng;
-                ed25519_dalek::SigningKey::generate(&mut OsRng)
-            });
+            let signing_key = daemon_signing_key;
 
             let policy_resolver = Arc::new(GovernancePolicyResolver::new());
             let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&conn)));
@@ -978,7 +993,14 @@ impl DispatcherState {
         // lifecycle gate so sovereignty freeze recommendations are actuated
         // to persistent runtime stop controls.
         let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
-        let sovereignty_checker = crate::pcac::SovereigntyChecker::new([0u8; 32]);
+        // TCK-00427 quality BLOCKER fix: Use the daemon's signing key
+        // verifying key as the trusted sovereignty signer (instead of
+        // hardcoded [0u8; 32]). This ensures valid signed epochs can
+        // pass the signer gate in production. Fail-closed: if the
+        // derived key is somehow zero (impossible for Ed25519), the
+        // checker rejects zero signer keys.
+        let sovereignty_checker =
+            crate::pcac::SovereigntyChecker::new(sovereignty_trusted_signer_key);
         let pcac_gate = Arc::new(
             crate::pcac::LifecycleGate::with_sovereignty_and_stop_authority(
                 pcac_kernel,
@@ -1133,6 +1155,9 @@ impl DispatcherState {
             use rand::rngs::OsRng;
             ed25519_dalek::SigningKey::generate(&mut OsRng)
         });
+        // TCK-00427 quality BLOCKER fix: Capture the verifying key for
+        // sovereignty checker wiring before signing_key is moved.
+        let sovereignty_trusted_signer_key = signing_key.verifying_key().to_bytes();
 
         let policy_resolver = Arc::new(GovernancePolicyResolver::new());
         let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&sqlite_conn)));
@@ -1327,7 +1352,10 @@ impl DispatcherState {
         // lifecycle gate so sovereignty freeze recommendations are actuated
         // to persistent runtime stop controls.
         let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
-        let sovereignty_checker = crate::pcac::SovereigntyChecker::new([0u8; 32]);
+        // TCK-00427 quality BLOCKER fix: Use daemon's signing key verifying
+        // key as sovereignty trusted signer (not hardcoded zeros).
+        let sovereignty_checker =
+            crate::pcac::SovereigntyChecker::new(sovereignty_trusted_signer_key);
         let pcac_gate = Arc::new(
             crate::pcac::LifecycleGate::with_sovereignty_and_stop_authority(
                 pcac_kernel,
