@@ -58,6 +58,7 @@ waiver:
     rfc_id: "RFC-0018"
     workflow: ".github/workflows/forge-admission-cycle.yml"
     deferred_audit_due: "2026-03-11"
+    commit_sha: "9532d3b9a329603970364877dbec7ce524cb8e7b"
 
   approval:
     approver: "repository_owner"
