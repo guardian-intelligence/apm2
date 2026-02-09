@@ -281,7 +281,10 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         eprintln!("  Use `apm2 fac restart --pr {pr_number}` to retry.");
     }
 
+    let sha_short = &sha[..sha.len().min(8)];
     eprintln!("fac push: done (PR #{pr_number})");
+    eprintln!("  pipeline log: ~/.apm2/pipeline_logs/pr{pr_number}-{sha_short}.log");
+    eprintln!("  if pipeline fails: apm2 fac restart --pr {pr_number}");
     exit_codes::SUCCESS
 }
 

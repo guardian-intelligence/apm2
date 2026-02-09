@@ -107,7 +107,15 @@ fn current_branch() -> Result<String, String> {
 fn find_pr_for_branch(repo: &str, branch: &str) -> Result<u32, String> {
     let output = Command::new("gh")
         .args([
-            "pr", "list", "--repo", repo, "--head", branch, "--json", "number", "--jq",
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--head",
+            branch,
+            "--json",
+            "number",
+            "--jq",
             ".[0].number",
         ])
         .output()
@@ -142,12 +150,12 @@ fn determine_restart_strategy(
         return Ok(RestartStrategy::FullRestart);
     };
 
-    analyze_ci_status(&status)
+    Ok(analyze_ci_status(&status))
 }
 
-fn analyze_ci_status(status: &CiStatus) -> Result<RestartStrategy, String> {
+fn analyze_ci_status(status: &CiStatus) -> RestartStrategy {
     if status.gates.is_empty() {
-        return Ok(RestartStrategy::FullRestart);
+        return RestartStrategy::FullRestart;
     }
 
     // Evidence gate names (must match evidence.rs gate definitions).
@@ -176,11 +184,11 @@ fn analyze_ci_status(status: &CiStatus) -> Result<RestartStrategy, String> {
 
     if !has_any_evidence {
         // Status comment exists but no evidence gates recorded — full restart.
-        return Ok(RestartStrategy::FullRestart);
+        return RestartStrategy::FullRestart;
     }
 
     if !all_evidence_pass {
-        return Ok(RestartStrategy::EvidenceRestart);
+        return RestartStrategy::EvidenceRestart;
     }
 
     // All evidence gates passed. Check review status.
@@ -198,11 +206,11 @@ fn analyze_ci_status(status: &CiStatus) -> Result<RestartStrategy, String> {
     }
 
     if has_any_review && all_reviews_pass {
-        return Ok(RestartStrategy::Noop);
+        return RestartStrategy::Noop;
     }
 
     // Evidence passed, reviews incomplete → dispatch reviews only.
-    Ok(RestartStrategy::ReviewsOnly)
+    RestartStrategy::ReviewsOnly
 }
 
 // ── Execution ───────────────────────────────────────────────────────────────
@@ -215,13 +223,14 @@ fn execute_strategy(
         RestartStrategy::Noop => Ok((None, None)),
 
         RestartStrategy::ReviewsOnly => {
-            let reviews = dispatch_reviews(&ctx.pr_url, &ctx.owner_repo, ctx.pr_number, &ctx.head_sha)?;
+            let reviews =
+                dispatch_reviews(&ctx.pr_url, &ctx.owner_repo, ctx.pr_number, &ctx.head_sha)?;
             Ok((None, Some(reviews)))
         },
 
         RestartStrategy::EvidenceRestart | RestartStrategy::FullRestart => {
-            let workspace_root = std::env::current_dir()
-                .map_err(|e| format!("failed to resolve cwd: {e}"))?;
+            let workspace_root =
+                std::env::current_dir().map_err(|e| format!("failed to resolve cwd: {e}"))?;
 
             let passed = run_evidence_gates_with_status(
                 &workspace_root,
@@ -232,12 +241,8 @@ fn execute_strategy(
             )?;
 
             if passed {
-                let reviews = dispatch_reviews(
-                    &ctx.pr_url,
-                    &ctx.owner_repo,
-                    ctx.pr_number,
-                    &ctx.head_sha,
-                )?;
+                let reviews =
+                    dispatch_reviews(&ctx.pr_url, &ctx.owner_repo, ctx.pr_number, &ctx.head_sha)?;
                 Ok((Some(true), Some(reviews)))
             } else {
                 Ok((Some(false), None))
@@ -259,8 +264,14 @@ fn dispatch_reviews(
 
     let mut results = Vec::with_capacity(2);
     for kind in [ReviewKind::Security, ReviewKind::Quality] {
-        let result =
-            dispatch_single_review(pr_url, owner_repo, pr_number, kind, head_sha, dispatch_epoch)?;
+        let result = dispatch_single_review(
+            pr_url,
+            owner_repo,
+            pr_number,
+            kind,
+            head_sha,
+            dispatch_epoch,
+        )?;
         results.push(result);
     }
     Ok(results)
@@ -289,10 +300,7 @@ pub fn run_restart(
                 println!("  Head SHA:      {}", summary.head_sha);
                 println!("  Strategy:      {}", summary.strategy.label());
                 if let Some(passed) = summary.evidence_passed {
-                    println!(
-                        "  Evidence:      {}",
-                        if passed { "PASS" } else { "FAIL" }
-                    );
+                    println!("  Evidence:      {}", if passed { "PASS" } else { "FAIL" });
                 }
                 if let Some(ref reviews) = summary.reviews_dispatched {
                     for r in reviews {
@@ -300,8 +308,7 @@ pub fn run_restart(
                             "  Review:        {} ({}{}{})",
                             r.review_type,
                             r.mode,
-                            r.pid
-                                .map_or_else(String::new, |p| format!(", pid={p}")),
+                            r.pid.map_or_else(String::new, |p| format!(", pid={p}")),
                             r.log_file
                                 .as_ref()
                                 .map_or_else(String::new, |l| format!(", log={l}")),
@@ -392,10 +399,7 @@ mod tests {
             updated_at: "2025-01-01T00:00:00Z".to_string(),
             gates: BTreeMap::new(),
         };
-        assert_eq!(
-            analyze_ci_status(&status).unwrap(),
-            RestartStrategy::FullRestart
-        );
+        assert_eq!(analyze_ci_status(&status), RestartStrategy::FullRestart);
     }
 
     #[test]
@@ -411,10 +415,7 @@ mod tests {
             updated_at: "2025-01-01T00:00:00Z".to_string(),
             gates,
         };
-        assert_eq!(
-            analyze_ci_status(&status).unwrap(),
-            RestartStrategy::ReviewsOnly
-        );
+        assert_eq!(analyze_ci_status(&status), RestartStrategy::ReviewsOnly);
     }
 
     #[test]
@@ -430,10 +431,7 @@ mod tests {
             updated_at: "2025-01-01T00:00:00Z".to_string(),
             gates,
         };
-        assert_eq!(
-            analyze_ci_status(&status).unwrap(),
-            RestartStrategy::EvidenceRestart
-        );
+        assert_eq!(analyze_ci_status(&status), RestartStrategy::EvidenceRestart);
     }
 
     #[test]
@@ -447,10 +445,7 @@ mod tests {
             updated_at: "2025-01-01T00:00:00Z".to_string(),
             gates,
         };
-        assert_eq!(
-            analyze_ci_status(&status).unwrap(),
-            RestartStrategy::EvidenceRestart
-        );
+        assert_eq!(analyze_ci_status(&status), RestartStrategy::EvidenceRestart);
     }
 
     #[test]
@@ -468,9 +463,6 @@ mod tests {
             updated_at: "2025-01-01T00:00:00Z".to_string(),
             gates,
         };
-        assert_eq!(
-            analyze_ci_status(&status).unwrap(),
-            RestartStrategy::Noop
-        );
+        assert_eq!(analyze_ci_status(&status), RestartStrategy::Noop);
     }
 }
