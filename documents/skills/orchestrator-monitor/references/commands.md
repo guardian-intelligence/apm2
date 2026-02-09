@@ -7,7 +7,7 @@ notes:
   - "All commands that can hang should use timeout wrappers."
   - "Commands labeled side_effect=true modify external state."
   - "Use `apm2 fac push` as the canonical push workflow — it pushes, creates/updates the PR, enables auto-merge, and reviews auto-start via CI."
-  - "Prefer FAC-native `apm2 fac review ...` commands for reviewer lifecycle state and retrigger operations."
+  - "Prefer FAC-native `apm2 fac review ...` commands for reviewer lifecycle state and `apm2 fac restart` for recovery operations."
   - "Use direct `gh` commands only for surfaces that FAC does not yet expose (for example full review comment bodies)."
   - "Do NOT manually dispatch reviews after pushing — the Forge Admission Cycle CI workflow auto-dispatches them."
 
@@ -47,9 +47,9 @@ commands[18]:
     purpose: "Fallback cross-check of projected status contexts on GitHub for exact HEAD SHA binding."
     side_effect: false
 
-  - name: retrigger_fac_via_apm2
-    command: "timeout 30s apm2 fac review retrigger --repo guardian-intelligence/apm2 --pr <PR_NUMBER>"
-    purpose: "Projection-native FAC retrigger path that dispatches Forge Admission Cycle from apm2 CLI."
+  - name: restart_fac_via_apm2
+    command: "timeout 30s apm2 fac restart --pr <PR_NUMBER>"
+    purpose: "Restart FAC review cycle from apm2 CLI."
     side_effect: true
 
   - name: fac_push
@@ -59,7 +59,7 @@ commands[18]:
 
   - name: retrigger_review_stream
     command: "timeout 30s gh workflow run forge-admission-cycle.yml --repo guardian-intelligence/apm2 -f pr_number=<PR_NUMBER>"
-    purpose: "Fallback-only recovery path when `apm2 fac review retrigger` is unavailable."
+    purpose: "Fallback-only recovery path when `apm2 fac restart` is unavailable."
     side_effect: true
 
   - name: fac_review_tail

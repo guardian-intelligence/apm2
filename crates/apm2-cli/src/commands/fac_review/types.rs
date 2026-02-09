@@ -204,14 +204,6 @@ pub struct DispatchSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct RetriggerSummary {
-    pub workflow: String,
-    pub repo: String,
-    pub pr_number: u32,
-    pub dispatched_at: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct BarrierSummary {
     pub repo: String,
     pub event_name: String,

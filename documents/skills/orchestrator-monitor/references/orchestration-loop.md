@@ -45,8 +45,8 @@ decision_tree:
           action: |
             For REVIEW_MISSING PRs: reviews auto-start via the Forge Admission Cycle CI workflow on push.
             Do NOT manually dispatch reviews. Instead, monitor with `apm2 fac review project --pr <N> --emit-errors`.
-            If reviews have not started within 2 minutes of the push, use `apm2 fac review retrigger` as recovery.
-            If retrigger also fails, use `apm2 fac review dispatch <PR_URL> --type all` as last-resort fallback.
+            If reviews have not started within 2 minutes of the push, use `apm2 fac restart --pr <PR_NUMBER>` as recovery.
+            If restart also fails, use `gh workflow run forge-admission-cycle.yml` as last-resort fallback.
         - id: FIX_AGENT_ACTION
           action: |
             For CI_FAILED, REVIEW_FAILED, or PR_CONFLICTING PRs with implementor slots, dispatch one fresh fix agent.

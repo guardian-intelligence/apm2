@@ -22,10 +22,9 @@
 //!   observe FAC review lifecycle for GitHub projection
 //! - `apm2 fac review run <PR_URL>` - Run FAC review orchestration (parallel,
 //!   multi-model)
-//! - `apm2 fac review dispatch <PR_URL>` - Idempotent detached review dispatch
-//! - `apm2 fac review retrigger --pr <PR_NUMBER>` - Dispatch FAC workflow from
-//!   local CLI
 //! - `apm2 fac review status` - Show FAC review state and recent events
+//! - `apm2 fac restart --pr <PR_NUMBER>` - Intelligent pipeline restart from
+//!   optimal point
 //! - `apm2 fac review project` - Render one projection status line
 //! - `apm2 fac review tail` - Tail FAC review NDJSON telemetry stream
 //!
@@ -173,8 +172,19 @@ pub enum FacSubcommand {
     /// Push code and create/update PR (lean push).
     ///
     /// Pushes to remote, creates or updates a PR from ticket YAML metadata,
-    /// enables auto-merge, and exits immediately.
+    /// enables auto-merge, spawns background evidence+review pipeline, and
+    /// exits immediately.
     Push(PushArgs),
+
+    /// Restart the evidence/review pipeline from the optimal point.
+    ///
+    /// Reads current CI state from the PR status comment and determines
+    /// whether to re-run evidence gates, dispatch reviews, or both.
+    Restart(RestartArgs),
+
+    /// Internal: background evidence+review pipeline (hidden from help).
+    #[command(hide = true)]
+    Pipeline(PipelineArgs),
 
     /// Run and observe FAC review orchestration for pull requests.
     ///
@@ -406,6 +416,46 @@ pub struct PushArgs {
     pub ticket: Option<PathBuf>,
 }
 
+/// Arguments for `apm2 fac restart`.
+#[derive(Debug, Args)]
+pub struct RestartArgs {
+    /// Repository in owner/repo format.
+    #[arg(long, default_value = "guardian-intelligence/apm2")]
+    pub repo: String,
+
+    /// Pull request number (auto-detected from current branch if omitted).
+    #[arg(long)]
+    pub pr: Option<u32>,
+
+    /// Pull request URL (alternative to --pr).
+    #[arg(long)]
+    pub pr_url: Option<String>,
+
+    /// Restart everything regardless of current CI state.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+}
+
+/// Arguments for `apm2 fac pipeline` (hidden, internal).
+#[derive(Debug, Args)]
+pub struct PipelineArgs {
+    /// Repository in owner/repo format.
+    #[arg(long)]
+    pub repo: String,
+
+    /// Pull request URL.
+    #[arg(long)]
+    pub pr_url: String,
+
+    /// Pull request number.
+    #[arg(long)]
+    pub pr: u32,
+
+    /// Commit SHA to run pipeline against.
+    #[arg(long)]
+    pub sha: String,
+}
+
 /// Arguments for `apm2 fac review`.
 #[derive(Debug, Args)]
 pub struct ReviewArgs {
@@ -418,10 +468,6 @@ pub struct ReviewArgs {
 pub enum ReviewSubcommand {
     /// Run FAC review orchestration for a pull request URL.
     Run(ReviewRunArgs),
-    /// Idempotently dispatch detached FAC review workers.
-    Dispatch(ReviewDispatchArgs),
-    /// Retrigger FAC GitHub projection workflow via `workflow_dispatch`.
-    Retrigger(ReviewRetriggerArgs),
     /// Show FAC review state/events from local operational artifacts.
     Status(ReviewStatusArgs),
     /// Render one condensed projection line for GitHub log surfaces.
@@ -449,39 +495,6 @@ pub struct ReviewRunArgs {
     /// start.
     #[arg(long)]
     pub expected_head_sha: Option<String>,
-}
-
-/// Arguments for `apm2 fac review dispatch`.
-#[derive(Debug, Args)]
-pub struct ReviewDispatchArgs {
-    /// GitHub pull request URL.
-    pub pr_url: String,
-
-    /// Review selection (`all`, `security`, or `quality`).
-    #[arg(
-        long = "type",
-        alias = "review-type",
-        value_enum,
-        default_value_t = fac_review::ReviewRunType::All
-    )]
-    pub review_type: fac_review::ReviewRunType,
-
-    /// Optional expected head SHA (40 hex) to fail closed on stale dispatch
-    /// start.
-    #[arg(long)]
-    pub expected_head_sha: Option<String>,
-}
-
-/// Arguments for `apm2 fac review retrigger`.
-#[derive(Debug, Args)]
-pub struct ReviewRetriggerArgs {
-    /// Repository in owner/repo format.
-    #[arg(long, default_value = "guardian-intelligence/apm2")]
-    pub repo: String,
-
-    /// Pull request number.
-    #[arg(long)]
-    pub pr: u32,
 }
 
 /// Arguments for `apm2 fac review status`.
@@ -764,6 +777,16 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
             args.branch.as_deref(),
             args.ticket.as_deref(),
         ),
+        FacSubcommand::Restart(args) => fac_review::run_restart(
+            &args.repo,
+            args.pr,
+            args.pr_url.as_deref(),
+            args.force,
+            json_output,
+        ),
+        FacSubcommand::Pipeline(args) => {
+            fac_review::run_pipeline(&args.repo, &args.pr_url, args.pr, &args.sha)
+        },
         FacSubcommand::Review(args) => match &args.subcommand {
             ReviewSubcommand::Run(run_args) => fac_review::run_review(
                 &run_args.pr_url,
@@ -771,15 +794,6 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
                 run_args.expected_head_sha.as_deref(),
                 json_output,
             ),
-            ReviewSubcommand::Dispatch(dispatch_args) => fac_review::run_dispatch(
-                &dispatch_args.pr_url,
-                dispatch_args.review_type,
-                dispatch_args.expected_head_sha.as_deref(),
-                json_output,
-            ),
-            ReviewSubcommand::Retrigger(retrigger_args) => {
-                fac_review::run_retrigger(&retrigger_args.repo, retrigger_args.pr, json_output)
-            },
             ReviewSubcommand::Status(status_args) => {
                 fac_review::run_status(status_args.pr, status_args.pr_url.as_deref(), json_output)
             },

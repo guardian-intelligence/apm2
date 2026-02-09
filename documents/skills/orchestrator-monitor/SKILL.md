@@ -29,7 +29,7 @@ bootstrap:
 notes:
   - "Use `apm2 fac push` as the canonical push workflow — it pushes, creates/updates the PR, and enables auto-merge. Reviews auto-start via CI."
   - "Use `apm2 fac review project --pr <N> --emit-errors` to monitor all gate states (CI gates + reviews) after a push."
-  - "Use `apm2 fac review` for reviewer lifecycle actions (`status`, `project`, `retrigger`). Manual `dispatch` is recovery-only."
+  - "Use `apm2 fac review` for reviewer lifecycle actions (`status`, `project`). Use `apm2 fac restart` for recovery."
   - "Use direct `gh` commands only when FAC has no equivalent (for now: PR metadata and full comment-body retrieval)."
 
 references[10]:
@@ -110,9 +110,9 @@ push_workflow:
   implication: "Agents MUST NOT manually dispatch reviews after pushing. Reviews start automatically via CI."
 
 runtime_review_protocol:
-  automatic_trigger: "Reviews are auto-dispatched by the Forge Admission Cycle CI workflow on every push. Agents do NOT need to manually call `apm2 fac review dispatch` after pushing."
-  manual_dispatch: "apm2 fac review dispatch <PR_URL> --type all (use ONLY when CI auto-dispatch has failed or for recovery)"
-  recovery_entrypoint: "apm2 fac review retrigger --repo guardian-intelligence/apm2 --pr <PR_NUMBER>"
+  automatic_trigger: "Reviews are auto-dispatched by the `apm2 fac push` pipeline on every push. Agents do NOT need to manually trigger reviews after pushing."
+  manual_restart: "apm2 fac restart --pr <PR_NUMBER> (use ONLY when auto-dispatch has failed or for recovery)"
+  recovery_entrypoint: "apm2 fac restart --pr <PR_NUMBER>"
   monitoring:
     primary: "apm2 fac review project --pr <PR_NUMBER> --emit-errors (1Hz projection of review + CI gate states)"
     secondary: "apm2 fac review status --pr <PR_NUMBER> (snapshot of reviewer process state)"
@@ -142,7 +142,7 @@ invariants[14]:
   - "Bounded search: orchestrate only 1-20 PRs per run; >20 requires explicit user partitioning into waves."
   - "One active implementor agent per PR at any time."
   - "At most one active review batch per PR at any time."
-  - "Use `apm2 fac review retrigger` for review reruns; direct `gh workflow run forge-admission-cycle.yml` is fallback-only."
+  - "Use `apm2 fac restart` for review reruns; direct `gh workflow run forge-admission-cycle.yml` is fallback-only."
   - "No merge action without Forge Admission Cycle=success for current HEAD SHA."
   - "Review prompt dispatch includes review_prompt_required_payload."
   - "Never use the same model family for both implementing and reviewing the same PR cycle."

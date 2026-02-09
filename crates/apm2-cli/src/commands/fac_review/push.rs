@@ -274,6 +274,69 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         eprintln!("fac push: auto-merge enabled on PR #{pr_number}");
     }
 
+    // Step 4: spawn background evidence+review pipeline.
+    let pr_url = format!("https://github.com/{repo}/pull/{pr_number}");
+    if let Err(e) = spawn_pipeline(repo, &pr_url, pr_number, &sha) {
+        eprintln!("WARNING: pipeline spawn failed: {e}");
+        eprintln!("  Use `apm2 fac restart --pr {pr_number}` to retry.");
+    }
+
     eprintln!("fac push: done (PR #{pr_number})");
     exit_codes::SUCCESS
+}
+
+// ── Background pipeline spawn ────────────────────────────────────────────────
+
+/// Spawn `apm2 fac pipeline` as a detached background process.
+fn spawn_pipeline(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> Result<(), String> {
+    use std::fs::{self, OpenOptions};
+
+    let exe_path = std::env::current_exe()
+        .map_err(|e| format!("failed to resolve current executable: {e}"))?;
+    let cwd = std::env::current_dir().map_err(|e| format!("failed to resolve cwd: {e}"))?;
+
+    // Log to ~/.apm2/pipeline_logs/pr{N}-{sha_short}.log
+    let home = super::types::apm2_home_dir()?;
+    let log_dir = home.join("pipeline_logs");
+    fs::create_dir_all(&log_dir)
+        .map_err(|e| format!("failed to create pipeline log directory: {e}"))?;
+    let sha_short = &sha[..sha.len().min(8)];
+    let log_path = log_dir.join(format!("pr{pr_number}-{sha_short}.log"));
+
+    let stdout = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("failed to open pipeline log {}: {e}", log_path.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .map_err(|e| format!("failed to clone pipeline log handle: {e}"))?;
+
+    let child = Command::new(&exe_path)
+        .arg("fac")
+        .arg("pipeline")
+        .arg("--repo")
+        .arg(repo)
+        .arg("--pr-url")
+        .arg(pr_url)
+        .arg("--pr")
+        .arg(pr_number.to_string())
+        .arg("--sha")
+        .arg(sha)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::from(stderr))
+        .spawn()
+        .map_err(|e| format!("failed to spawn pipeline process: {e}"))?;
+
+    let pid = child.id();
+    // Drop child handle to detach — the process continues in background.
+    drop(child);
+
+    eprintln!(
+        "fac push: pipeline spawned (pid={pid}, log={})",
+        log_path.display()
+    );
+    Ok(())
 }

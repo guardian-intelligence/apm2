@@ -71,6 +71,7 @@ pub fn run_single_evidence_gate(
 /// Run evidence gates (cargo fmt check, clippy, doc, test, CI scripts).
 /// Returns `Ok(true)` if all gates passed, `Ok(false)` if any failed.
 /// Fail-closed: any error running a gate counts as failure.
+#[allow(dead_code)]
 pub fn run_evidence_gates(
     workspace_root: &Path,
     sha: &str,
