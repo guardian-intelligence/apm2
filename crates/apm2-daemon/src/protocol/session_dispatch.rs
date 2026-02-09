@@ -746,6 +746,13 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// `join -> revalidate -> consume` lifecycle before reaching broker
     /// dispatch. If absent, the PCAC gate is skipped (Phase 1 opt-in).
     pcac_lifecycle_gate: Option<Arc<crate::pcac::LifecycleGate>>,
+    /// PCAC privileged handler enforcement flag (TCK-00424).
+    ///
+    /// When `true`, `DelegateSublease` and `IngestReviewReceipt` handlers
+    /// enforce PCAC lifecycle gates with delegation narrowing checks.
+    /// When `false`, privileged handlers skip PCAC enforcement (default).
+    /// This enables policy-switchable rollout without wire protocol breakage.
+    pcac_privileged_enforcement: bool,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -780,6 +787,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             stop_conditions_store: None,
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
+            pcac_privileged_enforcement: false,
         }
     }
 
@@ -806,6 +814,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             stop_conditions_store: None,
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
+            pcac_privileged_enforcement: false,
         }
     }
 }
@@ -837,6 +846,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             stop_conditions_store: None,
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
+            pcac_privileged_enforcement: false,
         }
     }
 
@@ -868,6 +878,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             stop_conditions_store: None,
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
+            pcac_privileged_enforcement: false,
         }
     }
 
@@ -915,6 +926,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             stop_conditions_store: None,
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
+            pcac_privileged_enforcement: false,
         }
     }
 
@@ -1100,6 +1112,17 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     #[must_use]
     pub fn with_pcac_lifecycle_gate(mut self, gate: Arc<crate::pcac::LifecycleGate>) -> Self {
         self.pcac_lifecycle_gate = Some(gate);
+        self
+    }
+
+    /// Enables PCAC lifecycle enforcement for privileged handlers (TCK-00424).
+    ///
+    /// When enabled, `DelegateSublease` and `IngestReviewReceipt` handlers
+    /// enforce PCAC lifecycle gates with delegation narrowing checks.
+    /// This can be toggled without wire protocol breakage.
+    #[must_use]
+    pub const fn with_pcac_privileged_enforcement(mut self, enabled: bool) -> Self {
+        self.pcac_privileged_enforcement = enabled;
         self
     }
 

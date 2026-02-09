@@ -5886,6 +5886,21 @@ pub struct PrivilegedDispatcher {
     /// resolver returns a receipt, it is stored on the `WorkClaim` and
     /// subsequently enforced by the delegated spawn gate.
     permeability_receipt_resolver: Arc<dyn PermeabilityReceiptResolver>,
+
+    /// PCAC lifecycle gate for authority lifecycle enforcement (TCK-00424).
+    ///
+    /// When set (and `pcac_privileged_enforcement` is `true`), privileged
+    /// handlers (`DelegateSublease`, `IngestReviewReceipt`) enforce the
+    /// `join -> revalidate -> consume` lifecycle before authoritative effects.
+    pcac_lifecycle_gate: Option<Arc<crate::pcac::LifecycleGate>>,
+
+    /// PCAC privileged handler enforcement flag (TCK-00424).
+    ///
+    /// When `true`, privileged handlers enforce PCAC lifecycle gates with
+    /// delegation narrowing checks. When `false`, PCAC enforcement is
+    /// skipped (default). Enables policy-switchable rollout without wire
+    /// protocol breakage.
+    pcac_privileged_enforcement: bool,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -6044,6 +6059,8 @@ impl PrivilegedDispatcher {
             adapter_profile_ids_by_hash: HashMap::new(),
             adapter_profile_cas: None,
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
+            pcac_lifecycle_gate: None,
+            pcac_privileged_enforcement: false,
         }
     }
 
@@ -6123,6 +6140,8 @@ impl PrivilegedDispatcher {
             adapter_profile_ids_by_hash: HashMap::new(),
             adapter_profile_cas: None,
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
+            pcac_lifecycle_gate: None,
+            pcac_privileged_enforcement: false,
         }
     }
 
@@ -6219,6 +6238,8 @@ impl PrivilegedDispatcher {
             adapter_profile_ids_by_hash: HashMap::new(),
             adapter_profile_cas: None,
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
+            pcac_lifecycle_gate: None,
+            pcac_privileged_enforcement: false,
         }
     }
 
@@ -6293,6 +6314,8 @@ impl PrivilegedDispatcher {
             adapter_profile_ids_by_hash: HashMap::new(),
             adapter_profile_cas: None,
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
+            pcac_lifecycle_gate: None,
+            pcac_privileged_enforcement: false,
         }
     }
 
@@ -6514,6 +6537,28 @@ impl PrivilegedDispatcher {
             .map(|(profile_id, profile_hash)| (profile_hash, profile_id))
             .collect();
         self.adapter_profile_cas = Some(profile_cas);
+        self
+    }
+
+    /// Sets the PCAC lifecycle gate for privileged handler enforcement
+    /// (TCK-00424).
+    ///
+    /// When set along with `pcac_privileged_enforcement`, privileged handlers
+    /// (`DelegateSublease`, `IngestReviewReceipt`) enforce the PCAC lifecycle.
+    #[must_use]
+    pub fn with_pcac_lifecycle_gate(mut self, gate: Arc<crate::pcac::LifecycleGate>) -> Self {
+        self.pcac_lifecycle_gate = Some(gate);
+        self
+    }
+
+    /// Enables PCAC lifecycle enforcement for privileged handlers (TCK-00424).
+    ///
+    /// When enabled, `DelegateSublease` and `IngestReviewReceipt` handlers
+    /// enforce PCAC lifecycle gates with delegation narrowing checks.
+    /// This can be toggled without wire protocol breakage.
+    #[must_use]
+    pub const fn with_pcac_privileged_enforcement(mut self, enabled: bool) -> Self {
+        self.pcac_privileged_enforcement = enabled;
         self
     }
 
@@ -11102,6 +11147,101 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        // ---- TCK-00424: PCAC lifecycle gate for IngestReviewReceipt ----
+        //
+        // When pcac_privileged_enforcement is enabled and a lifecycle gate is
+        // configured, the review receipt handler must pass through
+        // join -> revalidate -> consume before the authoritative effect
+        // (event emission) is permitted.
+        let _pcac_privileged_receipts = if self.pcac_privileged_enforcement {
+            if let Some(ref pcac_gate) = self.pcac_lifecycle_gate {
+                let identity_proof_hash_arr: [u8; 32] = request
+                    .identity_proof_hash
+                    .as_slice()
+                    .try_into()
+                    .expect("validated to be 32 bytes above");
+                let changeset_arr: [u8; 32] = request
+                    .changeset_digest
+                    .as_slice()
+                    .try_into()
+                    .expect("validated to be 32 bytes above");
+
+                let pcac_builder = crate::pcac::PrivilegedJoinInputBuilder {
+                    actor_id: authenticated_reviewer_id.clone(),
+                    lease_id: request.lease_id.clone(),
+                    intent_digest: *blake3::hash(
+                        &[
+                            request.receipt_id.as_bytes(),
+                            &changeset_arr[..],
+                            request.verdict.to_string().as_bytes(),
+                        ]
+                        .concat(),
+                    )
+                    .as_bytes(),
+                    identity_proof_hash: identity_proof_hash_arr,
+                    risk_tier: match risk_tier {
+                        apm2_core::fac::RiskTier::Tier0 => apm2_core::pcac::RiskTier::Tier0,
+                        apm2_core::fac::RiskTier::Tier1 => apm2_core::pcac::RiskTier::Tier1,
+                        _ => apm2_core::pcac::RiskTier::Tier2Plus,
+                    },
+                    time_envelope_ref: *blake3::hash(lease_time_envelope_ref.as_bytes()).as_bytes(),
+                    as_of_ledger_anchor: *blake3::hash(lease_time_envelope_ref.as_bytes())
+                        .as_bytes(),
+                    directory_head_hash: *blake3::hash(lease_time_envelope_ref.as_bytes())
+                        .as_bytes(),
+                    changeset_digest: changeset_arr,
+                    policy_hash: resolved_policy_hash,
+                    freshness_witness_tick: match self.holonic_clock.now_hlc() {
+                        Ok(hlc) => hlc.wall_ns / 1_000_000_000,
+                        Err(e) => {
+                            warn!(error = %e, "PCAC freshness tick clock error — failing closed");
+                            return Ok(PrivilegedResponse::error(
+                                PrivilegedErrorCode::CapabilityRequestRejected,
+                                format!("PCAC clock error: {e}"),
+                            ));
+                        },
+                    },
+                    permeability_receipt_hash: None,
+                };
+
+                let pcac_input = pcac_builder.build();
+                let current_time_envelope_ref = pcac_input.time_envelope_ref;
+                let current_ledger_anchor = pcac_input.as_of_ledger_anchor;
+                let current_revocation_head = pcac_input.directory_head_hash;
+
+                match pcac_gate.execute(
+                    &pcac_input,
+                    current_time_envelope_ref,
+                    current_ledger_anchor,
+                    current_revocation_head,
+                ) {
+                    Ok(receipts) => {
+                        info!(
+                            receipt_id = %request.receipt_id,
+                            ajc_id = %hex::encode(receipts.certificate.ajc_id),
+                            "PCAC lifecycle gate passed for IngestReviewReceipt"
+                        );
+                        Some(receipts)
+                    },
+                    Err(deny) => {
+                        warn!(
+                            receipt_id = %request.receipt_id,
+                            deny_class = %deny.deny_class,
+                            "IngestReviewReceipt denied by PCAC lifecycle gate"
+                        );
+                        return Ok(PrivilegedResponse::error(
+                            PrivilegedErrorCode::CapabilityRequestRejected,
+                            format!("PCAC authority denied: {}", deny.deny_class),
+                        ));
+                    },
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let request_changeset_digest_arr: [u8; 32] = request
             .changeset_digest
             .as_slice()
@@ -12533,6 +12673,147 @@ impl PrivilegedDispatcher {
                 format!("parent lease HTF authority validation failed: {e}"),
             ));
         }
+
+        // ---- TCK-00424: PCAC lifecycle gate + delegation narrowing for
+        // DelegateSublease ----
+        //
+        // When pcac_privileged_enforcement is enabled and a lifecycle gate is
+        // configured, sublease delegation must pass through:
+        // 1. Delegation lineage validation
+        // 2. Delegation narrowing (strict-subset) check (Law 5)
+        // 3. PCAC join -> revalidate -> consume lifecycle
+        let _pcac_privileged_receipts = if self.pcac_privileged_enforcement {
+            if let Some(ref pcac_gate) = self.pcac_lifecycle_gate {
+                // TCK-00424 Step 1: Validate delegation lineage.
+                let parent_time_envelope_ref =
+                    *blake3::hash(parent_lease.time_envelope_ref.as_bytes()).as_bytes();
+                if let Err(deny) = crate::pcac::DelegationNarrowingChecker::validate_lineage(
+                    &request.parent_lease_id,
+                    &request.delegatee_actor_id,
+                    parent_time_envelope_ref,
+                    parent_time_envelope_ref,
+                    0, // tick is informational
+                ) {
+                    warn!(
+                        parent_lease_id = %request.parent_lease_id,
+                        delegatee = %request.delegatee_actor_id,
+                        deny_class = %deny.deny_class,
+                        "DelegateSublease denied: invalid delegation lineage"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("PCAC delegation lineage invalid: {}", deny.deny_class),
+                    ));
+                }
+
+                // TCK-00424 Step 2: Delegation narrowing (Law 5).
+                // Sublease inherits parent's changeset and policy; expiry must
+                // not exceed parent.
+                let sublease_expiry_ms = request.requested_expiry_ns / 1_000_000;
+                let narrowing_params = crate::pcac::DelegationNarrowingParams {
+                    parent_expiry_ms: parent_lease.expires_at,
+                    sublease_expiry_ms,
+                    parent_changeset_digest: &parent_lease.changeset_digest,
+                    sublease_changeset_digest: &parent_lease.changeset_digest,
+                    parent_policy_hash: &parent_lease.policy_hash,
+                    sublease_policy_hash: &parent_lease.policy_hash,
+                    parent_gate_id: &parent_lease.gate_id,
+                    sublease_gate_id: &parent_lease.gate_id,
+                    time_envelope_ref: parent_time_envelope_ref,
+                    ledger_anchor: parent_time_envelope_ref,
+                    current_tick: 0,
+                };
+                if let Err(deny) =
+                    crate::pcac::DelegationNarrowingChecker::validate(&narrowing_params)
+                {
+                    warn!(
+                        parent_lease_id = %request.parent_lease_id,
+                        sublease_id = %request.sublease_id,
+                        deny_class = %deny.deny_class,
+                        "DelegateSublease denied: delegation widening"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("PCAC delegation narrowing failed: {}", deny.deny_class),
+                    ));
+                }
+
+                // TCK-00424 Step 3: PCAC lifecycle gate.
+                let pcac_builder = crate::pcac::PrivilegedJoinInputBuilder {
+                    actor_id: caller_actor_id.clone(),
+                    lease_id: request.parent_lease_id.clone(),
+                    intent_digest: *blake3::hash(
+                        &[
+                            request.sublease_id.as_bytes(),
+                            request.delegatee_actor_id.as_bytes(),
+                            &request.requested_expiry_ns.to_le_bytes(),
+                        ]
+                        .concat(),
+                    )
+                    .as_bytes(),
+                    identity_proof_hash: request_identity_proof_hash,
+                    risk_tier: match parent_risk_tier {
+                        apm2_core::fac::RiskTier::Tier0 => apm2_core::pcac::RiskTier::Tier0,
+                        apm2_core::fac::RiskTier::Tier1 => apm2_core::pcac::RiskTier::Tier1,
+                        _ => apm2_core::pcac::RiskTier::Tier2Plus,
+                    },
+                    time_envelope_ref: parent_time_envelope_ref,
+                    as_of_ledger_anchor: parent_time_envelope_ref,
+                    directory_head_hash: parent_time_envelope_ref,
+                    changeset_digest: parent_lease.changeset_digest,
+                    policy_hash: parent_lease.policy_hash,
+                    freshness_witness_tick: match self.holonic_clock.now_hlc() {
+                        Ok(hlc) => hlc.wall_ns / 1_000_000_000,
+                        Err(e) => {
+                            warn!(error = %e, "PCAC freshness tick clock error — failing closed");
+                            return Ok(PrivilegedResponse::error(
+                                PrivilegedErrorCode::CapabilityRequestRejected,
+                                format!("PCAC clock error: {e}"),
+                            ));
+                        },
+                    },
+                    permeability_receipt_hash: Some(
+                        *blake3::hash(request.parent_lease_id.as_bytes()).as_bytes(),
+                    ),
+                };
+
+                let pcac_input = pcac_builder.build();
+                let current_time_envelope_ref = pcac_input.time_envelope_ref;
+                let current_ledger_anchor = pcac_input.as_of_ledger_anchor;
+                let current_revocation_head = pcac_input.directory_head_hash;
+
+                match pcac_gate.execute(
+                    &pcac_input,
+                    current_time_envelope_ref,
+                    current_ledger_anchor,
+                    current_revocation_head,
+                ) {
+                    Ok(receipts) => {
+                        info!(
+                            sublease_id = %request.sublease_id,
+                            ajc_id = %hex::encode(receipts.certificate.ajc_id),
+                            "PCAC lifecycle gate passed for DelegateSublease"
+                        );
+                        Some(receipts)
+                    },
+                    Err(deny) => {
+                        warn!(
+                            sublease_id = %request.sublease_id,
+                            deny_class = %deny.deny_class,
+                            "DelegateSublease denied by PCAC lifecycle gate"
+                        );
+                        return Ok(PrivilegedResponse::error(
+                            PrivilegedErrorCode::CapabilityRequestRejected,
+                            format!("PCAC authority denied: {}", deny.deny_class),
+                        ));
+                    },
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // ---- Phase 2c: Sublease ID uniqueness check (admission before mutation) ----
         //
