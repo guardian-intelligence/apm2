@@ -2188,9 +2188,11 @@ impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
     /// 1. The entry must be currently revoked.
     /// 2. The anchor must reference the current revocation event hash.
     /// 3. An [`AuthorizationProof`] with valid policy-root signature/waiver.
-    /// 4. The proof's `effective_anchor` must be strictly greater than the
+    /// 4. An [`AuthorizationVerifier`] to cryptographically verify the proof's
+    ///    signature (fail-closed: the verifier is **required**, not optional).
+    /// 5. The proof's `effective_anchor` must be strictly greater than the
     ///    entry's current `effective_anchor`.
-    /// 5. The total number of re-admissions must not exceed
+    /// 6. The total number of re-admissions must not exceed
     ///    [`MAX_READMISSION_ANCHORS`].
     ///
     /// # Errors
@@ -2213,6 +2215,7 @@ impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
         node_id: NodeId,
         anchor: ReAdmissionAnchor,
         auth_proof: &AuthorizationProof,
+        verifier: &dyn AuthorizationVerifier,
     ) -> Result<Self, CrdtMergeError> {
         // Must be currently revoked
         if self.status != DirectoryStatus::Revoked {
@@ -2226,8 +2229,13 @@ impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
             .ok_or(CrdtMergeError::RevocationWinsViolation)?;
         anchor.validate_for_revocation(revocation_hash)?;
 
-        // Validate authorization proof integrity
-        auth_proof.validate_integrity(revocation_hash, anchor.signer_node_id())?;
+        // Validate authorization proof integrity WITH cryptographic signature
+        // verification (fail-closed: verifier is required, not optional).
+        auth_proof.validate_integrity_with_verifier(
+            revocation_hash,
+            anchor.signer_node_id(),
+            Some(verifier),
+        )?;
 
         // Effective anchor must be strictly greater (RFC-0020 exception)
         if auth_proof.effective_anchor() <= self.effective_anchor {
@@ -2520,6 +2528,38 @@ impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // Test verifiers for AuthorizationVerifier trait
+    // =========================================================================
+
+    /// Test verifier that always approves signature verification.
+    #[derive(Debug)]
+    struct AlwaysApproveVerifier;
+    impl AuthorizationVerifier for AlwaysApproveVerifier {
+        fn verify(
+            &self,
+            _policy_root_hash: &[u8; 32],
+            _message: &[u8],
+            _signature_tail: &[u8; 32],
+        ) -> bool {
+            true
+        }
+    }
+
+    /// Test verifier that always rejects signature verification.
+    #[derive(Debug)]
+    struct AlwaysRejectVerifier;
+    impl AuthorizationVerifier for AlwaysRejectVerifier {
+        fn verify(
+            &self,
+            _policy_root_hash: &[u8; 32],
+            _message: &[u8],
+            _signature_tail: &[u8; 32],
+        ) -> bool {
+            false
+        }
+    }
 
     // =========================================================================
     // TCK-00197: HLC-Based CRDT Merge Operators
@@ -3778,6 +3818,7 @@ mod tests {
                 [0x02; 32],
                 anchor,
                 &auth_proof,
+                &AlwaysApproveVerifier,
             )
             .unwrap();
 
@@ -3804,6 +3845,7 @@ mod tests {
             [0x02; 32],
             bad_anchor,
             &auth_proof,
+            &AlwaysApproveVerifier,
         );
 
         assert!(matches!(
@@ -3827,6 +3869,7 @@ mod tests {
             [0x02; 32],
             anchor,
             &auth_proof,
+            &AlwaysApproveVerifier,
         );
 
         assert!(matches!(
@@ -3928,6 +3971,7 @@ mod tests {
                 [0x02; 32],
                 anchor,
                 &auth_proof,
+                &AlwaysApproveVerifier,
             )
             .unwrap();
         assert_eq!(part_b.status(), DirectoryStatus::Active);
@@ -3974,6 +4018,7 @@ mod tests {
                 [0x02; 32],
                 anchor,
                 &auth_proof,
+                &AlwaysApproveVerifier,
             )
             .unwrap();
 
@@ -4176,6 +4221,7 @@ mod tests {
             signer,
             anchor,
             &bad_proof,
+            &AlwaysApproveVerifier,
         );
         assert!(matches!(
             result,
@@ -4191,6 +4237,7 @@ mod tests {
             signer,
             anchor2,
             &bad_proof2,
+            &AlwaysApproveVerifier,
         );
         assert!(matches!(
             result2,
@@ -4209,7 +4256,14 @@ mod tests {
         let anchor1 = ReAdmissionAnchor::new(rev_hash, Hlc::new(2000, 0), signer);
         let auth1 = make_auth_proof(&rev_hash, &signer, 1);
         let readmitted = reg
-            .readmit("v2".to_string(), Hlc::new(2000, 0), signer, anchor1, &auth1)
+            .readmit(
+                "v2".to_string(),
+                Hlc::new(2000, 0),
+                signer,
+                anchor1,
+                &auth1,
+                &AlwaysApproveVerifier,
+            )
             .unwrap();
         assert_eq!(readmitted.effective_anchor(), 1);
 
@@ -4226,6 +4280,7 @@ mod tests {
             signer,
             anchor2,
             &auth_same,
+            &AlwaysApproveVerifier,
         );
         assert!(matches!(
             result,
@@ -4241,6 +4296,7 @@ mod tests {
             signer,
             anchor3,
             &auth_greater,
+            &AlwaysApproveVerifier,
         );
         assert!(result2.is_ok());
         assert_eq!(result2.unwrap().effective_anchor(), 2);
@@ -4256,7 +4312,14 @@ mod tests {
         let signer = [0x02; 32];
         let anchor = ReAdmissionAnchor::new([0xAA; 32], Hlc::new(2000, 0), signer);
         let auth = make_auth_proof(&[0xAA; 32], &signer, 1);
-        let result = reg.readmit("new".to_string(), Hlc::new(2000, 0), signer, anchor, &auth);
+        let result = reg.readmit(
+            "new".to_string(),
+            Hlc::new(2000, 0),
+            signer,
+            anchor,
+            &auth,
+            &AlwaysApproveVerifier,
+        );
         assert!(matches!(
             result,
             Err(CrdtMergeError::ReAdmissionAnchorLimitExceeded { .. })
@@ -4422,6 +4485,7 @@ mod tests {
                 signer,
                 anchor,
                 &auth_proof,
+                &AlwaysApproveVerifier,
             )
             .unwrap();
         assert_eq!(readmitted.effective_anchor(), 5);
@@ -4498,34 +4562,6 @@ mod tests {
     // BLOCKER 1 fix: AuthorizationVerifier cryptographic signature verification
     // =========================================================================
 
-    /// Test verifier that always approves.
-    #[derive(Debug)]
-    struct AlwaysApproveVerifier;
-    impl AuthorizationVerifier for AlwaysApproveVerifier {
-        fn verify(
-            &self,
-            _policy_root_hash: &[u8; 32],
-            _message: &[u8],
-            _signature_tail: &[u8; 32],
-        ) -> bool {
-            true
-        }
-    }
-
-    /// Test verifier that always rejects.
-    #[derive(Debug)]
-    struct AlwaysRejectVerifier;
-    impl AuthorizationVerifier for AlwaysRejectVerifier {
-        fn verify(
-            &self,
-            _policy_root_hash: &[u8; 32],
-            _message: &[u8],
-            _signature_tail: &[u8; 32],
-        ) -> bool {
-            false
-        }
-    }
-
     /// BLOCKER 1 fix: `validate_integrity_with_verifier` passes with approving
     /// verifier.
     #[test]
@@ -4564,7 +4600,8 @@ mod tests {
     }
 
     /// BLOCKER 1 fix: `validate_integrity` (no verifier) still works for
-    /// backward compatibility.
+    /// backward compatibility at the proof level (but NOT at the readmit
+    /// level).
     #[test]
     fn tck_00360_authorization_proof_no_verifier_backward_compat() {
         let rev_hash = [0xAA; 32];
@@ -4573,13 +4610,93 @@ mod tests {
             [0x01; 32], &rev_hash, 1, &signer, [0xFF; 32], false,
         );
 
-        // Without verifier, structural checks still pass
+        // Without verifier, structural checks still pass at the proof level
         assert!(proof.validate_integrity(&rev_hash, &signer).is_ok());
         // With None verifier explicitly, same result
         assert!(
             proof
                 .validate_integrity_with_verifier(&rev_hash, &signer, None)
                 .is_ok()
+        );
+    }
+
+    /// BLOCKER fix: `readmit()` with a forged proof (correct commitment hash
+    /// but garbage `signature_tail`) is rejected when a verifier is present.
+    ///
+    /// This is the key attack vector: an attacker can compute the correct
+    /// `signature_commitment` (payload hash) because all inputs are public,
+    /// but cannot forge the `signature_tail` without the private key. The
+    /// verifier catches this forgery.
+    #[test]
+    fn tck_00360_readmit_rejects_forged_signature_with_verifier() {
+        let rev_hash = [0xAA; 32];
+        let signer = [0x02; 32];
+        let reg = make_revoked_reg("old_value", 1000, 0x01, rev_hash);
+
+        // Build a proof with a valid commitment hash but garbage signature_tail.
+        // The `with_valid_commitment` helper computes the correct commitment,
+        // so structural checks pass. The rejecting verifier simulates the
+        // cryptographic check failing on the forged tail.
+        let forged_proof = AuthorizationProof::with_valid_commitment(
+            [0x01; 32], // policy_root_hash
+            &rev_hash, 1, // effective_anchor
+            &signer, [0xDE; 32], // garbage signature_tail (forged)
+            false,
+        );
+
+        let anchor = ReAdmissionAnchor::new(rev_hash, Hlc::new(2000, 0), signer);
+        let result = reg.readmit(
+            "attacker_value".to_string(),
+            Hlc::new(2000, 0),
+            signer,
+            anchor,
+            &forged_proof,
+            &AlwaysRejectVerifier, // simulates crypto rejection of forged tail
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(CrdtMergeError::AuthorizationProofInvalid { ref reason })
+                if reason.contains("cryptographic signature verification failed")
+            ),
+            "readmit() must reject forged signature when verifier is present: {result:?}"
+        );
+    }
+
+    /// BLOCKER fix: `readmit()` requires a verifier (fail-closed by design).
+    ///
+    /// The `readmit()` signature now takes `&dyn AuthorizationVerifier` as a
+    /// required parameter (not `Option`). This test demonstrates the
+    /// fail-closed property: even with a structurally valid proof, if the
+    /// verifier rejects the signature, readmission is denied.
+    #[test]
+    fn tck_00360_readmit_fail_closed_with_rejecting_verifier() {
+        let rev_hash = [0xAA; 32];
+        let signer = [0x02; 32];
+        let reg = make_revoked_reg("old_value", 1000, 0x01, rev_hash);
+
+        // A structurally valid proof (correct commitment) that would pass
+        // without a verifier, but the AlwaysRejectVerifier denies it.
+        let valid_proof = make_auth_proof(&rev_hash, &signer, 1);
+        let anchor = ReAdmissionAnchor::new(rev_hash, Hlc::new(2000, 0), signer);
+
+        let result = reg.readmit(
+            "should_be_denied".to_string(),
+            Hlc::new(2000, 0),
+            signer,
+            anchor,
+            &valid_proof,
+            &AlwaysRejectVerifier, // fail-closed: always denies
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(CrdtMergeError::AuthorizationProofInvalid { ref reason })
+                if reason.contains("cryptographic signature verification failed")
+            ),
+            "readmit() must deny re-admission when verifier rejects (fail-closed): {result:?}"
         );
     }
 
@@ -4753,6 +4870,7 @@ mod tests {
                 signer,
                 anchor,
                 &auth_proof,
+                &AlwaysApproveVerifier,
             )
             .unwrap();
 
