@@ -30,6 +30,7 @@ notes:
   - "Use `apm2 fac push` as the canonical push workflow — it pushes, creates/updates the PR, and enables auto-merge. Reviews auto-start via CI."
   - "Use `apm2 fac review project --pr <N> --emit-errors` to monitor all gate states (CI gates + reviews) after a push."
   - "Use `apm2 fac review` for reviewer lifecycle actions (`status`, `project`). Use `apm2 fac restart` for recovery."
+  - "Use `apm2 fac logs --pr <N>` to discover and display local pipeline/evidence/review log files. Add `--json` for machine-readable output."
   - "Use direct `gh` commands only when FAC has no equivalent (for now: PR metadata and full comment-body retrieval)."
 
 references[10]:
@@ -116,10 +117,12 @@ runtime_review_protocol:
   monitoring:
     primary: "apm2 fac review project --pr <PR_NUMBER> --emit-errors (1Hz projection of review + CI gate states)"
     secondary: "apm2 fac review status --pr <PR_NUMBER> (snapshot of reviewer process state)"
+    log_discovery: "apm2 fac logs --pr <PR_NUMBER> (lists all local log files for evidence gates, pipeline runs, review dispatch, and events)"
     ci_status_comment: "PR comment with marker `apm2-ci-status:v1` containing YAML gate statuses (rustfmt, clippy, doc, test, security_review, quality_review)"
   observability_surfaces:
     - "~/.apm2/review_events.ndjson (append-only lifecycle events)"
     - "~/.apm2/review_state.json (active review process/model/backend state)"
+    - "~/.apm2/pipeline_logs/pr<PR>-<SHA>.log (per-push pipeline stdout/stderr)"
     - "~/.apm2/review_pulses/pr<PR>_review_pulse_{security|quality}.json (PR-scoped HEAD SHA pulse files)"
     - "PR comment `apm2-ci-status:v1` (machine-readable YAML with all gate statuses and token counts)"
   required_semantics:

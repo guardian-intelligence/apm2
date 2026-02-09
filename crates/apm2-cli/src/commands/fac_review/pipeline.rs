@@ -29,12 +29,7 @@ pub fn run_pipeline(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> u8 {
     }
 }
 
-fn run_pipeline_inner(
-    repo: &str,
-    pr_url: &str,
-    pr_number: u32,
-    sha: &str,
-) -> Result<bool, String> {
+fn run_pipeline_inner(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> Result<bool, String> {
     let workspace_root =
         std::env::current_dir().map_err(|e| format!("failed to resolve cwd: {e}"))?;
 
@@ -67,8 +62,14 @@ fn run_pipeline_inner(
                 );
             },
             Err(err) => {
-                eprintln!("pipeline: failed to dispatch {} review: {err}", kind.as_str());
-                return Err(format!("review dispatch failed for {}: {err}", kind.as_str()));
+                eprintln!(
+                    "pipeline: failed to dispatch {} review: {err}",
+                    kind.as_str()
+                );
+                return Err(format!(
+                    "review dispatch failed for {}: {err}",
+                    kind.as_str()
+                ));
             },
         }
     }
