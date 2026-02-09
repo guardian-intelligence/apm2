@@ -383,7 +383,7 @@ pub fn run_evidence_gates_with_status(
         .map_err(|e| format!("failed to create evidence directory: {e}"))?;
 
     let mut status = CiStatus::new(sha, pr_number);
-    let mut updater = ThrottledUpdater::new(owner_repo, pr_number);
+    let updater = ThrottledUpdater::new(owner_repo, pr_number);
 
     // Load gate cache for this SHA (populated by `fac gates`).
     let cache = GateCache::load(sha);

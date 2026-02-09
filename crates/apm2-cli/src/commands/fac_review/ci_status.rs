@@ -1,8 +1,9 @@
-//! CI status PR comment: CRUD operations and throttled updater.
+//! CI status PR comment: single-post updater.
 //!
 //! Projects all CI gate results to a single machine-readable YAML PR comment
-//! with marker `apm2-ci-status:v1`. The comment is created once per SHA and
-//! updated in-place as gates complete.
+//! with marker `apm2-ci-status:v1`. The comment is created **once** when the
+//! pipeline completes — no intermediate edits — to minimise GitHub API calls
+//! and avoid rate-limit exhaustion.
 //!
 //! # Security boundary
 //!
@@ -24,7 +25,6 @@
 
 use std::collections::BTreeMap;
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -174,42 +174,30 @@ pub fn find_status_comment(
     Ok(None)
 }
 
-/// Create or update the CI status comment on a PR.
-pub fn upsert_status_comment(
+/// Post a single CI status comment on a PR (no find+edit, just POST).
+pub fn create_status_comment(
     owner_repo: &str,
     pr_number: u32,
     status: &CiStatus,
 ) -> Result<(), String> {
     let body = status.to_comment_body();
-
-    let (method, endpoint) =
-        if let Some((comment_id, _)) = find_status_comment(owner_repo, pr_number, &status.sha)? {
-            (
-                "PATCH",
-                format!("/repos/{owner_repo}/issues/comments/{comment_id}"),
-            )
-        } else {
-            (
-                "POST",
-                format!("/repos/{owner_repo}/issues/{pr_number}/comments"),
-            )
-        };
+    let endpoint = format!("/repos/{owner_repo}/issues/{pr_number}/comments");
 
     let output = Command::new("gh")
         .args([
             "api",
             "-X",
-            method,
+            "POST",
             &endpoint,
             "-f",
             &format!("body={body}"),
         ])
         .output()
-        .map_err(|e| format!("failed to {method} status comment: {e}"))?;
+        .map_err(|e| format!("failed to POST status comment: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("status comment {method} failed: {stderr}"));
+        return Err(format!("status comment POST failed: {stderr}"));
     }
     Ok(())
 }
@@ -234,80 +222,47 @@ fn extract_yaml_block(body: &str) -> Option<&str> {
     Some(&body[yaml_content_start..yaml_content_start + end])
 }
 
-// ── Throttled updater ────────────────────────────────────────────────────────
+// ── Deferred updater ─────────────────────────────────────────────────────────
 
-/// Rate-limited wrapper around `upsert_status_comment` with debounce and
-/// exponential backoff.
+/// Deferred single-post wrapper around `create_status_comment`.
+///
+/// `update()` is a no-op that only records the latest status in memory.
+/// `force_update()` posts one comment with the final state — this is the
+/// only call that touches the GitHub API, avoiding rate-limit exhaustion
+/// from repeated find+edit cycles.
 pub struct ThrottledUpdater {
     owner_repo: String,
     pr_number: u32,
-    last_update: Option<Instant>,
-    retry_count: u32,
-    debounce: Duration,
 }
 
 impl ThrottledUpdater {
-    /// Create a new throttled updater for the given repo and PR.
+    /// Create a new updater for the given repo and PR.
     pub fn new(owner_repo: &str, pr_number: u32) -> Self {
         Self {
             owner_repo: owner_repo.to_string(),
             pr_number,
-            last_update: None,
-            retry_count: 0,
-            debounce: Duration::from_secs(5),
         }
     }
 
-    /// Attempt to update the CI status comment, respecting debounce and
-    /// backoff.
+    /// Record latest status locally (no API call).
     ///
-    /// Returns `true` if the update was sent, `false` if debounced/skipped.
-    pub fn update(&mut self, status: &CiStatus) -> bool {
-        // Debounce: skip if last update was too recent.
-        if let Some(last) = self.last_update {
-            let min_interval = if self.retry_count == 0 {
-                self.debounce
-            } else {
-                // Exponential backoff: 2^retry * base(2s), max 60s, +jitter.
-                let base_secs = 2u64.saturating_pow(self.retry_count).min(30);
-                // Integer-only 30% jitter: base_secs * 3 / 10.
-                let jitter_range = base_secs * 3 / 10;
-                let jitter = if jitter_range > 0 {
-                    // Simple deterministic jitter from retry count.
-                    (u64::from(self.retry_count) * 7) % (jitter_range * 2)
-                } else {
-                    0
-                };
-                let secs = base_secs.saturating_add(jitter).min(60);
-                Duration::from_secs(secs)
-            };
+    /// Callers still pass their `CiStatus` here so the call-sites don't
+    /// need to change — the status struct itself is the in-memory
+    /// accumulator.
+    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
+    pub fn update(&self, _status: &CiStatus) -> bool {
+        // No-op: we post once at the end via force_update().
+        false
+    }
 
-            if last.elapsed() < min_interval {
-                return false;
-            }
-        }
-
-        match upsert_status_comment(&self.owner_repo, self.pr_number, status) {
-            Ok(()) => {
-                self.last_update = Some(Instant::now());
-                self.retry_count = 0;
-                true
-            },
+    /// Post the final CI status comment (single POST, no find+edit).
+    pub fn force_update(&self, status: &CiStatus) -> bool {
+        match create_status_comment(&self.owner_repo, self.pr_number, status) {
+            Ok(()) => true,
             Err(e) => {
-                eprintln!(
-                    "WARNING: ci_status update failed (retry={}): {e}",
-                    self.retry_count
-                );
-                self.retry_count = self.retry_count.saturating_add(1);
-                self.last_update = Some(Instant::now());
+                eprintln!("WARNING: ci_status final post failed: {e}");
                 false
             },
         }
-    }
-
-    /// Force an update, bypassing debounce (still respects backoff on errors).
-    pub fn force_update(&mut self, status: &CiStatus) -> bool {
-        self.last_update = None;
-        self.update(status)
     }
 }
