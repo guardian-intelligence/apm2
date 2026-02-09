@@ -647,6 +647,54 @@ pub struct SovereigntyEpoch {
     pub signature: [u8; 64],
 }
 
+impl SovereigntyEpoch {
+    /// Validate boundary constraints on sovereignty epoch fields.
+    ///
+    /// Checks that:
+    /// - `epoch_id` is non-empty and within [`MAX_STRING_LENGTH`].
+    /// - `principal_scope_hash` is non-zero.
+    /// - `signer_public_key` is non-zero.
+    /// - `freshness_tick` is strictly positive.
+    /// - `signature` is non-zero (unsigned epochs are invalid).
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError` on the first violation found
+    /// (fail-closed).
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        if self.epoch_id.is_empty() {
+            return Err(PcacValidationError::EmptyRequiredField { field: "epoch_id" });
+        }
+        if self.epoch_id.len() > MAX_STRING_LENGTH {
+            return Err(PcacValidationError::StringTooLong {
+                field: "epoch_id",
+                len: self.epoch_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+
+        if self.principal_scope_hash == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "principal_scope_hash",
+            });
+        }
+        if self.signer_public_key == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "signer_public_key",
+            });
+        }
+        if self.freshness_tick == 0 {
+            return Err(PcacValidationError::NonPositiveTick {
+                field: "freshness_tick",
+            });
+        }
+        if self.signature == [0u8; 64] {
+            return Err(PcacValidationError::ZeroHash { field: "signature" });
+        }
+        Ok(())
+    }
+}
+
 /// Freeze action emitted on sovereignty uncertainty conditions.
 ///
 /// When sovereignty state is uncertain, policy may require a freeze to

@@ -316,6 +316,22 @@ impl SovereigntyChecker {
             }));
         };
 
+        // Validate epoch field boundaries (fail-closed on oversized fields).
+        if let Err(validation_err) = epoch.validate() {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: AuthorityDenyClass::SovereigntyUncertainty {
+                    reason: format!(
+                        "sovereignty epoch boundary validation failed: {validation_err}"
+                    ),
+                },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: current_ledger_anchor,
+                denied_at_tick: current_tick,
+                containment_action: Some(FreezeAction::HardFreeze),
+            }));
+        }
+
         // Zero signature is treated as unsigned/invalid.
         if epoch.signature == ZERO_SIGNATURE {
             return Err(Box::new(AuthorityDenyV1 {
@@ -1327,6 +1343,117 @@ mod tests {
             ),
             "cross-principal replay on consume must be denied, got: {:?}",
             err.deny_class
+        );
+    }
+
+    // =========================================================================
+    // SovereigntyEpoch boundary validation tests (Security BLOCKER fix)
+    // =========================================================================
+
+    #[test]
+    fn oversized_epoch_id_denied_on_revalidate() {
+        let checker = checker();
+        let cert = tier2_cert();
+        let mut state = valid_sovereignty_state();
+        // Create an epoch with an epoch_id that exceeds MAX_STRING_LENGTH.
+        let oversized_id = "x".repeat(apm2_core::pcac::MAX_STRING_LENGTH + 1);
+        state.epoch = Some(signed_epoch(
+            &oversized_id,
+            100,
+            TRUSTED_SIGNER_SEED,
+            TEST_PRINCIPAL_ID,
+        ));
+
+        let err = checker
+            .check_revalidate(&cert, &state, 110, test_hash(0x07), test_hash(0x08))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.deny_class,
+                AuthorityDenyClass::SovereigntyUncertainty { ref reason }
+                    if reason.contains("boundary validation failed")
+            ),
+            "oversized epoch_id must be denied as sovereignty uncertainty, got: {:?}",
+            err.deny_class
+        );
+        assert_eq!(
+            err.containment_action,
+            Some(FreezeAction::HardFreeze),
+            "oversized epoch_id must carry hard-freeze containment"
+        );
+    }
+
+    #[test]
+    fn oversized_epoch_id_denied_on_consume() {
+        let checker = checker();
+        let cert = tier2_cert();
+        let mut state = valid_sovereignty_state();
+        let oversized_id = "x".repeat(apm2_core::pcac::MAX_STRING_LENGTH + 1);
+        state.epoch = Some(signed_epoch(
+            &oversized_id,
+            100,
+            TRUSTED_SIGNER_SEED,
+            TEST_PRINCIPAL_ID,
+        ));
+
+        let err = checker
+            .check_consume(&cert, &state, 110, test_hash(0x07), test_hash(0x08))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.deny_class,
+                AuthorityDenyClass::SovereigntyUncertainty { ref reason }
+                    if reason.contains("boundary validation failed")
+            ),
+            "oversized epoch_id must be denied on consume path, got: {:?}",
+            err.deny_class
+        );
+    }
+
+    #[test]
+    fn empty_epoch_id_denied_on_revalidate() {
+        let checker = checker();
+        let cert = tier2_cert();
+        let mut state = valid_sovereignty_state();
+        state.epoch = Some(signed_epoch(
+            "",
+            100,
+            TRUSTED_SIGNER_SEED,
+            TEST_PRINCIPAL_ID,
+        ));
+
+        let err = checker
+            .check_revalidate(&cert, &state, 110, test_hash(0x07), test_hash(0x08))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.deny_class,
+                AuthorityDenyClass::SovereigntyUncertainty { ref reason }
+                    if reason.contains("boundary validation failed")
+            ),
+            "empty epoch_id must be denied, got: {:?}",
+            err.deny_class
+        );
+    }
+
+    #[test]
+    fn epoch_id_at_max_length_passes() {
+        let checker = checker();
+        let cert = tier2_cert();
+        let mut state = valid_sovereignty_state();
+        // epoch_id at exactly MAX_STRING_LENGTH should pass validation.
+        let max_id = "x".repeat(apm2_core::pcac::MAX_STRING_LENGTH);
+        state.epoch = Some(signed_epoch(
+            &max_id,
+            100,
+            TRUSTED_SIGNER_SEED,
+            TEST_PRINCIPAL_ID,
+        ));
+
+        let result = checker.check_revalidate(&cert, &state, 110, test_hash(0x07), test_hash(0x08));
+        assert!(
+            result.is_ok(),
+            "epoch_id at exactly MAX_STRING_LENGTH should pass validation"
         );
     }
 
