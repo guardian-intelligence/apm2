@@ -119,7 +119,7 @@ pub enum AuthorityDenyClass {
 
     /// Boundary monotonicity violation.
     ///
-    /// Per RFC-0027 §4 Law 6: `join < revalidate <= consume <= effect`.
+    /// Per RFC-0027 §4 Law 6: `join < revalidate < consume <= effect`.
     BoundaryMonotonicityViolation {
         /// Description of the violation.
         description: String,

@@ -103,12 +103,16 @@ pub struct BindingExpectations<'a> {
 /// 6. When `receipt_batch_root_hash` is present, `expected_seal_subject_hash`
 ///    MUST be provided and must equal the batch root to anchor the Merkle proof
 ///    to the authority seal.
+/// 7. When the pointer is unbatched (`merkle_inclusion_proof` and
+///    `receipt_batch_root_hash` are both absent), `expected_seal_subject_hash`
+///    MUST be provided and must equal `receipt_hash`.
 ///
 /// # Arguments
 ///
 /// * `expected_seal_subject_hash` - The subject hash authenticated by the
-///   authority seal. Required for pointer-path batched proofs; the batch root
-///   must equal this hash.
+///   authority seal. Required for pointer path:
+///   - batched: must equal `receipt_batch_root_hash`
+///   - unbatched: must equal `receipt_hash`
 ///
 /// # Errors
 ///
@@ -509,7 +513,38 @@ fn verify_pointer_auth(
                 ctx,
             ));
         },
-        (None, None) => {},
+        (None, None) => {
+            verify_unbatched_pointer_subject(receipt_hash, expected_seal_subject_hash, ctx)?;
+        },
+    }
+    Ok(())
+}
+
+fn verify_unbatched_pointer_subject(
+    receipt_hash: &Hash,
+    expected_seal_subject_hash: Option<&Hash>,
+    ctx: &DenyContext,
+) -> Result<(), Box<AuthorityDenyV1>> {
+    let subject_hash = expected_seal_subject_hash.ok_or_else(|| {
+        make_deny(
+            AuthorityDenyClass::UnknownState {
+                description:
+                    "missing expected_seal_subject_hash for unbatched pointer verification"
+                        .to_string(),
+            },
+            ctx,
+        )
+    })?;
+    require_nonzero(subject_hash, "expected_seal_subject_hash", ctx)?;
+    if !hashes_equal(receipt_hash, subject_hash) {
+        return Err(make_deny(
+            AuthorityDenyClass::UnknownState {
+                description:
+                    "UnbatchedReceiptNotSealSubject: receipt_hash does not match expected_seal_subject_hash"
+                        .to_string(),
+            },
+            ctx,
+        ));
     }
     Ok(())
 }

@@ -28,7 +28,7 @@
 //! 4. **Revocation Dominance**: revocation frontier advancement denies consume.
 //! 5. **Delegation Narrowing**: delegated joins must be strict-subset of
 //!    parent.
-//! 6. **Boundary Monotonicity**: `join < revalidate <= consume <= effect`.
+//! 6. **Boundary Monotonicity**: `join < revalidate < consume <= effect`.
 //! 7. **Evidence Sufficiency**: authoritative outcomes require
 //!    replay-resolvable receipts.
 //!
@@ -60,5 +60,5 @@ pub use receipts::{
 };
 pub use types::{
     AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityJoinCertificateV1,
-    AuthorityJoinInputV1, IdentityEvidenceLevel,
+    AuthorityJoinInputV1, DeterminismClass, IdentityEvidenceLevel, RiskTier,
 };

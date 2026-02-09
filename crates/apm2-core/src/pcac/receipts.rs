@@ -11,11 +11,32 @@
 //! - `view_commitment_hash` (ledger/context observation commitment).
 //! - One admissible receipt authentication shape (direct or pointer/batched).
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error;
+use serde::{Deserialize, Deserializer, Serialize};
 
+use super::auth_verifier::MAX_MERKLE_INCLUSION_PROOF_DEPTH;
 use super::deny::AuthorityDenyClass;
 use super::types::RiskTier;
 use crate::crypto::Hash;
+
+fn deserialize_bounded_merkle_inclusion_proof<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<MerkleProofEntry>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let proof = Option::<Vec<MerkleProofEntry>>::deserialize(deserializer)?;
+    if let Some(entries) = proof.as_ref() {
+        if entries.len() > MAX_MERKLE_INCLUSION_PROOF_DEPTH {
+            return Err(D::Error::custom(format!(
+                "merkle_inclusion_proof length {} exceeds maximum {}",
+                entries.len(),
+                MAX_MERKLE_INCLUSION_PROOF_DEPTH
+            )));
+        }
+    }
+    Ok(proof)
+}
 
 // =============================================================================
 // MerkleProofEntry — direction-aware inclusion proof step
@@ -83,7 +104,11 @@ pub enum ReceiptAuthentication {
         /// Each entry carries the sibling hash and its position (left or
         /// right), enabling correct root recomputation for both
         /// left-branch and right-branch leaves in the batch tree.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_bounded_merkle_inclusion_proof"
+        )]
         merkle_inclusion_proof: Option<Vec<MerkleProofEntry>>,
         /// Batch root hash (when using batch descriptor path).
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -99,6 +99,35 @@ fn consume_record_has_required_fields() {
     assert!(record.consumed_at_tick > 0);
 }
 
+#[test]
+fn pcac_re_exports_allow_authority_join_input_construction() {
+    use crate::pcac::{AuthorityJoinInputV1, DeterminismClass, IdentityEvidenceLevel, RiskTier};
+
+    let input = AuthorityJoinInputV1 {
+        session_id: "session-export".to_string(),
+        holon_id: None,
+        intent_digest: test_hash(0x11),
+        capability_manifest_hash: test_hash(0x12),
+        scope_witness_hashes: vec![],
+        lease_id: "lease-export".to_string(),
+        permeability_receipt_hash: None,
+        identity_proof_hash: test_hash(0x13),
+        identity_evidence_level: IdentityEvidenceLevel::Verified,
+        directory_head_hash: test_hash(0x14),
+        freshness_policy_hash: test_hash(0x15),
+        freshness_witness_tick: 42,
+        stop_budget_profile_digest: test_hash(0x16),
+        pre_actuation_receipt_hashes: vec![],
+        risk_tier: RiskTier::Tier1,
+        determinism_class: DeterminismClass::Deterministic,
+        time_envelope_ref: test_hash(0x17),
+        as_of_ledger_anchor: test_hash(0x18),
+    };
+
+    assert_eq!(input.risk_tier, RiskTier::Tier1);
+    assert_eq!(input.determinism_class, DeterminismClass::Deterministic);
+}
+
 // =============================================================================
 // Identity evidence level tests
 // =============================================================================
@@ -406,6 +435,32 @@ fn receipt_authentication_pointer_serde() {
 }
 
 #[test]
+fn receipt_authentication_pointer_serde_rejects_oversized_proof() {
+    use super::receipts::*;
+
+    #[allow(clippy::cast_possible_truncation)]
+    let too_many: Vec<MerkleProofEntry> = (0
+        ..=super::auth_verifier::MAX_MERKLE_INCLUSION_PROOF_DEPTH)
+        .map(|i| MerkleProofEntry {
+            sibling_hash: test_hash((i as u8).wrapping_add(1)),
+            sibling_is_left: false,
+        })
+        .collect();
+    let json = serde_json::json!({
+        "auth_type": "pointer",
+        "receipt_hash": test_hash(0xE1),
+        "authority_seal_hash": test_hash(0xE2),
+        "merkle_inclusion_proof": too_many,
+        "receipt_batch_root_hash": test_hash(0xE5),
+    });
+    let err = serde_json::from_value::<ReceiptAuthentication>(json).unwrap_err();
+    assert!(
+        err.to_string().contains("exceeds maximum"),
+        "oversized merkle proof must be rejected during deserialization"
+    );
+}
+
+#[test]
 fn lifecycle_stage_display() {
     use super::receipts::LifecycleStage;
 
@@ -647,6 +702,7 @@ fn expected_seal_subject_hash(auth: &ReceiptAuthentication) -> Option<Hash> {
             receipt_batch_root_hash: Some(root),
             ..
         } => Some(*root),
+        ReceiptAuthentication::Pointer { receipt_hash, .. } => Some(*receipt_hash),
         _ => None,
     }
 }
@@ -731,14 +787,36 @@ fn pointer_auth_happy_path_with_merkle_proof() {
 
 #[test]
 fn pointer_auth_happy_path_without_batching() {
+    let receipt_hash = test_hash(0xE1);
     let auth = ReceiptAuthentication::Pointer {
-        receipt_hash: test_hash(0xE1),
+        receipt_hash,
         authority_seal_hash: SEAL,
         merkle_inclusion_proof: None,
         receipt_batch_root_hash: None,
     };
-    let result = verify_receipt_authentication_with_default_subject(&auth);
+    let result =
+        verify_receipt_authentication(&auth, &SEAL, Some(&receipt_hash), TIME_REF, LEDGER, TICK);
     assert!(result.is_ok());
+}
+
+#[test]
+fn pointer_auth_unbatched_receipt_not_seal_subject_denied() {
+    let receipt_hash = test_hash(0xE1);
+    let wrong_subject = test_hash(0xE2);
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash,
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: None,
+        receipt_batch_root_hash: None,
+    };
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, Some(&wrong_subject), TIME_REF, LEDGER, TICK)
+            .unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::UnknownState { ref description }
+        if description.contains("UnbatchedReceiptNotSealSubject")
+    ));
 }
 
 #[test]
