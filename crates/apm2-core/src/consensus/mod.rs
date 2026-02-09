@@ -72,6 +72,7 @@ pub mod bisimulation;
 pub mod crdt;
 pub mod discovery;
 pub mod equivocation;
+pub mod fact_root;
 pub mod genesis;
 pub mod handlers;
 pub mod merkle;
@@ -111,11 +112,13 @@ pub use bisimulation::{
     PromotionGate, PromotionGateResult, StopKind, TraceStep, Transition, build_linear_composition,
 };
 // HLC-based CRDT merge operators (TCK-00197)
+// Revocation-wins signed CRDT merge law (TCK-00360)
 pub use crdt::{
-    ConflictRecord, CrdtMergeError, GCounter, Hlc, HlcWithNodeId, LwwRegister,
-    MAX_CONFLICTS_PER_BATCH, MAX_KEY_LEN, MAX_NODE_ID_LEN, MAX_SET_ELEMENTS, MergeEngine,
-    MergeOperator, MergeResult, MergeWinner, NodeId, SetUnion, hash_value, validate_key,
-    validate_node_id,
+    AuthorizationProof, ConflictRecord, CrdtDelta, CrdtMergeError, DirectoryStatus, GCounter, Hlc,
+    HlcWithNodeId, LwwRegister, MAX_CONFLICTS_PER_BATCH, MAX_KEY_LEN, MAX_NODE_ID_LEN,
+    MAX_READMISSION_ANCHORS, MAX_SET_ELEMENTS, MergeEngine, MergeOperator, MergeResult,
+    MergeWinner, NodeId, READMISSION_ANCHOR_DOMAIN, ReAdmissionAnchor, RevocationWinsRegister,
+    SetUnion, hash_value, validate_key, validate_node_id,
 };
 pub use discovery::{
     DiscoveryConfig, DiscoveryError, PeerDiscovery, PeerInfo, PeerList, PeerStatus,
@@ -125,6 +128,12 @@ pub use equivocation::{
     ConflictingProposal, DOMAIN_PREFIX_EQUIVOCATION, EquivocationCheckResult, EquivocationDetector,
     EquivocationError, EquivocationEvidence, EquivocationType, MAX_CACHED_PROPOSALS,
     MAX_PROPOSAL_AGE_SECS,
+};
+// FactRootV1 composition with RFC-0014 quorum checkpoints (TCK-00370)
+pub use fact_root::{
+    CompactMultiProof, FactRootError, FactRootV1, FactRootVerificationResult, FactRootVerifier,
+    MAX_BATCH_ROOTS, MAX_COMPACT_MULTIPROOF_LEAVES, MAX_COMPACT_PROOF_NODES,
+    MAX_COMPACT_PROOF_STRUCTURE, ProofPathEntry, build_compact_multiproof, compute_qc_anchor_hash,
 };
 pub use genesis::{
     Genesis, GenesisConfig, GenesisConfigBuilder, GenesisError, GenesisValidator, InvitationToken,
