@@ -1910,6 +1910,24 @@ fn join_receipt_zero_ledger_anchor_rejected() {
 }
 
 #[test]
+fn join_receipt_non_positive_joined_at_tick_rejected() {
+    let receipt = AuthorityJoinReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        authority_join_hash: test_hash(0xBB),
+        risk_tier: types::RiskTier::Tier1,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        joined_at_tick: 0,
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::NonPositiveTick { field } if field == "joined_at_tick")
+    );
+}
+
+#[test]
 fn join_receipt_propagates_binding_validation_errors() {
     let mut bindings = valid_bindings();
     bindings.episode_envelope_hash = zero_hash();
@@ -2060,6 +2078,25 @@ fn consume_receipt_zero_effect_selector_digest_rejected() {
 }
 
 #[test]
+fn consume_receipt_non_positive_consumed_at_tick_rejected() {
+    let receipt = AuthorityConsumeReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        intent_digest: test_hash(0x01),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        consumed_at_tick: 0,
+        effect_selector_digest: test_hash(0xEE),
+        pre_actuation_receipt_hash: None,
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::NonPositiveTick { field } if field == "consumed_at_tick")
+    );
+}
+
+#[test]
 fn consume_receipt_propagates_binding_validation_errors() {
     let mut bindings = valid_bindings();
     bindings.view_commitment_hash = zero_hash();
@@ -2172,6 +2209,24 @@ fn deny_receipt_zero_ledger_anchor_rejected() {
 }
 
 #[test]
+fn deny_receipt_non_positive_denied_at_tick_rejected() {
+    let receipt = AuthorityDenyReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        deny_class: AuthorityDenyClass::InvalidSessionId,
+        ajc_id: None,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        denied_at_tick: 0,
+        denied_at_stage: LifecycleStage::Join,
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::NonPositiveTick { field } if field == "denied_at_tick")
+    );
+}
+
+#[test]
 fn deny_receipt_zero_content_digest_rejected() {
     let receipt = AuthorityDenyReceiptV1 {
         digest_meta: ReceiptDigestMeta {
@@ -2261,6 +2316,24 @@ fn revalidate_receipt_zero_revocation_head_hash_rejected() {
     let err = receipt.validate().unwrap_err();
     assert!(
         matches!(err, types::PcacValidationError::ZeroHash { field } if field == "revocation_head_hash")
+    );
+}
+
+#[test]
+fn revalidate_receipt_non_positive_revalidated_at_tick_rejected() {
+    let receipt = AuthorityRevalidateReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        revocation_head_hash: test_hash(0xCC),
+        revalidated_at_tick: 0,
+        checkpoint: "before_broker".to_string(),
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::NonPositiveTick { field } if field == "revalidated_at_tick")
     );
 }
 

@@ -497,6 +497,7 @@ impl AuthorityRevalidateReceiptV1 {
     /// - `time_envelope_ref` is non-zero.
     /// - `ledger_anchor` is non-zero.
     /// - `revocation_head_hash` is non-zero.
+    /// - `revalidated_at_tick` is strictly positive.
     /// - `checkpoint` is non-empty and within length bounds.
     /// - Authoritative bindings, when present, are valid.
     ///
@@ -522,6 +523,11 @@ impl AuthorityRevalidateReceiptV1 {
         if self.revocation_head_hash == ZERO_HASH {
             return Err(PcacValidationError::ZeroHash {
                 field: "revocation_head_hash",
+            });
+        }
+        if self.revalidated_at_tick == 0 {
+            return Err(PcacValidationError::NonPositiveTick {
+                field: "revalidated_at_tick",
             });
         }
         if self.checkpoint.is_empty() {
@@ -573,6 +579,7 @@ impl AuthorityJoinReceiptV1 {
     /// - `authority_join_hash` is non-zero.
     /// - `time_envelope_ref` is non-zero.
     /// - `ledger_anchor` is non-zero.
+    /// - `joined_at_tick` is strictly positive.
     /// - Authoritative bindings, when present, are valid.
     ///
     /// # Errors
@@ -597,6 +604,11 @@ impl AuthorityJoinReceiptV1 {
         if self.ledger_anchor == ZERO_HASH {
             return Err(PcacValidationError::ZeroHash {
                 field: "ledger_anchor",
+            });
+        }
+        if self.joined_at_tick == 0 {
+            return Err(PcacValidationError::NonPositiveTick {
+                field: "joined_at_tick",
             });
         }
         if let Some(ref bindings) = self.authoritative_bindings {
@@ -636,6 +648,7 @@ impl AuthorityConsumeReceiptV1 {
     /// - `intent_digest` is non-zero.
     /// - `time_envelope_ref` is non-zero.
     /// - `ledger_anchor` is non-zero.
+    /// - `consumed_at_tick` is strictly positive.
     /// - `effect_selector_digest` is non-zero.
     /// - Authoritative bindings, when present, are valid.
     ///
@@ -661,6 +674,11 @@ impl AuthorityConsumeReceiptV1 {
         if self.ledger_anchor == ZERO_HASH {
             return Err(PcacValidationError::ZeroHash {
                 field: "ledger_anchor",
+            });
+        }
+        if self.consumed_at_tick == 0 {
+            return Err(PcacValidationError::NonPositiveTick {
+                field: "consumed_at_tick",
             });
         }
         if self.effect_selector_digest == ZERO_HASH {
@@ -713,6 +731,7 @@ impl AuthorityDenyReceiptV1 {
     /// - `deny_class` embedded string fields are within bounds.
     /// - `time_envelope_ref` is non-zero.
     /// - `ledger_anchor` is non-zero.
+    /// - `denied_at_tick` is strictly positive.
     /// - `ajc_id`, when present, is non-zero.
     ///
     /// # Errors
@@ -730,6 +749,11 @@ impl AuthorityDenyReceiptV1 {
         if self.ledger_anchor == ZERO_HASH {
             return Err(PcacValidationError::ZeroHash {
                 field: "ledger_anchor",
+            });
+        }
+        if self.denied_at_tick == 0 {
+            return Err(PcacValidationError::NonPositiveTick {
+                field: "denied_at_tick",
             });
         }
         if let Some(ref ajc) = self.ajc_id {
