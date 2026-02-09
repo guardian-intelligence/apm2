@@ -198,7 +198,7 @@ pub struct GitSpec {
     pub branch_prefix: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub allow_dirty: bool,
     #[serde(default = "default_true")]
     pub commit_each_admission: bool,
