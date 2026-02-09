@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dcp://apm2.local/lab/schemas/rfc_control_spec.v1",
+  "title": "RFC Control Spec v1",
+  "type": "object",
+  "required": [
+    "kind",
+    "version",
+    "goal_statement",
+    "target_rfc_path",
+    "runtime",
+    "council",
+    "controller",
+    "budget",
+    "git",
+    "outputs"
+  ],
+  "properties": {
+    "kind": { "type": "string" },
+    "version": { "type": "string" },
+    "goal_statement": { "type": "string", "minLength": 1 },
+    "target_rfc_path": { "type": "string", "minLength": 1 },
+    "runtime": {
+      "type": "object",
+      "required": ["command", "model", "max_iterations"],
+      "properties": {
+        "command": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "max_iterations": { "type": "integer", "minimum": 1 },
+        "include_alien_protocol": { "type": "boolean" }
+      }
+    },
+    "council": {
+      "type": "object",
+      "required": ["reviewer_ids"],
+      "properties": {
+        "reviewer_ids": {
+          "type": "array",
+          "minItems": 3,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "controller": {
+      "type": "object",
+      "required": ["quality_weights", "cost_coefficients", "thresholds"],
+      "properties": {
+        "quality_weights": {
+          "type": "object",
+          "required": ["security", "robustness", "reliability", "performance", "implementability", "verifiability"],
+          "properties": {
+            "security": { "type": "number", "minimum": 0 },
+            "robustness": { "type": "number", "minimum": 0 },
+            "reliability": { "type": "number", "minimum": 0 },
+            "performance": { "type": "number", "minimum": 0 },
+            "implementability": { "type": "number", "minimum": 0 },
+            "verifiability": { "type": "number", "minimum": 0 }
+          }
+        },
+        "cost_coefficients": {
+          "type": "object",
+          "required": ["token", "elapsed_second", "call", "line_churn", "disagreement"],
+          "properties": {
+            "token": { "type": "number" },
+            "elapsed_second": { "type": "number" },
+            "call": { "type": "number" },
+            "line_churn": { "type": "number" },
+            "disagreement": { "type": "number" }
+          }
+        },
+        "thresholds": {
+          "type": "object",
+          "required": ["min_absolute_delta_u", "min_efficiency", "max_disagreement"],
+          "properties": {
+            "min_absolute_delta_u": { "type": "number" },
+            "min_efficiency": { "type": "number" },
+            "max_disagreement": { "type": "number", "minimum": 0 }
+          }
+        },
+        "critical_regression_penalty": { "type": "number", "minimum": 0 }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "required": ["max_tokens", "max_cli_calls", "max_elapsed_seconds"],
+      "properties": {
+        "max_tokens": { "type": "integer", "minimum": 1 },
+        "max_cli_calls": { "type": "integer", "minimum": 1 },
+        "max_elapsed_seconds": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "git": {
+      "type": "object",
+      "required": ["branch_prefix", "enabled", "allow_dirty", "commit_each_admission"],
+      "properties": {
+        "branch_prefix": { "type": "string", "minLength": 1 },
+        "enabled": { "type": "boolean" },
+        "allow_dirty": { "type": "boolean" },
+        "commit_each_admission": { "type": "boolean" }
+      }
+    },
+    "outputs": {
+      "type": "object",
+      "required": ["root_dir"],
+      "properties": {
+        "root_dir": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

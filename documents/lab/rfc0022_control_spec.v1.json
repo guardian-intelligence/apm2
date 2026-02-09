@@ -1,0 +1,56 @@
+{
+  "kind": "apm2.lab.rfc_control.v1",
+  "version": "v1",
+  "goal_statement": "Improve RFC-0022 quality under containment-first governance while maintaining machine-checkable specificity and auditability.",
+  "target_rfc_path": "documents/rfcs/RFC-0022/PRINCIPAL_SOVEREIGNTY_INTERFACE.md",
+  "runtime": {
+    "command": "claude",
+    "model": "sonnet",
+    "max_iterations": 6,
+    "include_alien_protocol": true
+  },
+  "council": {
+    "reviewer_ids": [
+      "council_a",
+      "council_b",
+      "council_c"
+    ]
+  },
+  "controller": {
+    "quality_weights": {
+      "security": 0.30,
+      "robustness": 0.20,
+      "reliability": 0.15,
+      "performance": 0.10,
+      "implementability": 0.15,
+      "verifiability": 0.10
+    },
+    "cost_coefficients": {
+      "token": 0.0002,
+      "elapsed_second": 0.005,
+      "call": 0.25,
+      "line_churn": 0.002,
+      "disagreement": 0.75
+    },
+    "thresholds": {
+      "min_absolute_delta_u": 0.005,
+      "min_efficiency": 0.0005,
+      "max_disagreement": 0.18
+    },
+    "critical_regression_penalty": 5.0
+  },
+  "budget": {
+    "max_tokens": 120000,
+    "max_cli_calls": 80,
+    "max_elapsed_seconds": 1800.0
+  },
+  "git": {
+    "branch_prefix": "exp/rfc0022-control",
+    "enabled": true,
+    "allow_dirty": false,
+    "commit_each_admission": true
+  },
+  "outputs": {
+    "root_dir": "evidence/lab/rfc0022_control"
+  }
+}

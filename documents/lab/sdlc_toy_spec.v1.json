@@ -1,0 +1,95 @@
+{
+  "kind": "apm2.lab.sdlc_toy",
+  "version": "v1",
+  "goal": {
+    "id": "GOAL-CLI-WORK-SUMMARIZE",
+    "statement": "Add a CLI subcommand that summarizes work outcomes from ledger JSONL",
+    "problem_statement": "Operators need quick visibility into admitted/rejected/pending work outcomes",
+    "objective_function": "maximize outcome visibility with deterministic outputs and bounded errors",
+    "constraints": [
+      "no daemon protocol changes",
+      "cli-only implementation",
+      "tests required"
+    ],
+    "assumptions": [
+      "ledger events are available in JSONL",
+      "clap command hierarchy is extensible"
+    ],
+    "acceptance_predicates": [
+      "command_accepts_ledger_path",
+      "plain_and_json_output_modes_work",
+      "invalid_lines_are_fail_closed",
+      "tests_cover_happy_and_failure_paths"
+    ]
+  },
+  "task": {
+    "command_name": "work_summarize",
+    "summary": "Summarize work outcomes by status and work type from ledger JSONL",
+    "target_paths": [
+      "crates/apm2-cli/src/main.rs",
+      "crates/apm2-cli/src/commands",
+      "crates/apm2-cli/tests"
+    ],
+    "acceptance_predicates": [
+      "parse_valid_ledger",
+      "invalid_line_returns_error",
+      "empty_ledger_returns_zero_counts",
+      "json_output_matches_schema",
+      "plain_output_is_deterministic"
+    ],
+    "verification_commands": [
+      "cargo test -p apm2-cli -- work",
+      "cargo clippy -p apm2-cli --all-targets -- -D warnings"
+    ]
+  },
+  "agents": [
+    {
+      "id": "alpha",
+      "specialty": "decompose",
+      "initial_budget_tokens": 20000
+    },
+    {
+      "id": "beta",
+      "specialty": "verify",
+      "initial_budget_tokens": 20000
+    }
+  ],
+  "policy": {
+    "max_ticks": 40,
+    "requirement_quorum": 2,
+    "submit_deadline_ticks": 3,
+    "verify_deadline_ticks": 2,
+    "action_costs": {
+      "propose_requirement": 5,
+      "attest_requirement": 2,
+      "propose_ticket": 4,
+      "claim_ticket": 3,
+      "submit_ticket": 15,
+      "verify_ticket": 8,
+      "pass": 1,
+      "obligation_breach_penalty": 20,
+      "ticket_reward": 50
+    }
+  },
+  "sandbox": {
+    "enabled": true,
+    "simulate_command_results": true,
+    "allowed_paths": [
+      "crates/apm2-cli/src/main.rs",
+      "crates/apm2-cli/src/commands",
+      "crates/apm2-cli/tests"
+    ],
+    "allowed_command_prefixes": [
+      "cargo test",
+      "cargo clippy",
+      "echo"
+    ],
+    "command_timeout_ms": 30000
+  },
+  "outputs": {
+    "metrics_path": "out/sdlc_metrics.jsonl",
+    "summary_path": "out/sdlc_summary.json",
+    "trace_path": "out/sdlc_trace.json",
+    "ledger_path": "out/sdlc_ledger.jsonl"
+  }
+}

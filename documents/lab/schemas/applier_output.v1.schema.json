@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dcp://apm2.local/lab/schemas/applier_output.v1",
+  "title": "Applier Output v1",
+  "type": "object",
+  "required": ["kind", "base_revision_hash", "proposal_hash", "updated_document"],
+  "properties": {
+    "kind": { "const": "apm2.rfc.applier_output.v1" },
+    "base_revision_hash": { "type": "string", "minLength": 1 },
+    "proposal_hash": { "type": "string", "minLength": 1 },
+    "updated_document": { "type": "string", "minLength": 1 },
+    "notes": { "type": "string" }
+  }
+}

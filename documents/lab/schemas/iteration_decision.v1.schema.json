@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dcp://apm2.local/lab/schemas/iteration_decision.v1",
+  "title": "Iteration Decision v1",
+  "type": "object",
+  "required": [
+    "run_id",
+    "seed",
+    "iteration",
+    "admitted",
+    "continue_loop",
+    "stop_reason",
+    "critical_regression",
+    "disagreement",
+    "quality_before",
+    "quality_after",
+    "delta_u",
+    "cost",
+    "efficiency",
+    "token_cost",
+    "elapsed_seconds",
+    "cli_calls",
+    "line_churn"
+  ],
+  "properties": {
+    "run_id": { "type": "string" },
+    "seed": { "type": "integer", "minimum": 0 },
+    "iteration": { "type": "integer", "minimum": 0 },
+    "admitted": { "type": "boolean" },
+    "continue_loop": { "type": "boolean" },
+    "stop_reason": { "type": "string" },
+    "critical_regression": { "type": "boolean" },
+    "disagreement": { "type": "number", "minimum": 0 },
+    "quality_before": { "$ref": "#/$defs/quality_vector" },
+    "quality_after": { "$ref": "#/$defs/quality_vector" },
+    "delta_u": { "type": "number" },
+    "cost": { "type": "number", "minimum": 0 },
+    "efficiency": { "type": "number" },
+    "token_cost": { "type": "integer", "minimum": 0 },
+    "elapsed_seconds": { "type": "number", "minimum": 0 },
+    "cli_calls": { "type": "integer", "minimum": 0 },
+    "line_churn": { "type": "integer", "minimum": 0 },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "quality_vector": {
+      "type": "object",
+      "required": ["security", "robustness", "reliability", "performance", "implementability", "verifiability"],
+      "properties": {
+        "security": { "type": "number" },
+        "robustness": { "type": "number" },
+        "reliability": { "type": "number" },
+        "performance": { "type": "number" },
+        "implementability": { "type": "number" },
+        "verifiability": { "type": "number" }
+      }
+    }
+  }
+}

@@ -1,0 +1,83 @@
+{
+  "goal_id": "GOAL-CLI-WORK-SUMMARIZE",
+  "requirements": [
+    "REQ-001-command-surface",
+    "REQ-002-ledger-parse",
+    "REQ-003-output-modes",
+    "REQ-004-error-handling",
+    "REQ-005-tests"
+  ],
+  "tickets": [
+    "TKT-001-parser-aggregation",
+    "TKT-002-output-contract",
+    "TKT-003-cli-wiring",
+    "TKT-004-errors",
+    "TKT-005-regression-tests"
+  ],
+  "links": [
+    {
+      "from_id": "GOAL-CLI-WORK-SUMMARIZE",
+      "to_id": "REQ-001-command-surface",
+      "kind": "goal_to_requirement"
+    },
+    {
+      "from_id": "GOAL-CLI-WORK-SUMMARIZE",
+      "to_id": "REQ-002-ledger-parse",
+      "kind": "goal_to_requirement"
+    },
+    {
+      "from_id": "GOAL-CLI-WORK-SUMMARIZE",
+      "to_id": "REQ-003-output-modes",
+      "kind": "goal_to_requirement"
+    },
+    {
+      "from_id": "GOAL-CLI-WORK-SUMMARIZE",
+      "to_id": "REQ-004-error-handling",
+      "kind": "goal_to_requirement"
+    },
+    {
+      "from_id": "GOAL-CLI-WORK-SUMMARIZE",
+      "to_id": "REQ-005-tests",
+      "kind": "goal_to_requirement"
+    },
+    {
+      "from_id": "REQ-002-ledger-parse",
+      "to_id": "TKT-001-parser-aggregation",
+      "kind": "requirement_to_ticket"
+    },
+    {
+      "from_id": "REQ-003-output-modes",
+      "to_id": "TKT-002-output-contract",
+      "kind": "requirement_to_ticket"
+    },
+    {
+      "from_id": "REQ-001-command-surface",
+      "to_id": "TKT-003-cli-wiring",
+      "kind": "requirement_to_ticket"
+    },
+    {
+      "from_id": "REQ-004-error-handling",
+      "to_id": "TKT-004-errors",
+      "kind": "requirement_to_ticket"
+    },
+    {
+      "from_id": "REQ-005-tests",
+      "to_id": "TKT-005-regression-tests",
+      "kind": "requirement_to_ticket"
+    }
+  ],
+  "admitted_requirements": [
+    "REQ-001-command-surface",
+    "REQ-002-ledger-parse",
+    "REQ-003-output-modes",
+    "REQ-004-error-handling",
+    "REQ-005-tests"
+  ],
+  "admitted_tickets": [
+    "TKT-001-parser-aggregation",
+    "TKT-002-output-contract",
+    "TKT-003-cli-wiring",
+    "TKT-004-errors",
+    "TKT-005-regression-tests"
+  ]
+}

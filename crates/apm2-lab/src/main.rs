@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use apm2_lab::closure::{ClosureConfig, ClosureReducer};
 use apm2_lab::harness::run_experiment;
 use apm2_lab::ledger::LabLedger;
+use apm2_lab::sdlc::run_sdlc_toy_from_path;
 use apm2_lab::spec::LabSpec;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -46,6 +47,13 @@ enum Command {
         ledger: PathBuf,
         #[arg(long)]
         spec: Option<PathBuf>,
+    },
+    /// Run the symbolic toy SDLC experiment (goal -> requirements -> tickets).
+    RunSdlcToy {
+        #[arg(long)]
+        spec: PathBuf,
+        #[arg(long)]
+        seed: u64,
     },
 }
 
@@ -129,6 +137,10 @@ async fn main() -> Result<()> {
                 derived_events_if_replayed: snapshot.derived_events.len(),
             };
             println!("{}", serde_json::to_string_pretty(&report)?);
+        },
+        Command::RunSdlcToy { spec, seed } => {
+            let summary = run_sdlc_toy_from_path(spec, seed).await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
         },
     }
 

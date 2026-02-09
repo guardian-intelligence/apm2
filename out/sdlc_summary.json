@@ -1,0 +1,17 @@
+{
+  "seed": 7,
+  "goal_id": "GOAL-CLI-WORK-SUMMARIZE",
+  "completed": true,
+  "completion_tick": 11,
+  "max_ticks": 40,
+  "requirements_total": 5,
+  "requirements_admitted": 5,
+  "tickets_total": 5,
+  "tickets_admitted": 5,
+  "obligation_breaches": 0,
+  "overlap_violations": 0,
+  "contradiction_violations": 0,
+  "traceability_completeness": 1.0,
+  "total_tokens_spent": 198,
+  "total_events": 113
+}

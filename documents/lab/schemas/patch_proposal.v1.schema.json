@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dcp://apm2.local/lab/schemas/patch_proposal.v1",
+  "title": "Patch Proposal v1",
+  "type": "object",
+  "required": ["kind", "base_revision_hash", "summary", "rationale", "diffs"],
+  "properties": {
+    "kind": { "const": "apm2.rfc.proposal.v1" },
+    "base_revision_hash": { "type": "string", "minLength": 1 },
+    "summary": { "type": "string", "minLength": 1 },
+    "rationale": { "type": "string", "minLength": 1 },
+    "diffs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "predicted_delta": {
+      "type": "object",
+      "required": ["security", "robustness", "reliability", "performance", "implementability", "verifiability"],
+      "properties": {
+        "security": { "type": "number" },
+        "robustness": { "type": "number" },
+        "reliability": { "type": "number" },
+        "performance": { "type": "number" },
+        "implementability": { "type": "number" },
+        "verifiability": { "type": "number" }
+      }
+    },
+    "risk_flags": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

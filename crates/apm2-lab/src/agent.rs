@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::process::Output;
 
 use anyhow::{Context, Result, anyhow};
 use apm2_core::crypto::Signer;
@@ -99,7 +100,9 @@ pub trait AgentInvoker: Send {
 }
 
 #[derive(Debug, Default)]
-pub struct ClaudeCliInvoker;
+pub struct ClaudeCliInvoker {
+    session_initialized: bool,
+}
 
 #[async_trait]
 impl AgentInvoker for ClaudeCliInvoker {
@@ -110,20 +113,24 @@ impl AgentInvoker for ClaudeCliInvoker {
         system_prompt_file: &Path,
         prompt: &str,
     ) -> Result<String> {
-        let output = Command::new("claude")
-            .arg("-p")
-            .arg("--session-id")
-            .arg(session_id)
-            .arg("--model")
-            .arg(model)
-            .arg("--system-prompt-file")
-            .arg(system_prompt_file)
-            .arg("--output-format")
-            .arg("json")
-            .arg(prompt)
-            .output()
-            .await
-            .context("spawn claude CLI")?;
+        let primary_flag = if self.session_initialized {
+            "--resume"
+        } else {
+            "--session-id"
+        };
+
+        let mut output =
+            invoke_claude(session_id, model, system_prompt_file, prompt, primary_flag).await?;
+
+        // Claude CLI allows --session-id for session creation, then expects --resume
+        // for subsequent non-interactive turns against that same session.
+        if !output.status.success() && !self.session_initialized {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("already in use") {
+                output = invoke_claude(session_id, model, system_prompt_file, prompt, "--resume")
+                    .await?;
+            }
+        }
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -136,8 +143,32 @@ impl AgentInvoker for ClaudeCliInvoker {
             ));
         }
 
+        self.session_initialized = true;
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
+}
+
+async fn invoke_claude(
+    session_id: &str,
+    model: &str,
+    system_prompt_file: &Path,
+    prompt: &str,
+    session_flag: &str,
+) -> Result<Output> {
+    Command::new("claude")
+        .arg("-p")
+        .arg(session_flag)
+        .arg(session_id)
+        .arg("--model")
+        .arg(model)
+        .arg("--system-prompt-file")
+        .arg(system_prompt_file)
+        .arg("--output-format")
+        .arg("json")
+        .arg(prompt)
+        .output()
+        .await
+        .with_context(|| format!("spawn claude CLI ({session_flag})"))
 }
 
 #[derive(Debug, Default)]

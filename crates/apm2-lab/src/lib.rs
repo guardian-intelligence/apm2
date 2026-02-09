@@ -9,17 +9,24 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_precision_loss)]
+#![allow(clippy::assigning_clones)]
+#![allow(clippy::collapsible_if)]
 #![allow(clippy::derivable_impls)]
+#![allow(clippy::filter_next)]
+#![allow(clippy::format_collect)]
 #![allow(clippy::implicit_clone)]
 #![allow(clippy::literal_string_with_formatting_args)]
+#![allow(clippy::manual_midpoint)]
 #![allow(clippy::map_unwrap_or)]
 #![allow(clippy::match_same_arms)]
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_fields_in_debug)]
 #![allow(clippy::must_use_candidate)]
 #![allow(clippy::option_if_let_else)]
+#![allow(clippy::redundant_clone)]
 #![allow(clippy::similar_names)]
 #![allow(clippy::suboptimal_flops)]
+#![allow(clippy::too_many_arguments)]
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::uninlined_format_args)]
 #![allow(clippy::unnecessary_join)]
@@ -27,12 +34,19 @@
 
 pub mod agent;
 pub mod closure;
+pub mod closure_sdlc;
+pub mod decompose;
 pub mod event;
 pub mod harness;
 pub mod ledger;
 pub mod metrics;
+pub mod obligation;
 pub mod prompt;
+pub mod sandbox;
+pub mod schema;
 pub mod scoring;
+pub mod sdlc;
 pub mod spec;
+pub mod task_cli_subcommand;
 pub mod verdict;
 pub mod world;

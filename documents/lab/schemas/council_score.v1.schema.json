@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dcp://apm2.local/lab/schemas/council_score.v1",
+  "title": "Council Score v1",
+  "type": "object",
+  "required": ["kind", "reviewer_id", "before", "after", "confidence"],
+  "properties": {
+    "kind": { "const": "apm2.rfc.council_score.v1" },
+    "reviewer_id": { "type": "string", "minLength": 1 },
+    "before": { "$ref": "#/$defs/quality_vector" },
+    "after": { "$ref": "#/$defs/quality_vector" },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "regressions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "rationale": { "type": "string" }
+  },
+  "$defs": {
+    "quality_vector": {
+      "type": "object",
+      "required": ["security", "robustness", "reliability", "performance", "implementability", "verifiability"],
+      "properties": {
+        "security": { "type": "number", "minimum": 0, "maximum": 1 },
+        "robustness": { "type": "number", "minimum": 0, "maximum": 1 },
+        "reliability": { "type": "number", "minimum": 0, "maximum": 1 },
+        "performance": { "type": "number", "minimum": 0, "maximum": 1 },
+        "implementability": { "type": "number", "minimum": 0, "maximum": 1 },
+        "verifiability": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    }
+  }
+}

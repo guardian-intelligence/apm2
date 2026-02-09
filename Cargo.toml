@@ -7,6 +7,7 @@ members = [
     "xtask",
     "crates/apm2-holon",
     "crates/apm2-lab",
+    "crates/apm2-lab2",
 ]
 exclude = ["fuzz"]
 
