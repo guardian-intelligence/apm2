@@ -164,8 +164,17 @@ impl ObservationWindow {
     ///
     /// A binding is stale when the gap between `current_tick` and
     /// `last_seen_tick` exceeds `max_staleness_ticks`.
+    ///
+    /// **Fail-closed on temporal inversion**: if `current_tick <
+    /// last_seen_tick` (tick regression / temporal anomaly), the binding is
+    /// treated as stale. This prevents a regressed clock from silently
+    /// bypassing staleness detection ([INV-ALIAS-004]).
     #[must_use]
     pub const fn is_stale(&self, last_seen_tick: u64, current_tick: u64) -> bool {
+        // Fail-closed: tick regression is always stale (temporal anomaly).
+        if current_tick < last_seen_tick {
+            return true;
+        }
         current_tick.saturating_sub(last_seen_tick) > self.max_staleness_ticks
     }
 }
@@ -184,6 +193,12 @@ pub const ZERO_HASH: Hash = [0u8; 32];
 ///
 /// - **`NotFound`**: alias not present in canonical projections
 /// - **`Mismatch`**: alias present but maps to a different `work_id`
+/// - **`Ambiguous`**: alias maps to multiple distinct `work_id` values
+///
+/// The `canonical_projections` map uses `Vec<Hash>` values to preserve
+/// multiplicity. When an alias maps to more than one distinct `work_id`,
+/// the reconciliation emits a `DefectClass::Ambiguous` defect and the
+/// `promotion_gate` will block (fail-closed).
 ///
 /// Staleness checks are not performed here; use [`ObservationWindow::is_stale`]
 /// separately if needed.
@@ -191,8 +206,9 @@ pub const ZERO_HASH: Hash = [0u8; 32];
 /// # Arguments
 ///
 /// * `bindings` - The alias bindings to reconcile.
-/// * `canonical_projections` - Map from ticket alias to canonical `work_id`
-///   hash.
+/// * `canonical_projections` - Map from ticket alias to one or more canonical
+///   `work_id` hashes. Multiple entries indicate ambiguity.
+/// * `current_tick` - The current HTF tick for defect timestamping.
 ///
 /// # Returns
 ///
@@ -200,7 +216,7 @@ pub const ZERO_HASH: Hash = [0u8; 32];
 #[must_use]
 pub fn reconcile_aliases<S: BuildHasher>(
     bindings: &[TicketAliasBinding],
-    canonical_projections: &HashMap<String, Hash, S>,
+    canonical_projections: &HashMap<String, Vec<Hash>, S>,
     current_tick: u64,
 ) -> AliasReconciliationResult {
     let mut resolved_count = 0usize;
@@ -208,15 +224,35 @@ pub fn reconcile_aliases<S: BuildHasher>(
 
     for binding in bindings {
         match canonical_projections.get(&binding.ticket_alias) {
-            Some(canonical_id) => {
-                if *canonical_id == binding.canonical_work_id {
-                    resolved_count += 1;
-                } else {
+            Some(canonical_ids) => {
+                if canonical_ids.len() > 1 {
+                    // Multiple distinct work_ids for the same alias => ambiguous.
                     unresolved_defects.push(AliasReconciliationDefect {
                         ticket_alias: binding.ticket_alias.clone(),
                         expected_work_id: binding.canonical_work_id,
-                        actual_work_id: *canonical_id,
-                        defect_class: DefectClass::Mismatch,
+                        actual_work_id: ZERO_HASH,
+                        defect_class: DefectClass::Ambiguous,
+                        detected_at_tick: current_tick,
+                    });
+                } else if let Some(canonical_id) = canonical_ids.first() {
+                    if *canonical_id == binding.canonical_work_id {
+                        resolved_count += 1;
+                    } else {
+                        unresolved_defects.push(AliasReconciliationDefect {
+                            ticket_alias: binding.ticket_alias.clone(),
+                            expected_work_id: binding.canonical_work_id,
+                            actual_work_id: *canonical_id,
+                            defect_class: DefectClass::Mismatch,
+                            detected_at_tick: current_tick,
+                        });
+                    }
+                } else {
+                    // Empty vec => treat as not found (fail-closed).
+                    unresolved_defects.push(AliasReconciliationDefect {
+                        ticket_alias: binding.ticket_alias.clone(),
+                        expected_work_id: binding.canonical_work_id,
+                        actual_work_id: ZERO_HASH,
+                        defect_class: DefectClass::NotFound,
                         detected_at_tick: current_tick,
                     });
                 }
@@ -349,9 +385,9 @@ mod tests {
             ];
 
             let mut projections = HashMap::new();
-            projections.insert("TCK-001".to_string(), make_hash(0x01));
-            projections.insert("TCK-002".to_string(), make_hash(0x02));
-            projections.insert("TCK-003".to_string(), make_hash(0x03));
+            projections.insert("TCK-001".to_string(), vec![make_hash(0x01)]);
+            projections.insert("TCK-002".to_string(), vec![make_hash(0x02)]);
+            projections.insert("TCK-003".to_string(), vec![make_hash(0x03)]);
 
             let result = reconcile_aliases(&bindings, &projections, 100);
 
@@ -365,9 +401,9 @@ mod tests {
             let bindings = vec![make_binding("TCK-001", 0x01), make_binding("TCK-002", 0x02)];
 
             let mut projections = HashMap::new();
-            projections.insert("TCK-001".to_string(), make_hash(0x01));
+            projections.insert("TCK-001".to_string(), vec![make_hash(0x01)]);
             // TCK-002 maps to a different hash in canonical projections
-            projections.insert("TCK-002".to_string(), make_hash(0xFF));
+            projections.insert("TCK-002".to_string(), vec![make_hash(0xFF)]);
 
             let result = reconcile_aliases(&bindings, &projections, 100);
 
@@ -406,7 +442,7 @@ mod tests {
 
         #[test]
         fn empty_bindings_passes() {
-            let projections = HashMap::new();
+            let projections: HashMap<String, Vec<Hash>> = HashMap::new();
             let result = reconcile_aliases(&[], &projections, 0);
 
             assert_eq!(result.resolved_count, 0);
@@ -423,8 +459,8 @@ mod tests {
             ];
 
             let mut projections = HashMap::new();
-            projections.insert("TCK-001".to_string(), make_hash(0x01)); // match
-            projections.insert("TCK-002".to_string(), make_hash(0xAA)); // mismatch
+            projections.insert("TCK-001".to_string(), vec![make_hash(0x01)]); // match
+            projections.insert("TCK-002".to_string(), vec![make_hash(0xAA)]); // mismatch
             // TCK-003 not in projections -> not found
 
             let result = reconcile_aliases(&bindings, &projections, 200);
@@ -440,6 +476,50 @@ mod tests {
             assert!(classes.contains(&DefectClass::Mismatch));
             assert!(classes.contains(&DefectClass::NotFound));
 
+            assert!(!promotion_gate(&result));
+        }
+
+        #[test]
+        fn ambiguous_alias_produces_defect() {
+            let bindings = vec![make_binding("TCK-001", 0x01)];
+
+            let mut projections = HashMap::new();
+            // Two distinct work_ids for the same alias => ambiguous
+            projections.insert(
+                "TCK-001".to_string(),
+                vec![make_hash(0x01), make_hash(0x02)],
+            );
+
+            let result = reconcile_aliases(&bindings, &projections, 100);
+
+            assert_eq!(result.resolved_count, 0);
+            assert_eq!(result.unresolved_defects.len(), 1);
+
+            let defect = &result.unresolved_defects[0];
+            assert_eq!(defect.ticket_alias, "TCK-001");
+            assert_eq!(defect.defect_class, DefectClass::Ambiguous);
+            assert_eq!(defect.actual_work_id, ZERO_HASH);
+            assert_eq!(defect.detected_at_tick, 100);
+
+            // Ambiguity MUST block promotion (fail-closed)
+            assert!(!promotion_gate(&result));
+        }
+
+        #[test]
+        fn empty_vec_projection_produces_not_found() {
+            let bindings = vec![make_binding("TCK-001", 0x01)];
+
+            let mut projections = HashMap::new();
+            projections.insert("TCK-001".to_string(), vec![]);
+
+            let result = reconcile_aliases(&bindings, &projections, 100);
+
+            assert_eq!(result.resolved_count, 0);
+            assert_eq!(result.unresolved_defects.len(), 1);
+            assert_eq!(
+                result.unresolved_defects[0].defect_class,
+                DefectClass::NotFound
+            );
             assert!(!promotion_gate(&result));
         }
     }
@@ -504,16 +584,19 @@ mod tests {
         }
 
         #[test]
-        fn staleness_saturating_sub_safety() {
+        fn tick_regression_is_stale_fail_closed() {
             let window = ObservationWindow {
                 start_tick: 0,
                 end_tick: 1000,
                 max_staleness_ticks: 10,
             };
 
-            // If current_tick < last_seen_tick (anomalous), saturating_sub
-            // returns 0 which is not > threshold, so not stale (fail-safe).
-            assert!(!window.is_stale(100, 50));
+            // Fail-closed: temporal inversion (current_tick < last_seen_tick)
+            // MUST be treated as stale. A regressed clock is a temporal anomaly
+            // that blocks promotion ([INV-ALIAS-004]).
+            assert!(window.is_stale(100, 50));
+            assert!(window.is_stale(200, 100));
+            assert!(window.is_stale(1, 0));
         }
     }
 
