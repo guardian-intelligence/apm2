@@ -941,6 +941,9 @@ impl DispatcherState {
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         // TCK-00351: Wire pre-actuation gate, stop authority, and stop conditions store
         // TCK-00352: Wire V1 manifest store for scope enforcement
+        // TCK-00426 BLOCKER 4: Wire PCAC lifecycle gate in production path.
+        let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+        let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
@@ -949,7 +952,8 @@ impl DispatcherState {
                 .with_preactuation_gate(preactuation_gate)
                 .with_stop_authority(Arc::clone(&stop_authority))
                 .with_stop_conditions_store(stop_conditions_store)
-                .with_v1_manifest_store(v1_manifest_store);
+                .with_v1_manifest_store(v1_manifest_store)
+                .with_pcac_lifecycle_gate(pcac_gate);
 
         Ok(Self {
             privileged_dispatcher,
@@ -1273,6 +1277,9 @@ impl DispatcherState {
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         // TCK-00351: Wire pre-actuation gate, stop authority, stop conditions store
         // TCK-00352: Wire V1 manifest store for scope enforcement
+        // TCK-00426 BLOCKER 4: Wire PCAC lifecycle gate in production path.
+        let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+        let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
@@ -1286,7 +1293,8 @@ impl DispatcherState {
                 .with_preactuation_gate(preactuation_gate)
                 .with_stop_authority(Arc::clone(&stop_authority))
                 .with_stop_conditions_store(stop_conditions_store)
-                .with_v1_manifest_store(v1_manifest_store);
+                .with_v1_manifest_store(v1_manifest_store)
+                .with_pcac_lifecycle_gate(pcac_gate);
 
         Ok(Self {
             privileged_dispatcher,

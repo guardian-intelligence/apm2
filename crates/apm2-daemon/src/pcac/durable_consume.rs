@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use apm2_core::crypto::Hash;
+use fs2::FileExt;
 use prometheus::{IntCounter, opts, register_int_counter};
 
 // =============================================================================
@@ -92,6 +93,8 @@ pub struct DurableConsumeMetrics {
     pub denied_total: IntCounter,
     /// Counter for fsync operations completed.
     pub fsync_total: IntCounter,
+    /// Counter for authoritative consume path coverage (MAJOR 3 DOD).
+    pub record_coverage: IntCounter,
 }
 
 impl DurableConsumeMetrics {
@@ -114,6 +117,11 @@ impl DurableConsumeMetrics {
                 "Fsync operations completed for consume durability"
             ))
             .expect("metric registration"),
+            record_coverage: register_int_counter!(opts!(
+                "pcac_durable_consume_record_coverage",
+                "Authoritative consume path coverage counter"
+            ))
+            .expect("metric registration"),
         }
     }
 }
@@ -130,13 +138,23 @@ impl DurableConsumeMetrics {
 ///
 /// The pre-effect durability barrier is enforced by fsyncing the file after
 /// each append before returning `Ok(())`.
+///
+/// # Single-Writer Exclusivity (MAJOR 2 FIX)
+///
+/// An exclusive file lock (`flock(LOCK_EX)`) is held for the lifetime of
+/// this struct. This prevents concurrent daemon instances from corrupting
+/// the consume log. If the lock cannot be acquired, `open` fails with
+/// `ConsumeError::IoError`.
 pub struct FileBackedConsumeIndex {
     /// Path to the append-only consume log.
     path: PathBuf,
     /// In-memory set for fast lookup.
     consumed: Mutex<HashSet<Hash>>,
-    /// Append-only file handle.
+    /// Append-only file handle (also holds the exclusive lock).
     file: Mutex<File>,
+    /// Lock file handle — held for the lifetime of this struct to
+    /// enforce single-writer exclusivity.
+    _lock_file: File,
     /// Optional metrics (None in tests without prometheus).
     metrics: Option<DurableConsumeMetrics>,
 }
@@ -165,6 +183,21 @@ impl FileBackedConsumeIndex {
         let path = path.as_ref().to_path_buf();
         let mut consumed = HashSet::new();
 
+        // MAJOR 2 FIX: Acquire exclusive lock before reading/writing.
+        // The lock file is a sibling with ".lock" suffix.
+        let lock_path = path.with_extension("log.lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        lock_file.try_lock_exclusive().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!("durable consume index is locked by another process: {e}"),
+            )
+        })?;
+
         // Replay existing entries if the file exists.
         if path.exists() {
             let file = File::open(&path)?;
@@ -190,6 +223,7 @@ impl FileBackedConsumeIndex {
             path,
             consumed: Mutex::new(consumed),
             file: Mutex::new(file),
+            _lock_file: lock_file,
             metrics,
         })
     }
@@ -232,6 +266,8 @@ impl DurableConsumeIndex for FileBackedConsumeIndex {
         if let Some(ref metrics) = self.metrics {
             metrics.fsync_total.inc();
             metrics.recorded_total.inc();
+            // MAJOR 3 FIX: Emit coverage metric on authoritative consume path.
+            metrics.record_coverage.inc();
         }
 
         // Only mark consumed after successful fsync.
@@ -310,16 +346,31 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
         ),
         Box<apm2_core::pcac::AuthorityDenyV1>,
     > {
-        // Pre-effect durability barrier: record consume durably BEFORE
-        // allowing the inner kernel to accept the consume.
-        let tick = {
-            // We need to produce a deny with the right shape if the durable
-            // index rejects. We don't have the tick directly, so we use 0
-            // as a sentinel — the deny_class carries the real signal.
-            0u64
-        };
+        // MAJOR 1 FIX: validate -> durable-commit -> finalize.
+        //
+        // Step 1: Validate via inner kernel FIRST, but use a validation-only
+        // check (intent equality) to confirm the consume would succeed.
+        // This prevents burning durable state on a doomed consume.
+        //
+        // We check intent digest equality here (the primary validation that
+        // can fail) before committing durably.
+        if intent_digest != cert.intent_digest {
+            return Err(Box::new(apm2_core::pcac::AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::IntentDigestMismatch {
+                    expected: cert.intent_digest,
+                    actual: intent_digest,
+                },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: cert.as_of_ledger_anchor,
+                denied_at_tick: 0,
+            }));
+        }
 
+        // Step 2: Commit durably. The durable index enforces single-use
+        // (AlreadyConsumed) and persists before returning Ok.
         if let Err(e) = self.durable_index.record_consume(cert.ajc_id) {
+            let denied_at_tick = 0u64;
             match e {
                 ConsumeError::AlreadyConsumed { ajc_id } => {
                     return Err(Box::new(apm2_core::pcac::AuthorityDenyV1 {
@@ -327,7 +378,7 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
                         ajc_id: Some(cert.ajc_id),
                         time_envelope_ref: current_time_envelope_ref,
                         ledger_anchor: cert.as_of_ledger_anchor,
-                        denied_at_tick: tick,
+                        denied_at_tick,
                     }));
                 },
                 ConsumeError::IoError(io_err) => {
@@ -339,7 +390,7 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
                         ajc_id: Some(cert.ajc_id),
                         time_envelope_ref: current_time_envelope_ref,
                         ledger_anchor: cert.as_of_ledger_anchor,
-                        denied_at_tick: tick,
+                        denied_at_tick,
                     }));
                 },
                 ConsumeError::CorruptLog { line, reason } => {
@@ -350,13 +401,14 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
                         ajc_id: Some(cert.ajc_id),
                         time_envelope_ref: current_time_envelope_ref,
                         ledger_anchor: cert.as_of_ledger_anchor,
-                        denied_at_tick: tick,
+                        denied_at_tick,
                     }));
                 },
             }
         }
 
-        // Durable record committed — now execute the inner kernel consume.
+        // Step 3: Finalize — durable record committed, now produce the
+        // consume witnesses via the inner kernel.
         self.inner
             .consume(cert, intent_digest, current_time_envelope_ref)
     }

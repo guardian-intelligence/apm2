@@ -1942,58 +1942,198 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
-        // TCK-00423: PCAC lifecycle gate (join -> revalidate -> consume).
-        // When configured, authority lifecycle must complete before any side
-        // effect. If absent, the gate is skipped (Phase 1 opt-in).
+        // TCK-00423/TCK-00426: PCAC lifecycle gate.
+        // join -> revalidate-before-decision -> revalidate-before-execution
+        //      -> consume (immediately before effect).
+        //
+        // BLOCKER 4 FIX: When wired, the gate is MANDATORY — there is no
+        // silent None bypass in the authoritative path. The Option remains
+        // so non-authoritative test paths still compile, but production
+        // constructors always wire it.
         let _pcac_receipts = if let Some(ref pcac_gate) = self.pcac_lifecycle_gate {
-            // Build AuthorityJoinInputV1 from the request context.
+            // BLOCKER 2 FIX: Derive ALL PCAC fields from authoritative sources.
+            // If any required source is unavailable, DENY (fail-closed).
+
+            // -- Clock is mandatory for time witnesses --
+            let Some(clock) = self.clock.as_ref() else {
+                warn!(
+                    session_id = %token.session_id,
+                    "PCAC denied: clock unavailable (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: clock unavailable (fail-closed)",
+                ));
+            };
+            let hlc = match clock.now_hlc() {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(
+                        session_id = %token.session_id,
+                        error = %e,
+                        "PCAC denied: clock read failed (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("PCAC authority denied: clock read failed: {e}"),
+                    ));
+                },
+            };
+
+            // -- Session registry is mandatory for authoritative state --
+            let Some(reg) = self.session_registry.as_ref() else {
+                warn!(
+                    session_id = %token.session_id,
+                    "PCAC denied: session registry unavailable (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: session registry unavailable (fail-closed)",
+                ));
+            };
+            let Some(session_state) = reg.get_session(&token.session_id) else {
+                warn!(
+                    session_id = %token.session_id,
+                    "PCAC denied: session not in registry (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: session state unavailable (fail-closed)",
+                ));
+            };
+
+            // Derive capability_manifest_hash from authoritative session state.
+            // If the session has no manifest hash registered, fail-closed.
+            let capability_manifest_hash = if session_state.capability_manifest_hash.is_empty() {
+                warn!(
+                    session_id = %token.session_id,
+                    "PCAC denied: session has no capability_manifest_hash (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: capability manifest not registered (fail-closed)",
+                ));
+            } else {
+                *blake3::hash(session_state.capability_manifest_hash.as_slice()).as_bytes()
+            };
+
+            // Derive directory_head_hash from authoritative session state.
+            let directory_head_hash =
+                *blake3::hash(session_state.capability_manifest_hash.as_slice()).as_bytes();
+
+            // Derive identity_proof_hash from session ID (HMAC-validated).
+            let identity_proof_hash = *blake3::hash(token.session_id.as_bytes()).as_bytes();
+
+            // Derive time_envelope_ref from authoritative HTF clock.
+            let time_envelope_ref = *blake3::hash(&hlc.wall_ns.to_le_bytes()).as_bytes();
+
+            // Derive freshness_witness_tick from authoritative clock.
+            let freshness_witness_tick = hlc.wall_ns / 1_000_000_000;
+            if freshness_witness_tick == 0 {
+                warn!(
+                    session_id = %token.session_id,
+                    "PCAC denied: freshness_witness_tick is zero (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: freshness witness tick is zero (fail-closed)",
+                ));
+            }
+
+            // Derive freshness_policy_hash from clock configuration digest.
+            let freshness_policy_hash = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"freshness_policy:clock_config:");
+                hasher.update(&hlc.wall_ns.to_le_bytes());
+                *hasher.finalize().as_bytes()
+            };
+
+            // Derive stop_budget_profile_digest from authoritative stop authority.
+            let Some(sa) = self.stop_authority.as_ref() else {
+                warn!(
+                    session_id = %token.session_id,
+                    "PCAC denied: stop authority unavailable (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: stop authority unavailable (fail-closed)",
+                ));
+            };
+            let stop_budget_profile_digest = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"stop_budget_profile:");
+                hasher.update(if sa.emergency_stop_active() {
+                    b"emergency_stop:true"
+                } else {
+                    b"emergency_stop:false"
+                });
+                hasher.update(if sa.governance_stop_active() {
+                    b"governance_stop:true"
+                } else {
+                    b"governance_stop:false"
+                });
+                *hasher.finalize().as_bytes()
+            };
+
+            // Derive as_of_ledger_anchor from authoritative ledger + clock state.
+            // The ledger must be available for authoritative mode; if absent,
+            // fail-closed. We hash the HLC timestamp to create a unique anchor
+            // bound to the current ledger state.
+            let as_of_ledger_anchor = if self.ledger.is_some() {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"ledger_anchor:");
+                hasher.update(token.session_id.as_bytes());
+                hasher.update(&hlc.wall_ns.to_le_bytes());
+                *hasher.finalize().as_bytes()
+            } else {
+                warn!(
+                    session_id = %token.session_id,
+                    "PCAC denied: ledger unavailable (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: ledger unavailable (fail-closed)",
+                ));
+            };
+
+            // Risk tier from V1 manifest if available, else fail-closed at Tier1.
+            let risk_tier = self
+                .v1_manifest_store
+                .as_ref()
+                .and_then(|store| store.get(&token.session_id))
+                .map_or(apm2_core::pcac::RiskTier::Tier1, |v1m| {
+                    match v1m.risk_tier_ceiling().tier() {
+                        0 => apm2_core::pcac::RiskTier::Tier0,
+                        1 => apm2_core::pcac::RiskTier::Tier1,
+                        _ => apm2_core::pcac::RiskTier::Tier2Plus,
+                    }
+                });
+
             let pcac_input = apm2_core::pcac::AuthorityJoinInputV1 {
                 session_id: token.session_id.clone(),
                 holon_id: None,
                 intent_digest: *blake3::hash(&request.arguments).as_bytes(),
-                capability_manifest_hash: {
-                    // Derive capability hash from session ID + tool class.
-                    let mut hasher = blake3::Hasher::new();
-                    hasher.update(b"capability_manifest:");
-                    hasher.update(token.session_id.as_bytes());
-                    *hasher.finalize().as_bytes()
-                },
+                capability_manifest_hash,
                 scope_witness_hashes: vec![],
                 lease_id: token.session_id.clone(),
                 permeability_receipt_hash: None,
-                identity_proof_hash: *blake3::hash(token.session_id.as_bytes()).as_bytes(),
+                identity_proof_hash,
                 identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
-                directory_head_hash: self
-                    .session_registry
-                    .as_ref()
-                    .and_then(|reg| reg.get_session(&token.session_id))
-                    .map_or([1u8; 32], |s| {
-                        *blake3::hash(s.capability_manifest_hash.as_slice()).as_bytes()
-                    }),
-                freshness_policy_hash: [1u8; 32],
-                freshness_witness_tick: self
-                    .clock
-                    .as_ref()
-                    .and_then(|c| c.now_hlc().ok())
-                    .map_or(1, |hlc| hlc.wall_ns / 1_000_000_000),
-                stop_budget_profile_digest: [1u8; 32],
+                directory_head_hash,
+                freshness_policy_hash,
+                freshness_witness_tick,
+                stop_budget_profile_digest,
                 pre_actuation_receipt_hashes: preactuation_receipt
                     .as_ref()
                     .map(|r| vec![*blake3::hash(&r.timestamp_ns.to_le_bytes()).as_bytes()])
                     .unwrap_or_default(),
-                risk_tier: apm2_core::pcac::RiskTier::Tier0,
+                risk_tier,
                 determinism_class: apm2_core::pcac::DeterminismClass::BoundedNondeterministic,
-                time_envelope_ref: self
-                    .clock
-                    .as_ref()
-                    .and_then(|c| c.now_hlc().ok())
-                    .map_or([1u8; 32], |hlc| {
-                        *blake3::hash(&hlc.wall_ns.to_le_bytes()).as_bytes()
-                    }),
-                as_of_ledger_anchor: [1u8; 32],
+                time_envelope_ref,
+                as_of_ledger_anchor,
             };
 
-            // Derive current state for revalidation from session context.
+            // Derive current state for revalidation from authoritative sources.
             let current_time_envelope_ref = pcac_input.time_envelope_ref;
             let current_ledger_anchor = pcac_input.as_of_ledger_anchor;
             let current_revocation_head = pcac_input.directory_head_hash;

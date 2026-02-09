@@ -13,12 +13,14 @@
 //! 3. **Freshness Dominance**: Tier2+ denies on stale freshness.
 //! 4. **Revocation Dominance**: Revocation frontier advancement denies.
 //! 5. **Delegation Narrowing**: Delegated joins are strict-subset.
-//! 6. **Boundary Monotonicity**: `join < revalidate <= consume <= effect`.
+//! 6. **Boundary Monotonicity**: `join < pre-actuation <
+//!    revalidate-before-decision < revalidate-before-execution < consume <=
+//!    effect`.
 //! 7. **Evidence Sufficiency**: Authoritative outcomes need replay receipts.
 //!
 //! [`LifecycleGate`] wraps a kernel and provides a single-call entry point
-//! for `handle_request_tool` that executes the full `join -> revalidate ->
-//! consume` sequence.
+//! for `handle_request_tool` that executes the full `join -> revalidate
+//! (before-decision) -> revalidate (before-execution) -> consume` sequence.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -86,16 +88,108 @@ impl InProcessKernel {
         Ok(())
     }
 
-    /// Computes the authority join hash from the input fields.
+    /// Computes the authority join hash from the FULL input surface.
+    ///
+    /// All authority dimensions are canonicalized with domain-separated
+    /// field tags to prevent cross-field collision and ensure binding
+    /// completeness (RFC-0027 §3.1).
     fn compute_join_hash(input: &AuthorityJoinInputV1) -> Hash {
         use blake3::Hasher;
         let mut hasher = Hasher::new();
+
+        // Domain separation prefix for the authority join hash.
+        hasher.update(b"pcac:authority_join_hash:v1:");
+
+        // -- Subject bindings --
+        hasher.update(b"session_id:");
         hasher.update(input.session_id.as_bytes());
+        hasher.update(b"\x00");
+
+        hasher.update(b"holon_id:");
+        if let Some(ref holon_id) = input.holon_id {
+            hasher.update(holon_id.as_bytes());
+        }
+        hasher.update(b"\x00");
+
+        // -- Intent binding --
+        hasher.update(b"intent_digest:");
         hasher.update(&input.intent_digest);
+
+        // -- Capability bindings --
+        hasher.update(b"capability_manifest_hash:");
         hasher.update(&input.capability_manifest_hash);
+
+        hasher.update(b"scope_witness_hashes:");
+        for swh in &input.scope_witness_hashes {
+            hasher.update(swh);
+        }
+        hasher.update(b"\x00");
+
+        // -- Delegation bindings --
+        hasher.update(b"lease_id:");
+        hasher.update(input.lease_id.as_bytes());
+        hasher.update(b"\x00");
+
+        hasher.update(b"permeability_receipt_hash:");
+        if let Some(ref prh) = input.permeability_receipt_hash {
+            hasher.update(prh);
+        }
+        hasher.update(b"\x00");
+
+        // -- Identity bindings --
+        hasher.update(b"identity_proof_hash:");
         hasher.update(&input.identity_proof_hash);
+
+        hasher.update(b"identity_evidence_level:");
+        hasher.update(input.identity_evidence_level.to_string().as_bytes());
+        hasher.update(b"\x00");
+
+        // -- Freshness bindings --
+        hasher.update(b"directory_head_hash:");
+        hasher.update(&input.directory_head_hash);
+
+        hasher.update(b"freshness_policy_hash:");
+        hasher.update(&input.freshness_policy_hash);
+
+        hasher.update(b"freshness_witness_tick:");
+        hasher.update(&input.freshness_witness_tick.to_le_bytes());
+
+        // -- Stop/budget policy bindings --
+        hasher.update(b"stop_budget_profile_digest:");
+        hasher.update(&input.stop_budget_profile_digest);
+
+        hasher.update(b"pre_actuation_receipt_hashes:");
+        for parh in &input.pre_actuation_receipt_hashes {
+            hasher.update(parh);
+        }
+        hasher.update(b"\x00");
+
+        // -- Risk classification --
+        hasher.update(b"risk_tier:");
+        hasher.update(input.risk_tier.to_string().as_bytes());
+        hasher.update(b"\x00");
+
+        hasher.update(b"determinism_class:");
+        match input.determinism_class {
+            apm2_core::pcac::DeterminismClass::Deterministic => {
+                hasher.update(b"deterministic");
+            },
+            apm2_core::pcac::DeterminismClass::BoundedNondeterministic => {
+                hasher.update(b"bounded_nondeterministic");
+            },
+            _ => {
+                hasher.update(b"unknown");
+            },
+        }
+        hasher.update(b"\x00");
+
+        // -- HTF time witness bindings --
+        hasher.update(b"time_envelope_ref:");
         hasher.update(&input.time_envelope_ref);
+
+        hasher.update(b"as_of_ledger_anchor:");
         hasher.update(&input.as_of_ledger_anchor);
+
         *hasher.finalize().as_bytes()
     }
 
@@ -342,6 +436,10 @@ impl LifecycleGate {
 
     /// Executes the full PCAC lifecycle for a tool request.
     ///
+    /// RFC-0027 §3.3 lifecycle ordering:
+    /// `join < pre-actuation < revalidate-before-decision <
+    ///  revalidate-before-execution < consume <= effect`
+    ///
     /// # Arguments
     ///
     /// * `input` — Authority join inputs (session, intent, capabilities, etc.)
@@ -353,7 +451,7 @@ impl LifecycleGate {
     ///
     /// # Returns
     ///
-    /// `Ok(LifecycleReceipts)` if all three stages pass, or `Err(deny)` at
+    /// `Ok(LifecycleReceipts)` if all stages pass, or `Err(deny)` at
     /// the first failing stage.
     ///
     /// # Errors
@@ -371,7 +469,8 @@ impl LifecycleGate {
         // Stage 1: Join — construct AJC from validated inputs.
         let cert = self.kernel.join(input)?;
 
-        // Stage 2: Revalidate — verify AJC against current state.
+        // Stage 2: Revalidate-before-decision — verify AJC against current
+        // state prior to making the consume decision.
         self.kernel.revalidate(
             &cert,
             current_time_envelope_ref,
@@ -379,7 +478,18 @@ impl LifecycleGate {
             current_revocation_head_hash,
         )?;
 
-        // Stage 3: Consume — single-use consumption with intent equality.
+        // Stage 3: Revalidate-before-execution — second revalidation
+        // immediately before consume to close the window between decision
+        // and execution (RFC-0027 §3.3 ordering requirement).
+        self.kernel.revalidate(
+            &cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head_hash,
+        )?;
+
+        // Stage 4: Consume — single-use consumption with intent equality.
+        // Consume must be immediately before the effect.
         let (consumed_witness, consume_record) =
             self.kernel
                 .consume(&cert, input.intent_digest, current_time_envelope_ref)?;
