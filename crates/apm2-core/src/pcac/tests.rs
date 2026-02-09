@@ -544,12 +544,27 @@ fn valid_direct_auth(seal: Hash) -> ReceiptAuthentication {
     }
 }
 
+/// Build a valid pointer authentication with a merkle proof that actually
+/// verifies. We compute the batch root deterministically from `receipt_hash`
+/// and proof siblings using the same `hash_leaf` / `hash_internal` logic
+/// that the verifier uses.
 fn valid_pointer_auth(seal: Hash) -> ReceiptAuthentication {
+    use crate::consensus::merkle::{hash_internal, hash_leaf};
+
+    let receipt_hash = test_hash(0xE1);
+    let sibling0 = test_hash(0xE3);
+    let sibling1 = test_hash(0xE4);
+
+    // Recompute the expected root: hash_leaf(receipt_hash), then fold.
+    let leaf = hash_leaf(&receipt_hash);
+    let level1 = hash_internal(&leaf, &sibling0);
+    let root = hash_internal(&level1, &sibling1);
+
     ReceiptAuthentication::Pointer {
-        receipt_hash: test_hash(0xE1),
+        receipt_hash,
         authority_seal_hash: seal,
-        merkle_inclusion_proof: Some(vec![test_hash(0xE3), test_hash(0xE4)]),
-        receipt_batch_root_hash: Some(test_hash(0xE5)),
+        merkle_inclusion_proof: Some(vec![sibling0, sibling1]),
+        receipt_batch_root_hash: Some(root),
     }
 }
 
@@ -894,4 +909,553 @@ fn deny_carries_correct_context() {
     assert_eq!(err.ledger_anchor, LEDGER);
     assert_eq!(err.denied_at_tick, TICK);
     assert!(err.ajc_id.is_none());
+}
+
+// =============================================================================
+// Merkle inclusion verification negative tests (TCK-00425, BLOCKER fix)
+// =============================================================================
+
+#[test]
+fn pointer_auth_wrong_batch_root_denied() {
+    // Proof siblings are valid non-zero hashes, but batch_root is an
+    // arbitrary hash that does not match the recomputed root.
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: Some(vec![test_hash(0xE3), test_hash(0xE4)]),
+        receipt_batch_root_hash: Some(test_hash(0xFF)), // wrong root
+    };
+    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::UnknownState { ref description }
+        if description.contains("recomputed root does not match")
+    ));
+}
+
+#[test]
+fn pointer_auth_wrong_sibling_branch_denied() {
+    // Build a valid proof for receipt_hash 0xE1 then swap one sibling.
+    use crate::consensus::merkle::{hash_internal, hash_leaf};
+
+    let receipt_hash = test_hash(0xE1);
+    let correct_sibling0 = test_hash(0xE3);
+    let sibling1 = test_hash(0xE4);
+
+    // Compute the correct root.
+    let leaf = hash_leaf(&receipt_hash);
+    let level1 = hash_internal(&leaf, &correct_sibling0);
+    let correct_root = hash_internal(&level1, &sibling1);
+
+    // Now use a WRONG sibling at position 0.
+    let wrong_sibling0 = test_hash(0xAA);
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash,
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: Some(vec![wrong_sibling0, sibling1]),
+        receipt_batch_root_hash: Some(correct_root),
+    };
+    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::UnknownState { ref description }
+        if description.contains("recomputed root does not match")
+    ));
+}
+
+#[test]
+fn pointer_auth_wrong_receipt_hash_denied() {
+    // Build a valid proof for receipt_hash 0xE1, then submit it with a
+    // different receipt_hash (0xE2). The recomputed root won't match.
+    use crate::consensus::merkle::{hash_internal, hash_leaf};
+
+    let original_receipt = test_hash(0xE1);
+    let sibling0 = test_hash(0xE3);
+    let sibling1 = test_hash(0xE4);
+
+    let leaf = hash_leaf(&original_receipt);
+    let level1 = hash_internal(&leaf, &sibling0);
+    let root = hash_internal(&level1, &sibling1);
+
+    // Use a different receipt_hash.
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash: test_hash(0xE2), // different receipt
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: Some(vec![sibling0, sibling1]),
+        receipt_batch_root_hash: Some(root),
+    };
+    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::UnknownState { ref description }
+        if description.contains("recomputed root does not match")
+    ));
+}
+
+#[test]
+fn pointer_auth_proof_exceeds_max_depth_denied() {
+    // Build a proof that exceeds MAX_MERKLE_INCLUSION_PROOF_DEPTH.
+    #[allow(clippy::cast_possible_truncation)]
+    let too_many: Vec<Hash> = (0..=super::auth_verifier::MAX_MERKLE_INCLUSION_PROOF_DEPTH)
+        .map(|i| test_hash((i as u8).wrapping_add(1)))
+        .collect();
+    // Also need a matching root -- but we expect denial before verification.
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: Some(too_many),
+        receipt_batch_root_hash: Some(test_hash(0xFF)),
+    };
+    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::UnknownState { ref description }
+        if description.contains("exceeds maximum")
+    ));
+}
+
+#[test]
+fn pointer_auth_single_sibling_proof_valid() {
+    // Minimal valid proof: one sibling.
+    use crate::consensus::merkle::{hash_internal, hash_leaf};
+
+    let receipt_hash = test_hash(0xE1);
+    let sibling = test_hash(0xE3);
+    let leaf = hash_leaf(&receipt_hash);
+    let root = hash_internal(&leaf, &sibling);
+
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash,
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: Some(vec![sibling]),
+        receipt_batch_root_hash: Some(root),
+    };
+    let result = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok());
+}
+
+// =============================================================================
+// Replay lifecycle ordering tests (TCK-00425, REQ-0006)
+// =============================================================================
+
+#[test]
+fn replay_lifecycle_valid_ordering() {
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Join,
+            tick: 100,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: 200,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Consume,
+            tick: 300,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+    ];
+    let result = validate_replay_lifecycle_order(&entries, Some(300), TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn replay_lifecycle_valid_with_effect_after_consume() {
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Join,
+            tick: 10,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: 20,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Consume,
+            tick: 30,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+    ];
+    let result = validate_replay_lifecycle_order(&entries, Some(50), TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn replay_lifecycle_missing_join_denied() {
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: 200,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Consume,
+            tick: 300,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+    ];
+    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::BoundaryMonotonicityViolation { ref description }
+        if description.contains("missing AuthorityJoin")
+    ));
+}
+
+#[test]
+fn replay_lifecycle_missing_revalidate_denied() {
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Join,
+            tick: 100,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Consume,
+            tick: 300,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+    ];
+    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::BoundaryMonotonicityViolation { ref description }
+        if description.contains("missing AuthorityRevalidate")
+    ));
+}
+
+#[test]
+fn replay_lifecycle_missing_consume_denied() {
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Join,
+            tick: 100,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: 200,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+    ];
+    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::BoundaryMonotonicityViolation { ref description }
+        if description.contains("missing AuthorityConsume")
+    ));
+}
+
+#[test]
+fn replay_lifecycle_join_not_before_revalidate_denied() {
+    // Join tick == Revalidate tick (must be strict <)
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Join,
+            tick: 200,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: 200,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Consume,
+            tick: 300,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+    ];
+    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::BoundaryMonotonicityViolation { ref description }
+        if description.contains("AuthorityJoin tick")
+    ));
+}
+
+#[test]
+fn replay_lifecycle_revalidate_not_before_consume_denied() {
+    // Revalidate tick >= Consume tick
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Join,
+            tick: 100,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: 300,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Consume,
+            tick: 200,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+    ];
+    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::BoundaryMonotonicityViolation { ref description }
+        if description.contains("AuthorityRevalidate tick")
+    ));
+}
+
+#[test]
+fn replay_lifecycle_consume_after_effect_receipt_denied() {
+    // Consume tick > effect receipt tick
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Join,
+            tick: 100,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: 200,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Consume,
+            tick: 400,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+    ];
+    let err =
+        validate_replay_lifecycle_order(&entries, Some(300), TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::BoundaryMonotonicityViolation { ref description }
+        if description.contains("EffectReceipt tick")
+    ));
+}
+
+#[test]
+fn replay_lifecycle_consume_equal_to_effect_receipt_ok() {
+    // Consume tick == effect receipt tick (allowed: <=)
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Join,
+            tick: 100,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: 200,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Consume,
+            tick: 300,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+    ];
+    let result = validate_replay_lifecycle_order(&entries, Some(300), TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn replay_lifecycle_missing_pre_actuation_selector_denied() {
+    // Consume requires pre-actuation but selector is None
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Join,
+            tick: 100,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: 200,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Consume,
+            tick: 300,
+            requires_pre_actuation: true,
+            pre_actuation_selector_hash: None,
+        },
+    ];
+    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::MissingPreActuationReceipt
+    ));
+}
+
+#[test]
+fn replay_lifecycle_zero_pre_actuation_selector_denied() {
+    // Consume requires pre-actuation but selector hash is zero
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Join,
+            tick: 100,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: 200,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Consume,
+            tick: 300,
+            requires_pre_actuation: true,
+            pre_actuation_selector_hash: Some(zero_hash()),
+        },
+    ];
+    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::MissingPreActuationReceipt
+    ));
+}
+
+#[test]
+fn replay_lifecycle_valid_pre_actuation_selector_ok() {
+    // Consume requires pre-actuation and selector is present and non-zero
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Join,
+            tick: 100,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: 200,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Consume,
+            tick: 300,
+            requires_pre_actuation: true,
+            pre_actuation_selector_hash: Some(test_hash(0xAB)),
+        },
+    ];
+    let result = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn replay_lifecycle_exceeds_max_entries_denied() {
+    // Build a sequence exceeding MAX_REPLAY_LIFECYCLE_ENTRIES
+    let mut entries = Vec::new();
+    entries.push(ReplayLifecycleEntry {
+        stage: LifecycleStage::Join,
+        tick: 1,
+        requires_pre_actuation: false,
+        pre_actuation_selector_hash: None,
+    });
+    for i in 2..=super::auth_verifier::MAX_REPLAY_LIFECYCLE_ENTRIES {
+        entries.push(ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: i as u64,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        });
+    }
+    // One more to exceed
+    entries.push(ReplayLifecycleEntry {
+        stage: LifecycleStage::Consume,
+        tick: 999,
+        requires_pre_actuation: false,
+        pre_actuation_selector_hash: None,
+    });
+    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::UnknownState { ref description }
+        if description.contains("exceeds maximum")
+    ));
+}
+
+#[test]
+fn replay_lifecycle_join_after_revalidate_denied() {
+    // Join tick > Revalidate tick (strict order violation)
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Join,
+            tick: 500,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: 200,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Consume,
+            tick: 600,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+    ];
+    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::BoundaryMonotonicityViolation { .. }
+    ));
+}
+
+#[test]
+fn replay_lifecycle_no_effect_receipt_ok() {
+    // No effect receipt tick provided -- only entry ordering is checked
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Join,
+            tick: 10,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: 20,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Consume,
+            tick: 30,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+    ];
+    let result = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok());
 }

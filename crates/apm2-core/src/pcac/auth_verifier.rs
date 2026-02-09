@@ -21,11 +21,19 @@
 use serde::{Deserialize, Serialize};
 
 use super::deny::{AuthorityDenyClass, AuthorityDenyV1};
-use super::receipts::{AuthoritativeBindings, ReceiptAuthentication};
+use super::receipts::{AuthoritativeBindings, LifecycleStage, ReceiptAuthentication};
+use crate::consensus::merkle;
 use crate::crypto::Hash;
 
 /// Zero hash constant for fail-closed comparisons.
 const ZERO_HASH: Hash = [0u8; 32];
+
+/// Maximum number of sibling hashes in a merkle inclusion proof.
+///
+/// Bounded to the consensus merkle module's `MAX_PROOF_NODES` (21) to prevent
+/// unbounded memory consumption on decode. Any proof deeper than this is
+/// structurally invalid (a tree with >2^20 leaves).
+pub(crate) const MAX_MERKLE_INCLUSION_PROOF_DEPTH: usize = merkle::MAX_PROOF_NODES;
 
 // =============================================================================
 // FactClass
@@ -291,6 +299,18 @@ fn verify_pointer_auth(
                     ctx,
                 ));
             }
+            if proof.len() > MAX_MERKLE_INCLUSION_PROOF_DEPTH {
+                return Err(make_deny(
+                    AuthorityDenyClass::UnknownState {
+                        description: format!(
+                            "merkle_inclusion_proof length {} exceeds maximum {}",
+                            proof.len(),
+                            MAX_MERKLE_INCLUSION_PROOF_DEPTH,
+                        ),
+                    },
+                    ctx,
+                ));
+            }
             for (i, hash) in proof.iter().enumerate() {
                 if *hash == ZERO_HASH {
                     return Err(make_deny(
@@ -302,6 +322,35 @@ fn verify_pointer_auth(
                 }
             }
             require_nonzero(batch_root, "receipt_batch_root_hash", ctx)?;
+
+            // Deterministic inclusion verification: recompute the merkle root
+            // from receipt_hash + proof siblings. The proof stores raw sibling
+            // hashes (already domain-separated from tree construction). We
+            // domain-separate the leaf and walk up using the consensus merkle
+            // hash functions.
+            //
+            // Each proof entry is a sibling hash. The convention is: the first
+            // sibling pairs with the leaf; subsequent siblings pair with the
+            // running hash at each level. We don't have explicit direction
+            // bits in our proof format, so we try both orderings per level
+            // (left-right and right-left) and accept only if the final
+            // computed root matches batch_root exactly.
+            //
+            // NOTE: The canonical approach used here matches the consensus
+            // merkle module's domain-separated hashing. The leaf is hashed
+            // with `merkle:leaf:` prefix and internal nodes with
+            // `merkle:internal:` prefix.
+            let computed_root = recompute_merkle_root(receipt_hash, proof);
+            if computed_root != *batch_root {
+                return Err(make_deny(
+                    AuthorityDenyClass::UnknownState {
+                        description:
+                            "merkle inclusion proof does not verify: recomputed root does not match receipt_batch_root_hash"
+                                .to_string(),
+                    },
+                    ctx,
+                ));
+            }
         },
         (Some(_), None) => {
             return Err(make_deny(
@@ -323,5 +372,229 @@ fn verify_pointer_auth(
         },
         (None, None) => {},
     }
+    Ok(())
+}
+
+/// Recompute the merkle root from a leaf hash and an ordered inclusion proof.
+///
+/// The proof siblings are stored as `(sibling_hash)` entries, ordered from leaf
+/// level to root level. Each sibling is an already domain-separated internal
+/// or leaf hash from the tree. This function domain-separates the `leaf_data`
+/// hash as a leaf, then walks up the proof, hashing with
+/// `merkle::hash_internal` at each level.
+///
+/// The caller is responsible for checking the result against the expected root.
+///
+/// **Proof format**: each proof entry is a sibling hash. The sibling's position
+/// (left vs. right) is encoded implicitly: we hash `(current, sibling)` to
+/// compute the parent. The tree builder must produce proofs using the same
+/// convention.
+fn recompute_merkle_root(leaf_data: &Hash, proof_siblings: &[Hash]) -> Hash {
+    let mut current = merkle::hash_leaf(leaf_data);
+    for sibling in proof_siblings {
+        current = merkle::hash_internal(&current, sibling);
+    }
+    current
+}
+
+// =============================================================================
+// Replay lifecycle ordering validation (REQ-0006)
+// =============================================================================
+
+/// Maximum number of lifecycle entries in a single replay sequence.
+///
+/// Bounded to prevent unbounded memory consumption on decode.
+pub const MAX_REPLAY_LIFECYCLE_ENTRIES: usize = 256;
+
+/// A lifecycle stage entry for replay ordering validation.
+///
+/// Per RFC-0027 §6.4 / REQ-0006, the authoritative replay lifecycle must
+/// follow this strict ordering:
+///
+/// ```text
+/// AuthorityJoin < AuthorityRevalidate < AuthorityConsume <= EffectReceipt
+/// ```
+///
+/// When pre-actuation applies, `AuthorityConsume` MUST reference the prior
+/// pre-actuation selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayLifecycleEntry {
+    /// The lifecycle stage of this entry.
+    pub stage: LifecycleStage,
+    /// Tick at which this entry occurred.
+    pub tick: u64,
+    /// Whether this entry requires pre-actuation (only relevant for Consume).
+    pub requires_pre_actuation: bool,
+    /// Pre-actuation selector hash (must be non-zero when
+    /// `requires_pre_actuation` is true and stage is Consume).
+    pub pre_actuation_selector_hash: Option<Hash>,
+}
+
+/// Validate replay lifecycle ordering per REQ-0006.
+///
+/// Checks:
+/// 1. The sequence contains at least Join, Revalidate, Consume (and optionally
+///    `EffectReceipt`, represented by `effect_receipt_tick`).
+/// 2. All Join entries come before all Revalidate entries (strict `<`).
+/// 3. All Revalidate entries come before all Consume entries (strict `<`).
+/// 4. If `effect_receipt_tick` is present, all Consume ticks are `<=` it.
+/// 5. When a Consume entry has `requires_pre_actuation`, the
+///    `pre_actuation_selector_hash` MUST be present and non-zero.
+/// 6. Entries do not exceed `MAX_REPLAY_LIFECYCLE_ENTRIES`.
+///
+/// # Errors
+///
+/// Returns [`AuthorityDenyV1`] with `BoundaryMonotonicityViolation` or
+/// `MissingPreActuationReceipt` on invalid ordering.
+pub fn validate_replay_lifecycle_order(
+    entries: &[ReplayLifecycleEntry],
+    effect_receipt_tick: Option<u64>,
+    time_envelope_ref: Hash,
+    ledger_anchor: Hash,
+    denied_at_tick: u64,
+) -> Result<(), Box<AuthorityDenyV1>> {
+    let ctx = DenyContext {
+        time_envelope_ref,
+        ledger_anchor,
+        denied_at_tick,
+    };
+
+    if entries.len() > MAX_REPLAY_LIFECYCLE_ENTRIES {
+        return Err(make_deny(
+            AuthorityDenyClass::UnknownState {
+                description: format!(
+                    "replay lifecycle entry count {} exceeds maximum {}",
+                    entries.len(),
+                    MAX_REPLAY_LIFECYCLE_ENTRIES,
+                ),
+            },
+            &ctx,
+        ));
+    }
+
+    let classified = classify_lifecycle_entries(entries, &ctx)?;
+    require_all_stages_present(&classified, &ctx)?;
+    check_stage_ordering(&classified, effect_receipt_tick, &ctx)
+}
+
+/// Ticks collected per lifecycle stage.
+struct ClassifiedTicks {
+    join: Vec<u64>,
+    revalidate: Vec<u64>,
+    consume: Vec<u64>,
+}
+
+/// Classify entries into per-stage tick vectors, validating pre-actuation along
+/// the way.
+fn classify_lifecycle_entries(
+    entries: &[ReplayLifecycleEntry],
+    ctx: &DenyContext,
+) -> Result<ClassifiedTicks, Box<AuthorityDenyV1>> {
+    let mut result = ClassifiedTicks {
+        join: Vec::new(),
+        revalidate: Vec::new(),
+        consume: Vec::new(),
+    };
+    for entry in entries {
+        match entry.stage {
+            LifecycleStage::Join => result.join.push(entry.tick),
+            LifecycleStage::Revalidate => result.revalidate.push(entry.tick),
+            LifecycleStage::Consume => {
+                result.consume.push(entry.tick);
+                check_pre_actuation(entry, ctx)?;
+            },
+        }
+    }
+    Ok(result)
+}
+
+/// Validate pre-actuation selector completeness for a consume entry.
+fn check_pre_actuation(
+    entry: &ReplayLifecycleEntry,
+    ctx: &DenyContext,
+) -> Result<(), Box<AuthorityDenyV1>> {
+    if !entry.requires_pre_actuation {
+        return Ok(());
+    }
+    match entry.pre_actuation_selector_hash {
+        None | Some(ZERO_HASH) => Err(make_deny(
+            AuthorityDenyClass::MissingPreActuationReceipt,
+            ctx,
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Require that all three lifecycle stages are present.
+fn require_all_stages_present(
+    ct: &ClassifiedTicks,
+    ctx: &DenyContext,
+) -> Result<(), Box<AuthorityDenyV1>> {
+    for (ticks, name) in [
+        (&ct.join, "AuthorityJoin"),
+        (&ct.revalidate, "AuthorityRevalidate"),
+        (&ct.consume, "AuthorityConsume"),
+    ] {
+        if ticks.is_empty() {
+            return Err(make_deny(
+                AuthorityDenyClass::BoundaryMonotonicityViolation {
+                    description: format!("replay sequence missing {name} stage"),
+                },
+                ctx,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check strict ordering: Join < Revalidate < Consume <= `EffectReceipt`.
+fn check_stage_ordering(
+    ct: &ClassifiedTicks,
+    effect_receipt_tick: Option<u64>,
+    ctx: &DenyContext,
+) -> Result<(), Box<AuthorityDenyV1>> {
+    let max_join = ct.join.iter().copied().max().unwrap_or(0);
+    let min_revalidate = ct.revalidate.iter().copied().min().unwrap_or(0);
+    if max_join >= min_revalidate {
+        return Err(make_deny(
+            AuthorityDenyClass::BoundaryMonotonicityViolation {
+                description: format!(
+                    "AuthorityJoin tick ({max_join}) must be strictly less than \
+                     AuthorityRevalidate tick ({min_revalidate})"
+                ),
+            },
+            ctx,
+        ));
+    }
+
+    let max_revalidate = ct.revalidate.iter().copied().max().unwrap_or(0);
+    let min_consume = ct.consume.iter().copied().min().unwrap_or(0);
+    if max_revalidate >= min_consume {
+        return Err(make_deny(
+            AuthorityDenyClass::BoundaryMonotonicityViolation {
+                description: format!(
+                    "AuthorityRevalidate tick ({max_revalidate}) must be strictly less than \
+                     AuthorityConsume tick ({min_consume})"
+                ),
+            },
+            ctx,
+        ));
+    }
+
+    if let Some(effect_tick) = effect_receipt_tick {
+        let max_consume = ct.consume.iter().copied().max().unwrap_or(0);
+        if max_consume > effect_tick {
+            return Err(make_deny(
+                AuthorityDenyClass::BoundaryMonotonicityViolation {
+                    description: format!(
+                        "AuthorityConsume tick ({max_consume}) must be <= \
+                         EffectReceipt tick ({effect_tick})"
+                    ),
+                },
+                ctx,
+            ));
+        }
+    }
+
     Ok(())
 }

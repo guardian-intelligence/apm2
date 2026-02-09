@@ -47,13 +47,15 @@ mod types;
 mod tests;
 
 pub use auth_verifier::{
-    FactClass, classify_fact, validate_authoritative_bindings, verify_receipt_authentication,
+    FactClass, MAX_REPLAY_LIFECYCLE_ENTRIES, ReplayLifecycleEntry, classify_fact,
+    validate_authoritative_bindings, validate_replay_lifecycle_order,
+    verify_receipt_authentication,
 };
 pub use deny::{AuthorityDenyClass, AuthorityDenyV1};
 pub use kernel::AuthorityJoinKernel;
 pub use receipts::{
     AuthoritativeBindings, AuthorityConsumeReceiptV1, AuthorityDenyReceiptV1,
-    AuthorityJoinReceiptV1, AuthorityRevalidateReceiptV1, ReceiptAuthentication,
+    AuthorityJoinReceiptV1, AuthorityRevalidateReceiptV1, LifecycleStage, ReceiptAuthentication,
 };
 pub use types::{
     AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityJoinCertificateV1,
