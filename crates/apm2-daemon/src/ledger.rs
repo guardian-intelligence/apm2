@@ -64,6 +64,14 @@ impl SqliteLedgerEventEmitter {
             "CREATE INDEX IF NOT EXISTS idx_ledger_events_work_id ON ledger_events(work_id)",
             [],
         )?;
+        // QUALITY MAJOR 1 FIX: Index on timestamp_ns for O(log N) latest-event
+        // lookups in `get_latest_event()`. Without this, the
+        // `ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1` query performs a
+        // full table scan (O(N) cost) on every PCAC ledger anchor derivation.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ledger_events_timestamp ON ledger_events(timestamp_ns)",
+            [],
+        )?;
         // Index for LeaseValidator
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ledger_events_type_payload ON ledger_events(event_type)",

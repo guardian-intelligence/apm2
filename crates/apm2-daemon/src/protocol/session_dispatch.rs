@@ -2898,23 +2898,64 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         },
                     };
 
-                    // QUALITY MAJOR 1: Keep receipts on the authoritative
-                    // effect path by logging certificate and consume evidence.
+                    // QUALITY BLOCKER 1 & 2 FIX (RFC-0027 §6.1 step 9):
+                    // Emit a ToolActuation ledger event that binds the PCAC
+                    // lifecycle receipts to the tool actuation. This persists
+                    // the authority chain evidence (ajc_id, join_tick,
+                    // consume_tick, intent_digest) before effect execution.
                     let consume_record_hash = {
                         let mut hasher = blake3::Hasher::new();
                         hasher.update(&consume_record.ajc_id);
                         hasher.update(&consume_record.consumed_time_envelope_ref);
                         hasher.update(&consume_record.consumed_at_tick.to_le_bytes());
                         hasher.update(&consume_record.effect_selector_digest);
-                        hex::encode(hasher.finalize().as_bytes())
+                        *hasher.finalize().as_bytes()
                     };
+
+                    if let Some(ref ledger) = self.ledger {
+                        let tool_actuation_payload = serde_json::json!({
+                            "event_kind": "ToolActuation",
+                            "ajc_id": hex::encode(pending_pcac.certificate.ajc_id),
+                            "tool_class": tool_class.to_string(),
+                            "intent_digest": hex::encode(pending_pcac.intent_digest),
+                            "join_tick": pending_pcac.certificate.expires_at_tick.saturating_sub(300),
+                            "consume_tick": consumed_witness.consumed_at_tick,
+                            "time_envelope_ref": hex::encode(current_time_envelope_ref),
+                            "ledger_anchor": hex::encode(current_ledger_anchor),
+                            "consume_record_hash": hex::encode(consume_record_hash),
+                        });
+                        let payload_bytes =
+                            serde_json::to_vec(&tool_actuation_payload).unwrap_or_default();
+                        if let Err(e) = ledger.emit_session_event(
+                            session_id,
+                            "pcac_tool_actuation",
+                            &payload_bytes,
+                            "pcac:lifecycle",
+                            timestamp_ns,
+                        ) {
+                            // Fail-closed: if the ToolActuation event cannot be
+                            // persisted, deny the effect. The authority chain
+                            // evidence MUST be durable before any side effect.
+                            warn!(
+                                session_id = %session_id,
+                                request_id = %request_id,
+                                error = %e,
+                                "ToolActuation ledger event persistence failed (fail-closed)"
+                            );
+                            return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorInternal,
+                                format!("PCAC tool actuation evidence persistence failed: {e}"),
+                            ));
+                        }
+                    }
+
                     info!(
                         session_id = %session_id,
                         request_id = %request_id,
                         ajc_id = %hex::encode(pending_pcac.certificate.ajc_id),
                         consumed_tick = consumed_witness.consumed_at_tick,
-                        consume_record_hash = %consume_record_hash,
-                        "PCAC consume completed immediately before effect execution"
+                        consume_record_hash = %hex::encode(consume_record_hash),
+                        "PCAC consume completed and ToolActuation event persisted before effect execution"
                     );
                 }
 
