@@ -2838,6 +2838,22 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             },
                         };
 
+                    // SECURITY BLOCKER 1 FIX (round 2): Advance the kernel tick
+                    // from fresh HLC wall time BEFORE revalidation. Without this,
+                    // the kernel retains the tick from the join phase (before the
+                    // broker call). If the broker takes significant time, an AJC
+                    // that expires during the broker phase would be incorrectly
+                    // accepted because revalidate_before_execution uses the stale
+                    // join-phase tick. This closes the TOCTOU window.
+                    if let Some(ref clock) = self.clock {
+                        if let Ok(hlc) = clock.now_hlc() {
+                            let fresh_tick = hlc.wall_ns / 1_000_000_000;
+                            if fresh_tick > 0 {
+                                pending_pcac.gate.advance_tick(fresh_tick);
+                            }
+                        }
+                    }
+
                     if let Err(deny) = pending_pcac.gate.revalidate_before_execution(
                         &pending_pcac.certificate,
                         current_time_envelope_ref,

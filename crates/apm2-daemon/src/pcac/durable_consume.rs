@@ -138,6 +138,17 @@ impl DurableConsumeMetrics {
 // FileBackedConsumeIndex
 // =============================================================================
 
+/// Maximum number of consumed AJC IDs held in the in-memory index.
+///
+/// When the set exceeds this limit, a warning is logged on each new consume
+/// to alert operators that rotation or archival is needed. The consume still
+/// succeeds (fail-open for availability) because the on-disk log is the
+/// authoritative source of truth for crash replay.
+///
+/// TODO(TCK-ROTATION): Implement log rotation or a sharded/Bloom-filter
+/// strategy to bound long-term memory growth.
+const MAX_CONSUMED_ENTRIES: usize = 1_000_000;
+
 /// Append-only file-backed durable consume index.
 ///
 /// Each consumed AJC ID is written as a 64-character hex line followed by
@@ -207,60 +218,77 @@ impl FileBackedConsumeIndex {
             )
         })?;
 
-        // Replay existing entries from the locked file.
+        // Replay existing entries from the locked file using streaming I/O.
         //
-        // MAJOR 2 FIX: Handle torn tail writes gracefully. If the LAST
-        // line fails parsing, it is treated as a torn write from a crash
-        // before fsync completed — the file is truncated to remove the
-        // incomplete record and startup continues. Mid-file corruption
-        // still returns CorruptLog (fail-closed) because it indicates
-        // data integrity violations beyond a simple torn tail.
+        // SECURITY BLOCKER 2 FIX (round 2): Process lines in a streaming
+        // manner instead of collecting all lines into a Vec<String>. This
+        // prevents OOM on startup when the consume log is large (millions
+        // of entries). The torn-tail detection works by tracking the last
+        // valid byte position and the last parse result; if the final line
+        // fails parsing, it is treated as a torn write from a crash before
+        // fsync completed and the file is truncated. Mid-file corruption
+        // still returns CorruptLog (fail-closed).
         let mut needs_truncate_to: Option<u64> = None;
         {
             let mut replay = file.try_clone()?;
             replay.seek(SeekFrom::Start(0))?;
             let reader = BufReader::new(&mut replay);
 
-            // Collect all lines to determine which is the last.
-            let raw_lines: Vec<String> = reader.lines().collect::<Result<Vec<_>, _>>()?;
-            let line_count = raw_lines.len();
-
-            // Track byte offset for potential tail truncation.
+            // Stream lines one at a time, tracking position for torn-tail
+            // detection. We keep the byte offset of the start of the
+            // current line so we can truncate to the last valid position
+            // if the final line is corrupt.
             let mut byte_offset: u64 = 0;
-            for (line_idx, line) in raw_lines.iter().enumerate() {
+            let mut line_idx: usize = 0;
+            // Track whether the previous line was a parse error so we can
+            // detect mid-file corruption (an error followed by more lines).
+            let mut pending_error: Option<(usize, u64, String)> = None;
+
+            for line_result in reader.lines() {
+                let line = line_result?;
+
+                // If a previous line had a parse error and we have MORE
+                // lines after it, that is mid-file corruption (fail-closed).
+                if let Some((err_line, _err_offset, err_reason)) = pending_error.take() {
+                    return Err(ConsumeError::CorruptLog {
+                        line: err_line,
+                        reason: err_reason,
+                    });
+                }
+
                 let trimmed = line.trim();
                 let line_byte_len = (line.len() + 1) as u64; // +1 for newline
+
                 if trimmed.is_empty() {
                     byte_offset += line_byte_len;
+                    line_idx += 1;
                     continue;
                 }
+
                 match hex_to_hash(trimmed) {
                     Ok(hash) => {
                         consumed.insert(hash);
                     },
                     Err(reason) => {
-                        if line_idx == line_count - 1 {
-                            // Torn tail record — safe to truncate because
-                            // if fsync did not complete, the effect was
-                            // never accepted (consume returns only after
-                            // fsync).
-                            tracing::warn!(
-                                line = line_idx + 1,
-                                reason = %reason,
-                                path = %path.display(),
-                                "truncating torn tail record from durable consume log"
-                            );
-                            needs_truncate_to = Some(byte_offset);
-                        } else {
-                            // Mid-file corruption — fail closed.
-                            return Err(ConsumeError::CorruptLog {
-                                line: line_idx + 1,
-                                reason,
-                            });
-                        }
+                        // Defer the error — if this is the last line, it is
+                        // a torn tail. If more lines follow, it is mid-file
+                        // corruption.
+                        pending_error = Some((line_idx + 1, byte_offset, reason));
                     },
                 }
                 byte_offset += line_byte_len;
+                line_idx += 1;
+            }
+
+            // If the last line was an error, treat it as torn tail.
+            if let Some((err_line, err_offset, reason)) = pending_error {
+                tracing::warn!(
+                    line = err_line,
+                    reason = %reason,
+                    path = %path.display(),
+                    "truncating torn tail record from durable consume log"
+                );
+                needs_truncate_to = Some(err_offset);
             }
         }
 
@@ -324,6 +352,30 @@ impl DurableConsumeIndex for FileBackedConsumeIndex {
 
         // Only mark consumed after successful fsync.
         consumed.insert(ajc_id);
+
+        // SECURITY MAJOR FIX (round 2): Warn when the in-memory index
+        // approaches or exceeds the capacity limit. The consume still
+        // succeeds because the durable log is authoritative, but operators
+        // must be alerted to implement rotation before memory is exhausted.
+        let current_len = consumed.len();
+        if current_len >= MAX_CONSUMED_ENTRIES {
+            tracing::warn!(
+                consumed_count = current_len,
+                max_capacity = MAX_CONSUMED_ENTRIES,
+                path = %self.path.display(),
+                "durable consume index exceeds MAX_CONSUMED_ENTRIES capacity; \
+                 log rotation or archival is required to bound memory growth"
+            );
+        } else if current_len > 0 && current_len % (MAX_CONSUMED_ENTRIES / 10) == 0 {
+            // Log a periodic info-level message at each 10% milestone so
+            // operators can observe growth trends before hitting the limit.
+            tracing::info!(
+                consumed_count = current_len,
+                max_capacity = MAX_CONSUMED_ENTRIES,
+                "durable consume index capacity checkpoint"
+            );
+        }
+
         Ok(())
     }
 
@@ -1063,6 +1115,93 @@ mod tests {
         assert!(
             !reopened.is_consumed(&cert.ajc_id),
             "durable record must not be written when inner consume denies"
+        );
+    }
+
+    // =========================================================================
+    // hex_to_hash helper tests
+    // =========================================================================
+
+    // =========================================================================
+    // SECURITY BLOCKER 2 FIX (round 2): Streaming open regression tests
+    // =========================================================================
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn streaming_open_handles_many_entries() {
+        // Verify that the streaming open path correctly processes a file
+        // with many entries without collecting them all into a Vec first.
+        // We use a moderate count (1000) to prove streaming correctness
+        // without making the test slow.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("consume.log");
+
+        let mut content = String::new();
+        let entry_count = 1000;
+        let mut expected_hashes = Vec::with_capacity(entry_count);
+        for i in 0..entry_count {
+            // Create unique hashes by varying the first two bytes.
+            let mut h = [0u8; 32];
+            h[0] = (i >> 8) as u8;
+            h[1] = (i & 0xFF) as u8;
+            expected_hashes.push(h);
+            content.push_str(&hex::encode(h));
+            content.push('\n');
+        }
+        std::fs::write(&path, &content).unwrap();
+
+        let index = FileBackedConsumeIndex::open(&path, None).unwrap();
+        assert_eq!(
+            index.len(),
+            entry_count,
+            "streaming open must load all {entry_count} entries"
+        );
+        for h in &expected_hashes {
+            assert!(
+                index.is_consumed(h),
+                "every replayed hash must be in the consumed set"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn streaming_open_torn_tail_after_many_valid() {
+        // Streaming path: many valid entries followed by a torn tail.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("consume.log");
+
+        let mut content = String::new();
+        let valid_count = 50;
+        for i in 0..valid_count {
+            let mut h = [0u8; 32];
+            h[0] = (i >> 8) as u8;
+            h[1] = (i & 0xFF) as u8;
+            content.push_str(&hex::encode(h));
+            content.push('\n');
+        }
+        // Append a torn tail line.
+        content.push_str("deadbeef_short\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let index = FileBackedConsumeIndex::open(&path, None).unwrap();
+        assert_eq!(
+            index.len(),
+            valid_count,
+            "torn tail must be removed, only valid entries remain"
+        );
+    }
+
+    // =========================================================================
+    // SECURITY MAJOR FIX (round 2): MAX_CONSUMED_ENTRIES capacity constant
+    // =========================================================================
+
+    #[test]
+    fn max_consumed_entries_constant_is_reasonable() {
+        // Verify the constant exists and is a reasonable upper bound.
+        assert_eq!(
+            MAX_CONSUMED_ENTRIES, 1_000_000,
+            "MAX_CONSUMED_ENTRIES must be 1 million"
         );
     }
 

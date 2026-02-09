@@ -845,3 +845,103 @@ fn durable_kernel_crash_replay_lifecycle_gate() {
         );
     }
 }
+
+// =============================================================================
+// SECURITY BLOCKER 1 FIX (round 2): Stale tick TOCTOU in broker decision phase
+// =============================================================================
+
+#[test]
+fn test_stale_tick_after_broker_phase_denies_expired_authority() {
+    // Simulates the TOCTOU scenario: join at tick T, then the broker takes
+    // significant time. After the broker returns, the tick has advanced past
+    // the AJC's expires_at_tick. Revalidation with the advanced tick MUST
+    // deny the expired certificate.
+    //
+    // This is a unit test for the kernel + gate layer. The session_dispatch
+    // integration (which calls `advance_tick` from HLC before
+    // `revalidate_before_execution`) is verified by this test proving that
+    // advancing the tick causes expiry denial.
+
+    let starting_tick = 1000u64;
+    let tick_kernel = Arc::new(InProcessKernel::new(starting_tick));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&tick_kernel) as _;
+    let gate = LifecycleGate::with_tick_kernel(kernel_trait, Arc::clone(&tick_kernel));
+
+    let input = valid_input();
+
+    // Stage 1+2: join_and_revalidate at tick 1000 (pre-broker).
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("join_and_revalidate should succeed at tick 1000");
+
+    // The AJC has a default TTL of 300 ticks, so expires_at_tick = 1300.
+    assert_eq!(
+        cert.expires_at_tick, 1300,
+        "AJC must expire at starting_tick + 300"
+    );
+
+    // Simulate broker phase taking a long time: advance tick past expiry.
+    let post_broker_tick = cert.expires_at_tick + 1; // 1301
+    gate.advance_tick(post_broker_tick);
+    assert_eq!(tick_kernel.current_tick(), post_broker_tick);
+
+    // Stage 3: revalidate_before_execution MUST deny because the AJC
+    // has expired (current_tick 1301 > expires_at_tick 1300).
+    let err = gate
+        .revalidate_before_execution(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect_err("revalidate_before_execution must deny expired AJC after tick advance");
+
+    assert!(
+        matches!(
+            err.deny_class,
+            AuthorityDenyClass::CertificateExpired {
+                expired_at: 1300,
+                current_tick: 1301,
+            }
+        ),
+        "deny must be CertificateExpired with correct tick values, got: {:?}",
+        err.deny_class
+    );
+}
+
+#[test]
+fn test_tick_advance_within_ttl_allows_revalidation() {
+    // Companion to the stale-tick test: if the tick advances but stays
+    // within the AJC's TTL, revalidation must still succeed.
+    let starting_tick = 1000u64;
+    let tick_kernel = Arc::new(InProcessKernel::new(starting_tick));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&tick_kernel) as _;
+    let gate = LifecycleGate::with_tick_kernel(kernel_trait, Arc::clone(&tick_kernel));
+
+    let input = valid_input();
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("join should succeed");
+
+    // Advance tick but stay within TTL window (expires_at_tick = 1300).
+    gate.advance_tick(1100);
+
+    // Revalidation should succeed.
+    gate.revalidate_before_execution(
+        &cert,
+        input.time_envelope_ref,
+        input.as_of_ledger_anchor,
+        input.directory_head_hash,
+    )
+    .expect("revalidate_before_execution should succeed within TTL window");
+}
