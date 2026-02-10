@@ -1252,7 +1252,7 @@ fn protocol_dispatch_cutover_json_tag_validation() {
     let json_array_byte: u8 = b'[';
     assert_eq!(json_array_byte, 91);
 
-    // Valid privileged message types are 1-26 (with a gap at 20)
+    // Valid privileged message types are 1-27.
     // Tags 1-4: Original privileged endpoints
     assert!(PrivilegedMessageType::from_tag(1).is_some()); // ClaimWork
     assert!(PrivilegedMessageType::from_tag(2).is_some()); // SpawnEpisode
