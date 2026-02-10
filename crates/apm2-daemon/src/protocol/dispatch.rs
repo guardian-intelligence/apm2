@@ -600,6 +600,8 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// * `identity_proof_hash` - Identity proof hash binding (32 bytes)
     /// * `time_envelope_ref` - CAS hash reference of the authoritative
     ///   `TimeEnvelopeV1` binding this receipt
+    /// * `pcac_lifecycle` - Optional privileged PCAC lifecycle selectors for
+    ///   replay/audit linkage
     ///
     /// # Returns
     ///
@@ -620,6 +622,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
         identity_proof_hash: &[u8; 32],
         time_envelope_ref: &str,
+        pcac_lifecycle: Option<&PrivilegedPcacLifecycleArtifacts>,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
     /// Emits a `ReviewBlockedRecorded` ledger event (TCK-00389).
@@ -641,6 +644,8 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// * `identity_proof_hash` - Identity proof hash binding (32 bytes)
     /// * `time_envelope_ref` - CAS hash reference of the authoritative
     ///   `TimeEnvelopeV1` binding this receipt
+    /// * `pcac_lifecycle` - Optional privileged PCAC lifecycle selectors for
+    ///   replay/audit linkage
     ///
     /// # Returns
     ///
@@ -662,6 +667,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
         identity_proof_hash: &[u8; 32],
         time_envelope_ref: &str,
+        pcac_lifecycle: Option<&PrivilegedPcacLifecycleArtifacts>,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
     /// Returns the number of `work_transitioned` events for a given work ID.
@@ -981,6 +987,7 @@ pub trait LedgerEventEmitter: Send + Sync {
             timestamp_ns,
             identity_proof_hash,
             &envelope_hash_hex,
+            None,
         )
     }
 }
@@ -2092,6 +2099,33 @@ pub fn append_review_outcome_fields(
     );
 }
 
+/// Appends privileged PCAC lifecycle selectors to an event payload.
+pub fn append_privileged_pcac_lifecycle_fields(
+    payload: &mut serde_json::Map<String, serde_json::Value>,
+    artifacts: &PrivilegedPcacLifecycleArtifacts,
+) {
+    payload.insert(
+        "ajc_id".to_string(),
+        serde_json::Value::String(hex::encode(artifacts.ajc_id)),
+    );
+    payload.insert(
+        "intent_digest".to_string(),
+        serde_json::Value::String(hex::encode(artifacts.intent_digest)),
+    );
+    payload.insert(
+        "consume_tick".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(artifacts.consume_tick)),
+    );
+    payload.insert(
+        "pcac_time_envelope_ref".to_string(),
+        serde_json::Value::String(hex::encode(artifacts.time_envelope_ref)),
+    );
+    payload.insert(
+        "consume_selector_digest".to_string(),
+        serde_json::Value::String(hex::encode(artifacts.consume_selector_digest)),
+    );
+}
+
 /// Maximum number of events stored in `StubLedgerEventEmitter`.
 ///
 /// Per CTR-1303: In-memory stores must have `max_entries` limit with O(1)
@@ -2866,6 +2900,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         timestamp_ns: u64,
         identity_proof_hash: &[u8; 32],
         time_envelope_ref: &str,
+        pcac_lifecycle: Option<&PrivilegedPcacLifecycleArtifacts>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
@@ -2916,6 +2951,9 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         let outcome_bindings =
             derive_review_outcome_bindings(changeset_digest, artifact_bundle_hash, receipt_id);
         append_review_outcome_fields(&mut payload_map, &outcome_bindings);
+        if let Some(artifacts) = pcac_lifecycle {
+            append_privileged_pcac_lifecycle_fields(&mut payload_map, artifacts);
+        }
 
         let payload_json = serde_json::Value::Object(payload_map);
 
@@ -3003,6 +3041,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         timestamp_ns: u64,
         identity_proof_hash: &[u8; 32],
         time_envelope_ref: &str,
+        pcac_lifecycle: Option<&PrivilegedPcacLifecycleArtifacts>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
@@ -3056,6 +3095,9 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         let outcome_bindings =
             derive_review_outcome_bindings(changeset_digest, artifact_bundle_hash, receipt_id);
         append_review_outcome_fields(&mut payload_map, &outcome_bindings);
+        if let Some(artifacts) = pcac_lifecycle {
+            append_privileged_pcac_lifecycle_fields(&mut payload_map, artifacts);
+        }
 
         let payload_json = serde_json::Value::Object(payload_map);
 
@@ -6031,6 +6073,25 @@ pub struct PrivilegedPcacPolicy {
 
 type PrivilegedPcacRevalidationInputs = (u64, [u8; 32], [u8; 32], [u8; 32]);
 
+/// Lifecycle selectors returned from privileged PCAC enforcement.
+///
+/// These bindings are persisted on authoritative effect events so replay and
+/// audit paths can verify that the effect is anchored to a concrete
+/// `join -> revalidate -> consume` chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrivilegedPcacLifecycleArtifacts {
+    /// Single-use authority certificate ID consumed for the effect.
+    pub ajc_id: [u8; 32],
+    /// Effect intent digest consumed by PCAC.
+    pub intent_digest: [u8; 32],
+    /// Authoritative consume tick.
+    pub consume_tick: u64,
+    /// Consume-time HTF envelope witness.
+    pub time_envelope_ref: [u8; 32],
+    /// Consume selector digest from the durable consume record.
+    pub consume_selector_digest: [u8; 32],
+}
+
 impl PrivilegedDispatcher {
     /// Creates a new dispatcher with default decode configuration (TEST ONLY).
     ///
@@ -7013,7 +7074,7 @@ impl PrivilegedDispatcher {
         join_ledger_anchor: [u8; 32],
         join_revocation_head: [u8; 32],
         effect_intent_digest: [u8; 32],
-    ) -> Result<(), PrivilegedResponse> {
+    ) -> Result<Option<PrivilegedPcacLifecycleArtifacts>, PrivilegedResponse> {
         gate.advance_tick(join_freshness_tick);
 
         let certificate = gate
@@ -7082,23 +7143,30 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        gate.consume_before_effect(
-            &certificate,
-            effect_intent_digest,
-            current_time_envelope_ref,
-            current_revocation_head,
-        )
-        .map_err(|deny| {
-            warn!(
-                operation = %operation,
-                lease_id = %lease_id,
-                deny_class = %deny.deny_class,
-                "Privileged handler denied by PCAC consume-before-effect gate"
-            );
-            Self::map_pcac_deny_to_privileged_response(operation, &deny)
-        })?;
+        let (consumed_witness, consume_record) = gate
+            .consume_before_effect(
+                &certificate,
+                effect_intent_digest,
+                current_time_envelope_ref,
+                current_revocation_head,
+            )
+            .map_err(|deny| {
+                warn!(
+                    operation = %operation,
+                    lease_id = %lease_id,
+                    deny_class = %deny.deny_class,
+                    "Privileged handler denied by PCAC consume-before-effect gate"
+                );
+                Self::map_pcac_deny_to_privileged_response(operation, &deny)
+            })?;
 
-        Ok(())
+        Ok(Some(PrivilegedPcacLifecycleArtifacts {
+            ajc_id: certificate.ajc_id,
+            intent_digest: effect_intent_digest,
+            consume_tick: consumed_witness.consumed_at_tick,
+            time_envelope_ref: consumed_witness.consumed_time_envelope_ref,
+            consume_selector_digest: consume_record.effect_selector_digest,
+        }))
     }
 
     /// Returns whether a resolved clock profile is admissible for a risk tier.
@@ -11601,7 +11669,11 @@ impl PrivilegedDispatcher {
                 ));
             }
 
-            if !bool::from(original.identity_proof_hash.ct_eq(&request_identity_proof_hash_arr)) {
+            if !bool::from(
+                original
+                    .identity_proof_hash
+                    .ct_eq(&request_identity_proof_hash_arr),
+            ) {
                 warn!(
                     receipt_id = %request.receipt_id,
                     existing_event_id = %existing.event_id,
@@ -11807,6 +11879,7 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        let mut pcac_lifecycle_artifacts: Option<PrivilegedPcacLifecycleArtifacts> = None;
         if self
             .privileged_pcac_policy
             .require_ajc_for_ingest_review_receipt
@@ -11916,7 +11989,7 @@ impl PrivilegedDispatcher {
                 lease_id: request.lease_id.clone(),
                 permeability_receipt_hash: None,
                 identity_proof_hash: request_identity_proof_hash_arr,
-                identity_evidence_level: IdentityEvidenceLevel::Verified,
+                identity_evidence_level: IdentityEvidenceLevel::PointerOnly,
                 directory_head_hash: join_revocation_head,
                 freshness_policy_hash,
                 freshness_witness_tick: join_freshness_tick,
@@ -11928,7 +12001,7 @@ impl PrivilegedDispatcher {
                 as_of_ledger_anchor: join_ledger_anchor,
             };
 
-            if let Err(response) = self.enforce_privileged_pcac_lifecycle(
+            match self.enforce_privileged_pcac_lifecycle(
                 "IngestReviewReceipt",
                 pcac_gate,
                 &pcac_input,
@@ -11939,7 +12012,8 @@ impl PrivilegedDispatcher {
                 join_revocation_head,
                 effect_intent_digest,
             ) {
-                return Ok(response);
+                Ok(artifacts) => pcac_lifecycle_artifacts = artifacts,
+                Err(response) => return Ok(response),
             }
         }
 
@@ -11968,6 +12042,7 @@ impl PrivilegedDispatcher {
                     timestamp_ns,
                     &request_identity_proof_hash_arr,
                     &lease_time_envelope_ref,
+                    pcac_lifecycle_artifacts.as_ref(),
                 ),
                 "review receipt emission failed",
             ),
@@ -11987,6 +12062,7 @@ impl PrivilegedDispatcher {
                         timestamp_ns,
                         &request_identity_proof_hash_arr,
                         &lease_time_envelope_ref,
+                        pcac_lifecycle_artifacts.as_ref(),
                     ),
                     "review blocked emission failed",
                 )
@@ -13148,8 +13224,12 @@ impl PrivilegedDispatcher {
             let delegatee_matches = existing.executor_actor_id == request.delegatee_actor_id;
             let expiry_ms = request.requested_expiry_ns / 1_000_000;
             let expiry_matches = existing.expires_at == expiry_ms;
-            let lineage_matches = bool::from(existing.changeset_digest.ct_eq(&parent_lease.changeset_digest))
-                && bool::from(existing.policy_hash.ct_eq(&parent_lease.policy_hash));
+            let lineage_matches =
+                bool::from(
+                    existing
+                        .changeset_digest
+                        .ct_eq(&parent_lease.changeset_digest),
+                ) && bool::from(existing.policy_hash.ct_eq(&parent_lease.policy_hash));
             if existing.work_id == parent_lease.work_id
                 && existing.gate_id == parent_lease.gate_id
                 && delegatee_matches
@@ -13359,6 +13439,7 @@ impl PrivilegedDispatcher {
                 },
             };
 
+        let mut pcac_lifecycle_artifacts: Option<PrivilegedPcacLifecycleArtifacts> = None;
         if self
             .privileged_pcac_policy
             .require_ajc_for_delegate_sublease
@@ -13467,7 +13548,7 @@ impl PrivilegedDispatcher {
                 lease_id: request.parent_lease_id.clone(),
                 permeability_receipt_hash: Some(lineage_receipt_hash),
                 identity_proof_hash: request_identity_proof_hash,
-                identity_evidence_level: IdentityEvidenceLevel::Verified,
+                identity_evidence_level: IdentityEvidenceLevel::PointerOnly,
                 directory_head_hash: join_revocation_head,
                 freshness_policy_hash,
                 freshness_witness_tick: join_freshness_tick,
@@ -13479,7 +13560,7 @@ impl PrivilegedDispatcher {
                 as_of_ledger_anchor: join_ledger_anchor,
             };
 
-            if let Err(response) = self.enforce_privileged_pcac_lifecycle(
+            match self.enforce_privileged_pcac_lifecycle(
                 "DelegateSublease",
                 pcac_gate,
                 &pcac_input,
@@ -13490,7 +13571,8 @@ impl PrivilegedDispatcher {
                 join_revocation_head,
                 effect_intent_digest,
             ) {
-                return Ok(response);
+                Ok(artifacts) => pcac_lifecycle_artifacts = artifacts,
+                Err(response) => return Ok(response),
             }
         }
 
@@ -13756,7 +13838,7 @@ impl PrivilegedDispatcher {
         // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in
         // the signed event payload so it is audit-bound and cannot be
         // stripped post-signing.
-        let event_payload = serde_json::json!({
+        let mut event_payload = serde_json::json!({
             "parent_lease_id": request.parent_lease_id,
             "sublease_id": sublease.lease_id,
             "delegator_actor_id": caller_actor_id,
@@ -13767,6 +13849,12 @@ impl PrivilegedDispatcher {
             "issued_at": sublease.issued_at,
             "identity_proof_hash": hex::encode(&request.identity_proof_hash),
         });
+        if let (Some(artifacts), Some(payload_object)) = (
+            pcac_lifecycle_artifacts.as_ref(),
+            event_payload.as_object_mut(),
+        ) {
+            append_privileged_pcac_lifecycle_fields(payload_object, artifacts);
+        }
         // SECURITY (v10 MAJOR — Fail-closed serialization):
         //
         // Event payload serialization MUST NOT silently produce empty bytes.
@@ -23023,6 +23111,22 @@ mod tests {
             result.hash.to_vec()
         }
 
+        pub(super) fn decode_event_payload(event: &SignedLedgerEvent) -> serde_json::Value {
+            serde_json::from_slice(&event.payload).expect("event payload must be valid JSON")
+        }
+
+        pub(super) fn decode_wrapped_or_direct_event_payload(
+            event: &SignedLedgerEvent,
+        ) -> serde_json::Value {
+            let wrapper = decode_event_payload(event);
+            wrapper
+                .get("payload")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|hex_payload| hex::decode(hex_payload).ok())
+                .and_then(|inner| serde_json::from_slice::<serde_json::Value>(&inner).ok())
+                .unwrap_or(wrapper)
+        }
+
         /// Stores a canonical `ClockProfileV1` + `TimeEnvelopeV1` in CAS and
         /// returns the envelope hash reference (`time_envelope_ref`).
         pub(super) fn store_time_authority_artifacts(
@@ -26437,6 +26541,34 @@ mod tests {
                 sublease_event_count, 1,
                 "exactly one SubleaseIssued event must be emitted"
             );
+
+            let sublease_event = sublease_events
+                .iter()
+                .find(|event| event.event_type == "SubleaseIssued")
+                .expect("SubleaseIssued event must be present");
+            let payload = super::ingest_review_receipt::decode_wrapped_or_direct_event_payload(
+                sublease_event,
+            );
+            assert!(
+                payload.get("ajc_id").is_some(),
+                "SubleaseIssued payload must include ajc_id lifecycle selector"
+            );
+            assert!(
+                payload.get("intent_digest").is_some(),
+                "SubleaseIssued payload must include intent_digest lifecycle selector"
+            );
+            assert!(
+                payload.get("consume_tick").is_some(),
+                "SubleaseIssued payload must include consume_tick lifecycle selector"
+            );
+            assert!(
+                payload.get("pcac_time_envelope_ref").is_some(),
+                "SubleaseIssued payload must include pcac_time_envelope_ref lifecycle selector"
+            );
+            assert!(
+                payload.get("consume_selector_digest").is_some(),
+                "SubleaseIssued payload must include consume_selector_digest lifecycle selector"
+            );
         }
 
         #[test]
@@ -26498,6 +26630,327 @@ mod tests {
             assert_eq!(
                 review_event_count, 1,
                 "exactly one review_receipt_recorded event must be emitted"
+            );
+
+            let review_event = review_events
+                .iter()
+                .find(|event| event.event_type == "review_receipt_recorded")
+                .expect("review_receipt_recorded event must be present");
+            let payload =
+                super::ingest_review_receipt::decode_wrapped_or_direct_event_payload(review_event);
+            assert!(
+                payload.get("ajc_id").is_some(),
+                "review_receipt_recorded payload must include ajc_id lifecycle selector"
+            );
+            assert!(
+                payload.get("intent_digest").is_some(),
+                "review_receipt_recorded payload must include intent_digest lifecycle selector"
+            );
+            assert!(
+                payload.get("consume_tick").is_some(),
+                "review_receipt_recorded payload must include consume_tick lifecycle selector"
+            );
+            assert!(
+                payload.get("pcac_time_envelope_ref").is_some(),
+                "review_receipt_recorded payload must include pcac_time_envelope_ref lifecycle selector"
+            );
+            assert!(
+                payload.get("consume_selector_digest").is_some(),
+                "review_receipt_recorded payload must include consume_selector_digest lifecycle selector"
+            );
+        }
+
+        #[test]
+        fn test_ingest_review_blocked_privileged_pcac_lifecycle_enabled_succeeds() {
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
+                require_ajc_for_delegate_sublease: false,
+                require_ajc_for_ingest_review_receipt: true,
+            };
+            let (state, ctx, caller_actor, _cas_dir) =
+                setup_dispatcher_state_with_privileged_pcac(policy, false);
+
+            register_test_lease_and_claim(
+                &state,
+                "pcac-review-lease-blocked-ok",
+                "W-PCAC-RR-BLOCKED-OK",
+                "gate-pcac-review-blocked",
+                &caller_actor,
+                [0xBE; 32],
+                0,
+            );
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "pcac-review-lease-blocked-ok".to_string(),
+                receipt_id: "RR-PCAC-BLOCKED-OK".to_string(),
+                reviewer_actor_id: caller_actor,
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
+                verdict: ReviewReceiptVerdict::Blocked.into(),
+                blocked_reason_code: 73,
+                blocked_log_hash: vec![0x91; 32],
+                identity_proof_hash: vec![0x57; 32],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response = state
+                .privileged_dispatcher()
+                .dispatch(&frame, &ctx)
+                .unwrap();
+
+            match response {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(resp.receipt_id, "RR-PCAC-BLOCKED-OK");
+                    assert_eq!(resp.event_type, "ReviewBlockedRecorded");
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "IngestReviewReceipt blocked verdict must return non-empty event_id"
+                    );
+                },
+                other => panic!("expected IngestReviewReceipt blocked success, got {other:?}"),
+            }
+
+            let blocked_events = state
+                .privileged_dispatcher()
+                .event_emitter()
+                .get_events_by_work_id("RR-PCAC-BLOCKED-OK");
+            let blocked_event_count = blocked_events
+                .iter()
+                .filter(|event| event.event_type == "review_blocked_recorded")
+                .count();
+            assert_eq!(
+                blocked_event_count, 1,
+                "exactly one review_blocked_recorded event must be emitted"
+            );
+
+            let blocked_event = blocked_events
+                .iter()
+                .find(|event| event.event_type == "review_blocked_recorded")
+                .expect("review_blocked_recorded event must be present");
+            let payload =
+                super::ingest_review_receipt::decode_wrapped_or_direct_event_payload(blocked_event);
+            assert!(
+                payload.get("ajc_id").is_some(),
+                "review_blocked_recorded payload must include ajc_id lifecycle selector"
+            );
+            assert!(
+                payload.get("intent_digest").is_some(),
+                "review_blocked_recorded payload must include intent_digest lifecycle selector"
+            );
+            assert!(
+                payload.get("consume_tick").is_some(),
+                "review_blocked_recorded payload must include consume_tick lifecycle selector"
+            );
+            assert!(
+                payload.get("pcac_time_envelope_ref").is_some(),
+                "review_blocked_recorded payload must include pcac_time_envelope_ref lifecycle selector"
+            );
+            assert!(
+                payload.get("consume_selector_digest").is_some(),
+                "review_blocked_recorded payload must include consume_selector_digest lifecycle selector"
+            );
+        }
+
+        #[test]
+        fn test_delegate_sublease_privileged_pcac_tier2_pointer_only_denied() {
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
+                require_ajc_for_delegate_sublease: true,
+                require_ajc_for_ingest_review_receipt: false,
+            };
+            let (state, ctx, caller_actor, _cas_dir) =
+                setup_dispatcher_state_with_privileged_pcac(policy, false);
+
+            register_test_lease_and_claim(
+                &state,
+                "pcac-parent-tier2-pointer-only",
+                "W-PCAC-DS-T2-PO",
+                "gate-pcac-tier2-pointer-only",
+                &caller_actor,
+                [0xC1; 32],
+                2,
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "pcac-parent-tier2-pointer-only".to_string(),
+                delegatee_actor_id: "pcac-child-tier2-pointer-only".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "pcac-sublease-tier2-pointer-only".to_string(),
+                identity_proof_hash: vec![0x66; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+            let response = state
+                .privileged_dispatcher()
+                .dispatch(&frame, &ctx)
+                .unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message
+                            .contains("pointer-only identity denied at Tier2+"),
+                        "Tier2 DelegateSublease must deny pointer-only identity evidence, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected Tier2 pointer-only denial, got {other:?}"),
+            }
+
+            let persisted_sublease = state
+                .privileged_dispatcher()
+                .lease_validator()
+                .get_gate_lease("pcac-sublease-tier2-pointer-only");
+            assert!(
+                persisted_sublease.is_none(),
+                "Tier2 pointer-only denial must not persist a sublease"
+            );
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_privileged_pcac_join_uses_pointer_only_evidence() {
+            use apm2_core::pcac::{
+                AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyV1,
+                AuthorityJoinCertificateV1, AuthorityJoinInputV1, AuthorityJoinKernel,
+            };
+
+            struct CapturingKernel {
+                inner: crate::pcac::InProcessKernel,
+                observed_levels: Arc<Mutex<Vec<IdentityEvidenceLevel>>>,
+            }
+
+            impl CapturingKernel {
+                fn new(observed_levels: Arc<Mutex<Vec<IdentityEvidenceLevel>>>) -> Self {
+                    Self {
+                        inner: crate::pcac::InProcessKernel::new(1),
+                        observed_levels,
+                    }
+                }
+            }
+
+            impl AuthorityJoinKernel for CapturingKernel {
+                fn join(
+                    &self,
+                    input: &AuthorityJoinInputV1,
+                ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
+                    self.observed_levels
+                        .lock()
+                        .expect("lock poisoned")
+                        .push(input.identity_evidence_level);
+                    self.inner.join(input)
+                }
+
+                fn revalidate(
+                    &self,
+                    cert: &AuthorityJoinCertificateV1,
+                    current_time_envelope_ref: [u8; 32],
+                    current_ledger_anchor: [u8; 32],
+                    current_revocation_head_hash: [u8; 32],
+                ) -> Result<(), Box<AuthorityDenyV1>> {
+                    self.inner.revalidate(
+                        cert,
+                        current_time_envelope_ref,
+                        current_ledger_anchor,
+                        current_revocation_head_hash,
+                    )
+                }
+
+                fn consume(
+                    &self,
+                    cert: &AuthorityJoinCertificateV1,
+                    intent_digest: [u8; 32],
+                    current_time_envelope_ref: [u8; 32],
+                    current_revocation_head_hash: [u8; 32],
+                ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>
+                {
+                    self.inner.consume(
+                        cert,
+                        intent_digest,
+                        current_time_envelope_ref,
+                        current_revocation_head_hash,
+                    )
+                }
+            }
+
+            let (dispatcher, ctx, _conn) = setup_sqlite_dispatcher();
+
+            let peer_creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let caller_actor = derive_actor_id(&peer_creds);
+
+            let cas = dispatcher
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by setup helper");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: &dispatcher,
+                    cas: cas.as_ref(),
+                    lease_id: "pcac-review-pointer-only-observe",
+                    work_id: "W-PCAC-RR-PO-OBSERVE",
+                    gate_id: "gate-pcac-review-pointer-only-observe",
+                    executor_actor_id: &caller_actor,
+                    policy_hash: [0xC2; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
+            );
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: "W-PCAC-RR-PO-OBSERVE".to_string(),
+                    lease_id: "pcac-review-pointer-only-observe".to_string(),
+                    actor_id: caller_actor.clone(),
+                    role: WorkRole::Reviewer,
+                    policy_resolution: PolicyResolution {
+                        policy_resolved_ref: "PolicyResolvedForChangeSet:W-PCAC-RR-PO-OBSERVE"
+                            .to_string(),
+                        resolved_policy_hash: [0xC2; 32],
+                        capability_manifest_hash: [0x01; 32],
+                        context_pack_hash: [0x02; 32],
+                        resolved_risk_tier: 0,
+                        resolved_scope_baseline: None,
+                        expected_adapter_profile_hash: None,
+                    },
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("work claim registration");
+
+            let observed_levels = Arc::new(Mutex::new(Vec::new()));
+            let kernel: Arc<dyn AuthorityJoinKernel> =
+                Arc::new(CapturingKernel::new(Arc::clone(&observed_levels)));
+            let gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
+
+            let dispatcher = dispatcher
+                .with_pcac_lifecycle_gate(gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {
+                    require_ajc_for_delegate_sublease: false,
+                    require_ajc_for_ingest_review_receipt: true,
+                });
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "pcac-review-pointer-only-observe".to_string(),
+                receipt_id: "RR-PCAC-PO-OBSERVE".to_string(),
+                reviewer_actor_id: caller_actor,
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x55; 32],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            assert!(
+                matches!(response, PrivilegedResponse::IngestReviewReceipt(_)),
+                "Tier0 ingest with policy-enabled PCAC should succeed"
+            );
+
+            let observed = observed_levels.lock().expect("lock poisoned");
+            assert!(
+                observed.contains(&IdentityEvidenceLevel::PointerOnly),
+                "IngestReviewReceipt must construct join input with PointerOnly identity evidence"
             );
         }
 
