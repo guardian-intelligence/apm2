@@ -34,7 +34,7 @@ fn review_run_dir_for_home(home: &Path, pr_number: u32, review_type: &str) -> Pa
         .join(review_type)
 }
 
-fn review_run_state_path_for_home(home: &Path, pr_number: u32, review_type: &str) -> PathBuf {
+pub fn review_run_state_path_for_home(home: &Path, pr_number: u32, review_type: &str) -> PathBuf {
     review_run_dir_for_home(home, pr_number, review_type).join("state.json")
 }
 
@@ -95,6 +95,7 @@ fn legacy_pulse_file_path(review_type: &str) -> Result<PathBuf, String> {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ReviewRunStateLoad {
     Present(ReviewRunState),
     Missing {
@@ -134,7 +135,7 @@ fn review_run_state_candidates(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(candidates)
 }
 
-fn load_review_run_state_for_home(
+pub fn load_review_run_state_for_home(
     home: &Path,
     pr_number: u32,
     review_type: &str,
@@ -239,6 +240,15 @@ pub fn write_review_run_state(state: &ReviewRunState) -> Result<PathBuf, String>
     Ok(path)
 }
 
+pub fn write_review_run_state_for_home(
+    home: &Path,
+    state: &ReviewRunState,
+) -> Result<PathBuf, String> {
+    let path = review_run_state_path_for_home(home, state.pr_number, &state.review_type);
+    write_review_run_state_to_path(&path, state)?;
+    Ok(path)
+}
+
 pub fn write_review_run_state_to_path(path: &Path, state: &ReviewRunState) -> Result<(), String> {
     ensure_parent_dir(path)?;
     let payload = serde_json::to_vec_pretty(state)
@@ -258,7 +268,7 @@ pub fn write_review_run_state_to_path(path: &Path, state: &ReviewRunState) -> Re
     Ok(())
 }
 
-fn next_review_sequence_number_for_home(
+pub fn next_review_sequence_number_for_home(
     home: &Path,
     pr_number: u32,
     review_type: &str,
@@ -591,6 +601,8 @@ mod tests {
             backend_id: Some("codex".to_string()),
             restart_count: 1,
             sequence_number: 3,
+            previous_run_id: None,
+            previous_head_sha: None,
             pid: Some(12345),
         }
     }

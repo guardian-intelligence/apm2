@@ -346,6 +346,8 @@ fn run_single_review(
         backend_id: Some(current_model.backend.as_str().to_string()),
         restart_count,
         sequence_number,
+        previous_run_id: None,
+        previous_head_sha: None,
         pid: None,
     };
 
