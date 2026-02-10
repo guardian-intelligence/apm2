@@ -780,7 +780,7 @@ fn classify_tool_argument_source(arguments: &[u8]) -> TaintSource {
     ];
 
     let Ok(text) = std::str::from_utf8(arguments) else {
-        return TaintSource::FileRead;
+        return TaintSource::UserPrompt;
     };
     let lowered = text.to_ascii_lowercase();
     if PROMPT_INJECTION_MARKERS
@@ -1463,14 +1463,14 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_tool_argument_ingress_binary_payload_is_untrusted() {
+    fn test_evaluate_tool_argument_ingress_binary_payload_is_adversarial() {
         let policy = TaintPolicy::default();
         let args = [0xff, 0xfe, 0x00, 0x11];
 
         let assessment = evaluate_tool_argument_ingress(&args, &policy);
 
-        assert!(assessment.is_allowed());
-        assert_eq!(assessment.tag.source, TaintSource::FileRead);
+        assert!(!assessment.is_allowed());
+        assert_eq!(assessment.tag.source, TaintSource::UserPrompt);
     }
 
     // =========================================================================

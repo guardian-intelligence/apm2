@@ -10079,26 +10079,42 @@ impl PrivilegedDispatcher {
 
         let mut view_commitment_hasher = blake3::Hasher::new();
         view_commitment_hasher.update(b"apm2.spawn.view_commitment.v1");
+        view_commitment_hasher.update(b"\0");
         view_commitment_hasher.update(session_id.as_bytes());
+        view_commitment_hasher.update(b"\0");
         view_commitment_hasher.update(claim.work_id.as_bytes());
+        view_commitment_hasher.update(b"\0");
         view_commitment_hasher.update(claim.lease_id.as_bytes());
+        view_commitment_hasher.update(b"\0");
         view_commitment_hasher.update(claim.actor_id.as_bytes());
+        view_commitment_hasher.update(b"\0");
         view_commitment_hasher.update(&claim.policy_resolution.resolved_policy_hash);
+        view_commitment_hasher.update(b"\0");
         view_commitment_hasher.update(&claim.policy_resolution.capability_manifest_hash);
+        view_commitment_hasher.update(b"\0");
         view_commitment_hasher.update(&claim.policy_resolution.context_pack_hash);
+        view_commitment_hasher.update(b"\0");
         view_commitment_hasher.update(&claim.policy_resolution.context_pack_recipe_hash);
+        view_commitment_hasher.update(b"\0");
         view_commitment_hasher.update(&adapter_profile_hash);
+        view_commitment_hasher.update(b"\0");
         if let Some(hash) = role_spec_hash {
             view_commitment_hasher.update(&hash);
+            view_commitment_hasher.update(b"\0");
         }
         let view_commitment_hash: [u8; 32] = view_commitment_hasher.finalize().into();
 
         let mut freshness_pinset_hasher = blake3::Hasher::new();
         freshness_pinset_hasher.update(b"apm2.spawn.freshness_pinset.v1");
+        freshness_pinset_hasher.update(b"\0");
         freshness_pinset_hasher.update(claim.work_id.as_bytes());
+        freshness_pinset_hasher.update(b"\0");
         freshness_pinset_hasher.update(claim.lease_id.as_bytes());
+        freshness_pinset_hasher.update(b"\0");
         freshness_pinset_hasher.update(&claim.policy_resolution.context_pack_hash);
+        freshness_pinset_hasher.update(b"\0");
         freshness_pinset_hasher.update(&claim.policy_resolution.context_pack_recipe_hash);
+        freshness_pinset_hasher.update(b"\0");
         let freshness_pinset_hash: [u8; 32] = freshness_pinset_hasher.finalize().into();
 
         let pinned_snapshot = crate::episode::PinnedSnapshot::builder()
