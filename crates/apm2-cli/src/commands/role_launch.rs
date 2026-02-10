@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use anyhow::{Result, anyhow};
 #[cfg(test)]
@@ -388,13 +389,21 @@ fn resolve_channel_context(
     let Some(expected_lease_id) = args.lease_id.as_deref() else {
         return RoleLaunchChannelContext::direct_cli_fail_closed();
     };
+    let Ok(current_time_secs) = UNIX_EPOCH.elapsed().map(|duration| duration.as_secs()) else {
+        return RoleLaunchChannelContext::direct_cli_fail_closed();
+    };
 
     if token.len() > MAX_CHANNEL_CONTEXT_TOKEN_LENGTH {
         return RoleLaunchChannelContext::direct_cli_fail_closed();
     }
 
-    let Ok(check) = decode_channel_context_token(token, daemon_verifying_key, expected_lease_id)
-    else {
+    let Ok(check) = decode_channel_context_token(
+        token,
+        daemon_verifying_key,
+        expected_lease_id,
+        current_time_secs,
+        None,
+    ) else {
         return RoleLaunchChannelContext::direct_cli_fail_closed();
     };
 
@@ -1870,8 +1879,17 @@ mod tests {
             policy_ledger_verified: true,
         };
         env.args.channel_context_token = Some(
-            issue_channel_context_token(&check, "L-TEST-001", &signer)
-                .expect("token issuance should succeed"),
+            issue_channel_context_token(
+                &check,
+                "L-TEST-001",
+                "REQ-TEST-ROLE-LAUNCH-1",
+                UNIX_EPOCH
+                    .elapsed()
+                    .expect("current time should be after unix epoch")
+                    .as_secs(),
+                &signer,
+            )
+            .expect("token issuance should succeed"),
         );
 
         let response = execute_role_launch_with_daemon_verifying_key(
@@ -1928,8 +1946,17 @@ mod tests {
             policy_ledger_verified: true,
         };
         env.args.channel_context_token = Some(
-            issue_channel_context_token(&check, "L-OTHER", &signer)
-                .expect("token issuance should succeed"),
+            issue_channel_context_token(
+                &check,
+                "L-OTHER",
+                "REQ-TEST-ROLE-LAUNCH-2",
+                UNIX_EPOCH
+                    .elapsed()
+                    .expect("current time should be after unix epoch")
+                    .as_secs(),
+                &signer,
+            )
+            .expect("token issuance should succeed"),
         );
 
         let error = execute_role_launch_with_daemon_verifying_key(

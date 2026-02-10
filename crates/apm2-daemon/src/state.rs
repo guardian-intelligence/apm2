@@ -600,11 +600,16 @@ impl DispatcherState {
     #[must_use]
     #[allow(dead_code)] // Kept for testing and potential future use
     pub fn new(metrics_registry: Option<SharedMetricsRegistry>) -> Self {
-        // TCK-00287 Item 2: Generate a single stable secret at daemon startup.
-        // This secret is used for the entire daemon lifetime, ensuring tokens
-        // minted on one connection are valid on other connections.
-        let token_secret = TokenMinter::generate_secret();
+        // TCK-00450: Non-persistent wiring must keep daemon signing surfaces
+        // aligned. Derive the session token secret and channel-context signer
+        // from the same key material.
+        let signing_key = {
+            use rand::rngs::OsRng;
+            ed25519_dalek::SigningKey::generate(&mut OsRng)
+        };
+        let token_secret = SecretString::from(hex::encode(signing_key.to_bytes()));
         let token_minter = Arc::new(TokenMinter::new(token_secret));
+        let channel_context_signer = Arc::new(apm2_core::crypto::Signer::new(signing_key.clone()));
 
         // TCK-00287 MAJOR 3: Use shared manifest store.
         // Manifests registered during SpawnEpisode will be visible to SessionDispatcher
@@ -631,12 +636,13 @@ impl DispatcherState {
         let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
 
         // TCK-00287 BLOCKER 1 & 2: Create privileged dispatcher with shared state
-        let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
+        let privileged_dispatcher = PrivilegedDispatcher::with_shared_state_and_signing_key(
             Arc::clone(&token_minter),
             Arc::clone(&manifest_store),
             Arc::clone(&session_registry),
             clock,
             Arc::clone(&subscription_registry),
+            signing_key,
         )
         .with_credential_store(credential_store)
         .with_privileged_pcac_policy(PrivilegedPcacPolicy::default());
@@ -665,7 +671,7 @@ impl DispatcherState {
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
-                .with_channel_context_signer(Arc::new(apm2_core::crypto::Signer::generate()))
+                .with_channel_context_signer(channel_context_signer)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry)
                 .with_telemetry_store(telemetry_store);
@@ -699,9 +705,16 @@ impl DispatcherState {
         session_registry: Arc<dyn SessionRegistry>,
         metrics_registry: Option<SharedMetricsRegistry>,
     ) -> Self {
-        // TCK-00287 Item 2: Generate a single stable secret at daemon startup.
-        let token_secret = TokenMinter::generate_secret();
+        // TCK-00450: Non-persistent wiring must keep daemon signing surfaces
+        // aligned. Derive the session token secret and channel-context signer
+        // from the same key material.
+        let signing_key = {
+            use rand::rngs::OsRng;
+            ed25519_dalek::SigningKey::generate(&mut OsRng)
+        };
+        let token_secret = SecretString::from(hex::encode(signing_key.to_bytes()));
         let token_minter = Arc::new(TokenMinter::new(token_secret));
+        let channel_context_signer = Arc::new(apm2_core::crypto::Signer::new(signing_key.clone()));
 
         // TCK-00287 MAJOR 3: Use shared manifest store.
         let manifest_store = Arc::new(InMemoryManifestStore::new());
@@ -722,12 +735,13 @@ impl DispatcherState {
 
         // TCK-00287 BLOCKER 1: Create privileged dispatcher with global session
         // registry
-        let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
+        let privileged_dispatcher = PrivilegedDispatcher::with_shared_state_and_signing_key(
             Arc::clone(&token_minter),
             Arc::clone(&manifest_store),
             Arc::clone(&session_registry),
             clock,
             Arc::clone(&subscription_registry),
+            signing_key,
         )
         .with_credential_store(credential_store)
         .with_privileged_pcac_policy(PrivilegedPcacPolicy::default());
@@ -754,7 +768,7 @@ impl DispatcherState {
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
-                .with_channel_context_signer(Arc::new(apm2_core::crypto::Signer::generate()))
+                .with_channel_context_signer(channel_context_signer)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry)
                 .with_telemetry_store(telemetry_store);

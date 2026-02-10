@@ -14,6 +14,7 @@ pub const MAX_CHANNEL_DETAIL_LENGTH: usize = 512;
 const CHANNEL_SOURCE_WITNESS_DOMAIN: &[u8] = b"apm2.channel_source_witness.v1";
 const CHANNEL_CONTEXT_TOKEN_SCHEMA_ID: &str = "apm2.channel_context_token.v1";
 const MAX_CHANNEL_CONTEXT_TOKEN_LEN: usize = 8192;
+const CHANNEL_CONTEXT_TOKEN_DEFAULT_EXPIRES_AFTER_SECS: u64 = 300;
 
 /// Channel source classification for actuation boundary enforcement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -66,6 +67,12 @@ pub struct ChannelBoundaryCheck {
 struct ChannelContextTokenPayloadV1 {
     source: ChannelSource,
     pub lease_id: String,
+    /// The specific request ID this token was issued for.
+    pub request_id: String,
+    /// Unix timestamp (seconds) when the token was issued.
+    pub issued_at_secs: u64,
+    /// Token validity window in seconds.
+    pub expires_after_secs: u64,
     channel_source_witness: [u8; 32],
     broker_verified: bool,
     capability_verified: bool,
@@ -133,6 +140,24 @@ pub enum ChannelContextTokenError {
         expected: String,
         /// Lease identifier carried in the token payload.
         actual: String,
+    },
+    /// Token request binding did not match the expected request ID.
+    #[error("channel context token request mismatch: expected {expected}, got {actual}")]
+    RequestIdMismatch {
+        /// Request identifier expected by the current operation.
+        expected: String,
+        /// Request identifier carried in the token payload.
+        actual: String,
+    },
+    /// Token expired before decode.
+    #[error("channel context token expired")]
+    ExpiredToken {
+        /// Token issuance time in seconds since Unix epoch.
+        issued_at_secs: u64,
+        /// Token validity duration.
+        expires_after_secs: u64,
+        /// Decoder current time.
+        current_time_secs: u64,
     },
 }
 
@@ -221,6 +246,27 @@ pub fn verify_channel_source_witness(
 pub fn issue_channel_context_token(
     check: &ChannelBoundaryCheck,
     lease_id: &str,
+    request_id: &str,
+    issued_at_secs: u64,
+    signer: &Signer,
+) -> Result<String, ChannelContextTokenError> {
+    issue_channel_context_token_with_freshness(
+        check,
+        lease_id,
+        request_id,
+        issued_at_secs,
+        CHANNEL_CONTEXT_TOKEN_DEFAULT_EXPIRES_AFTER_SECS,
+        signer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn issue_channel_context_token_with_freshness(
+    check: &ChannelBoundaryCheck,
+    lease_id: &str,
+    request_id: &str,
+    issued_at_secs: u64,
+    expires_after_secs: u64,
     signer: &Signer,
 ) -> Result<String, ChannelContextTokenError> {
     let Some(channel_source_witness) = check.channel_source_witness else {
@@ -230,6 +276,9 @@ pub fn issue_channel_context_token(
     let payload = ChannelContextTokenPayloadV1 {
         source: check.source,
         lease_id: lease_id.to_string(),
+        request_id: request_id.to_string(),
+        issued_at_secs,
+        expires_after_secs,
         channel_source_witness,
         broker_verified: check.broker_verified,
         capability_verified: check.capability_verified,
@@ -264,6 +313,8 @@ pub fn decode_channel_context_token(
     token: &str,
     daemon_verifying_key: &VerifyingKey,
     expected_lease_id: &str,
+    current_time_secs: u64,
+    expected_request_id: Option<&str>,
 ) -> Result<ChannelBoundaryCheck, ChannelContextTokenError> {
     if token.len() > MAX_CHANNEL_CONTEXT_TOKEN_LEN {
         return Err(ChannelContextTokenError::TokenTooLong {
@@ -325,6 +376,23 @@ pub fn decode_channel_context_token(
         return Err(ChannelContextTokenError::LeaseMismatch {
             expected: expected_lease_id.to_string(),
             actual: payload.payload.lease_id,
+        });
+    }
+    if let Some(expected_request_id) = expected_request_id {
+        if payload.payload.request_id != expected_request_id {
+            return Err(ChannelContextTokenError::RequestIdMismatch {
+                expected: expected_request_id.to_string(),
+                actual: payload.payload.request_id,
+            });
+        }
+    }
+
+    let token_age_secs = current_time_secs.saturating_sub(payload.payload.issued_at_secs);
+    if token_age_secs >= payload.payload.expires_after_secs {
+        return Err(ChannelContextTokenError::ExpiredToken {
+            issued_at_secs: payload.payload.issued_at_secs,
+            expires_after_secs: payload.payload.expires_after_secs,
+            current_time_secs,
         });
     }
 
@@ -436,6 +504,8 @@ fn truncate_channel_detail(mut detail: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn baseline_check() -> ChannelBoundaryCheck {
@@ -449,6 +519,13 @@ mod tests {
             context_firewall_verified: true,
             policy_ledger_verified: true,
         }
+    }
+
+    fn now_secs() -> u64 {
+        std::time::UNIX_EPOCH
+            .elapsed()
+            .expect("current time should be after unix epoch")
+            .as_secs()
     }
 
     #[test]
@@ -623,10 +700,16 @@ mod tests {
     fn test_channel_context_token_roundtrip() {
         let check = baseline_check();
         let signer = Signer::generate();
-        let token =
-            issue_channel_context_token(&check, "lease-1", &signer).expect("token should encode");
-        let decoded = decode_channel_context_token(&token, &signer.verifying_key(), "lease-1")
-            .expect("token should decode");
+        let token = issue_channel_context_token(&check, "lease-1", "REQ-1", now_secs(), &signer)
+            .expect("token should encode");
+        let decoded = decode_channel_context_token(
+            &token,
+            &signer.verifying_key(),
+            "lease-1",
+            now_secs(),
+            Some("REQ-1"),
+        )
+        .expect("token should decode");
         assert_eq!(decoded, check);
     }
 
@@ -636,6 +719,9 @@ mod tests {
         let payload = ChannelContextTokenPayloadV1 {
             source: ChannelSource::TypedToolIntent,
             lease_id: "lease-1".to_string(),
+            request_id: "REQ-1".to_string(),
+            issued_at_secs: now_secs(),
+            expires_after_secs: CHANNEL_CONTEXT_TOKEN_DEFAULT_EXPIRES_AFTER_SECS,
             channel_source_witness: [0xCC; 32],
             broker_verified: true,
             capability_verified: true,
@@ -652,7 +738,13 @@ mod tests {
         let token = base64::engine::general_purpose::STANDARD
             .encode(serde_json::to_vec(&token_payload).expect("token payload should serialize"));
 
-        let result = decode_channel_context_token(&token, &signer.verifying_key(), "lease-1");
+        let result = decode_channel_context_token(
+            &token,
+            &signer.verifying_key(),
+            "lease-1",
+            now_secs(),
+            Some("REQ-1"),
+        );
         assert_eq!(
             result,
             Err(ChannelContextTokenError::WitnessVerificationFailed)
@@ -664,11 +756,17 @@ mod tests {
         let check = baseline_check();
         let daemon_signer = Signer::generate();
         let attacker_signer = Signer::generate();
-        let forged_token = issue_channel_context_token(&check, "lease-1", &attacker_signer)
-            .expect("attacker token should encode");
+        let forged_token =
+            issue_channel_context_token(&check, "lease-1", "REQ-1", now_secs(), &attacker_signer)
+                .expect("attacker token should encode");
 
-        let result =
-            decode_channel_context_token(&forged_token, &daemon_signer.verifying_key(), "lease-1");
+        let result = decode_channel_context_token(
+            &forged_token,
+            &daemon_signer.verifying_key(),
+            "lease-1",
+            now_secs(),
+            Some("REQ-1"),
+        );
         assert_eq!(
             result,
             Err(ChannelContextTokenError::SignatureVerificationFailed)
@@ -679,8 +777,8 @@ mod tests {
     fn test_tampered_token_rejected() {
         let check = baseline_check();
         let signer = Signer::generate();
-        let token =
-            issue_channel_context_token(&check, "lease-1", &signer).expect("token should encode");
+        let token = issue_channel_context_token(&check, "lease-1", "REQ-1", now_secs(), &signer)
+            .expect("token should encode");
 
         let token_json = base64::engine::general_purpose::STANDARD
             .decode(token)
@@ -692,8 +790,13 @@ mod tests {
         let tampered_token = base64::engine::general_purpose::STANDARD
             .encode(serde_json::to_vec(&token_payload).expect("tampered token should serialize"));
 
-        let result =
-            decode_channel_context_token(&tampered_token, &signer.verifying_key(), "lease-1");
+        let result = decode_channel_context_token(
+            &tampered_token,
+            &signer.verifying_key(),
+            "lease-1",
+            now_secs(),
+            Some("REQ-1"),
+        );
         assert_eq!(
             result,
             Err(ChannelContextTokenError::SignatureVerificationFailed)
@@ -704,10 +807,16 @@ mod tests {
     fn test_token_with_wrong_lease_id_rejected() {
         let check = baseline_check();
         let signer = Signer::generate();
-        let token =
-            issue_channel_context_token(&check, "lease-a", &signer).expect("token should encode");
+        let token = issue_channel_context_token(&check, "lease-a", "REQ-1", now_secs(), &signer)
+            .expect("token should encode");
 
-        let result = decode_channel_context_token(&token, &signer.verifying_key(), "lease-b");
+        let result = decode_channel_context_token(
+            &token,
+            &signer.verifying_key(),
+            "lease-b",
+            now_secs(),
+            Some("REQ-1"),
+        );
         assert_eq!(
             result,
             Err(ChannelContextTokenError::LeaseMismatch {
@@ -721,11 +830,89 @@ mod tests {
     fn test_token_with_matching_lease_id_accepted() {
         let check = baseline_check();
         let signer = Signer::generate();
-        let token =
-            issue_channel_context_token(&check, "lease-a", &signer).expect("token should encode");
+        let token = issue_channel_context_token(&check, "lease-a", "REQ-1", now_secs(), &signer)
+            .expect("token should encode");
 
-        let decoded = decode_channel_context_token(&token, &signer.verifying_key(), "lease-a")
-            .expect("matching lease must pass");
+        let decoded = decode_channel_context_token(
+            &token,
+            &signer.verifying_key(),
+            "lease-a",
+            now_secs(),
+            Some("REQ-1"),
+        )
+        .expect("matching lease must pass");
+        assert_eq!(decoded, check);
+    }
+
+    #[test]
+    fn test_expired_token_rejected() {
+        let check = baseline_check();
+        let signer = Signer::generate();
+        let issued_at_secs = now_secs();
+        let token = issue_channel_context_token_with_freshness(
+            &check,
+            "lease-1",
+            "REQ-1",
+            issued_at_secs,
+            1,
+            &signer,
+        )
+        .expect("token should encode");
+
+        std::thread::sleep(Duration::from_secs(2));
+
+        let result = decode_channel_context_token(
+            &token,
+            &signer.verifying_key(),
+            "lease-1",
+            now_secs(),
+            Some("REQ-1"),
+        );
+        assert!(
+            matches!(result, Err(ChannelContextTokenError::ExpiredToken { .. })),
+            "expired token must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_request_id_mismatch_rejected() {
+        let check = baseline_check();
+        let signer = Signer::generate();
+        let token = issue_channel_context_token(&check, "lease-1", "REQ-A", now_secs(), &signer)
+            .expect("token should encode");
+
+        let result = decode_channel_context_token(
+            &token,
+            &signer.verifying_key(),
+            "lease-1",
+            now_secs(),
+            Some("REQ-B"),
+        );
+        assert_eq!(
+            result,
+            Err(ChannelContextTokenError::RequestIdMismatch {
+                expected: "REQ-B".to_string(),
+                actual: "REQ-A".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_valid_fresh_token_accepted() {
+        let check = baseline_check();
+        let signer = Signer::generate();
+        let token =
+            issue_channel_context_token(&check, "lease-1", "REQ-FRESH-1", now_secs(), &signer)
+                .expect("token should encode");
+
+        let decoded = decode_channel_context_token(
+            &token,
+            &signer.verifying_key(),
+            "lease-1",
+            now_secs(),
+            Some("REQ-FRESH-1"),
+        )
+        .expect("fresh token with matching request must decode");
         assert_eq!(decoded, check);
     }
 }

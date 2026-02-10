@@ -2974,22 +2974,27 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         let decision_requires_termination = matches!(&decision, Ok(ToolDecision::Terminate { .. }));
 
         let channel_context_token = if Self::requires_channel_boundary_enforcement(tool_class) {
-            let policy_verified = Self::tool_decision_policy_verified(&decision);
+            let _decision_policy_verified = Self::tool_decision_policy_verified(&decision);
             let broker_verified = Self::tool_decision_broker_verified(&decision);
             let capability_verified = Self::tool_decision_capability_verified(&decision);
             let context_firewall_verified = defects.is_empty();
+            // TODO(TCK-00450): Replace with explicit ledger-backed policy hash
+            // admission proof. Decision-level allow is not sufficient evidence.
+            let policy_ledger_verified = false;
             let all_verification_flags_true = broker_verified
                 && capability_verified
                 && context_firewall_verified
-                && policy_verified;
+                && policy_ledger_verified;
 
             if all_verification_flags_true {
                 match channel_boundary_dispatcher()
                     .validate_channel_boundary_and_issue_context_token(
                         self.channel_context_signer.as_ref(),
                         &token.lease_id,
+                        &request_id,
+                        timestamp_ns / 1_000_000_000,
                         &tool_class,
-                        policy_verified,
+                        policy_ledger_verified,
                         broker_verified,
                         capability_verified,
                         context_firewall_verified,
@@ -5672,10 +5677,16 @@ mod tests {
         use crate::episode::ToolClass;
 
         let signer = apm2_core::crypto::Signer::generate();
+        let issued_at_secs = std::time::UNIX_EPOCH
+            .elapsed()
+            .expect("current time should be after unix epoch")
+            .as_secs();
         let token = channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token(
                 &signer,
                 "lease-1",
+                "REQ-1",
+                issued_at_secs,
                 &ToolClass::Execute,
                 true,
                 true,
@@ -5684,8 +5695,17 @@ mod tests {
             )
             .expect("daemon should issue channel context token");
 
-        let decoded = decode_channel_context_token(&token, &signer.verifying_key(), "lease-1")
-            .expect("token should decode");
+        let decoded = decode_channel_context_token(
+            &token,
+            &signer.verifying_key(),
+            "lease-1",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_secs(),
+            Some("REQ-1"),
+        )
+        .expect("token should decode");
         assert_eq!(decoded.source, ChannelSource::TypedToolIntent);
         assert!(
             decoded.channel_source_witness.is_some(),
