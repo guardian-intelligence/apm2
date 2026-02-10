@@ -314,7 +314,9 @@ pub enum CacDefectClass {
 }
 
 impl CacDefectClass {
-    const fn compatibility_state(self) -> CacCompatibilityState {
+    /// Derives deterministic compatibility-state impact from defect class.
+    #[must_use]
+    pub const fn compatibility_state(&self) -> CacCompatibilityState {
         match self {
             Self::SchemaUnresolved
             | Self::SchemaVersionIncompatible
@@ -354,18 +356,44 @@ impl CacCompatibilityState {
 }
 
 /// CAC defect emitted by deterministic validation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacDefect {
     /// Defect classification.
     pub class: CacDefectClass,
     /// Validation step that emitted this defect.
     pub step: CacValidationStep,
-    /// Compatibility-state impact for this defect.
+    /// Compatibility-state impact for this defect, derived from `class`.
     pub compatibility_state: CacCompatibilityState,
     /// Human-readable defect detail.
     #[serde(deserialize_with = "deserialize_bounded_string")]
     pub detail: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CacDefectRaw {
+    class: CacDefectClass,
+    step: CacValidationStep,
+    #[serde(default, rename = "compatibility_state")]
+    _compatibility_state: Option<de::IgnoredAny>,
+    #[serde(deserialize_with = "deserialize_bounded_string")]
+    detail: String,
+}
+
+impl<'de> Deserialize<'de> for CacDefect {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = CacDefectRaw::deserialize(deserializer)?;
+        Ok(Self {
+            class: raw.class,
+            step: raw.step,
+            compatibility_state: raw.class.compatibility_state(),
+            detail: raw.detail,
+        })
+    }
 }
 
 impl CacDefect {
@@ -528,22 +556,21 @@ impl CacObject {
     /// Builds a validation input seeded from a registry row.
     #[must_use]
     pub fn from_registry_entry(entry: &ContractObjectRegistryEntry) -> Self {
-        let digest = [0xA5; 32];
         Self {
             object_id: entry.object_id.clone(),
             kind: entry.kind.clone(),
             schema_id: entry.schema_id.clone(),
             schema_major: entry.schema_major,
             schema_stable_id: entry.schema_stable_id.clone(),
-            object_digest: Some(digest),
-            expected_digest: Some(digest),
+            object_digest: None,
+            expected_digest: None,
             digest_algorithm: entry.digest_algorithm.clone(),
             canonicalizer_id: entry.canonicalizer_id.clone(),
             canonicalizer_version: entry.canonicalizer_version.clone(),
             canonicalizer_vectors_ref: entry.canonicalizer_vectors_ref.clone(),
-            signature_status: CacSignatureStatus::Valid,
-            freshness_status: CacFreshnessStatus::Fresh,
-            predicate_status: CacPredicateStatus::Passed,
+            signature_status: CacSignatureStatus::Invalid,
+            freshness_status: CacFreshnessStatus::Stale,
+            predicate_status: CacPredicateStatus::Failed,
             declared_validation_order: Vec::new(),
             role_spec_context_binding: None,
         }
@@ -805,7 +832,7 @@ where
 fn recompute_compatibility_state_from_defects(defects: &[CacDefect]) -> CacCompatibilityState {
     defects
         .iter()
-        .map(|defect| defect.compatibility_state)
+        .map(|defect| defect.class.compatibility_state())
         .max()
         .unwrap_or(CacCompatibilityState::Compatible)
 }
@@ -1542,6 +1569,16 @@ mod tests {
         }
     }
 
+    fn sample_admissible_object(entry: &ContractObjectRegistryEntry) -> CacObject {
+        let mut object = CacObject::from_registry_entry(entry);
+        object.object_digest = Some([0xA5; 32]);
+        object.expected_digest = Some([0xA5; 32]);
+        object.signature_status = CacSignatureStatus::Valid;
+        object.freshness_status = CacFreshnessStatus::Fresh;
+        object.predicate_status = CacPredicateStatus::Passed;
+        object
+    }
+
     #[test]
     fn test_default_registry_complete() {
         let registry = ContractObjectRegistry::default_registry();
@@ -1633,7 +1670,7 @@ mod tests {
             .lookup_by_schema_id("apm2.pcac_snapshot_report.v1")
             .expect("schema should resolve for deterministic test");
 
-        let mut object = CacObject::from_registry_entry(entry);
+        let mut object = sample_admissible_object(entry);
         object.declared_validation_order = CAC_VALIDATION_ORDER.to_vec();
 
         let result = validate_cac_contract(&registry, &object);
@@ -1645,6 +1682,21 @@ mod tests {
         assert_eq!(result.executed_steps, CAC_VALIDATION_ORDER.to_vec());
         assert!(!result.short_circuited);
         assert!(result.defects.is_empty());
+    }
+
+    #[test]
+    fn test_from_registry_entry_defaults_fail_closed() {
+        let registry = ContractObjectRegistry::default_registry();
+        let entry = registry
+            .lookup_by_schema_id("apm2.pcac_snapshot_report.v1")
+            .expect("schema should resolve for default fail-closed test");
+        let object = CacObject::from_registry_entry(entry);
+
+        let result = validate_cac_contract(&registry, &object);
+
+        assert_eq!(result.compatibility_state, CacCompatibilityState::Blocked);
+        assert!(!result.is_admissible());
+        assert!(result.short_circuited);
     }
 
     #[test]
@@ -1890,6 +1942,25 @@ mod tests {
     }
 
     #[test]
+    fn test_forged_defect_compatibility_state_rejected() {
+        let value = serde_json::json!({
+            "class": "schema_unresolved",
+            "step": "schema_resolution",
+            "compatibility_state": "compatible",
+            "detail": "forged compatible compatibility state",
+        });
+
+        let defect: CacDefect =
+            serde_json::from_value(value).expect("defect should deserialize with derived state");
+
+        assert_eq!(defect.compatibility_state, CacCompatibilityState::Blocked);
+        assert_eq!(
+            defect.compatibility_state,
+            defect.class.compatibility_state()
+        );
+    }
+
+    #[test]
     fn test_cac_validation_result_deserialize_rejects_incoherent_compatibility_state() {
         let value = serde_json::json!({
             "compatibility_state": "compatible",
@@ -1919,7 +1990,7 @@ mod tests {
         let entry = registry
             .lookup_by_schema_id("apm2.pcac_snapshot_report.v1")
             .expect("schema should resolve for digest mismatch test");
-        let mut object = CacObject::from_registry_entry(entry);
+        let mut object = sample_admissible_object(entry);
         object.object_digest = Some([0x11; 32]);
         object.expected_digest = Some([0x22; 32]);
         object.declared_validation_order = CAC_VALIDATION_ORDER.to_vec();
