@@ -7,5 +7,6 @@ pub mod enforcement;
 
 pub use enforcement::{
     ChannelBoundaryCheck, ChannelBoundaryDefect, ChannelSource, ChannelViolationClass,
-    MAX_CHANNEL_DETAIL_LENGTH, validate_channel_boundary,
+    MAX_CHANNEL_DETAIL_LENGTH, derive_channel_source_witness, validate_channel_boundary,
+    verify_channel_source_witness,
 };

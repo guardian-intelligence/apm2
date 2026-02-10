@@ -4,9 +4,11 @@
 //! and emits structured defects for boundary violations.
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 /// Maximum string length for channel enforcement detail fields.
 pub const MAX_CHANNEL_DETAIL_LENGTH: usize = 512;
+const CHANNEL_SOURCE_WITNESS_DOMAIN: &[u8] = b"apm2.channel_source_witness.v1";
 
 /// Channel source classification for actuation boundary enforcement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -22,6 +24,17 @@ pub enum ChannelSource {
     Unknown,
 }
 
+impl ChannelSource {
+    const fn canonical_label(self) -> &'static str {
+        match self {
+            Self::TypedToolIntent => "typed_tool_intent",
+            Self::FreeFormOutput => "free_form_output",
+            Self::DirectManifest => "direct_manifest",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Channel boundary enforcement result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
@@ -29,14 +42,16 @@ pub enum ChannelSource {
 pub struct ChannelBoundaryCheck {
     /// The classified channel source.
     pub source: ChannelSource,
-    /// Whether the source is authorized for actuation.
-    pub authorized: bool,
+    /// Witness proving the channel source was attested by a trusted launcher.
+    pub channel_source_witness: Option<[u8; 32]>,
     /// Whether the broker path was verified.
     pub broker_verified: bool,
     /// Whether capability enforcement was verified.
     pub capability_verified: bool,
     /// Whether context-firewall integrity was verified.
     pub context_firewall_verified: bool,
+    /// Whether policy hash admission was verified against the ledger.
+    pub policy_ledger_verified: bool,
 }
 
 /// Channel boundary violation defect.
@@ -76,6 +91,27 @@ pub enum ChannelViolationClass {
     MissingChannelMetadata,
     /// Channel source unknown or unclassifiable.
     UnknownChannelSource,
+    /// Policy hash was not verified against authoritative ledger admission.
+    PolicyNotLedgerVerified,
+}
+
+/// Deterministically derives a witness token for the provided channel source.
+///
+/// The daemon uses this witness to bind channel-source classification into a
+/// replay-stable token carried with boundary checks.
+#[must_use]
+pub fn derive_channel_source_witness(source: ChannelSource) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CHANNEL_SOURCE_WITNESS_DOMAIN);
+    hasher.update(source.canonical_label().as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Validates a channel source witness token.
+#[must_use]
+pub fn verify_channel_source_witness(source: ChannelSource, witness: &[u8; 32]) -> bool {
+    let expected = derive_channel_source_witness(source);
+    bool::from(expected.ct_eq(witness))
 }
 
 /// Validate that a channel boundary check satisfies actuation requirements.
@@ -86,7 +122,8 @@ pub enum ChannelViolationClass {
 pub fn validate_channel_boundary(check: &ChannelBoundaryCheck) -> Vec<ChannelBoundaryDefect> {
     let mut defects = Vec::new();
 
-    match check.source {
+    let source = resolve_effective_source(check, &mut defects);
+    match source {
         ChannelSource::TypedToolIntent => {},
         ChannelSource::FreeFormOutput => defects.push(ChannelBoundaryDefect::new(
             ChannelViolationClass::UntypedChannelSource,
@@ -123,7 +160,41 @@ pub fn validate_channel_boundary(check: &ChannelBoundaryCheck) -> Vec<ChannelBou
         ));
     }
 
+    if !check.policy_ledger_verified {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::PolicyNotLedgerVerified,
+            "policy hash admission was not verified against ledger state",
+        ));
+    }
+
     defects
+}
+
+fn resolve_effective_source(
+    check: &ChannelBoundaryCheck,
+    defects: &mut Vec<ChannelBoundaryDefect>,
+) -> ChannelSource {
+    if check.source != ChannelSource::TypedToolIntent {
+        return check.source;
+    }
+
+    if let Some(witness) = check.channel_source_witness {
+        if verify_channel_source_witness(ChannelSource::TypedToolIntent, &witness) {
+            ChannelSource::TypedToolIntent
+        } else {
+            defects.push(ChannelBoundaryDefect::new(
+                ChannelViolationClass::MissingChannelMetadata,
+                "channel source witness verification failed",
+            ));
+            ChannelSource::Unknown
+        }
+    } else {
+        defects.push(ChannelBoundaryDefect::new(
+            ChannelViolationClass::MissingChannelMetadata,
+            "channel source witness is required for typed tool-intent classification",
+        ));
+        ChannelSource::Unknown
+    }
 }
 
 fn truncate_channel_detail(mut detail: String) -> String {
@@ -146,10 +217,13 @@ mod tests {
     fn baseline_check() -> ChannelBoundaryCheck {
         ChannelBoundaryCheck {
             source: ChannelSource::TypedToolIntent,
-            authorized: true,
+            channel_source_witness: Some(derive_channel_source_witness(
+                ChannelSource::TypedToolIntent,
+            )),
             broker_verified: true,
             capability_verified: true,
             context_firewall_verified: true,
+            policy_ledger_verified: true,
         }
     }
 
@@ -233,13 +307,62 @@ mod tests {
     }
 
     #[test]
+    fn test_policy_not_ledger_verified_denied() {
+        let mut check = baseline_check();
+        check.policy_ledger_verified = false;
+        let defects = validate_channel_boundary(&check);
+        assert_eq!(defects.len(), 1);
+        assert_eq!(
+            defects[0].violation_class,
+            ChannelViolationClass::PolicyNotLedgerVerified
+        );
+    }
+
+    #[test]
+    fn test_typed_tool_intent_without_witness_denied() {
+        let mut check = baseline_check();
+        check.channel_source_witness = None;
+        let defects = validate_channel_boundary(&check);
+        let classes: Vec<ChannelViolationClass> = defects
+            .iter()
+            .map(|defect| defect.violation_class)
+            .collect();
+        assert_eq!(
+            classes,
+            vec![
+                ChannelViolationClass::MissingChannelMetadata,
+                ChannelViolationClass::UnknownChannelSource,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_typed_tool_intent_with_invalid_witness_denied() {
+        let mut check = baseline_check();
+        check.channel_source_witness = Some([0xAA; 32]);
+        let defects = validate_channel_boundary(&check);
+        let classes: Vec<ChannelViolationClass> = defects
+            .iter()
+            .map(|defect| defect.violation_class)
+            .collect();
+        assert_eq!(
+            classes,
+            vec![
+                ChannelViolationClass::MissingChannelMetadata,
+                ChannelViolationClass::UnknownChannelSource,
+            ]
+        );
+    }
+
+    #[test]
     fn test_multiple_violations_emitted() {
         let check = ChannelBoundaryCheck {
             source: ChannelSource::FreeFormOutput,
-            authorized: false,
+            channel_source_witness: None,
             broker_verified: false,
             capability_verified: false,
             context_firewall_verified: false,
+            policy_ledger_verified: false,
         };
 
         let defects = validate_channel_boundary(&check);
@@ -254,6 +377,7 @@ mod tests {
                 ChannelViolationClass::BrokerBypassDetected,
                 ChannelViolationClass::CapabilityNotVerified,
                 ChannelViolationClass::ContextFirewallNotVerified,
+                ChannelViolationClass::PolicyNotLedgerVerified,
             ]
         );
     }

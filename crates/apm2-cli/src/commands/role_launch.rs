@@ -9,6 +9,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
+#[cfg(test)]
+use apm2_core::channel::derive_channel_source_witness;
 use apm2_core::channel::{
     ChannelBoundaryCheck, ChannelSource, ChannelViolationClass, validate_channel_boundary,
 };
@@ -54,16 +56,45 @@ pub struct RoleLaunchArgs {
     /// Optional lease ID for authorization.
     #[arg(long)]
     pub lease_id: Option<String>,
-    /// Classified authority channel source for launch actuation.
-    ///
-    /// `typed_tool_intent` is the only admissible authoritative source.
-    /// All other sources deny fail-closed.
-    #[arg(
-        long,
-        value_parser = parse_channel_source_arg,
-        default_value = "unknown"
-    )]
-    pub channel_source: ChannelSource,
+}
+
+/// System-resolved channel context used for boundary enforcement.
+#[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
+struct RoleLaunchChannelContext {
+    source: ChannelSource,
+    channel_source_witness: Option<[u8; 32]>,
+    broker_verified: bool,
+    capability_verified: bool,
+    context_firewall_verified: bool,
+    policy_ledger_verified: bool,
+}
+
+impl RoleLaunchChannelContext {
+    const fn direct_cli_fail_closed() -> Self {
+        Self {
+            source: ChannelSource::Unknown,
+            channel_source_witness: None,
+            broker_verified: false,
+            capability_verified: false,
+            context_firewall_verified: false,
+            policy_ledger_verified: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn daemon_verified_for_tests() -> Self {
+        Self {
+            source: ChannelSource::TypedToolIntent,
+            channel_source_witness: Some(derive_channel_source_witness(
+                ChannelSource::TypedToolIntent,
+            )),
+            broker_verified: true,
+            capability_verified: true,
+            context_firewall_verified: true,
+            policy_ledger_verified: true,
+        }
+    }
 }
 
 /// Fail-closed denial reasons for role launch admission.
@@ -300,6 +331,20 @@ fn execute_role_launch(
     ledger_path: &Path,
     cas_path: &Path,
 ) -> std::result::Result<RoleLaunchResponse, RoleLaunchError> {
+    execute_role_launch_with_channel_context(
+        args,
+        ledger_path,
+        cas_path,
+        RoleLaunchChannelContext::direct_cli_fail_closed(),
+    )
+}
+
+fn execute_role_launch_with_channel_context(
+    args: &RoleLaunchArgs,
+    ledger_path: &Path,
+    cas_path: &Path,
+    channel_context: RoleLaunchChannelContext,
+) -> std::result::Result<RoleLaunchResponse, RoleLaunchError> {
     validate_required_bounded("work_id", &args.work_id, MAX_WORK_ID_LENGTH)?;
     validate_required_bounded("role", &args.role, MAX_ROLE_LENGTH)?;
     if let Some(lease_id) = &args.lease_id {
@@ -334,10 +379,10 @@ fn execute_role_launch(
     )
     .map_err(RoleLaunchError::denied)?;
 
-    enforce_channel_boundary(args.channel_source).map_err(RoleLaunchError::denied)?;
+    enforce_channel_boundary(channel_context).map_err(RoleLaunchError::denied)?;
 
     let timestamp_ns = derive_receipt_timestamp_ns(&ledger)?;
-    let receipt = build_launch_receipt(args, hashes, timestamp_ns)?;
+    let receipt = build_launch_receipt(args, hashes, timestamp_ns, channel_context.source)?;
     let receipt_hash = store_receipt_in_cas(cas_path, &receipt)?;
 
     Ok(RoleLaunchResponse {
@@ -438,19 +483,6 @@ fn validate_optional_bounded(
     Ok(())
 }
 
-fn parse_channel_source_arg(value: &str) -> std::result::Result<ChannelSource, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "typed_tool_intent" => Ok(ChannelSource::TypedToolIntent),
-        "free_form_output" => Ok(ChannelSource::FreeFormOutput),
-        "direct_manifest" => Ok(ChannelSource::DirectManifest),
-        "unknown" => Ok(ChannelSource::Unknown),
-        _ => Err(
-            "channel_source must be one of: typed_tool_intent, free_form_output, direct_manifest, unknown"
-                .to_string(),
-        ),
-    }
-}
-
 fn parse_hash_input(field: &str, value: &str) -> std::result::Result<[u8; 32], LaunchDenyReason> {
     parse_hex_hash_literal(field, value).map_err(|detail| LaunchDenyReason::InvalidHashFormat {
         field: field.to_string(),
@@ -459,14 +491,15 @@ fn parse_hash_input(field: &str, value: &str) -> std::result::Result<[u8; 32], L
 }
 
 fn enforce_channel_boundary(
-    channel_source: ChannelSource,
+    channel_context: RoleLaunchChannelContext,
 ) -> std::result::Result<(), LaunchDenyReason> {
     let check = ChannelBoundaryCheck {
-        source: channel_source,
-        authorized: matches!(channel_source, ChannelSource::TypedToolIntent),
-        broker_verified: matches!(channel_source, ChannelSource::TypedToolIntent),
-        capability_verified: true,
-        context_firewall_verified: true,
+        source: channel_context.source,
+        channel_source_witness: channel_context.channel_source_witness,
+        broker_verified: channel_context.broker_verified,
+        capability_verified: channel_context.capability_verified,
+        context_firewall_verified: channel_context.context_firewall_verified,
+        policy_ledger_verified: channel_context.policy_ledger_verified,
     };
     let defects = validate_channel_boundary(&check);
     if defects.is_empty() {
@@ -547,6 +580,7 @@ fn build_launch_receipt(
     args: &RoleLaunchArgs,
     hashes: ParsedHashes,
     timestamp_ns: u64,
+    channel_source: ChannelSource,
 ) -> std::result::Result<LaunchReceiptV1, RoleLaunchError> {
     let lease_id = args.lease_id.clone().unwrap_or_default();
     let digest_input = LaunchReceiptDigestInput {
@@ -558,7 +592,7 @@ fn build_launch_receipt(
         capability_manifest_hash: hashes.capability_manifest,
         policy_hash: hashes.policy,
         lease_id: lease_id.clone(),
-        channel_source: args.channel_source,
+        channel_source,
         timestamp_ns,
     };
 
@@ -574,7 +608,7 @@ fn build_launch_receipt(
         capability_manifest_hash: hashes.capability_manifest,
         policy_hash: hashes.policy,
         lease_id,
-        channel_source: args.channel_source,
+        channel_source,
         timestamp_ns,
         receipt_digest,
     })
@@ -1206,6 +1240,7 @@ const fn channel_violation_label(violation: ChannelViolationClass) -> &'static s
         ChannelViolationClass::ContextFirewallNotVerified => "context_firewall_not_verified",
         ChannelViolationClass::MissingChannelMetadata => "missing_channel_metadata",
         ChannelViolationClass::UnknownChannelSource => "unknown_channel_source",
+        ChannelViolationClass::PolicyNotLedgerVerified => "policy_not_ledger_verified",
     }
 }
 
@@ -1227,6 +1262,7 @@ mod tests {
         ledger_path: PathBuf,
         cas_path: PathBuf,
         args: RoleLaunchArgs,
+        channel_context: RoleLaunchChannelContext,
     }
 
     fn store_capability_manifest(cas_path: &Path, capability_ids: &[String]) -> [u8; 32] {
@@ -1331,7 +1367,6 @@ mod tests {
             capability_manifest_hash: capability_manifest_hash_hex,
             policy_hash: hex::encode(policy_hash),
             lease_id: Some("L-TEST-001".to_string()),
-            channel_source: ChannelSource::TypedToolIntent,
         };
 
         TestEnv {
@@ -1339,7 +1374,17 @@ mod tests {
             ledger_path,
             cas_path,
             args,
+            channel_context: RoleLaunchChannelContext::daemon_verified_for_tests(),
         }
+    }
+
+    fn execute_launch(env: &TestEnv) -> std::result::Result<RoleLaunchResponse, RoleLaunchError> {
+        execute_role_launch_with_channel_context(
+            &env.args,
+            &env.ledger_path,
+            &env.cas_path,
+            env.channel_context,
+        )
     }
 
     fn load_receipt(cas_path: &Path, receipt_hash_hex: &str) -> LaunchReceiptV1 {
@@ -1353,8 +1398,7 @@ mod tests {
     #[test]
     fn test_valid_launch_succeeds() {
         let env = setup_test_env();
-        let response = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect("valid launch should succeed");
+        let response = execute_launch(&env).expect("valid launch should succeed");
 
         assert_eq!(response.work_id, env.args.work_id);
         assert_eq!(response.role, env.args.role);
@@ -1383,15 +1427,13 @@ mod tests {
     fn test_lease_id_included_in_receipt() {
         let mut env = setup_test_env();
         env.args.lease_id = Some("L-TEST-LEASE-A".to_string());
-        let first = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect("launch with lease id should succeed");
+        let first = execute_launch(&env).expect("launch with lease id should succeed");
 
         let first_receipt = load_receipt(&env.cas_path, &first.receipt_hash);
         assert_eq!(first_receipt.lease_id, "L-TEST-LEASE-A");
 
         env.args.lease_id = Some("L-TEST-LEASE-B".to_string());
-        let second = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect("launch with changed lease id should succeed");
+        let second = execute_launch(&env).expect("launch with changed lease id should succeed");
 
         assert_ne!(
             first.receipt_digest, second.receipt_digest,
@@ -1404,8 +1446,7 @@ mod tests {
         let mut env = setup_test_env();
         env.args.role_spec_hash = "00".repeat(32);
 
-        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect_err("missing role_spec_hash should deny launch");
+        let error = execute_launch(&env).expect_err("missing role_spec_hash should deny launch");
         match error {
             RoleLaunchError::Denied { reason } => {
                 assert_eq!(reason, LaunchDenyReason::MissingRoleSpecHash);
@@ -1419,8 +1460,7 @@ mod tests {
         let mut env = setup_test_env();
         env.args.context_pack_hash = "00".repeat(32);
 
-        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect_err("missing context_pack_hash should deny launch");
+        let error = execute_launch(&env).expect_err("missing context_pack_hash should deny launch");
         match error {
             RoleLaunchError::Denied { reason } => {
                 assert_eq!(reason, LaunchDenyReason::MissingContextPackHash);
@@ -1434,8 +1474,7 @@ mod tests {
         let mut env = setup_test_env();
         env.args.role_spec_hash = "not-hex".to_string();
 
-        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect_err("invalid hash format should deny launch");
+        let error = execute_launch(&env).expect_err("invalid hash format should deny launch");
         match error {
             RoleLaunchError::Denied {
                 reason: LaunchDenyReason::InvalidHashFormat { field, .. },
@@ -1451,8 +1490,8 @@ mod tests {
         let mut env = setup_test_env();
         env.args.role_spec_hash = hex::encode([0xAB; 32]);
 
-        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect_err("unresolvable role_spec_hash should deny launch");
+        let error =
+            execute_launch(&env).expect_err("unresolvable role_spec_hash should deny launch");
         match error {
             RoleLaunchError::Denied { reason } => {
                 assert_eq!(reason, LaunchDenyReason::UnresolvableRoleSpec);
@@ -1466,8 +1505,7 @@ mod tests {
         let mut env = setup_test_env();
         env.args.work_id = "W-TEST-OTHER".to_string();
 
-        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect_err("work_id mismatch should deny launch");
+        let error = execute_launch(&env).expect_err("work_id mismatch should deny launch");
         match error {
             RoleLaunchError::Denied { reason } => {
                 assert_eq!(reason, LaunchDenyReason::WorkIdBindingMismatch);
@@ -1489,8 +1527,8 @@ mod tests {
         );
         env.args.policy_hash = hex::encode(policy_hash);
 
-        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect_err("policy missing work_id binding should deny launch");
+        let error =
+            execute_launch(&env).expect_err("policy missing work_id binding should deny launch");
         match error {
             RoleLaunchError::Denied { reason } => {
                 assert_eq!(reason, LaunchDenyReason::MissingPolicyWorkIdBinding);
@@ -1512,7 +1550,7 @@ mod tests {
         );
         env.args.policy_hash = hex::encode(policy_hash);
 
-        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
+        let error = execute_launch(&env)
             .expect_err("policy missing capability_manifest_hash binding should deny launch");
         match error {
             RoleLaunchError::Denied { reason } => {
@@ -1537,8 +1575,8 @@ mod tests {
         let alternate_manifest_hash = store_capability_manifest(&env.cas_path, &capabilities);
         env.args.capability_manifest_hash = hex::encode(alternate_manifest_hash);
 
-        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect_err("capability manifest hash mismatch should deny launch");
+        let error =
+            execute_launch(&env).expect_err("capability manifest hash mismatch should deny launch");
         match error {
             RoleLaunchError::Denied { reason } => {
                 assert_eq!(
@@ -1567,7 +1605,7 @@ mod tests {
         );
         env.args.policy_hash = hex::encode(policy_hash);
 
-        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
+        let error = execute_launch(&env)
             .expect_err("missing required role capabilities should deny launch");
         match error {
             RoleLaunchError::Denied {
@@ -1593,8 +1631,7 @@ mod tests {
             .expect("stale context should store");
         env.args.context_pack_hash = hex::encode(stale_context_hash);
 
-        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect_err("stale context binding should deny launch");
+        let error = execute_launch(&env).expect_err("stale context binding should deny launch");
         match error {
             RoleLaunchError::Denied {
                 reason: LaunchDenyReason::StaleBindingContext { detail },
@@ -1611,10 +1648,8 @@ mod tests {
     #[test]
     fn test_receipt_deterministic() {
         let env = setup_test_env();
-        let first = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect("first launch should succeed");
-        let second = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect("second launch should succeed");
+        let first = execute_launch(&env).expect("first launch should succeed");
+        let second = execute_launch(&env).expect("second launch should succeed");
 
         assert_eq!(
             first.receipt_digest, second.receipt_digest,
@@ -1629,10 +1664,11 @@ mod tests {
     #[test]
     fn test_launch_denied_on_channel_violation() {
         let mut env = setup_test_env();
-        env.args.channel_source = ChannelSource::FreeFormOutput;
+        env.channel_context.source = ChannelSource::FreeFormOutput;
+        env.channel_context.channel_source_witness = None;
+        env.channel_context.broker_verified = false;
 
-        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect_err("free-form channel source should deny launch");
+        let error = execute_launch(&env).expect_err("free-form channel source should deny launch");
         match error {
             RoleLaunchError::Denied {
                 reason: LaunchDenyReason::ChannelBoundaryViolation { violations },
@@ -1644,6 +1680,47 @@ mod tests {
                 assert!(
                     violations.contains(&ChannelViolationClass::BrokerBypassDetected),
                     "violations should include broker bypass detection"
+                );
+            },
+            other => panic!("expected channel-boundary denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_launch_denied_when_policy_not_ledger_verified() {
+        let mut env = setup_test_env();
+        env.channel_context.policy_ledger_verified = false;
+
+        let error = execute_launch(&env).expect_err("unverified policy should deny launch");
+        match error {
+            RoleLaunchError::Denied {
+                reason: LaunchDenyReason::ChannelBoundaryViolation { violations },
+            } => {
+                assert!(
+                    violations.contains(&ChannelViolationClass::PolicyNotLedgerVerified),
+                    "violations should include policy_not_ledger_verified"
+                );
+            },
+            other => panic!("expected channel-boundary denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_direct_cli_context_defaults_fail_closed() {
+        let env = setup_test_env();
+        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
+            .expect_err("direct CLI launch without daemon context should fail closed");
+        match error {
+            RoleLaunchError::Denied {
+                reason: LaunchDenyReason::ChannelBoundaryViolation { violations },
+            } => {
+                assert!(
+                    violations.contains(&ChannelViolationClass::UnknownChannelSource),
+                    "violations should include unknown channel source"
+                );
+                assert!(
+                    violations.contains(&ChannelViolationClass::PolicyNotLedgerVerified),
+                    "violations should include policy_not_ledger_verified"
                 );
             },
             other => panic!("expected channel-boundary denial, got {other:?}"),

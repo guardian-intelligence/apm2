@@ -30,6 +30,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use apm2_core::channel::{
+    ChannelBoundaryCheck, ChannelSource, derive_channel_source_witness,
+    verify_channel_source_witness,
+};
 use apm2_core::credentials::{
     AuthMethod, CredentialProfile as CoreCredentialProfile, CredentialStore, ProfileId, Provider,
 };
@@ -146,7 +150,7 @@ use crate::episode::{
     CapabilityManifest, CustodyDomainError, CustodyDomainId, EpisodeId, EpisodeRuntime,
     EpisodeRuntimeConfig, InMemoryCasManifestLoader, LeaseIssueDenialReason, ManifestLoader,
     RuntimePreconditionEvaluator, SharedSessionBrokerRegistry, SharedToolBroker, TerminationClass,
-    ToolBroker, ToolBrokerConfig, validate_custody_domain_overlap,
+    ToolBroker, ToolBrokerConfig, ToolClass, validate_custody_domain_overlap,
 };
 use crate::evidence::keychain::{GitHubCredentialStore, SshCredentialStore};
 use crate::governance::GovernanceFreshnessMonitor;
@@ -6377,6 +6381,49 @@ pub struct PrivilegedPcacLifecycleArtifacts {
 }
 
 impl PrivilegedDispatcher {
+    /// Builds a channel-boundary check from daemon-classified tool context.
+    ///
+    /// Tool requests accepted by the daemon session plane are treated as
+    /// typed tool-intent authority inputs. Unknown future tool classes
+    /// fail-closed to `Unknown`.
+    #[must_use]
+    pub fn build_channel_boundary_check(
+        &self,
+        tool_class: &ToolClass,
+        policy_verified: bool,
+    ) -> ChannelBoundaryCheck {
+        let source = match tool_class {
+            ToolClass::Read
+            | ToolClass::Write
+            | ToolClass::Execute
+            | ToolClass::Network
+            | ToolClass::Git
+            | ToolClass::Inference
+            | ToolClass::Artifact
+            | ToolClass::ListFiles
+            | ToolClass::Search => ChannelSource::TypedToolIntent,
+            _ => ChannelSource::Unknown,
+        };
+
+        let witness = derive_channel_source_witness(source);
+        let channel_source_witness =
+            verify_channel_source_witness(source, &witness).then_some(witness);
+        let effective_source = if channel_source_witness.is_some() {
+            source
+        } else {
+            ChannelSource::Unknown
+        };
+
+        ChannelBoundaryCheck {
+            source: effective_source,
+            channel_source_witness,
+            broker_verified: effective_source == ChannelSource::TypedToolIntent,
+            capability_verified: effective_source == ChannelSource::TypedToolIntent,
+            context_firewall_verified: effective_source == ChannelSource::TypedToolIntent,
+            policy_ledger_verified: policy_verified,
+        }
+    }
+
     /// Creates a new dispatcher with default decode configuration (TEST ONLY).
     ///
     /// # Warning: RSK-2503 Mixed Clock Domain Hazard
@@ -15690,6 +15737,43 @@ mod tests {
     /// Uses /tmp which exists on all Unix systems.
     fn test_workspace_root() -> String {
         "/tmp".to_string()
+    }
+
+    mod channel_boundary_integration {
+        use apm2_core::channel::{ChannelSource, ChannelViolationClass, validate_channel_boundary};
+
+        use super::*;
+
+        #[test]
+        fn test_daemon_classifies_tool_request_as_typed() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let check = dispatcher.build_channel_boundary_check(&ToolClass::Read, true);
+
+            assert_eq!(check.source, ChannelSource::TypedToolIntent);
+            assert!(
+                check.channel_source_witness.is_some(),
+                "typed tool request must carry channel source witness"
+            );
+
+            let defects = validate_channel_boundary(&check);
+            assert!(
+                defects.is_empty(),
+                "fully verified daemon-built check should pass boundary validation"
+            );
+        }
+
+        #[test]
+        fn test_daemon_denies_unverified_policy() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let check = dispatcher.build_channel_boundary_check(&ToolClass::Read, false);
+
+            let defects = validate_channel_boundary(&check);
+            assert!(
+                defects.iter().any(|defect| defect.violation_class
+                    == ChannelViolationClass::PolicyNotLedgerVerified),
+                "unverified policy must emit PolicyNotLedgerVerified defect"
+            );
+        }
     }
 
     mod governance_probe_failure_classification {
