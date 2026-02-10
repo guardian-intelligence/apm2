@@ -6891,6 +6891,7 @@ policy:
             epoch,
             htf_ref,
             quorum,
+            None,
             auth,
         )
         .expect("valid seal placeholder");
@@ -6907,6 +6908,7 @@ policy:
             epoch,
             htf_ref,
             quorum,
+            None,
             auth,
         )
         .expect("valid seal")

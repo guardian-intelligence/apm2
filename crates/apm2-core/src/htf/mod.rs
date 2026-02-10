@@ -73,6 +73,7 @@ pub mod canonical;
 pub mod epoch_seal;
 pub mod freshness;
 mod types;
+pub mod vdf_profile;
 
 // Re-export all public types
 pub use canonical::{Canonicalizable, CanonicalizationError};
@@ -108,4 +109,9 @@ pub use types::{
     TimeEnvelopeRef,
     TimeSyncObservation,
     WallTimeSource,
+};
+pub use vdf_profile::{
+    DefaultVdfVerifier, MAX_VDF_DIFFICULTY, MAX_VDF_OUTPUT_LENGTH, MIN_VDF_DIFFICULTY,
+    PietrzakV1Verifier, SlothV1Verifier, VdfPolicy, VdfProfileError, VdfProfileV1, VdfScheme,
+    VdfVerificationError, VdfVerifier,
 };
