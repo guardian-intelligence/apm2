@@ -353,6 +353,17 @@ pub struct ReviewBlockedRecorded {
 }
 
 impl ReviewBlockedRecorded {
+    fn validate_role_spec_hash_length(hash: &[u8]) -> Result<(), ReviewBlockedError> {
+        if hash.is_empty() || hash.len() == 32 {
+            Ok(())
+        } else {
+            Err(ReviewBlockedError::InvalidData(format!(
+                "role_spec_hash must be empty or 32 bytes, got {}",
+                hash.len()
+            )))
+        }
+    }
+
     /// Creates a new `ReviewBlockedRecorded` event.
     ///
     /// # Arguments
@@ -408,6 +419,7 @@ impl ReviewBlockedRecorded {
                 max: MAX_STRING_LENGTH,
             });
         }
+        Self::validate_role_spec_hash_length(&role_spec_hash)?;
 
         // Construct event with placeholder signature
         let mut event = Self {
@@ -780,6 +792,8 @@ impl TryFrom<ReviewBlockedRecordedProto> for ReviewBlockedRecorded {
             if hash == [0u8; 32] { None } else { Some(hash) }
         };
 
+        Self::validate_role_spec_hash_length(&proto.role_spec_hash)?;
+
         Ok(Self {
             blocked_id: proto.blocked_id,
             changeset_digest,
@@ -1057,6 +1071,52 @@ mod tests {
     }
 
     #[test]
+    fn test_review_blocked_create_rejects_31_byte_role_spec_hash() {
+        let signer = Signer::generate();
+        let result = ReviewBlockedRecorded::create(
+            "blocked-001".to_string(),
+            [0x42; 32],
+            ReasonCode::ApplyFailed,
+            [0x33; 32],
+            [0x44; 32],
+            "recorder-001".to_string(),
+            Some([0x55; 32]),
+            Some([0x66; 32]),
+            vec![0x77; 31],
+            &signer,
+        );
+
+        assert!(matches!(
+            result,
+            Err(ReviewBlockedError::InvalidData(message))
+                if message.contains("role_spec_hash must be empty or 32 bytes")
+        ));
+    }
+
+    #[test]
+    fn test_review_blocked_create_rejects_33_byte_role_spec_hash() {
+        let signer = Signer::generate();
+        let result = ReviewBlockedRecorded::create(
+            "blocked-001".to_string(),
+            [0x42; 32],
+            ReasonCode::ApplyFailed,
+            [0x33; 32],
+            [0x44; 32],
+            "recorder-001".to_string(),
+            Some([0x55; 32]),
+            Some([0x66; 32]),
+            vec![0x77; 33],
+            &signer,
+        );
+
+        assert!(matches!(
+            result,
+            Err(ReviewBlockedError::InvalidData(message))
+                if message.contains("role_spec_hash must be empty or 32 bytes")
+        ));
+    }
+
+    #[test]
     fn test_review_blocked_string_too_long() {
         let signer = Signer::generate();
         let long_id = "x".repeat(MAX_BLOCKED_ID_LENGTH + 1);
@@ -1329,5 +1389,55 @@ mod tests {
 
         assert_ne!(event1.canonical_bytes(), event2.canonical_bytes());
         assert_ne!(event1.recorder_signature, event2.recorder_signature);
+    }
+
+    #[test]
+    fn test_proto_rejects_31_byte_role_spec_hash() {
+        let proto = ReviewBlockedRecordedProto {
+            blocked_id: "blocked-001".to_string(),
+            changeset_digest: vec![0x42; 32],
+            reason_code: i32::from(ReasonCode::ApplyFailed.to_code()),
+            blocked_log_hash: vec![0x33; 32],
+            time_envelope_ref: Some(crate::events::TimeEnvelopeRef {
+                hash: vec![0x44; 32],
+            }),
+            recorder_actor_id: "recorder-001".to_string(),
+            recorder_signature: vec![0x88; 64],
+            capability_manifest_hash: vec![0x55; 32],
+            context_pack_hash: vec![0x66; 32],
+            role_spec_hash: vec![0x77; 31],
+        };
+
+        let result = ReviewBlockedRecorded::try_from(proto);
+        assert!(matches!(
+            result,
+            Err(ReviewBlockedError::InvalidData(message))
+                if message.contains("role_spec_hash must be empty or 32 bytes")
+        ));
+    }
+
+    #[test]
+    fn test_proto_rejects_33_byte_role_spec_hash() {
+        let proto = ReviewBlockedRecordedProto {
+            blocked_id: "blocked-001".to_string(),
+            changeset_digest: vec![0x42; 32],
+            reason_code: i32::from(ReasonCode::ApplyFailed.to_code()),
+            blocked_log_hash: vec![0x33; 32],
+            time_envelope_ref: Some(crate::events::TimeEnvelopeRef {
+                hash: vec![0x44; 32],
+            }),
+            recorder_actor_id: "recorder-001".to_string(),
+            recorder_signature: vec![0x88; 64],
+            capability_manifest_hash: vec![0x55; 32],
+            context_pack_hash: vec![0x66; 32],
+            role_spec_hash: vec![0x77; 33],
+        };
+
+        let result = ReviewBlockedRecorded::try_from(proto);
+        assert!(matches!(
+            result,
+            Err(ReviewBlockedError::InvalidData(message))
+                if message.contains("role_spec_hash must be empty or 32 bytes")
+        ));
     }
 }

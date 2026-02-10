@@ -966,40 +966,20 @@ pub trait LedgerEventEmitter: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn emit_receipt_with_bindings(
         &self,
-        episode_id: &str,
-        receipt_id: &str,
-        changeset_digest: &[u8; 32],
-        artifact_bundle_hash: &[u8; 32],
-        reviewer_actor_id: &str,
-        timestamp_ns: u64,
-        bindings: &crate::episode::EnvelopeBindings,
-        identity_proof_hash: &[u8; 32],
+        _episode_id: &str,
+        _receipt_id: &str,
+        _changeset_digest: &[u8; 32],
+        _artifact_bundle_hash: &[u8; 32],
+        _reviewer_actor_id: &str,
+        _timestamp_ns: u64,
+        _bindings: &crate::episode::EnvelopeBindings,
+        _identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        // Fail-closed: validate bindings before emission
-        bindings
-            .validate()
-            .map_err(|e| LedgerEventError::ValidationFailed {
-                message: format!("envelope binding validation failed: {e}"),
-            })?;
-
-        let (envelope_hash_hex, _, _) = bindings.to_hex_map();
-
-        // Default implementation delegates to emit_review_receipt.
-        // Implementations that persist bindings should override this.
-        self.emit_review_receipt(
-            episode_id,
-            receipt_id,
-            changeset_digest,
-            artifact_bundle_hash,
-            &bindings.capability_manifest_hash,
-            &bindings.envelope_hash,
-            &bindings.view_commitment_hash,
-            reviewer_actor_id,
-            timestamp_ns,
-            identity_proof_hash,
-            &envelope_hash_hex,
-            None,
-        )
+        Err(LedgerEventError::ValidationFailed {
+            message: "emit_receipt_with_bindings default is fail-closed; implementers must \
+                      override to persist envelope bindings correctly"
+                .to_string(),
+        })
     }
 }
 
@@ -1874,7 +1854,7 @@ pub fn build_policy_context_pack(
     ContextPackManifestBuilder::new(format!("manifest:{work_id}"), format!("profile:{actor_id}"))
         .add_entry(
             ManifestEntryBuilder::new(
-                format!("/work/{work_id}/context.yaml"),
+                format!("work/{work_id}/context.yaml"),
                 *content_hash.as_bytes(),
             )
             .stable_id("work-context")
@@ -16166,6 +16146,44 @@ mod tests {
             cas,
         )
         .expect("test helper should seed policy lineage artifacts");
+    }
+
+    #[test]
+    fn test_policy_context_manifest_and_recipe_path_formats_are_consistent() {
+        let work_id = "W-001";
+        let actor_id = "actor-001";
+        let role_spec_hash = [0x11; 32];
+
+        let context_pack = build_policy_context_pack(work_id, actor_id);
+        let manifest_path = context_pack
+            .entries()
+            .first()
+            .expect("context pack should include one deterministic entry")
+            .path();
+        let manifest_relative = manifest_path
+            .strip_prefix('/')
+            .expect("manifest entry path should be absolute");
+
+        let compiled = build_policy_context_pack_recipe(
+            work_id,
+            actor_id,
+            role_spec_hash,
+            context_pack.manifest_hash(),
+        )
+        .expect("recipe should compile");
+        let recipe_path = compiled
+            .recipe
+            .required_read_paths
+            .first()
+            .expect("recipe should include one required read path");
+
+        assert_eq!(recipe_path, manifest_relative);
+        assert!(
+            compiled
+                .recipe
+                .required_read_digests
+                .contains_key(recipe_path)
+        );
     }
 
     // ========================================================================
