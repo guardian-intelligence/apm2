@@ -84,6 +84,13 @@ pub const MAX_TRACKED_RELAYS: usize = 1024;
 /// Maximum detail string length on structured anti-entropy defects.
 pub const MAX_DEFECT_DETAIL_LEN: usize = 512;
 
+/// Maximum tracked issuer identities in the replay high-water map.
+///
+/// When this limit is reached, the oldest issuer entry (by sequence) is
+/// evicted. This prevents unbounded memory growth under adversarial or
+/// high-churn issuer sets.
+pub const MAX_REPLAY_ISSUERS: usize = 4096;
+
 /// Maximum configurable events-per-session budget.
 pub const MAX_EVENTS_PER_SESSION_BUDGET: usize = 1 << 20;
 
@@ -1122,6 +1129,24 @@ impl ReplayProtector {
     where
         M: ReplayStamped,
     {
+        self.check(message)?;
+        self.record(message)
+    }
+
+    /// Read-only monotonicity and duplicate check. Does NOT mutate state.
+    ///
+    /// Use this when you need to verify replay constraints before other
+    /// authorization gates and only commit replay state after all checks
+    /// pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns structured replay defects on duplicate or non-monotone issuer
+    /// metadata.
+    pub fn check<M>(&self, message: &M) -> Result<(), HsiAntiEntropyError>
+    where
+        M: ReplayStamped,
+    {
         let issuer_id = message.issuer_id();
         validate_bounded_string("issuer_id", issuer_id, MAX_ISSUER_ID_LEN)?;
 
@@ -1170,22 +1195,62 @@ impl ReplayProtector {
             ));
         }
 
+        Ok(())
+    }
+
+    /// Records a message into replay state. Must only be called after all
+    /// authorization gates have passed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HsiAntiEntropyError::CanonicalizationFailed`] if the
+    /// message cannot be hashed.
+    pub fn record<M>(&mut self, message: &M) -> Result<(), HsiAntiEntropyError>
+    where
+        M: ReplayStamped,
+    {
+        let issuer_id = message.issuer_id();
+        let sequence = message.issuer_sequence();
+        let hlc = message.issuer_hlc();
+        let message_hash =
+            <M as Canonicalizable>::canonical_hash(message).map_err(HsiAntiEntropyError::from)?;
+
         self.window.push_back(ReplayEntry {
             issuer_id: issuer_id.to_string(),
             sequence,
             message_hash,
         });
-        self.seen_sequences.insert(seq_key);
-        self.seen_hashes.insert(hash_key);
+        self.seen_sequences
+            .insert((issuer_id.to_string(), sequence));
+        self.seen_hashes
+            .insert((issuer_id.to_string(), message_hash));
         self.high_water
             .insert(issuer_id.to_string(), (hlc, sequence));
 
+        // Evict oldest window entries when exceeding capacity.
         while self.window.len() > self.max_entries {
             if let Some(oldest) = self.window.pop_front() {
                 self.seen_sequences
                     .remove(&(oldest.issuer_id.clone(), oldest.sequence));
                 self.seen_hashes
                     .remove(&(oldest.issuer_id, oldest.message_hash));
+            }
+        }
+
+        // Evict oldest high-water issuer entries when exceeding
+        // MAX_REPLAY_ISSUERS to prevent unbounded memory growth under
+        // adversarial or high-churn issuer sets.
+        while self.high_water.len() > MAX_REPLAY_ISSUERS {
+            // Evict the issuer with the lowest sequence number.
+            let evict_key = self
+                .high_water
+                .iter()
+                .min_by_key(|(_, (_, seq))| *seq)
+                .map(|(k, _)| k.clone());
+            if let Some(key) = evict_key {
+                self.high_water.remove(&key);
+            } else {
+                break;
             }
         }
 
@@ -1202,6 +1267,12 @@ impl ReplayProtector {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.window.is_empty()
+    }
+
+    /// Returns the number of tracked issuers in the high-water map.
+    #[must_use]
+    pub fn high_water_len(&self) -> usize {
+        self.high_water.len()
     }
 }
 
@@ -1458,7 +1529,11 @@ impl PullOnlyEnforcer {
             ));
         }
 
-        self.replay_protector.check_and_record(deliver)?;
+        // SECURITY: Read-only replay check BEFORE request correlation.
+        // State mutation (record) is deferred until after all authorization
+        // gates pass. This prevents unsolicited deliveries from poisoning
+        // replay high-water marks for legitimate future deliveries.
+        self.replay_protector.check(deliver)?;
 
         let Some(request) = self.outstanding_requests.get(&deliver.request_id) else {
             return Err(defect_error(
@@ -1522,6 +1597,11 @@ impl PullOnlyEnforcer {
             deliver.events.len(),
             bytes,
         )?;
+
+        // SECURITY: Only record replay state AFTER all authorization gates
+        // have passed. This ensures unsolicited or tampered deliveries
+        // cannot poison replay high-water marks.
+        self.replay_protector.record(deliver)?;
 
         self.outstanding_requests.remove(&deliver.request_id);
         Ok(())
@@ -2013,6 +2093,74 @@ mod tests {
         assert_eq!(
             err.defect().unwrap().kind,
             AntiEntropyDefectKind::InvalidAttestation
+        );
+    }
+
+    // ─── Regression: unsolicited deliver must NOT poison replay state ─────
+    #[test]
+    fn tck_00381_unsolicited_deliver_does_not_poison_replay_for_valid_deliver() {
+        // SECURITY REGRESSION: Verifies the blocker fix — an unsolicited
+        // delivery (no matching request) must NOT advance the replay
+        // high-water mark so that a subsequent legitimate delivery with
+        // the same issuer sequence still succeeds.
+        let events = build_events(1, 1, [0u8; HASH_SIZE]);
+        let mut enforcer = PullOnlyEnforcer::new(true, default_budget()).unwrap();
+
+        // Register a legitimate request.
+        let digest = range_digest_for(&events);
+        let request = mk_request("req-legit", "sess-1", 1, 1, 42, digest, 1);
+        enforcer
+            .register_request(&request, Some("relay-1"))
+            .unwrap();
+
+        // Attempt an unsolicited delivery (request_id does not match).
+        let unsolicited = mk_deliver("req-bogus", "sess-1", 1, 1, 42, events.clone(), 10);
+        let err = enforcer
+            .accept_deliver(&unsolicited, &AcceptAllVerifier)
+            .unwrap_err();
+        assert_eq!(
+            err.defect().unwrap().kind,
+            AntiEntropyDefectKind::UnsolicitedDelivery,
+            "unsolicited deliver must be rejected"
+        );
+
+        // Now deliver the SAME events with the legitimate request_id.
+        // The replay protector must NOT reject this because the unsolicited
+        // delivery above should not have mutated replay state.
+        let legit = mk_deliver("req-legit", "sess-1", 1, 1, 42, events, 10);
+        enforcer
+            .accept_deliver(&legit, &AcceptAllVerifier)
+            .expect("legitimate deliver must succeed after unsolicited rejection");
+    }
+
+    // ─── Regression: replay high-water eviction bounded ──────────────────
+    #[test]
+    fn tck_00381_replay_high_water_eviction_bounded() {
+        // SECURITY REGRESSION: Verifies the major fix — the high-water
+        // map must not grow unbounded. After inserting MAX_REPLAY_ISSUERS + N
+        // distinct issuers, the map must not exceed MAX_REPLAY_ISSUERS.
+        let mut rp = ReplayProtector::new(MAX_REPLAY_LOG_ENTRIES).unwrap();
+        let extra = 100;
+        for i in 0..(MAX_REPLAY_ISSUERS + extra) {
+            let offer = AntiEntropyOffer {
+                offer_id: format!("offer-{i}"),
+                cell_id: "cell-hw".to_string(),
+                issuer_id: format!("issuer-{i}"),
+                issuer_hlc: Hlc::new(1000 + u64::try_from(i).unwrap_or(0), 0),
+                issuer_sequence: 1,
+                ledger_head_seq: 10,
+                ledger_head_hash: [1u8; HASH_SIZE],
+                merkle_root_hash: [2u8; HASH_SIZE],
+                range_bounds: (1, 10),
+                max_leaves: 1024,
+            };
+            rp.check_and_record(&offer).unwrap();
+        }
+        assert!(
+            rp.high_water_len() <= MAX_REPLAY_ISSUERS,
+            "high_water must be bounded: {} > {}",
+            rp.high_water_len(),
+            MAX_REPLAY_ISSUERS,
         );
     }
 }

@@ -173,8 +173,9 @@ pub use hsi_anti_entropy::{
     AntiEntropyOffer, AntiEntropyRequestEvents, ByzantineRelayDetector, DeliveredEvent,
     EventAttestationVerifier, HsiAntiEntropyError, MAX_ANTI_ENTROPY_LEAVES, MAX_CELL_ID_LEN,
     MAX_COMPARE_ID_LEN, MAX_DELIVER_PROOF_HASHES, MAX_EVENTS_PER_DELIVER, MAX_OFFER_ID_LEN,
-    MAX_OUTSTANDING_REQUESTS, MAX_REPLAY_LOG_ENTRIES, MAX_REQUEST_ID_LEN, MAX_SESSION_ID_LEN,
-    PullOnlyEnforcer, RelayBudget, RelayBudgetEnforcer, ReplayProtector, SessionUsageSnapshot,
+    MAX_OUTSTANDING_REQUESTS, MAX_REPLAY_ISSUERS, MAX_REPLAY_LOG_ENTRIES, MAX_REQUEST_ID_LEN,
+    MAX_SESSION_ID_LEN, PullOnlyEnforcer, RelayBudget, RelayBudgetEnforcer, ReplayProtector,
+    SessionUsageSnapshot,
 };
 pub use merkle::{
     DivergentRange, EMPTY_HASH, MAX_PROOF_NODES, MAX_TREE_DEPTH, MAX_TREE_LEAVES, MerkleError,
