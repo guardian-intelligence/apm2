@@ -7,7 +7,7 @@ use std::process::Command;
 use chrono::Utc;
 use fs2::FileExt;
 
-use super::state::{find_active_review_entry, is_process_alive};
+use super::state::{find_active_review_entry, is_process_alive, load_review_run_state};
 use super::types::{
     DISPATCH_PENDING_TTL, DispatchReviewResult, PendingDispatchEntry, ReviewKind, apm2_home_dir,
     ensure_parent_dir, sanitize_for_path,
@@ -171,6 +171,44 @@ fn command_available(command: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+fn attach_run_state_contract(
+    pr_number: u32,
+    review_type: &str,
+    mut result: DispatchReviewResult,
+) -> Result<DispatchReviewResult, String> {
+    match load_review_run_state(pr_number, review_type)? {
+        super::state::ReviewRunStateLoad::Present(state) => {
+            result.run_state = state.status.as_str().to_string();
+            result.run_id = Some(state.run_id);
+            result.sequence_number = Some(state.sequence_number);
+            result.terminal_reason = state.terminal_reason;
+            if result.pid.is_none() {
+                result.pid = state.pid;
+            }
+            Ok(result)
+        },
+        super::state::ReviewRunStateLoad::Missing { .. } => {
+            result.run_state = "no-run-state".to_string();
+            Ok(result)
+        },
+        super::state::ReviewRunStateLoad::Corrupt { path, error } => Err(format!(
+            "corrupt-state path={} detail={error}",
+            path.display()
+        )),
+        super::state::ReviewRunStateLoad::Ambiguous { dir, candidates } => {
+            let rendered = candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            Err(format!(
+                "ambiguous-state dir={} candidates={rendered}",
+                dir.display()
+            ))
+        },
+    }
+}
+
 // ── Single review dispatch ──────────────────────────────────────────────────
 
 pub fn dispatch_single_review(
@@ -181,48 +219,73 @@ pub fn dispatch_single_review(
     head_sha: &str,
     dispatch_epoch: u64,
 ) -> Result<DispatchReviewResult, String> {
-    with_dispatch_lock(
-        owner_repo,
-        pr_number,
-        review_kind.as_str(),
-        head_sha,
-        || {
-            if let Some(existing) =
-                find_active_review_entry(pr_number, review_kind.as_str(), Some(head_sha))?
-            {
-                return Ok(DispatchReviewResult {
-                    review_type: review_kind.as_str().to_string(),
+    let review_type = review_kind.as_str();
+    with_dispatch_lock(owner_repo, pr_number, review_type, head_sha, || {
+        if let super::state::ReviewRunStateLoad::Present(state) =
+            load_review_run_state(pr_number, review_type)?
+        {
+            if state.head_sha.eq_ignore_ascii_case(head_sha) && !state.status.is_terminal() {
+                return attach_run_state_contract(
+                    pr_number,
+                    review_type,
+                    DispatchReviewResult {
+                        review_type: review_type.to_string(),
+                        mode: "joined".to_string(),
+                        run_state: "alive".to_string(),
+                        run_id: Some(state.run_id),
+                        sequence_number: Some(state.sequence_number),
+                        terminal_reason: state.terminal_reason,
+                        pid: state.pid,
+                        unit: None,
+                        log_file: None,
+                    },
+                );
+            }
+        }
+
+        if let Some(existing) = find_active_review_entry(pr_number, review_type, Some(head_sha))? {
+            return attach_run_state_contract(
+                pr_number,
+                review_type,
+                DispatchReviewResult {
+                    review_type: review_type.to_string(),
                     mode: "joined".to_string(),
+                    run_state: "unknown".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
                     pid: Some(existing.pid),
                     unit: None,
                     log_file: Some(existing.log_file.display().to_string()),
-                });
-            }
+                },
+            );
+        }
 
-            if let Some(pending) =
-                read_fresh_pending_dispatch(owner_repo, pr_number, review_kind.as_str(), head_sha)?
-            {
-                return Ok(DispatchReviewResult {
-                    review_type: review_kind.as_str().to_string(),
+        if let Some(pending) =
+            read_fresh_pending_dispatch(owner_repo, pr_number, review_type, head_sha)?
+        {
+            return attach_run_state_contract(
+                pr_number,
+                review_type,
+                DispatchReviewResult {
+                    review_type: review_type.to_string(),
                     mode: "joined".to_string(),
+                    run_state: "unknown".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
                     pid: pending.pid,
                     unit: pending.unit,
                     log_file: pending.log_file,
-                });
-            }
+                },
+            );
+        }
 
-            let result =
-                spawn_detached_review(pr_url, pr_number, review_kind, head_sha, dispatch_epoch)?;
-            write_pending_dispatch(
-                owner_repo,
-                pr_number,
-                review_kind.as_str(),
-                head_sha,
-                &result,
-            )?;
-            Ok(result)
-        },
-    )
+        let result =
+            spawn_detached_review(pr_url, pr_number, review_kind, head_sha, dispatch_epoch)?;
+        write_pending_dispatch(owner_repo, pr_number, review_type, head_sha, &result)?;
+        attach_run_state_contract(pr_number, review_type, result)
+    })
 }
 
 fn spawn_detached_review(
@@ -282,6 +345,10 @@ fn spawn_detached_review(
         return Ok(DispatchReviewResult {
             review_type: review_kind.as_str().to_string(),
             mode: "started".to_string(),
+            run_state: "pending".to_string(),
+            run_id: None,
+            sequence_number: None,
+            terminal_reason: None,
             pid: None,
             unit: Some(unit),
             log_file: None,
@@ -322,13 +389,15 @@ fn spawn_detached_review(
         .stderr(std::process::Stdio::from(stderr))
         .spawn()
         .map_err(|err| format!("failed to spawn detached review process: {err}"))?;
-    let pid = child.id();
-    drop(child);
 
     Ok(DispatchReviewResult {
         review_type: review_kind.as_str().to_string(),
         mode: "started".to_string(),
-        pid: Some(pid),
+        run_state: "pending".to_string(),
+        run_id: None,
+        sequence_number: None,
+        terminal_reason: None,
+        pid: Some(child.id()),
         unit: None,
         log_file: Some(log_path.display().to_string()),
     })

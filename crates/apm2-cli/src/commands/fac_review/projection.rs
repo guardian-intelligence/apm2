@@ -3,10 +3,14 @@
 
 use chrono::{DateTime, SecondsFormat, Utc};
 
-use super::state::{read_pulse_file, with_review_state_shared};
+use super::state::{
+    ReviewRunStateLoad, load_review_run_state, read_pulse_file, review_run_state_path,
+    with_review_state_shared,
+};
+#[cfg(test)]
+use super::types::ReviewKind;
 use super::types::{
-    MAX_RESTART_ATTEMPTS, ProjectionError, ProjectionStatus, ReviewKind, ReviewStateFile,
-    entry_pr_number,
+    MAX_RESTART_ATTEMPTS, ProjectionError, ProjectionStatus, ReviewStateFile, entry_pr_number,
 };
 
 // ── Projection state predicates ─────────────────────────────────────────────
@@ -19,6 +23,7 @@ pub fn projection_state_failed(state: &str) -> bool {
     state.starts_with("failed:")
 }
 
+#[cfg(test)]
 fn projection_state_from_sequence_verdict(verdict: Option<&str>, head_short: &str) -> String {
     let normalized = verdict.unwrap_or("").trim().to_ascii_uppercase();
     match normalized.as_str() {
@@ -31,6 +36,7 @@ fn projection_state_from_sequence_verdict(verdict: Option<&str>, head_short: &st
 
 // ── Sequence-done fallback ──────────────────────────────────────────────────
 
+#[cfg(test)]
 pub fn apply_sequence_done_fallback(
     events: &[serde_json::Value],
     security: &mut String,
@@ -74,6 +80,7 @@ pub fn apply_sequence_done_fallback(
 
 // ── SHA resolution ──────────────────────────────────────────────────────────
 
+#[cfg(test)]
 pub fn resolve_projection_sha(
     pr_number: u32,
     state: &ReviewStateFile,
@@ -89,6 +96,7 @@ pub fn resolve_projection_sha(
         .unwrap_or_else(|| "-".to_string())
 }
 
+#[cfg(test)]
 pub fn resolve_current_head_sha(
     pr_number: u32,
     state: &ReviewStateFile,
@@ -139,6 +147,7 @@ fn latest_pulse_head_sha(pr_number: u32) -> Option<String> {
 
 // ── Event helpers ───────────────────────────────────────────────────────────
 
+#[cfg(test)]
 pub fn event_name(event: &serde_json::Value) -> &str {
     event
         .get("event")
@@ -175,6 +184,7 @@ pub fn event_is_terminal_crash(event: &serde_json::Value) -> bool {
 
 // ── Per-type projection state ───────────────────────────────────────────────
 
+#[cfg(test)]
 pub fn projection_state_for_type(
     state: &ReviewStateFile,
     events: &[serde_json::Value],
@@ -295,6 +305,83 @@ pub fn projection_state_for_type(
     "none".to_string()
 }
 
+fn render_state_code_from_run_state(load: &super::state::ReviewRunStateLoad) -> String {
+    match load {
+        super::state::ReviewRunStateLoad::Present(state) => {
+            let head_short = &state.head_sha[..state.head_sha.len().min(7)];
+            let model = state.model_id.as_deref().unwrap_or("n/a");
+            let backend = state.backend_id.as_deref().unwrap_or("n/a");
+            match state.status.as_str() {
+                "pending" | "alive" => format!(
+                    "alive:{model}/{backend}:r{}:{head_short}",
+                    state.restart_count
+                ),
+                "done" => {
+                    let reason = state.terminal_reason.as_deref().unwrap_or("");
+                    let reason_upper = reason.to_ascii_uppercase();
+                    if matches!(reason_upper.as_str(), "FAIL" | "UNKNOWN") {
+                        format!("failed:{}", reason.to_ascii_lowercase())
+                    } else {
+                        format!(
+                            "done:{model}/{backend}:r{}:{head_short}",
+                            state.restart_count
+                        )
+                    }
+                },
+                "failed" | "crashed" => {
+                    let reason = state
+                        .terminal_reason
+                        .clone()
+                        .unwrap_or_else(|| state.status.as_str().to_string());
+                    format!("failed:{reason}")
+                },
+                _ => "failed:invalid-run-state".to_string(),
+            }
+        },
+        super::state::ReviewRunStateLoad::Missing { .. } => "no-run-state".to_string(),
+        super::state::ReviewRunStateLoad::Corrupt { .. } => "corrupt-state".to_string(),
+        super::state::ReviewRunStateLoad::Ambiguous { .. } => "ambiguous-state".to_string(),
+    }
+}
+
+fn run_state_error(
+    load: &super::state::ReviewRunStateLoad,
+    review_type: &str,
+) -> Option<ProjectionError> {
+    match load {
+        super::state::ReviewRunStateLoad::Corrupt { path, error } => Some(ProjectionError {
+            ts: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            event: "corrupt-state".to_string(),
+            review_type: review_type.to_string(),
+            seq: 0,
+            detail: format!("path={} detail={error}", path.display()),
+        }),
+        super::state::ReviewRunStateLoad::Ambiguous { dir, candidates } => Some(ProjectionError {
+            ts: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            event: "ambiguous-state".to_string(),
+            review_type: review_type.to_string(),
+            seq: 0,
+            detail: format!(
+                "dir={} candidates={}",
+                dir.display(),
+                candidates
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        }),
+        super::state::ReviewRunStateLoad::Missing { path } => Some(ProjectionError {
+            ts: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            event: "no-run-state".to_string(),
+            review_type: review_type.to_string(),
+            seq: 0,
+            detail: format!("path={}", path.display()),
+        }),
+        super::state::ReviewRunStateLoad::Present(_) => None,
+    }
+}
+
 // ── run_project_inner ───────────────────────────────────────────────────────
 
 pub fn run_project_inner(
@@ -339,23 +426,54 @@ pub fn run_project_inner(
         .collect::<Vec<_>>();
     events.sort_by_key(event_seq);
 
-    let mut security = projection_state_for_type(
-        &state,
-        &events,
-        pr_number,
-        ReviewKind::Security,
-        normalized_head.as_deref(),
+    let mut security_load = load_review_run_state(pr_number, "security")?;
+    let mut quality_load = load_review_run_state(pr_number, "quality")?;
+    if let Some(head) = normalized_head.as_deref() {
+        if let ReviewRunStateLoad::Present(state) = &security_load {
+            if !state.head_sha.eq_ignore_ascii_case(head) {
+                security_load = ReviewRunStateLoad::Missing {
+                    path: review_run_state_path(pr_number, "security")?,
+                };
+            }
+        }
+        if let ReviewRunStateLoad::Present(state) = &quality_load {
+            if !state.head_sha.eq_ignore_ascii_case(head) {
+                quality_load = ReviewRunStateLoad::Missing {
+                    path: review_run_state_path(pr_number, "quality")?,
+                };
+            }
+        }
+    }
+    let security = render_state_code_from_run_state(&security_load);
+    let quality = render_state_code_from_run_state(&quality_load);
+
+    let latest_run_state_head = [&security_load, &quality_load]
+        .into_iter()
+        .filter_map(|load| match load {
+            super::state::ReviewRunStateLoad::Present(state) => {
+                Some((state.sequence_number, state.head_sha.clone()))
+            },
+            _ => None,
+        })
+        .max_by_key(|(sequence, _)| *sequence)
+        .map(|(_, head_sha)| head_sha);
+
+    let sha = normalized_head.as_ref().map_or_else(
+        || {
+            latest_run_state_head
+                .clone()
+                .or_else(|| latest_event_head_sha(&events))
+                .or_else(|| latest_state_head_sha(&state, pr_number))
+                .or_else(|| latest_pulse_head_sha(pr_number))
+                .unwrap_or_else(|| "-".to_string())
+        },
+        Clone::clone,
     );
-    let mut quality = projection_state_for_type(
-        &state,
-        &events,
-        pr_number,
-        ReviewKind::Quality,
-        normalized_head.as_deref(),
-    );
-    apply_sequence_done_fallback(&events, &mut security, &mut quality);
-    let sha = resolve_projection_sha(pr_number, &state, &events, normalized_head.as_deref());
-    let current_head_sha = resolve_current_head_sha(pr_number, &state, &events, &sha);
+    let current_head_sha = latest_pulse_head_sha(pr_number)
+        .or(latest_run_state_head)
+        .or_else(|| latest_event_head_sha(&events))
+        .or_else(|| latest_state_head_sha(&state, pr_number))
+        .unwrap_or_else(|| sha.clone());
 
     let recent_events = events
         .iter()
@@ -380,7 +498,19 @@ pub fn run_project_inner(
     };
 
     let mut errors = Vec::new();
-    let mut terminal_failure = false;
+    if let Some(error) = run_state_error(&security_load, "security") {
+        errors.push(error);
+    }
+    if let Some(error) = run_state_error(&quality_load, "quality") {
+        errors.push(error);
+    }
+    let mut terminal_failure = matches!(
+        security.as_str(),
+        "no-run-state" | "corrupt-state" | "ambiguous-state"
+    ) || matches!(
+        quality.as_str(),
+        "no-run-state" | "corrupt-state" | "ambiguous-state"
+    );
     let mut last_seq = after_seq;
     for event in &events {
         let seq = event_seq(event);
