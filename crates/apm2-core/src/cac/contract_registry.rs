@@ -60,6 +60,15 @@ pub enum RegistryDefect {
         #[serde(deserialize_with = "deserialize_bounded_string")]
         schema_id: String,
     },
+    /// A required schema row attempted to relax mandatory security semantics.
+    RequiredSchemaSecurityDowngrade {
+        /// Required schema identifier.
+        #[serde(deserialize_with = "deserialize_bounded_string")]
+        schema_id: String,
+        /// Downgraded field name.
+        #[serde(deserialize_with = "deserialize_bounded_string")]
+        field_name: String,
+    },
     /// Multiple entries claim the same schema identifier.
     DuplicateSchemaId {
         /// Duplicated schema identifier.
@@ -211,8 +220,9 @@ impl ContractObjectRegistry {
     ///
     /// # Errors
     ///
-    /// Returns a bounded defect list when the registry is incomplete or
-    /// contains duplicate schema/stable identifiers.
+    /// Returns a bounded defect list when the registry is incomplete, contains
+    /// duplicate schema/stable identifiers, or downgrades required-row
+    /// signature/freshness semantics.
     pub fn validate_completeness(&self) -> Result<(), Vec<RegistryDefect>> {
         let mut defects = Vec::new();
 
@@ -250,13 +260,36 @@ impl ContractObjectRegistry {
         }
 
         for schema_id in REQUIRED_CONTRACT_SCHEMA_IDS {
-            if self.lookup_by_schema_id(schema_id).is_none() {
-                push_registry_defect(
-                    &mut defects,
-                    RegistryDefect::MissingRequiredSchema {
-                        schema_id: (*schema_id).to_string(),
-                    },
-                );
+            match self.lookup_by_schema_id(schema_id) {
+                Some(entry) => {
+                    if entry.signature_set_ref.is_none() {
+                        push_registry_defect(
+                            &mut defects,
+                            RegistryDefect::RequiredSchemaSecurityDowngrade {
+                                schema_id: (*schema_id).to_string(),
+                                field_name: "signature_set_ref".to_string(),
+                            },
+                        );
+                    }
+
+                    if entry.window_or_ttl_ref.is_none() {
+                        push_registry_defect(
+                            &mut defects,
+                            RegistryDefect::RequiredSchemaSecurityDowngrade {
+                                schema_id: (*schema_id).to_string(),
+                                field_name: "window_or_ttl_ref".to_string(),
+                            },
+                        );
+                    }
+                },
+                None => {
+                    push_registry_defect(
+                        &mut defects,
+                        RegistryDefect::MissingRequiredSchema {
+                            schema_id: (*schema_id).to_string(),
+                        },
+                    );
+                },
             }
         }
 
@@ -1066,70 +1099,152 @@ pub fn validate_cac_contract(
             },
             CacValidationStep::SignatureFreshness => {
                 if let Some(entry) = resolved_entry {
-                    match resolve_requirement_binding(
+                    let required_schema = is_required_contract_schema(entry.schema_id.as_str());
+
+                    let signature_requirement = resolve_requirement_binding(
                         entry.signature_set_ref.as_deref(),
                         "signature_set_ref",
                         SIGNATURE_SET_REQUIRED_REF,
                         SIGNATURE_SET_NOT_REQUIRED_REF,
-                    ) {
-                        Ok(Some(RequirementBinding::Required)) => {
-                            if object.signature_status == CacSignatureStatus::Invalid {
-                                update_with_defect(
-                                    &mut defects,
-                                    &mut compatibility_state,
-                                    CacDefect::new(
-                                        CacDefectClass::SignatureFreshnessFailed,
-                                        step,
-                                        "signature verification failed",
-                                    ),
-                                );
-                            }
-                        },
-                        Ok(Some(RequirementBinding::NotRequired) | None) => {},
-                        Err(detail) => {
+                    );
+                    if required_schema {
+                        if entry.signature_set_ref.is_none() {
                             update_with_defect(
                                 &mut defects,
                                 &mut compatibility_state,
                                 CacDefect::new(
                                     CacDefectClass::RequirementRefUnresolved,
                                     step,
-                                    detail,
+                                    format!(
+                                        "required schema '{}' is missing signature_set_ref",
+                                        entry.schema_id
+                                    ),
                                 ),
                             );
-                        },
+                        } else if let Err(detail) = &signature_requirement {
+                            update_with_defect(
+                                &mut defects,
+                                &mut compatibility_state,
+                                CacDefect::new(
+                                    CacDefectClass::RequirementRefUnresolved,
+                                    step,
+                                    detail.clone(),
+                                ),
+                            );
+                        }
+
+                        if object.signature_status == CacSignatureStatus::Invalid {
+                            update_with_defect(
+                                &mut defects,
+                                &mut compatibility_state,
+                                CacDefect::new(
+                                    CacDefectClass::SignatureFreshnessFailed,
+                                    step,
+                                    "signature verification failed",
+                                ),
+                            );
+                        }
+                    } else {
+                        match signature_requirement {
+                            Ok(Some(RequirementBinding::Required)) => {
+                                if object.signature_status == CacSignatureStatus::Invalid {
+                                    update_with_defect(
+                                        &mut defects,
+                                        &mut compatibility_state,
+                                        CacDefect::new(
+                                            CacDefectClass::SignatureFreshnessFailed,
+                                            step,
+                                            "signature verification failed",
+                                        ),
+                                    );
+                                }
+                            },
+                            Ok(Some(RequirementBinding::NotRequired) | None) => {},
+                            Err(detail) => {
+                                update_with_defect(
+                                    &mut defects,
+                                    &mut compatibility_state,
+                                    CacDefect::new(
+                                        CacDefectClass::RequirementRefUnresolved,
+                                        step,
+                                        detail,
+                                    ),
+                                );
+                            },
+                        }
                     }
 
-                    match resolve_requirement_binding(
+                    let freshness_requirement = resolve_requirement_binding(
                         entry.window_or_ttl_ref.as_deref(),
                         "window_or_ttl_ref",
                         WINDOW_OR_TTL_REQUIRED_REF,
                         WINDOW_OR_TTL_NOT_REQUIRED_REF,
-                    ) {
-                        Ok(Some(RequirementBinding::Required)) => {
-                            if object.freshness_status == CacFreshnessStatus::Stale {
-                                update_with_defect(
-                                    &mut defects,
-                                    &mut compatibility_state,
-                                    CacDefect::new(
-                                        CacDefectClass::StaleInputDetected,
-                                        step,
-                                        "object input is stale for required window/ttl",
-                                    ),
-                                );
-                            }
-                        },
-                        Ok(Some(RequirementBinding::NotRequired) | None) => {},
-                        Err(detail) => {
+                    );
+                    if required_schema {
+                        if entry.window_or_ttl_ref.is_none() {
                             update_with_defect(
                                 &mut defects,
                                 &mut compatibility_state,
                                 CacDefect::new(
                                     CacDefectClass::RequirementRefUnresolved,
                                     step,
-                                    detail,
+                                    format!(
+                                        "required schema '{}' is missing window_or_ttl_ref",
+                                        entry.schema_id
+                                    ),
                                 ),
                             );
-                        },
+                        } else if let Err(detail) = &freshness_requirement {
+                            update_with_defect(
+                                &mut defects,
+                                &mut compatibility_state,
+                                CacDefect::new(
+                                    CacDefectClass::RequirementRefUnresolved,
+                                    step,
+                                    detail.clone(),
+                                ),
+                            );
+                        }
+
+                        if object.freshness_status == CacFreshnessStatus::Stale {
+                            update_with_defect(
+                                &mut defects,
+                                &mut compatibility_state,
+                                CacDefect::new(
+                                    CacDefectClass::StaleInputDetected,
+                                    step,
+                                    "object input is stale for required window/ttl",
+                                ),
+                            );
+                        }
+                    } else {
+                        match freshness_requirement {
+                            Ok(Some(RequirementBinding::Required)) => {
+                                if object.freshness_status == CacFreshnessStatus::Stale {
+                                    update_with_defect(
+                                        &mut defects,
+                                        &mut compatibility_state,
+                                        CacDefect::new(
+                                            CacDefectClass::StaleInputDetected,
+                                            step,
+                                            "object input is stale for required window/ttl",
+                                        ),
+                                    );
+                                }
+                            },
+                            Ok(Some(RequirementBinding::NotRequired) | None) => {},
+                            Err(detail) => {
+                                update_with_defect(
+                                    &mut defects,
+                                    &mut compatibility_state,
+                                    CacDefect::new(
+                                        CacDefectClass::RequirementRefUnresolved,
+                                        step,
+                                        detail,
+                                    ),
+                                );
+                            },
+                        }
                     }
                 } else {
                     update_with_defect(
@@ -1692,10 +1807,16 @@ const REQUIRED_CONTRACT_SCHEMA_IDS: &[&str] = &[
     "apm2.anti_entropy_convergence_receipt.v1",
 ];
 
+fn is_required_contract_schema(schema_id: &str) -> bool {
+    REQUIRED_CONTRACT_SCHEMA_IDS.contains(&schema_id)
+}
+
 #[cfg(test)]
 #[allow(missing_docs)]
 mod tests {
     use super::*;
+
+    const NON_REQUIRED_TEST_SCHEMA_ID: &str = "apm2.contract_registry_optional_test.v1";
 
     fn sample_blocked_defect() -> CacDefect {
         CacDefect::new(
@@ -1703,6 +1824,25 @@ mod tests {
             CacValidationStep::SchemaResolution,
             "test blocked defect",
         )
+    }
+
+    fn registry_with_non_required_entry_mutation(
+        mutate: impl FnOnce(&mut ContractObjectRegistryEntry),
+    ) -> ContractObjectRegistry {
+        let mut entries = ContractObjectRegistry::default_registry()
+            .entries()
+            .to_vec();
+        let mut optional_entry = default_registry_entry(
+            "ContractRegistryOptionalTestV1",
+            "test.optional.contract.object",
+            NON_REQUIRED_TEST_SCHEMA_ID,
+            SIGNATURE_SET_REQUIRED_REF,
+            WINDOW_OR_TTL_REQUIRED_REF,
+        );
+        mutate(&mut optional_entry);
+        entries.push(optional_entry);
+        ContractObjectRegistry::new(entries)
+            .expect("mutated non-required registry should satisfy completeness constraints")
     }
 
     fn registry_with_entry_mutation(
@@ -1954,13 +2094,13 @@ mod tests {
 
     #[test]
     fn test_unsigned_object_skips_signature_check() {
-        let schema_id = "apm2.pcac_snapshot_report.v1";
-        let registry = registry_with_entry_mutation(schema_id, |entry| {
+        let schema_id = NON_REQUIRED_TEST_SCHEMA_ID;
+        let registry = registry_with_non_required_entry_mutation(|entry| {
             entry.signature_set_ref = None;
         });
         let entry = registry
             .lookup_by_schema_id(schema_id)
-            .expect("schema should resolve for signature bypass test");
+            .expect("optional schema should resolve for signature bypass test");
         let mut object = sample_admissible_object(entry);
         object.signature_status = CacSignatureStatus::Invalid;
 
@@ -1980,13 +2120,13 @@ mod tests {
 
     #[test]
     fn test_non_window_bound_skips_freshness_check() {
-        let schema_id = "apm2.pcac_snapshot_report.v1";
-        let registry = registry_with_entry_mutation(schema_id, |entry| {
+        let schema_id = NON_REQUIRED_TEST_SCHEMA_ID;
+        let registry = registry_with_non_required_entry_mutation(|entry| {
             entry.window_or_ttl_ref = None;
         });
         let entry = registry
             .lookup_by_schema_id(schema_id)
-            .expect("schema should resolve for freshness bypass test");
+            .expect("optional schema should resolve for freshness bypass test");
         let mut object = sample_admissible_object(entry);
         object.freshness_status = CacFreshnessStatus::Stale;
 
@@ -2018,6 +2158,94 @@ mod tests {
         let result = validate_cac_contract(&registry, &object);
 
         assert_eq!(result.compatibility_state, CacCompatibilityState::Blocked);
+        assert!(
+            result
+                .defects
+                .iter()
+                .any(|defect| defect.class == CacDefectClass::RequirementRefUnresolved)
+        );
+    }
+
+    #[test]
+    fn test_required_schema_missing_signature_ref_rejected() {
+        let required_schema_id = "apm2.pcac_snapshot_report.v1";
+        let mut entries = ContractObjectRegistry::default_registry()
+            .entries()
+            .to_vec();
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.schema_id == required_schema_id)
+            .expect("required schema should exist in default registry");
+        entry.signature_set_ref = None;
+
+        let defects = ContractObjectRegistry::new(entries)
+            .expect_err("required schema missing signature_set_ref must be rejected");
+
+        assert!(defects.iter().any(|defect| {
+            matches!(
+                defect,
+                RegistryDefect::RequiredSchemaSecurityDowngrade {
+                    schema_id,
+                    field_name,
+                } if schema_id == required_schema_id && field_name == "signature_set_ref"
+            )
+        }));
+    }
+
+    #[test]
+    fn test_required_schema_missing_window_ref_rejected() {
+        let required_schema_id = "apm2.pcac_snapshot_report.v1";
+        let mut entries = ContractObjectRegistry::default_registry()
+            .entries()
+            .to_vec();
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.schema_id == required_schema_id)
+            .expect("required schema should exist in default registry");
+        entry.window_or_ttl_ref = None;
+
+        let defects = ContractObjectRegistry::new(entries)
+            .expect_err("required schema missing window_or_ttl_ref must be rejected");
+
+        assert!(defects.iter().any(|defect| {
+            matches!(
+                defect,
+                RegistryDefect::RequiredSchemaSecurityDowngrade {
+                    schema_id,
+                    field_name,
+                } if schema_id == required_schema_id && field_name == "window_or_ttl_ref"
+            )
+        }));
+    }
+
+    #[test]
+    fn test_required_schema_downgrade_blocked() {
+        let required_schema_id = "apm2.pcac_snapshot_report.v1";
+        let mut entries = ContractObjectRegistry::default_registry()
+            .entries()
+            .to_vec();
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.schema_id == required_schema_id)
+            .expect("required schema should exist in default registry");
+        entry.signature_set_ref = None;
+        entry.window_or_ttl_ref = None;
+
+        // Construct directly to emulate a tampered in-memory registry that bypassed
+        // constructor checks.
+        let registry = ContractObjectRegistry { entries };
+        let entry = registry
+            .lookup_by_schema_id(required_schema_id)
+            .expect("required schema should resolve for downgrade test");
+        let object = sample_admissible_object(entry);
+
+        let result = validate_cac_contract(&registry, &object);
+
+        assert_ne!(
+            result.compatibility_state,
+            CacCompatibilityState::Compatible
+        );
+        assert!(!result.is_admissible());
         assert!(
             result
                 .defects
