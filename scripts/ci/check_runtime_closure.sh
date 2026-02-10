@@ -156,12 +156,34 @@ PY
         | sort -u
 }
 
+is_waiver_only_commit() {
+    local commit_path file_path
+    commit_path="$1"
+
+    if ! git rev-parse --verify "${commit_path}^1" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    mapfile -t changed_commit_files < <(git diff --name-only "${commit_path}^1..${commit_path}")
+    if [[ ${#changed_commit_files[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    for file_path in "${changed_commit_files[@]}"; do
+        if [[ "${file_path}" != documents/work/waivers/* ]]; then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
 validate_waiver_binding() {
     local waiver_file output
     waiver_file="$1"
 
     if output="$(
-        python3 - "${waiver_file}" "${ALLOWED_WAIVER_COMMITS_CSV}" "${CURRENT_PR_NUMBER}" "${CURRENT_PR_CATEGORIES_CSV}" <<'PY'
+        python3 - "${waiver_file}" "${ALLOWED_WAIVER_COMMITS_CSV}" "${CURRENT_PR_NUMBER}" "${CURRENT_PR_CATEGORIES_CSV}" "${REVIEW_HEAD_PARENT_SHA}" "${REVIEW_HEAD_IS_WAIVER_ONLY}" <<'PY'
 import re
 import sys
 
@@ -191,6 +213,8 @@ current_categories = {
     for item in sys.argv[4].split(",")
     if item.strip()
 }
+review_head_parent_sha = sys.argv[5].strip().lower()
+review_head_is_waiver_only = sys.argv[6].strip().lower() == "yes"
 
 with open(waiver_path, "r", encoding="utf-8") as handle:
     payload = yaml.safe_load(handle) or {}
@@ -213,7 +237,13 @@ commit_sha = commit_sha.strip().lower()
 if not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
     fail("references.commit_sha must be a full 40-hex commit SHA")
 if commit_sha not in allowed_commits:
-    fail("references.commit_sha does not match reviewed HEAD or immediate parent")
+    fail("references.commit_sha does not match reviewed HEAD or first parent")
+if (
+    review_head_parent_sha
+    and commit_sha == review_head_parent_sha
+    and not review_head_is_waiver_only
+):
+    fail("parent_sha_waiver_requires_waiver_only_head_commit")
 
 reference_pr_number = references.get("pr_number")
 if reference_pr_number is not None:
@@ -292,11 +322,16 @@ PY
 }
 
 REVIEW_HEAD_SHA="$(resolve_review_head_sha)"
-mapfile -t ALLOWED_WAIVER_COMMITS < <(
-    git rev-list --parents -n 1 "${REVIEW_HEAD_SHA}" \
-        | awk '{print $1; for (i = 2; i <= NF; ++i) print $i}' \
-        | sort -u
-)
+REVIEW_HEAD_PARENT_SHA="$(git rev-parse --verify "${REVIEW_HEAD_SHA}^1" 2>/dev/null || true)"
+REVIEW_HEAD_IS_WAIVER_ONLY="no"
+if [[ -n "${REVIEW_HEAD_PARENT_SHA}" ]] && is_waiver_only_commit "${REVIEW_HEAD_SHA}"; then
+    REVIEW_HEAD_IS_WAIVER_ONLY="yes"
+fi
+
+declare -a ALLOWED_WAIVER_COMMITS=("${REVIEW_HEAD_SHA}")
+if [[ -n "${REVIEW_HEAD_PARENT_SHA}" ]]; then
+    ALLOWED_WAIVER_COMMITS+=("${REVIEW_HEAD_PARENT_SHA}")
+fi
 ALLOWED_WAIVER_COMMITS_CSV="$(IFS=,; echo "${ALLOWED_WAIVER_COMMITS[*]}")"
 
 CURRENT_PR_NUMBER="$(detect_current_pr_number || true)"

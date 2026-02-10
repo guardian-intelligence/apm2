@@ -235,11 +235,12 @@ runtime_parent_sha="$(git -C "${runtime_repo}" rev-parse HEAD~1)"
 runtime_base_ref="${runtime_parent_sha}"
 
 run_runtime_closure_check() {
+    local reviewed_sha="${1:-${runtime_head_sha}}"
     (
         cd "${runtime_repo}"
         env \
             APM2_DIFF_BASE="${runtime_base_ref}" \
-            APM2_REVIEW_HEAD_SHA="${runtime_head_sha}" \
+            APM2_REVIEW_HEAD_SHA="${reviewed_sha}" \
             APM2_PR_NUMBER="569" \
             APM2_PR_CATEGORY="SECURITY" \
             APM2_SECURITY_QCP="YES" \
@@ -302,10 +303,10 @@ else
 fi
 
 write_runtime_waiver "${runtime_parent_sha}" 569 "SECURITY" "yes"
-if run_runtime_closure_check >/dev/null 2>&1; then
-    log_pass "waiver bound to immediate parent commit is accepted"
+if expect_fail run_runtime_closure_check; then
+    log_pass "parent-SHA waiver with non-waiver reviewed HEAD commit is rejected"
 else
-    log_fail "waiver bound to immediate parent commit was rejected"
+    log_fail "parent-SHA waiver with non-waiver reviewed HEAD commit unexpectedly passed"
 fi
 
 write_runtime_waiver "${runtime_head_sha}" 569 "SECURITY" "yes"
@@ -313,6 +314,22 @@ if run_runtime_closure_check >/dev/null 2>&1; then
     log_pass "waiver bound to reviewed HEAD commit is accepted"
 else
     log_fail "waiver bound to reviewed HEAD commit was rejected"
+fi
+
+runtime_waiver_only_parent_sha="${runtime_head_sha}"
+(
+    cd "${runtime_repo}"
+    printf 'waiver-only fixture commit\n' > documents/work/waivers/fixture-note.txt
+    git add documents/work/waivers/fixture-note.txt
+    git commit -q -m "waiver-only head commit"
+)
+runtime_waiver_only_head_sha="$(git -C "${runtime_repo}" rev-parse HEAD)"
+
+write_runtime_waiver "${runtime_waiver_only_parent_sha}" 569 "SECURITY" "yes"
+if run_runtime_closure_check "${runtime_waiver_only_head_sha}" >/dev/null 2>&1; then
+    log_pass "parent-SHA waiver with waiver-only reviewed HEAD commit is accepted"
+else
+    log_fail "parent-SHA waiver with waiver-only reviewed HEAD commit was rejected"
 fi
 
 rm -rf "${runtime_repo}"
