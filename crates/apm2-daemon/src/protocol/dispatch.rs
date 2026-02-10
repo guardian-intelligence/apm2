@@ -11601,7 +11601,7 @@ impl PrivilegedDispatcher {
                 ));
             }
 
-            if original.identity_proof_hash != request_identity_proof_hash_arr {
+            if !bool::from(original.identity_proof_hash.ct_eq(&request_identity_proof_hash_arr)) {
                 warn!(
                     receipt_id = %request.receipt_id,
                     existing_event_id = %existing.event_id,
@@ -13148,8 +13148,8 @@ impl PrivilegedDispatcher {
             let delegatee_matches = existing.executor_actor_id == request.delegatee_actor_id;
             let expiry_ms = request.requested_expiry_ns / 1_000_000;
             let expiry_matches = existing.expires_at == expiry_ms;
-            let lineage_matches = existing.changeset_digest == parent_lease.changeset_digest
-                && existing.policy_hash == parent_lease.policy_hash;
+            let lineage_matches = bool::from(existing.changeset_digest.ct_eq(&parent_lease.changeset_digest))
+                && bool::from(existing.policy_hash.ct_eq(&parent_lease.policy_hash));
             if existing.work_id == parent_lease.work_id
                 && existing.gate_id == parent_lease.gate_id
                 && delegatee_matches
@@ -13254,7 +13254,7 @@ impl PrivilegedDispatcher {
                     ));
                 }
 
-                if original_identity_proof_hash != request_identity_proof_hash {
+                if !bool::from(original_identity_proof_hash.ct_eq(&request_identity_proof_hash)) {
                     warn!(
                         sublease_id = %request.sublease_id,
                         original_identity_proof_hash = %hex::encode(original_identity_proof_hash),
@@ -13695,7 +13695,7 @@ impl PrivilegedDispatcher {
                     ));
                 }
 
-                if original_identity_proof_hash != request_identity_proof_hash {
+                if !bool::from(original_identity_proof_hash.ct_eq(&request_identity_proof_hash)) {
                     warn!(
                         sublease_id = %sublease.lease_id,
                         original_identity_proof_hash = %hex::encode(original_identity_proof_hash),
