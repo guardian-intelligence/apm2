@@ -289,7 +289,7 @@ pub enum PolicyResolutionError {
 /// changeset. All subsequent lease issuance and receipt validation must
 /// reference this anchor.
 ///
-/// # Fields (11 total)
+/// # Fields (13 total)
 ///
 /// - `work_id`: Work item this policy resolution applies to
 /// - `changeset_digest`: Hash binding to specific changeset
@@ -302,6 +302,9 @@ pub enum PolicyResolutionError {
 /// - `resolved_verifier_policy_hashes`: Hashes of resolved verifier policies
 /// - `resolver_actor_id`: Actor who performed the policy resolution
 /// - `resolver_version`: Version of the resolver component
+/// - `role_spec_hash`: BLAKE3 hash of the authoritative `RoleSpecV2` contract
+/// - `context_pack_recipe_hash`: BLAKE3 hash of the context recipe lineage
+///   artifact
 /// - `resolver_signature`: Ed25519 signature with domain separation
 ///
 /// # Security
@@ -348,6 +351,16 @@ pub struct PolicyResolvedForChangeSet {
 
     /// Version of the resolver component.
     pub resolver_version: String,
+
+    /// BLAKE3 hash of the authoritative `RoleSpecV2` contract (32 bytes,
+    /// TCK-00448).
+    #[serde(with = "serde_bytes", default, skip_serializing_if = "Vec::is_empty")]
+    pub role_spec_hash: Vec<u8>,
+
+    /// BLAKE3 hash of the compiled context recipe lineage artifact (32 bytes,
+    /// TCK-00448).
+    #[serde(with = "serde_bytes", default, skip_serializing_if = "Vec::is_empty")]
+    pub context_pack_recipe_hash: Vec<u8>,
 
     /// Ed25519 signature over canonical bytes with domain separation.
     #[serde(with = "serde_bytes")]
@@ -493,6 +506,8 @@ impl PolicyResolvedForChangeSet {
         // - 1 byte section separator
         // - 4 bytes for resolver_actor_id length + content
         // - 4 bytes for resolver_version length + content
+        // - role_spec_hash bytes
+        // - context_pack_recipe_hash bytes
         let capacity = 4
             + self.work_id.len()
             + 32 // changeset_digest
@@ -505,7 +520,9 @@ impl PolicyResolvedForChangeSet {
             + self.resolved_verifier_policy_hashes.len() * 32
             + 1  // section separator
             + 4 + self.resolver_actor_id.len()
-            + 4 + self.resolver_version.len();
+            + 4 + self.resolver_version.len()
+            + self.role_spec_hash.len()
+            + self.context_pack_recipe_hash.len();
 
         let mut bytes = Vec::with_capacity(capacity);
 
@@ -570,6 +587,12 @@ impl PolicyResolvedForChangeSet {
         // 10. resolver_version (length-prefixed)
         bytes.extend_from_slice(&(self.resolver_version.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.resolver_version.as_bytes());
+
+        // 11. role_spec_hash (TCK-00448)
+        bytes.extend_from_slice(&self.role_spec_hash);
+
+        // 12. context_pack_recipe_hash (TCK-00448)
+        bytes.extend_from_slice(&self.context_pack_recipe_hash);
 
         bytes
     }
@@ -756,6 +779,8 @@ pub struct PolicyResolvedForChangeSetBuilder {
     resolved_verifier_policy_hashes: Vec<[u8; 32]>,
     resolver_actor_id: Option<String>,
     resolver_version: Option<String>,
+    role_spec_hash: Vec<u8>,
+    context_pack_recipe_hash: Vec<u8>,
 }
 
 impl PolicyResolvedForChangeSetBuilder {
@@ -836,6 +861,20 @@ impl PolicyResolvedForChangeSetBuilder {
     #[must_use]
     pub fn resolver_version(mut self, version: impl Into<String>) -> Self {
         self.resolver_version = Some(version.into());
+        self
+    }
+
+    /// Sets the authoritative `RoleSpecV2` hash (TCK-00448).
+    #[must_use]
+    pub fn role_spec_hash(mut self, hash: [u8; 32]) -> Self {
+        self.role_spec_hash = hash.to_vec();
+        self
+    }
+
+    /// Sets the authoritative context recipe lineage hash (TCK-00448).
+    #[must_use]
+    pub fn context_pack_recipe_hash(mut self, hash: [u8; 32]) -> Self {
+        self.context_pack_recipe_hash = hash.to_vec();
         self
     }
 
@@ -986,6 +1025,8 @@ impl PolicyResolvedForChangeSetBuilder {
             resolved_verifier_policy_hashes,
             resolver_actor_id,
             resolver_version,
+            role_spec_hash: self.role_spec_hash,
+            context_pack_recipe_hash: self.context_pack_recipe_hash,
             resolver_signature: [0u8; 64],
         };
 
@@ -1184,6 +1225,8 @@ impl TryFrom<PolicyResolvedForChangeSetProto> for PolicyResolvedForChangeSet {
             resolved_verifier_policy_hashes,
             resolver_actor_id: proto.resolver_actor_id,
             resolver_version: proto.resolver_version,
+            role_spec_hash: proto.role_spec_hash,
+            context_pack_recipe_hash: proto.context_pack_recipe_hash,
             resolver_signature,
         })
     }
@@ -1210,9 +1253,9 @@ impl From<PolicyResolvedForChangeSet> for PolicyResolvedForChangeSetProto {
                 .collect(),
             resolver_actor_id: resolution.resolver_actor_id,
             resolver_version: resolution.resolver_version,
+            role_spec_hash: resolution.role_spec_hash,
+            context_pack_recipe_hash: resolution.context_pack_recipe_hash,
             resolver_signature: resolution.resolver_signature.to_vec(),
-            role_spec_hash: Vec::new(),
-            context_pack_recipe_hash: Vec::new(),
         }
     }
 }
@@ -1238,6 +1281,8 @@ pub mod tests {
             .add_verifier_policy_hash([0x22; 32])
             .resolver_actor_id("resolver-001")
             .resolver_version("1.0.0")
+            .role_spec_hash([0x77; 32])
+            .context_pack_recipe_hash([0x88; 32])
             .build_and_sign(signer)
     }
 
@@ -1258,6 +1303,8 @@ pub mod tests {
         assert_eq!(resolution.resolved_verifier_policy_hashes, vec![[0x22; 32]]);
         assert_eq!(resolution.resolver_actor_id, "resolver-001");
         assert_eq!(resolution.resolver_version, "1.0.0");
+        assert_eq!(resolution.role_spec_hash, vec![0x77; 32]);
+        assert_eq!(resolution.context_pack_recipe_hash, vec![0x88; 32]);
     }
 
     #[test]
@@ -1305,6 +1352,29 @@ pub mod tests {
 
         // Same content should produce same canonical bytes
         assert_eq!(resolution1.canonical_bytes(), resolution2.canonical_bytes());
+    }
+
+    #[test]
+    fn test_canonical_bytes_bind_lineage_hashes() {
+        let signer = Signer::generate();
+        let resolution1 = create_test_resolution(&signer);
+        let resolution2 = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+            .resolved_risk_tier(1)
+            .resolved_determinism_class(0)
+            .add_rcp_profile_id("rcp-profile-001")
+            .add_rcp_manifest_hash([0x11; 32])
+            .add_verifier_policy_hash([0x22; 32])
+            .resolver_actor_id("resolver-001")
+            .resolver_version("1.0.0")
+            .role_spec_hash([0x99; 32]) // changed lineage
+            .context_pack_recipe_hash([0x88; 32])
+            .build_and_sign(&signer);
+
+        assert_ne!(resolution1.canonical_bytes(), resolution2.canonical_bytes());
+        assert_ne!(
+            resolution1.resolver_signature,
+            resolution2.resolver_signature
+        );
     }
 
     #[test]
@@ -1503,6 +1573,11 @@ pub mod tests {
         );
         assert_eq!(original.resolver_actor_id, recovered.resolver_actor_id);
         assert_eq!(original.resolver_version, recovered.resolver_version);
+        assert_eq!(original.role_spec_hash, recovered.role_spec_hash);
+        assert_eq!(
+            original.context_pack_recipe_hash,
+            recovered.context_pack_recipe_hash
+        );
         assert_eq!(original.resolver_signature, recovered.resolver_signature);
 
         // Signature should still be valid

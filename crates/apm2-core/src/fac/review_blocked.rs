@@ -38,6 +38,7 @@
 //!     "recorder-001".to_string(),
 //!     Some([0x55; 32]), // capability_manifest_hash (TCK-00326, optional)
 //!     Some([0x66; 32]), // context_pack_hash (TCK-00326, optional)
+//!     vec![0x77; 32],   // role_spec_hash (TCK-00448, optional for backward compatibility)
 //!     &signer,
 //! )
 //! .expect("valid event");
@@ -343,6 +344,12 @@ pub struct ReviewBlockedRecorded {
         skip_serializing_if = "Option::is_none"
     )]
     pub context_pack_hash: Option<[u8; 32]>,
+    /// BLAKE3 hash of the `RoleSpecV2` in effect (32 bytes, TCK-00448).
+    ///
+    /// This field defaults to empty for backward compatibility with events
+    /// created before TCK-00448.
+    #[serde(with = "serde_bytes", default, skip_serializing_if = "Vec::is_empty")]
+    pub role_spec_hash: Vec<u8>,
 }
 
 impl ReviewBlockedRecorded {
@@ -360,6 +367,8 @@ impl ReviewBlockedRecorded {
     ///   effect (optional for backward compatibility)
     /// * `context_pack_hash` - Hash of the sealed `ContextPackManifest` in
     ///   effect (optional for backward compatibility)
+    /// * `role_spec_hash` - Hash of the authoritative `RoleSpecV2` (optional
+    ///   for backward compatibility)
     /// * `signer` - Signer to authorize the event
     ///
     /// # Errors
@@ -375,6 +384,7 @@ impl ReviewBlockedRecorded {
         recorder_actor_id: String,
         capability_manifest_hash: Option<[u8; 32]>,
         context_pack_hash: Option<[u8; 32]>,
+        role_spec_hash: Vec<u8>,
         signer: &Signer,
     ) -> Result<Self, ReviewBlockedError> {
         // Validate inputs
@@ -410,6 +420,7 @@ impl ReviewBlockedRecorded {
             recorder_signature: [0u8; 64],
             capability_manifest_hash,
             context_pack_hash,
+            role_spec_hash,
         };
 
         // Sign
@@ -438,6 +449,7 @@ impl ReviewBlockedRecorded {
         recorder_actor_id: String,
         capability_manifest_hash: Option<[u8; 32]>,
         context_pack_hash: Option<[u8; 32]>,
+        role_spec_hash: Vec<u8>,
         signer: &Signer,
     ) -> Result<Self, ReviewBlockedError> {
         let time_envelope_ref: [u8; 32] = *envelope_ref.as_bytes();
@@ -450,6 +462,7 @@ impl ReviewBlockedRecorded {
             recorder_actor_id,
             capability_manifest_hash,
             context_pack_hash,
+            role_spec_hash,
             signer,
         )
     }
@@ -465,6 +478,7 @@ impl ReviewBlockedRecorded {
     /// - `recorder_actor_id` (len + bytes)
     /// - `capability_manifest_hash` (32 bytes, TCK-00326, only if present)
     /// - `context_pack_hash` (32 bytes, TCK-00326, only if present)
+    /// - `role_spec_hash` (bytes, TCK-00448)
     ///
     /// # Backward Compatibility
     ///
@@ -506,6 +520,9 @@ impl ReviewBlockedRecorded {
             bytes.extend_from_slice(hash);
         }
 
+        // 9. role_spec_hash (TCK-00448)
+        bytes.extend_from_slice(&self.role_spec_hash);
+
         bytes
     }
 
@@ -544,6 +561,7 @@ pub struct ReviewBlockedRecordedBuilder {
     recorder_actor_id: Option<String>,
     capability_manifest_hash: Option<[u8; 32]>,
     context_pack_hash: Option<[u8; 32]>,
+    role_spec_hash: Vec<u8>,
 }
 
 #[allow(clippy::missing_const_for_fn)] // Builder methods take `mut self` and can't be const
@@ -617,6 +635,13 @@ impl ReviewBlockedRecordedBuilder {
         self
     }
 
+    /// Sets the role spec hash (TCK-00448).
+    #[must_use]
+    pub fn role_spec_hash(mut self, hash: [u8; 32]) -> Self {
+        self.role_spec_hash = hash.to_vec();
+        self
+    }
+
     /// Builds the event and signs it.
     ///
     /// # Errors
@@ -653,6 +678,7 @@ impl ReviewBlockedRecordedBuilder {
         // These are optional for backward compatibility (TCK-00326)
         let capability_manifest_hash = self.capability_manifest_hash;
         let context_pack_hash = self.context_pack_hash;
+        let role_spec_hash = self.role_spec_hash;
 
         ReviewBlockedRecorded::create(
             blocked_id,
@@ -663,6 +689,7 @@ impl ReviewBlockedRecordedBuilder {
             recorder_actor_id,
             capability_manifest_hash,
             context_pack_hash,
+            role_spec_hash,
             signer,
         )
     }
@@ -763,6 +790,7 @@ impl TryFrom<ReviewBlockedRecordedProto> for ReviewBlockedRecorded {
             recorder_signature,
             capability_manifest_hash,
             context_pack_hash,
+            role_spec_hash: proto.role_spec_hash,
         })
     }
 }
@@ -789,7 +817,7 @@ impl From<ReviewBlockedRecorded> for ReviewBlockedRecordedProto {
             context_pack_hash: event
                 .context_pack_hash
                 .map_or_else(Vec::new, |h| h.to_vec()),
-            role_spec_hash: Vec::new(),
+            role_spec_hash: event.role_spec_hash,
         }
     }
 }
@@ -920,6 +948,7 @@ mod tests {
             "recorder-001".to_string(),
             Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
             Some([0x66; 32]), // context_pack_hash (TCK-00326)
+            vec![0x77; 32],   // role_spec_hash (TCK-00448)
             &signer,
         )
         .expect("valid event");
@@ -940,6 +969,7 @@ mod tests {
             "recorder-001".to_string(),
             Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
             Some([0x66; 32]), // context_pack_hash (TCK-00326)
+            vec![0x77; 32],   // role_spec_hash (TCK-00448)
             &signer,
         )
         .expect("valid event");
@@ -963,6 +993,7 @@ mod tests {
             .recorder_actor_id("recorder-002")
             .capability_manifest_hash([0x55; 32]) // TCK-00326
             .context_pack_hash([0x66; 32])        // TCK-00326
+            .role_spec_hash([0x77; 32])           // TCK-00448
             .build_and_sign(&signer)
             .expect("valid event");
 
@@ -970,6 +1001,7 @@ mod tests {
         assert_eq!(event.reason_code, ReasonCode::ToolFailed);
         assert_eq!(event.capability_manifest_hash, Some([0x55; 32]));
         assert_eq!(event.context_pack_hash, Some([0x66; 32]));
+        assert_eq!(event.role_spec_hash, vec![0x77; 32]);
         assert!(event.verify_signature(&signer.verifying_key()).is_ok());
     }
 
@@ -1038,6 +1070,7 @@ mod tests {
             "recorder-001".to_string(),
             Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
             Some([0x66; 32]), // context_pack_hash (TCK-00326)
+            Vec::new(),       // role_spec_hash (TCK-00448)
             &signer,
         );
 
@@ -1062,6 +1095,7 @@ mod tests {
             "recorder-001".to_string(),
             Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
             Some([0x66; 32]), // context_pack_hash (TCK-00326)
+            vec![0x77; 32],   // role_spec_hash (TCK-00448)
             &signer,
         )
         .expect("valid event");
@@ -1075,6 +1109,7 @@ mod tests {
             "recorder-001".to_string(),
             Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
             Some([0x66; 32]), // context_pack_hash (TCK-00326)
+            vec![0x77; 32],   // role_spec_hash (TCK-00448)
             &signer,
         )
         .expect("valid event");
@@ -1097,6 +1132,7 @@ mod tests {
             "recorder-001".to_string(),
             Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
             Some([0x66; 32]), // context_pack_hash (TCK-00326)
+            vec![0x77; 32],   // role_spec_hash (TCK-00448)
             &signer,
         )
         .expect("valid event");
@@ -1110,6 +1146,7 @@ mod tests {
             "recorder-001".to_string(),
             Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
             Some([0x66; 32]), // context_pack_hash (TCK-00326)
+            vec![0x77; 32],   // role_spec_hash (TCK-00448)
             &signer,
         )
         .expect("valid event");
@@ -1132,6 +1169,7 @@ mod tests {
             "recorder-001".to_string(),
             Some([0x55; 32]),
             Some([0x66; 32]),
+            vec![0x77; 32],
             &signer,
         )
         .expect("valid event");
@@ -1145,6 +1183,7 @@ mod tests {
             "recorder-001".to_string(),
             None,
             None,
+            Vec::new(),
             &signer,
         )
         .expect("valid event");
@@ -1233,6 +1272,7 @@ mod tests {
             "recorder-001".to_string(),
             Some([0x55; 32]), // capability_manifest_hash
             Some([0x66; 32]), // context_pack_hash
+            vec![0x77; 32],   // role_spec_hash
             &signer,
         )
         .expect("valid event");
@@ -1246,11 +1286,47 @@ mod tests {
             "recorder-001".to_string(),
             Some([0xAA; 32]), // Different capability_manifest_hash
             Some([0x66; 32]), // Same context_pack_hash
+            vec![0x77; 32],   // Same role_spec_hash
             &signer,
         )
         .expect("valid event");
 
         // Different authority binding produces different canonical bytes and signature
+        assert_ne!(event1.canonical_bytes(), event2.canonical_bytes());
+        assert_ne!(event1.recorder_signature, event2.recorder_signature);
+    }
+
+    #[test]
+    fn test_role_spec_hash_in_signature() {
+        let signer = Signer::generate();
+        let event1 = ReviewBlockedRecorded::create(
+            "blocked-001".to_string(),
+            [0x42; 32],
+            ReasonCode::ApplyFailed,
+            [0x33; 32],
+            [0x44; 32],
+            "recorder-001".to_string(),
+            Some([0x55; 32]),
+            Some([0x66; 32]),
+            vec![0x77; 32],
+            &signer,
+        )
+        .expect("valid event");
+
+        let event2 = ReviewBlockedRecorded::create(
+            "blocked-001".to_string(),
+            [0x42; 32],
+            ReasonCode::ApplyFailed,
+            [0x33; 32],
+            [0x44; 32],
+            "recorder-001".to_string(),
+            Some([0x55; 32]),
+            Some([0x66; 32]),
+            vec![0x88; 32], // Different role_spec_hash
+            &signer,
+        )
+        .expect("valid event");
+
         assert_ne!(event1.canonical_bytes(), event2.canonical_bytes());
         assert_ne!(event1.recorder_signature, event2.recorder_signature);
     }
