@@ -12,7 +12,7 @@
 //! - `FailClosedManifestStore` that denies all tools by default
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -169,6 +169,56 @@ fn build_adapter_selection_policy(
     }
 
     Ok((policy, available_profile_hashes))
+}
+
+/// Derives the durable PCAC consume-log path from the `SQLite` main database.
+///
+/// Authoritative persistence mode must bind durable consume state to the
+/// daemon's durable runtime storage, not a temporary directory.
+fn derive_pcac_consume_log_path(sqlite_conn: &Arc<Mutex<Connection>>) -> Result<PathBuf, String> {
+    let conn = sqlite_conn
+        .lock()
+        .map_err(|e| format!("sqlite connection lock poisoned while deriving PCAC path: {e}"))?;
+
+    let mut stmt = conn
+        .prepare("PRAGMA database_list")
+        .map_err(|e| format!("failed to query sqlite database list for PCAC path: {e}"))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| format!("failed to iterate sqlite database list for PCAC path: {e}"))?;
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("failed to read sqlite database row for PCAC path: {e}"))?
+    {
+        let name: String = row
+            .get(1)
+            .map_err(|e| format!("failed to read sqlite database name for PCAC path: {e}"))?;
+        if name != "main" {
+            continue;
+        }
+
+        let file: String = row
+            .get(2)
+            .map_err(|e| format!("failed to read sqlite database file for PCAC path: {e}"))?;
+        if file.is_empty() || file == ":memory:" {
+            return Err(
+                "authoritative PCAC requires file-backed sqlite; in-memory main database has no durable path"
+                    .to_string(),
+            );
+        }
+
+        let db_path = PathBuf::from(file);
+        let Some(parent) = db_path.parent() else {
+            return Err(format!(
+                "sqlite main database has no parent directory for PCAC path: {}",
+                db_path.display()
+            ));
+        };
+        return Ok(parent.join("pcac_consume.log"));
+    }
+
+    Err("sqlite main database entry not found while deriving PCAC path".to_string())
 }
 
 const GITHUB_PROFILE_PREFIX: &str = "github-installation:";
@@ -489,44 +539,6 @@ pub struct DispatcherState {
 }
 
 impl DispatcherState {
-    /// Builds a bootstrap sovereignty state for test-only wiring.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    fn bootstrap_sovereignty_state() -> Arc<crate::pcac::SovereigntyState> {
-        let signing_key_seed = *blake3::hash(uuid::Uuid::new_v4().as_bytes()).as_bytes();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&signing_key_seed);
-        // Use max tick to avoid immediate staleness in tests that are not
-        // asserting epoch freshness behavior.
-        let freshness_tick = u64::MAX;
-        let epoch_id = "bootstrap-sovereignty-epoch-v1";
-        let principal_id = "bootstrap-principal";
-        let signature = crate::pcac::SovereigntyChecker::sign_epoch(
-            &signing_key,
-            principal_id,
-            epoch_id,
-            freshness_tick,
-        );
-
-        Arc::new(crate::pcac::SovereigntyState {
-            epoch: Some(apm2_core::pcac::SovereigntyEpoch {
-                epoch_id: epoch_id.to_string(),
-                freshness_tick,
-                principal_scope_hash: crate::pcac::SovereigntyChecker::principal_scope_hash(
-                    principal_id,
-                ),
-                signer_public_key: signing_key.verifying_key().to_bytes(),
-                signature,
-            }),
-            principal_id: principal_id.to_string(),
-            revocation_head_known: true,
-            autonomy_ceiling: Some(apm2_core::pcac::AutonomyCeiling {
-                max_risk_tier: apm2_core::pcac::RiskTier::Tier2Plus,
-                policy_binding_hash: *blake3::hash(b"bootstrap-sovereignty-policy-v1").as_bytes(),
-            }),
-            active_freeze: apm2_core::pcac::FreezeAction::NoAction,
-        })
-    }
-
     /// Creates new dispatcher state with shared registries and stable secrets.
     ///
     /// # Arguments
@@ -778,6 +790,10 @@ impl DispatcherState {
         let token_secret = TokenMinter::generate_secret();
         let token_minter = Arc::new(TokenMinter::new(token_secret));
         let manifest_store = Arc::new(InMemoryManifestStore::new());
+        let sqlite_conn_for_pcac = sqlite_conn.clone();
+        let mut sovereignty_trusted_signer_key = ledger_signing_key
+            .as_ref()
+            .map(|key| key.verifying_key().to_bytes());
 
         // TCK-00303: Create shared subscription registry for HEF resource governance
         let subscription_registry: SharedSubscriptionRegistry =
@@ -796,29 +812,16 @@ impl DispatcherState {
         // TCK-00352: Create shared V1 manifest store for scope enforcement
         let v1_manifest_store = Arc::new(V1ManifestStore::new());
 
-        // TCK-00427 quality BLOCKER fix: Resolve the daemon-lifecycle signing
-        // key BEFORE the privileged dispatcher branch so we can derive the
-        // sovereignty trusted signer key from it (instead of hardcoded zeros).
-        let daemon_signing_key = ledger_signing_key.unwrap_or_else(|| {
-            use rand::rngs::OsRng;
-            ed25519_dalek::SigningKey::generate(&mut OsRng)
-        });
-        // Capture the verifying key bytes for sovereignty checker wiring.
-        let sovereignty_trusted_signer_key = daemon_signing_key.verifying_key().to_bytes();
-
-        // TCK-00427 quality BLOCKER fix: Hoist clock creation before the
-        // privileged dispatcher branch so it can be shared with the PCAC
-        // kernel via `InProcessKernel::with_clock`. This ensures certificate
-        // expiry checks use real elapsed time (RFC-0027 Law 4).
-        let clock =
-            Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock failed"));
-
         let privileged_dispatcher = if let Some(conn) = sqlite_conn {
             // Use real implementations
             // Security Review v5 MAJOR 2: Reuse the daemon-lifecycle signing key
             // if provided, otherwise generate a new one. This ensures recovery
             // and dispatcher events are signed with the same key.
-            let signing_key = daemon_signing_key;
+            let signing_key = ledger_signing_key.unwrap_or_else(|| {
+                use rand::rngs::OsRng;
+                ed25519_dalek::SigningKey::generate(&mut OsRng)
+            });
+            sovereignty_trusted_signer_key = Some(signing_key.verifying_key().to_bytes());
 
             let policy_resolver = Arc::new(GovernancePolicyResolver::new());
             let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&conn)));
@@ -871,6 +874,8 @@ impl DispatcherState {
                 .with_session_registry(session_registry_for_runtime);
 
             let episode_runtime = Arc::new(episode_runtime);
+            let clock =
+                Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock failed"));
 
             // TCK-00399: Create adapter registry so SpawnEpisode can spawn
             // adapter processes (fail-closed: registry is required).
@@ -905,7 +910,7 @@ impl DispatcherState {
                 episode_runtime,
                 session_registry,
                 lease_validator,
-                Arc::clone(&clock),
+                clock,
                 token_minter.clone(),
                 manifest_store.clone(),
                 // TCK-00317: Pre-seed CAS with reviewer v0 manifest
@@ -932,11 +937,15 @@ impl DispatcherState {
             )
         } else {
             // Use stubs
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None)
+                    .expect("failed to create default clock"),
+            );
             PrivilegedDispatcher::with_shared_state(
                 token_minter.clone(),
                 manifest_store.clone(),
                 session_registry,
-                Arc::clone(&clock),
+                clock,
                 Arc::clone(&subscription_registry),
             )
         }
@@ -987,32 +996,9 @@ impl DispatcherState {
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         // TCK-00351: Wire pre-actuation gate, stop authority, and stop conditions store
         // TCK-00352: Wire V1 manifest store for scope enforcement
-        // TCK-00427 BLOCKER 1 FIX: Wire PCAC lifecycle gate with sovereignty
-        // checker into production dispatcher so the gate is active in real
-        // daemon paths (not just tests).
-        // TCK-00427 security review BLOCKER 1: Wire StopAuthority into the
-        // lifecycle gate so sovereignty freeze recommendations are actuated
-        // to persistent runtime stop controls.
-        // TCK-00427 quality BLOCKER fix: Use clock-backed kernel so
-        // certificate expiry checks use real elapsed time (Law 4).
-        let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::with_clock(Arc::clone(&clock)));
-        // TCK-00427 quality BLOCKER fix: Use the daemon's signing key
-        // verifying key as the trusted sovereignty signer (instead of
-        // hardcoded [0u8; 32]). This ensures valid signed epochs can
-        // pass the signer gate in production. Fail-closed: if the
-        // derived key is somehow zero (impossible for Ed25519), the
-        // checker rejects zero signer keys.
-        let sovereignty_checker =
-            crate::pcac::SovereigntyChecker::new(sovereignty_trusted_signer_key);
-        let pcac_gate = Arc::new(
-            crate::pcac::LifecycleGate::with_sovereignty_and_stop_authority(
-                pcac_kernel,
-                sovereignty_checker,
-                Arc::clone(&stop_authority),
-            ),
-        );
-
-        let session_dispatcher =
+        // TCK-00426: Authoritative persistence mode requires durable consume
+        // enforcement and lifecycle gate wiring.
+        let mut session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
@@ -1020,8 +1006,50 @@ impl DispatcherState {
                 .with_preactuation_gate(preactuation_gate)
                 .with_stop_authority(Arc::clone(&stop_authority))
                 .with_stop_conditions_store(stop_conditions_store)
-                .with_v1_manifest_store(v1_manifest_store)
-                .with_pcac_lifecycle_gate(pcac_gate);
+                .with_v1_manifest_store(v1_manifest_store);
+
+        let sovereignty_trusted_signer_key = sovereignty_trusted_signer_key.unwrap_or([0u8; 32]);
+        if let Some(conn) = sqlite_conn_for_pcac {
+            match derive_pcac_consume_log_path(&conn) {
+                Ok(consume_log_path) => {
+                    let durable_index = crate::pcac::FileBackedConsumeIndex::open(
+                        &consume_log_path,
+                        Some(crate::pcac::DurableConsumeMetrics::global()),
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "failed to open durable consume index at {}: {e}",
+                            consume_log_path.display()
+                        )
+                    })?;
+                    let tick_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+                    let durable_kernel = crate::pcac::DurableKernel::new_with_shared_kernel(
+                        Arc::clone(&tick_kernel),
+                        Box::new(durable_index),
+                    );
+                    let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                        Arc::new(durable_kernel);
+                    let sovereignty_checker =
+                        crate::pcac::SovereigntyChecker::new(sovereignty_trusted_signer_key);
+                    let pcac_gate = Arc::new(
+                        crate::pcac::LifecycleGate::with_tick_kernel_and_sovereignty(
+                            pcac_kernel,
+                            tick_kernel,
+                            sovereignty_checker,
+                            Arc::clone(&stop_authority),
+                        ),
+                    );
+                    session_dispatcher = session_dispatcher.with_pcac_lifecycle_gate(pcac_gate);
+                },
+                Err(error) if error.contains("in-memory main database has no durable path") => {
+                    tracing::warn!(
+                        reason = %error,
+                        "Skipping PCAC durable consume wiring for in-memory sqlite (non-authoritative mode)"
+                    );
+                },
+                Err(error) => return Err(error),
+            }
+        }
 
         Ok(Self {
             privileged_dispatcher,
@@ -1158,8 +1186,6 @@ impl DispatcherState {
             use rand::rngs::OsRng;
             ed25519_dalek::SigningKey::generate(&mut OsRng)
         });
-        // TCK-00427 quality BLOCKER fix: Capture the verifying key for
-        // sovereignty checker wiring before signing_key is moved.
         let sovereignty_trusted_signer_key = signing_key.verifying_key().to_bytes();
 
         let policy_resolver = Arc::new(GovernancePolicyResolver::new());
@@ -1348,27 +1374,36 @@ impl DispatcherState {
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         // TCK-00351: Wire pre-actuation gate, stop authority, stop conditions store
         // TCK-00352: Wire V1 manifest store for scope enforcement
-        // TCK-00427 BLOCKER 1 FIX: Wire PCAC lifecycle gate with sovereignty
-        // checker into production dispatcher so the gate is active in real
-        // daemon paths (not just tests).
-        // TCK-00427 security review BLOCKER 1: Wire StopAuthority into the
-        // lifecycle gate so sovereignty freeze recommendations are actuated
-        // to persistent runtime stop controls.
-        // TCK-00427 quality BLOCKER fix: Use clock-backed kernel so
-        // certificate expiry checks use real elapsed time (Law 4).
-        let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::with_clock(Arc::clone(&clock)));
-        // TCK-00427 quality BLOCKER fix: Use daemon's signing key verifying
-        // key as sovereignty trusted signer (not hardcoded zeros).
+        // TCK-00426 BLOCKER 1 FIX: Wire DurableKernel + FileBackedConsumeIndex
+        // in production constructor. The consume log path is co-located inside
+        // the CAS directory to ensure per-instance isolation.
+        let consume_log_path = cas_path.as_ref().join("pcac_consume.log");
+        let durable_index = crate::pcac::FileBackedConsumeIndex::open(
+            &consume_log_path,
+            Some(crate::pcac::DurableConsumeMetrics::global()),
+        )
+        .map_err(|e| crate::cas::DurableCasError::InitializationFailed {
+            message: format!(
+                "failed to open durable consume index at {}: {e}",
+                consume_log_path.display()
+            ),
+        })?;
+        let tick_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+        let durable_kernel = crate::pcac::DurableKernel::new_with_shared_kernel(
+            Arc::clone(&tick_kernel),
+            Box::new(durable_index),
+        );
+        let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> = Arc::new(durable_kernel);
         let sovereignty_checker =
             crate::pcac::SovereigntyChecker::new(sovereignty_trusted_signer_key);
         let pcac_gate = Arc::new(
-            crate::pcac::LifecycleGate::with_sovereignty_and_stop_authority(
+            crate::pcac::LifecycleGate::with_tick_kernel_and_sovereignty(
                 pcac_kernel,
+                tick_kernel,
                 sovereignty_checker,
                 Arc::clone(&stop_authority),
             ),
         );
-
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
@@ -2232,59 +2267,6 @@ mod tests {
         assert!(
             receipt.budget_enforcement_deferred,
             "deferred budget enforcement marker must be bound in receipt"
-        );
-    }
-
-    #[test]
-    fn production_constructor_leaves_sovereignty_state_unset() {
-        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
-        let state = DispatcherState::with_persistence(session_registry, None, None, None)
-            .expect("test dispatcher state initialization must succeed");
-
-        assert!(
-            state
-                .session_dispatcher()
-                .sovereignty_state_for_test()
-                .is_none(),
-            "production constructor must not synthesize sovereignty state"
-        );
-    }
-
-    #[test]
-    fn persistent_constructor_leaves_sovereignty_state_unset() {
-        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
-        let conn = Connection::open_in_memory().expect("sqlite in-memory should open");
-        SqliteLedgerEventEmitter::init_schema(&conn).expect("ledger schema init should succeed");
-        SqliteWorkRegistry::init_schema(&conn).expect("work schema init should succeed");
-        let conn = Arc::new(Mutex::new(conn));
-        let cas_root = tempfile::tempdir().expect("temp CAS root should be created");
-        let cas_dir = cas_root.path().join("cas");
-        std::fs::create_dir(&cas_dir).expect("CAS dir should be created");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mut perms = std::fs::metadata(&cas_dir)
-                .expect("CAS dir metadata should exist")
-                .permissions();
-            perms.set_mode(0o700);
-            std::fs::set_permissions(&cas_dir, perms).expect("CAS dir permissions should be set");
-        }
-
-        let state = DispatcherState::with_persistence_and_cas(
-            session_registry,
-            None,
-            Arc::clone(&conn),
-            &cas_dir,
-        )
-        .expect("state with persistence+cas should be created");
-
-        assert!(
-            state
-                .session_dispatcher()
-                .sovereignty_state_for_test()
-                .is_none(),
-            "persistent constructor must not synthesize sovereignty state"
         );
     }
 

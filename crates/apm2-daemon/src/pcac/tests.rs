@@ -9,6 +9,7 @@ use apm2_core::pcac::{
     IdentityEvidenceLevel, RiskTier,
 };
 
+use super::durable_consume::DurableConsumeIndex;
 use super::lifecycle_gate::{InProcessKernel, LifecycleGate};
 
 fn test_hash(byte: u8) -> Hash {
@@ -1898,4 +1899,330 @@ fn clock_error_deny_carries_ajc_id_when_provided() {
         "deny class must be SovereigntyUncertainty, got: {:?}",
         deny.deny_class
     );
+}
+
+// =============================================================================
+// TCK-00426: Durable consume + split-stage lifecycle tests from main
+// =============================================================================
+
+#[test]
+fn durable_kernel_lifecycle_gate_integration() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let path = dir.path().join("consume.log");
+    let index = super::durable_consume::FileBackedConsumeIndex::open(&path, None).expect("index");
+    let inner = InProcessKernel::new(100);
+    let durable = super::durable_consume::DurableKernel::new(inner, Box::new(index));
+    let gate = LifecycleGate::new(Arc::new(durable));
+
+    let input = valid_input();
+    let receipts = gate
+        .execute(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("durable lifecycle gate should succeed");
+
+    assert_ne!(receipts.certificate.ajc_id, zero_hash());
+    assert_eq!(receipts.consume_record.ajc_id, receipts.certificate.ajc_id);
+
+    let contents = std::fs::read_to_string(&path).expect("read consume log");
+    assert!(contents.contains(&hex::encode(receipts.certificate.ajc_id)));
+
+    let err = gate
+        .execute(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect_err("duplicate consume should deny");
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::AlreadyConsumed { .. }
+    ));
+}
+
+#[test]
+fn revalidation_denies_when_tick_advanced_past_ajc_expiry() {
+    let kernel = InProcessKernel::new(100);
+    let input = valid_input();
+    let cert = kernel.join(&input).expect("join");
+    assert_eq!(cert.expires_at_tick, 400);
+
+    kernel.advance_tick(399);
+    kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            cert.revocation_head_hash,
+        )
+        .expect("revalidation at tick 399 should succeed");
+
+    kernel.advance_tick(401);
+    let err = kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            cert.revocation_head_hash,
+        )
+        .expect_err("expired cert must deny");
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::CertificateExpired {
+            expired_at: 400,
+            current_tick: 401
+        }
+    ));
+}
+
+#[test]
+fn revalidation_denies_with_different_revocation_head() {
+    let kernel = InProcessKernel::new(100);
+    let input = valid_input();
+    let cert = kernel.join(&input).expect("join");
+
+    kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            cert.revocation_head_hash,
+        )
+        .expect("matching revocation head should pass");
+
+    let err = kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            test_hash(0xDE),
+        )
+        .expect_err("different revocation head must deny");
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::RevocationFrontierAdvanced
+    ));
+}
+
+#[test]
+fn test_revalidate_denies_ledger_anchor_drift() {
+    let kernel = InProcessKernel::new(100);
+    let input = valid_input();
+    let cert = kernel.join(&input).expect("join");
+
+    kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            cert.revocation_head_hash,
+        )
+        .expect("matching anchor should pass");
+
+    let err = kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            test_hash(0xBB),
+            cert.revocation_head_hash,
+        )
+        .expect_err("anchor drift must deny");
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::LedgerAnchorDrift
+    ));
+}
+
+#[test]
+fn test_revalidate_denies_stale_freshness() {
+    let kernel = InProcessKernel::new(100);
+    let input = valid_input();
+    let cert = kernel.join(&input).expect("join");
+
+    kernel.advance_tick(401);
+    let err = kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            cert.revocation_head_hash,
+        )
+        .expect_err("stale freshness must deny");
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::StaleFreshnessAtRevalidate
+            | AuthorityDenyClass::CertificateExpired { .. }
+    ));
+}
+
+#[test]
+fn test_lifecycle_gate_advance_tick_wiring() {
+    let tick_kernel = Arc::new(InProcessKernel::new(1));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&tick_kernel) as _;
+    let gate = LifecycleGate::with_tick_kernel(kernel_trait, Arc::clone(&tick_kernel));
+
+    assert_eq!(tick_kernel.current_tick().expect("tick"), 1);
+    gate.advance_tick(500);
+    assert_eq!(tick_kernel.current_tick().expect("tick"), 500);
+
+    gate.advance_tick(100);
+    assert_eq!(tick_kernel.current_tick().expect("tick"), 500);
+}
+
+#[test]
+fn durable_kernel_consume_does_not_double_consume_inner() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let path = dir.path().join("consume.log");
+    let index = super::durable_consume::FileBackedConsumeIndex::open(&path, None).expect("index");
+    let inner = InProcessKernel::new(100);
+    let durable = super::durable_consume::DurableKernel::new(inner, Box::new(index));
+
+    let input = valid_input();
+    let cert = durable.join(&input).expect("join");
+
+    let (witness, record) = durable
+        .consume(
+            &cert,
+            input.intent_digest,
+            input.time_envelope_ref,
+            cert.revocation_head_hash,
+        )
+        .expect("consume");
+    assert_eq!(witness.ajc_id, cert.ajc_id);
+    assert_eq!(record.ajc_id, cert.ajc_id);
+
+    let contents = std::fs::read_to_string(&path).expect("read consume log");
+    assert!(contents.contains(&hex::encode(cert.ajc_id)));
+
+    let err = durable
+        .consume(
+            &cert,
+            input.intent_digest,
+            input.time_envelope_ref,
+            cert.revocation_head_hash,
+        )
+        .expect_err("double consume must deny");
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::AlreadyConsumed { .. }
+    ));
+}
+
+#[test]
+fn durable_kernel_crash_replay_lifecycle_gate() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let path = dir.path().join("consume.log");
+    let input = valid_input();
+    let ajc_id;
+
+    {
+        let index =
+            super::durable_consume::FileBackedConsumeIndex::open(&path, None).expect("index");
+        let inner = InProcessKernel::new(100);
+        let durable = super::durable_consume::DurableKernel::new(inner, Box::new(index));
+        let gate = LifecycleGate::new(Arc::new(durable));
+
+        let receipts = gate
+            .execute(
+                &input,
+                input.time_envelope_ref,
+                input.as_of_ledger_anchor,
+                input.directory_head_hash,
+            )
+            .expect("first consume");
+        ajc_id = receipts.certificate.ajc_id;
+    }
+
+    {
+        let index =
+            super::durable_consume::FileBackedConsumeIndex::open(&path, None).expect("index");
+        assert!(index.is_consumed(&ajc_id), "consume log should replay");
+
+        let inner = InProcessKernel::new(100);
+        let durable = super::durable_consume::DurableKernel::new(inner, Box::new(index));
+        let gate = LifecycleGate::new(Arc::new(durable));
+
+        let err = gate
+            .execute(
+                &input,
+                input.time_envelope_ref,
+                input.as_of_ledger_anchor,
+                input.directory_head_hash,
+            )
+            .expect_err("replayed consume must deny");
+        assert!(matches!(
+            err.deny_class,
+            AuthorityDenyClass::AlreadyConsumed { .. }
+        ));
+    }
+}
+
+#[test]
+fn test_stale_tick_after_broker_phase_denies_expired_authority() {
+    let starting_tick = 1000_u64;
+    let tick_kernel = Arc::new(InProcessKernel::new(starting_tick));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&tick_kernel) as _;
+    let gate = LifecycleGate::with_tick_kernel(kernel_trait, Arc::clone(&tick_kernel));
+
+    let input = valid_input();
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("join and revalidate");
+    assert_eq!(cert.expires_at_tick, 1300);
+
+    let post_broker_tick = cert.expires_at_tick + 1;
+    gate.advance_tick(post_broker_tick);
+    assert_eq!(tick_kernel.current_tick().expect("tick"), post_broker_tick);
+
+    let err = gate
+        .revalidate_before_execution(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect_err("revalidate-before-execution must deny expired cert");
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::CertificateExpired {
+            expired_at: 1300,
+            current_tick: 1301
+        }
+    ));
+}
+
+#[test]
+fn test_tick_advance_within_ttl_allows_revalidation() {
+    let starting_tick = 1000_u64;
+    let tick_kernel = Arc::new(InProcessKernel::new(starting_tick));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&tick_kernel) as _;
+    let gate = LifecycleGate::with_tick_kernel(kernel_trait, Arc::clone(&tick_kernel));
+
+    let input = valid_input();
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("join");
+
+    gate.advance_tick(1100);
+    gate.revalidate_before_execution(
+        &cert,
+        input.time_envelope_ref,
+        input.as_of_ledger_anchor,
+        input.directory_head_hash,
+    )
+    .expect("within TTL should pass");
 }

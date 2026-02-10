@@ -9,13 +9,20 @@
 //! # Integration Point
 //!
 //! The [`LifecycleGate`] is injected into `SessionDispatcher` and called
-//! between V1 scope enforcement and broker dispatch in `handle_request_tool`.
+//! in split stages from `handle_request_tool`:
+//! `join -> revalidate-before-decision -> broker decision ->
+//!  revalidate-before-execution -> consume-before-effect`.
 
+pub mod durable_consume;
 mod lifecycle_gate;
 pub mod sovereignty;
 
 #[cfg(test)]
 mod tests;
 
+pub use durable_consume::{
+    ConsumeError, DurableConsumeIndex, DurableConsumeMetrics, DurableKernel, DurableKernelShared,
+    FileBackedConsumeIndex,
+};
 pub use lifecycle_gate::{InProcessKernel, LifecycleGate, LifecycleReceipts};
 pub use sovereignty::{SovereigntyChecker, SovereigntyState};

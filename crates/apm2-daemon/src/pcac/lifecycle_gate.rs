@@ -679,6 +679,10 @@ pub struct LifecycleReceipts {
 /// and consume stages.
 pub struct LifecycleGate {
     kernel: Arc<dyn AuthorityJoinKernel>,
+    /// Optional reference to the in-process kernel for production tick
+    /// advancement. When set, `advance_tick` calls are forwarded so
+    /// freshness checks observe monotonic runtime time.
+    tick_kernel: Option<Arc<InProcessKernel>>,
     /// Optional sovereignty checker for Tier2+ enforcement (TCK-00427).
     sovereignty_checker: Option<super::sovereignty::SovereigntyChecker>,
     /// Optional stop authority for sovereignty freeze actuation (TCK-00427
@@ -703,8 +707,44 @@ impl LifecycleGate {
     pub fn new(kernel: Arc<dyn AuthorityJoinKernel>) -> Self {
         Self {
             kernel,
+            tick_kernel: None,
             sovereignty_checker: None,
             stop_authority: None,
+        }
+    }
+
+    /// Creates a lifecycle gate with production tick advancement wiring.
+    ///
+    /// The `tick_kernel` reference is advanced by session dispatch using
+    /// fresh HLC-derived ticks so revalidation/consume freshness checks
+    /// cannot stay pinned to join-time.
+    #[must_use]
+    pub fn with_tick_kernel(
+        kernel: Arc<dyn AuthorityJoinKernel>,
+        tick_kernel: Arc<InProcessKernel>,
+    ) -> Self {
+        Self {
+            kernel,
+            tick_kernel: Some(tick_kernel),
+            sovereignty_checker: None,
+            stop_authority: None,
+        }
+    }
+
+    /// Creates a lifecycle gate with both tick advancement and sovereignty
+    /// composition checks.
+    #[must_use]
+    pub fn with_tick_kernel_and_sovereignty(
+        kernel: Arc<dyn AuthorityJoinKernel>,
+        tick_kernel: Arc<InProcessKernel>,
+        checker: super::sovereignty::SovereigntyChecker,
+        stop_authority: Arc<crate::episode::preactuation::StopAuthority>,
+    ) -> Self {
+        Self {
+            kernel,
+            tick_kernel: Some(tick_kernel),
+            sovereignty_checker: Some(checker),
+            stop_authority: Some(stop_authority),
         }
     }
 
@@ -719,6 +759,7 @@ impl LifecycleGate {
     ) -> Self {
         Self {
             kernel,
+            tick_kernel: None,
             sovereignty_checker: Some(checker),
             stop_authority: None,
         }
@@ -739,8 +780,16 @@ impl LifecycleGate {
     ) -> Self {
         Self {
             kernel,
+            tick_kernel: None,
             sovereignty_checker: Some(checker),
             stop_authority: Some(stop_authority),
+        }
+    }
+
+    /// Advances the attached tick kernel (if configured) monotonically.
+    pub fn advance_tick(&self, new_tick: u64) {
+        if let Some(ref tick_kernel) = self.tick_kernel {
+            tick_kernel.advance_tick(new_tick);
         }
     }
 
@@ -805,27 +854,227 @@ impl LifecycleGate {
         }
     }
 
-    /// Executes the full PCAC lifecycle for a tool request.
-    ///
-    /// # Arguments
-    ///
-    /// * `input` — Authority join inputs (session, intent, capabilities, etc.)
-    /// * `current_time_envelope_ref` — Current HTF time witness for
-    ///   revalidation.
-    /// * `current_ledger_anchor` — Current ledger anchor for revalidation.
-    /// * `current_revocation_head_hash` — Current revocation frontier for
-    ///   revalidation.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(LifecycleReceipts)` if all three stages pass, or `Err(deny)` at
-    /// the first failing stage.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Box<AuthorityDenyV1>` from whichever lifecycle stage fails
-    /// first. The deny carries the stage context (join, revalidate, or
-    /// consume).
+    fn check_revalidate_sovereignty(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
+        current_tick: u64,
+        stage: &'static str,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        if !Self::requires_sovereignty_check(cert) {
+            return Ok(());
+        }
+
+        match (&self.sovereignty_checker, sovereignty_state) {
+            (Some(checker), Some(sov_state)) => checker
+                .check_revalidate(
+                    cert,
+                    sov_state,
+                    current_tick,
+                    current_time_envelope_ref,
+                    current_ledger_anchor,
+                )
+                .inspect_err(|deny| self.actuate_containment(stage, deny)),
+            (Some(_), None) => {
+                let deny = Box::new(AuthorityDenyV1 {
+                    deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
+                        reason: "sovereignty state not available for Tier2+ revalidation"
+                            .to_string(),
+                    },
+                    ajc_id: Some(cert.ajc_id),
+                    time_envelope_ref: current_time_envelope_ref,
+                    ledger_anchor: current_ledger_anchor,
+                    denied_at_tick: current_tick,
+                    containment_action: Some(FreezeAction::HardFreeze),
+                });
+                self.actuate_containment(stage, &deny);
+                Err(deny)
+            },
+            (None, _) => Ok(()),
+        }
+    }
+
+    fn check_consume_sovereignty(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
+        current_tick: u64,
+        stage: &'static str,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        if !Self::requires_sovereignty_check(cert) {
+            return Ok(());
+        }
+
+        match (&self.sovereignty_checker, sovereignty_state) {
+            (Some(checker), Some(sov_state)) => checker
+                .check_consume(
+                    cert,
+                    sov_state,
+                    current_tick,
+                    current_time_envelope_ref,
+                    current_ledger_anchor,
+                )
+                .inspect_err(|deny| self.actuate_containment(stage, deny)),
+            (Some(_), None) => {
+                let deny = Box::new(AuthorityDenyV1 {
+                    deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
+                        reason: "sovereignty state not available for Tier2+ consume".to_string(),
+                    },
+                    ajc_id: Some(cert.ajc_id),
+                    time_envelope_ref: current_time_envelope_ref,
+                    ledger_anchor: current_ledger_anchor,
+                    denied_at_tick: current_tick,
+                    containment_action: Some(FreezeAction::HardFreeze),
+                });
+                self.actuate_containment(stage, &deny);
+                Err(deny)
+            },
+            (None, _) => Ok(()),
+        }
+    }
+
+    /// Executes `join -> revalidate-before-decision`.
+    pub fn join_and_revalidate(
+        &self,
+        input: &AuthorityJoinInputV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_revocation_head_hash: Hash,
+    ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
+        let cert = self.kernel.join(input)?;
+        self.kernel.revalidate(
+            &cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head_hash,
+        )?;
+        Ok(cert)
+    }
+
+    /// Executes `join -> revalidate-before-decision` with optional
+    /// sovereignty checks for Tier2+.
+    pub fn join_and_revalidate_with_sovereignty(
+        &self,
+        input: &AuthorityJoinInputV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_revocation_head_hash: Hash,
+        sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
+        current_tick: u64,
+    ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
+        let cert = self.join_and_revalidate(
+            input,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head_hash,
+        )?;
+        self.check_revalidate_sovereignty(
+            &cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            sovereignty_state,
+            current_tick,
+            "revalidate-before-decision",
+        )?;
+        Ok(cert)
+    }
+
+    /// Executes revalidate-before-execution for an already joined
+    /// certificate.
+    pub fn revalidate_before_execution(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_revocation_head_hash: Hash,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        self.kernel.revalidate(
+            cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head_hash,
+        )
+    }
+
+    /// Executes revalidate-before-execution with optional sovereignty checks
+    /// for Tier2+.
+    pub fn revalidate_before_execution_with_sovereignty(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_revocation_head_hash: Hash,
+        sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
+        current_tick: u64,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        self.revalidate_before_execution(
+            cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head_hash,
+        )?;
+        self.check_revalidate_sovereignty(
+            cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            sovereignty_state,
+            current_tick,
+            "revalidate-before-execution",
+        )
+    }
+
+    /// Consumes authority immediately before effect execution.
+    pub fn consume_before_effect(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        intent_digest: Hash,
+        current_time_envelope_ref: Hash,
+        current_revocation_head_hash: Hash,
+    ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
+        self.kernel.consume(
+            cert,
+            intent_digest,
+            current_time_envelope_ref,
+            current_revocation_head_hash,
+        )
+    }
+
+    /// Consumes authority immediately before effect execution with optional
+    /// sovereignty checks for Tier2+.
+    #[allow(clippy::too_many_arguments)]
+    pub fn consume_before_effect_with_sovereignty(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        intent_digest: Hash,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_revocation_head_hash: Hash,
+        sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
+        current_tick: u64,
+    ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
+        self.check_consume_sovereignty(
+            cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            sovereignty_state,
+            current_tick,
+            "consume-before-effect",
+        )?;
+        self.consume_before_effect(
+            cert,
+            intent_digest,
+            current_time_envelope_ref,
+            current_revocation_head_hash,
+        )
+    }
+
+    /// Executes the full lifecycle:
+    /// `join -> revalidate-before-decision -> revalidate-before-execution ->
+    /// consume`.
     pub fn execute(
         &self,
         input: &AuthorityJoinInputV1,
@@ -843,26 +1092,7 @@ impl LifecycleGate {
         )
     }
 
-    /// Executes the full PCAC lifecycle with optional sovereignty state
-    /// (TCK-00427).
-    ///
-    /// When `sovereignty_state` is `Some` and a sovereignty checker is
-    /// configured, Tier2+ operations are validated against sovereignty
-    /// state during revalidate and consume stages.
-    ///
-    /// # Arguments
-    ///
-    /// * `input` — Authority join inputs.
-    /// * `current_time_envelope_ref` — Current HTF time witness.
-    /// * `current_ledger_anchor` — Current ledger anchor.
-    /// * `current_revocation_head_hash` — Current revocation frontier.
-    /// * `sovereignty_state` — Optional sovereignty state for Tier2+ checks.
-    /// * `current_tick` — Current tick for sovereignty staleness checks.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Box<AuthorityDenyV1>` from whichever lifecycle or sovereignty
-    /// stage fails first.
+    /// Executes the full lifecycle with optional sovereignty checks.
     pub fn execute_with_sovereignty(
         &self,
         input: &AuthorityJoinInputV1,
@@ -872,103 +1102,32 @@ impl LifecycleGate {
         sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
         current_tick: u64,
     ) -> Result<LifecycleReceipts, Box<AuthorityDenyV1>> {
-        // Stage 1: Join — construct AJC from validated inputs.
-        let cert = self.kernel.join(input)?;
+        let cert = self.join_and_revalidate_with_sovereignty(
+            input,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head_hash,
+            sovereignty_state,
+            current_tick,
+        )?;
 
-        // Stage 2: Revalidate — verify AJC against current state.
-        self.kernel.revalidate(
+        self.revalidate_before_execution_with_sovereignty(
             &cert,
             current_time_envelope_ref,
             current_ledger_anchor,
             current_revocation_head_hash,
+            sovereignty_state,
+            current_tick,
         )?;
 
-        // Stage 2b (TCK-00427): Sovereignty revalidation for Tier2+.
-        // BLOCKER 1 FIX: Fail-closed when checker is configured but state
-        // is absent for a Tier2+ operation. Previously the `if let` conjunction
-        // silently skipped the check.
-        if Self::requires_sovereignty_check(&cert) {
-            match (&self.sovereignty_checker, sovereignty_state) {
-                (Some(checker), Some(state)) => {
-                    if let Err(deny) = checker.check_revalidate(
-                        &cert,
-                        state,
-                        current_tick,
-                        current_time_envelope_ref,
-                        current_ledger_anchor,
-                    ) {
-                        self.actuate_containment("revalidate", &deny);
-                        return Err(deny);
-                    }
-                },
-                (Some(_), None) => {
-                    let deny = Box::new(AuthorityDenyV1 {
-                        deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
-                            reason: "sovereignty state not available for Tier2+ revalidation"
-                                .to_string(),
-                        },
-                        ajc_id: Some(cert.ajc_id),
-                        time_envelope_ref: current_time_envelope_ref,
-                        ledger_anchor: current_ledger_anchor,
-                        denied_at_tick: current_tick,
-                        containment_action: Some(FreezeAction::HardFreeze),
-                    });
-                    self.actuate_containment("revalidate", &deny);
-                    return Err(deny);
-                },
-                (None, _) => {
-                    // No sovereignty checker configured — sovereignty checks
-                    // are not enforced (Phase 1 opt-in).
-                },
-            }
-        }
-
-        // Stage 3b (TCK-00427): Sovereignty consume checks for Tier2+.
-        // BLOCKER 2 FIX: This check is performed BEFORE kernel.consume() to
-        // prevent irrevocable consume-set mutation before sovereignty
-        // validation passes.
-        if Self::requires_sovereignty_check(&cert) {
-            match (&self.sovereignty_checker, sovereignty_state) {
-                (Some(checker), Some(state)) => {
-                    if let Err(deny) = checker.check_consume(
-                        &cert,
-                        state,
-                        current_tick,
-                        current_time_envelope_ref,
-                        current_ledger_anchor,
-                    ) {
-                        self.actuate_containment("consume", &deny);
-                        return Err(deny);
-                    }
-                },
-                (Some(_), None) => {
-                    let deny = Box::new(AuthorityDenyV1 {
-                        deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
-                            reason: "sovereignty state not available for Tier2+ consume"
-                                .to_string(),
-                        },
-                        ajc_id: Some(cert.ajc_id),
-                        time_envelope_ref: current_time_envelope_ref,
-                        ledger_anchor: current_ledger_anchor,
-                        denied_at_tick: current_tick,
-                        containment_action: Some(FreezeAction::HardFreeze),
-                    });
-                    self.actuate_containment("consume", &deny);
-                    return Err(deny);
-                },
-                (None, _) => {},
-            }
-        }
-
-        // Stage 3: Consume — single-use consumption with intent equality.
-        // BLOCKER 2 FIX: kernel.consume() is now called AFTER sovereignty
-        // checks, preventing irrevocable consume-set mutation before
-        // all admission checks pass.
-        let (consumed_witness, consume_record) = self.kernel.consume(
+        let (consumed_witness, consume_record) = self.consume_before_effect_with_sovereignty(
             &cert,
             input.intent_digest,
             current_time_envelope_ref,
+            current_ledger_anchor,
             current_revocation_head_hash,
+            sovereignty_state,
+            current_tick,
         )?;
 
         Ok(LifecycleReceipts {
