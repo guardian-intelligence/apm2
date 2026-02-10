@@ -21,6 +21,7 @@ fn valid_join_input() -> AuthorityJoinInputV1 {
         session_id: "session-001".to_string(),
         holon_id: None,
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
         capability_manifest_hash: test_hash(0x02),
         scope_witness_hashes: vec![],
         lease_id: "lease-001".to_string(),
@@ -45,6 +46,7 @@ fn valid_certificate() -> AuthorityJoinCertificateV1 {
         ajc_id: test_hash(0xAA),
         authority_join_hash: test_hash(0xBB),
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
         risk_tier: types::RiskTier::Tier1,
         issued_time_envelope_ref: test_hash(0x07),
         as_of_ledger_anchor: test_hash(0x08),
@@ -554,6 +556,7 @@ fn join_receipt_serde_roundtrip() {
         ajc_id: test_hash(0xAA),
         authority_join_hash: test_hash(0xBB),
         risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Assert,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
@@ -581,6 +584,7 @@ fn deny_receipt_serde_roundtrip() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 1500,
+        boundary_intent_class: None,
         denied_at_stage: LifecycleStage::Consume,
         authoritative_bindings: None,
     };
@@ -1108,6 +1112,7 @@ fn deny_unknown_fields_join_receipt() {
         ajc_id: test_hash(0xAA),
         authority_join_hash: test_hash(0xBB),
         risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Assert,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
@@ -1157,6 +1162,8 @@ fn deny_unknown_fields_consume_receipt() {
         },
         ajc_id: test_hash(0xAA),
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        acceptance_fact_class: AcceptanceFactClass::Authoritative,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         consumed_at_tick: 1500,
@@ -1186,6 +1193,7 @@ fn deny_unknown_fields_deny_receipt() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 1500,
+        boundary_intent_class: None,
         denied_at_stage: LifecycleStage::Join,
         authoritative_bindings: None,
     };
@@ -1678,6 +1686,7 @@ fn risk_tier_and_determinism_class_reexported_from_pcac_module() {
         session_id: "session-001".to_string(),
         holon_id: None,
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
         capability_manifest_hash: test_hash(0x02),
         scope_witness_hashes: vec![],
         lease_id: "lease-001".to_string(),
@@ -2093,6 +2102,7 @@ fn valid_join_receipt_passes_validation() {
         ajc_id: test_hash(0xAA),
         authority_join_hash: test_hash(0xBB),
         risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Assert,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
@@ -2109,6 +2119,7 @@ fn join_receipt_zero_ajc_id_rejected() {
         ajc_id: zero_hash(),
         authority_join_hash: test_hash(0xBB),
         risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Assert,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
@@ -2125,6 +2136,7 @@ fn join_receipt_zero_authority_join_hash_rejected() {
         ajc_id: test_hash(0xAA),
         authority_join_hash: zero_hash(),
         risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Assert,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
@@ -2143,6 +2155,7 @@ fn join_receipt_zero_time_envelope_ref_rejected() {
         ajc_id: test_hash(0xAA),
         authority_join_hash: test_hash(0xBB),
         risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Assert,
         time_envelope_ref: zero_hash(),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
@@ -2161,6 +2174,7 @@ fn join_receipt_zero_ledger_anchor_rejected() {
         ajc_id: test_hash(0xAA),
         authority_join_hash: test_hash(0xBB),
         risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Assert,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: zero_hash(),
         joined_at_tick: 1000,
@@ -2179,6 +2193,7 @@ fn join_receipt_non_positive_joined_at_tick_rejected() {
         ajc_id: test_hash(0xAA),
         authority_join_hash: test_hash(0xBB),
         risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Assert,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 0,
@@ -2199,6 +2214,7 @@ fn join_receipt_propagates_binding_validation_errors() {
         ajc_id: test_hash(0xAA),
         authority_join_hash: test_hash(0xBB),
         risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Assert,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
@@ -2217,6 +2233,7 @@ fn join_receipt_validate_authoritative_requires_bindings() {
         ajc_id: test_hash(0xAA),
         authority_join_hash: test_hash(0xBB),
         risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Assert,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
@@ -2237,6 +2254,7 @@ fn join_receipt_mismatched_authoritative_time_envelope_ref_rejected() {
         ajc_id: test_hash(0xAA),
         authority_join_hash: test_hash(0xBB),
         risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Assert,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
@@ -2260,6 +2278,7 @@ fn join_receipt_authoritative_unknown_canonicalizer_rejected() {
         ajc_id: test_hash(0xAA),
         authority_join_hash: test_hash(0xBB),
         risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Assert,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
@@ -2282,6 +2301,7 @@ fn join_receipt_validate_authoritative_with_digest_passes() {
         ajc_id: test_hash(0xAA),
         authority_join_hash: test_hash(0xBB),
         risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Assert,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
@@ -2301,6 +2321,7 @@ fn join_receipt_validate_authoritative_with_digest_rejects_mismatch() {
         ajc_id: test_hash(0xAA),
         authority_join_hash: test_hash(0xBB),
         risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Assert,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
@@ -2320,6 +2341,8 @@ fn valid_consume_receipt_passes_validation() {
         digest_meta: valid_digest_meta(),
         ajc_id: test_hash(0xAA),
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        acceptance_fact_class: AcceptanceFactClass::Authoritative,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         consumed_at_tick: 1500,
@@ -2337,6 +2360,8 @@ fn consume_receipt_zero_ajc_id_rejected() {
         digest_meta: valid_digest_meta(),
         ajc_id: zero_hash(),
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        acceptance_fact_class: AcceptanceFactClass::Authoritative,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         consumed_at_tick: 1500,
@@ -2354,6 +2379,8 @@ fn consume_receipt_zero_intent_digest_rejected() {
         digest_meta: valid_digest_meta(),
         ajc_id: test_hash(0xAA),
         intent_digest: zero_hash(),
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        acceptance_fact_class: AcceptanceFactClass::Authoritative,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         consumed_at_tick: 1500,
@@ -2373,6 +2400,8 @@ fn consume_receipt_zero_time_envelope_ref_rejected() {
         digest_meta: valid_digest_meta(),
         ajc_id: test_hash(0xAA),
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        acceptance_fact_class: AcceptanceFactClass::Authoritative,
         time_envelope_ref: zero_hash(),
         ledger_anchor: test_hash(0x08),
         consumed_at_tick: 1500,
@@ -2392,6 +2421,8 @@ fn consume_receipt_zero_ledger_anchor_rejected() {
         digest_meta: valid_digest_meta(),
         ajc_id: test_hash(0xAA),
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        acceptance_fact_class: AcceptanceFactClass::Authoritative,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: zero_hash(),
         consumed_at_tick: 1500,
@@ -2411,6 +2442,8 @@ fn consume_receipt_zero_effect_selector_digest_rejected() {
         digest_meta: valid_digest_meta(),
         ajc_id: test_hash(0xAA),
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        acceptance_fact_class: AcceptanceFactClass::Authoritative,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         consumed_at_tick: 1500,
@@ -2430,6 +2463,8 @@ fn consume_receipt_non_positive_consumed_at_tick_rejected() {
         digest_meta: valid_digest_meta(),
         ajc_id: test_hash(0xAA),
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        acceptance_fact_class: AcceptanceFactClass::Authoritative,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         consumed_at_tick: 0,
@@ -2451,6 +2486,8 @@ fn consume_receipt_propagates_binding_validation_errors() {
         digest_meta: valid_digest_meta(),
         ajc_id: test_hash(0xAA),
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        acceptance_fact_class: AcceptanceFactClass::Authoritative,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         consumed_at_tick: 1500,
@@ -2470,6 +2507,8 @@ fn consume_receipt_validate_authoritative_requires_bindings() {
         digest_meta: valid_digest_meta(),
         ajc_id: test_hash(0xAA),
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        acceptance_fact_class: AcceptanceFactClass::Authoritative,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         consumed_at_tick: 1500,
@@ -2491,6 +2530,8 @@ fn consume_receipt_mismatched_authoritative_time_envelope_ref_rejected() {
         digest_meta: valid_digest_meta(),
         ajc_id: test_hash(0xAA),
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        acceptance_fact_class: AcceptanceFactClass::Authoritative,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         consumed_at_tick: 1500,
@@ -2515,6 +2556,8 @@ fn consume_receipt_authoritative_unknown_canonicalizer_rejected() {
         digest_meta: valid_digest_meta(),
         ajc_id: test_hash(0xAA),
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        acceptance_fact_class: AcceptanceFactClass::Authoritative,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         consumed_at_tick: 1500,
@@ -2538,6 +2581,8 @@ fn consume_receipt_validate_authoritative_with_digest_passes() {
         digest_meta: digest_meta_for_canonical_bytes("apm2.canonicalizer.jcs", canonical_bytes),
         ajc_id: test_hash(0xAA),
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        acceptance_fact_class: AcceptanceFactClass::Authoritative,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         consumed_at_tick: 1500,
@@ -2563,6 +2608,7 @@ fn valid_deny_receipt_passes_validation() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        boundary_intent_class: None,
         denied_at_stage: LifecycleStage::Join,
         authoritative_bindings: Some(valid_bindings()),
     };
@@ -2579,6 +2625,7 @@ fn deny_receipt_validate_authoritative_requires_bindings() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        boundary_intent_class: None,
         denied_at_stage: LifecycleStage::Join,
         authoritative_bindings: None,
     };
@@ -2597,6 +2644,7 @@ fn deny_receipt_zero_time_envelope_ref_rejected() {
         time_envelope_ref: zero_hash(),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        boundary_intent_class: None,
         denied_at_stage: LifecycleStage::Join,
         authoritative_bindings: None,
     };
@@ -2615,6 +2663,7 @@ fn deny_receipt_zero_ledger_anchor_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: zero_hash(),
         denied_at_tick: 500,
+        boundary_intent_class: None,
         denied_at_stage: LifecycleStage::Join,
         authoritative_bindings: None,
     };
@@ -2633,6 +2682,7 @@ fn deny_receipt_non_positive_denied_at_tick_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 0,
+        boundary_intent_class: None,
         denied_at_stage: LifecycleStage::Join,
         authoritative_bindings: None,
     };
@@ -2653,6 +2703,7 @@ fn deny_receipt_mismatched_authoritative_time_envelope_ref_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        boundary_intent_class: None,
         denied_at_stage: LifecycleStage::Join,
         authoritative_bindings: Some(bindings),
     };
@@ -2676,6 +2727,7 @@ fn deny_receipt_authoritative_unknown_canonicalizer_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        boundary_intent_class: None,
         denied_at_stage: LifecycleStage::Join,
         authoritative_bindings: Some(valid_bindings()),
     };
@@ -2698,6 +2750,7 @@ fn deny_receipt_validate_authoritative_with_digest_passes() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        boundary_intent_class: None,
         denied_at_stage: LifecycleStage::Join,
         authoritative_bindings: Some(valid_bindings()),
     };
@@ -2720,6 +2773,7 @@ fn deny_receipt_zero_content_digest_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        boundary_intent_class: None,
         denied_at_stage: LifecycleStage::Join,
         authoritative_bindings: None,
     };
@@ -3087,6 +3141,7 @@ fn deny_receipt_validates_deny_class_strings() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        boundary_intent_class: None,
         denied_at_stage: LifecycleStage::Join,
         authoritative_bindings: None,
     };
@@ -3107,6 +3162,7 @@ fn deny_receipt_oversize_description_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        boundary_intent_class: None,
         denied_at_stage: LifecycleStage::Join,
         authoritative_bindings: None,
     };
@@ -3127,6 +3183,7 @@ fn deny_receipt_oversize_reason_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        boundary_intent_class: None,
         denied_at_stage: LifecycleStage::Join,
         authoritative_bindings: None,
     };
@@ -3147,6 +3204,7 @@ fn deny_receipt_zero_ajc_id_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        boundary_intent_class: None,
         denied_at_stage: LifecycleStage::Consume,
         authoritative_bindings: None,
     };
@@ -3165,6 +3223,7 @@ fn deny_receipt_valid_ajc_id_passes() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        boundary_intent_class: None,
         denied_at_stage: LifecycleStage::Consume,
         authoritative_bindings: None,
     };
@@ -3182,6 +3241,8 @@ fn consume_receipt_zero_pre_actuation_receipt_hash_rejected() {
         digest_meta: valid_digest_meta(),
         ajc_id: test_hash(0xAA),
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        acceptance_fact_class: AcceptanceFactClass::Authoritative,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         consumed_at_tick: 1500,
@@ -3201,6 +3262,8 @@ fn consume_receipt_valid_pre_actuation_receipt_hash_passes() {
         digest_meta: valid_digest_meta(),
         ajc_id: test_hash(0xAA),
         intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        acceptance_fact_class: AcceptanceFactClass::Authoritative,
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         consumed_at_tick: 1500,
@@ -3874,4 +3937,97 @@ fn auth_verifier_replay_order_exceeds_max_entries_denied() {
     assert!(
         matches!(err.deny_class, AuthorityDenyClass::UnknownState { ref description } if description.contains("exceeds maximum"))
     );
+}
+
+#[test]
+fn test_acceptance_fact_derivation() {
+    assert_eq!(
+        BoundaryIntentClass::Observe.acceptance_fact_class(),
+        AcceptanceFactClass::Observational
+    );
+    assert_eq!(
+        BoundaryIntentClass::Assert.acceptance_fact_class(),
+        AcceptanceFactClass::Authoritative
+    );
+    assert_eq!(
+        BoundaryIntentClass::Delegate.acceptance_fact_class(),
+        AcceptanceFactClass::Authoritative
+    );
+    assert_eq!(
+        BoundaryIntentClass::Actuate.acceptance_fact_class(),
+        AcceptanceFactClass::Authoritative
+    );
+    assert_eq!(
+        BoundaryIntentClass::Govern.acceptance_fact_class(),
+        AcceptanceFactClass::Authoritative
+    );
+}
+
+#[test]
+fn test_intent_class_preserved_in_receipts() {
+    let join_receipt = AuthorityJoinReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        authority_join_hash: test_hash(0xBB),
+        risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Delegate,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        joined_at_tick: 1000,
+        authoritative_bindings: Some(valid_bindings()),
+    };
+    assert!(join_receipt.validate().is_ok());
+
+    let consume_receipt = AuthorityConsumeReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Delegate,
+        acceptance_fact_class: BoundaryIntentClass::Delegate.acceptance_fact_class(),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        consumed_at_tick: 1001,
+        effect_selector_digest: test_hash(0xEE),
+        pre_actuation_receipt_hash: None,
+        authoritative_bindings: Some(valid_bindings()),
+    };
+    assert!(consume_receipt.validate().is_ok());
+
+    let join_roundtrip: AuthorityJoinReceiptV1 =
+        serde_json::from_str(&serde_json::to_string(&join_receipt).unwrap()).unwrap();
+    let consume_roundtrip: AuthorityConsumeReceiptV1 =
+        serde_json::from_str(&serde_json::to_string(&consume_receipt).unwrap()).unwrap();
+    assert_eq!(
+        join_roundtrip.boundary_intent_class,
+        BoundaryIntentClass::Delegate
+    );
+    assert_eq!(
+        consume_roundtrip.boundary_intent_class,
+        BoundaryIntentClass::Delegate
+    );
+    assert_eq!(
+        consume_roundtrip.acceptance_fact_class,
+        AcceptanceFactClass::Authoritative
+    );
+}
+
+#[test]
+fn test_deny_receipt_includes_intent_class() {
+    let receipt = AuthorityDenyReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        deny_class: AuthorityDenyClass::ObservationalPayloadInAuthoritativePath {
+            intent_class: BoundaryIntentClass::Observe,
+        },
+        ajc_id: Some(test_hash(0xAA)),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        denied_at_tick: 1500,
+        boundary_intent_class: Some(BoundaryIntentClass::Observe),
+        denied_at_stage: LifecycleStage::Consume,
+        authoritative_bindings: None,
+    };
+    assert!(receipt.validate().is_ok());
+
+    let value = serde_json::to_value(&receipt).unwrap();
+    assert_eq!(value["boundary_intent_class"], "observe");
 }
