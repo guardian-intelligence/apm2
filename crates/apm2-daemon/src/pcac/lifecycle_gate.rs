@@ -2681,12 +2681,25 @@ impl LifecycleGate {
                 &consume_result.0,
                 &consume_result.1,
             );
-        if let Err(error) = apm2_core::pcac::maybe_export_runtime_pass_bundle(&lifecycle_evidence) {
-            warn!(
-                error = %error,
-                ajc_id = %hex::encode(cert.ajc_id),
-                "pcac objective/gate evidence export failed after consume; continuing to avoid authority burn"
-            );
+        match apm2_core::pcac::maybe_export_runtime_bundle(&lifecycle_evidence) {
+            Ok(
+                apm2_core::pcac::PcacRuntimeExportOutcome::Disabled
+                | apm2_core::pcac::PcacRuntimeExportOutcome::Admissible,
+            ) => {},
+            Ok(apm2_core::pcac::PcacRuntimeExportOutcome::NonAdmissible { reason }) => {
+                warn!(
+                    reason = %reason,
+                    ajc_id = %hex::encode(cert.ajc_id),
+                    "pcac objective/gate evidence exported as non-admissible lifecycle snapshot; continuing to avoid authority burn"
+                );
+            },
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    ajc_id = %hex::encode(cert.ajc_id),
+                    "pcac objective/gate evidence export failed after consume; continuing to avoid authority burn"
+                );
+            },
         }
 
         Ok(consume_result)

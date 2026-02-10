@@ -9,9 +9,10 @@
 use std::fs;
 
 use apm2_core::pcac::{
-    PcacEvidenceBundle, PcacGateId, PcacObjectiveId, PcacPredicateSummary, SummarySource,
+    PcacEvidenceBundle, PcacEvidenceExportError, PcacGateId, PcacLifecycleEvidenceState,
+    PcacObjectiveId, PcacPredicateSummary, PcacRuntimeExportOutcome, SummarySource,
     assert_exported_predicates, evaluate_exported_predicates, evaluate_gate_predicate_value,
-    evaluate_objective_predicate_value, export_pcac_evidence_bundle,
+    evaluate_objective_predicate_value, export_pcac_evidence_bundle, export_runtime_bundle_to_root,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -191,5 +192,145 @@ fn tck_00430_synthetic_source_is_non_admissible() {
     assert!(
         reason.contains("summary_source"),
         "failure reason must mention summary_source gating"
+    );
+}
+
+#[test]
+fn tck_00430_near_one_coverage_values_fail_exact_equality() {
+    for near_one in [0.999_999_999_5_f64, 1.000_000_000_1_f64] {
+        let mut summary_value =
+            serde_json::to_value(PcacPredicateSummary::all_pass()).expect("summary must serialize");
+        summary_value["summary_source"] = serde_json::json!("observed");
+        summary_value["durable_consume_record_coverage"] = serde_json::json!(near_one);
+
+        let objective_eval =
+            evaluate_objective_predicate_value(PcacObjectiveId::ObjPcac02, &summary_value);
+        assert!(
+            !objective_eval.passed,
+            "OBJ-PCAC-02 must require exact 1.0 coverage value; got {near_one}"
+        );
+        let gate_eval =
+            evaluate_gate_predicate_value(PcacGateId::GatePcacSingleConsume, &summary_value);
+        assert!(
+            !gate_eval.passed,
+            "GATE-PCAC-SINGLE-CONSUME must require exact 1.0 coverage value; got {near_one}"
+        );
+
+        summary_value["durable_consume_record_coverage"] = serde_json::json!(1.0_f64);
+        summary_value["authoritative_outcomes_with_full_replay_contract"] =
+            serde_json::json!(near_one);
+
+        let objective_eval =
+            evaluate_objective_predicate_value(PcacObjectiveId::ObjPcac06, &summary_value);
+        assert!(
+            !objective_eval.passed,
+            "OBJ-PCAC-06 must require exact 1.0 replay coverage value; got {near_one}"
+        );
+        let gate_eval = evaluate_gate_predicate_value(PcacGateId::GatePcacReplay, &summary_value);
+        assert!(
+            !gate_eval.passed,
+            "GATE-PCAC-REPLAY must require exact 1.0 replay coverage value; got {near_one}"
+        );
+    }
+}
+
+#[test]
+fn tck_00430_runtime_partial_lifecycle_export_is_non_admissible() {
+    let temp_dir = TempDir::new().expect("tempdir must be created");
+    let lifecycle_state = PcacLifecycleEvidenceState {
+        summary_source: SummarySource::PartialLifecycle,
+        missing_lifecycle_stage_count: 0,
+        ordered_receipt_chain_pass: true,
+        duplicate_consume_accept_count: Some(0),
+        durable_consume_record_coverage: Some(1.0),
+        tier2plus_stale_allow_count: None,
+        freshness_unknown_state_count: None,
+        delegation_narrowing_violations: None,
+        intent_mismatch_allow_count: Some(0),
+        authoritative_outcomes_with_full_replay_contract: None,
+        missing_selector_count: None,
+        unknown_state_count: 0,
+    };
+
+    let outcome = export_runtime_bundle_to_root(temp_dir.path(), &lifecycle_state)
+        .expect("runtime export with partial lifecycle metrics must still emit bundle");
+    let reason = match outcome {
+        PcacRuntimeExportOutcome::NonAdmissible { reason } => reason,
+        other => panic!("expected non-admissible runtime export outcome, got {other:?}"),
+    };
+    assert!(
+        reason.contains("summary_source"),
+        "non-admissible reason must explain summary_source classification"
+    );
+
+    let sample_path = temp_dir
+        .path()
+        .join(PcacObjectiveId::ObjPcac01.summary_relative_path());
+    let sample_summary = fs::read_to_string(&sample_path).expect("summary file must be readable");
+    assert!(
+        sample_summary.contains("\"summary_source\": \"partial_lifecycle\""),
+        "runtime lifecycle export must carry partial_lifecycle summary_source"
+    );
+}
+
+#[test]
+fn tck_00430_runtime_export_rejects_relative_root() {
+    let lifecycle_state = PcacLifecycleEvidenceState {
+        summary_source: SummarySource::PartialLifecycle,
+        missing_lifecycle_stage_count: 0,
+        ordered_receipt_chain_pass: true,
+        duplicate_consume_accept_count: Some(0),
+        durable_consume_record_coverage: Some(1.0),
+        tier2plus_stale_allow_count: None,
+        freshness_unknown_state_count: None,
+        delegation_narrowing_violations: None,
+        intent_mismatch_allow_count: Some(0),
+        authoritative_outcomes_with_full_replay_contract: None,
+        missing_selector_count: None,
+        unknown_state_count: 0,
+    };
+
+    let err = export_runtime_bundle_to_root("relative-export-root", &lifecycle_state)
+        .expect_err("relative export root must be rejected");
+    assert!(
+        matches!(err, PcacEvidenceExportError::InvalidExportRoot { .. }),
+        "relative path must fail root confinement validation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tck_00430_runtime_export_rejects_symlink_root() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = TempDir::new().expect("tempdir must be created");
+    let target_root = temp_dir.path().join("root");
+    fs::create_dir(&target_root).expect("target root must be created");
+    let symlink_root = temp_dir.path().join("root-link");
+    symlink(&target_root, &symlink_root).expect("symlink root must be created");
+
+    let lifecycle_state = PcacLifecycleEvidenceState {
+        summary_source: SummarySource::PartialLifecycle,
+        missing_lifecycle_stage_count: 0,
+        ordered_receipt_chain_pass: true,
+        duplicate_consume_accept_count: Some(0),
+        durable_consume_record_coverage: Some(1.0),
+        tier2plus_stale_allow_count: None,
+        freshness_unknown_state_count: None,
+        delegation_narrowing_violations: None,
+        intent_mismatch_allow_count: Some(0),
+        authoritative_outcomes_with_full_replay_contract: None,
+        missing_selector_count: None,
+        unknown_state_count: 0,
+    };
+
+    let err = export_runtime_bundle_to_root(&symlink_root, &lifecycle_state)
+        .expect_err("symlink export root must be rejected");
+    let PcacEvidenceExportError::InvalidExportRoot { reason, .. } = err else {
+        panic!("expected invalid export root error for symlink root");
+    };
+    assert!(
+        reason.contains("symlink"),
+        "symlink root rejection reason must mention symlink traversal"
     );
 }

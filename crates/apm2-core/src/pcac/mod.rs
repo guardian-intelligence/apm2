@@ -63,10 +63,10 @@ pub use deny::{AuthorityDenyClass, AuthorityDenyV1};
 pub use evidence_export::{
     PCAC_EVIDENCE_EXPORT_ROOT_ENV, PcacEvidenceBundle, PcacEvidenceExportError, PcacGateId,
     PcacLifecycleEvidenceState, PcacObjectiveId, PcacPredicateEvaluationReport,
-    PcacPredicateSummary, PredicateEvaluation, SummarySource, assert_exported_predicates,
-    evaluate_exported_predicates, evaluate_gate_predicate_value,
-    evaluate_objective_predicate_value, export_pcac_evidence_bundle,
-    maybe_export_runtime_pass_bundle,
+    PcacPredicateSummary, PcacRuntimeExportOutcome, PredicateEvaluation, SummarySource,
+    assert_exported_predicates, evaluate_exported_predicates, evaluate_gate_predicate_value,
+    evaluate_objective_predicate_value, export_pcac_evidence_bundle, export_runtime_bundle_to_root,
+    maybe_export_runtime_bundle, maybe_export_runtime_pass_bundle,
 };
 pub use intent_class::{AcceptanceFactClass, BoundaryIntentClass};
 pub use kernel::AuthorityJoinKernel;

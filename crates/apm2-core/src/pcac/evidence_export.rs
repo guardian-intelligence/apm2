@@ -11,14 +11,12 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityJoinCertificateV1};
-
-const FLOAT_EQ_TOLERANCE: f64 = 1e-9;
 
 /// Environment variable used to enable runtime summary export.
 ///
@@ -138,6 +136,11 @@ impl PcacGateId {
 pub enum SummarySource {
     /// Derived from authoritative runtime lifecycle outcomes.
     Observed,
+    /// Derived from lifecycle hooks with only a partial metric surface wired.
+    ///
+    /// This source is explicit non-admissible evidence until all RFC-0027
+    /// metrics are present.
+    PartialLifecycle,
     /// Generated placeholder/test data (non-admissible).
     Synthetic,
 }
@@ -173,8 +176,11 @@ pub struct PcacLifecycleEvidenceState {
 }
 
 impl PcacLifecycleEvidenceState {
-    /// Builds observed runtime state from a successful lifecycle consume
-    /// transition.
+    /// Builds runtime lifecycle state from a successful consume transition.
+    ///
+    /// The lifecycle hook currently has partial metric coverage only, so it is
+    /// tagged as [`SummarySource::PartialLifecycle`] and exported as explicit
+    /// non-admissible evidence.
     #[must_use]
     pub fn from_successful_consume(
         cert: &AuthorityJoinCertificateV1,
@@ -193,7 +199,7 @@ impl PcacLifecycleEvidenceState {
             receipt_identity_matches && receipt_tick_monotonic && receipt_time_binding_matches;
 
         Self {
-            summary_source: SummarySource::Observed,
+            summary_source: SummarySource::PartialLifecycle,
             missing_lifecycle_stage_count: 0,
             ordered_receipt_chain_pass,
             duplicate_consume_accept_count: Some(0),
@@ -449,6 +455,21 @@ impl PcacPredicateEvaluationReport {
     }
 }
 
+/// Runtime export outcome for lifecycle-derived RFC-0027 evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PcacRuntimeExportOutcome {
+    /// Runtime export is disabled because
+    /// [`PCAC_EVIDENCE_EXPORT_ROOT_ENV`] is unset.
+    Disabled,
+    /// Export completed and all predicates passed.
+    Admissible,
+    /// Export completed but the summary set is non-admissible.
+    NonAdmissible {
+        /// Deterministic first failure reason.
+        reason: String,
+    },
+}
+
 /// Export and predicate-evaluation errors for PCAC RFC-0027 evidence.
 #[derive(Debug, thiserror::Error)]
 pub enum PcacEvidenceExportError {
@@ -485,6 +506,25 @@ pub enum PcacEvidenceExportError {
     #[error("failed to write summary file '{path}': {source}")]
     WriteFile {
         /// Summary path being written.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Runtime export root violates confinement policy.
+    #[error("invalid export root '{path}': {reason}")]
+    InvalidExportRoot {
+        /// Export root under evaluation.
+        path: PathBuf,
+        /// Deterministic validation failure reason.
+        reason: String,
+    },
+
+    /// Reading export root metadata failed.
+    #[error("failed to inspect export root '{path}': {source}")]
+    InspectExportRoot {
+        /// Export root path being inspected.
         path: PathBuf,
         /// Underlying I/O error.
         #[source]
@@ -643,27 +683,63 @@ pub fn assert_exported_predicates(
     }
 }
 
-/// Runtime convenience hook.
+/// Exports lifecycle evidence to a validated runtime root and evaluates
+/// admissibility.
 ///
-/// If [`PCAC_EVIDENCE_EXPORT_ROOT_ENV`] is set, this exports a fail-closed
-/// lifecycle-derived bundle and validates all objective/gate predicates against
-/// the exported artifacts.
+/// This helper never asserts admissibility. It exports available metrics and
+/// returns [`PcacRuntimeExportOutcome::NonAdmissible`] when predicates fail.
 ///
 /// # Errors
 ///
-/// Returns [`PcacEvidenceExportError`] when export or predicate evaluation
-/// fails while runtime export is enabled.
+/// Returns [`PcacEvidenceExportError`] when root validation or file I/O fails.
+pub fn export_runtime_bundle_to_root(
+    root: impl AsRef<Path>,
+    lifecycle_state: &PcacLifecycleEvidenceState,
+) -> Result<PcacRuntimeExportOutcome, PcacEvidenceExportError> {
+    let root = validate_export_root(root.as_ref())?;
+    let bundle = lifecycle_state.to_bundle();
+    export_pcac_evidence_bundle(&root, &bundle)?;
+    let report = evaluate_exported_predicates(&root);
+    if report.all_passed() {
+        Ok(PcacRuntimeExportOutcome::Admissible)
+    } else {
+        Ok(PcacRuntimeExportOutcome::NonAdmissible {
+            reason: report
+                .first_failure_reason()
+                .unwrap_or_else(|| "unknown predicate failure".to_string()),
+        })
+    }
+}
+
+/// Runtime convenience hook.
+///
+/// If [`PCAC_EVIDENCE_EXPORT_ROOT_ENV`] is set, this exports lifecycle-derived
+/// evidence under the validated root and returns whether it is admissible.
+///
+/// # Errors
+///
+/// Returns [`PcacEvidenceExportError`] when root validation or export fails.
+pub fn maybe_export_runtime_bundle(
+    lifecycle_state: &PcacLifecycleEvidenceState,
+) -> Result<PcacRuntimeExportOutcome, PcacEvidenceExportError> {
+    let Some(root) = std::env::var_os(PCAC_EVIDENCE_EXPORT_ROOT_ENV) else {
+        return Ok(PcacRuntimeExportOutcome::Disabled);
+    };
+    export_runtime_bundle_to_root(PathBuf::from(root), lifecycle_state)
+}
+
+/// Backward-compatible wrapper that exports runtime evidence when enabled.
+///
+/// This no longer asserts admissibility; callers that need explicit outcome
+/// handling should use [`maybe_export_runtime_bundle`].
+///
+/// # Errors
+///
+/// Returns [`PcacEvidenceExportError`] when root validation or export fails.
 pub fn maybe_export_runtime_pass_bundle(
     lifecycle_state: &PcacLifecycleEvidenceState,
 ) -> Result<(), PcacEvidenceExportError> {
-    let Some(root) = std::env::var_os(PCAC_EVIDENCE_EXPORT_ROOT_ENV) else {
-        return Ok(());
-    };
-
-    let root = PathBuf::from(root);
-    let bundle = lifecycle_state.to_bundle();
-    export_pcac_evidence_bundle(&root, &bundle)?;
-    let _report = assert_exported_predicates(&root)?;
+    let _ = maybe_export_runtime_bundle(lifecycle_state)?;
     Ok(())
 }
 
@@ -712,6 +788,119 @@ fn write_summary_file(
     })
 }
 
+fn validate_export_root(path: &Path) -> Result<PathBuf, PcacEvidenceExportError> {
+    if path.as_os_str().is_empty() {
+        return Err(PcacEvidenceExportError::InvalidExportRoot {
+            path: path.to_path_buf(),
+            reason: "export root must be non-empty".to_string(),
+        });
+    }
+    if !path.is_absolute() {
+        return Err(PcacEvidenceExportError::InvalidExportRoot {
+            path: path.to_path_buf(),
+            reason: "export root must be an absolute path".to_string(),
+        });
+    }
+
+    let normalized = normalize_absolute_path(path)?;
+    let metadata =
+        fs::metadata(&normalized).map_err(|source| PcacEvidenceExportError::InspectExportRoot {
+            path: normalized.clone(),
+            source,
+        })?;
+    if !metadata.is_dir() {
+        return Err(PcacEvidenceExportError::InvalidExportRoot {
+            path: normalized,
+            reason: "export root must be an existing directory".to_string(),
+        });
+    }
+
+    let canonical = fs::canonicalize(&normalized).map_err(|source| {
+        PcacEvidenceExportError::InspectExportRoot {
+            path: normalized.clone(),
+            source,
+        }
+    })?;
+    if canonical != normalized {
+        return Err(PcacEvidenceExportError::InvalidExportRoot {
+            path: normalized,
+            reason: format!(
+                "export root must not traverse symlinks; canonical path is '{}'",
+                canonical.display()
+            ),
+        });
+    }
+
+    ensure_export_root_permissions(&canonical, &metadata)?;
+    Ok(canonical)
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf, PcacEvidenceExportError> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {},
+            Component::ParentDir => {
+                return Err(PcacEvidenceExportError::InvalidExportRoot {
+                    path: path.to_path_buf(),
+                    reason: "export root must not contain parent traversal ('..')".to_string(),
+                });
+            },
+            Component::Normal(segment) => normalized.push(segment),
+        }
+    }
+    if normalized.as_os_str().is_empty() || !normalized.is_absolute() {
+        return Err(PcacEvidenceExportError::InvalidExportRoot {
+            path: path.to_path_buf(),
+            reason: "export root must resolve to an absolute path".to_string(),
+        });
+    }
+    Ok(normalized)
+}
+
+#[cfg(unix)]
+fn ensure_export_root_permissions(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), PcacEvidenceExportError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let writable = !metadata.permissions().readonly();
+    if writable {
+        return Ok(());
+    }
+
+    let owner_uid = metadata.uid();
+    let current_uid = nix::unistd::geteuid().as_raw();
+    let reason = if owner_uid == current_uid {
+        "export root must be writable by the current user".to_string()
+    } else {
+        format!(
+            "export root must be owned by uid {current_uid} or writable; owner uid is {owner_uid} and directory is not writable"
+        )
+    };
+    Err(PcacEvidenceExportError::InvalidExportRoot {
+        path: path.to_path_buf(),
+        reason,
+    })
+}
+
+#[cfg(not(unix))]
+fn ensure_export_root_permissions(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), PcacEvidenceExportError> {
+    if metadata.permissions().readonly() {
+        return Err(PcacEvidenceExportError::InvalidExportRoot {
+            path: path.to_path_buf(),
+            reason: "export root must be writable".to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn evaluate_obj_pcac_01(summary: &Value) -> Result<bool, String> {
     let missing_lifecycle_stage_count = require_u64(summary, "missing_lifecycle_stage_count")?;
     let ordered_receipt_chain_pass = require_bool(summary, "ordered_receipt_chain_pass")?;
@@ -728,7 +917,7 @@ fn evaluate_obj_pcac_02(summary: &Value) -> Result<bool, String> {
     let durable_consume_record_coverage = require_f64(summary, "durable_consume_record_coverage")?;
     let unknown_state_count = require_u64(summary, "unknown_state_count")?;
     Ok(duplicate_consume_accept_count == 0
-        && float_eq(durable_consume_record_coverage, 1.0)
+        && is_exact_one(durable_consume_record_coverage)
         && unknown_state_count == 0)
 }
 
@@ -759,7 +948,7 @@ fn evaluate_obj_pcac_06(summary: &Value) -> Result<bool, String> {
     let missing_selector_count = require_u64(summary, "missing_selector_count")?;
     let unknown_state_count = require_u64(summary, "unknown_state_count")?;
     Ok(
-        float_eq(authoritative_outcomes_with_full_replay_contract, 1.0)
+        is_exact_one(authoritative_outcomes_with_full_replay_contract)
             && missing_selector_count == 0
             && unknown_state_count == 0,
     )
@@ -776,7 +965,7 @@ fn evaluate_gate_pcac_single_consume(summary: &Value) -> Result<bool, String> {
     let durable_consume_record_coverage = require_f64(summary, "durable_consume_record_coverage")?;
     let unknown_state_count = require_u64(summary, "unknown_state_count")?;
     Ok(duplicate_consume_accept_count == 0
-        && float_eq(durable_consume_record_coverage, 1.0)
+        && is_exact_one(durable_consume_record_coverage)
         && unknown_state_count == 0)
 }
 
@@ -795,10 +984,16 @@ fn evaluate_gate_pcac_replay(summary: &Value) -> Result<bool, String> {
     let missing_selector_count = require_u64(summary, "missing_selector_count")?;
     let unknown_state_count = require_u64(summary, "unknown_state_count")?;
     Ok(
-        float_eq(authoritative_outcomes_with_full_replay_contract, 1.0)
+        is_exact_one(authoritative_outcomes_with_full_replay_contract)
             && missing_selector_count == 0
             && unknown_state_count == 0,
     )
+}
+
+#[allow(clippy::float_cmp)]
+fn is_exact_one(value: f64) -> bool {
+    // RFC-0027 predicates require exact equality (`== 1.0`) for these fields.
+    value == 1.0
 }
 
 fn evaluate_predicate_result(
@@ -844,12 +1039,16 @@ fn require_observed_summary_source(summary: &Value) -> Result<(), String> {
         .ok_or_else(|| "field 'summary_source' must be a string".to_string())?;
     match source {
         "observed" => Ok(()),
+        "partial_lifecycle" => Err(
+            "summary_source is 'partial_lifecycle'; lifecycle export is non-admissible until full RFC-0027 metric wiring"
+                .to_string(),
+        ),
         "synthetic" => Err(
             "summary_source is 'synthetic'; RFC-0027 machine predicates require observed evidence"
                 .to_string(),
         ),
         _ => Err(format!(
-            "field 'summary_source' must be one of ['observed','synthetic']; got '{source}'"
+            "field 'summary_source' must be one of ['observed','partial_lifecycle','synthetic']; got '{source}'"
         )),
     }
 }
@@ -887,9 +1086,4 @@ fn require_f64(summary: &Value, field: &str) -> Result<f64, String> {
     } else {
         Err(format!("field '{field}' must be finite"))
     }
-}
-
-#[must_use]
-fn float_eq(lhs: f64, rhs: f64) -> bool {
-    (lhs - rhs).abs() <= FLOAT_EQ_TOLERANCE
 }
