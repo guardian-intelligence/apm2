@@ -61,8 +61,6 @@
 //! - REQ-0017: `ReceiptPointer` and multiproof acceptance equivalence
 //! - EVID-0017: `ReceiptPointer` conformance evidence
 
-use std::time::Instant;
-
 use apm2_core::consensus::{
     AttestationOverheadGate, AttestationScaleMeasurement, DEFAULT_MAX_P99_OVERHEAD_RATIO,
 };
@@ -276,6 +274,26 @@ pub enum ReceiptPointerError {
         batch_receipt_hash: Hash,
         /// Fallback direct pointer receipt hash.
         direct_receipt_hash: Hash,
+    },
+
+    /// Fallback direct material does not preserve batch-path authority
+    /// semantics (issuer identity and quorum requirements).
+    #[error(
+        "fallback authority semantics mismatch: batch_issuer={batch_issuer_id:?}, \
+         fallback_issuer={fallback_issuer_id:?}, \
+         batch_requires_quorum={batch_requires_quorum}, \
+         batch_threshold={batch_threshold:?}"
+    )]
+    FallbackAuthoritySemanticsMismatch {
+        /// Issuer required by the batch-path seal.
+        batch_issuer_id: IssuerId,
+        /// Issuer encoded in the fallback direct seal.
+        fallback_issuer_id: IssuerId,
+        /// Whether batch verification required quorum semantics.
+        batch_requires_quorum: bool,
+        /// Threshold implied by batch verifier material (`Some(n)` for
+        /// multisig n-of-n and threshold k-of-n).
+        batch_threshold: Option<usize>,
     },
 
     /// Batch verification failed with a fallback-eligible reason, but no
@@ -942,11 +960,10 @@ pub enum BatchSealVerifier<'a> {
     },
 }
 
-/// Runtime overhead policy for batched attestation verification.
+/// Deterministic overhead policy for batched attestation verification.
 ///
 /// The policy carries direct-path baseline envelopes used to evaluate whether
-/// the current batched verification sample violates the `<1%` overhead
-/// contract.
+/// authenticated batch proof structure violates the `<1%` overhead contract.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BatchOverheadPolicy {
     /// Direct verification CPU p99 baseline in microseconds.
@@ -961,12 +978,14 @@ pub struct BatchOverheadPolicy {
 
 impl Default for BatchOverheadPolicy {
     fn default() -> Self {
+        const DEFAULT_DIRECT_CPU_P99_US: f64 = 100.0;
+        const DEFAULT_DIRECT_NETWORK_P99_BYTES: f64 = 2_048.0;
+
         Self {
-            // Conservative non-zero sentinels. Production callers should
-            // replace these with measured baselines from attestation harness
-            // outputs.
-            direct_cpu_p99_us: 1.0,
-            direct_network_p99_bytes: 1.0,
+            // Safe, realistic baseline envelopes to avoid sentinel-triggered
+            // near-constant fallback behavior when callers use defaults.
+            direct_cpu_p99_us: DEFAULT_DIRECT_CPU_P99_US,
+            direct_network_p99_bytes: DEFAULT_DIRECT_NETWORK_P99_BYTES,
             max_cpu_overhead_ratio: DEFAULT_MAX_P99_OVERHEAD_RATIO,
             max_network_overhead_ratio: DEFAULT_MAX_P99_OVERHEAD_RATIO,
         }
@@ -1155,6 +1174,10 @@ impl ReceiptPointerVerifier {
     }
 
     const OVERHEAD_RATIO_PPM_SCALE: f64 = 1_000_000.0;
+    const STRUCTURAL_CPU_BASE_US: f64 = 8.0;
+    const STRUCTURAL_CPU_US_PER_SIGNATURE: f64 = 40.0;
+    const STRUCTURAL_CPU_US_PER_MERKLE_LAYER: f64 = 2.0;
+    const STRUCTURAL_CPU_US_PER_CANONICAL_BYTE: f64 = 0.01;
 
     fn ratio_to_ppm(overhead_ratio: f64) -> u32 {
         if !overhead_ratio.is_finite() {
@@ -1207,15 +1230,73 @@ impl ReceiptPointerVerifier {
         f64::from(pointer_bytes) + f64::from(seal_bytes)
     }
 
+    fn estimate_structural_batch_cpu_us(pointer: &ReceiptPointerV1, seal: &AuthoritySealV1) -> f64 {
+        let signature_count = f64::from(u32::try_from(seal.signatures().len()).unwrap_or(u32::MAX));
+        let merkle_layers = f64::from(
+            u32::try_from(
+                pointer
+                    .inclusion_proof()
+                    .map_or(0usize, |proof| proof.siblings.len().saturating_add(1)),
+            )
+            .unwrap_or(u32::MAX),
+        );
+        let canonical_bytes = Self::estimate_verification_bytes(pointer, seal);
+        let structural_cpu_us = merkle_layers.mul_add(
+            Self::STRUCTURAL_CPU_US_PER_MERKLE_LAYER,
+            signature_count.mul_add(
+                Self::STRUCTURAL_CPU_US_PER_SIGNATURE,
+                Self::STRUCTURAL_CPU_BASE_US,
+            ),
+        );
+        canonical_bytes.mul_add(
+            Self::STRUCTURAL_CPU_US_PER_CANONICAL_BYTE,
+            structural_cpu_us,
+        )
+    }
+
+    const fn batch_quorum_requirements(
+        batch_verifier: BatchSealVerifier<'_>,
+    ) -> (bool, Option<usize>) {
+        match batch_verifier {
+            BatchSealVerifier::SingleKey(_) => (false, None),
+            BatchSealVerifier::QuorumMultisig { verifying_keys, .. } => {
+                (true, Some(verifying_keys.len()))
+            },
+            BatchSealVerifier::QuorumThreshold { threshold, .. } => (true, Some(threshold)),
+        }
+    }
+
+    fn enforce_fallback_authority_semantics(
+        batch_seal: &AuthoritySealV1,
+        batch_verifier: BatchSealVerifier<'_>,
+        fallback_seal: &AuthoritySealV1,
+    ) -> Result<(), ReceiptPointerError> {
+        let (verifier_requires_quorum, batch_threshold) =
+            Self::batch_quorum_requirements(batch_verifier);
+        let batch_requires_quorum =
+            verifier_requires_quorum || matches!(batch_seal.issuer_id(), IssuerId::Quorum(_));
+
+        if !batch_requires_quorum && batch_seal.issuer_id() == fallback_seal.issuer_id() {
+            return Ok(());
+        }
+
+        Err(ReceiptPointerError::FallbackAuthoritySemanticsMismatch {
+            batch_issuer_id: batch_seal.issuer_id().clone(),
+            fallback_issuer_id: fallback_seal.issuer_id().clone(),
+            batch_requires_quorum,
+            batch_threshold,
+        })
+    }
+
     fn evaluate_batch_overhead_policy(
-        batch_elapsed_us: f64,
+        batch_estimated_cpu_us: f64,
         batch_network_bytes: f64,
         policy: BatchOverheadPolicy,
     ) -> Result<(), ReceiptPointerError> {
         let measurement = AttestationScaleMeasurement::new(
             1,
             policy.direct_cpu_p99_us,
-            batch_elapsed_us,
+            batch_estimated_cpu_us,
             policy.direct_network_p99_bytes,
             batch_network_bytes,
         )
@@ -1242,6 +1323,8 @@ impl ReceiptPointerVerifier {
     #[allow(clippy::too_many_arguments)]
     fn verify_direct_fallback_or_fail(
         batch_pointer: &ReceiptPointerV1,
+        batch_seal: &AuthoritySealV1,
+        batch_verifier: BatchSealVerifier<'_>,
         expected_subject_kind: &str,
         require_temporal: bool,
         fallback: Option<DirectVerificationFallback<'_>>,
@@ -1260,6 +1343,16 @@ impl ReceiptPointerVerifier {
                 batch_receipt_hash: batch_pointer.receipt_hash,
                 direct_receipt_hash: fallback.pointer.receipt_hash,
             };
+            return Err(ReceiptPointerError::FallbackVerificationFailed {
+                reason,
+                primary: Box::new(primary),
+                fallback: Box::new(mismatch),
+            });
+        }
+
+        if let Err(mismatch) =
+            Self::enforce_fallback_authority_semantics(batch_seal, batch_verifier, fallback.seal)
+        {
             return Err(ReceiptPointerError::FallbackVerificationFailed {
                 reason,
                 primary: Box::new(primary),
@@ -1375,6 +1468,10 @@ impl ReceiptPointerVerifier {
     /// - integrity failures (proof/signature/seal mismatches), or
     /// - freshness failures (`TemporalAuthorityRequired`).
     ///
+    /// Degradation gates are evaluated from deterministic structural cost
+    /// estimates (proof depth, signature count, canonical bytes), not
+    /// process-local wall-clock timing.
+    ///
     /// If fallback data is absent or fallback verification fails, this method
     /// fails closed.
     #[allow(clippy::too_many_arguments)]
@@ -1387,7 +1484,6 @@ impl ReceiptPointerVerifier {
         fallback: Option<DirectVerificationFallback<'_>>,
         overhead_policy: Option<BatchOverheadPolicy>,
     ) -> Result<VerificationResult, ReceiptPointerError> {
-        let batch_start = Instant::now();
         let batch_result = Self::verify_batch_internal(
             pointer,
             seal,
@@ -1395,24 +1491,22 @@ impl ReceiptPointerVerifier {
             expected_subject_kind,
             require_temporal,
         );
-        let batch_elapsed_us = {
-            let elapsed_us_u64 =
-                u64::try_from(batch_start.elapsed().as_micros()).unwrap_or(u64::MAX);
-            let elapsed_us_u32 = u32::try_from(elapsed_us_u64).unwrap_or(u32::MAX);
-            f64::from(elapsed_us_u32)
-        };
 
         match batch_result {
             Ok(batch_ok) => {
                 if let Some(policy) = overhead_policy {
                     let batch_network_bytes = Self::estimate_verification_bytes(pointer, seal);
+                    let batch_estimated_cpu_us =
+                        Self::estimate_structural_batch_cpu_us(pointer, seal);
                     if let Err(overhead_error) = Self::evaluate_batch_overhead_policy(
-                        batch_elapsed_us,
+                        batch_estimated_cpu_us,
                         batch_network_bytes,
                         policy,
                     ) {
                         return Self::verify_direct_fallback_or_fail(
                             pointer,
+                            seal,
+                            batch_verifier,
                             expected_subject_kind,
                             require_temporal,
                             fallback,
@@ -1427,6 +1521,8 @@ impl ReceiptPointerVerifier {
                 if let Some(reason) = Self::classify_batch_fallback_reason(&primary) {
                     return Self::verify_direct_fallback_or_fail(
                         pointer,
+                        seal,
+                        batch_verifier,
                         expected_subject_kind,
                         require_temporal,
                         fallback,
@@ -2514,6 +2610,21 @@ mod tests {
     }
 
     #[test]
+    fn batch_overhead_policy_default_uses_safe_baselines() {
+        let policy = BatchOverheadPolicy::default();
+        assert!(
+            policy.direct_cpu_p99_us >= 50.0,
+            "default CPU baseline must be realistic, got: {}",
+            policy.direct_cpu_p99_us
+        );
+        assert!(
+            policy.direct_network_p99_bytes >= 512.0,
+            "default network baseline must be realistic, got: {}",
+            policy.direct_network_p99_bytes
+        );
+    }
+
+    #[test]
     fn verify_batch_fail_closed_when_fallback_is_unavailable() {
         let signer = Signer::generate();
         let receipt_hashes = [[0x72; 32], [0x73; 32]];
@@ -2591,6 +2702,116 @@ mod tests {
             } if matches!(
                 *fallback,
                 ReceiptPointerError::FallbackReceiptHashMismatch { .. }
+            )
+        ));
+    }
+
+    #[test]
+    fn verify_batch_fail_closed_when_fallback_issuer_semantics_mismatch() {
+        let batch_signer = Signer::generate();
+        let fallback_signer = Signer::generate();
+        let receipt_hashes = [[0x92; 32], [0x93; 32]];
+        let (root, proofs) = build_merkle_tree(&receipt_hashes);
+
+        let batch_seal = make_batch_seal(&batch_signer, &root);
+        let batch_seal_hash = *blake3::hash(&batch_seal.canonical_bytes()).as_bytes();
+        let mut tampered_proof = proofs[0].clone();
+        tampered_proof.siblings[0].hash = [0xEE; 32];
+        let batch_ptr =
+            ReceiptPointerV1::new_batch(receipt_hashes[0], batch_seal_hash, tampered_proof)
+                .expect("batch ptr");
+
+        let direct_seal = make_direct_seal(&fallback_signer, &receipt_hashes[0]);
+        let direct_seal_hash = *blake3::hash(&direct_seal.canonical_bytes()).as_bytes();
+        let direct_ptr =
+            ReceiptPointerV1::new_direct(receipt_hashes[0], direct_seal_hash).expect("direct ptr");
+
+        let err = ReceiptPointerVerifier::verify_batch_with_fallback(
+            &batch_ptr,
+            &batch_seal,
+            BatchSealVerifier::SingleKey(&batch_signer.verifying_key()),
+            TEST_SUBJECT_KIND,
+            false,
+            Some(DirectVerificationFallback {
+                pointer: &direct_ptr,
+                seal: &direct_seal,
+                verifying_key: &fallback_signer.verifying_key(),
+            }),
+            None,
+        )
+        .expect_err("fallback with mismatched issuer semantics must fail closed");
+
+        assert!(matches!(
+            err,
+            ReceiptPointerError::FallbackVerificationFailed {
+                reason: BatchFallbackReason::IntegrityFailure,
+                fallback,
+                ..
+            } if matches!(
+                *fallback,
+                ReceiptPointerError::FallbackAuthoritySemanticsMismatch {
+                    batch_requires_quorum: false,
+                    batch_threshold: None,
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn verify_batch_fail_closed_when_quorum_batch_falls_back_to_direct() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let signer_c = Signer::generate();
+        let receipt_hashes = [[0xA2; 32], [0xA3; 32]];
+        let (root, proofs) = build_merkle_tree(&receipt_hashes);
+
+        let (quorum_batch_seal, quorum_keys) =
+            make_quorum_batch_seal_threshold_2of3(&signer_a, &signer_b, &signer_c, &root, true);
+        let batch_seal_hash = *blake3::hash(&quorum_batch_seal.canonical_bytes()).as_bytes();
+        let mut tampered_proof = proofs[0].clone();
+        tampered_proof.siblings[0].hash = [0xDD; 32];
+        let batch_ptr =
+            ReceiptPointerV1::new_batch(receipt_hashes[0], batch_seal_hash, tampered_proof)
+                .expect("batch ptr");
+
+        let direct_seal = make_direct_seal(&signer_a, &receipt_hashes[0]);
+        let direct_seal_hash = *blake3::hash(&direct_seal.canonical_bytes()).as_bytes();
+        let direct_ptr =
+            ReceiptPointerV1::new_direct(receipt_hashes[0], direct_seal_hash).expect("direct ptr");
+
+        let err = ReceiptPointerVerifier::verify_batch_with_fallback(
+            &batch_ptr,
+            &quorum_batch_seal,
+            BatchSealVerifier::QuorumThreshold {
+                verifying_keys: &quorum_keys,
+                threshold: 2,
+                weights: None,
+            },
+            TEST_SUBJECT_KIND,
+            false,
+            Some(DirectVerificationFallback {
+                pointer: &direct_ptr,
+                seal: &direct_seal,
+                verifying_key: &signer_a.verifying_key(),
+            }),
+            None,
+        )
+        .expect_err("quorum batch fallback to direct must fail closed");
+
+        assert!(matches!(
+            err,
+            ReceiptPointerError::FallbackVerificationFailed {
+                reason: BatchFallbackReason::IntegrityFailure,
+                fallback,
+                ..
+            } if matches!(
+                *fallback,
+                ReceiptPointerError::FallbackAuthoritySemanticsMismatch {
+                    batch_requires_quorum: true,
+                    batch_threshold: Some(2),
+                    ..
+                }
             )
         ));
     }
