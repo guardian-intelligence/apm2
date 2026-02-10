@@ -54,6 +54,9 @@ regex.workspace = true
 fs2 = "0.4"
 rand.workspace = true
 
+# Security / Credentials
+keyring.workspace = true
+
 # Cryptographic hashing
 blake3.workspace = true
 hex.workspace = true

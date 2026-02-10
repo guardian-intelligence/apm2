@@ -64,8 +64,8 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
-use crate::commands::fac_review;
 use crate::commands::role_launch::{self, RoleLaunchArgs};
+use crate::commands::{fac_pr, fac_review};
 use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
 // =============================================================================
@@ -197,6 +197,12 @@ pub enum FacSubcommand {
     /// parallel `security + quality` orchestration, model fallback, and
     /// NDJSON telemetry under `~/.apm2`.
     Review(ReviewArgs),
+
+    /// GitHub App credential management and PR operations.
+    ///
+    /// Provides `auth-setup` for bootstrapping credentials and
+    /// `auth-check` for verifying they are accessible.
+    Pr(fac_pr::PrArgs),
 }
 
 /// Arguments for `apm2 fac gates`.
@@ -839,6 +845,7 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
                 fac_review::run_tail(tail_args.lines, tail_args.follow)
             },
         },
+        FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
     }
 }
 

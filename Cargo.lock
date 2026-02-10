@@ -117,6 +117,7 @@ dependencies = [
  "fs2",
  "futures",
  "hex",
+ "keyring",
  "prost",
  "rand 0.8.5",
  "regex",

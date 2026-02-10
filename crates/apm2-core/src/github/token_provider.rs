@@ -30,14 +30,168 @@
 //! - Per-episode rate limits prevent token churn attacks (LAW-06)
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use secrecy::SecretString;
+use serde::Deserialize;
 
 use super::MAX_SCOPES_PER_LEASE;
 use super::error::GitHubError;
 use super::scope::{GitHubApp, GitHubScope, RiskTier};
+
+// =============================================================================
+// Persistent GitHub App Configuration
+// =============================================================================
+
+/// Persistent GitHub App configuration loaded from `~/.apm2/github_app.toml`.
+///
+/// This config file is written by `apm2 fac pr auth-setup` and read as a
+/// fallback when environment variables are not set. It stores non-secret
+/// metadata and a *path* to the PEM file (never the PEM content itself).
+#[derive(Debug, Deserialize)]
+pub struct GitHubAppConfig {
+    /// GitHub App ID (e.g. `"2715660"`).
+    pub app_id: String,
+    /// GitHub installation ID (e.g. `"109311315"`).
+    pub installation_id: String,
+    /// Optional path to the PEM private key file.
+    /// On systems with a working keyring this may be `None`.
+    pub private_key_file: Option<PathBuf>,
+}
+
+/// Loads the persistent GitHub App config from disk.
+///
+/// Resolution order for the config directory:
+/// 1. `$APM2_HOME/github_app.toml`
+/// 2. `~/.apm2/github_app.toml`
+///
+/// Returns `None` if the file does not exist (not an error — env-var
+/// fallback still works).
+///
+/// # Errors
+///
+/// Returns `None` on any I/O or parse error. Callers should treat
+/// absence the same as "not configured" and fall through to env vars.
+#[must_use]
+pub fn load_github_app_config() -> Option<GitHubAppConfig> {
+    let config_path = resolve_config_path()?;
+    let content = std::fs::read_to_string(&config_path).ok()?;
+    toml::from_str(&content).ok()
+}
+
+/// Returns the path to the config directory (`$APM2_HOME` or `~/.apm2`).
+#[must_use]
+pub fn resolve_apm2_home() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("APM2_HOME") {
+        let p = PathBuf::from(home);
+        if p.is_absolute() {
+            return Some(p);
+        }
+    }
+    directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".apm2"))
+}
+
+/// Returns the path to `github_app.toml` inside the APM2 home directory.
+fn resolve_config_path() -> Option<PathBuf> {
+    resolve_apm2_home().map(|dir| dir.join("github_app.toml"))
+}
+
+// =============================================================================
+// GitHubAppTokenProvider — credential resolution helpers
+// =============================================================================
+
+/// Helper for resolving GitHub App private key material.
+///
+/// This is **not** a full `TokenProvider` implementation — it only handles
+/// credential resolution (PEM loading). Token minting requires an HTTP
+/// client and JWT signing which live in the daemon.
+pub struct GitHubAppTokenProvider;
+
+impl GitHubAppTokenProvider {
+    /// Resolves the GitHub App private key from multiple sources.
+    ///
+    /// Resolution order:
+    /// 1. Env var (inline PEM content via `env_var_name`)
+    /// 2. Config file `private_key_file` path → read file
+    /// 3. OS keyring lookup (service/account derived from `app_id`)
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable error string if the key cannot be found
+    /// in any source.
+    pub fn resolve_private_key(
+        app_id: &str,
+        env_var_name: &str,
+        config: Option<&GitHubAppConfig>,
+        keyring_service: Option<&str>,
+        keyring_account: Option<&str>,
+    ) -> Result<String, String> {
+        // 1. Env var — inline PEM content
+        if let Ok(value) = std::env::var(env_var_name) {
+            let trimmed = value.trim().to_string();
+            if !trimmed.is_empty() {
+                return Ok(trimmed);
+            }
+        }
+
+        // 2. Config file private_key_file
+        if let Some(cfg) = config {
+            if let Some(ref pem_path) = cfg.private_key_file {
+                match std::fs::read_to_string(pem_path) {
+                    Ok(content) if !content.trim().is_empty() => {
+                        return Ok(content);
+                    },
+                    Ok(_) => {},
+                    Err(err) => {
+                        return Err(format!(
+                            "config file points to {}, but read failed: {err}",
+                            pem_path.display()
+                        ));
+                    },
+                }
+            }
+        }
+
+        // 3. Keyring lookup
+        let service = keyring_service.unwrap_or("apm2.github.app");
+        let account = keyring_account.map_or_else(|| format!("app-{app_id}"), String::from);
+
+        match keyring::Entry::new(service, &account) {
+            Ok(entry) => match entry.get_password() {
+                Ok(secret) if !secret.trim().is_empty() => Ok(secret),
+                Ok(_) => Err(
+                    "keyring entry exists but is empty; re-run `apm2 fac pr auth-setup`"
+                        .to_string(),
+                ),
+                Err(keyring::Error::NoEntry) => Err(format!(
+                    "no private key found: set ${env_var_name}, run `apm2 fac pr auth-setup`, \
+                     or store key in keyring ({service}/{account})"
+                )),
+                Err(err) => Err(format!("keyring lookup failed: {err}")),
+            },
+            Err(err) => Err(format!("keyring init failed: {err}")),
+        }
+    }
+
+    /// Legacy helper — resolves from env var or keyring only (no config file).
+    ///
+    /// Prefer [`resolve_private_key`] which also checks the config file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if no private key is found in the environment variable or
+    /// OS keyring, or if the keyring lookup fails.
+    pub fn load_private_key_from_env_or_keyring(
+        app_id: &str,
+        env_var_name: &str,
+        keyring_service: Option<&str>,
+        keyring_account: Option<&str>,
+    ) -> Result<String, String> {
+        Self::resolve_private_key(app_id, env_var_name, None, keyring_service, keyring_account)
+    }
+}
 
 /// Request for minting a new installation access token.
 #[derive(Debug, Clone)]
