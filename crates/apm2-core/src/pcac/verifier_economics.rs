@@ -1,0 +1,262 @@
+// AGENT-AUTHORED
+//! Verifier economics profile and enforcement checks for PCAC (RFC-0027 §8).
+//!
+//! Tier2+ operations fail closed when declared verifier-economics bounds are
+//! exceeded. Tier0/1 operations are monitor-only.
+
+use serde::{Deserialize, Serialize};
+
+use super::{AuthorityDenyClass, RiskTier};
+
+/// Per-operation timing bounds for PCAC verifier checks.
+///
+/// Each field is the p95 upper bound in microseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierEconomicsProfile {
+    /// p95 upper bound for `verify_receipt_authentication` (microseconds).
+    pub p95_verify_receipt_us: u64,
+    /// p95 upper bound for `validate_authoritative_bindings` (microseconds).
+    pub p95_validate_bindings_us: u64,
+    /// p95 upper bound for `classify_fact` (microseconds).
+    pub p95_classify_fact_us: u64,
+    /// p95 upper bound for `validate_replay_lifecycle_order` (microseconds).
+    pub p95_replay_lifecycle_us: u64,
+}
+
+impl Default for VerifierEconomicsProfile {
+    fn default() -> Self {
+        // Conservative finite defaults (10ms per verifier operation).
+        Self {
+            p95_verify_receipt_us: 10_000,
+            p95_validate_bindings_us: 10_000,
+            p95_classify_fact_us: 10_000,
+            p95_replay_lifecycle_us: 10_000,
+        }
+    }
+}
+
+/// Identifies the verifier operation being measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifierOperation {
+    /// Timing sample for `verify_receipt_authentication`.
+    VerifyReceiptAuthentication,
+    /// Timing sample for `validate_authoritative_bindings`.
+    ValidateAuthoritativeBindings,
+    /// Timing sample for `classify_fact`.
+    ClassifyFact,
+    /// Timing sample for `validate_replay_lifecycle_order`.
+    ValidateReplayLifecycleOrder,
+}
+
+impl std::fmt::Display for VerifierOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VerifyReceiptAuthentication => write!(f, "verify_receipt_authentication"),
+            Self::ValidateAuthoritativeBindings => write!(f, "validate_authoritative_bindings"),
+            Self::ClassifyFact => write!(f, "classify_fact"),
+            Self::ValidateReplayLifecycleOrder => write!(f, "validate_replay_lifecycle_order"),
+        }
+    }
+}
+
+/// Verifier economics bound checker for PCAC authority lifecycle operations.
+pub struct VerifierEconomicsChecker {
+    profile: VerifierEconomicsProfile,
+}
+
+impl VerifierEconomicsChecker {
+    /// Creates a checker from a concrete economics profile.
+    #[must_use]
+    pub const fn new(profile: VerifierEconomicsProfile) -> Self {
+        Self { profile }
+    }
+
+    const fn bound_for(&self, operation: VerifierOperation) -> u64 {
+        match operation {
+            VerifierOperation::VerifyReceiptAuthentication => self.profile.p95_verify_receipt_us,
+            VerifierOperation::ValidateAuthoritativeBindings => {
+                self.profile.p95_validate_bindings_us
+            },
+            VerifierOperation::ClassifyFact => self.profile.p95_classify_fact_us,
+            VerifierOperation::ValidateReplayLifecycleOrder => self.profile.p95_replay_lifecycle_us,
+        }
+    }
+
+    /// Checks elapsed verifier time against profile bounds for a risk tier.
+    ///
+    /// Tier2+ is fail-closed on bound exceedance. Tier0/1 is monitor-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityDenyClass::VerifierEconomicsBoundsExceeded`] when
+    /// elapsed time exceeds bounds for Tier2+ operations.
+    pub fn check_timing(
+        &self,
+        operation: VerifierOperation,
+        elapsed_us: u64,
+        risk_tier: RiskTier,
+    ) -> Result<(), AuthorityDenyClass> {
+        let bound_us = self.bound_for(operation);
+        if elapsed_us <= bound_us {
+            return Ok(());
+        }
+
+        match risk_tier {
+            RiskTier::Tier0 | RiskTier::Tier1 => Ok(()),
+            RiskTier::Tier2Plus => Err(AuthorityDenyClass::VerifierEconomicsBoundsExceeded {
+                operation: operation.to_string(),
+                risk_tier,
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tight_profile() -> VerifierEconomicsProfile {
+        VerifierEconomicsProfile {
+            p95_verify_receipt_us: 10,
+            p95_validate_bindings_us: 20,
+            p95_classify_fact_us: 30,
+            p95_replay_lifecycle_us: 40,
+        }
+    }
+
+    #[test]
+    fn tier2plus_exceedance_denies() {
+        let checker = VerifierEconomicsChecker::new(tight_profile());
+        let err = checker
+            .check_timing(
+                VerifierOperation::VerifyReceiptAuthentication,
+                11,
+                RiskTier::Tier2Plus,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthorityDenyClass::VerifierEconomicsBoundsExceeded { ref operation, risk_tier }
+                if operation == "verify_receipt_authentication" && risk_tier == RiskTier::Tier2Plus
+        ));
+    }
+
+    #[test]
+    fn tier0_tier1_exceedance_is_monitor_only() {
+        let checker = VerifierEconomicsChecker::new(tight_profile());
+        let tier0 = checker.check_timing(
+            VerifierOperation::ValidateAuthoritativeBindings,
+            21,
+            RiskTier::Tier0,
+        );
+        let tier1 = checker.check_timing(
+            VerifierOperation::ValidateAuthoritativeBindings,
+            21,
+            RiskTier::Tier1,
+        );
+        assert!(tier0.is_ok());
+        assert!(tier1.is_ok());
+    }
+
+    #[test]
+    fn all_operation_variants_are_covered() {
+        let checker = VerifierEconomicsChecker::new(tight_profile());
+        let cases = [
+            (
+                VerifierOperation::VerifyReceiptAuthentication,
+                11,
+                "verify_receipt_authentication",
+            ),
+            (
+                VerifierOperation::ValidateAuthoritativeBindings,
+                21,
+                "validate_authoritative_bindings",
+            ),
+            (VerifierOperation::ClassifyFact, 31, "classify_fact"),
+            (
+                VerifierOperation::ValidateReplayLifecycleOrder,
+                41,
+                "validate_replay_lifecycle_order",
+            ),
+        ];
+
+        for (operation, elapsed, expected_name) in cases {
+            let err = checker
+                .check_timing(operation, elapsed, RiskTier::Tier2Plus)
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                AuthorityDenyClass::VerifierEconomicsBoundsExceeded { ref operation, risk_tier }
+                    if operation == expected_name && risk_tier == RiskTier::Tier2Plus
+            ));
+        }
+    }
+
+    #[test]
+    fn default_profile_is_non_zero() {
+        let profile = VerifierEconomicsProfile::default();
+        assert_eq!(profile.p95_verify_receipt_us, 10_000);
+        assert_eq!(profile.p95_validate_bindings_us, 10_000);
+        assert_eq!(profile.p95_classify_fact_us, 10_000);
+        assert_eq!(profile.p95_replay_lifecycle_us, 10_000);
+    }
+
+    #[test]
+    fn profile_serialization_round_trip() {
+        let profile = VerifierEconomicsProfile {
+            p95_verify_receipt_us: 111,
+            p95_validate_bindings_us: 222,
+            p95_classify_fact_us: 333,
+            p95_replay_lifecycle_us: 444,
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        let decoded: VerifierEconomicsProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.p95_verify_receipt_us, 111);
+        assert_eq!(decoded.p95_validate_bindings_us, 222);
+        assert_eq!(decoded.p95_classify_fact_us, 333);
+        assert_eq!(decoded.p95_replay_lifecycle_us, 444);
+    }
+
+    #[test]
+    fn zero_bounds_deny_non_zero_tier2plus_elapsed() {
+        let checker = VerifierEconomicsChecker::new(VerifierEconomicsProfile {
+            p95_verify_receipt_us: 0,
+            p95_validate_bindings_us: 0,
+            p95_classify_fact_us: 0,
+            p95_replay_lifecycle_us: 0,
+        });
+        let err = checker
+            .check_timing(VerifierOperation::ClassifyFact, 1, RiskTier::Tier2Plus)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthorityDenyClass::VerifierEconomicsBoundsExceeded { ref operation, risk_tier }
+                if operation == "classify_fact" && risk_tier == RiskTier::Tier2Plus
+        ));
+    }
+
+    #[test]
+    fn boundary_exact_is_allowed_and_plus_one_denies() {
+        let checker = VerifierEconomicsChecker::new(tight_profile());
+        let exact = checker.check_timing(
+            VerifierOperation::ValidateReplayLifecycleOrder,
+            40,
+            RiskTier::Tier2Plus,
+        );
+        assert!(exact.is_ok());
+
+        let over = checker
+            .check_timing(
+                VerifierOperation::ValidateReplayLifecycleOrder,
+                41,
+                RiskTier::Tier2Plus,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            over,
+            AuthorityDenyClass::VerifierEconomicsBoundsExceeded { ref operation, risk_tier }
+                if operation == "validate_replay_lifecycle_order" && risk_tier == RiskTier::Tier2Plus
+        ));
+    }
+}

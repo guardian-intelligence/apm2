@@ -43,13 +43,16 @@ pub mod intent_class;
 mod kernel;
 mod receipts;
 mod types;
+pub mod verifier_economics;
 
 #[cfg(test)]
 mod tests;
 
 pub use auth_verifier::{
     BindingExpectations, FactClass, MAX_MERKLE_INCLUSION_PROOF_DEPTH, MAX_REPLAY_LIFECYCLE_ENTRIES,
-    ReplayLifecycleEntry, classify_fact, validate_authoritative_bindings,
+    ReplayLifecycleEntry, TimedVerificationResult, classify_fact, timed_classify_fact,
+    timed_validate_authoritative_bindings, timed_validate_replay_lifecycle_order,
+    timed_verify_receipt_authentication, validate_authoritative_bindings,
     validate_replay_lifecycle_order, verify_receipt_authentication,
 };
 pub use deny::{AuthorityDenyClass, AuthorityDenyV1};
@@ -68,4 +71,7 @@ pub use types::{
     MAX_PRE_ACTUATION_RECEIPT_HASHES, MAX_REASON_LENGTH, MAX_SCOPE_WITNESS_HASHES,
     MAX_STRING_LENGTH, PcacPolicyKnobs, PcacValidationError, PointerOnlyWaiver, RiskTier,
     SovereigntyEnforcementMode, SovereigntyEpoch, WaiverBindingMeta,
+};
+pub use verifier_economics::{
+    VerifierEconomicsChecker, VerifierEconomicsProfile, VerifierOperation,
 };

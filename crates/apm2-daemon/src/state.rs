@@ -1059,7 +1059,11 @@ impl DispatcherState {
                             consume_log_path.display()
                         )
                     })?;
-                    let tick_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+                    let tick_kernel = Arc::new(
+                        crate::pcac::InProcessKernel::new(1).with_verifier_economics(
+                            apm2_core::pcac::VerifierEconomicsProfile::default(),
+                        ),
+                    );
                     let durable_kernel = crate::pcac::DurableKernel::new_with_shared_kernel(
                         Arc::clone(&tick_kernel),
                         Box::new(durable_index),
@@ -1435,7 +1439,10 @@ impl DispatcherState {
                 consume_log_path.display()
             ),
         })?;
-        let tick_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+        let tick_kernel = Arc::new(
+            crate::pcac::InProcessKernel::new(1)
+                .with_verifier_economics(apm2_core::pcac::VerifierEconomicsProfile::default()),
+        );
         let durable_kernel = crate::pcac::DurableKernel::new_with_shared_kernel(
             Arc::clone(&tick_kernel),
             Box::new(durable_index),

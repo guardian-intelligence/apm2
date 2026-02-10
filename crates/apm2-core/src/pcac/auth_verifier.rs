@@ -17,6 +17,8 @@
 //! All checks fail closed: unknown, incomplete, or mismatched proof state is
 //! denied.
 
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 use subtle::{Choice, ConstantTimeEq};
 
@@ -77,6 +79,15 @@ pub struct ReplayLifecycleEntry {
     /// Pre-actuation selector hash, required when
     /// `requires_pre_actuation == true`.
     pub pre_actuation_selector_hash: Option<Hash>,
+}
+
+/// Result of a timed verification operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimedVerificationResult<T> {
+    /// Original result returned by the verification operation.
+    pub result: T,
+    /// Elapsed wall-clock time in microseconds.
+    pub elapsed_us: u64,
 }
 
 /// Verify an authentication shape is admissible for authoritative acceptance.
@@ -320,6 +331,113 @@ pub fn validate_replay_lifecycle_order(
     let classified = classify_lifecycle_entries(entries, known_pre_actuation_hashes, &ctx)?;
     require_all_stages_present(&classified, &ctx)?;
     check_stage_ordering(&classified, effect_receipt_tick, &ctx)
+}
+
+/// Times [`verify_receipt_authentication`] and returns elapsed microseconds.
+#[must_use]
+pub fn timed_verify_receipt_authentication(
+    auth: &ReceiptAuthentication,
+    expected_seal_hash: &Hash,
+    expected_seal_subject_hash: Option<&Hash>,
+    time_envelope_ref: Hash,
+    ledger_anchor: Hash,
+    denied_at_tick: u64,
+) -> TimedVerificationResult<Result<(), Box<AuthorityDenyV1>>> {
+    let start = Instant::now();
+    let result = verify_receipt_authentication(
+        auth,
+        expected_seal_hash,
+        expected_seal_subject_hash,
+        time_envelope_ref,
+        ledger_anchor,
+        denied_at_tick,
+    );
+    TimedVerificationResult {
+        result,
+        elapsed_us: elapsed_us_since(start),
+    }
+}
+
+/// Times [`validate_authoritative_bindings`] and returns elapsed microseconds.
+#[must_use]
+pub fn timed_validate_authoritative_bindings(
+    bindings: &AuthoritativeBindings,
+    time_envelope_ref: Hash,
+    ledger_anchor: Hash,
+    denied_at_tick: u64,
+    expected_view_commitment: Option<&Hash>,
+    expected_ledger_anchor: Option<&Hash>,
+) -> TimedVerificationResult<Result<(), Box<AuthorityDenyV1>>> {
+    let start = Instant::now();
+    let result = validate_authoritative_bindings(
+        bindings,
+        time_envelope_ref,
+        ledger_anchor,
+        denied_at_tick,
+        expected_view_commitment,
+        expected_ledger_anchor,
+    );
+    TimedVerificationResult {
+        result,
+        elapsed_us: elapsed_us_since(start),
+    }
+}
+
+/// Times [`classify_fact`] and returns elapsed microseconds.
+#[must_use]
+pub fn timed_classify_fact(
+    bindings: Option<&AuthoritativeBindings>,
+    expected_seal_hash: &Hash,
+    expected_seal_subject_hash: Option<&Hash>,
+    time_envelope_ref: Hash,
+    ledger_anchor: Hash,
+    current_tick: u64,
+    expectations: BindingExpectations<'_>,
+) -> TimedVerificationResult<FactClass> {
+    let start = Instant::now();
+    let result = classify_fact(
+        bindings,
+        expected_seal_hash,
+        expected_seal_subject_hash,
+        time_envelope_ref,
+        ledger_anchor,
+        current_tick,
+        expectations,
+    );
+    TimedVerificationResult {
+        result,
+        elapsed_us: elapsed_us_since(start),
+    }
+}
+
+/// Times [`validate_replay_lifecycle_order`] and returns elapsed microseconds.
+#[must_use]
+pub fn timed_validate_replay_lifecycle_order(
+    entries: &[ReplayLifecycleEntry],
+    effect_receipt_tick: Option<u64>,
+    known_pre_actuation_hashes: &[Hash],
+    time_envelope_ref: Hash,
+    ledger_anchor: Hash,
+    denied_at_tick: u64,
+) -> TimedVerificationResult<Result<(), Box<AuthorityDenyV1>>> {
+    let start = Instant::now();
+    let result = validate_replay_lifecycle_order(
+        entries,
+        effect_receipt_tick,
+        known_pre_actuation_hashes,
+        time_envelope_ref,
+        ledger_anchor,
+        denied_at_tick,
+    );
+    TimedVerificationResult {
+        result,
+        elapsed_us: elapsed_us_since(start),
+    }
+}
+
+#[inline]
+fn elapsed_us_since(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 struct DenyContext {

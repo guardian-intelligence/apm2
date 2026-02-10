@@ -25,9 +25,13 @@ use std::sync::{Arc, Mutex};
 
 use apm2_core::crypto::Hash;
 use apm2_core::pcac::{
-    AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyClass, AuthorityDenyV1,
-    AuthorityJoinCertificateV1, AuthorityJoinInputV1, AuthorityJoinKernel, BoundaryIntentClass,
-    FreezeAction, IdentityEvidenceLevel, PcacPolicyKnobs, RiskTier, SovereigntyEnforcementMode,
+    AuthoritativeBindings, AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyClass,
+    AuthorityDenyV1, AuthorityJoinCertificateV1, AuthorityJoinInputV1, AuthorityJoinKernel,
+    BindingExpectations, BoundaryIntentClass, FactClass, FreezeAction, IdentityEvidenceLevel,
+    LifecycleStage, PcacPolicyKnobs, ReceiptAuthentication, ReplayLifecycleEntry, RiskTier,
+    SovereigntyEnforcementMode, VerifierEconomicsChecker, VerifierEconomicsProfile,
+    VerifierOperation, timed_classify_fact, timed_validate_authoritative_bindings,
+    timed_validate_replay_lifecycle_order, timed_verify_receipt_authentication,
 };
 use subtle::ConstantTimeEq;
 use tracing::{info, warn};
@@ -35,6 +39,9 @@ use tracing::{info, warn};
 use crate::htf::HolonicClock;
 
 const ZERO_HASH: Hash = [0u8; 32];
+const VERIFIER_PROBE_SEAL_HASH: Hash = [0xA1; 32];
+const VERIFIER_PROBE_EPISODE_HASH: Hash = [0xB1; 32];
+const VERIFIER_PROBE_VIEW_HASH: Hash = [0xC1; 32];
 
 // =============================================================================
 // InProcessKernel
@@ -66,6 +73,8 @@ pub struct InProcessKernel {
     /// clock instead of using the manual counter. This prevents the
     /// "frozen tick" bug where certificates never expire.
     clock: Option<Arc<HolonicClock>>,
+    /// Optional verifier-economics checker for Tier2+ fail-closed bounds.
+    verifier_economics_checker: Option<VerifierEconomicsChecker>,
 }
 
 impl InProcessKernel {
@@ -82,6 +91,7 @@ impl InProcessKernel {
             consumed: Mutex::new(HashSet::new()),
             manual_tick: Mutex::new(starting_tick),
             clock: None,
+            verifier_economics_checker: None,
         }
     }
 
@@ -104,7 +114,18 @@ impl InProcessKernel {
             consumed: Mutex::new(HashSet::new()),
             manual_tick: Mutex::new(0),
             clock: Some(clock),
+            verifier_economics_checker: None,
         }
+    }
+
+    /// Enables verifier-economics bound enforcement for this kernel.
+    ///
+    /// Tier2+ operations deny when measured verifier probe timings exceed
+    /// profile bounds; Tier0/1 remains monitor-only.
+    #[must_use]
+    pub const fn with_verifier_economics(mut self, profile: VerifierEconomicsProfile) -> Self {
+        self.verifier_economics_checker = Some(VerifierEconomicsChecker::new(profile));
+        self
     }
 
     /// Advances the kernel tick (for testing and time progression).
@@ -286,6 +307,253 @@ impl InProcessKernel {
             denied_at_tick,
             containment_action: None,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enforce_verifier_economics_timing(
+        &self,
+        operation: VerifierOperation,
+        elapsed_us: u64,
+        risk_tier: RiskTier,
+        ajc_id: Option<Hash>,
+        time_envelope_ref: Hash,
+        ledger_anchor: Hash,
+        denied_at_tick: u64,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        let Some(checker) = self.verifier_economics_checker.as_ref() else {
+            return Ok(());
+        };
+
+        checker
+            .check_timing(operation, elapsed_us, risk_tier)
+            .map_err(|deny_class| {
+                Self::deny(
+                    deny_class,
+                    ajc_id,
+                    time_envelope_ref,
+                    ledger_anchor,
+                    denied_at_tick,
+                )
+            })
+    }
+
+    const fn build_verifier_probe_bindings(time_envelope_ref: Hash) -> AuthoritativeBindings {
+        AuthoritativeBindings {
+            episode_envelope_hash: VERIFIER_PROBE_EPISODE_HASH,
+            view_commitment_hash: VERIFIER_PROBE_VIEW_HASH,
+            time_envelope_ref,
+            authentication: ReceiptAuthentication::Direct {
+                authority_seal_hash: VERIFIER_PROBE_SEAL_HASH,
+            },
+            permeability_receipt_hash: None,
+            delegation_chain_hash: None,
+        }
+    }
+
+    fn run_join_verifier_probe(
+        &self,
+        risk_tier: RiskTier,
+        time_envelope_ref: Hash,
+        ledger_anchor: Hash,
+        denied_at_tick: u64,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        if self.verifier_economics_checker.is_none() {
+            return Ok(());
+        }
+        if time_envelope_ref == ZERO_HASH || ledger_anchor == ZERO_HASH {
+            return Ok(());
+        }
+
+        let timed = timed_verify_receipt_authentication(
+            &ReceiptAuthentication::Direct {
+                authority_seal_hash: VERIFIER_PROBE_SEAL_HASH,
+            },
+            &VERIFIER_PROBE_SEAL_HASH,
+            None,
+            time_envelope_ref,
+            ledger_anchor,
+            denied_at_tick,
+        );
+        if let Err(err) = timed.result {
+            return Err(Self::deny(
+                AuthorityDenyClass::UnknownState {
+                    description: format!(
+                        "verifier economics probe verify_receipt_authentication failed: {}",
+                        err.deny_class
+                    ),
+                },
+                None,
+                time_envelope_ref,
+                ledger_anchor,
+                denied_at_tick,
+            ));
+        }
+
+        self.enforce_verifier_economics_timing(
+            VerifierOperation::VerifyReceiptAuthentication,
+            timed.elapsed_us,
+            risk_tier,
+            None,
+            time_envelope_ref,
+            ledger_anchor,
+            denied_at_tick,
+        )
+    }
+
+    fn run_revalidate_verifier_probe(
+        &self,
+        risk_tier: RiskTier,
+        ajc_id: Hash,
+        time_envelope_ref: Hash,
+        ledger_anchor: Hash,
+        denied_at_tick: u64,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        if self.verifier_economics_checker.is_none() {
+            return Ok(());
+        }
+        if time_envelope_ref == ZERO_HASH || ledger_anchor == ZERO_HASH {
+            return Ok(());
+        }
+
+        let bindings = Self::build_verifier_probe_bindings(time_envelope_ref);
+        let timed_bindings = timed_validate_authoritative_bindings(
+            &bindings,
+            time_envelope_ref,
+            ledger_anchor,
+            denied_at_tick,
+            Some(&VERIFIER_PROBE_VIEW_HASH),
+            Some(&ledger_anchor),
+        );
+        if let Err(err) = timed_bindings.result {
+            return Err(Self::deny(
+                AuthorityDenyClass::UnknownState {
+                    description: format!(
+                        "verifier economics probe validate_authoritative_bindings failed: {}",
+                        err.deny_class
+                    ),
+                },
+                Some(ajc_id),
+                time_envelope_ref,
+                ledger_anchor,
+                denied_at_tick,
+            ));
+        }
+        self.enforce_verifier_economics_timing(
+            VerifierOperation::ValidateAuthoritativeBindings,
+            timed_bindings.elapsed_us,
+            risk_tier,
+            Some(ajc_id),
+            time_envelope_ref,
+            ledger_anchor,
+            denied_at_tick,
+        )?;
+
+        let timed_classification = timed_classify_fact(
+            Some(&bindings),
+            &VERIFIER_PROBE_SEAL_HASH,
+            None,
+            time_envelope_ref,
+            ledger_anchor,
+            denied_at_tick,
+            BindingExpectations {
+                expected_view_commitment: Some(&VERIFIER_PROBE_VIEW_HASH),
+                expected_ledger_anchor: Some(&ledger_anchor),
+            },
+        );
+        if timed_classification.result != FactClass::AcceptanceFact {
+            return Err(Self::deny(
+                AuthorityDenyClass::UnknownState {
+                    description:
+                        "verifier economics probe classify_fact returned non-authoritative class"
+                            .to_string(),
+                },
+                Some(ajc_id),
+                time_envelope_ref,
+                ledger_anchor,
+                denied_at_tick,
+            ));
+        }
+
+        self.enforce_verifier_economics_timing(
+            VerifierOperation::ClassifyFact,
+            timed_classification.elapsed_us,
+            risk_tier,
+            Some(ajc_id),
+            time_envelope_ref,
+            ledger_anchor,
+            denied_at_tick,
+        )
+    }
+
+    fn run_consume_verifier_probe(
+        &self,
+        risk_tier: RiskTier,
+        ajc_id: Hash,
+        time_envelope_ref: Hash,
+        ledger_anchor: Hash,
+        denied_at_tick: u64,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        if self.verifier_economics_checker.is_none() {
+            return Ok(());
+        }
+        if time_envelope_ref == ZERO_HASH || ledger_anchor == ZERO_HASH {
+            return Ok(());
+        }
+
+        let base_tick = denied_at_tick.max(3);
+        let entries = [
+            ReplayLifecycleEntry {
+                stage: LifecycleStage::Join,
+                tick: base_tick - 2,
+                requires_pre_actuation: false,
+                pre_actuation_selector_hash: None,
+            },
+            ReplayLifecycleEntry {
+                stage: LifecycleStage::Revalidate,
+                tick: base_tick - 1,
+                requires_pre_actuation: false,
+                pre_actuation_selector_hash: None,
+            },
+            ReplayLifecycleEntry {
+                stage: LifecycleStage::Consume,
+                tick: base_tick,
+                requires_pre_actuation: false,
+                pre_actuation_selector_hash: None,
+            },
+        ];
+
+        let timed_replay = timed_validate_replay_lifecycle_order(
+            &entries,
+            Some(base_tick),
+            &[],
+            time_envelope_ref,
+            ledger_anchor,
+            denied_at_tick,
+        );
+        if let Err(err) = timed_replay.result {
+            return Err(Self::deny(
+                AuthorityDenyClass::UnknownState {
+                    description: format!(
+                        "verifier economics probe validate_replay_lifecycle_order failed: {}",
+                        err.deny_class
+                    ),
+                },
+                Some(ajc_id),
+                time_envelope_ref,
+                ledger_anchor,
+                denied_at_tick,
+            ));
+        }
+
+        self.enforce_verifier_economics_timing(
+            VerifierOperation::ValidateReplayLifecycleOrder,
+            timed_replay.elapsed_us,
+            risk_tier,
+            Some(ajc_id),
+            time_envelope_ref,
+            ledger_anchor,
+            denied_at_tick,
+        )
     }
 
     fn validate_policy(
@@ -774,6 +1042,14 @@ impl AuthorityJoinKernel for InProcessKernel {
             Self::validate_pointer_only_waiver(input, policy, tick)?;
         }
 
+        // TCK-00429: run verifier-economics probe and enforce tiered bounds.
+        self.run_join_verifier_probe(
+            input.risk_tier,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
+        )?;
+
         // Compute join hash and mint AJC.
         let join_hash = Self::compute_join_hash(input);
         let ajc_id = Self::mint_ajc_id(&join_hash, tick);
@@ -933,6 +1209,15 @@ impl AuthorityJoinKernel for InProcessKernel {
             }));
         }
 
+        // TCK-00429: run verifier-economics probes for revalidate-stage checks.
+        self.run_revalidate_verifier_probe(
+            cert.risk_tier,
+            cert.ajc_id,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            tick,
+        )?;
+
         Ok(())
     }
 
@@ -1075,6 +1360,16 @@ impl AuthorityJoinKernel for InProcessKernel {
                 containment_action: None,
             }));
         }
+
+        // TCK-00429: enforce replay-lifecycle verifier economics before
+        // mutating durable consume state.
+        self.run_consume_verifier_probe(
+            cert.risk_tier,
+            cert.ajc_id,
+            current_time_envelope_ref,
+            cert.as_of_ledger_anchor,
+            tick,
+        )?;
 
         // Law 1: Linear consumption — check and mark consumed atomically.
         {
