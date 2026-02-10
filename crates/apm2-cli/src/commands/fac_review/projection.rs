@@ -631,6 +631,7 @@ mod tests {
             previous_run_id: None,
             previous_head_sha: None,
             pid: None,
+            proc_start_time: None,
         }
     }
 

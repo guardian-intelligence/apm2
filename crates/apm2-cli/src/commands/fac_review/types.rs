@@ -282,6 +282,8 @@ pub struct ReviewRunState {
     pub previous_head_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proc_start_time: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -338,6 +340,8 @@ pub struct PendingDispatchEntry {
     pub started_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proc_start_time: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

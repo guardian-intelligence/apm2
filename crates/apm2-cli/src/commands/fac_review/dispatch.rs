@@ -11,8 +11,9 @@ use chrono::Utc;
 use fs2::FileExt;
 
 use super::state::{
-    ReviewRunStateLoad, build_review_run_id, load_review_run_state_for_home,
-    next_review_sequence_number_for_home, write_review_run_state_for_home,
+    ReviewRunStateLoad, build_review_run_id, get_process_start_time,
+    load_review_run_state_for_home, next_review_sequence_number_for_home,
+    write_review_run_state_for_home,
 };
 use super::types::{
     DISPATCH_LOCK_ACQUIRE_TIMEOUT, DISPATCH_PENDING_TTL, DispatchIdempotencyKey,
@@ -93,6 +94,7 @@ fn write_pending_dispatch_for_home(
     let entry = PendingDispatchEntry {
         started_at: Utc::now(),
         pid: result.pid,
+        proc_start_time: result.pid.and_then(get_process_start_time),
         unit: result.unit.clone(),
         log_file: result.log_file.clone(),
     };
@@ -203,6 +205,19 @@ fn run_state_has_live_process(state: &ReviewRunState) -> bool {
     state.pid.is_some_and(is_process_alive)
 }
 
+fn verify_process_identity(pid: u32, recorded_proc_start_time: Option<u64>) -> Result<(), String> {
+    let expected_start = recorded_proc_start_time
+        .ok_or_else(|| format!("missing recorded proc_start_time for pid={pid}"))?;
+    let observed_start = get_process_start_time(pid)
+        .ok_or_else(|| format!("failed to read /proc/{pid}/stat starttime"))?;
+    if observed_start != expected_start {
+        return Err(format!(
+            "pid starttime mismatch pid={pid} expected={expected_start} observed={observed_start}"
+        ));
+    }
+    Ok(())
+}
+
 fn wait_for_process_exit(pid: u32, timeout: Duration) {
     let started = Instant::now();
     while started.elapsed() < timeout {
@@ -291,6 +306,9 @@ fn terminate_systemd_unit_with_timeout(unit: &str) -> Result<(), String> {
 
 fn terminate_pending_dispatch_entry(entry: &PendingDispatchEntry) -> Result<(), String> {
     if let Some(pid) = entry.pid {
+        if is_process_alive(pid) {
+            verify_process_identity(pid, entry.proc_start_time)?;
+        }
         terminate_process_with_timeout(pid)?;
     }
     if let Some(unit) = entry.unit.as_deref() {
@@ -386,6 +404,7 @@ fn write_fail_closed_state_for_dispatch(
         previous_run_id: None,
         previous_head_sha: None,
         pid: None,
+        proc_start_time: None,
     };
     write_review_run_state_for_home(home, &state)?;
     Ok(state)
@@ -458,6 +477,7 @@ where
     superseded.status = ReviewRunStatus::Failed;
     superseded.terminal_reason = Some(TERMINAL_SHA_DRIFT_SUPERSEDED.to_string());
     superseded.pid = None;
+    superseded.proc_start_time = None;
     write_review_run_state_for_home(home, &superseded)?;
 
     let lineage = drift_lineage_from_state(state, key);
@@ -527,6 +547,7 @@ fn seed_pending_run_state_for_dispatch_for_home(
         previous_run_id: lineage.map(|value| value.previous_run_id.clone()),
         previous_head_sha: lineage.map(|value| value.previous_head_sha.clone()),
         pid: None,
+        proc_start_time: None,
     };
     write_review_run_state_for_home(home, &state)?;
     Ok(state)
@@ -628,6 +649,19 @@ where
             if !state.status.is_terminal() && !state.head_sha.eq_ignore_ascii_case(&key.head_sha) {
                 match state.pid {
                     Some(pid) if is_process_alive(pid) => {
+                        if let Err(err) = verify_process_identity(pid, state.proc_start_time) {
+                            return fail_closed_dispatch(
+                                home,
+                                pr_url,
+                                key,
+                                TERMINAL_STALE_HEAD_AMBIGUITY,
+                                &format!(
+                                    "stale run-state process identity mismatch pid={pid} head={} run_id={}: {err}",
+                                    state.head_sha, state.run_id
+                                ),
+                                Some(state.sequence_number.saturating_add(1).max(1)),
+                            );
+                        }
                         if let Err(err) = terminate_process_with_timeout(pid) {
                             return fail_closed_dispatch(
                                 home,
@@ -979,7 +1013,7 @@ mod tests {
         run_state_has_live_process, write_pending_dispatch_for_home,
     };
     use crate::commands::fac_review::state::{
-        load_review_run_state_for_home, review_run_state_path_for_home,
+        get_process_start_time, load_review_run_state_for_home, review_run_state_path_for_home,
         write_review_run_state_for_home,
     };
     use crate::commands::fac_review::types::{
@@ -1006,6 +1040,7 @@ mod tests {
             previous_run_id: None,
             previous_head_sha: None,
             pid,
+            proc_start_time: pid.and_then(get_process_start_time),
         }
     }
 
@@ -1268,6 +1303,109 @@ mod tests {
             },
             other => panic!("expected present run-state, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_pid_reuse_not_killed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+
+        let stale_pid = spawn_long_lived_pid();
+        let mut stale_state = sample_run_state(Some(stale_pid));
+        stale_state.head_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        stale_state.run_id = "pr441-security-s12-aaaaaaaa".to_string();
+        stale_state.sequence_number = 12;
+        // Simulate pid reuse by forcing a mismatched recorded starttime.
+        stale_state.proc_start_time = Some(0);
+        write_review_run_state_for_home(home, &stale_state).expect("seed stale state");
+
+        let key = dispatch_key("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let spawn = |_: &str,
+                     _: u32,
+                     _: ReviewKind,
+                     _: &str,
+                     _: u64|
+         -> Result<DispatchReviewResult, String> {
+            panic!("spawn must not be called when stale-head identity is ambiguous");
+        };
+
+        let err = dispatch_single_review_for_home_with_spawn(
+            home,
+            pr_url(),
+            &key,
+            ReviewKind::Security,
+            44,
+            &spawn,
+        )
+        .expect_err("dispatch with pid reuse ambiguity must fail closed");
+        assert!(
+            err.contains(TERMINAL_STALE_HEAD_AMBIGUITY),
+            "unexpected error: {err}"
+        );
+        assert!(
+            crate::commands::fac_review::state::is_process_alive(stale_pid),
+            "ambiguous pid identity must not be killed"
+        );
+
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &stale_pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    #[test]
+    fn test_identity_verified_before_kill() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+
+        let old_pid = spawn_long_lived_pid();
+        let mut old_state = sample_run_state(Some(old_pid));
+        old_state.head_sha = "cccccccccccccccccccccccccccccccccccccccc".to_string();
+        old_state.run_id = "pr441-security-s13-cccccccc".to_string();
+        old_state.sequence_number = 13;
+        old_state.proc_start_time = get_process_start_time(old_pid);
+        assert!(
+            old_state.proc_start_time.is_some(),
+            "expected /proc start time for live pid"
+        );
+        write_review_run_state_for_home(home, &old_state).expect("seed old state");
+
+        let spawn = |_: &str,
+                     _: u32,
+                     _: ReviewKind,
+                     _: &str,
+                     _: u64|
+         -> Result<DispatchReviewResult, String> {
+            Ok(DispatchReviewResult {
+                review_type: "security".to_string(),
+                mode: "started".to_string(),
+                run_state: "pending".to_string(),
+                run_id: None,
+                sequence_number: None,
+                terminal_reason: None,
+                pid: Some(dead_pid_for_test()),
+                unit: None,
+                log_file: None,
+            })
+        };
+
+        let key = dispatch_key("dddddddddddddddddddddddddddddddddddddddd");
+        let result = dispatch_single_review_for_home_with_spawn(
+            home,
+            pr_url(),
+            &key,
+            ReviewKind::Security,
+            45,
+            &spawn,
+        )
+        .expect("dispatch with matching identity should terminate stale pid");
+
+        assert_eq!(result.mode, "drift_resumed");
+        assert!(
+            !crate::commands::fac_review::state::is_process_alive(old_pid),
+            "identity-verified stale process should be terminated"
+        );
     }
 
     #[test]
