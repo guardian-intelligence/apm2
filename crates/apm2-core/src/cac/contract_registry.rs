@@ -117,11 +117,23 @@ pub struct ContractObjectRegistryEntry {
     #[serde(deserialize_with = "deserialize_bounded_string")]
     pub canonicalizer_vectors_ref: String,
     /// Signature set binding requirement reference.
-    #[serde(deserialize_with = "deserialize_bounded_string")]
-    pub signature_set_ref: String,
+    ///
+    /// `None` means no signature requirement is declared for this row.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_bounded_string"
+    )]
+    pub signature_set_ref: Option<String>,
     /// Window/TTL freshness binding requirement reference.
-    #[serde(deserialize_with = "deserialize_bounded_string")]
-    pub window_or_ttl_ref: String,
+    ///
+    /// `None` means no freshness requirement is declared for this row.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_bounded_string"
+    )]
+    pub window_or_ttl_ref: Option<String>,
 }
 
 /// Contract object registry containing schema-qualified snapshot rows.
@@ -305,12 +317,16 @@ pub enum CacDefectClass {
     SignatureFreshnessFailed,
     /// Input failed freshness checks.
     StaleInputDetected,
+    /// Registry requirement reference is unknown or malformed.
+    RequirementRefUnresolved,
     /// Validation did not execute in deterministic order.
     ValidationOrderViolation,
     /// Predicate execution failed.
     PredicateExecutionFailed,
     /// Object kind was not recognized for resolved schema.
     UnknownObjectKind,
+    /// Resolved registry row and object identity do not match.
+    ObjectIdentityMismatch,
 }
 
 impl CacDefectClass {
@@ -327,9 +343,11 @@ impl CacDefectClass {
             | Self::DigestMismatch
             | Self::SignatureFreshnessFailed
             | Self::StaleInputDetected
+            | Self::RequirementRefUnresolved
             | Self::ValidationOrderViolation
             | Self::PredicateExecutionFailed
-            | Self::UnknownObjectKind => CacCompatibilityState::Blocked,
+            | Self::UnknownObjectKind
+            | Self::ObjectIdentityMismatch => CacCompatibilityState::Blocked,
         }
     }
 }
@@ -364,7 +382,7 @@ pub struct CacDefect {
     /// Validation step that emitted this defect.
     pub step: CacValidationStep,
     /// Compatibility-state impact for this defect, derived from `class`.
-    pub compatibility_state: CacCompatibilityState,
+    compatibility_state: CacCompatibilityState,
     /// Human-readable defect detail.
     #[serde(deserialize_with = "deserialize_bounded_string")]
     pub detail: String,
@@ -406,6 +424,12 @@ impl CacDefect {
             compatibility_state: class.compatibility_state(),
             detail: detail.into(),
         }
+    }
+
+    /// Returns compatibility-state impact derived from the defect class.
+    #[must_use]
+    pub const fn compatibility_state(&self) -> CacCompatibilityState {
+        self.compatibility_state
     }
 }
 
@@ -702,7 +726,7 @@ impl Tier2EscalationPolicy {
     pub fn evaluate(&self, defects: &[CacDefect], unresolved_for_secs: u64) -> EscalationAction {
         let compatibility_state = defects
             .iter()
-            .map(|defect| defect.compatibility_state)
+            .map(|defect| defect.class.compatibility_state())
             .max()
             .unwrap_or(CacCompatibilityState::Compatible);
 
@@ -732,6 +756,58 @@ where
         )));
     }
     Ok(value)
+}
+
+fn deserialize_optional_bounded_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(value) = value {
+        if value.len() > MAX_STRING_LENGTH {
+            return Err(de::Error::custom(format!(
+                "string exceeds maximum length ({} > {MAX_STRING_LENGTH})",
+                value.len()
+            )));
+        }
+        Ok(Some(value))
+    } else {
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequirementBinding {
+    Required,
+    NotRequired,
+}
+
+fn resolve_requirement_binding(
+    requirement_ref: Option<&str>,
+    field_name: &str,
+    required_ref: &str,
+    not_required_ref: &str,
+) -> Result<Option<RequirementBinding>, String> {
+    let Some(raw_ref) = requirement_ref else {
+        return Ok(None);
+    };
+
+    let ref_value = raw_ref.trim();
+    if ref_value.is_empty() {
+        return Err(format!(
+            "{field_name} is empty; expected '{required_ref}' or '{not_required_ref}'"
+        ));
+    }
+
+    if ref_value == required_ref {
+        Ok(Some(RequirementBinding::Required))
+    } else if ref_value == not_required_ref {
+        Ok(Some(RequirementBinding::NotRequired))
+    } else {
+        Err(format!(
+            "unknown {field_name} '{ref_value}'; expected '{required_ref}' or '{not_required_ref}'"
+        ))
+    }
 }
 
 fn deserialize_bounded_vec<'de, D, T>(
@@ -872,6 +948,21 @@ pub fn validate_cac_contract(
                 if let Some(entry) = registry.lookup_by_schema_id(&object.schema_id) {
                     resolved_entry = Some(entry);
 
+                    if entry.object_id != object.object_id {
+                        update_with_defect(
+                            &mut defects,
+                            &mut compatibility_state,
+                            CacDefect::new(
+                                CacDefectClass::ObjectIdentityMismatch,
+                                step,
+                                format!(
+                                    "object_id mismatch: expected '{}', got '{}'",
+                                    entry.object_id, object.object_id
+                                ),
+                            ),
+                        );
+                    }
+
                     if entry.kind != object.kind {
                         update_with_defect(
                             &mut defects,
@@ -974,26 +1065,80 @@ pub fn validate_cac_contract(
                 }
             },
             CacValidationStep::SignatureFreshness => {
-                if object.signature_status == CacSignatureStatus::Invalid {
-                    update_with_defect(
-                        &mut defects,
-                        &mut compatibility_state,
-                        CacDefect::new(
-                            CacDefectClass::SignatureFreshnessFailed,
-                            step,
-                            "signature verification failed",
-                        ),
-                    );
-                }
+                if let Some(entry) = resolved_entry {
+                    match resolve_requirement_binding(
+                        entry.signature_set_ref.as_deref(),
+                        "signature_set_ref",
+                        SIGNATURE_SET_REQUIRED_REF,
+                        SIGNATURE_SET_NOT_REQUIRED_REF,
+                    ) {
+                        Ok(Some(RequirementBinding::Required)) => {
+                            if object.signature_status == CacSignatureStatus::Invalid {
+                                update_with_defect(
+                                    &mut defects,
+                                    &mut compatibility_state,
+                                    CacDefect::new(
+                                        CacDefectClass::SignatureFreshnessFailed,
+                                        step,
+                                        "signature verification failed",
+                                    ),
+                                );
+                            }
+                        },
+                        Ok(Some(RequirementBinding::NotRequired) | None) => {},
+                        Err(detail) => {
+                            update_with_defect(
+                                &mut defects,
+                                &mut compatibility_state,
+                                CacDefect::new(
+                                    CacDefectClass::RequirementRefUnresolved,
+                                    step,
+                                    detail,
+                                ),
+                            );
+                        },
+                    }
 
-                if object.freshness_status == CacFreshnessStatus::Stale {
+                    match resolve_requirement_binding(
+                        entry.window_or_ttl_ref.as_deref(),
+                        "window_or_ttl_ref",
+                        WINDOW_OR_TTL_REQUIRED_REF,
+                        WINDOW_OR_TTL_NOT_REQUIRED_REF,
+                    ) {
+                        Ok(Some(RequirementBinding::Required)) => {
+                            if object.freshness_status == CacFreshnessStatus::Stale {
+                                update_with_defect(
+                                    &mut defects,
+                                    &mut compatibility_state,
+                                    CacDefect::new(
+                                        CacDefectClass::StaleInputDetected,
+                                        step,
+                                        "object input is stale for required window/ttl",
+                                    ),
+                                );
+                            }
+                        },
+                        Ok(Some(RequirementBinding::NotRequired) | None) => {},
+                        Err(detail) => {
+                            update_with_defect(
+                                &mut defects,
+                                &mut compatibility_state,
+                                CacDefect::new(
+                                    CacDefectClass::RequirementRefUnresolved,
+                                    step,
+                                    detail,
+                                ),
+                            );
+                        },
+                    }
+                } else {
                     update_with_defect(
                         &mut defects,
                         &mut compatibility_state,
                         CacDefect::new(
-                            CacDefectClass::StaleInputDetected,
+                            CacDefectClass::SchemaUnresolved,
                             step,
-                            "object input is stale for required window/ttl",
+                            "schema must resolve before signature/freshness checks",
                         ),
                     );
                 }
@@ -1105,7 +1250,7 @@ fn update_with_defect(
     compatibility_state: &mut CacCompatibilityState,
     defect: CacDefect,
 ) {
-    *compatibility_state = (*compatibility_state).max(defect.compatibility_state);
+    *compatibility_state = (*compatibility_state).max(defect.compatibility_state());
     if defects.len() < MAX_CAC_DEFECTS {
         defects.push(defect);
     }
@@ -1149,8 +1294,8 @@ fn default_registry_entry(
         canonicalizer_id: CANONICALIZER_ID.to_string(),
         canonicalizer_version: CANONICALIZER_VERSION.to_string(),
         canonicalizer_vectors_ref: CAC_CANONICALIZER_VECTORS_REF.to_string(),
-        signature_set_ref: signature_set_ref.to_string(),
-        window_or_ttl_ref: window_or_ttl_ref.to_string(),
+        signature_set_ref: Some(signature_set_ref.to_string()),
+        window_or_ttl_ref: Some(window_or_ttl_ref.to_string()),
     }
 }
 
@@ -1560,13 +1705,20 @@ mod tests {
         )
     }
 
-    fn sample_suspect_defect() -> CacDefect {
-        CacDefect {
-            class: CacDefectClass::SchemaRegistryDriftAmbiguous,
-            step: CacValidationStep::SchemaResolution,
-            compatibility_state: CacCompatibilityState::Suspect,
-            detail: "test suspect defect".to_string(),
-        }
+    fn registry_with_entry_mutation(
+        schema_id: &str,
+        mutate: impl FnOnce(&mut ContractObjectRegistryEntry),
+    ) -> ContractObjectRegistry {
+        let mut entries = ContractObjectRegistry::default_registry()
+            .entries()
+            .to_vec();
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.schema_id == schema_id)
+            .unwrap_or_else(|| panic!("schema_id '{schema_id}' should exist in default registry"));
+        mutate(entry);
+        ContractObjectRegistry::new(entries)
+            .expect("mutated registry should still satisfy completeness constraints")
     }
 
     fn sample_admissible_object(entry: &ContractObjectRegistryEntry) -> CacObject {
@@ -1620,9 +1772,11 @@ mod tests {
             CacDefectClass::DigestMismatch,
             CacDefectClass::SignatureFreshnessFailed,
             CacDefectClass::StaleInputDetected,
+            CacDefectClass::RequirementRefUnresolved,
             CacDefectClass::ValidationOrderViolation,
             CacDefectClass::PredicateExecutionFailed,
             CacDefectClass::UnknownObjectKind,
+            CacDefectClass::ObjectIdentityMismatch,
         ];
 
         assert!(!all_classes.is_empty());
@@ -1649,7 +1803,7 @@ mod tests {
             "schema_stable_id drift detected",
         );
 
-        assert_eq!(defect.compatibility_state, CacCompatibilityState::Blocked);
+        assert_eq!(defect.compatibility_state(), CacCompatibilityState::Blocked);
     }
 
     #[test]
@@ -1660,7 +1814,7 @@ mod tests {
             "canonicalizer tuple mismatch detected",
         );
 
-        assert_eq!(defect.compatibility_state, CacCompatibilityState::Blocked);
+        assert_eq!(defect.compatibility_state(), CacCompatibilityState::Blocked);
     }
 
     #[test]
@@ -1718,21 +1872,17 @@ mod tests {
     }
 
     #[test]
-    fn test_tier2_freeze_on_suspect_before_deadline() {
+    fn test_escalation_ignores_forged_compatibility_state() {
         let policy = Tier2EscalationPolicy::default_strict();
-        let defects = vec![sample_suspect_defect()];
+        let defects = vec![CacDefect {
+            class: CacDefectClass::SchemaUnresolved,
+            step: CacValidationStep::SchemaResolution,
+            compatibility_state: CacCompatibilityState::Compatible,
+            detail: "forged compatible state".to_string(),
+        }];
 
         let action = policy.evaluate(&defects, policy.adjudication_deadline_secs - 1);
         assert_eq!(action, EscalationAction::FreezePromotionPaths);
-    }
-
-    #[test]
-    fn test_tier2_halt_on_suspect_after_deadline() {
-        let policy = Tier2EscalationPolicy::default_strict();
-        let defects = vec![sample_suspect_defect()];
-
-        let action = policy.evaluate(&defects, policy.adjudication_deadline_secs);
-        assert_eq!(action, EscalationAction::Halt);
     }
 
     #[test]
@@ -1799,6 +1949,126 @@ mod tests {
                 .defects
                 .iter()
                 .any(|defect| defect.class == CacDefectClass::SchemaUnresolved)
+        );
+    }
+
+    #[test]
+    fn test_unsigned_object_skips_signature_check() {
+        let schema_id = "apm2.pcac_snapshot_report.v1";
+        let registry = registry_with_entry_mutation(schema_id, |entry| {
+            entry.signature_set_ref = None;
+        });
+        let entry = registry
+            .lookup_by_schema_id(schema_id)
+            .expect("schema should resolve for signature bypass test");
+        let mut object = sample_admissible_object(entry);
+        object.signature_status = CacSignatureStatus::Invalid;
+
+        let result = validate_cac_contract(&registry, &object);
+
+        assert_eq!(
+            result.compatibility_state,
+            CacCompatibilityState::Compatible
+        );
+        assert!(
+            !result
+                .defects
+                .iter()
+                .any(|defect| defect.class == CacDefectClass::SignatureFreshnessFailed)
+        );
+    }
+
+    #[test]
+    fn test_non_window_bound_skips_freshness_check() {
+        let schema_id = "apm2.pcac_snapshot_report.v1";
+        let registry = registry_with_entry_mutation(schema_id, |entry| {
+            entry.window_or_ttl_ref = None;
+        });
+        let entry = registry
+            .lookup_by_schema_id(schema_id)
+            .expect("schema should resolve for freshness bypass test");
+        let mut object = sample_admissible_object(entry);
+        object.freshness_status = CacFreshnessStatus::Stale;
+
+        let result = validate_cac_contract(&registry, &object);
+
+        assert_eq!(
+            result.compatibility_state,
+            CacCompatibilityState::Compatible
+        );
+        assert!(
+            !result
+                .defects
+                .iter()
+                .any(|defect| defect.class == CacDefectClass::StaleInputDetected)
+        );
+    }
+
+    #[test]
+    fn test_unknown_ref_value_is_explicit_defect() {
+        let schema_id = "apm2.pcac_snapshot_report.v1";
+        let registry = registry_with_entry_mutation(schema_id, |entry| {
+            entry.signature_set_ref = Some("signature_set.unknown".to_string());
+        });
+        let entry = registry
+            .lookup_by_schema_id(schema_id)
+            .expect("schema should resolve for unknown-ref test");
+        let object = sample_admissible_object(entry);
+
+        let result = validate_cac_contract(&registry, &object);
+
+        assert_eq!(result.compatibility_state, CacCompatibilityState::Blocked);
+        assert!(
+            result
+                .defects
+                .iter()
+                .any(|defect| defect.class == CacDefectClass::RequirementRefUnresolved)
+        );
+    }
+
+    #[test]
+    fn test_object_id_mismatch_rejected() {
+        let registry = ContractObjectRegistry::default_registry();
+        let entry = registry
+            .lookup_by_schema_id("apm2.pcac_snapshot_report.v1")
+            .expect("schema should resolve for object_id mismatch test");
+        let mut object = sample_admissible_object(entry);
+        object.object_id = "DifferentObjectIdV1".to_string();
+
+        let result = validate_cac_contract(&registry, &object);
+
+        assert_eq!(result.compatibility_state, CacCompatibilityState::Blocked);
+        assert_eq!(
+            result.executed_steps,
+            vec![CacValidationStep::SchemaResolution]
+        );
+        assert!(
+            result
+                .defects
+                .iter()
+                .any(|defect| defect.class == CacDefectClass::ObjectIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn test_object_id_match_accepted() {
+        let registry = ContractObjectRegistry::default_registry();
+        let entry = registry
+            .lookup_by_schema_id("apm2.pcac_snapshot_report.v1")
+            .expect("schema should resolve for object_id match test");
+        let object = sample_admissible_object(entry);
+
+        let result = validate_cac_contract(&registry, &object);
+
+        assert_eq!(
+            result.compatibility_state,
+            CacCompatibilityState::Compatible
+        );
+        assert!(
+            !result
+                .defects
+                .iter()
+                .any(|defect| defect.class == CacDefectClass::ObjectIdentityMismatch)
         );
     }
 
@@ -1953,9 +2223,9 @@ mod tests {
         let defect: CacDefect =
             serde_json::from_value(value).expect("defect should deserialize with derived state");
 
-        assert_eq!(defect.compatibility_state, CacCompatibilityState::Blocked);
+        assert_eq!(defect.compatibility_state(), CacCompatibilityState::Blocked);
         assert_eq!(
-            defect.compatibility_state,
+            defect.compatibility_state(),
             defect.class.compatibility_state()
         );
     }
