@@ -12,9 +12,10 @@ use std::time::Instant;
 use apm2_core::consensus::SyncEvent;
 use apm2_core::crypto::{EventHasher, Hash};
 use apm2_core::pcac::{
-    AuthorityDenyClass, AuthorityJoinInputV1, AuthorityJoinKernel, BoundaryIntentClass,
-    DeterminismClass, IdentityEvidenceLevel, RiskTier, VerifierEconomicsProfile,
-    timed_anti_entropy_verification,
+    AuthoritativeBindings, AuthorityDenyClass, AuthorityJoinInputV1, AuthorityJoinKernel,
+    BindingExpectations, BoundaryIntentClass, DeterminismClass, FactClass, IdentityEvidenceLevel,
+    ReceiptAuthentication, RiskTier, VerifierEconomicsProfile, timed_anti_entropy_verification,
+    timed_classify_fact, timed_validate_authoritative_bindings,
 };
 use apm2_daemon::pcac::{InProcessKernel, LifecycleGate};
 
@@ -56,6 +57,7 @@ fn valid_input(risk_tier: RiskTier, scope_complexity: usize, seed: u8) -> Author
 
 const fn permissive_timing_profile(max_proof_checks: u64) -> VerifierEconomicsProfile {
     VerifierEconomicsProfile {
+        p95_join_us: u64::MAX,
         p95_verify_receipt_us: u64::MAX,
         p95_validate_bindings_us: u64::MAX,
         p95_classify_fact_us: u64::MAX,
@@ -63,6 +65,23 @@ const fn permissive_timing_profile(max_proof_checks: u64) -> VerifierEconomicsPr
         p95_anti_entropy_us: u64::MAX,
         max_proof_checks,
     }
+}
+
+const fn valid_bindings(seed: u8) -> (AuthoritativeBindings, Hash) {
+    let authority_seal_hash = test_hash(seed.wrapping_add(0x11));
+    (
+        AuthoritativeBindings {
+            episode_envelope_hash: test_hash(seed.wrapping_add(0x12)),
+            view_commitment_hash: test_hash(seed.wrapping_add(0x13)),
+            time_envelope_ref: test_hash(seed.wrapping_add(0x14)),
+            authentication: ReceiptAuthentication::Direct {
+                authority_seal_hash,
+            },
+            permeability_receipt_hash: None,
+            delegation_chain_hash: None,
+        },
+        authority_seal_hash,
+    )
 }
 
 fn make_sync_events(count: usize) -> Vec<SyncEvent> {
@@ -97,7 +116,7 @@ fn p95(samples: &mut [u64]) -> u64 {
 
 #[test]
 fn test_join_scope_witness_cardinality_does_not_trigger_merkle_depth_denial() {
-    let kernel = InProcessKernel::new(100).with_verifier_economics(permissive_timing_profile(0));
+    let kernel = InProcessKernel::new(100).with_verifier_economics(permissive_timing_profile(1));
     let input = valid_input(
         RiskTier::Tier2Plus,
         apm2_core::pcac::MAX_SCOPE_WITNESS_HASHES,
@@ -120,19 +139,33 @@ fn test_tier0_join_allows_on_verifier_bounds_exceeded() {
 }
 
 #[test]
+fn test_join_operation_uses_join_metric_and_enforces_join_bound() {
+    let kernel = InProcessKernel::new(100).with_verifier_economics(VerifierEconomicsProfile {
+        p95_join_us: 0,
+        p95_verify_receipt_us: u64::MAX,
+        p95_validate_bindings_us: u64::MAX,
+        p95_classify_fact_us: u64::MAX,
+        p95_replay_lifecycle_us: u64::MAX,
+        p95_anti_entropy_us: u64::MAX,
+        max_proof_checks: u64::MAX,
+    });
+    let input = valid_input(RiskTier::Tier2Plus, 1, 0x22);
+    let err = kernel
+        .join(&input)
+        .expect_err("Tier2+ join must deny when Join timing bound is exceeded");
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::VerifierEconomicsBoundsExceeded { ref operation, risk_tier }
+            if operation == "join" && risk_tier == RiskTier::Tier2Plus
+    ));
+}
+
+#[test]
 fn test_proof_check_count_enforcement() {
     let kernel = InProcessKernel::new(100).with_verifier_economics(permissive_timing_profile(2));
     let input = valid_input(RiskTier::Tier2Plus, 0, 0x30);
 
     let cert = kernel.join(&input).expect("join must pass");
-    kernel
-        .revalidate(
-            &cert,
-            input.time_envelope_ref,
-            input.as_of_ledger_anchor,
-            cert.revocation_head_hash,
-        )
-        .expect("revalidate must pass");
 
     let err = kernel
         .consume(
@@ -205,6 +238,38 @@ fn test_anti_entropy_proof_checks_exclude_event_count() {
 }
 
 #[test]
+fn test_crypto_operations_report_non_zero_proof_checks() {
+    let (bindings, expected_seal_hash) = valid_bindings(0x60);
+    let ledger_anchor = test_hash(0x70);
+
+    let timed_bindings = timed_validate_authoritative_bindings(
+        &bindings,
+        bindings.time_envelope_ref,
+        ledger_anchor,
+        100,
+        Some(&bindings.view_commitment_hash),
+        Some(&ledger_anchor),
+    );
+    assert!(timed_bindings.result.is_ok());
+    assert_eq!(timed_bindings.proof_check_count, 3);
+
+    let timed_classification = timed_classify_fact(
+        Some(&bindings),
+        &expected_seal_hash,
+        None,
+        bindings.time_envelope_ref,
+        ledger_anchor,
+        100,
+        BindingExpectations {
+            expected_view_commitment: Some(&bindings.view_commitment_hash),
+            expected_ledger_anchor: Some(&ledger_anchor),
+        },
+    );
+    assert_eq!(timed_classification.result, FactClass::AcceptanceFact);
+    assert_eq!(timed_classification.proof_check_count, 3);
+}
+
+#[test]
 fn test_evid_0005_benchmark_output() {
     let profile = VerifierEconomicsProfile::default();
     let mut join_samples = Vec::new();
@@ -212,7 +277,7 @@ fn test_evid_0005_benchmark_output() {
     let mut consume_samples = Vec::new();
     let mut anti_entropy_samples = Vec::new();
 
-    let join_proof_checks_total = 0_u64;
+    let mut join_proof_checks_total = 0_u64;
     let mut replay_proof_checks_total = 0_u64;
     let mut anti_entropy_proof_checks_total = 0_u64;
 
@@ -231,6 +296,7 @@ fn test_evid_0005_benchmark_output() {
             let start = Instant::now();
             let cert = kernel.join(&input).expect("join benchmark");
             join_samples.push(elapsed_us_since(start));
+            join_proof_checks_total = join_proof_checks_total.saturating_add(1);
 
             let start = Instant::now();
             kernel
@@ -284,7 +350,8 @@ fn test_evid_0005_benchmark_output() {
 
     let tier2_join_deny = {
         let kernel = InProcessKernel::new(200).with_verifier_economics(VerifierEconomicsProfile {
-            p95_verify_receipt_us: 0,
+            p95_join_us: 0,
+            p95_verify_receipt_us: u64::MAX,
             p95_validate_bindings_us: u64::MAX,
             p95_classify_fact_us: u64::MAX,
             p95_replay_lifecycle_us: u64::MAX,
@@ -303,14 +370,6 @@ fn test_evid_0005_benchmark_output() {
             InProcessKernel::new(300).with_verifier_economics(permissive_timing_profile(2));
         let input = valid_input(RiskTier::Tier2Plus, 0, 0x91);
         let cert = kernel.join(&input).expect("join");
-        kernel
-            .revalidate(
-                &cert,
-                input.time_envelope_ref,
-                input.as_of_ledger_anchor,
-                cert.revocation_head_hash,
-            )
-            .expect("revalidate");
         kernel
             .consume(
                 &cert,

@@ -1046,9 +1046,9 @@ impl AuthorityJoinKernel for InProcessKernel {
         // the actual join operation latency directly and keep proof checks
         // independent of scope witness cardinality.
         self.enforce_verifier_economics_sample(
-            VerifierOperation::VerifyReceiptAuthentication,
+            VerifierOperation::Join,
             u64::try_from(join_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
-            0,
+            1, // compute_join_hash performs one BLAKE3 hash
             input.risk_tier,
             None,
             input.time_envelope_ref,

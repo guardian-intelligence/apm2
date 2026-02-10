@@ -393,7 +393,10 @@ pub fn timed_validate_authoritative_bindings(
     TimedVerificationResult {
         result,
         elapsed_us: elapsed_us_since(start),
-        proof_check_count: 0,
+        proof_check_count: proof_checks_for_validate_bindings(
+            expected_view_commitment.is_some(),
+            expected_ledger_anchor.is_some(),
+        ),
         event_count: 0,
     }
 }
@@ -410,6 +413,15 @@ pub fn timed_classify_fact(
     expectations: BindingExpectations<'_>,
 ) -> TimedVerificationResult<FactClass> {
     let start = Instant::now();
+    let binding_checks = bindings.map_or(0, |_| {
+        proof_checks_for_validate_bindings(
+            expectations.expected_view_commitment.is_some(),
+            expectations.expected_ledger_anchor.is_some(),
+        )
+    });
+    let receipt_checks = bindings.map_or(0, |binding| {
+        proof_checks_for_receipt_auth(&binding.authentication)
+    });
     let result = classify_fact(
         bindings,
         expected_seal_hash,
@@ -422,7 +434,7 @@ pub fn timed_classify_fact(
     TimedVerificationResult {
         result,
         elapsed_us: elapsed_us_since(start),
-        proof_check_count: 0,
+        proof_check_count: binding_checks.saturating_add(receipt_checks),
         event_count: 0,
     }
 }
@@ -489,6 +501,19 @@ pub fn timed_anti_entropy_verification(
 #[inline]
 fn elapsed_us_since(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Counts the constant-time hash comparisons performed by
+/// [`validate_authoritative_bindings`].
+///
+/// 1 mandatory (`time_envelope_ref`) + conditionals for view commitment
+/// and ledger anchor.
+#[inline]
+const fn proof_checks_for_validate_bindings(
+    expected_view_commitment: bool,
+    expected_ledger_anchor: bool,
+) -> u64 {
+    1 + expected_view_commitment as u64 + expected_ledger_anchor as u64
 }
 
 #[inline]

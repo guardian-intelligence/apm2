@@ -14,6 +14,8 @@ use super::{AuthorityDenyClass, RiskTier};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifierEconomicsProfile {
+    /// p95 upper bound for the `join` lifecycle stage (microseconds).
+    pub p95_join_us: u64,
     /// p95 upper bound for `verify_receipt_authentication` (microseconds).
     pub p95_verify_receipt_us: u64,
     /// p95 upper bound for `validate_authoritative_bindings` (microseconds).
@@ -36,6 +38,7 @@ impl Default for VerifierEconomicsProfile {
     fn default() -> Self {
         // Conservative finite defaults.
         Self {
+            p95_join_us: 10_000,
             p95_verify_receipt_us: 10_000,
             p95_validate_bindings_us: 10_000,
             p95_classify_fact_us: 10_000,
@@ -51,6 +54,8 @@ impl Default for VerifierEconomicsProfile {
 /// Identifies the verifier operation being measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifierOperation {
+    /// Timing sample for the `join` lifecycle stage (certificate issuance).
+    Join,
     /// Timing sample for `verify_receipt_authentication`.
     VerifyReceiptAuthentication,
     /// Timing sample for `validate_authoritative_bindings`.
@@ -66,6 +71,7 @@ pub enum VerifierOperation {
 impl std::fmt::Display for VerifierOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Join => write!(f, "join"),
             Self::VerifyReceiptAuthentication => write!(f, "verify_receipt_authentication"),
             Self::ValidateAuthoritativeBindings => write!(f, "validate_authoritative_bindings"),
             Self::ClassifyFact => write!(f, "classify_fact"),
@@ -89,6 +95,7 @@ impl VerifierEconomicsChecker {
 
     const fn bound_for(&self, operation: VerifierOperation) -> u64 {
         match operation {
+            VerifierOperation::Join => self.profile.p95_join_us,
             VerifierOperation::VerifyReceiptAuthentication => self.profile.p95_verify_receipt_us,
             VerifierOperation::ValidateAuthoritativeBindings => {
                 self.profile.p95_validate_bindings_us
@@ -162,6 +169,7 @@ mod tests {
 
     fn tight_profile() -> VerifierEconomicsProfile {
         VerifierEconomicsProfile {
+            p95_join_us: 5,
             p95_verify_receipt_us: 10,
             p95_validate_bindings_us: 20,
             p95_classify_fact_us: 30,
@@ -209,6 +217,7 @@ mod tests {
     fn all_operation_variants_are_covered() {
         let checker = VerifierEconomicsChecker::new(tight_profile());
         let cases = [
+            (VerifierOperation::Join, 6, "join"),
             (
                 VerifierOperation::VerifyReceiptAuthentication,
                 11,
@@ -247,6 +256,7 @@ mod tests {
     #[test]
     fn default_profile_is_non_zero() {
         let profile = VerifierEconomicsProfile::default();
+        assert_eq!(profile.p95_join_us, 10_000);
         assert_eq!(profile.p95_verify_receipt_us, 10_000);
         assert_eq!(profile.p95_validate_bindings_us, 10_000);
         assert_eq!(profile.p95_classify_fact_us, 10_000);
@@ -258,6 +268,7 @@ mod tests {
     #[test]
     fn profile_serialization_round_trip() {
         let profile = VerifierEconomicsProfile {
+            p95_join_us: 100,
             p95_verify_receipt_us: 111,
             p95_validate_bindings_us: 222,
             p95_classify_fact_us: 333,
@@ -267,6 +278,7 @@ mod tests {
         };
         let json = serde_json::to_string(&profile).unwrap();
         let decoded: VerifierEconomicsProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.p95_join_us, 100);
         assert_eq!(decoded.p95_verify_receipt_us, 111);
         assert_eq!(decoded.p95_validate_bindings_us, 222);
         assert_eq!(decoded.p95_classify_fact_us, 333);
@@ -278,6 +290,7 @@ mod tests {
     #[test]
     fn zero_bounds_deny_non_zero_tier2plus_elapsed() {
         let checker = VerifierEconomicsChecker::new(VerifierEconomicsProfile {
+            p95_join_us: 0,
             p95_verify_receipt_us: 0,
             p95_validate_bindings_us: 0,
             p95_classify_fact_us: 0,
