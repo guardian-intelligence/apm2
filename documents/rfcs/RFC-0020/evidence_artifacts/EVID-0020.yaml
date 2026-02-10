@@ -1,0 +1,19 @@
+evidence_artifact:
+  schema_version: "2026-02-05"
+  id: "EVID-0020"
+  title: "Optional VDF delay profile evidence"
+  category: "TESTING"
+  status: "DELIVERED"
+  description: |
+    Evidence for REQ-0020: Optional VDF delay profile correctness.
+    VDF profile implementation with deterministic challenge derivation,
+    fail-closed verification, bounded difficulty, and adversarial tests.
+  artifact_pointers:
+    - path: "crates/apm2-core/src/htf/vdf_profile.rs"
+      description: "VDF profile types, verifier traits, and unit tests"
+    - path: "crates/apm2-core/src/htf/epoch_seal.rs"
+      description: "EpochSealV1 VDF integration and verification tests"
+  requirement_refs:
+    - "REQ-0020"
+  ticket_refs:
+    - "TCK-00366"

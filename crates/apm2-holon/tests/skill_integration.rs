@@ -240,8 +240,6 @@ fn spawn_config_from_holon_config(
 /// Verifies that the SKILL.md file parses successfully and contains
 /// valid holon configuration.
 #[test]
-// Fixture removed in PR #534 (RFC-0019 Quantum Leap)
-#[ignore = "Fixture removed in PR #534 (RFC-0019 Quantum Leap)"]
 fn test_example_holon_skill_loads_correctly() {
     let skill_path = example_holon_skill_path();
 
@@ -317,8 +315,6 @@ fn test_example_holon_skill_loads_correctly() {
 /// Verifies that a holon configured from the skill executes episodes
 /// correctly until completion.
 #[test]
-// Fixture removed in PR #534 (RFC-0019 Quantum Leap)
-#[ignore = "Fixture removed in PR #534 (RFC-0019 Quantum Leap)"]
 fn test_skill_executes_through_episode_loop() {
     let skill_path = example_holon_skill_path();
     let (frontmatter, _) = parse_skill_file(&skill_path).expect("should parse");
@@ -351,8 +347,6 @@ fn test_skill_executes_through_episode_loop() {
 ///
 /// Verifies that all configured stop conditions trigger correctly.
 #[test]
-// Fixture removed in PR #534 (RFC-0019 Quantum Leap)
-#[ignore = "Fixture removed in PR #534 (RFC-0019 Quantum Leap)"]
 fn test_stop_conditions_work_as_documented() {
     let skill_path = example_holon_skill_path();
     let (frontmatter, _) = parse_skill_file(&skill_path).expect("should parse");
@@ -473,8 +467,6 @@ fn test_stop_conditions_work_as_documented() {
 /// Verifies that the skill documentation contains all required sections
 /// and explains the holon pattern clearly.
 #[test]
-// Fixture removed in PR #534 (RFC-0019 Quantum Leap)
-#[ignore = "Fixture removed in PR #534 (RFC-0019 Quantum Leap)"]
 fn test_pattern_is_clear_from_documentation() {
     let skill_path = example_holon_skill_path();
     let (_, body) = parse_skill_file(&skill_path).expect("should parse");
@@ -533,8 +525,6 @@ fn test_pattern_is_clear_from_documentation() {
 /// This test is the comprehensive integration test that exercises the
 /// full skill loading and execution flow.
 #[test]
-// Fixture removed in PR #534 (RFC-0019 Quantum Leap)
-#[ignore = "Fixture removed in PR #534 (RFC-0019 Quantum Leap)"]
 fn test_full_skill_integration() {
     // Step 1: Load skill from file
     let skill_path = example_holon_skill_path();
@@ -695,8 +685,6 @@ holon:
 
 /// Test that episode controller respects skill configuration.
 #[test]
-// Fixture removed in PR #534 (RFC-0019 Quantum Leap)
-#[ignore = "Fixture removed in PR #534 (RFC-0019 Quantum Leap)"]
 fn test_episode_controller_respects_skill_config() {
     let skill_path = example_holon_skill_path();
     let (frontmatter, _) = parse_skill_file(&skill_path).expect("should parse");

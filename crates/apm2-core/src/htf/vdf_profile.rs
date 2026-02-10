@@ -120,6 +120,13 @@ pub enum VdfVerificationError {
     /// Output does not match recomputed expected value.
     #[error("vdf output mismatch")]
     OutputMismatch,
+
+    /// Scheme exists but verifier support is not yet implemented.
+    #[error("vdf verification unsupported: {scheme}")]
+    UnsupportedScheme {
+        /// Human-readable unsupported scheme reason.
+        scheme: String,
+    },
 }
 
 /// A VDF delay profile attached to an epoch seal.
@@ -308,7 +315,7 @@ impl VdfVerifier for SlothV1Verifier {
     }
 }
 
-/// Pietrzak-v1 verifier stub.
+/// Pietrzak-v1 verifier placeholder.
 #[derive(Debug, Default)]
 pub struct PietrzakV1Verifier;
 
@@ -321,8 +328,9 @@ impl VdfVerifier for PietrzakV1Verifier {
                 actual: profile.scheme(),
             });
         }
-        // Stub for RFC-0020 phase: structural validation only.
-        Ok(())
+        Err(VdfVerificationError::UnsupportedScheme {
+            scheme: "PietrzakV1 verification not implemented; fail-closed per RFC-0020 §1.9".into(),
+        })
     }
 }
 
@@ -487,13 +495,46 @@ mod tests {
     }
 
     #[test]
-    fn pietrzak_stub_accepts_structurally_valid_profile() {
+    fn pietrzak_verifier_fails_closed_until_implemented() {
         let input =
             VdfProfileV1::derive_challenge("cell-alpha", &test_anchor(0x11), &test_anchor(0x22));
         let profile = VdfProfileV1::new(VdfScheme::PietrzakV1, input, vec![0xAB; 48], 7)
             .expect("valid profile");
 
         let verifier = PietrzakV1Verifier;
-        assert!(verifier.verify_vdf(&profile).is_ok());
+        let err = verifier
+            .verify_vdf(&profile)
+            .expect_err("PietrzakV1 must fail closed until verification is implemented");
+        match err {
+            VdfVerificationError::UnsupportedScheme { scheme } => {
+                assert_eq!(
+                    scheme,
+                    "PietrzakV1 verification not implemented; fail-closed per RFC-0020 §1.9"
+                );
+            },
+            _ => panic!("unexpected error variant"),
+        }
+    }
+
+    #[test]
+    fn default_verifier_rejects_pietrzak_profiles_fail_closed() {
+        let input =
+            VdfProfileV1::derive_challenge("cell-alpha", &test_anchor(0x11), &test_anchor(0x22));
+        let profile = VdfProfileV1::new(VdfScheme::PietrzakV1, input, vec![0xAB; 48], 7)
+            .expect("valid profile");
+
+        let verifier = DefaultVdfVerifier::default();
+        let err = verifier
+            .verify_vdf(&profile)
+            .expect_err("DefaultVdfVerifier must reject unimplemented PietrzakV1");
+        match err {
+            VdfVerificationError::UnsupportedScheme { scheme } => {
+                assert_eq!(
+                    scheme,
+                    "PietrzakV1 verification not implemented; fail-closed per RFC-0020 §1.9"
+                );
+            },
+            _ => panic!("unexpected error variant"),
+        }
     }
 }
