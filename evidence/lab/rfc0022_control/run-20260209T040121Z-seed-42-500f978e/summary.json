@@ -1,0 +1,28 @@
+{
+  "run_id": "run-20260209T040121Z-seed-42-500f978e",
+  "seed": 42,
+  "target_rfc_path": "documents/rfcs/RFC-0022/PRINCIPAL_SOVEREIGNTY_INTERFACE.md",
+  "branch_name": "exp/rfc0022-control/run-20260209T040121Z-seed-42-500f978e",
+  "completed": false,
+  "stop_reason": "proposal_hash_mismatch_applier",
+  "iterations_executed": 1,
+  "iterations_admitted": 0,
+  "final_quality": {
+    "security": 0.0,
+    "robustness": 0.0,
+    "reliability": 0.0,
+    "performance": 0.0,
+    "implementability": 0.0,
+    "verifiability": 0.0
+  },
+  "total_delta_u": 0.0,
+  "total_cost": 0.0,
+  "total_tokens": 25000,
+  "total_cli_calls": 2,
+  "total_elapsed_seconds": 620.257609808,
+  "critical_regression_count": 0,
+  "council_disagreement_mean": 0.0,
+  "final_rfc_hash": "5eb033085a336db6a07279f4e8da163bce182139749fb47071f04a994089d2ea",
+  "summary_path": "/home/ubuntu/Projects/apm2-lab/evidence/lab/rfc0022_control/run-20260209T040121Z-seed-42-500f978e/summary.json",
+  "events_path": "/home/ubuntu/Projects/apm2-lab/evidence/lab/rfc0022_control/run-20260209T040121Z-seed-42-500f978e/events.jsonl"
+}

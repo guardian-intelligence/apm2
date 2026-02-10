@@ -1,0 +1,6 @@
+{
+  "h0_supported": true,
+  "h1_supported": false,
+  "iterations_admitted": 0,
+  "stop_reason": "proposal_hash_mismatch_applier"
+}

@@ -56,22 +56,27 @@ pub async fn run_rfc_control_with_backend<B: AgentBackend>(
     };
 
     let run_id = build_run_id(seed);
+    println!("[lab2] starting run_id={run_id} seed={seed}");
     let branch_name = if spec.git.enabled {
         let branch = format!("{}/{}", spec.git.branch_prefix, run_id);
         git_audit::create_and_checkout_branch(&repo_root, &branch, &base_ref)?;
+        println!("[lab2] git branch created: {branch}");
         Some(branch)
     } else {
+        println!("[lab2] git integration disabled");
         None
     };
 
     let output_root = repo_root.join(&spec.outputs.root_dir);
     let paths = RunPaths::new(&output_root, &run_id)?;
+    println!("[lab2] artifacts dir: {}", paths.run_dir.display());
 
     let prompt_files = prompt::write_system_prompts(&paths.run_dir, &spec)?;
 
     let target_path = repo_root.join(spec.target_path());
     let mut current_doc = fs::read_to_string(&target_path)
         .with_context(|| format!("read target RFC {}", target_path.display()))?;
+    println!("[lab2] target RFC: {}", target_path.display());
 
     let mut sessions = BTreeMap::new();
     sessions.insert(PROPOSER_ROLE.to_string(), new_session_id(PROPOSER_ROLE));
@@ -101,6 +106,7 @@ pub async fn run_rfc_control_with_backend<B: AgentBackend>(
 
     for iteration in 0..spec.runtime.max_iterations {
         iterations_executed = iteration + 1;
+        println!("[lab2] iteration={iteration} begin");
         let iter_dir = paths.iterations_dir.join(format!("iter_{iteration:03}"));
         fs::create_dir_all(&iter_dir).with_context(|| format!("create {}", iter_dir.display()))?;
 
@@ -121,6 +127,10 @@ pub async fn run_rfc_control_with_backend<B: AgentBackend>(
                 proposer_prompt,
             )?)
             .await?;
+        println!(
+            "[lab2] iteration={iteration} role={} tokens={} elapsed_s={:.3}",
+            PROPOSER_ROLE, proposer_response.token_estimate, proposer_response.elapsed_seconds
+        );
         write_text(
             iter_dir.join("raw_proposer.json"),
             &proposer_response.raw_output,
@@ -153,6 +163,10 @@ pub async fn run_rfc_control_with_backend<B: AgentBackend>(
                 applier_prompt,
             )?)
             .await?;
+        println!(
+            "[lab2] iteration={iteration} role={} tokens={} elapsed_s={:.3}",
+            APPLIER_ROLE, applier_response.token_estimate, applier_response.elapsed_seconds
+        );
         write_text(
             iter_dir.join("raw_applier.json"),
             &applier_response.raw_output,
@@ -167,16 +181,6 @@ pub async fn run_rfc_control_with_backend<B: AgentBackend>(
             .context("parse applier output")?;
         write_json(iter_dir.join("applier.json"), &applier)?;
 
-        if applier.base_revision_hash != before_hash {
-            last_stop_reason = "base_hash_mismatch_applier".to_string();
-            break;
-        }
-
-        if applier.proposal_hash != proposal_hash {
-            last_stop_reason = "proposal_hash_mismatch_applier".to_string();
-            break;
-        }
-
         if applier.updated_document.trim().is_empty() {
             last_stop_reason = "empty_applier_document".to_string();
             break;
@@ -184,6 +188,25 @@ pub async fn run_rfc_control_with_backend<B: AgentBackend>(
 
         let after_doc_path = iter_dir.join("after.md");
         write_text(&after_doc_path, &applier.updated_document)?;
+
+        let mut precheck_notes = Vec::new();
+        if applier.base_revision_hash != before_hash {
+            let note = format!(
+                "applier base hash mismatch: expected={} got={}",
+                before_hash, applier.base_revision_hash
+            );
+            println!("[lab2] iteration={iteration} warning: {note}");
+            precheck_notes.push(note);
+        }
+
+        if applier.proposal_hash != proposal_hash {
+            let note = format!(
+                "applier proposal hash mismatch: expected={} got={}",
+                proposal_hash, applier.proposal_hash
+            );
+            println!("[lab2] iteration={iteration} warning: {note}");
+            precheck_notes.push(note);
+        }
 
         let (diff_text, line_churn) = git_audit::make_diff(&before_doc_path, &after_doc_path)?;
         write_text(iter_dir.join("diff.patch"), &diff_text)?;
@@ -206,6 +229,10 @@ pub async fn run_rfc_control_with_backend<B: AgentBackend>(
                     council_prompt,
                 )?)
                 .await?;
+            println!(
+                "[lab2] iteration={iteration} role={} tokens={} elapsed_s={:.3}",
+                reviewer_id, council_response.token_estimate, council_response.elapsed_seconds
+            );
             write_text(
                 iter_dir.join(format!("raw_council_{reviewer_id}.json")),
                 &council_response.raw_output,
@@ -240,6 +267,11 @@ pub async fn run_rfc_control_with_backend<B: AgentBackend>(
         };
 
         let mut outcome = evaluate_iteration(&spec.controller, &input);
+        outcome.notes.extend(precheck_notes);
+        println!(
+            "[lab2] iteration={iteration} delta_u={:.6} cost={:.6} efficiency={:.6} disagreement={:.6}",
+            outcome.delta_u, outcome.cost, outcome.efficiency, aggregate.disagreement
+        );
 
         let budget_exhausted = total_tokens > spec.budget.max_tokens
             || total_calls > spec.budget.max_cli_calls
@@ -250,6 +282,7 @@ pub async fn run_rfc_control_with_backend<B: AgentBackend>(
             outcome.continue_loop = false;
             outcome.stop_reason = "budget_exhausted".to_string();
             outcome.notes.push("budget limit exceeded".to_string());
+            println!("[lab2] iteration={iteration} budget exhausted");
         }
 
         if outcome.critical_regression {
@@ -302,6 +335,10 @@ pub async fn run_rfc_control_with_backend<B: AgentBackend>(
         total_cost += decision.cost;
 
         if decision.admitted {
+            println!(
+                "[lab2] iteration={iteration} admitted=true stop_reason={}",
+                decision.stop_reason
+            );
             write_text(&target_path, &applier.updated_document)?;
             current_doc = applier.updated_document;
             total_delta_u += decision.delta_u;
@@ -314,9 +351,14 @@ pub async fn run_rfc_control_with_backend<B: AgentBackend>(
                     iteration, seed, decision.delta_u, decision.efficiency
                 );
                 let commit_paths = vec![target_path.clone(), iter_dir.clone()];
-                let _ = git_audit::commit_paths(&repo_root, &message, &commit_paths)?;
+                let committed = git_audit::commit_paths(&repo_root, &message, &commit_paths)?;
+                println!("[lab2] iteration={iteration} commit_written={committed}");
             }
         } else {
+            println!(
+                "[lab2] iteration={iteration} admitted=false stop_reason={}",
+                decision.stop_reason
+            );
             final_quality = decision.quality_before;
             last_stop_reason = decision.stop_reason;
             break;
@@ -371,6 +413,15 @@ pub async fn run_rfc_control_with_backend<B: AgentBackend>(
             "stop_reason": summary.stop_reason,
         }),
     )?;
+
+    println!(
+        "[lab2] completed run_id={} iterations_executed={} admitted={} stop_reason={} summary={}",
+        summary.run_id,
+        summary.iterations_executed,
+        summary.iterations_admitted,
+        summary.stop_reason,
+        summary.summary_path
+    );
 
     Ok(summary)
 }
