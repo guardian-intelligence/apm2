@@ -340,11 +340,11 @@ pub struct CoordinationController {
     /// Per-work tracking state.
     work_tracking: Vec<WorkItemState>,
 
-    /// Advisory planner objectives by work ID.
+    /// Advisory planner objectives by work queue index.
     ///
     /// This collection is strictly informational and is not consulted by
     /// stop/budget/freshness gate checks.
-    advisory_objectives: Vec<(String, AdvisoryPlannerScore)>,
+    advisory_objectives: Vec<(usize, AdvisoryPlannerScore)>,
 
     /// Active session state (enforces serial execution and `work_id`
     /// validation).
@@ -497,24 +497,30 @@ impl CoordinationController {
     /// limit is exceeded, or receipt construction fails.
     pub fn record_advisory_objective(
         &mut self,
+        work_index: usize,
         score: AdvisoryPlannerScore,
+        current_tick: u64,
     ) -> ControllerResult<Option<CoordinationObjectiveReceiptV1>> {
-        let work_id = score.work_id().to_string();
+        let tracked_work =
+            self.work_tracking
+                .get(work_index)
+                .ok_or_else(|| ControllerError::Internal {
+                    message: format!(
+                        "work index out of bounds for advisory objective: {work_index}"
+                    ),
+                })?;
+        if tracked_work.work_id.as_str() != score.work_id() {
+            return Err(ControllerError::WorkNotFound {
+                work_id: score.work_id().to_string(),
+            });
+        }
 
-        let escalation_count = self
-            .work_tracking
-            .iter()
-            .filter(|tracking| tracking.work_id.as_str() == work_id.as_str())
-            .map(|tracking| tracking.attempt_count)
-            .max()
-            .ok_or_else(|| ControllerError::WorkNotFound {
-                work_id: work_id.clone(),
-            })?;
+        let escalation_count = tracked_work.attempt_count;
 
         if let Some((_, existing_score)) = self
             .advisory_objectives
             .iter_mut()
-            .find(|(tracked_work_id, _)| tracked_work_id == &work_id)
+            .find(|(tracked_index, _)| *tracked_index == work_index)
         {
             *existing_score = score;
         } else {
@@ -526,7 +532,7 @@ impl CoordinationController {
                 };
                 return Err(planner_error_to_controller(&error));
             }
-            self.advisory_objectives.push((work_id.clone(), score));
+            self.advisory_objectives.push((work_index, score));
         }
 
         if escalation_count >= TIER3_ESCALATION_THRESHOLD {
@@ -538,7 +544,7 @@ impl CoordinationController {
                     })?;
 
             let advisory_score =
-                self.advisory_score_for(&work_id)
+                self.advisory_score_for(work_index)
                     .ok_or_else(|| ControllerError::Internal {
                         message: "advisory objective not found after record".to_string(),
                     })?;
@@ -547,7 +553,7 @@ impl CoordinationController {
                 coordination_id,
                 advisory_score.objective(),
                 escalation_count,
-                advisory_score.computed_at_tick(),
+                current_tick,
             )
             .map_err(|error| planner_error_to_controller(&error))?;
 
@@ -561,12 +567,12 @@ impl CoordinationController {
     ///
     /// This method is read-only and informational.
     #[must_use]
-    pub fn advisory_score_for(&self, work_id: &str) -> Option<&AdvisoryPlannerScore> {
+    pub fn advisory_score_for(&self, work_index: usize) -> Option<&AdvisoryPlannerScore> {
         self.advisory_objectives
             .iter()
             .rev()
-            .find_map(|(tracked_work_id, score)| {
-                if tracked_work_id == work_id {
+            .find_map(|(tracked_index, score)| {
+                if *tracked_index == work_index {
                     Some(score)
                 } else {
                     None

@@ -34,15 +34,15 @@ pub const OBJECTIVE_RECEIPT_SCHEMA_VERSION: &str = "1.0.0";
 pub struct EfeWeights {
     /// Weight for expected policy violation component.
     #[serde(rename = "lambda_risk")]
-    pub lambda_risk: f64,
+    risk: f64,
 
     /// Weight for expected evidence ambiguity component.
     #[serde(rename = "lambda_uncertainty")]
-    pub lambda_uncertainty: f64,
+    uncertainty: f64,
 
     /// Weight for expected resource cost component.
     #[serde(rename = "lambda_cost")]
-    pub lambda_cost: f64,
+    cost: f64,
 }
 
 impl EfeWeights {
@@ -60,19 +60,44 @@ impl EfeWeights {
         lambda_cost: f64,
     ) -> Result<Self, PlannerError> {
         Ok(Self {
-            lambda_risk: clamp_weight("lambda_risk", lambda_risk)?,
-            lambda_uncertainty: clamp_weight("lambda_uncertainty", lambda_uncertainty)?,
-            lambda_cost: clamp_weight("lambda_cost", lambda_cost)?,
+            risk: clamp_weight("lambda_risk", lambda_risk)?,
+            uncertainty: clamp_weight("lambda_uncertainty", lambda_uncertainty)?,
+            cost: clamp_weight("lambda_cost", lambda_cost)?,
         })
+    }
+
+    /// Returns the policy-violation component weight.
+    #[must_use]
+    pub const fn lambda_risk(&self) -> f64 {
+        self.risk
+    }
+
+    /// Returns the evidence-ambiguity component weight.
+    #[must_use]
+    pub const fn lambda_uncertainty(&self) -> f64 {
+        self.uncertainty
+    }
+
+    /// Returns the resource-cost component weight.
+    #[must_use]
+    pub const fn lambda_cost(&self) -> f64 {
+        self.cost
+    }
+
+    fn validate_bounded(&self) -> Result<(), PlannerError> {
+        validate_weight_in_unit_interval("lambda_risk", self.risk)?;
+        validate_weight_in_unit_interval("lambda_uncertainty", self.uncertainty)?;
+        validate_weight_in_unit_interval("lambda_cost", self.cost)?;
+        Ok(())
     }
 }
 
 impl Default for EfeWeights {
     fn default() -> Self {
         Self {
-            lambda_risk: 1.0,
-            lambda_uncertainty: 1.0,
-            lambda_cost: 1.0,
+            risk: 1.0,
+            uncertainty: 1.0,
+            cost: 1.0,
         }
     }
 }
@@ -86,15 +111,15 @@ pub struct EfeComponents {
     /// Estimated policy violation score from capability/stop/freshness
     /// constraints.
     #[serde(rename = "expected_policy_violation")]
-    pub expected_policy_violation: f64,
+    policy_violation: f64,
 
     /// Evidence ambiguity score (reduced by context/evidence acquisition).
     #[serde(rename = "expected_evidence_ambiguity")]
-    pub expected_evidence_ambiguity: f64,
+    evidence_ambiguity: f64,
 
     /// Resource cost score (bounded by episode/channel budgets).
     #[serde(rename = "expected_resource_cost")]
-    pub expected_resource_cost: f64,
+    resource_cost: f64,
 }
 
 impl EfeComponents {
@@ -113,31 +138,59 @@ impl EfeComponents {
         expected_resource_cost: f64,
     ) -> Result<Self, PlannerError> {
         Ok(Self {
-            expected_policy_violation: validate_component_in_unit_interval(
+            policy_violation: validate_component_in_unit_interval(
                 "expected_policy_violation",
                 expected_policy_violation,
             )?,
-            expected_evidence_ambiguity: validate_component_in_unit_interval(
+            evidence_ambiguity: validate_component_in_unit_interval(
                 "expected_evidence_ambiguity",
                 expected_evidence_ambiguity,
             )?,
-            expected_resource_cost: validate_component_in_unit_interval(
+            resource_cost: validate_component_in_unit_interval(
                 "expected_resource_cost",
                 expected_resource_cost,
             )?,
         })
     }
 
+    /// Returns the expected policy-violation component.
+    #[must_use]
+    pub const fn expected_policy_violation(&self) -> f64 {
+        self.policy_violation
+    }
+
+    /// Returns the expected evidence-ambiguity component.
+    #[must_use]
+    pub const fn expected_evidence_ambiguity(&self) -> f64 {
+        self.evidence_ambiguity
+    }
+
+    /// Returns the expected resource-cost component.
+    #[must_use]
+    pub const fn expected_resource_cost(&self) -> f64 {
+        self.resource_cost
+    }
+
     /// Computes EFE as a weighted sum of bounded components.
     #[must_use]
     pub fn compute_efe(&self, weights: &EfeWeights) -> f64 {
-        weights.lambda_cost.mul_add(
-            self.expected_resource_cost,
-            weights.lambda_risk.mul_add(
-                self.expected_policy_violation,
-                weights.lambda_uncertainty * self.expected_evidence_ambiguity,
+        weights.lambda_cost().mul_add(
+            self.expected_resource_cost(),
+            weights.lambda_risk().mul_add(
+                self.expected_policy_violation(),
+                weights.lambda_uncertainty() * self.expected_evidence_ambiguity(),
             ),
         )
+    }
+
+    fn validate_bounded(&self) -> Result<(), PlannerError> {
+        validate_component_in_unit_interval("expected_policy_violation", self.policy_violation)?;
+        validate_component_in_unit_interval(
+            "expected_evidence_ambiguity",
+            self.evidence_ambiguity,
+        )?;
+        validate_component_in_unit_interval("expected_resource_cost", self.resource_cost)?;
+        Ok(())
     }
 }
 
@@ -151,23 +204,23 @@ impl EfeComponents {
 pub struct EfeObjective {
     /// The work item this objective applies to.
     #[serde(rename = "work_id")]
-    pub work_id: String,
+    work_id: String,
 
     /// Component scores used to compute the objective.
     #[serde(rename = "components")]
-    pub components: EfeComponents,
+    components: EfeComponents,
 
     /// Weights used for objective computation.
     #[serde(rename = "weights")]
-    pub weights: EfeWeights,
+    weights: EfeWeights,
 
     /// Computed EFE score (lower is better). Advisory only.
     #[serde(rename = "efe_score")]
-    pub efe_score: f64,
+    efe_score: f64,
 
     /// Monotonic tick at which this objective was computed.
     #[serde(rename = "computed_at_tick")]
-    pub computed_at_tick: u64,
+    computed_at_tick: u64,
 }
 
 impl EfeObjective {
@@ -187,14 +240,62 @@ impl EfeObjective {
         validate_field_len("work_id", &work_id, MAX_PLANNER_WORK_ID_LEN)?;
 
         let efe_score = components.compute_efe(&weights);
-
-        Ok(Self {
+        let objective = Self {
             work_id,
             components,
             weights,
             efe_score,
             computed_at_tick,
-        })
+        };
+        objective.validate_components_and_weights()?;
+        validate_finite("efe_score", objective.efe_score)?;
+        Ok(objective)
+    }
+
+    /// Returns the work item this objective applies to.
+    #[must_use]
+    pub fn work_id(&self) -> &str {
+        &self.work_id
+    }
+
+    /// Returns the EFE components used for scoring.
+    #[must_use]
+    pub const fn components(&self) -> &EfeComponents {
+        &self.components
+    }
+
+    /// Returns the EFE weights used for scoring.
+    #[must_use]
+    pub const fn weights(&self) -> &EfeWeights {
+        &self.weights
+    }
+
+    /// Returns the advisory EFE score.
+    #[must_use]
+    pub const fn efe_score(&self) -> f64 {
+        self.efe_score
+    }
+
+    /// Returns the monotonic tick at objective computation time.
+    #[must_use]
+    pub const fn computed_at_tick(&self) -> u64 {
+        self.computed_at_tick
+    }
+
+    fn validate_components_and_weights(&self) -> Result<(), PlannerError> {
+        self.components.validate_bounded()?;
+        self.weights.validate_bounded()?;
+        Ok(())
+    }
+
+    #[must_use]
+    const fn inputs_are_finite(&self) -> bool {
+        self.components.expected_policy_violation().is_finite()
+            && self.components.expected_evidence_ambiguity().is_finite()
+            && self.components.expected_resource_cost().is_finite()
+            && self.weights.lambda_risk().is_finite()
+            && self.weights.lambda_uncertainty().is_finite()
+            && self.weights.lambda_cost().is_finite()
     }
 
     /// Returns a BLAKE3 hash over canonical JSON objective inputs
@@ -209,6 +310,11 @@ impl EfeObjective {
             #[serde(rename = "weights")]
             weights: &'a EfeWeights,
         }
+
+        debug_assert!(
+            self.inputs_are_finite(),
+            "objective inputs must be finite before hashing"
+        );
 
         let inputs = ObjectiveInputs {
             components: &self.components,
@@ -279,16 +385,16 @@ impl CoordinationObjectiveReceiptV1 {
             &coordination_id,
             MAX_PLANNER_COORDINATION_ID_LEN,
         )?;
-        validate_field_len("work_id", &objective.work_id, MAX_PLANNER_WORK_ID_LEN)?;
+        validate_field_len("work_id", objective.work_id(), MAX_PLANNER_WORK_ID_LEN)?;
 
         Ok(Self {
             schema_version: OBJECTIVE_RECEIPT_SCHEMA_VERSION.to_string(),
             coordination_id,
-            work_id: objective.work_id.clone(),
+            work_id: objective.work_id().to_string(),
             objective_inputs_hash: objective.objective_inputs_hash(),
-            efe_score_repr: format!("{:.17}", objective.efe_score),
+            efe_score_repr: format!("{:.17}", objective.efe_score()),
             escalation_count,
-            computed_at_tick: objective.computed_at_tick,
+            computed_at_tick: objective.computed_at_tick(),
             emitted_at_tick,
         })
     }
@@ -336,33 +442,39 @@ pub struct AdvisoryPlannerScore {
 
 impl AdvisoryPlannerScore {
     /// Wraps an objective as advisory planner score.
-    #[must_use]
-    pub const fn new(objective: EfeObjective) -> Self {
-        Self { objective }
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PlannerError`] if components/weights are non-finite or
+    /// out of bounds.
+    pub fn new(objective: EfeObjective) -> Result<Self, PlannerError> {
+        objective.validate_components_and_weights()?;
+        validate_finite("efe_score", objective.efe_score())?;
+        Ok(Self { objective })
     }
 
     /// Returns the advisory EFE score (lower is better).
     #[must_use]
     pub const fn efe_score(&self) -> f64 {
-        self.objective.efe_score
+        self.objective.efe_score()
     }
 
     /// Returns the work item ID this score applies to.
     #[must_use]
     pub fn work_id(&self) -> &str {
-        &self.objective.work_id
+        self.objective.work_id()
     }
 
     /// Returns EFE component scores.
     #[must_use]
     pub const fn components(&self) -> &EfeComponents {
-        &self.objective.components
+        self.objective.components()
     }
 
     /// Returns EFE component weights.
     #[must_use]
     pub const fn weights(&self) -> &EfeWeights {
-        &self.objective.weights
+        self.objective.weights()
     }
 
     /// Returns hash of objective inputs (`components` + `weights`).
@@ -374,7 +486,7 @@ impl AdvisoryPlannerScore {
     /// Returns the objective compute tick.
     #[must_use]
     pub(crate) const fn computed_at_tick(&self) -> u64 {
-        self.objective.computed_at_tick
+        self.objective.computed_at_tick()
     }
 
     /// Returns the underlying objective for internal receipt generation.
@@ -496,6 +608,19 @@ fn validate_component_in_unit_interval(
     field: &'static str,
     value: f64,
 ) -> Result<f64, PlannerError> {
+    validate_finite(field, value)?;
+    if !(0.0..=1.0).contains(&value) {
+        return Err(PlannerError::OutOfRange {
+            field,
+            value,
+            min: 0.0,
+            max: 1.0,
+        });
+    }
+    Ok(value)
+}
+
+fn validate_weight_in_unit_interval(field: &'static str, value: f64) -> Result<f64, PlannerError> {
     validate_finite(field, value)?;
     if !(0.0..=1.0).contains(&value) {
         return Err(PlannerError::OutOfRange {
