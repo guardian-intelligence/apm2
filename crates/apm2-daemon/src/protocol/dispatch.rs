@@ -1445,7 +1445,7 @@ pub fn validate_transition_authority_bindings(
     }
 
     // 4. Validate permeability_receipt_hash is non-zero and CAS-resolvable
-    if bindings.permeability_receipt_hash == [0u8; 32] {
+    if bool::from(bindings.permeability_receipt_hash.ct_eq(&[0u8; 32])) {
         violations.push("permeability_receipt_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.permeability_receipt_hash) {
@@ -1459,7 +1459,7 @@ pub fn validate_transition_authority_bindings(
     }
 
     // 5. Validate capability_manifest_hash is non-zero and CAS-resolvable
-    if bindings.capability_manifest_hash == [0u8; 32] {
+    if bool::from(bindings.capability_manifest_hash.ct_eq(&[0u8; 32])) {
         violations.push("capability_manifest_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.capability_manifest_hash) {
@@ -1473,7 +1473,7 @@ pub fn validate_transition_authority_bindings(
     }
 
     // 6. Validate context_pack_hash is non-zero and CAS-resolvable
-    if bindings.context_pack_hash == [0u8; 32] {
+    if bool::from(bindings.context_pack_hash.ct_eq(&[0u8; 32])) {
         violations.push("context_pack_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.context_pack_hash) {
@@ -1487,7 +1487,7 @@ pub fn validate_transition_authority_bindings(
     }
 
     // 7. Validate stop_condition_hash is non-zero and CAS-resolvable
-    if bindings.stop_condition_hash == [0u8; 32] {
+    if bool::from(bindings.stop_condition_hash.ct_eq(&[0u8; 32])) {
         violations.push("stop_condition_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.stop_condition_hash) {
@@ -1501,7 +1501,7 @@ pub fn validate_transition_authority_bindings(
     }
 
     // 8. Validate typed_budget_hash is non-zero and CAS-resolvable
-    if bindings.typed_budget_hash == [0u8; 32] {
+    if bool::from(bindings.typed_budget_hash.ct_eq(&[0u8; 32])) {
         violations.push("typed_budget_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.typed_budget_hash) {
@@ -1524,8 +1524,8 @@ pub fn validate_transition_authority_bindings(
 
     // 10. Re-derive hashes and verify they match (tamper detection)
     let recomputed_stop_hash = hash_bytes(&bindings.stop_conditions.canonical_bytes());
-    if bindings.stop_condition_hash != [0u8; 32]
-        && bindings.stop_condition_hash != recomputed_stop_hash
+    if !bool::from(bindings.stop_condition_hash.ct_eq(&[0u8; 32]))
+        && !bool::from(bindings.stop_condition_hash.ct_eq(&recomputed_stop_hash))
     {
         violations.push(format!(
             "stop_condition_hash mismatch: declared={} recomputed={}",
@@ -1538,8 +1538,8 @@ pub fn validate_transition_authority_bindings(
         canonical_json_bytes(&build_typed_budget_payload(&bindings.typed_budgets))
     {
         let recomputed_budget_hash = hash_bytes(&budget_payload);
-        if bindings.typed_budget_hash != [0u8; 32]
-            && bindings.typed_budget_hash != recomputed_budget_hash
+        if !bool::from(bindings.typed_budget_hash.ct_eq(&[0u8; 32]))
+            && !bool::from(bindings.typed_budget_hash.ct_eq(&recomputed_budget_hash))
         {
             violations.push(format!(
                 "typed_budget_hash mismatch: declared={} recomputed={}",
@@ -1588,7 +1588,7 @@ pub fn validate_review_outcome_bindings(
     let mut violations: Vec<String> = Vec::new();
 
     // 1. view_commitment_hash
-    if bindings.view_commitment_hash == [0u8; 32] {
+    if bool::from(bindings.view_commitment_hash.ct_eq(&[0u8; 32])) {
         violations.push("view_commitment_hash is zero (unset)".to_string());
     } else {
         match cas.exists(&bindings.view_commitment_hash) {
@@ -1602,7 +1602,7 @@ pub fn validate_review_outcome_bindings(
     }
 
     // 2. tool_log_index_hash
-    if bindings.tool_log_index_hash == [0u8; 32] {
+    if bool::from(bindings.tool_log_index_hash.ct_eq(&[0u8; 32])) {
         violations.push("tool_log_index_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.tool_log_index_hash) {
@@ -1616,7 +1616,7 @@ pub fn validate_review_outcome_bindings(
     }
 
     // 3. summary_receipt_hash
-    if bindings.summary_receipt_hash == [0u8; 32] {
+    if bool::from(bindings.summary_receipt_hash.ct_eq(&[0u8; 32])) {
         violations.push("summary_receipt_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.summary_receipt_hash) {
@@ -2173,19 +2173,19 @@ pub fn validate_and_store_transition_authority(
     // capability_manifest_hash and context_pack_hash are mandatory per
     // REQ-HEF-0013 -- zero values indicate missing policy resolution and
     // MUST be rejected (fail-closed).
-    if bindings.permeability_receipt_hash == [0u8; 32] {
+    if bool::from(bindings.permeability_receipt_hash.ct_eq(&[0u8; 32])) {
         violations.push("permeability_receipt_hash is zero (unset)".to_string());
     }
-    if bindings.capability_manifest_hash == [0u8; 32] {
+    if bool::from(bindings.capability_manifest_hash.ct_eq(&[0u8; 32])) {
         violations.push("capability_manifest_hash is zero (unset)".to_string());
     }
-    if bindings.context_pack_hash == [0u8; 32] {
+    if bool::from(bindings.context_pack_hash.ct_eq(&[0u8; 32])) {
         violations.push("context_pack_hash is zero (unset)".to_string());
     }
-    if bindings.stop_condition_hash == [0u8; 32] {
+    if bool::from(bindings.stop_condition_hash.ct_eq(&[0u8; 32])) {
         violations.push("stop_condition_hash is zero (unset)".to_string());
     }
-    if bindings.typed_budget_hash == [0u8; 32] {
+    if bool::from(bindings.typed_budget_hash.ct_eq(&[0u8; 32])) {
         violations.push("typed_budget_hash is zero (unset)".to_string());
     }
 
@@ -2208,7 +2208,7 @@ pub fn validate_and_store_transition_authority(
         ("stop_condition_hash", bindings.stop_condition_hash),
         ("typed_budget_hash", bindings.typed_budget_hash),
     ] {
-        if hash != [0u8; 32] && violations.len() < MAX_BINDING_VIOLATIONS {
+        if !bool::from(hash.ct_eq(&[0u8; 32])) && violations.len() < MAX_BINDING_VIOLATIONS {
             match cas.exists(&hash) {
                 Ok(true) => {},
                 Ok(false) => violations.push(format!(
@@ -2230,8 +2230,8 @@ pub fn validate_and_store_transition_authority(
 
     // Hash integrity: re-derive and verify
     let recomputed_stop_hash = hash_bytes(&bindings.stop_conditions.canonical_bytes());
-    if bindings.stop_condition_hash != [0u8; 32]
-        && bindings.stop_condition_hash != recomputed_stop_hash
+    if !bool::from(bindings.stop_condition_hash.ct_eq(&[0u8; 32]))
+        && !bool::from(bindings.stop_condition_hash.ct_eq(&recomputed_stop_hash))
     {
         violations.push(format!(
             "stop_condition_hash mismatch: declared={} recomputed={}",
@@ -2244,8 +2244,8 @@ pub fn validate_and_store_transition_authority(
         canonical_json_bytes(&build_typed_budget_payload(&bindings.typed_budgets))
     {
         let recomputed_budget_hash = hash_bytes(&budget_payload);
-        if bindings.typed_budget_hash != [0u8; 32]
-            && bindings.typed_budget_hash != recomputed_budget_hash
+        if !bool::from(bindings.typed_budget_hash.ct_eq(&[0u8; 32]))
+            && !bool::from(bindings.typed_budget_hash.ct_eq(&recomputed_budget_hash))
         {
             violations.push(format!(
                 "typed_budget_hash mismatch: declared={} recomputed={}",
@@ -4911,7 +4911,7 @@ impl ConnectionContext {
         &mut self,
         profile_hash: [u8; 32],
     ) -> Result<(), crate::identity::IdentityProofError> {
-        if profile_hash == [0u8; 32] {
+        if bool::from(profile_hash.ct_eq(&[0u8; 32])) {
             return Err(crate::identity::IdentityProofError::InvalidField {
                 field: "identity_proof_profile_hash",
                 reason: "must be non-zero".to_string(),
@@ -7713,7 +7713,7 @@ impl PrivilegedDispatcher {
         let envelope_canonical_hash = envelope
             .canonical_hash()
             .map_err(|e| format!("failed to canonicalize time envelope: {e}"))?;
-        if envelope_canonical_hash != envelope_hash {
+        if !bool::from(envelope_canonical_hash.ct_eq(&envelope_hash)) {
             return Err(format!(
                 "time_envelope_ref hash mismatch: ref={} actual={}",
                 hex::encode(envelope_hash),
@@ -7732,7 +7732,7 @@ impl PrivilegedDispatcher {
         let profile_canonical_hash = clock_profile
             .canonical_hash()
             .map_err(|e| format!("failed to canonicalize clock profile: {e}"))?;
-        if profile_canonical_hash != clock_profile_hash {
+        if !bool::from(profile_canonical_hash.ct_eq(&clock_profile_hash)) {
             return Err(format!(
                 "clock_profile_hash mismatch: envelope={} actual={}",
                 hex::encode(clock_profile_hash),
@@ -9478,7 +9478,7 @@ impl PrivilegedDispatcher {
             receipt_hash.copy_from_slice(receipt_hash_bytes);
 
             // Fail-closed: receipt hash must be non-zero.
-            if receipt_hash == [0u8; 32] {
+            if bool::from(receipt_hash.ct_eq(&[0u8; 32])) {
                 warn!(
                     work_id = %request.work_id,
                     "SpawnEpisode rejected: permeability_receipt_hash is zero"
@@ -9505,7 +9505,7 @@ impl PrivilegedDispatcher {
 
             // Verify the receipt content hash matches the declared hash.
             let actual_hash = receipt.content_hash();
-            if actual_hash != receipt_hash {
+            if !bool::from(actual_hash.ct_eq(&receipt_hash)) {
                 warn!(
                     work_id = %request.work_id,
                     expected = %hex::encode(receipt_hash),
@@ -12544,17 +12544,18 @@ impl PrivilegedDispatcher {
         } else {
             None
         };
-        let request_blocked_log_hash_arr = if verdict == ReviewReceiptVerdict::Blocked {
-            Some(
-                request
-                    .blocked_log_hash
-                    .as_slice()
-                    .try_into()
-                    .expect("validated to be 32 bytes above"),
-            )
-        } else {
-            None
-        };
+        let request_blocked_log_hash_arr: Option<[u8; 32]> =
+            if verdict == ReviewReceiptVerdict::Blocked {
+                Some(
+                    request
+                        .blocked_log_hash
+                        .as_slice()
+                        .try_into()
+                        .expect("validated to be 32 bytes above"),
+                )
+            } else {
+                None
+            };
 
         let to_response_event_type = |event_type: &str| -> String {
             match event_type {
@@ -12603,7 +12604,11 @@ impl PrivilegedDispatcher {
                 ));
             }
 
-            if original.changeset_digest != request_changeset_digest_arr {
+            if !bool::from(
+                original
+                    .changeset_digest
+                    .ct_eq(&request_changeset_digest_arr),
+            ) {
                 warn!(
                     receipt_id = %request.receipt_id,
                     existing_event_id = %existing.event_id,
@@ -12633,7 +12638,11 @@ impl PrivilegedDispatcher {
                 ));
             }
 
-            if original.artifact_bundle_hash != request_artifact_bundle_hash_arr {
+            if !bool::from(
+                original
+                    .artifact_bundle_hash
+                    .ct_eq(&request_artifact_bundle_hash_arr),
+            ) {
                 warn!(
                     receipt_id = %request.receipt_id,
                     existing_event_id = %existing.event_id,
@@ -12672,7 +12681,11 @@ impl PrivilegedDispatcher {
             if let Some(original_blocked_log_hash) = original.blocked_log_hash {
                 let requested_blocked_log_hash = request_blocked_log_hash_arr
                     .map_or_else(|| "<missing>".to_string(), hex::encode);
-                if Some(original_blocked_log_hash) != request_blocked_log_hash_arr {
+                let blocked_log_hash_matches =
+                    request_blocked_log_hash_arr.is_some_and(|request_blocked_log_hash| {
+                        bool::from(original_blocked_log_hash.ct_eq(&request_blocked_log_hash))
+                    });
+                if !blocked_log_hash_matches {
                     warn!(
                         receipt_id = %request.receipt_id,
                         existing_event_id = %existing.event_id,
@@ -13731,7 +13744,7 @@ impl PrivilegedDispatcher {
         // digest mismatches before any side effects.
         let computed_changeset_digest = bundle.compute_digest();
         let provided_changeset_digest = bundle.changeset_digest();
-        if computed_changeset_digest != provided_changeset_digest {
+        if !bool::from(computed_changeset_digest.ct_eq(&provided_changeset_digest)) {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
                 format!(
@@ -14339,7 +14352,9 @@ impl PrivilegedDispatcher {
         }
 
         // Lineage binding prerequisites for delegated paths.
-        if parent_lease.changeset_digest == [0u8; 32] || parent_lease.policy_hash == [0u8; 32] {
+        if bool::from(parent_lease.changeset_digest.ct_eq(&[0u8; 32]))
+            || bool::from(parent_lease.policy_hash.ct_eq(&[0u8; 32]))
+        {
             let deny_class = AuthorityDenyClass::InvalidDelegationChain;
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
@@ -14608,8 +14623,8 @@ impl PrivilegedDispatcher {
                     && existing.gate_id == sublease.gate_id
                     && existing.executor_actor_id == sublease.executor_actor_id
                     && existing.expires_at == sublease.expires_at
-                    && existing.changeset_digest == sublease.changeset_digest
-                    && existing.policy_hash == sublease.policy_hash
+                    && bool::from(existing.changeset_digest.ct_eq(&sublease.changeset_digest))
+                    && bool::from(existing.policy_hash.ct_eq(&sublease.policy_hash))
                     && existing.issuer_actor_id == sublease.issuer_actor_id;
 
                 if !fields_match {

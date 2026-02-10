@@ -55,6 +55,7 @@
 //! - TB-0006: `ContextPack` Firewall Boundary
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 // =============================================================================
 // Constants
@@ -806,7 +807,7 @@ fn classify_tool_argument_source(
     match provenance {
         Some(ToolArgumentProvenance::CasBound {
             content_hash: expected_hash,
-        }) if expected_hash == content_hash => TaintSource::FileRead,
+        }) if bool::from(expected_hash.ct_eq(&content_hash)) => TaintSource::FileRead,
         Some(ToolArgumentProvenance::ExplicitFileRead) => TaintSource::FileRead,
         _ => TaintSource::UserPrompt,
     }
