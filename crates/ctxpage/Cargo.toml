@@ -1,0 +1,38 @@
+[package]
+name = "ctxpage"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/ctxpage"
+authors.workspace = true
+keywords = ["context", "pagination", "agents", "deterministic", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+description = "Deterministic pagination for large context streams"
+readme = "README.md"
+
+[dependencies]
+base64.workspace = true
+blake3.workspace = true
+clap = { workspace = true, features = ["derive"] }
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bin]]
+name = "ctxpage"
+path = "src/main.rs"
+
+[[bench]]
+name = "pagination_bench"
+harness = false
+
+[lints]
+workspace = true

@@ -1,10 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/calloc",
     "crates/apm2-core",
     "crates/apm2-daemon",
     "crates/apm2-cli",
-    "xtask", "crates/apm2-holon",
+    "xtask", "crates/apm2-holon", "crates/ctxpage",
 ]
 exclude = ["fuzz"]
 
