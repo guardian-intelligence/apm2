@@ -1445,7 +1445,6 @@ pub fn validate_cac_snapshot(
 
     for object in objects {
         let result = validate_cac_contract(registry, object);
-        compatibility_state = compatibility_state.max(result.recompute_compatibility_state());
         for defect in &result.defects {
             update_with_defect(&mut defects, &mut compatibility_state, defect.clone());
         }
