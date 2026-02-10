@@ -354,6 +354,12 @@ pub struct StopFlagsMutation<'a> {
     pub request_context: &'a serde_json::Value,
 }
 
+/// Maximum number of ledger events loaded into launch projections per request.
+///
+/// Projection endpoints must replay a bounded recent-history window to prevent
+/// unbounded CPU and memory consumption as the append-only ledger grows.
+pub const MAX_PROJECTION_EVENTS: usize = 10_000;
+
 /// Trait for emitting signed events to the ledger.
 ///
 /// Per TCK-00253 acceptance criteria:
@@ -550,24 +556,40 @@ pub trait LedgerEventEmitter: Send + Sync {
         None
     }
 
-    /// Queries authoritative receipt events used by launch projections.
-    ///
-    /// Implementations should return events in deterministic replay order.
-    fn get_authoritative_receipt_events(&self) -> Vec<SignedLedgerEvent> {
+    /// Returns the total number of authoritative receipt events used by launch
+    /// projections.
+    fn get_authoritative_receipt_event_count(&self) -> usize {
         self.get_all_events()
             .into_iter()
             .filter(|event| {
                 event.event_type == "review_receipt_recorded"
                     || event.event_type == "review_blocked_recorded"
             })
-            .collect()
+            .count()
     }
 
-    /// Queries liveness-relevant launch events used by orchestrator
-    /// projections.
+    /// Queries authoritative receipt events used by launch projections.
     ///
-    /// Implementations should return events in deterministic replay order.
-    fn get_launch_liveness_projection_events(&self) -> Vec<SignedLedgerEvent> {
+    /// Implementations should return at most [`MAX_PROJECTION_EVENTS`] events
+    /// in deterministic replay order. Retrieval MUST prefer the most recent
+    /// events to avoid replaying unbounded historical ledgers per request.
+    fn get_authoritative_receipt_events(&self) -> Vec<SignedLedgerEvent> {
+        let events: Vec<SignedLedgerEvent> = self
+            .get_all_events()
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "review_receipt_recorded"
+                    || event.event_type == "review_blocked_recorded"
+            })
+            .collect();
+
+        let start = events.len().saturating_sub(MAX_PROJECTION_EVENTS);
+        events.into_iter().skip(start).collect()
+    }
+
+    /// Returns the total number of liveness-relevant launch events used by
+    /// orchestrator projections.
+    fn get_launch_liveness_projection_event_count(&self) -> usize {
         self.get_all_events()
             .into_iter()
             .filter(|event| {
@@ -576,7 +598,29 @@ pub trait LedgerEventEmitter: Send + Sync {
                     || event.event_type == "review_receipt_recorded"
                     || event.event_type == "review_blocked_recorded"
             })
-            .collect()
+            .count()
+    }
+
+    /// Queries liveness-relevant launch events used by orchestrator
+    /// projections.
+    ///
+    /// Implementations should return at most [`MAX_PROJECTION_EVENTS`] events
+    /// in deterministic replay order. Retrieval MUST prefer the most recent
+    /// events to avoid replaying unbounded historical ledgers per request.
+    fn get_launch_liveness_projection_events(&self) -> Vec<SignedLedgerEvent> {
+        let events: Vec<SignedLedgerEvent> = self
+            .get_all_events()
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "session_started"
+                    || event.event_type == "session_terminated"
+                    || event.event_type == "review_receipt_recorded"
+                    || event.event_type == "review_blocked_recorded"
+            })
+            .collect();
+
+        let start = events.len().saturating_sub(MAX_PROJECTION_EVENTS);
+        events.into_iter().skip(start).collect()
     }
 
     /// Emits an episode lifecycle event to the ledger (TCK-00321).
@@ -2356,7 +2400,7 @@ pub fn append_privileged_pcac_lifecycle_fields(
 /// Per CTR-1303: In-memory stores must have `max_entries` limit with O(1)
 /// eviction. This prevents denial-of-service via memory exhaustion from
 /// unbounded event emission.
-pub const MAX_LEDGER_EVENTS: usize = 10_000;
+pub const MAX_LEDGER_EVENTS: usize = MAX_PROJECTION_EVENTS;
 
 /// Stub ledger event emitter for testing.
 ///
@@ -11741,8 +11785,9 @@ impl PrivilegedDispatcher {
     }
 
     fn build_auditor_launch_projection(&self) -> AuditorLaunchProjectionV1 {
+        let total_receipts = self.event_emitter.get_authoritative_receipt_event_count();
         let receipt_events = self.event_emitter.get_authoritative_receipt_events();
-        let total_receipts = receipt_events.len();
+        let considered_receipts = receipt_events.len();
         let mut complete_lineage_receipt_count = 0usize;
         let mut boundary_conformant_receipt_count = 0usize;
         let mut uncertainty_flags = Vec::new();
@@ -11767,18 +11812,22 @@ impl PrivilegedDispatcher {
             }
         }
 
-        if total_receipts == 0 {
+        if total_receipts > considered_receipts {
+            uncertainty_flags.push(ProjectionUncertainty::TruncatedHistory);
+        }
+
+        if considered_receipts == 0 {
             uncertainty_flags.push(ProjectionUncertainty::MissingLineageEvidence);
             uncertainty_flags.push(ProjectionUncertainty::BoundaryConformanceUnverifiable);
         }
 
         let lineage_complete =
-            total_receipts > 0 && complete_lineage_receipt_count == total_receipts;
+            considered_receipts > 0 && complete_lineage_receipt_count == considered_receipts;
         let boundary_conformant =
-            total_receipts > 0 && boundary_conformant_receipt_count == total_receipts;
+            considered_receipts > 0 && boundary_conformant_receipt_count == considered_receipts;
 
         AuditorLaunchProjectionV1::new(
-            saturating_u32(total_receipts),
+            saturating_u32(considered_receipts),
             saturating_u32(complete_lineage_receipt_count),
             saturating_u32(boundary_conformant_receipt_count),
             lineage_complete,
@@ -11788,6 +11837,9 @@ impl PrivilegedDispatcher {
     }
 
     fn build_orchestrator_launch_projection(&self) -> OrchestratorLaunchProjectionV1 {
+        let total_events = self
+            .event_emitter
+            .get_launch_liveness_projection_event_count();
         let events = self.event_emitter.get_launch_liveness_projection_events();
         let mut uncertainty_flags = Vec::new();
         let mut active_sessions = BTreeSet::new();
@@ -11856,6 +11908,9 @@ impl PrivilegedDispatcher {
             }
         }
 
+        if total_events > events.len() {
+            uncertainty_flags.push(ProjectionUncertainty::TruncatedHistory);
+        }
         if !has_liveness_evidence {
             uncertainty_flags.push(ProjectionUncertainty::MissingLivenessEvidence);
         }
@@ -11923,6 +11978,9 @@ impl PrivilegedDispatcher {
             },
             ProjectionUncertainty::MissingAuthoritativeReceiptTick => {
                 ProjectionUncertaintyFlag::MissingAuthoritativeReceiptTick as i32
+            },
+            ProjectionUncertainty::TruncatedHistory => {
+                ProjectionUncertaintyFlag::TruncatedHistory as i32
             },
         }
     }

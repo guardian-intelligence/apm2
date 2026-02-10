@@ -449,6 +449,8 @@ enum ProjectionUncertaintyFlag {
   PROJECTION_UNCERTAINTY_FLAG_MISSING_LIVENESS_EVIDENCE = 3;
   // No authoritative receipt tick is available.
   PROJECTION_UNCERTAINTY_FLAG_MISSING_AUTHORITATIVE_RECEIPT_TICK = 4;
+  // Projection replay used a bounded recent-history window.
+  PROJECTION_UNCERTAINTY_FLAG_TRUNCATED_HISTORY = 5;
 }
 
 // IPC-PRIV-020: AuditorLaunchProjection (TCK-00452)

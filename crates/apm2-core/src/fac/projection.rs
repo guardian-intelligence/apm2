@@ -49,6 +49,8 @@ pub enum ProjectionUncertainty {
     MissingLivenessEvidence,
     /// No authoritative receipt tick is available.
     MissingAuthoritativeReceiptTick,
+    /// Projection replay processed only a bounded recent window.
+    TruncatedHistory,
 }
 
 /// Auditor-facing projection for launch lineage and boundary conformance.

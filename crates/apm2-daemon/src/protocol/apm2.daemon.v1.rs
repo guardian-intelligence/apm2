@@ -2050,6 +2050,8 @@ pub enum ProjectionUncertaintyFlag {
     MissingLivenessEvidence = 3,
     /// No authoritative receipt tick is available.
     MissingAuthoritativeReceiptTick = 4,
+    /// Projection replay used a bounded recent-history window.
+    TruncatedHistory = 5,
 }
 impl ProjectionUncertaintyFlag {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2071,6 +2073,7 @@ impl ProjectionUncertaintyFlag {
             Self::MissingAuthoritativeReceiptTick => {
                 "PROJECTION_UNCERTAINTY_FLAG_MISSING_AUTHORITATIVE_RECEIPT_TICK"
             }
+            Self::TruncatedHistory => "PROJECTION_UNCERTAINTY_FLAG_TRUNCATED_HISTORY",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2088,6 +2091,9 @@ impl ProjectionUncertaintyFlag {
             }
             "PROJECTION_UNCERTAINTY_FLAG_MISSING_AUTHORITATIVE_RECEIPT_TICK" => {
                 Some(Self::MissingAuthoritativeReceiptTick)
+            }
+            "PROJECTION_UNCERTAINTY_FLAG_TRUNCATED_HISTORY" => {
+                Some(Self::TruncatedHistory)
             }
             _ => None,
         }
