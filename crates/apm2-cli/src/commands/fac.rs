@@ -212,12 +212,18 @@ pub struct GatesArgs {
     #[arg(long, default_value_t = false)]
     pub force: bool,
 
+    /// Run quick inner-loop gates (skips the heavyweight test gate).
+    ///
+    /// Use this during active implementation; run full gates before push.
+    #[arg(long, default_value_t = false)]
+    pub quick: bool,
+
     /// Wall timeout for bounded test execution (seconds).
-    #[arg(long, default_value_t = 900)]
+    #[arg(long, default_value_t = 240)]
     pub timeout_seconds: u64,
 
     /// Memory ceiling for bounded test execution.
-    #[arg(long, default_value = "4G")]
+    #[arg(long, default_value = "24G")]
     pub memory_max: String,
 
     /// PID/task ceiling for bounded test execution.
@@ -734,6 +740,7 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
     match &cmd.subcommand {
         FacSubcommand::Gates(args) => fac_review::run_gates(
             args.force,
+            args.quick,
             args.timeout_seconds,
             &args.memory_max,
             args.pids_max,
