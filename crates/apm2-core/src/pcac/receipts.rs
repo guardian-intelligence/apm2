@@ -698,6 +698,12 @@ impl AuthorityJoinReceiptV1 {
     /// authoritative bindings are absent, or propagates any structural/binding
     /// validation error.
     pub fn validate_authoritative(&self) -> Result<(), PcacValidationError> {
+        if !self.boundary_intent_class.is_authoritative() {
+            return Err(PcacValidationError::FieldCoherenceMismatch {
+                outer_field: "boundary_intent_class",
+                inner_field: "authoritative_boundary_intent_class",
+            });
+        }
         self.validate()?;
         self.digest_meta.validate_authoritative()?;
         let bindings = self.authoritative_bindings.as_ref().ok_or(
@@ -808,6 +814,18 @@ impl AuthorityConsumeReceiptV1 {
     /// authoritative bindings are absent, or propagates any structural/binding
     /// validation error.
     pub fn validate_authoritative(&self) -> Result<(), PcacValidationError> {
+        if !self.boundary_intent_class.is_authoritative() {
+            return Err(PcacValidationError::FieldCoherenceMismatch {
+                outer_field: "boundary_intent_class",
+                inner_field: "authoritative_boundary_intent_class",
+            });
+        }
+        if self.acceptance_fact_class != AcceptanceFactClass::Authoritative {
+            return Err(PcacValidationError::FieldCoherenceMismatch {
+                outer_field: "acceptance_fact_class",
+                inner_field: "AcceptanceFactClass::Authoritative",
+            });
+        }
         self.validate()?;
         self.digest_meta.validate_authoritative()?;
         let bindings = self.authoritative_bindings.as_ref().ok_or(

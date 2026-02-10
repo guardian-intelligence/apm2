@@ -2113,6 +2113,83 @@ fn valid_join_receipt_passes_validation() {
 }
 
 #[test]
+fn test_observational_receipt_fails_authoritative_validation() {
+    let receipt = AuthorityJoinReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        authority_join_hash: test_hash(0xBB),
+        risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Observe,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        joined_at_tick: 1000,
+        authoritative_bindings: Some(valid_bindings()),
+    };
+    let err = receipt.validate_authoritative().unwrap_err();
+    assert!(matches!(
+        err,
+        types::PcacValidationError::FieldCoherenceMismatch {
+            outer_field,
+            inner_field,
+        } if outer_field == "boundary_intent_class"
+            && inner_field == "authoritative_boundary_intent_class"
+    ));
+}
+
+#[test]
+fn test_omitted_class_field_fails_authoritative_validation() {
+    let receipt = AuthorityJoinReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        authority_join_hash: test_hash(0xBB),
+        risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        joined_at_tick: 1000,
+        authoritative_bindings: Some(valid_bindings()),
+    };
+    let mut value = serde_json::to_value(&receipt).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("boundary_intent_class")
+        .unwrap();
+
+    let deserialized: AuthorityJoinReceiptV1 = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        deserialized.boundary_intent_class,
+        BoundaryIntentClass::Observe
+    );
+
+    let err = deserialized.validate_authoritative().unwrap_err();
+    assert!(matches!(
+        err,
+        types::PcacValidationError::FieldCoherenceMismatch {
+            outer_field,
+            inner_field,
+        } if outer_field == "boundary_intent_class"
+            && inner_field == "authoritative_boundary_intent_class"
+    ));
+}
+
+#[test]
+fn test_authoritative_class_passes_authoritative_validation() {
+    let receipt = AuthorityJoinReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        authority_join_hash: test_hash(0xBB),
+        risk_tier: types::RiskTier::Tier1,
+        boundary_intent_class: BoundaryIntentClass::Delegate,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        joined_at_tick: 1000,
+        authoritative_bindings: Some(valid_bindings()),
+    };
+    assert!(receipt.validate_authoritative().is_ok());
+}
+
+#[test]
 fn join_receipt_zero_ajc_id_rejected() {
     let receipt = AuthorityJoinReceiptV1 {
         digest_meta: valid_digest_meta(),
@@ -2352,6 +2429,58 @@ fn valid_consume_receipt_passes_validation() {
     };
     assert!(receipt.validate().is_ok());
     assert!(receipt.validate_authoritative().is_ok());
+}
+
+#[test]
+fn consume_receipt_observational_class_fails_authoritative_validation() {
+    let receipt = AuthorityConsumeReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Observe,
+        acceptance_fact_class: AcceptanceFactClass::Observational,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        consumed_at_tick: 1500,
+        effect_selector_digest: test_hash(0xEE),
+        pre_actuation_receipt_hash: None,
+        authoritative_bindings: Some(valid_bindings()),
+    };
+    let err = receipt.validate_authoritative().unwrap_err();
+    assert!(matches!(
+        err,
+        types::PcacValidationError::FieldCoherenceMismatch {
+            outer_field,
+            inner_field,
+        } if outer_field == "boundary_intent_class"
+            && inner_field == "authoritative_boundary_intent_class"
+    ));
+}
+
+#[test]
+fn consume_receipt_non_authoritative_acceptance_fact_class_rejected_for_authoritative_validation() {
+    let receipt = AuthorityConsumeReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        intent_digest: test_hash(0x01),
+        boundary_intent_class: BoundaryIntentClass::Assert,
+        acceptance_fact_class: AcceptanceFactClass::Observational,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        consumed_at_tick: 1500,
+        effect_selector_digest: test_hash(0xEE),
+        pre_actuation_receipt_hash: None,
+        authoritative_bindings: Some(valid_bindings()),
+    };
+    let err = receipt.validate_authoritative().unwrap_err();
+    assert!(matches!(
+        err,
+        types::PcacValidationError::FieldCoherenceMismatch {
+            outer_field,
+            inner_field,
+        } if outer_field == "acceptance_fact_class"
+            && inner_field == "AcceptanceFactClass::Authoritative"
+    ));
 }
 
 #[test]
