@@ -53,7 +53,9 @@ use crate::governance::{
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::ledger::{SqliteLeaseValidator, SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use crate::metrics::SharedMetricsRegistry;
-use crate::protocol::dispatch::{PolicyResolutionError, PolicyResolver, PrivilegedDispatcher};
+use crate::protocol::dispatch::{
+    PolicyResolutionError, PolicyResolver, PrivilegedDispatcher, PrivilegedPcacPolicy,
+};
 use crate::protocol::messages::{DecodeConfig, WorkRole};
 use crate::protocol::resource_governance::{SharedSubscriptionRegistry, SubscriptionRegistry};
 use crate::protocol::session_dispatch::{
@@ -636,7 +638,8 @@ impl DispatcherState {
             clock,
             Arc::clone(&subscription_registry),
         )
-        .with_credential_store(credential_store);
+        .with_credential_store(credential_store)
+        .with_privileged_pcac_policy(PrivilegedPcacPolicy::default());
 
         // Add metrics if provided
         let privileged_dispatcher = if let Some(metrics) = metrics_registry {
@@ -725,7 +728,8 @@ impl DispatcherState {
             clock,
             Arc::clone(&subscription_registry),
         )
-        .with_credential_store(credential_store);
+        .with_credential_store(credential_store)
+        .with_privileged_pcac_policy(PrivilegedPcacPolicy::default());
 
         // Add metrics if provided
         let privileged_dispatcher = if let Some(metrics) = metrics_registry {
@@ -980,7 +984,10 @@ impl DispatcherState {
         }
         .with_credential_store(credential_store);
 
-        let privileged_dispatcher = if let Some(metrics) = metrics_registry {
+        let mut privileged_dispatcher =
+            privileged_dispatcher.with_privileged_pcac_policy(PrivilegedPcacPolicy::default());
+
+        privileged_dispatcher = if let Some(metrics) = metrics_registry {
             privileged_dispatcher.with_metrics(metrics)
         } else {
             privileged_dispatcher
@@ -1014,7 +1021,7 @@ impl DispatcherState {
         // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
         // registration
         // TCK-00351 v4: Wire stop conditions store into privileged dispatcher
-        let privileged_dispatcher = privileged_dispatcher
+        privileged_dispatcher = privileged_dispatcher
             .with_telemetry_store(Arc::clone(&telemetry_store))
             .with_stop_conditions_store(Arc::clone(&stop_conditions_store))
             .with_stop_authority(Arc::clone(&stop_authority))
@@ -1070,6 +1077,8 @@ impl DispatcherState {
                             Arc::clone(&stop_authority),
                         ),
                     );
+                    privileged_dispatcher =
+                        privileged_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
                     session_dispatcher = session_dispatcher.with_pcac_lifecycle_gate(pcac_gate);
                     if let Some(sovereignty_state) = sovereignty_state {
                         session_dispatcher =
@@ -1329,7 +1338,7 @@ impl DispatcherState {
         // TCK-00352: Create shared V1 manifest store for scope enforcement
         let v1_manifest_store = Arc::new(V1ManifestStore::new());
 
-        let privileged_dispatcher = PrivilegedDispatcher::with_dependencies(
+        let mut privileged_dispatcher = PrivilegedDispatcher::with_dependencies(
             DecodeConfig::default(),
             policy_resolver,
             work_registry,
@@ -1362,9 +1371,10 @@ impl DispatcherState {
             available_profile_hashes,
             profile_hashes,
             Arc::clone(&evidence_cas),
-        );
+        )
+        .with_privileged_pcac_policy(PrivilegedPcacPolicy::default());
 
-        let privileged_dispatcher = if let Some(ref metrics) = metrics_registry {
+        privileged_dispatcher = if let Some(ref metrics) = metrics_registry {
             privileged_dispatcher.with_metrics(Arc::clone(metrics))
         } else {
             privileged_dispatcher
@@ -1398,7 +1408,7 @@ impl DispatcherState {
         // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
         // registration
         // TCK-00351 v4: Wire stop conditions store into privileged dispatcher
-        let privileged_dispatcher = privileged_dispatcher
+        privileged_dispatcher = privileged_dispatcher
             .with_telemetry_store(Arc::clone(&telemetry_store))
             .with_stop_conditions_store(Arc::clone(&stop_conditions_store))
             .with_stop_authority(Arc::clone(&stop_authority))
@@ -1441,6 +1451,8 @@ impl DispatcherState {
                 Arc::clone(&stop_authority),
             ),
         );
+        privileged_dispatcher =
+            privileged_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
         let mut session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
@@ -1572,6 +1584,23 @@ impl DispatcherState {
     #[must_use]
     pub fn with_daemon_state(mut self, state: SharedState) -> Self {
         self.privileged_dispatcher = self.privileged_dispatcher.with_daemon_state(state);
+        self
+    }
+
+    /// Sets privileged PCAC rollout policy for authority-bearing handlers.
+    #[must_use]
+    pub fn with_privileged_pcac_policy(mut self, policy: PrivilegedPcacPolicy) -> Self {
+        self.privileged_dispatcher = self
+            .privileged_dispatcher
+            .with_privileged_pcac_policy(policy);
+        self
+    }
+
+    /// Clears privileged PCAC lifecycle gate wiring (TEST ONLY).
+    #[cfg(test)]
+    #[must_use]
+    pub fn without_privileged_pcac_lifecycle_gate(mut self) -> Self {
+        self.privileged_dispatcher = self.privileged_dispatcher.without_pcac_lifecycle_gate();
         self
     }
 
