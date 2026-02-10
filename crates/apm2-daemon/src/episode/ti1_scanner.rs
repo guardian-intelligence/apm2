@@ -30,6 +30,12 @@ const TI1_CLOSE: char = '\u{27E7}';
 /// TI1 request delimiter prefix.
 const TI1_PREFIX: &str = "TI1 ";
 
+/// Maximum bytes retained for a single in-progress PTY output line.
+///
+/// This bounds `line_buffer` growth when an agent emits output without
+/// newline delimiters.
+pub const MAX_LINE_LENGTH: usize = 256 * 1024;
+
 /// Error type for TI1 frame parsing failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ti1ParseError {
@@ -58,10 +64,29 @@ pub enum Ti1ParseError {
         max_size: usize,
     },
 
+    /// The base64url input length exceeds the safe pre-decode bound for
+    /// `max_args_size`.
+    ArgsBase64TooLarge {
+        /// Encoded base64url size in bytes.
+        encoded_size: usize,
+        /// Maximum allowed encoded size in bytes.
+        max_encoded_size: usize,
+        /// Maximum decoded size in bytes.
+        max_decoded_size: usize,
+    },
+
     /// Failed to decode base64url args.
     InvalidBase64 {
         /// Description of the decode error.
         reason: String,
+    },
+
+    /// A PTY output line exceeded `MAX_LINE_LENGTH` during scanning.
+    LineTooLong {
+        /// Attempted line length in bytes.
+        line_length: usize,
+        /// Maximum allowed line size.
+        max_size: usize,
     },
 
     /// Failed to parse decoded args as JSON.
@@ -86,7 +111,23 @@ impl std::fmt::Display for Ti1ParseError {
                 f,
                 "TI1 args too large: {decoded_size} bytes exceeds maximum {max_size}"
             ),
+            Self::ArgsBase64TooLarge {
+                encoded_size,
+                max_encoded_size,
+                max_decoded_size,
+            } => write!(
+                f,
+                "TI1 args base64 too large: encoded {encoded_size} bytes exceeds maximum \
+                 {max_encoded_size} bytes for decoded limit {max_decoded_size}"
+            ),
             Self::InvalidBase64 { reason } => write!(f, "invalid base64url in TI1 args: {reason}"),
+            Self::LineTooLong {
+                line_length,
+                max_size,
+            } => write!(
+                f,
+                "TI1 scanner line too long: {line_length} bytes exceeds maximum {max_size}"
+            ),
             Self::InvalidJson { reason } => write!(f, "invalid JSON in TI1 args: {reason}"),
         }
     }
@@ -142,6 +183,17 @@ pub struct Ti1ScannerConfig {
     pub nonce: String,
     /// Maximum decoded args size in bytes.
     pub max_args_size: usize,
+}
+
+/// Compute a safe pre-decode bound for base64url input length.
+///
+/// Uses the upper-bound formula `decoded ~= encoded * 3 / 4`, rearranged to
+/// `encoded <= (max_args_size * 4 / 3) + 4`.
+const fn max_base64_input_len(max_args_size: usize) -> usize {
+    max_args_size
+        .saturating_mul(4)
+        .saturating_div(3)
+        .saturating_add(4)
 }
 
 /// Scans a single line for a TI1 frame.
@@ -207,6 +259,15 @@ pub fn parse_ti1_line(line: &str, config: &Ti1ScannerConfig) -> Result<Ti1Frame,
     let tool_name = parts[1];
     let args_b64url = parts[2];
 
+    let max_b64_len = max_base64_input_len(config.max_args_size);
+    if args_b64url.len() > max_b64_len {
+        return Err(Ti1ParseError::ArgsBase64TooLarge {
+            encoded_size: args_b64url.len(),
+            max_encoded_size: max_b64_len,
+            max_decoded_size: config.max_args_size,
+        });
+    }
+
     // Decode base64url args
     let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let decoded_bytes = engine
@@ -252,27 +313,48 @@ pub fn scan_output(
     line_buffer: &mut String,
 ) -> Vec<Result<Ti1Frame, Ti1ParseError>> {
     let text = String::from_utf8_lossy(chunk);
-    line_buffer.push_str(&text);
-
     let mut results = Vec::new();
 
-    // Process complete lines
-    while let Some(newline_pos) = line_buffer.find('\n') {
-        let line = line_buffer[..newline_pos].to_string();
-        line_buffer.drain(..=newline_pos);
+    for piece in text.split_inclusive('\n') {
+        let has_newline = piece.ends_with('\n');
+        let line_fragment = if has_newline {
+            &piece[..piece.len() - 1]
+        } else {
+            piece
+        };
 
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+        if line_buffer.len() + line_fragment.len() > MAX_LINE_LENGTH {
+            let attempted_len = line_buffer.len().saturating_add(line_fragment.len());
+            results.push(Err(Ti1ParseError::LineTooLong {
+                line_length: attempted_len,
+                max_size: MAX_LINE_LENGTH,
+            }));
+
+            // Terminate the overlong line and start fresh from the current
+            // fragment when it is representable within bounds.
+            line_buffer.clear();
+            if line_fragment.len() <= MAX_LINE_LENGTH {
+                line_buffer.push_str(line_fragment);
+            }
+        } else {
+            line_buffer.push_str(line_fragment);
         }
 
-        match parse_ti1_line(trimmed, config) {
-            Ok(frame) => results.push(Ok(frame)),
-            Err(Ti1ParseError::NotTi1Frame) => {
-                // Opaque agent output -- Markov blanket preserved.
-                // Not an error; just not a TI1 frame.
-            },
-            Err(e) => results.push(Err(e)),
+        if has_newline {
+            let line = std::mem::take(line_buffer);
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            match parse_ti1_line(trimmed, config) {
+                Ok(frame) => results.push(Ok(frame)),
+                Err(Ti1ParseError::NotTi1Frame) => {
+                    // Opaque agent output -- Markov blanket preserved.
+                    // Not an error; just not a TI1 frame.
+                },
+                Err(e) => results.push(Err(e)),
+            }
         }
     }
 
@@ -465,7 +547,9 @@ mod tests {
             nonce: "abc123def456".to_string(),
             max_args_size: 10, // Very small limit
         };
-        let args = serde_json::json!({"path": "/tmp/test.txt", "extra": "data_to_exceed_limit"});
+        // Keep encoded length under the pre-decode cap while decoded JSON still
+        // exceeds max_args_size to exercise the post-decode bound.
+        let args = serde_json::json!({"a": 12345});
         let args_b64 = encode_args(&args);
         let line = format!(
             "\u{27E6}TI1 {}\u{27E7} req-001 read_file {}",
@@ -508,6 +592,26 @@ mod tests {
         assert!(
             matches!(result, Err(Ti1ParseError::InvalidJson { .. })),
             "invalid JSON should fail: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_oversized_base64_before_decode() {
+        let config = Ti1ScannerConfig {
+            nonce: "abc123def456".to_string(),
+            max_args_size: 12,
+        };
+        let max_encoded_len = max_base64_input_len(config.max_args_size);
+        let oversized_b64 = "A".repeat(max_encoded_len + 1);
+        let line = format!(
+            "\u{27E6}TI1 {}\u{27E7} req-001 read_file {}",
+            config.nonce, oversized_b64
+        );
+
+        let result = parse_ti1_line(&line, &config);
+        assert!(
+            matches!(result, Err(Ti1ParseError::ArgsBase64TooLarge { .. })),
+            "oversized base64 should fail pre-decode: {result:?}"
         );
     }
 
@@ -591,6 +695,29 @@ mod tests {
         assert!(results[0].is_ok());
     }
 
+    #[test]
+    fn test_scan_long_line_without_newline_triggers_limit() {
+        let config = test_config();
+        let chunk = vec![b'x'; MAX_LINE_LENGTH + 1];
+        let mut line_buf = String::new();
+
+        let results = scan_output(&chunk, &config, &mut line_buf);
+        assert!(
+            matches!(
+                results.as_slice(),
+                [Err(Ti1ParseError::LineTooLong {
+                    line_length: _,
+                    max_size: MAX_LINE_LENGTH
+                })]
+            ),
+            "oversized line should trigger scanner bound: {results:?}"
+        );
+        assert!(
+            line_buf.is_empty(),
+            "scanner should not retain oversized unterminated line"
+        );
+    }
+
     // =========================================================================
     // Frame to HarnessEvent conversion
     // =========================================================================
@@ -659,5 +786,11 @@ mod tests {
         };
         assert!(e.to_string().contains("2000000"));
         assert!(e.to_string().contains("1000000"));
+
+        let e = Ti1ParseError::LineTooLong {
+            line_length: MAX_LINE_LENGTH + 1,
+            max_size: MAX_LINE_LENGTH,
+        };
+        assert!(e.to_string().contains("line too long"));
     }
 }
