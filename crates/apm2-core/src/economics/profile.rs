@@ -17,6 +17,9 @@ use crate::pcac::{BoundaryIntentClass, RiskTier};
 
 const PROFILE_SCHEMA: &str = "apm2.economics_constraint_profile.v1";
 const PROFILE_SCHEMA_VERSION: &str = "1.0.0";
+const RISK_TIER_VARIANT_COUNT: usize = 3;
+const BOUNDARY_INTENT_CLASS_VARIANT_COUNT: usize = 5;
+const MAX_BUDGET_ENTRIES: usize = RISK_TIER_VARIANT_COUNT * BOUNDARY_INTENT_CLASS_VARIANT_COUNT;
 
 /// Domain separator for deterministic economics profile hashing.
 pub const ECONOMICS_PROFILE_HASH_DOMAIN: &[u8] = b"apm2-economics-profile-v1";
@@ -112,6 +115,15 @@ pub enum EconomicsProfileError {
         tier: String,
         /// Duplicate boundary intent class.
         intent_class: String,
+    },
+
+    /// Budget entry count exceeds the finite matrix key space.
+    #[error("budget entry count {count} exceeds maximum {max}")]
+    BudgetEntriesTooLarge {
+        /// Observed entry count.
+        count: usize,
+        /// Maximum supported entry count.
+        max: usize,
     },
 
     /// Serialization or canonicalization failed.
@@ -334,6 +346,13 @@ impl EconomicsProfile {
     fn from_wire(wire: EconomicsProfileWire) -> Result<Self, EconomicsProfileError> {
         wire.validate()?;
 
+        if wire.budget_entries.len() > MAX_BUDGET_ENTRIES {
+            return Err(EconomicsProfileError::BudgetEntriesTooLarge {
+                count: wire.budget_entries.len(),
+                max: MAX_BUDGET_ENTRIES,
+            });
+        }
+
         let mut budget_matrix = BTreeMap::new();
         for entry in wire.budget_entries {
             let key = (entry.risk_tier, entry.intent_class);
@@ -375,7 +394,11 @@ impl EconomicsProfileWire {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{BudgetEntry, EconomicsProfile, EconomicsProfileInputState, LifecycleCostVector};
+    use super::{
+        BudgetCell, BudgetEntry, ECONOMICS_PROFILE_HASH_DOMAIN, EconomicsProfile,
+        EconomicsProfileError, EconomicsProfileInputState, EconomicsProfileWire,
+        LifecycleCostVector, MAX_BUDGET_ENTRIES, PROFILE_SCHEMA, PROFILE_SCHEMA_VERSION,
+    };
     use crate::evidence::MemoryCas;
     use crate::pcac::{BoundaryIntentClass, RiskTier};
 
@@ -479,5 +502,34 @@ mod tests {
             EconomicsProfile::load_from_cas(&cas, &profile_hash).expect("profile should load");
 
         assert_eq!(profile, loaded);
+    }
+
+    #[test]
+    fn from_framed_bytes_rejects_budget_entries_above_maximum() {
+        let wire = EconomicsProfileWire {
+            schema: PROFILE_SCHEMA.to_string(),
+            schema_version: PROFILE_SCHEMA_VERSION.to_string(),
+            lifecycle_cost_vector: lifecycle_costs(),
+            input_state: EconomicsProfileInputState::Current,
+            budget_entries: vec![
+                BudgetCell {
+                    risk_tier: RiskTier::Tier0,
+                    intent_class: BoundaryIntentClass::Observe,
+                    budget: budget_entry(10),
+                };
+                MAX_BUDGET_ENTRIES + 1
+            ],
+        };
+        let payload = serde_json::to_vec(&wire).expect("wire should serialize");
+        let mut framed = Vec::from(ECONOMICS_PROFILE_HASH_DOMAIN);
+        framed.extend_from_slice(&payload);
+
+        let error = EconomicsProfile::from_framed_bytes(&framed)
+            .expect_err("oversized budget entries should fail closed");
+        assert!(matches!(
+            error,
+            EconomicsProfileError::BudgetEntriesTooLarge { count, max }
+                if count == MAX_BUDGET_ENTRIES + 1 && max == MAX_BUDGET_ENTRIES
+        ));
     }
 }

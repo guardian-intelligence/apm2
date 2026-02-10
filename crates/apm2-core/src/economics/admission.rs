@@ -9,7 +9,9 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::profile::{BudgetEntry, EconomicsProfile, EconomicsProfileInputState};
+use super::profile::{
+    BudgetEntry, EconomicsProfile, EconomicsProfileError, EconomicsProfileInputState,
+};
 use crate::crypto::Hash;
 use crate::determinism::canonicalize_json;
 use crate::evidence::{CasError, ContentAddressedStore};
@@ -195,15 +197,22 @@ impl<'a> BudgetAdmissionEvaluator<'a> {
             return Err(DENY_REASON_PROFILE_HASH_ZERO);
         }
 
-        let profile_bytes = match self.cas.retrieve(&self.profile_hash) {
-            Ok(bytes) => bytes,
-            Err(CasError::NotFound { .. }) => return Err(DENY_REASON_PROFILE_MISSING),
-            Err(_) => return Err(DENY_REASON_PROFILE_UNRESOLVED),
-        };
-
-        let Ok(profile) = EconomicsProfile::from_framed_bytes(&profile_bytes) else {
-            return Err(DENY_REASON_PROFILE_INVALID);
-        };
+        let profile =
+            EconomicsProfile::load_from_cas(self.cas, &self.profile_hash).map_err(|error| {
+                match error {
+                    EconomicsProfileError::Cas(CasError::NotFound { .. }) => {
+                        DENY_REASON_PROFILE_MISSING
+                    },
+                    EconomicsProfileError::HashMismatch { .. }
+                    | EconomicsProfileError::InvalidFrame
+                    | EconomicsProfileError::InvalidSchema { .. }
+                    | EconomicsProfileError::InvalidSchemaVersion { .. }
+                    | EconomicsProfileError::DuplicateBudgetEntry { .. }
+                    | EconomicsProfileError::BudgetEntriesTooLarge { .. }
+                    | EconomicsProfileError::Serialization { .. } => DENY_REASON_PROFILE_INVALID,
+                    EconomicsProfileError::Cas(_) => DENY_REASON_PROFILE_UNRESOLVED,
+                }
+            })?;
 
         match profile.input_state {
             EconomicsProfileInputState::Current => Ok(profile),
@@ -397,6 +406,40 @@ mod tests {
         let profile_hash = cas
             .store(&invalid)
             .expect("invalid payload should store")
+            .hash;
+
+        let evaluator = BudgetAdmissionEvaluator::new(&cas, profile_hash);
+        let decision = evaluator.evaluate(
+            RiskTier::Tier0,
+            BoundaryIntentClass::Observe,
+            &observed_within_limits(),
+        );
+
+        assert_eq!(decision.verdict, BudgetAdmissionVerdict::Deny);
+        assert_eq!(
+            decision.deny_reason.as_deref(),
+            Some(DENY_REASON_PROFILE_INVALID)
+        );
+    }
+
+    #[test]
+    fn noncanonical_profile_payload_hash_mismatch_denies_fail_closed() {
+        let cas = MemoryCas::new();
+        let profile = build_profile(EconomicsProfileInputState::Current);
+        let canonical_json = profile
+            .canonical_bytes()
+            .expect("canonical profile bytes should serialize");
+        let canonical_value: serde_json::Value =
+            serde_json::from_slice(&canonical_json).expect("canonical profile bytes should parse");
+        let noncanonical_json = serde_json::to_vec_pretty(&canonical_value)
+            .expect("non-canonical profile payload should serialize");
+        assert_ne!(noncanonical_json, canonical_json);
+
+        let mut framed = Vec::from(ECONOMICS_PROFILE_HASH_DOMAIN);
+        framed.extend_from_slice(&noncanonical_json);
+        let profile_hash = cas
+            .store(&framed)
+            .expect("non-canonical profile payload should store")
             .hash;
 
         let evaluator = BudgetAdmissionEvaluator::new(&cas, profile_hash);
