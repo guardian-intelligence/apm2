@@ -165,6 +165,61 @@ fn test_join_operation_uses_join_metric_and_enforces_join_bound() {
 }
 
 #[test]
+fn test_consume_economics_deny_does_not_burn_certificate() {
+    let kernel = InProcessKernel::new(101).with_verifier_economics(VerifierEconomicsProfile {
+        p95_join_us: u64::MAX,
+        p95_verify_receipt_us: u64::MAX,
+        p95_validate_bindings_us: u64::MAX,
+        p95_classify_fact_us: u64::MAX,
+        p95_replay_lifecycle_us: u64::MAX,
+        p95_anti_entropy_us: u64::MAX,
+        p95_revalidate_us: u64::MAX,
+        p95_consume_us: 0,
+        max_proof_checks: u64::MAX,
+    });
+    let input = valid_input(RiskTier::Tier2Plus, 1, 0x23);
+    let cert = kernel
+        .join(&input)
+        .expect("join must pass with permissive non-consume bounds");
+
+    let first_err = kernel
+        .consume(
+            &cert,
+            input.intent_digest,
+            input.boundary_intent_class,
+            true,
+            input.time_envelope_ref,
+            cert.revocation_head_hash,
+        )
+        .expect_err("first consume must deny on consume economics bound");
+    assert!(matches!(
+        first_err.deny_class,
+        AuthorityDenyClass::VerifierEconomicsBoundsExceeded { ref operation, risk_tier }
+            if operation == "consume" && risk_tier == RiskTier::Tier2Plus
+    ));
+
+    let second_err = kernel
+        .consume(
+            &cert,
+            input.intent_digest,
+            input.boundary_intent_class,
+            true,
+            input.time_envelope_ref,
+            cert.revocation_head_hash,
+        )
+        .expect_err("second consume must still deny on economics, not AlreadyConsumed");
+    assert!(matches!(
+        second_err.deny_class,
+        AuthorityDenyClass::VerifierEconomicsBoundsExceeded { ref operation, risk_tier }
+            if operation == "consume" && risk_tier == RiskTier::Tier2Plus
+    ));
+    assert!(!matches!(
+        second_err.deny_class,
+        AuthorityDenyClass::AlreadyConsumed { .. }
+    ));
+}
+
+#[test]
 fn test_proof_check_count_enforcement() {
     let kernel = InProcessKernel::new(100).with_verifier_economics(permissive_timing_profile(2));
     let input = valid_input(RiskTier::Tier2Plus, 0, 0x30);

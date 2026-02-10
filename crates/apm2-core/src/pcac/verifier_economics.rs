@@ -182,6 +182,10 @@ impl VerifierEconomicsChecker {
 mod tests {
     use super::*;
 
+    fn test_hash(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
     fn tight_profile() -> VerifierEconomicsProfile {
         VerifierEconomicsProfile {
             p95_join_us: 5,
@@ -389,5 +393,60 @@ mod tests {
                 .check_proof_count(VerifierOperation::ClassifyFact, 4, RiskTier::Tier1)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn deep_pointer_batched_proof_count_exceeds_bound_and_denies_tier2plus() {
+        let receipt_hash = test_hash(0x31);
+        let authority_seal_hash = test_hash(0x32);
+        let merkle_inclusion_proof: Vec<[u8; 32]> =
+            (0_u8..8).map(|step| test_hash(0x40 + step)).collect();
+
+        let mut receipt_batch_root_hash = crate::consensus::merkle::hash_leaf(&receipt_hash);
+        for sibling in &merkle_inclusion_proof {
+            receipt_batch_root_hash =
+                crate::consensus::merkle::hash_internal(&receipt_batch_root_hash, sibling);
+        }
+
+        let auth = crate::pcac::ReceiptAuthentication::PointerBatched {
+            receipt_hash,
+            authority_seal_hash,
+            merkle_inclusion_proof: merkle_inclusion_proof.clone(),
+            receipt_batch_root_hash,
+        };
+
+        let timed = crate::pcac::timed_verify_receipt_authentication(
+            &auth,
+            &authority_seal_hash,
+            Some(&receipt_batch_root_hash),
+            test_hash(0x70),
+            test_hash(0x71),
+            123,
+        );
+        assert!(
+            timed.result.is_ok(),
+            "constructed pointer-batched authentication should verify"
+        );
+
+        let proof_depth = u64::try_from(merkle_inclusion_proof.len()).unwrap_or(u64::MAX);
+        let expected_proof_checks = 2_u64.saturating_add(proof_depth);
+        assert_eq!(timed.proof_check_count, expected_proof_checks);
+
+        let checker = VerifierEconomicsChecker::new(VerifierEconomicsProfile {
+            max_proof_checks: expected_proof_checks.saturating_sub(1),
+            ..VerifierEconomicsProfile::default()
+        });
+        let err = checker
+            .check_proof_count(
+                VerifierOperation::VerifyReceiptAuthentication,
+                timed.proof_check_count,
+                RiskTier::Tier2Plus,
+            )
+            .expect_err("Tier2+ must deny when proof-check count exceeds tight bound");
+        assert!(matches!(
+            err,
+            AuthorityDenyClass::VerifierEconomicsBoundsExceeded { ref operation, risk_tier }
+                if operation == "verify_receipt_authentication" && risk_tier == RiskTier::Tier2Plus
+        ));
     }
 }

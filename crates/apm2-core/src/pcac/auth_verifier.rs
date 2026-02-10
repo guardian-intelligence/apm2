@@ -517,9 +517,15 @@ const fn proof_checks_for_validate_bindings(
 }
 
 #[inline]
-const fn proof_checks_for_receipt_auth(auth: &ReceiptAuthentication) -> u64 {
+fn proof_checks_for_receipt_auth(auth: &ReceiptAuthentication) -> u64 {
     match auth {
-        ReceiptAuthentication::PointerBatched { .. } => 1,
+        ReceiptAuthentication::PointerBatched {
+            merkle_inclusion_proof,
+            ..
+        } => {
+            let proof_depth = u64::try_from(merkle_inclusion_proof.len()).unwrap_or(u64::MAX);
+            2_u64.saturating_add(proof_depth)
+        },
         ReceiptAuthentication::Direct { .. } | ReceiptAuthentication::PointerUnbatched { .. } => 0,
     }
 }

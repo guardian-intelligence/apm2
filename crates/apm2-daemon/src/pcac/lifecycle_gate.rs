@@ -1451,6 +1451,17 @@ impl AuthorityJoinKernel for InProcessKernel {
             tick,
         )?;
 
+        self.enforce_verifier_economics_sample(
+            VerifierOperation::Consume,
+            u64::try_from(consume_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+            0, // stage-level doesn't track individual proof checks
+            cert.risk_tier,
+            Some(cert.ajc_id),
+            current_time_envelope_ref,
+            cert.as_of_ledger_anchor,
+            tick,
+        )?;
+
         // Law 1: Linear consumption — check and mark consumed atomically.
         {
             let mut consumed = self.consumed.lock().expect("lock poisoned");
@@ -1492,17 +1503,6 @@ impl AuthorityJoinKernel for InProcessKernel {
             consumed_at_tick: tick,
             effect_selector_digest,
         };
-
-        self.enforce_verifier_economics_sample(
-            VerifierOperation::Consume,
-            u64::try_from(consume_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
-            0, // stage-level doesn't track individual proof checks
-            cert.risk_tier,
-            Some(cert.ajc_id),
-            current_time_envelope_ref,
-            cert.as_of_ledger_anchor,
-            tick,
-        )?;
 
         Ok((consumed_witness, consume_record))
     }
