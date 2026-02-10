@@ -180,6 +180,7 @@ pub mod manifest;
 pub mod pack_spec;
 pub mod patch_engine;
 pub mod target_profile;
+pub mod traceability_overlay;
 mod validator;
 
 // Compiler exports
@@ -247,6 +248,10 @@ pub use target_profile::{
     MAX_PROFILE_ID_LENGTH, MAX_VERSION_LENGTH, OutputFormat, ProvenanceEmbed, RenderingPolicy,
     RenderingPolicyBuilder, RetrievalPolicy, RetrievalPolicyBuilder, Stage, TargetProfile,
     TargetProfileBuilder, TargetProfileError,
+};
+pub use traceability_overlay::{
+    CacOverlayRequirement, OverlayDefect, OverlayDefectClass, Tier2FailClosedBehavior, TrcFacClaim,
+    default_overlay_requirements, validate_overlay_requirements,
 };
 pub use validator::{
     CacValidator, MAX_ARRAY_MEMBERS, MAX_DEPTH, MAX_OBJECT_PROPERTIES, ValidationError,
