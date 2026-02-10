@@ -395,18 +395,18 @@ impl ContextPackRecipeCompiler {
         compiled_at_tick: u64,
     ) -> Result<CompiledContextPackRecipe, RecipeCompilerError> {
         let mut path_validation = PathValidationSession::default();
-        let normalized_paths = self.validate_selector_closure(
+        let (normalized_paths, normalized_digests) = self.validate_selector_closure(
             &selector.required_read_paths,
             &selector.required_read_digests,
             &mut path_validation,
         )?;
         let required_read_digest_set_hash =
-            compute_required_read_digest_set_hash(&selector.required_read_digests)?;
+            compute_required_read_digest_set_hash(&normalized_digests)?;
 
         let recipe = ContextPackRecipe::new(
             selector.role_spec_hash,
             normalized_paths,
-            selector.required_read_digests.clone(),
+            normalized_digests,
             required_read_digest_set_hash,
             selector.context_manifest_hash,
             selector.budget_profile_hash,
@@ -438,7 +438,7 @@ impl ContextPackRecipeCompiler {
         required_read_paths: &BTreeSet<String>,
         required_read_digests: &BTreeMap<String, [u8; 32]>,
         path_validation: &mut PathValidationSession,
-    ) -> Result<Vec<String>, RecipeCompilerError> {
+    ) -> Result<(Vec<String>, BTreeMap<String, [u8; 32]>), RecipeCompilerError> {
         if required_read_paths.is_empty() {
             return Err(RecipeCompilerError::SelectorClosure {
                 code: RecipeCompilerReasonCode::EmptyRequiredReadPaths,
@@ -523,7 +523,7 @@ impl ContextPackRecipeCompiler {
         }
 
         normalized.sort_unstable();
-        Ok(normalized)
+        Ok((normalized, normalized_digest_map))
     }
 
     fn enforce_observed_dependencies_hash_pinned(
@@ -1865,5 +1865,44 @@ mod tests {
             error.reason_code(),
             RecipeCompilerReasonCode::ArtifactTooLarge
         );
+    }
+
+    #[test]
+    fn regression_normalization_consistency_bug() {
+        let workspace = setup_workspace();
+        let compiler = ContextPackRecipeCompiler::new(workspace.path()).expect("compiler init");
+
+        let mut required_read_paths = BTreeSet::new();
+        // Use non-canonical path "./src/lib.rs"
+        let raw_path = "./src/lib.rs".to_string();
+        required_read_paths.insert(raw_path.clone());
+
+        let mut required_read_digests = BTreeMap::new();
+        required_read_digests.insert(raw_path.clone(), *blake3::hash(b"content").as_bytes());
+
+        let selector = ContextPackSelectorInput {
+            role_spec_hash: [0x11; 32],
+            required_read_paths,
+            required_read_digests,
+            context_manifest_hash: [0x22; 32],
+            budget_profile_hash: [0x33; 32],
+        };
+
+        // This should pass if normalization is consistent.
+        // It validates that validate_selector_closure returns the normalized digest map
+        // which is then used for recipe creation.
+        let result = compiler.compile(&selector);
+
+        match result {
+            Ok(compiled) => {
+                assert_eq!(compiled.recipe.required_read_paths.len(), 1);
+                assert_eq!(compiled.recipe.required_read_paths[0], "src/lib.rs"); // Normalized
+                // Verify digest map key is also normalized
+                assert!(compiled.recipe.required_read_digests.contains_key("src/lib.rs"));
+            },
+            Err(e) => {
+                panic!("Compilation failed unexpectedly: {:?}", e);
+            }
+        }
     }
 }

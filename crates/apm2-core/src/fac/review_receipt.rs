@@ -321,6 +321,12 @@ pub struct ReviewArtifactBundleV1 {
     /// The policy resolution binding used for the review session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_resolved_ref: Option<String>,
+    /// Drift fingerprint hash (from CAS).
+    ///
+    /// The hash of the `DriftFingerprint` representing the context state during
+    /// this review run. (TCK-00447)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drift_fingerprint_hash: Option<String>,
     /// Optional metadata for review context.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ReviewMetadata>,
@@ -441,6 +447,15 @@ impl ReviewArtifactBundleV1 {
             }
         }
 
+        // Validate drift_fingerprint_hash if present (TCK-00447)
+        if let Some(ref hash) = self.drift_fingerprint_hash {
+            if hash.len() != 64 {
+                return Err(ReviewReceiptError::InvalidData(
+                    "drift_fingerprint_hash must be 64 hex characters".into(),
+                ));
+            }
+        }
+
         // Validate metadata if present
         if let Some(ref metadata) = self.metadata {
             metadata.validate()?;
@@ -464,6 +479,7 @@ pub struct ReviewArtifactBundleV1Builder {
     time_envelope_ref: Option<[u8; 32]>,
     view_commitment_hash: Option<[u8; 32]>,
     policy_resolved_ref: Option<String>,
+    drift_fingerprint_hash: Option<[u8; 32]>,
     metadata: Option<ReviewMetadata>,
 }
 
@@ -525,6 +541,13 @@ impl ReviewArtifactBundleV1Builder {
         self
     }
 
+    /// Sets the drift fingerprint hash (TCK-00447).
+    #[must_use]
+    pub fn drift_fingerprint_hash(mut self, hash: [u8; 32]) -> Self {
+        self.drift_fingerprint_hash = Some(hash);
+        self
+    }
+
     /// Sets the metadata.
     #[must_use]
     pub fn metadata(mut self, metadata: ReviewMetadata) -> Self {
@@ -574,6 +597,7 @@ impl ReviewArtifactBundleV1Builder {
             time_envelope_ref: hex::encode(time_envelope_ref),
             view_commitment_hash: self.view_commitment_hash.map(hex::encode),
             policy_resolved_ref: self.policy_resolved_ref,
+            drift_fingerprint_hash: self.drift_fingerprint_hash.map(hex::encode),
             metadata: self.metadata,
         };
 
@@ -1811,5 +1835,46 @@ mod tests {
         assert_eq!(event.receipt_id, "RR-003");
         assert_eq!(event.role_spec_hash, Some([0x77; 32]));
         assert!(event.verify_signature(&signer.verifying_key()).is_ok());
+    }
+
+    // ==========================================================================
+    // TCK-00447: drift_fingerprint_hash tests
+    // ==========================================================================
+
+    #[test]
+    fn test_drift_fingerprint_hash_in_artifact_bundle() {
+        let bundle = ReviewArtifactBundleV1::builder()
+            .review_id("review-001")
+            .changeset_digest([0x42; 32])
+            .review_text_hash([0x11; 32])
+            .time_envelope_ref([0x44; 32])
+            .drift_fingerprint_hash([0x88; 32]) // TCK-00447
+            .build()
+            .expect("valid bundle");
+
+        assert!(bundle.drift_fingerprint_hash.is_some());
+        assert_eq!(
+            bundle.drift_fingerprint_hash.unwrap(),
+            hex::encode([0x88; 32])
+        );
+    }
+
+    #[test]
+    fn test_drift_fingerprint_hash_validation() {
+        let mut bundle = ReviewArtifactBundleV1::builder()
+            .review_id("review-001")
+            .changeset_digest([0x42; 32])
+            .review_text_hash([0x11; 32])
+            .time_envelope_ref([0x44; 32])
+            .drift_fingerprint_hash([0x88; 32])
+            .build()
+            .expect("valid bundle");
+
+        // Invalid length
+        bundle.drift_fingerprint_hash = Some("bad".to_string());
+        assert!(matches!(
+            bundle.validate(),
+            Err(ReviewReceiptError::InvalidData(msg)) if msg.contains("drift_fingerprint_hash")
+        ));
     }
 }
