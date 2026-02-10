@@ -22,6 +22,28 @@
 //!   laundering.
 //! - **Receipt-visible**: Every floor evaluation emits a [`FloorEvaluation`]
 //!   record, whether it passes or fails.
+//! - **Strict deserialization**: All boundary structs use
+//!   `#[serde(deny_unknown_fields)]` to reject non-canonical payloads.
+//! - **Fail-closed identifiers**: Oversized actor/cell IDs are rejected (not
+//!   truncated) in authoritative evaluation records to prevent audit-trail
+//!   collision.
+//!
+//! # Runtime Integration
+//!
+//! The [`AttestationFloorGuard`] is the single admission gate for floor
+//! checks. It is designed to be composed with the
+//! [`TaintEnforcementGuard`](super::taint::TaintEnforcementGuard) in the
+//! daemon's tool broker admission path:
+//!
+//! 1. The broker calls `TaintEnforcementGuard::admit()` for dual-lattice
+//!    taint/classification checks.
+//! 2. The broker calls `AttestationFloorGuard::admit_tier()` for attestation
+//!    floor checks.
+//! 3. Both checks must pass for the request to proceed (fail-closed).
+//!
+//! For cross-cell imports, the import admission path calls
+//! `AttestationFloorGuard::admit_cross_cell_import()` and quarantines facts
+//! that fail the floor.
 //!
 //! # Contract References
 //!
@@ -179,6 +201,7 @@ impl std::fmt::Display for AttestationLevel {
 ///
 /// The policy also governs cross-cell import floor requirements.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttestationFloorPolicy {
     /// Floor for Tier0 operations.
     #[serde(rename = "tier0_floor")]
@@ -280,24 +303,31 @@ impl AttestationFloorPolicy {
     /// the specified risk tier.
     ///
     /// Returns a [`FloorEvaluation`] regardless of pass/fail for audit
-    /// visibility.
-    #[must_use]
+    /// visibility. Rejects oversized actor IDs fail-closed to prevent
+    /// audit-trail collision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttestationFloorError::FieldTooLong`] if `actor_id`
+    /// exceeds the maximum length.
     pub fn evaluate_tier(
         &self,
         tier: u8,
         actual: AttestationLevel,
         actor_id: &str,
-    ) -> FloorEvaluation {
+    ) -> Result<FloorEvaluation, AttestationFloorError> {
+        validate_bounded(actor_id, "actor_id", MAX_ACTOR_ID_LEN)?;
+
         let required = self.floor_for_tier(tier);
         let passed = actual.meets_floor(required);
 
-        FloorEvaluation {
+        Ok(FloorEvaluation {
             kind: EvaluationKind::TierRequest,
             tier,
             required_level: required,
             actual_level: actual,
             passed,
-            actor_id: truncate_string(actor_id, MAX_ACTOR_ID_LEN),
+            actor_id: actor_id.to_string(),
             source_cell_id: String::new(),
             fact_hash: [0u8; FACT_HASH_LEN],
             detail: truncate_string(
@@ -308,32 +338,39 @@ impl AttestationFloorPolicy {
                 },
                 MAX_DETAIL_LEN,
             ),
-        }
+        })
     }
 
     /// Evaluates whether a cross-cell imported fact meets the import floor.
     ///
     /// Returns a [`FloorEvaluation`] with quarantine recommendation on
-    /// failure.
-    #[must_use]
+    /// failure. Rejects oversized identifiers fail-closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttestationFloorError::FieldTooLong`] if `actor_id` or
+    /// `source_cell_id` exceeds the maximum length.
     pub fn evaluate_cross_cell_import(
         &self,
         actual: AttestationLevel,
         source_cell_id: &str,
         fact_hash: [u8; FACT_HASH_LEN],
         actor_id: &str,
-    ) -> FloorEvaluation {
+    ) -> Result<FloorEvaluation, AttestationFloorError> {
+        validate_bounded(actor_id, "actor_id", MAX_ACTOR_ID_LEN)?;
+        validate_bounded(source_cell_id, "source_cell_id", MAX_CELL_ID_LEN)?;
+
         let required = self.cross_cell_import;
         let passed = actual.meets_floor(required);
 
-        FloorEvaluation {
+        Ok(FloorEvaluation {
             kind: EvaluationKind::CrossCellImport,
             tier: 0, // not tier-specific
             required_level: required,
             actual_level: actual,
             passed,
-            actor_id: truncate_string(actor_id, MAX_ACTOR_ID_LEN),
-            source_cell_id: truncate_string(source_cell_id, MAX_CELL_ID_LEN),
+            actor_id: actor_id.to_string(),
+            source_cell_id: source_cell_id.to_string(),
             fact_hash,
             detail: truncate_string(
                 &if passed {
@@ -349,7 +386,7 @@ impl AttestationFloorPolicy {
                 },
                 MAX_DETAIL_LEN,
             ),
-        }
+        })
     }
 }
 
@@ -365,6 +402,7 @@ impl AttestationFloorPolicy {
 /// - policy root key id
 /// - optional TEE / runner attestations
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttestationMetadata {
     /// The attestation level achieved.
     pub level: AttestationLevel,
@@ -446,6 +484,7 @@ impl std::fmt::Display for EvaluationKind {
 /// the REQ-0033 acceptance criterion that floor evaluations are
 /// receipt/audit-event visible.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FloorEvaluation {
     /// The kind of evaluation.
     pub kind: EvaluationKind,
@@ -518,6 +557,7 @@ impl FloorEvaluation {
 /// operators to inspect and potentially re-admit facts once proper
 /// attestation is obtained.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuarantineRecord {
     /// Hash of the quarantined fact.
     #[serde(with = "serde_bytes")]
@@ -569,7 +609,11 @@ impl QuarantineRecord {
 /// `admit_cross_cell_import` methods that return structured evaluation
 /// records.
 ///
-/// # Usage
+/// # Runtime Wiring
+///
+/// This guard is composed with the taint enforcement guard in the daemon's
+/// tool broker admission path. Both guards must pass for a request to
+/// proceed:
 ///
 /// ```rust
 /// use apm2_core::policy::attestation_floor::{
@@ -580,11 +624,15 @@ impl QuarantineRecord {
 /// let guard = AttestationFloorGuard::new(policy);
 ///
 /// // Tier3 request with Strong attestation passes.
-/// let eval = guard.admit_tier(3, AttestationLevel::Strong, "actor-1");
+/// let eval = guard
+///     .admit_tier(3, AttestationLevel::Strong, "actor-1")
+///     .unwrap();
 /// assert!(eval.passed);
 ///
 /// // Tier3 request with Soft attestation is denied.
-/// let eval = guard.admit_tier(3, AttestationLevel::Soft, "actor-2");
+/// let eval = guard
+///     .admit_tier(3, AttestationLevel::Soft, "actor-2")
+///     .unwrap();
 /// assert!(!eval.passed);
 /// ```
 #[derive(Debug, Clone)]
@@ -602,14 +650,19 @@ impl AttestationFloorGuard {
     /// Admit a tier-based request.
     ///
     /// Returns a [`FloorEvaluation`] recording the outcome. If the
-    /// evaluation fails, the caller MUST deny the request.
-    #[must_use]
+    /// evaluation fails (i.e., `eval.passed == false`), the caller MUST
+    /// deny the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttestationFloorError::FieldTooLong`] if `actor_id`
+    /// exceeds the maximum length (fail-closed).
     pub fn admit_tier(
         &self,
         tier: u8,
         actual: AttestationLevel,
         actor_id: &str,
-    ) -> FloorEvaluation {
+    ) -> Result<FloorEvaluation, AttestationFloorError> {
         self.policy.evaluate_tier(tier, actual, actor_id)
     }
 
@@ -617,14 +670,18 @@ impl AttestationFloorGuard {
     ///
     /// Returns a [`FloorEvaluation`] recording the outcome. If the
     /// evaluation fails, the caller MUST quarantine the fact.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttestationFloorError::FieldTooLong`] if `actor_id` or
+    /// `source_cell_id` exceeds the maximum length (fail-closed).
     pub fn admit_cross_cell_import(
         &self,
         actual: AttestationLevel,
         source_cell_id: &str,
         fact_hash: [u8; FACT_HASH_LEN],
         actor_id: &str,
-    ) -> FloorEvaluation {
+    ) -> Result<FloorEvaluation, AttestationFloorError> {
         self.policy
             .evaluate_cross_cell_import(actual, source_cell_id, fact_hash, actor_id)
     }
@@ -643,7 +700,9 @@ impl AttestationFloorGuard {
     /// # Errors
     ///
     /// Returns [`AttestationFloorError::BatchTooLarge`] if the input exceeds
-    /// the maximum batch evaluation count (10,000).
+    /// the maximum batch evaluation count (10,000), or
+    /// [`AttestationFloorError::FieldTooLong`] if any import request
+    /// contains an oversized identifier.
     pub fn batch_admit_cross_cell(
         &self,
         imports: &[CrossCellImportRequest],
@@ -654,7 +713,7 @@ impl AttestationFloorGuard {
                 max: MAX_BATCH_EVALUATIONS,
             });
         }
-        Ok(imports
+        imports
             .iter()
             .map(|req| {
                 self.admit_cross_cell_import(
@@ -664,7 +723,7 @@ impl AttestationFloorGuard {
                     &req.actor_id,
                 )
             })
-            .collect())
+            .collect()
     }
 }
 
@@ -936,7 +995,9 @@ mod tests {
     #[test]
     fn tier3_strong_attestation_passes() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_tier(3, AttestationLevel::Strong, "actor-1");
+        let eval = policy
+            .evaluate_tier(3, AttestationLevel::Strong, "actor-1")
+            .unwrap();
         assert!(eval.passed);
         assert!(!eval.is_denied());
         assert_eq!(eval.kind, EvaluationKind::TierRequest);
@@ -948,7 +1009,9 @@ mod tests {
     #[test]
     fn tier3_soft_attestation_denied() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_tier(3, AttestationLevel::Soft, "actor-1");
+        let eval = policy
+            .evaluate_tier(3, AttestationLevel::Soft, "actor-1")
+            .unwrap();
         assert!(!eval.passed);
         assert!(eval.is_denied());
         assert!(eval.detail.contains("DENIED"));
@@ -957,49 +1020,63 @@ mod tests {
     #[test]
     fn tier3_none_attestation_denied() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_tier(3, AttestationLevel::None, "actor-1");
+        let eval = policy
+            .evaluate_tier(3, AttestationLevel::None, "actor-1")
+            .unwrap();
         assert!(!eval.passed);
     }
 
     #[test]
     fn tier3_human_cosign_passes() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_tier(3, AttestationLevel::HumanCosign, "actor-1");
+        let eval = policy
+            .evaluate_tier(3, AttestationLevel::HumanCosign, "actor-1")
+            .unwrap();
         assert!(eval.passed);
     }
 
     #[test]
     fn tier0_none_attestation_passes() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_tier(0, AttestationLevel::None, "actor-1");
+        let eval = policy
+            .evaluate_tier(0, AttestationLevel::None, "actor-1")
+            .unwrap();
         assert!(eval.passed);
     }
 
     #[test]
     fn tier2_soft_attestation_passes() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_tier(2, AttestationLevel::Soft, "actor-1");
+        let eval = policy
+            .evaluate_tier(2, AttestationLevel::Soft, "actor-1")
+            .unwrap();
         assert!(eval.passed);
     }
 
     #[test]
     fn tier2_none_attestation_denied() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_tier(2, AttestationLevel::None, "actor-1");
+        let eval = policy
+            .evaluate_tier(2, AttestationLevel::None, "actor-1")
+            .unwrap();
         assert!(!eval.passed);
     }
 
     #[test]
     fn tier4_strong_attestation_passes() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_tier(4, AttestationLevel::Strong, "actor-1");
+        let eval = policy
+            .evaluate_tier(4, AttestationLevel::Strong, "actor-1")
+            .unwrap();
         assert!(eval.passed);
     }
 
     #[test]
     fn unknown_high_tier_uses_tier4_floor() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_tier(99, AttestationLevel::Soft, "actor-1");
+        let eval = policy
+            .evaluate_tier(99, AttestationLevel::Soft, "actor-1")
+            .unwrap();
         assert!(!eval.passed);
         assert_eq!(eval.required_level, AttestationLevel::Strong);
     }
@@ -1011,12 +1088,14 @@ mod tests {
     #[test]
     fn cross_cell_strong_passes() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_cross_cell_import(
-            AttestationLevel::Strong,
-            "cell-remote-01",
-            [0xAA; 32],
-            "importer-1",
-        );
+        let eval = policy
+            .evaluate_cross_cell_import(
+                AttestationLevel::Strong,
+                "cell-remote-01",
+                [0xAA; 32],
+                "importer-1",
+            )
+            .unwrap();
         assert!(eval.passed);
         assert!(!eval.requires_quarantine());
         assert_eq!(eval.kind, EvaluationKind::CrossCellImport);
@@ -1025,12 +1104,14 @@ mod tests {
     #[test]
     fn cross_cell_soft_quarantined() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_cross_cell_import(
-            AttestationLevel::Soft,
-            "cell-remote-01",
-            [0xBB; 32],
-            "importer-1",
-        );
+        let eval = policy
+            .evaluate_cross_cell_import(
+                AttestationLevel::Soft,
+                "cell-remote-01",
+                [0xBB; 32],
+                "importer-1",
+            )
+            .unwrap();
         assert!(!eval.passed);
         assert!(eval.requires_quarantine());
         assert!(eval.detail.contains("QUARANTINED"));
@@ -1039,12 +1120,14 @@ mod tests {
     #[test]
     fn cross_cell_none_quarantined() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_cross_cell_import(
-            AttestationLevel::None,
-            "cell-remote-01",
-            [0xCC; 32],
-            "importer-1",
-        );
+        let eval = policy
+            .evaluate_cross_cell_import(
+                AttestationLevel::None,
+                "cell-remote-01",
+                [0xCC; 32],
+                "importer-1",
+            )
+            .unwrap();
         assert!(!eval.passed);
         assert!(eval.requires_quarantine());
     }
@@ -1052,13 +1135,149 @@ mod tests {
     #[test]
     fn cross_cell_human_cosign_passes() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_cross_cell_import(
-            AttestationLevel::HumanCosign,
-            "cell-remote-01",
-            [0xDD; 32],
-            "importer-1",
-        );
+        let eval = policy
+            .evaluate_cross_cell_import(
+                AttestationLevel::HumanCosign,
+                "cell-remote-01",
+                [0xDD; 32],
+                "importer-1",
+            )
+            .unwrap();
         assert!(eval.passed);
+    }
+
+    // =========================================================================
+    // Oversized Identifier Rejection Tests (MAJOR fix #1)
+    // =========================================================================
+
+    #[test]
+    fn oversized_actor_id_rejected_in_tier_eval() {
+        let policy = AttestationFloorPolicy::default();
+        let long_actor = "a".repeat(MAX_ACTOR_ID_LEN + 1);
+        let result = policy.evaluate_tier(3, AttestationLevel::Strong, &long_actor);
+        assert!(matches!(
+            result,
+            Err(AttestationFloorError::FieldTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn oversized_actor_id_rejected_in_cross_cell_eval() {
+        let policy = AttestationFloorPolicy::default();
+        let long_actor = "a".repeat(MAX_ACTOR_ID_LEN + 1);
+        let result = policy.evaluate_cross_cell_import(
+            AttestationLevel::Strong,
+            "cell-01",
+            [0; 32],
+            &long_actor,
+        );
+        assert!(matches!(
+            result,
+            Err(AttestationFloorError::FieldTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn oversized_cell_id_rejected_in_cross_cell_eval() {
+        let policy = AttestationFloorPolicy::default();
+        let long_cell = "c".repeat(MAX_CELL_ID_LEN + 1);
+        let result = policy.evaluate_cross_cell_import(
+            AttestationLevel::Strong,
+            &long_cell,
+            [0; 32],
+            "actor-1",
+        );
+        assert!(matches!(
+            result,
+            Err(AttestationFloorError::FieldTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn max_length_actor_id_accepted() {
+        let policy = AttestationFloorPolicy::default();
+        let exact_actor = "a".repeat(MAX_ACTOR_ID_LEN);
+        let eval = policy
+            .evaluate_tier(3, AttestationLevel::Strong, &exact_actor)
+            .unwrap();
+        assert!(eval.passed);
+        assert_eq!(eval.actor_id.len(), MAX_ACTOR_ID_LEN);
+    }
+
+    #[test]
+    fn max_length_cell_id_accepted() {
+        let policy = AttestationFloorPolicy::default();
+        let exact_cell = "c".repeat(MAX_CELL_ID_LEN);
+        let eval = policy
+            .evaluate_cross_cell_import(AttestationLevel::Strong, &exact_cell, [0; 32], "actor-1")
+            .unwrap();
+        assert!(eval.passed);
+        assert_eq!(eval.source_cell_id.len(), MAX_CELL_ID_LEN);
+    }
+
+    // =========================================================================
+    // Deny Unknown Fields Tests (MAJOR fix #2)
+    // =========================================================================
+
+    #[test]
+    fn policy_rejects_unknown_fields() {
+        let json = r#"{
+            "tier0_floor": "NONE",
+            "tier1_floor": "NONE",
+            "tier2_floor": "SOFT",
+            "tier3_floor": "STRONG",
+            "tier4_floor": "STRONG",
+            "cross_cell_import_floor": "STRONG",
+            "smuggled_field": "evil"
+        }"#;
+        let result: Result<AttestationFloorPolicy, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "unknown fields must be rejected");
+    }
+
+    #[test]
+    fn metadata_rejects_unknown_fields() {
+        let json = r#"{
+            "level": "STRONG",
+            "actor_id": "actor",
+            "env_fingerprint": "env",
+            "policy_root_key_id": "key",
+            "tee_evidence_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "smuggled": true
+        }"#;
+        let result: Result<AttestationMetadata, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "unknown fields must be rejected");
+    }
+
+    #[test]
+    fn floor_evaluation_rejects_unknown_fields() {
+        let json = r#"{
+            "kind": "TIER_REQUEST",
+            "tier": 3,
+            "required_level": "STRONG",
+            "actual_level": "STRONG",
+            "passed": true,
+            "actor_id": "a",
+            "source_cell_id": "",
+            "fact_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "detail": "ok",
+            "extra": "bad"
+        }"#;
+        let result: Result<FloorEvaluation, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "unknown fields must be rejected");
+    }
+
+    #[test]
+    fn quarantine_record_rejects_unknown_fields() {
+        let json = r#"{
+            "fact_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "source_cell_id": "cell",
+            "actual_level": "SOFT",
+            "required_level": "STRONG",
+            "reason": "below floor",
+            "injected": 42
+        }"#;
+        let result: Result<QuarantineRecord, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "unknown fields must be rejected");
     }
 
     // =========================================================================
@@ -1068,12 +1287,14 @@ mod tests {
     #[test]
     fn quarantine_record_from_failed_cross_cell() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_cross_cell_import(
-            AttestationLevel::Soft,
-            "cell-remote-01",
-            [0xBB; 32],
-            "importer-1",
-        );
+        let eval = policy
+            .evaluate_cross_cell_import(
+                AttestationLevel::Soft,
+                "cell-remote-01",
+                [0xBB; 32],
+                "importer-1",
+            )
+            .unwrap();
         let record = QuarantineRecord::from_evaluation(&eval).unwrap();
         assert_eq!(record.fact_hash, [0xBB; 32]);
         assert_eq!(record.source_cell_id, "cell-remote-01");
@@ -1084,12 +1305,14 @@ mod tests {
     #[test]
     fn quarantine_record_from_passing_eval_fails() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_cross_cell_import(
-            AttestationLevel::Strong,
-            "cell-remote-01",
-            [0xAA; 32],
-            "importer-1",
-        );
+        let eval = policy
+            .evaluate_cross_cell_import(
+                AttestationLevel::Strong,
+                "cell-remote-01",
+                [0xAA; 32],
+                "importer-1",
+            )
+            .unwrap();
         assert!(matches!(
             QuarantineRecord::from_evaluation(&eval),
             Err(AttestationFloorError::NotQuarantinable { .. })
@@ -1099,7 +1322,9 @@ mod tests {
     #[test]
     fn quarantine_record_from_tier_eval_fails() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_tier(3, AttestationLevel::Soft, "actor-1");
+        let eval = policy
+            .evaluate_tier(3, AttestationLevel::Soft, "actor-1")
+            .unwrap();
         assert!(matches!(
             QuarantineRecord::from_evaluation(&eval),
             Err(AttestationFloorError::NotQuarantinable { .. })
@@ -1113,36 +1338,48 @@ mod tests {
     #[test]
     fn guard_admit_tier_passes() {
         let guard = AttestationFloorGuard::new(AttestationFloorPolicy::default());
-        let eval = guard.admit_tier(3, AttestationLevel::Strong, "actor-1");
+        let eval = guard
+            .admit_tier(3, AttestationLevel::Strong, "actor-1")
+            .unwrap();
         assert!(eval.passed);
     }
 
     #[test]
     fn guard_admit_tier_denied() {
         let guard = AttestationFloorGuard::new(AttestationFloorPolicy::default());
-        let eval = guard.admit_tier(3, AttestationLevel::Soft, "actor-1");
+        let eval = guard
+            .admit_tier(3, AttestationLevel::Soft, "actor-1")
+            .unwrap();
         assert!(!eval.passed);
     }
 
     #[test]
     fn guard_admit_cross_cell_passes() {
         let guard = AttestationFloorGuard::new(AttestationFloorPolicy::default());
-        let eval = guard.admit_cross_cell_import(
-            AttestationLevel::Strong,
-            "cell-01",
-            [0xFF; 32],
-            "actor-1",
-        );
+        let eval = guard
+            .admit_cross_cell_import(AttestationLevel::Strong, "cell-01", [0xFF; 32], "actor-1")
+            .unwrap();
         assert!(eval.passed);
     }
 
     #[test]
     fn guard_admit_cross_cell_quarantined() {
         let guard = AttestationFloorGuard::new(AttestationFloorPolicy::default());
-        let eval =
-            guard.admit_cross_cell_import(AttestationLevel::None, "cell-01", [0xFF; 32], "actor-1");
+        let eval = guard
+            .admit_cross_cell_import(AttestationLevel::None, "cell-01", [0xFF; 32], "actor-1")
+            .unwrap();
         assert!(!eval.passed);
         assert!(eval.requires_quarantine());
+    }
+
+    #[test]
+    fn guard_rejects_oversized_actor() {
+        let guard = AttestationFloorGuard::new(AttestationFloorPolicy::default());
+        let long_actor = "x".repeat(MAX_ACTOR_ID_LEN + 1);
+        assert!(matches!(
+            guard.admit_tier(3, AttestationLevel::Strong, &long_actor),
+            Err(AttestationFloorError::FieldTooLong { .. })
+        ));
     }
 
     // =========================================================================
@@ -1194,6 +1431,21 @@ mod tests {
         assert!(matches!(
             guard.batch_admit_cross_cell(&imports),
             Err(AttestationFloorError::BatchTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn batch_admit_fails_on_oversized_id_in_import() {
+        let guard = AttestationFloorGuard::new(AttestationFloorPolicy::default());
+        let imports = vec![CrossCellImportRequest {
+            actual_level: AttestationLevel::Strong,
+            source_cell_id: "c".repeat(MAX_CELL_ID_LEN + 1),
+            fact_hash: [0x00; 32],
+            actor_id: "actor-1".to_string(),
+        }];
+        assert!(matches!(
+            guard.batch_admit_cross_cell(&imports),
+            Err(AttestationFloorError::FieldTooLong { .. })
         ));
     }
 
@@ -1276,7 +1528,9 @@ mod tests {
     #[test]
     fn floor_evaluation_summary_pass() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_tier(3, AttestationLevel::Strong, "actor-1");
+        let eval = policy
+            .evaluate_tier(3, AttestationLevel::Strong, "actor-1")
+            .unwrap();
         let summary = eval.summary();
         assert!(summary.contains("PASS"));
         assert!(summary.contains("tier=3"));
@@ -1286,7 +1540,9 @@ mod tests {
     #[test]
     fn floor_evaluation_summary_fail_deny() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_tier(3, AttestationLevel::Soft, "actor-1");
+        let eval = policy
+            .evaluate_tier(3, AttestationLevel::Soft, "actor-1")
+            .unwrap();
         let summary = eval.summary();
         assert!(summary.contains("FAIL"));
         assert!(summary.contains("DENY"));
@@ -1295,12 +1551,9 @@ mod tests {
     #[test]
     fn floor_evaluation_summary_fail_quarantine() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_cross_cell_import(
-            AttestationLevel::Soft,
-            "cell-01",
-            [0; 32],
-            "actor-1",
-        );
+        let eval = policy
+            .evaluate_cross_cell_import(AttestationLevel::Soft, "cell-01", [0; 32], "actor-1")
+            .unwrap();
         let summary = eval.summary();
         assert!(summary.contains("FAIL"));
         assert!(summary.contains("QUARANTINE"));
@@ -1312,9 +1565,6 @@ mod tests {
 
     #[test]
     fn delegation_meet_takes_strictest_floor() {
-        // Per RFC-0020 Section 8.3.2.2:
-        // min_attestation_level(D) = max(min_attestation_level(A),
-        //                               min_attestation_level(O))
         let parent = AttestationLevel::Soft;
         let child = AttestationLevel::Strong;
         assert_eq!(parent.join(child), AttestationLevel::Strong);
@@ -1330,13 +1580,10 @@ mod tests {
 
     #[test]
     fn delegation_cannot_weaken_attestation_floor() {
-        // Attempting to delegate with a weaker floor should result in the
-        // parent's stricter floor being preserved.
         let parent_floor = AttestationLevel::Strong;
         let proposed_child = AttestationLevel::Soft;
         let effective = parent_floor.join(proposed_child);
         assert_eq!(effective, AttestationLevel::Strong);
-        // The child cannot weaken the parent's floor.
         assert!(effective.meets_floor(parent_floor));
     }
 
@@ -1352,22 +1599,24 @@ mod tests {
 
     #[test]
     fn fail_closed_tier3_no_attestation() {
-        // A Tier3 request with no attestation MUST be denied.
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_tier(3, AttestationLevel::None, "actor-1");
+        let eval = policy
+            .evaluate_tier(3, AttestationLevel::None, "actor-1")
+            .unwrap();
         assert!(!eval.passed);
     }
 
     #[test]
     fn fail_closed_cross_cell_no_attestation() {
-        // A cross-cell import with no attestation MUST be quarantined.
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_cross_cell_import(
-            AttestationLevel::None,
-            "cell-untrusted",
-            [0; 32],
-            "importer-1",
-        );
+        let eval = policy
+            .evaluate_cross_cell_import(
+                AttestationLevel::None,
+                "cell-untrusted",
+                [0; 32],
+                "importer-1",
+            )
+            .unwrap();
         assert!(!eval.passed);
         assert!(eval.requires_quarantine());
     }
@@ -1392,7 +1641,9 @@ mod tests {
     #[test]
     fn floor_evaluation_serde_roundtrip() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_tier(3, AttestationLevel::Strong, "actor-1");
+        let eval = policy
+            .evaluate_tier(3, AttestationLevel::Strong, "actor-1")
+            .unwrap();
         let json = serde_json::to_string(&eval).unwrap();
         let deserialized: FloorEvaluation = serde_json::from_str(&json).unwrap();
         assert_eq!(eval, deserialized);
@@ -1401,12 +1652,9 @@ mod tests {
     #[test]
     fn quarantine_record_serde_roundtrip() {
         let policy = AttestationFloorPolicy::default();
-        let eval = policy.evaluate_cross_cell_import(
-            AttestationLevel::Soft,
-            "cell-01",
-            [0xBB; 32],
-            "actor-1",
-        );
+        let eval = policy
+            .evaluate_cross_cell_import(AttestationLevel::Soft, "cell-01", [0xBB; 32], "actor-1")
+            .unwrap();
         let record = QuarantineRecord::from_evaluation(&eval).unwrap();
         let json = serde_json::to_string(&record).unwrap();
         let deserialized: QuarantineRecord = serde_json::from_str(&json).unwrap();
@@ -1437,33 +1685,6 @@ mod tests {
     }
 
     // =========================================================================
-    // Actor ID Truncation in Evaluations
-    // =========================================================================
-
-    #[test]
-    fn long_actor_id_truncated_in_evaluation() {
-        let policy = AttestationFloorPolicy::default();
-        let long_actor = "a".repeat(MAX_ACTOR_ID_LEN + 100);
-        let eval = policy.evaluate_tier(3, AttestationLevel::Strong, &long_actor);
-        assert!(eval.actor_id.len() <= MAX_ACTOR_ID_LEN);
-        assert!(eval.passed);
-    }
-
-    #[test]
-    fn long_cell_id_truncated_in_evaluation() {
-        let policy = AttestationFloorPolicy::default();
-        let long_cell = "c".repeat(MAX_CELL_ID_LEN + 100);
-        let eval = policy.evaluate_cross_cell_import(
-            AttestationLevel::Strong,
-            &long_cell,
-            [0; 32],
-            "actor-1",
-        );
-        assert!(eval.source_cell_id.len() <= MAX_CELL_ID_LEN);
-        assert!(eval.passed);
-    }
-
-    // =========================================================================
     // Edge Case: All Tiers With All Levels
     // =========================================================================
 
@@ -1481,7 +1702,7 @@ mod tests {
         for &tier in &tiers {
             let floor = policy.floor_for_tier(tier);
             for &level in &levels {
-                let eval = policy.evaluate_tier(tier, level, "test-actor");
+                let eval = policy.evaluate_tier(tier, level, "test-actor").unwrap();
                 let expected = level.meets_floor(floor);
                 assert_eq!(
                     eval.passed, expected,
