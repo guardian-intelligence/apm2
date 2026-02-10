@@ -14,6 +14,7 @@ use apm2_core::fac::{DenyCondition, RoleSpecV2};
 use apm2_core::ledger::{Ledger, LedgerError};
 use clap::Args;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::exit_codes::codes as exit_codes;
 
@@ -78,6 +79,9 @@ pub enum LaunchDenyReason {
     WorkIdBindingMismatch,
     /// Policy `capability_manifest_hash` binding does not match request.
     CapabilityManifestHashBindingMismatch,
+    /// Policy artifact does not declare a required `capability_manifest_hash`
+    /// binding.
+    MissingPolicyCapabilityManifestBinding,
     /// Capability manifest artifact is malformed or missing declarations.
     InvalidCapabilityManifest {
         /// Validation detail.
@@ -125,6 +129,8 @@ pub struct LaunchReceiptV1 {
     pub capability_manifest_hash: [u8; 32],
     /// Bound policy hash.
     pub policy_hash: [u8; 32],
+    /// Bound lease identifier used for authorization context.
+    pub lease_id: String,
     /// Monotonic timestamp in nanoseconds.
     pub timestamp_ns: u64,
     /// BLAKE3 digest over canonical receipt bytes (excluding this field).
@@ -141,6 +147,7 @@ struct LaunchReceiptDigestInput {
     context_pack_hash: [u8; 32],
     capability_manifest_hash: [u8; 32],
     policy_hash: [u8; 32],
+    lease_id: String,
     timestamp_ns: u64,
 }
 
@@ -479,6 +486,7 @@ fn build_launch_receipt(
     hashes: ParsedHashes,
     timestamp_ns: u64,
 ) -> std::result::Result<LaunchReceiptV1, RoleLaunchError> {
+    let lease_id = args.lease_id.clone().unwrap_or_default();
     let digest_input = LaunchReceiptDigestInput {
         schema_id: LAUNCH_RECEIPT_SCHEMA_ID.to_string(),
         work_id: args.work_id.clone(),
@@ -487,6 +495,7 @@ fn build_launch_receipt(
         context_pack_hash: hashes.context_pack,
         capability_manifest_hash: hashes.capability_manifest,
         policy_hash: hashes.policy,
+        lease_id: lease_id.clone(),
         timestamp_ns,
     };
 
@@ -501,6 +510,7 @@ fn build_launch_receipt(
         context_pack_hash: hashes.context_pack,
         capability_manifest_hash: hashes.capability_manifest,
         policy_hash: hashes.policy,
+        lease_id,
         timestamp_ns,
         receipt_digest,
     })
@@ -619,7 +629,7 @@ fn read_cas_object(cas_path: &Path, hash: &[u8; 32]) -> std::result::Result<Vec<
     }
 
     let computed_hash = *blake3::hash(&bytes).as_bytes();
-    if computed_hash != *hash {
+    if !bool::from(computed_hash.ct_eq(hash)) {
         return Err(format!(
             "CAS object '{}' hash mismatch (expected {}, got {})",
             path.display(),
@@ -637,7 +647,7 @@ fn resolve_required_hash(
     missing_reason: LaunchDenyReason,
     unresolvable_reason: LaunchDenyReason,
 ) -> std::result::Result<Vec<u8>, LaunchDenyReason> {
-    if hash == [0u8; 32] {
+    if bool::from(hash.ct_eq(&[0u8; 32])) {
         return Err(missing_reason);
     }
     read_cas_object(cas_path, &hash).map_err(|_| unresolvable_reason)
@@ -752,7 +762,7 @@ fn validate_cross_binding_consistency(
     validate_policy_work_binding(policy_object, work_id)?;
 
     let policy_role_spec_hash = extract_policy_hash(policy_object, "role_spec_hash")?;
-    if policy_role_spec_hash != hashes.role_spec {
+    if !bool::from(policy_role_spec_hash.ct_eq(&hashes.role_spec)) {
         return Err(LaunchDenyReason::StaleBindingContext {
             detail: format!(
                 "policy role_spec_hash {} does not match requested role_spec_hash {}",
@@ -763,7 +773,7 @@ fn validate_cross_binding_consistency(
     }
 
     let policy_context_pack_hash = extract_policy_hash(policy_object, "context_pack_hash")?;
-    if policy_context_pack_hash != hashes.context_pack {
+    if !bool::from(policy_context_pack_hash.ct_eq(&hashes.context_pack)) {
         return Err(LaunchDenyReason::StaleBindingContext {
             detail: format!(
                 "policy context_pack_hash {} does not match requested context_pack_hash {}",
@@ -792,7 +802,7 @@ fn validate_cross_binding_consistency(
     {
         let embedded_policy_hash = parse_hex_hash_literal("policy.policy_hash", policy_hash_value)
             .map_err(|detail| LaunchDenyReason::StaleBindingContext { detail })?;
-        if embedded_policy_hash != hashes.policy {
+        if !bool::from(embedded_policy_hash.ct_eq(&hashes.policy)) {
             return Err(LaunchDenyReason::StaleBindingContext {
                 detail: format!(
                     "embedded policy_hash {} does not match requested policy_hash {}",
@@ -830,14 +840,14 @@ fn validate_policy_capability_manifest_binding(
         .get("capability_manifest_hash")
         .and_then(serde_json::Value::as_str)
     else {
-        return Ok(());
+        return Err(LaunchDenyReason::MissingPolicyCapabilityManifestBinding);
     };
     let policy_hash =
         parse_hex_hash_literal("capability_manifest_hash", policy_capability_manifest_hash)
             .map_err(|detail| LaunchDenyReason::StaleBindingContext {
                 detail: format!("invalid 'capability_manifest_hash' in policy artifact: {detail}"),
             })?;
-    if policy_hash != capability_manifest_hash {
+    if !bool::from(policy_hash.ct_eq(&capability_manifest_hash)) {
         return Err(LaunchDenyReason::CapabilityManifestHashBindingMismatch);
     }
     Ok(())
@@ -1088,6 +1098,9 @@ fn deny_reason_message(reason: &LaunchDenyReason) -> String {
             "policy capability_manifest_hash does not match requested capability_manifest_hash"
                 .to_string()
         },
+        LaunchDenyReason::MissingPolicyCapabilityManifestBinding => {
+            "policy artifact missing required capability_manifest_hash binding".to_string()
+        },
         LaunchDenyReason::InvalidCapabilityManifest { detail } => {
             format!("invalid capability manifest: {detail}")
         },
@@ -1241,6 +1254,14 @@ mod tests {
         }
     }
 
+    fn load_receipt(cas_path: &Path, receipt_hash_hex: &str) -> LaunchReceiptV1 {
+        let receipt_hash = parse_hex_hash_literal("receipt_hash", receipt_hash_hex)
+            .expect("receipt hash should parse");
+        let receipt_bytes =
+            read_cas_object(cas_path, &receipt_hash).expect("receipt should be readable from CAS");
+        serde_json::from_slice(&receipt_bytes).expect("receipt payload should deserialize")
+    }
+
     #[test]
     fn test_valid_launch_succeeds() {
         let env = setup_test_env();
@@ -1265,6 +1286,26 @@ mod tests {
             receipt_path.exists(),
             "launch receipt must be stored in CAS at {}",
             receipt_path.display()
+        );
+    }
+
+    #[test]
+    fn test_lease_id_included_in_receipt() {
+        let mut env = setup_test_env();
+        env.args.lease_id = Some("L-TEST-LEASE-A".to_string());
+        let first = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
+            .expect("launch with lease id should succeed");
+
+        let first_receipt = load_receipt(&env.cas_path, &first.receipt_hash);
+        assert_eq!(first_receipt.lease_id, "L-TEST-LEASE-A");
+
+        env.args.lease_id = Some("L-TEST-LEASE-B".to_string());
+        let second = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
+            .expect("launch with changed lease id should succeed");
+
+        assert_ne!(
+            first.receipt_digest, second.receipt_digest,
+            "changing lease_id must change receipt_digest"
         );
     }
 
@@ -1363,6 +1404,32 @@ mod tests {
         match error {
             RoleLaunchError::Denied { reason } => {
                 assert_eq!(reason, LaunchDenyReason::MissingPolicyWorkIdBinding);
+            },
+            other => panic!("expected denied error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_missing_policy_capability_manifest_denied() {
+        let mut env = setup_test_env();
+        let policy_hash = store_policy_snapshot(
+            &env.cas_path,
+            Some(&env.args.work_id),
+            &env.args.role,
+            &env.args.role_spec_hash,
+            &env.args.context_pack_hash,
+            None,
+        );
+        env.args.policy_hash = hex::encode(policy_hash);
+
+        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
+            .expect_err("policy missing capability_manifest_hash binding should deny launch");
+        match error {
+            RoleLaunchError::Denied { reason } => {
+                assert_eq!(
+                    reason,
+                    LaunchDenyReason::MissingPolicyCapabilityManifestBinding
+                );
             },
             other => panic!("expected denied error, got {other:?}"),
         }
