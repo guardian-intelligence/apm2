@@ -7063,7 +7063,7 @@ impl PrivilegedDispatcher {
             Self::map_pcac_deny_to_privileged_response(operation, &deny)
         })?;
 
-        if certificate.intent_digest != effect_intent_digest {
+        if !bool::from(certificate.intent_digest.ct_eq(&effect_intent_digest)) {
             let deny_class = AuthorityDenyClass::IntentDigestMismatch {
                 expected: certificate.intent_digest,
                 actual: effect_intent_digest,
@@ -13538,10 +13538,16 @@ impl PrivilegedDispatcher {
 
         // Lineage continuity: delegated lease MUST preserve authoritative
         // parent bindings.
+        let lineage_hashes_match =
+            bool::from(
+                sublease
+                    .changeset_digest
+                    .ct_eq(&parent_lease.changeset_digest),
+            ) && bool::from(sublease.policy_hash.ct_eq(&parent_lease.policy_hash));
+
         if sublease.work_id != parent_lease.work_id
             || sublease.gate_id != parent_lease.gate_id
-            || sublease.changeset_digest != parent_lease.changeset_digest
-            || sublease.policy_hash != parent_lease.policy_hash
+            || !lineage_hashes_match
             || sublease.time_envelope_ref != parent_lease.time_envelope_ref
         {
             let deny_class = AuthorityDenyClass::InvalidDelegationChain;
@@ -26626,6 +26632,72 @@ mod tests {
             assert_eq!(
                 sublease_event_count, 0,
                 "missing-lineage denial must not emit SubleaseIssued events"
+            );
+        }
+
+        #[test]
+        fn test_delegate_sublease_privileged_pcac_deny_lifecycle_failure() {
+            let policy = crate::protocol::dispatch::PrivilegedPcacPolicy {
+                require_ajc_for_delegate_sublease: true,
+                require_ajc_for_ingest_review_receipt: false,
+            };
+            let (state, ctx, caller_actor, _cas_dir) =
+                setup_dispatcher_state_with_privileged_pcac(policy, true);
+
+            register_test_lease_and_claim(
+                &state,
+                "pcac-parent-missing-gate",
+                "W-PCAC-DS-MISSING-GATE",
+                "gate-pcac-missing-gate",
+                &caller_actor,
+                [0xDE; 32],
+                0,
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "pcac-parent-missing-gate".to_string(),
+                delegatee_actor_id: "pcac-child-missing-gate".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "pcac-sublease-missing-gate".to_string(),
+                identity_proof_hash: vec![0xAB; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+            let response = state
+                .privileged_dispatcher()
+                .dispatch(&frame, &ctx)
+                .unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("PCAC authority gate not wired"),
+                        "lifecycle failure must fail-closed on missing gate wiring, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected lifecycle failure denial, got {other:?}"),
+            }
+
+            let persisted_sublease = state
+                .privileged_dispatcher()
+                .lease_validator()
+                .get_gate_lease("pcac-sublease-missing-gate");
+            assert!(
+                persisted_sublease.is_none(),
+                "lifecycle denial must not persist a sublease"
+            );
+
+            let sublease_events = state
+                .privileged_dispatcher()
+                .event_emitter()
+                .get_events_by_work_id("pcac-sublease-missing-gate");
+            let sublease_event_count = sublease_events
+                .iter()
+                .filter(|event| event.event_type == "SubleaseIssued")
+                .count();
+            assert_eq!(
+                sublease_event_count, 0,
+                "lifecycle denial must not emit SubleaseIssued events"
             );
         }
 
