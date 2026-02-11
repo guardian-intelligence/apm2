@@ -83,7 +83,8 @@ use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
 use apm2_core::evidence::{
     AcceptancePackageV1, AdmissionVerdict as AcceptanceAdmissionVerdict, CasReceiptProvider,
     LedgerReceiptProvider, ReceiptPointer as AcceptanceReceiptPointer,
-    ReceiptType as AcceptanceReceiptType, TrustedIssuerSet, verify_acceptance_package,
+    ReceiptType as AcceptanceReceiptType, TrustedIssuerSet, VerificationResult,
+    verify_acceptance_package,
 };
 #[cfg(test)]
 use apm2_core::fac::taint::{FlowRule, TaintSource, TargetContext};
@@ -3829,6 +3830,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             &effect_digest,
         );
 
+        let declassification_required = matches!(
+            boundary_flow_state.declassification_intent,
+            DeclassificationIntentScope::RedundancyPurpose
+        );
+
         // Phase 1: compute digests and verify package structure in-memory before
         // any durable CAS/ledger writes.
         let mut prepared_receipts = Vec::with_capacity(receipt_payloads.len());
@@ -3872,6 +3878,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 .admitted_policy_root_digest,
             time_authority_ref: pending_pcac.certificate.issued_time_envelope_ref,
             verdict: AcceptanceAdmissionVerdict::Admitted,
+            declassification_required,
             issuer_signature: Vec::new(),
             issuer_verifying_key: [0u8; 32],
         };
@@ -3882,27 +3889,41 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 format!("acceptance package pre-verification signing failed: {error}")
             })?;
 
-        let cas_preverify = verify_acceptance_package(&preverify_package, &mem_cas_provider, None);
-        if !cas_preverify.verified {
-            return Err(Self::format_acceptance_verification_failure(
-                "cas-preverify",
-                &cas_preverify,
-            ));
-        }
+        let cas_available = self.cas.is_some();
+        let ledger_available = self.ledger.is_some();
 
-        let ledger_preverify =
-            verify_acceptance_package(&preverify_package, &mem_ledger_provider, None);
-        if !ledger_preverify.verified {
-            return Err(Self::format_acceptance_verification_failure(
-                "ledger-preverify",
-                &ledger_preverify,
-            ));
-        }
+        let cas_preverify = if cas_available {
+            let result = verify_acceptance_package(&preverify_package, &mem_cas_provider, None);
+            if !result.verified {
+                return Err(Self::format_acceptance_verification_failure(
+                    "cas-preverify",
+                    &result,
+                ));
+            }
+            Some(result)
+        } else {
+            None
+        };
 
-        if cas_preverify != ledger_preverify {
-            return Err(format!(
-                "acceptance package pre-verification concordance mismatch: cas={cas_preverify:?}, ledger={ledger_preverify:?}"
-            ));
+        let ledger_preverify = if ledger_available {
+            let result = verify_acceptance_package(&preverify_package, &mem_ledger_provider, None);
+            if !result.verified {
+                return Err(Self::format_acceptance_verification_failure(
+                    "ledger-preverify",
+                    &result,
+                ));
+            }
+            Some(result)
+        } else {
+            None
+        };
+
+        if let (Some(cas_r), Some(ledger_r)) = (&cas_preverify, &ledger_preverify) {
+            if cas_r != ledger_r {
+                return Err(format!(
+                    "acceptance package pre-verification concordance mismatch: cas={cas_r:?}, ledger={ledger_r:?}"
+                ));
+            }
         }
 
         // Phase 2: pre-verification passed, so now persist receipts durably.
@@ -3971,6 +3992,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 .admitted_policy_root_digest,
             time_authority_ref: pending_pcac.certificate.issued_time_envelope_ref,
             verdict: AcceptanceAdmissionVerdict::Admitted,
+            declassification_required,
             issuer_signature: Vec::new(),
             issuer_verifying_key: [0u8; 32],
         };
@@ -3984,27 +4006,35 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         let trusted_issuers =
             TrustedIssuerSet::from_keys(&[self.channel_context_signer.verifying_key().to_bytes()]);
 
-        let cas_result = verify_acceptance_package(&package, &cas_provider, Some(&trusted_issuers));
-        if !cas_result.verified {
-            return Err(Self::format_acceptance_verification_failure(
-                "cas",
-                &cas_result,
-            ));
-        }
+        let cas_result = if cas_available {
+            let result = verify_acceptance_package(&package, &cas_provider, Some(&trusted_issuers));
+            if !result.verified {
+                return Err(Self::format_acceptance_verification_failure("cas", &result));
+            }
+            Some(result)
+        } else {
+            None
+        };
 
-        let ledger_result =
-            verify_acceptance_package(&package, &ledger_provider, Some(&trusted_issuers));
-        if !ledger_result.verified {
-            return Err(Self::format_acceptance_verification_failure(
-                "ledger",
-                &ledger_result,
-            ));
-        }
+        let ledger_result = if ledger_available {
+            let result =
+                verify_acceptance_package(&package, &ledger_provider, Some(&trusted_issuers));
+            if !result.verified {
+                return Err(Self::format_acceptance_verification_failure(
+                    "ledger", &result,
+                ));
+            }
+            Some(result)
+        } else {
+            None
+        };
 
-        if cas_result != ledger_result {
-            return Err(format!(
-                "acceptance package verifier concordance mismatch: cas={cas_result:?}, ledger={ledger_result:?}"
-            ));
+        if let (Some(cas_r), Some(ledger_r)) = (&cas_result, &ledger_result) {
+            if cas_r != ledger_r {
+                return Err(format!(
+                    "acceptance package verifier concordance mismatch: cas={cas_r:?}, ledger={ledger_r:?}"
+                ));
+            }
         }
 
         let package_bytes = serde_json::to_vec(&package)
@@ -4012,6 +4042,22 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         let replay_fixture_hash = self.cas.as_ref().map(|cas| cas.store(&package_bytes));
 
         if let Some(ledger) = self.ledger.as_ref() {
+            let format_result_json = |result: &Option<VerificationResult>| {
+                result.as_ref().map_or(serde_json::json!(null), |r| {
+                    serde_json::json!({
+                        "verified": r.verified,
+                        "findings": r.findings.iter().map(|finding| serde_json::json!({
+                            "severity": format!("{:?}", finding.severity).to_lowercase(),
+                            "code": finding.code,
+                            "message": finding.message.as_str(),
+                        })).collect::<Vec<_>>(),
+                    })
+                })
+            };
+            let concordant = match (&cas_result, &ledger_result) {
+                (Some(cas_r), Some(ledger_r)) => cas_r == ledger_r,
+                _ => true,
+            };
             let concordance_payload = serde_json::to_vec(&serde_json::json!({
                 "schema": "apm2.acceptance_package_recorded.v1",
                 "request_id": request_id,
@@ -4023,23 +4069,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 "package": package,
                 "replay_fixture_hash": replay_fixture_hash.map(hex::encode),
                 "verifier_concordance": {
-                    "cas": {
-                        "verified": cas_result.verified,
-                        "findings": cas_result.findings.iter().map(|finding| serde_json::json!({
-                            "severity": format!("{:?}", finding.severity).to_lowercase(),
-                            "code": finding.code,
-                            "message": finding.message.as_str(),
-                        })).collect::<Vec<_>>(),
-                    },
-                    "ledger": {
-                        "verified": ledger_result.verified,
-                        "findings": ledger_result.findings.iter().map(|finding| serde_json::json!({
-                            "severity": format!("{:?}", finding.severity).to_lowercase(),
-                            "code": finding.code,
-                            "message": finding.message.as_str(),
-                        })).collect::<Vec<_>>(),
-                    },
-                    "concordant": true,
+                    "cas": format_result_json(&cas_result),
+                    "ledger": format_result_json(&ledger_result),
+                    "concordant": concordant,
                 },
                 "timestamp_ns": timestamp_ns,
             }))
@@ -10013,6 +10045,7 @@ mod tests {
             policy_snapshot_hash: [0xA1; 32],
             time_authority_ref: [0xB2; 32],
             verdict: AcceptanceAdmissionVerdict::Admitted,
+            declassification_required: false,
             issuer_signature: Vec::new(),
             issuer_verifying_key: [0u8; 32],
         };

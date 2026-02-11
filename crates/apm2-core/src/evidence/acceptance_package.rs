@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use serde::de::{self, Visitor};
+use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
@@ -51,6 +51,13 @@ pub struct AcceptancePackageV1 {
     pub time_authority_ref: Hash,
     /// The admission verdict this evidence supports.
     pub verdict: AdmissionVerdict,
+    /// Whether a declassification receipt is required for this package.
+    ///
+    /// Set to `true` when the boundary evidence indicates a
+    /// `RedundancyPurpose` declassification intent. The verifier checks that
+    /// a `Declassification` receipt pointer is present when this flag is set.
+    #[serde(default)]
+    pub declassification_required: bool,
     /// Signature over canonical package bytes by the issuing authority.
     #[serde(deserialize_with = "deserialize_bounded_signature")]
     pub issuer_signature: Vec<u8>,
@@ -257,6 +264,7 @@ impl AcceptancePackageV1 {
         hasher.update(&self.policy_snapshot_hash);
         hasher.update(&self.time_authority_ref);
         hasher.update(&[self.verdict.stable_tag()]);
+        hasher.update(&[u8::from(self.declassification_required)]);
         hasher.update(&self.issuer_verifying_key);
     }
 
@@ -293,36 +301,96 @@ fn hash_optional_string(hasher: &mut blake3::Hasher, value: Option<&str>) {
     }
 }
 
+struct BoundedReceiptPointersVisitor;
+
+impl<'de> Visitor<'de> for BoundedReceiptPointersVisitor {
+    type Value = Vec<ReceiptPointer>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "a sequence of at most {MAX_RECEIPT_POINTERS} receipt pointers",
+        )
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let capacity = seq.size_hint().unwrap_or(0).min(MAX_RECEIPT_POINTERS);
+        let mut pointers = Vec::with_capacity(capacity);
+        while let Some(element) = seq.next_element::<ReceiptPointer>()? {
+            if pointers.len() >= MAX_RECEIPT_POINTERS {
+                return Err(de::Error::custom(format!(
+                    "receipt_pointers count exceeds maximum of {MAX_RECEIPT_POINTERS}",
+                )));
+            }
+            pointers.push(element);
+        }
+        Ok(pointers)
+    }
+}
+
 fn deserialize_bounded_receipt_pointers<'de, D>(
     deserializer: D,
 ) -> Result<Vec<ReceiptPointer>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let pointers: Vec<ReceiptPointer> = Vec::deserialize(deserializer)?;
-    if pointers.len() > MAX_RECEIPT_POINTERS {
-        return Err(serde::de::Error::custom(format!(
-            "receipt_pointers count {} exceeds maximum of {}",
-            pointers.len(),
-            MAX_RECEIPT_POINTERS
-        )));
+    deserializer.deserialize_seq(BoundedReceiptPointersVisitor)
+}
+
+struct BoundedSignatureVisitor;
+
+impl<'de> Visitor<'de> for BoundedSignatureVisitor {
+    type Value = Vec<u8>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "a byte sequence of at most {MAX_SIGNATURE_BYTES} bytes",
+        )
     }
-    Ok(pointers)
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let capacity = seq.size_hint().unwrap_or(0).min(MAX_SIGNATURE_BYTES);
+        let mut bytes = Vec::with_capacity(capacity);
+        while let Some(byte) = seq.next_element::<u8>()? {
+            if bytes.len() >= MAX_SIGNATURE_BYTES {
+                return Err(de::Error::custom(format!(
+                    "issuer_signature length exceeds maximum of {MAX_SIGNATURE_BYTES}",
+                )));
+            }
+            bytes.push(byte);
+        }
+        Ok(bytes)
+    }
+
+    fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+        if value.len() > MAX_SIGNATURE_BYTES {
+            return Err(E::custom(format!(
+                "issuer_signature length {} exceeds maximum of {}",
+                value.len(),
+                MAX_SIGNATURE_BYTES
+            )));
+        }
+        Ok(value.to_vec())
+    }
+
+    fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+        if value.len() > MAX_SIGNATURE_BYTES {
+            return Err(E::custom(format!(
+                "issuer_signature length {} exceeds maximum of {}",
+                value.len(),
+                MAX_SIGNATURE_BYTES
+            )));
+        }
+        Ok(value)
+    }
 }
 
 fn deserialize_bounded_signature<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let bytes: Vec<u8> = Vec::deserialize(deserializer)?;
-    if bytes.len() > MAX_SIGNATURE_BYTES {
-        return Err(serde::de::Error::custom(format!(
-            "issuer_signature length {} exceeds maximum of {}",
-            bytes.len(),
-            MAX_SIGNATURE_BYTES
-        )));
-    }
-    Ok(bytes)
+    deserializer.deserialize_seq(BoundedSignatureVisitor)
 }
 
 struct BoundedStringVisitor(usize);
@@ -854,6 +922,19 @@ fn verify_required_receipt_types(
             ));
         }
     }
+
+    if package.declassification_required {
+        let has_declassification = package
+            .receipt_pointers
+            .iter()
+            .any(|pointer| pointer.receipt_type == ReceiptType::Declassification);
+        if !has_declassification {
+            findings.push(VerificationFinding::error(
+                "ACPT_DECLASSIFICATION_RECEIPT_MISSING",
+                "declassification_required is set but no Declassification receipt pointer is present",
+            ));
+        }
+    }
 }
 
 fn verify_receipts(
@@ -1014,6 +1095,7 @@ mod tests {
             policy_snapshot_hash: [0xA1; 32],
             time_authority_ref: [0xB2; 32],
             verdict: AdmissionVerdict::Admitted,
+            declassification_required: false,
             issuer_signature: Vec::new(),
             issuer_verifying_key: [0u8; 32],
         };
@@ -1484,6 +1566,101 @@ mod tests {
         assert!(
             error_msg.contains("string exceeds max length"),
             "error must mention max length, got: {error_msg}"
+        );
+    }
+
+    #[test]
+    fn declassification_required_missing_receipt_denies() {
+        let (mut package, fixtures) = build_fixture_package();
+        let cas_provider = build_cas_provider(&fixtures);
+
+        // Remove the declassification receipt pointer.
+        package
+            .receipt_pointers
+            .retain(|p| p.receipt_type != ReceiptType::Declassification);
+        package.declassification_required = true;
+        package.receipt_set_digest =
+            AcceptancePackageV1::compute_receipt_set_digest(&package.receipt_pointers);
+        package
+            .sign_with(&deterministic_signer())
+            .expect("re-signing package should succeed");
+
+        let result = verify_acceptance_package(&package, &cas_provider, None);
+        assert!(
+            !result.verified,
+            "declassification_required without Declassification receipt must deny: {result:?}"
+        );
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|finding| finding.code == "ACPT_DECLASSIFICATION_RECEIPT_MISSING"),
+            "declassification missing finding must be present: {result:?}"
+        );
+    }
+
+    #[test]
+    fn declassification_required_with_receipt_passes() {
+        let (mut package, fixtures) = build_fixture_package();
+        let cas_provider = build_cas_provider(&fixtures);
+
+        // The fixture package already includes a Declassification receipt.
+        package.declassification_required = true;
+        package.receipt_set_digest =
+            AcceptancePackageV1::compute_receipt_set_digest(&package.receipt_pointers);
+        package
+            .sign_with(&deterministic_signer())
+            .expect("re-signing package should succeed");
+
+        let result = verify_acceptance_package(&package, &cas_provider, None);
+        assert!(
+            result.verified,
+            "declassification_required with Declassification receipt must pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn declassification_not_required_without_receipt_passes() {
+        let (mut package, fixtures) = build_fixture_package();
+        let cas_provider = build_cas_provider(&fixtures);
+
+        // Remove the declassification receipt pointer but leave
+        // declassification_required at false.
+        package
+            .receipt_pointers
+            .retain(|p| p.receipt_type != ReceiptType::Declassification);
+        package.declassification_required = false;
+        package.receipt_set_digest =
+            AcceptancePackageV1::compute_receipt_set_digest(&package.receipt_pointers);
+        package
+            .sign_with(&deterministic_signer())
+            .expect("re-signing package should succeed");
+
+        let result = verify_acceptance_package(&package, &cas_provider, None);
+        assert!(
+            result.verified,
+            "declassification_required=false without Declassification receipt must pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn declassification_required_changes_package_id() {
+        let (mut package, _fixtures) = build_fixture_package();
+        package.declassification_required = false;
+        package
+            .sign_with(&deterministic_signer())
+            .expect("signing should succeed");
+        let id_without = package.compute_package_id().unwrap();
+
+        package.declassification_required = true;
+        package
+            .sign_with(&deterministic_signer())
+            .expect("signing should succeed");
+        let id_with = package.compute_package_id().unwrap();
+
+        assert_ne!(
+            id_without, id_with,
+            "declassification_required flag MUST affect package_id"
         );
     }
 
