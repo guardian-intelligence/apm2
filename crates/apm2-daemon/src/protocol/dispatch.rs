@@ -28369,12 +28369,13 @@ mod tests {
                 },
             );
 
-            let policy_resolution = test_policy_resolution_with_lineage(
+            let mut policy_resolution = test_policy_resolution_with_lineage(
                 "W-REVIEW-001",
                 &caller_actor,
                 WorkRole::Reviewer,
                 0,
             );
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
             seed_policy_lineage_for_test(
                 cas.as_ref(),
                 "W-REVIEW-001",
