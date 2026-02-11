@@ -606,6 +606,8 @@ struct ProjectionRecoveryState {
     receipts: Vec<ProjectionReplayReceiptV1>,
     replay_sequence_bounds: ReplaySequenceBoundsV1,
     time_authority_envelope: TimeAuthorityEnvelopeV1,
+    has_durable_provenance: bool,
+    durable_evidence_digest: Option<Hash>,
 }
 
 /// Default poll interval for divergence checks (30 seconds).
@@ -690,6 +692,15 @@ pub enum DivergenceError {
     /// Replay recovery failed during post-containment unfreeze checks.
     #[error("projection replay recovery failed: {0}")]
     ProjectionRecoveryFailed(String),
+
+    /// Replay recovery state exists but has no durable provenance proof.
+    #[error(
+        "recovery state exists but lacks durable provenance — unfreeze requires CAS/ledger-backed replay evidence (freeze_id: {freeze_id})"
+    )]
+    ProjectionRecoveryNotDurable {
+        /// Freeze identifier requiring durable recovery provenance.
+        freeze_id: String,
+    },
 
     /// Temporal authority envelope is missing for a compromise/recovery
     /// decision.
@@ -1671,6 +1682,8 @@ pub struct DivergenceWatchdogConfig {
     pub actor_id: String,
     /// Time envelope reference pattern.
     pub time_envelope_pattern: String,
+    /// External trusted time authority key bindings (CAC/HTF root).
+    pub trusted_time_authority_bindings: Vec<AuthorityKeyBindingV1>,
 }
 
 impl DivergenceWatchdogConfig {
@@ -1694,6 +1707,7 @@ impl DivergenceWatchdogConfig {
             poll_interval: DEFAULT_POLL_INTERVAL,
             actor_id: "divergence-watchdog".to_string(),
             time_envelope_pattern: "htf:tick:{}".to_string(),
+            trusted_time_authority_bindings: Vec::new(),
         })
     }
 
@@ -1728,6 +1742,42 @@ impl DivergenceWatchdogConfig {
         let actor_id = actor_id.into();
         validate_string_length("actor_id", &actor_id)?;
         self.actor_id = actor_id;
+        Ok(self)
+    }
+
+    /// Sets externally trusted time authority bindings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DivergenceError::InvalidConfiguration`] if the binding count
+    /// exceeds `MAX_TRUSTED_AUTHORITY_BINDINGS` or any verifying key fails to
+    /// parse.
+    pub fn with_trusted_time_authority_bindings(
+        mut self,
+        bindings: Vec<AuthorityKeyBindingV1>,
+    ) -> Result<Self, DivergenceError> {
+        if bindings.len() > MAX_TRUSTED_AUTHORITY_BINDINGS {
+            return Err(DivergenceError::InvalidConfiguration(format!(
+                "trusted authority bindings exceed limit: {} > {MAX_TRUSTED_AUTHORITY_BINDINGS}",
+                bindings.len()
+            )));
+        }
+
+        for binding in &bindings {
+            if binding.actor_id.trim().is_empty() {
+                return Err(DivergenceError::MissingField(
+                    "trusted_time_authority_bindings.actor_id",
+                ));
+            }
+            validate_string_length(
+                "trusted_time_authority_bindings.actor_id",
+                &binding.actor_id,
+            )?;
+            parse_verifying_key(&binding.verifying_key)
+                .map_err(|error| DivergenceError::InvalidConfiguration(error.to_string()))?;
+        }
+
+        self.trusted_time_authority_bindings = bindings;
         Ok(self)
     }
 }
@@ -2295,6 +2345,8 @@ pub struct DivergenceWatchdog<T: TimeSource = SystemTimeSource> {
     /// Per-freeze replay recovery state used for post-containment
     /// reconstruction checks before unfreeze.
     projection_recovery_state: std::sync::Mutex<HashMap<String, ProjectionRecoveryState>>,
+    /// Pending externally provided temporal authority envelope.
+    pending_time_authority_envelope: std::sync::Mutex<Option<TimeAuthorityEnvelopeV1>>,
 }
 
 impl DivergenceWatchdog<SystemTimeSource> {
@@ -2309,6 +2361,7 @@ impl DivergenceWatchdog<SystemTimeSource> {
             defect_counter: std::sync::atomic::AtomicU64::new(0),
             time_source: SystemTimeSource,
             projection_recovery_state: std::sync::Mutex::new(HashMap::new()),
+            pending_time_authority_envelope: std::sync::Mutex::new(None),
         }
     }
 
@@ -2327,6 +2380,7 @@ impl DivergenceWatchdog<SystemTimeSource> {
             defect_counter: std::sync::atomic::AtomicU64::new(0),
             time_source: SystemTimeSource,
             projection_recovery_state: std::sync::Mutex::new(HashMap::new()),
+            pending_time_authority_envelope: std::sync::Mutex::new(None),
         }
     }
 }
@@ -2350,6 +2404,7 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             defect_counter: std::sync::atomic::AtomicU64::new(0),
             time_source,
             projection_recovery_state: std::sync::Mutex::new(HashMap::new()),
+            pending_time_authority_envelope: std::sync::Mutex::new(None),
         }
     }
 
@@ -2370,6 +2425,7 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             defect_counter: std::sync::atomic::AtomicU64::new(0),
             time_source,
             projection_recovery_state: std::sync::Mutex::new(HashMap::new()),
+            pending_time_authority_envelope: std::sync::Mutex::new(None),
         }
     }
 
@@ -2416,21 +2472,24 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
     }
 
     fn trusted_authority_bindings(&self) -> Result<Vec<AuthorityKeyBindingV1>, DivergenceError> {
-        if self.config.actor_id.trim().is_empty() {
-            return Err(DivergenceError::MissingField("actor_id"));
-        }
-        if self.config.actor_id.len() > MAX_ACTOR_ID_LENGTH {
-            return Err(DivergenceError::StringTooLong {
-                field: "actor_id",
-                actual: self.config.actor_id.len(),
-                max: MAX_ACTOR_ID_LENGTH,
-            });
-        }
-
-        let bindings = vec![AuthorityKeyBindingV1 {
-            actor_id: self.config.actor_id.clone(),
-            verifying_key: self.signer.public_key_bytes(),
-        }];
+        let bindings = if self.config.trusted_time_authority_bindings.is_empty() {
+            if self.config.actor_id.trim().is_empty() {
+                return Err(DivergenceError::MissingField("actor_id"));
+            }
+            if self.config.actor_id.len() > MAX_ACTOR_ID_LENGTH {
+                return Err(DivergenceError::StringTooLong {
+                    field: "actor_id",
+                    actual: self.config.actor_id.len(),
+                    max: MAX_ACTOR_ID_LENGTH,
+                });
+            }
+            vec![AuthorityKeyBindingV1 {
+                actor_id: self.config.actor_id.clone(),
+                verifying_key: self.signer.public_key_bytes(),
+            }]
+        } else {
+            self.config.trusted_time_authority_bindings.clone()
+        };
 
         if bindings.len() > MAX_TRUSTED_AUTHORITY_BINDINGS {
             return Err(DivergenceError::InvalidConfiguration(format!(
@@ -2440,6 +2499,18 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         }
 
         for binding in &bindings {
+            if binding.actor_id.trim().is_empty() {
+                return Err(DivergenceError::MissingField(
+                    "trusted_time_authority_bindings.actor_id",
+                ));
+            }
+            if binding.actor_id.len() > MAX_ACTOR_ID_LENGTH {
+                return Err(DivergenceError::StringTooLong {
+                    field: "trusted_time_authority_bindings.actor_id",
+                    actual: binding.actor_id.len(),
+                    max: MAX_ACTOR_ID_LENGTH,
+                });
+            }
             parse_verifying_key(&binding.verifying_key)
                 .map_err(|error| DivergenceError::InvalidConfiguration(error.to_string()))?;
         }
@@ -2465,6 +2536,21 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         now_ns: u64,
         trusted_authority_bindings: &[AuthorityKeyBindingV1],
     ) -> Result<VerifiedTemporalAuthority, DivergenceError> {
+        let pending_envelope = self
+            .pending_time_authority_envelope
+            .lock()
+            .map_err(|error| {
+                DivergenceError::InvalidConfiguration(format!("lock poisoned: {error}"))
+            })?
+            .take();
+        if let Some(envelope) = pending_envelope {
+            return Self::verify_temporal_authority_envelope(
+                envelope,
+                trusted_authority_bindings,
+                now_ns,
+            );
+        }
+
         let time_envelope_ref = self.generate_time_envelope_ref();
         let window_ref = self.derive_window_ref(now_ns);
         let ttl_ns = u64::try_from(DEFAULT_TIME_AUTHORITY_TTL.as_nanos()).map_err(|_| {
@@ -2482,6 +2568,31 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             &self.signer,
         )?;
         Self::verify_temporal_authority_envelope(envelope, trusted_authority_bindings, now_ns)
+    }
+
+    /// Provides an externally signed temporal authority envelope for the next
+    /// divergence decision.
+    ///
+    /// The envelope is validated before it is accepted and stored.
+    pub fn provide_time_authority_envelope(
+        &self,
+        envelope: TimeAuthorityEnvelopeV1,
+    ) -> Result<(), DivergenceError> {
+        let trusted_authority_bindings = self.trusted_authority_bindings()?;
+        let now_ns = self.time_source.now_nanos();
+        let _verified = Self::verify_temporal_authority_envelope(
+            envelope.clone(),
+            &trusted_authority_bindings,
+            now_ns,
+        )?;
+        let mut pending = self
+            .pending_time_authority_envelope
+            .lock()
+            .map_err(|error| {
+                DivergenceError::InvalidConfiguration(format!("lock poisoned: {error}"))
+            })?;
+        *pending = Some(envelope);
+        Ok(())
     }
 
     /// Derives HTF window reference hash for compromise decisions.
@@ -2743,6 +2854,8 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
                         required_end_sequence: 0,
                     },
                     time_authority_envelope,
+                    has_durable_provenance: false,
+                    durable_evidence_digest: None,
                 },
             );
         }
@@ -2856,6 +2969,25 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             .clone();
         drop(recovery_state);
 
+        if !state.has_durable_provenance {
+            return Err(DivergenceError::ProjectionRecoveryNotDurable {
+                freeze_id: freeze_id.to_string(),
+            });
+        }
+        match state.durable_evidence_digest {
+            Some(digest) if !is_zero_hash(&digest) => {},
+            Some(_) => {
+                return Err(DivergenceError::ProjectionRecoveryFailed(
+                    "durable evidence digest must be non-zero".to_string(),
+                ));
+            },
+            None => {
+                return Err(DivergenceError::ProjectionRecoveryFailed(
+                    "durable evidence digest missing".to_string(),
+                ));
+            },
+        }
+
         let verified_temporal_authority = Self::verify_temporal_authority_envelope(
             state.time_authority_envelope.clone(),
             &trusted_authority_bindings,
@@ -2887,6 +3019,98 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             state.replay_sequence_bounds,
         )
         .map_err(|error| DivergenceError::ProjectionRecoveryFailed(error.to_string()))
+    }
+
+    /// Registers durable post-compromise replay evidence for a freeze.
+    ///
+    /// This upgrades the recovery state from synthetic/in-memory evidence to
+    /// durable provenance that can satisfy unfreeze gating.
+    pub fn register_durable_recovery_evidence(
+        &self,
+        freeze_id: &str,
+        receipts: Vec<ProjectionReplayReceiptV1>,
+        durable_evidence_digest: Hash,
+        sequence_bounds: ReplaySequenceBoundsV1,
+    ) -> Result<(), DivergenceError> {
+        let active =
+            self.registry.active_freezes.read().map_err(|e| {
+                DivergenceError::InvalidConfiguration(format!("lock poisoned: {e}"))
+            })?;
+        if !active.contains(freeze_id) {
+            return Err(DivergenceError::FreezeNotFound {
+                freeze_id: freeze_id.to_string(),
+            });
+        }
+        drop(active);
+
+        if is_zero_hash(&durable_evidence_digest) {
+            return Err(DivergenceError::ProjectionRecoveryFailed(
+                "durable evidence digest must be non-zero".to_string(),
+            ));
+        }
+
+        let trusted_authority_bindings = self.trusted_authority_bindings()?;
+        let now_ns = self.time_source.now_nanos();
+        let state = {
+            let recovery_state = self.projection_recovery_state.lock().map_err(|e| {
+                DivergenceError::InvalidConfiguration(format!("lock poisoned: {e}"))
+            })?;
+            recovery_state
+                .get(freeze_id)
+                .ok_or_else(|| {
+                    DivergenceError::ProjectionRecoveryFailed(format!(
+                        "missing recovery state for freeze_id={freeze_id}"
+                    ))
+                })?
+                .clone()
+        };
+
+        let verified_temporal_authority = Self::verify_temporal_authority_envelope(
+            state.time_authority_envelope.clone(),
+            &trusted_authority_bindings,
+            now_ns,
+        )?;
+        if verified_temporal_authority.time_authority_ref
+            != state.source_snapshot.time_authority_ref
+            || verified_temporal_authority.time_authority_ref
+                != state.sink_snapshot.time_authority_ref
+        {
+            return Err(DivergenceError::ProjectionRecoveryFailed(
+                "temporal authority reference mismatch in recovery state".to_string(),
+            ));
+        }
+        if verified_temporal_authority.envelope.window_ref != state.source_snapshot.window_ref
+            || verified_temporal_authority.envelope.window_ref != state.sink_snapshot.window_ref
+        {
+            return Err(DivergenceError::ProjectionRecoveryFailed(
+                "temporal window reference mismatch in recovery state".to_string(),
+            ));
+        }
+
+        reconstruct_projection_state(
+            &state.channel_id,
+            &receipts,
+            &state.source_snapshot,
+            &state.sink_snapshot,
+            &trusted_authority_bindings,
+            sequence_bounds,
+        )
+        .map_err(|error| DivergenceError::ProjectionRecoveryFailed(error.to_string()))?;
+
+        let mut recovery_state = self
+            .projection_recovery_state
+            .lock()
+            .map_err(|e| DivergenceError::InvalidConfiguration(format!("lock poisoned: {e}")))?;
+        let entry = recovery_state.get_mut(freeze_id).ok_or_else(|| {
+            DivergenceError::ProjectionRecoveryFailed(format!(
+                "missing recovery state for freeze_id={freeze_id}"
+            ))
+        })?;
+        entry.receipts = receipts;
+        entry.replay_sequence_bounds = sequence_bounds;
+        entry.has_durable_provenance = true;
+        entry.durable_evidence_digest = Some(durable_evidence_digest);
+        Ok(())
     }
 
     /// Creates an unfreeze event for a given freeze ID.
@@ -3052,6 +3276,10 @@ fn current_timestamp_ns() -> u64 {
         .unwrap_or(0)
 }
 
+fn is_zero_hash(hash: &Hash) -> bool {
+    hash.iter().all(|byte| *byte == 0)
+}
+
 /// Validates that a string field does not exceed the maximum length.
 const fn validate_string_length(field: &'static str, value: &str) -> Result<(), DivergenceError> {
     if value.len() > MAX_STRING_LENGTH {
@@ -3083,6 +3311,37 @@ pub mod tests {
         // Use a hydrated registry for tests to bypass fail-closed checks
         let registry = Arc::new(FreezeRegistry::new_hydrated_for_testing());
         DivergenceWatchdog::with_registry(signer, config, registry)
+    }
+
+    fn derive_test_durable_digest(freeze_id: &str, receipts: &[ProjectionReplayReceiptV1]) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.test.projection_durable_evidence_digest.v1");
+        hasher.update(freeze_id.as_bytes());
+        for receipt in receipts {
+            hasher.update(&receipt.canonical_bytes());
+            hasher.update(&receipt.signature);
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    fn register_test_durable_recovery(
+        watchdog: &DivergenceWatchdog,
+        freeze_id: &str,
+        replay_receipt: &ProjectionReplayReceiptV1,
+    ) {
+        let receipts = vec![replay_receipt.clone()];
+        let digest = derive_test_durable_digest(freeze_id, &receipts);
+        watchdog
+            .register_durable_recovery_evidence(
+                freeze_id,
+                receipts,
+                digest,
+                ReplaySequenceBoundsV1 {
+                    required_start_sequence: 0,
+                    required_end_sequence: 0,
+                },
+            )
+            .expect("durable recovery evidence should register");
     }
 
     // =========================================================================
@@ -4255,6 +4514,11 @@ pub mod tests {
             .unwrap()
             .unwrap();
         let freeze = &divergence_result.freeze;
+        register_test_durable_recovery(
+            &watchdog,
+            &freeze.freeze_id,
+            &divergence_result.replay_receipt,
+        );
 
         assert!(watchdog.check_admission().is_err());
 
@@ -4298,6 +4562,31 @@ pub mod tests {
 
         // Should allow admission after applying unfreeze
         assert!(watchdog.check_admission().is_ok());
+    }
+
+    #[test]
+    fn test_unfreeze_fails_without_durable_provenance() {
+        let watchdog = create_test_watchdog();
+        let divergence = watchdog
+            .check_divergence([0x42; 32], [0x99; 32])
+            .expect("divergence check should succeed")
+            .expect("divergence should create freeze");
+
+        let error = watchdog
+            .create_unfreeze(
+                &divergence.freeze.freeze_id,
+                ResolutionType::Adjudication,
+                Some("adj-001"),
+            )
+            .expect_err("unfreeze should fail without durable provenance");
+        assert!(
+            matches!(
+                error,
+                DivergenceError::ProjectionRecoveryNotDurable { ref freeze_id }
+                if freeze_id == &divergence.freeze.freeze_id
+            ),
+            "expected ProjectionRecoveryNotDurable, got {error:?}"
+        );
     }
 
     #[test]
@@ -4530,6 +4819,11 @@ pub mod tests {
             .unwrap()
             .unwrap();
         let freeze = &divergence_result.freeze;
+        register_test_durable_recovery(
+            &watchdog,
+            &freeze.freeze_id,
+            &divergence_result.replay_receipt,
+        );
 
         // 3. Admission is now blocked
         let err = watchdog.check_admission().unwrap_err();
@@ -4676,6 +4970,72 @@ pub mod tests {
             .replay_receipt
             .verify_signature(&trusted_authority_bindings)
             .expect("replay receipt must verify");
+    }
+
+    #[test]
+    fn test_temporal_authority_rejects_self_issued_when_external_configured() {
+        let watchdog_signer = Signer::generate();
+        let external_signer = Signer::generate();
+        let config = create_test_config()
+            .with_trusted_time_authority_bindings(vec![AuthorityKeyBindingV1 {
+                actor_id: "external-time-authority".to_string(),
+                verifying_key: external_signer.public_key_bytes(),
+            }])
+            .expect("external authority bindings should be valid");
+        let registry = Arc::new(FreezeRegistry::new_hydrated_for_testing());
+        let watchdog = DivergenceWatchdog::with_registry(watchdog_signer, config, registry);
+
+        let error = watchdog
+            .check_divergence([0x42; 32], [0x99; 32])
+            .expect_err("self-issued temporal authority must be rejected");
+        assert!(
+            matches!(error, DivergenceError::InvalidTemporalAuthority(ref message) if message.contains("unknown time authority actor")),
+            "expected InvalidTemporalAuthority unknown actor, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_temporal_authority_accepts_external_envelope() {
+        let watchdog_signer = Signer::generate();
+        let external_signer = Signer::generate();
+        let external_actor_id = "external-time-authority";
+        let config = create_test_config()
+            .with_trusted_time_authority_bindings(vec![AuthorityKeyBindingV1 {
+                actor_id: external_actor_id.to_string(),
+                verifying_key: external_signer.public_key_bytes(),
+            }])
+            .expect("external authority bindings should be valid");
+        let registry = Arc::new(FreezeRegistry::new_hydrated_for_testing());
+        let watchdog = DivergenceWatchdog::with_registry(watchdog_signer, config, registry);
+
+        let issued_at_ns = current_timestamp_ns();
+        let ttl_ns =
+            u64::try_from(DEFAULT_TIME_AUTHORITY_TTL.as_nanos()).expect("ttl must fit in u64");
+        let expires_at_ns = issued_at_ns
+            .checked_add(ttl_ns)
+            .expect("time authority expiry should not overflow");
+        let envelope = TimeAuthorityEnvelopeV1::create_signed(
+            "htf:tick:external-1",
+            watchdog.derive_window_ref(issued_at_ns),
+            issued_at_ns,
+            expires_at_ns,
+            external_actor_id,
+            &external_signer,
+        )
+        .expect("external envelope should be signable");
+        let expected_time_authority_ref = envelope.derive_time_authority_ref();
+        watchdog
+            .provide_time_authority_envelope(envelope)
+            .expect("external envelope should be accepted");
+
+        let divergence = watchdog
+            .check_divergence([0x12; 32], [0x34; 32])
+            .expect("divergence check should succeed")
+            .expect("divergence should create freeze");
+        assert_eq!(
+            divergence.source_trust_snapshot.time_authority_ref,
+            expected_time_authority_ref
+        );
     }
 
     #[test]
