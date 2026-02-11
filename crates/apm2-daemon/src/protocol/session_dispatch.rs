@@ -2277,6 +2277,98 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         })
     }
 
+    fn push_shell_command_segment<'a>(
+        command: &'a str,
+        start: usize,
+        end: usize,
+        segments: &mut Vec<&'a str>,
+    ) {
+        let segment = command[start..end].trim();
+        if !segment.is_empty() {
+            segments.push(segment);
+        }
+    }
+
+    fn split_shell_command_segments(command: &str) -> Vec<&str> {
+        let mut segments = Vec::new();
+        let bytes = command.as_bytes();
+        let mut segment_start = 0usize;
+        let mut idx = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+
+        while idx < bytes.len() {
+            let byte = bytes[idx];
+
+            if in_single_quote {
+                if byte == b'\'' {
+                    in_single_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if byte == b'\\' {
+                    idx = idx.saturating_add(2).min(bytes.len());
+                    continue;
+                }
+                if byte == b'"' {
+                    in_double_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            match byte {
+                b'\'' => {
+                    in_single_quote = true;
+                    idx += 1;
+                },
+                b'"' => {
+                    in_double_quote = true;
+                    idx += 1;
+                },
+                b'\\' => {
+                    idx = idx.saturating_add(2).min(bytes.len());
+                },
+                b';' | b'\n' => {
+                    Self::push_shell_command_segment(command, segment_start, idx, &mut segments);
+                    idx += 1;
+                    segment_start = idx;
+                },
+                b'\r' => {
+                    Self::push_shell_command_segment(command, segment_start, idx, &mut segments);
+                    idx += 1;
+                    if bytes.get(idx) == Some(&b'\n') {
+                        idx += 1;
+                    }
+                    segment_start = idx;
+                },
+                b'&' if bytes.get(idx + 1) == Some(&b'&') => {
+                    Self::push_shell_command_segment(command, segment_start, idx, &mut segments);
+                    idx += 2;
+                    segment_start = idx;
+                },
+                b'|' => {
+                    Self::push_shell_command_segment(command, segment_start, idx, &mut segments);
+                    if bytes.get(idx + 1) == Some(&b'|') {
+                        idx += 2;
+                    } else {
+                        idx += 1;
+                    }
+                    segment_start = idx;
+                },
+                _ => {
+                    idx += 1;
+                },
+            }
+        }
+
+        Self::push_shell_command_segment(command, segment_start, command.len(), &mut segments);
+        segments
+    }
+
     fn command_primary_executable_from_tokens(
         tokens: &[&str],
         start_idx: usize,
@@ -2591,6 +2683,27 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             return false;
         }
 
+        let command = Self::normalize_shell_token(command.trim());
+        if command.is_empty() {
+            return false;
+        }
+
+        let segments = Self::split_shell_command_segments(command);
+        if segments.len() > 1 {
+            if segments
+                .into_iter()
+                .any(|segment| Self::command_invokes_gh_cli_inner(segment, depth))
+            {
+                return true;
+            }
+
+            // Some shell indirection patterns (e.g., variable assignment in one
+            // segment and invocation in another) require full-command context.
+            return Self::command_substitution_contains_gh_reference(command, depth)
+                || Self::command_invokes_gh_cli_via_shell_variable(command);
+        }
+
+        let command = segments.first().copied().unwrap_or(command);
         let tokens: Vec<&str> = command.split_whitespace().collect();
         let Some((exec, exec_idx)) = Self::command_primary_executable_from_tokens(&tokens, 0)
         else {
@@ -2669,11 +2782,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     }
 
     fn command_targets_github_api(command: &str) -> bool {
-        let lower = command.to_ascii_lowercase();
-        lower.contains("api.github.com")
-            || command
-                .split_whitespace()
-                .any(Self::argument_targets_github_api)
+        let command = Self::normalize_shell_token(command.trim());
+        if command.is_empty() {
+            return false;
+        }
+
+        Self::split_shell_command_segments(command)
+            .into_iter()
+            .any(|segment| {
+                let lower = segment.to_ascii_lowercase();
+                lower.contains("api.github.com")
+                    || segment
+                        .split_whitespace()
+                        .any(Self::argument_targets_github_api)
+            })
     }
 
     // SECURITY (RFC-0028 REQ-0008): command-text inspection is a heuristic,
@@ -6855,6 +6977,56 @@ mod tests {
                 "cmd=gh; $cmd api /repos",
                 "projection-isolation-var-gh",
                 "gh_cli",
+            );
+        }
+
+        #[test]
+        fn chained_and_operator_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "true && gh api /repos/owner/repo",
+                "projection-isolation-chain-and-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn chained_semicolon_operator_gh_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "echo ok; gh pr view 123",
+                "projection-isolation-chain-semicolon-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn chained_semicolon_without_space_gh_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "echo;gh api /repos",
+                "projection-isolation-chain-semicolon-nospace-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn nested_bash_c_chained_gh_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "bash -c \"true && gh api /repos\"",
+                "projection-isolation-nested-bash-c-chain-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn quoted_gh_string_echo_argument_is_not_detected_as_direct_attempt() {
+            let args = serde_json::json!({ "command": "echo \"gh api /repos\"" });
+            let attempt =
+                SessionDispatcher::<InMemoryManifestStore>::detect_direct_github_runtime_attempt(
+                    ToolClass::Execute,
+                    Some(&args),
+                );
+            assert!(
+                attempt.is_none(),
+                "quoted gh string passed to echo must not be flagged as gh-cli invocation"
             );
         }
 
