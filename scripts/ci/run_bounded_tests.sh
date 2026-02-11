@@ -40,7 +40,7 @@ Usage:
 Options:
   --timeout-seconds N         Hard wall timeout (default/max: 240)
   --kill-after-seconds N      SIGTERM -> SIGKILL escalation delay (default: 20)
-  --heartbeat-seconds N       Heartbeat interval while command runs (default: 30)
+  --heartbeat-seconds N       Heartbeat interval while command runs (default: 10)
   --memory-max VALUE          systemd MemoryMax (default: 24G)
   --pids-max N                systemd TasksMax (default: 1536)
   --cpu-quota VALUE           systemd CPUQuota (default: 200%)
@@ -59,7 +59,7 @@ TEST_TIMEOUT_SLA_MESSAGE="p100 SLA for tests is 4 minutes, p99 is 180s, p50 is 8
 
 TIMEOUT_SECONDS=240
 KILL_AFTER_SECONDS=20
-HEARTBEAT_SECONDS=30
+HEARTBEAT_SECONDS=10
 MEMORY_MAX='24G'
 PIDS_MAX=1536
 CPU_QUOTA='200%'
@@ -225,6 +225,7 @@ format_bytes_best_effort() {
 
 emit_heartbeat() {
     local elapsed_secs="$1"
+    local tick="$2"
     local active_state="unknown"
     local sub_state="unknown"
     local memory_current="unknown"
@@ -250,7 +251,7 @@ emit_heartbeat() {
     local memory_display
     memory_display="$(format_bytes_best_effort "${memory_current}")"
 
-    log_info "HEARTBEAT unit=${UNIT} elapsed=${elapsed_secs}s state=${active_state}/${sub_state} tasks=${tasks_current} memory_current=${memory_display} memory_max=${MEMORY_MAX}"
+    log_info "HEARTBEAT unit=${UNIT} tick=${tick} elapsed=${elapsed_secs}s state=${active_state}/${sub_state} tasks=${tasks_current} memory_current=${memory_display} memory_max=${MEMORY_MAX}"
 }
 
 # Preserve selected caller environment in the transient unit.
@@ -294,15 +295,19 @@ systemd-run \
     "${COMMAND[@]}" &
 runner_pid=$!
 start_epoch="$(date +%s)"
+next_heartbeat_epoch="$((start_epoch + HEARTBEAT_SECONDS))"
 
 while kill -0 "${runner_pid}" 2>/dev/null; do
-    sleep "${HEARTBEAT_SECONDS}"
-    if ! kill -0 "${runner_pid}" 2>/dev/null; then
-        break
-    fi
     now_epoch="$(date +%s)"
-    elapsed="$((now_epoch - start_epoch))"
-    emit_heartbeat "${elapsed}"
+    if (( now_epoch >= next_heartbeat_epoch )); then
+        elapsed="$((now_epoch - start_epoch))"
+        tick="$((elapsed / HEARTBEAT_SECONDS))"
+        emit_heartbeat "${elapsed}" "${tick}"
+        while (( next_heartbeat_epoch <= now_epoch )); do
+            next_heartbeat_epoch="$((next_heartbeat_epoch + HEARTBEAT_SECONDS))"
+        done
+    fi
+    sleep 1
 done
 
 if wait "${runner_pid}"; then

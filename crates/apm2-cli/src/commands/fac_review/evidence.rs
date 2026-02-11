@@ -7,6 +7,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use apm2_daemon::telemetry::is_cgroup_v2_available;
 use sha2::{Digest, Sha256};
 
 use super::ci_status::{CiStatus, ThrottledUpdater};
@@ -39,9 +40,16 @@ pub struct EvidenceGateResult {
 }
 
 const SHORT_TEST_OUTPUT_HINT_THRESHOLD_BYTES: usize = 1024;
-const GATE_HEARTBEAT_INTERVAL_SECS: u64 = 30;
+// Observability-only monotonic pulse cadence (not HTF authority time).
+const MONOTONIC_HEARTBEAT_TICK_SECS: u64 = 10;
+const GATE_WAIT_POLL_MILLIS: u64 = 250;
 const TEST_TIMEOUT_SLA_MESSAGE: &str = "p100 SLA for tests is 4 minutes, p99 is 180s, p50 is 80s. If tests are taking longer that is a bug. Never increase this timeout. Investigate why tests that you added have increased the test time.";
 const MERGE_CONFLICT_GATE_NAME: &str = "merge_conflict_main";
+const DEFAULT_TEST_TIMEOUT_SECONDS: u64 = 240;
+const DEFAULT_TEST_MEMORY_MAX: &str = "24G";
+const DEFAULT_TEST_PIDS_MAX: u64 = 1536;
+const DEFAULT_TEST_CPU_QUOTA: &str = "200%";
+const DEFAULT_TEST_KILL_AFTER_SECONDS: u64 = 20;
 
 struct GateCommandOutput {
     status: ExitStatus,
@@ -119,25 +127,31 @@ fn run_gate_command_with_heartbeat(
     });
 
     let started = Instant::now();
-    let mut last_heartbeat = Instant::now();
-    let heartbeat_interval = Duration::from_secs(GATE_HEARTBEAT_INTERVAL_SECS);
+    let heartbeat_interval = Duration::from_secs(MONOTONIC_HEARTBEAT_TICK_SECS);
+    let mut next_heartbeat = heartbeat_interval;
 
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
 
-        if last_heartbeat.elapsed() >= heartbeat_interval {
+        let elapsed = started.elapsed();
+        if elapsed >= next_heartbeat {
+            let elapsed_secs = elapsed.as_secs();
             eprintln!(
-                "ts={} gate={} status=RUNNING elapsed_secs={}",
+                "ts={} gate={} status=RUNNING tick={} elapsed_secs={}",
                 now_iso8601(),
                 gate_name,
-                started.elapsed().as_secs()
+                elapsed_secs / MONOTONIC_HEARTBEAT_TICK_SECS,
+                elapsed_secs,
             );
-            last_heartbeat = Instant::now();
+            // Keep heartbeat ticks aligned to fixed wall intervals.
+            while elapsed >= next_heartbeat {
+                next_heartbeat += heartbeat_interval;
+            }
         }
 
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(GATE_WAIT_POLL_MILLIS));
     };
 
     let stdout = stdout_reader.join().unwrap_or_default();
@@ -363,6 +377,50 @@ fn verify_workspace_integrity_gate(
         log_path.display()
     );
     (passed, line)
+}
+
+fn build_pipeline_test_command(workspace_root: &Path) -> (Vec<String>, bool) {
+    let bounded_script = workspace_root.join("scripts/ci/run_bounded_tests.sh");
+    let bounded_runner = bounded_script.is_file() && is_cgroup_v2_available();
+    if bounded_runner {
+        return (
+            vec![
+                bounded_script.display().to_string(),
+                "--timeout-seconds".to_string(),
+                DEFAULT_TEST_TIMEOUT_SECONDS.to_string(),
+                "--kill-after-seconds".to_string(),
+                DEFAULT_TEST_KILL_AFTER_SECONDS.to_string(),
+                "--heartbeat-seconds".to_string(),
+                MONOTONIC_HEARTBEAT_TICK_SECS.to_string(),
+                "--memory-max".to_string(),
+                DEFAULT_TEST_MEMORY_MAX.to_string(),
+                "--pids-max".to_string(),
+                DEFAULT_TEST_PIDS_MAX.to_string(),
+                "--cpu-quota".to_string(),
+                DEFAULT_TEST_CPU_QUOTA.to_string(),
+                "--".to_string(),
+                "cargo".to_string(),
+                "nextest".to_string(),
+                "run".to_string(),
+                "--workspace".to_string(),
+                "--all-features".to_string(),
+                "--config-file".to_string(),
+                ".config/nextest.toml".to_string(),
+                "--profile".to_string(),
+                "ci".to_string(),
+            ],
+            true,
+        );
+    }
+
+    (
+        vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "--workspace".to_string(),
+        ],
+        false,
+    )
 }
 
 /// Run evidence gates (cargo fmt check, clippy, doc, test, CI scripts).
@@ -634,7 +692,15 @@ pub fn run_evidence_gates_with_status(
     // Load attested gate cache for this SHA (typically populated by `fac gates`).
     let cache = GateCache::load(sha);
     let mut gate_cache = GateCache::new(sha);
-    let policy = GateResourcePolicy::pipeline_default();
+    let (pipeline_test_command, bounded_runner) = build_pipeline_test_command(workspace_root);
+    let policy = GateResourcePolicy::from_cli(
+        false,
+        DEFAULT_TEST_TIMEOUT_SECONDS,
+        DEFAULT_TEST_MEMORY_MAX,
+        DEFAULT_TEST_PIDS_MAX,
+        DEFAULT_TEST_CPU_QUOTA,
+        bounded_runner,
+    );
 
     let gates: &[(&str, &[&str])] = &[
         ("rustfmt", &["cargo", "fmt", "--all", "--check"]),
@@ -893,8 +959,13 @@ pub fn run_evidence_gates_with_status(
 
     {
         let gate_name = "test";
-        let attestation_digest =
-            gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
+        let attestation_digest = gate_attestation_digest(
+            workspace_root,
+            sha,
+            gate_name,
+            Some(pipeline_test_command.as_slice()),
+            &policy,
+        );
         let reuse =
             reuse_decision_for_gate(cache.as_ref(), gate_name, attestation_digest.as_deref());
         if reuse.reusable {
@@ -943,12 +1014,15 @@ pub fn run_evidence_gates_with_status(
 
             let log_path = evidence_dir.join("test.log");
             let started = Instant::now();
+            let (test_cmd, test_args) = pipeline_test_command
+                .split_first()
+                .ok_or_else(|| "pipeline test command is empty".to_string())?;
             let passed = run_single_evidence_gate(
                 workspace_root,
                 sha,
                 gate_name,
-                "cargo",
-                &["test", "--workspace"],
+                test_cmd,
+                &test_args.iter().map(String::as_str).collect::<Vec<_>>(),
                 &log_path,
             );
             let duration = started.elapsed().as_secs();

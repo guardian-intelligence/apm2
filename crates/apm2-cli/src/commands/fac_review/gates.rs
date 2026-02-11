@@ -21,6 +21,7 @@ use super::types::apm2_home_dir;
 use crate::exit_codes::codes as exit_codes;
 
 const MAX_BOUNDED_TEST_TIMEOUT_SECONDS: u64 = 240;
+const HTF_TEST_HEARTBEAT_SECONDS: u64 = 10;
 const TEST_TIMEOUT_SLA_MESSAGE: &str = "p100 SLA for tests is 4 minutes, p99 is 180s, p50 is 80s. If tests are taking longer that is a bug. Never increase this timeout. Investigate why tests that you added have increased the test time.";
 
 /// Run all evidence gates locally with optional bounded test execution.
@@ -344,6 +345,8 @@ fn build_bounded_test_command(
         timeout_seconds.to_string(),
         "--kill-after-seconds".to_string(),
         "20".to_string(),
+        "--heartbeat-seconds".to_string(),
+        HTF_TEST_HEARTBEAT_SECONDS.to_string(),
         "--memory-max".to_string(),
         memory_max.to_string(),
         "--pids-max".to_string(),

@@ -28,18 +28,6 @@ pub struct GateResourcePolicy {
 
 impl GateResourcePolicy {
     #[must_use]
-    pub const fn pipeline_default() -> Self {
-        Self {
-            quick_mode: false,
-            timeout_seconds: None,
-            memory_max: None,
-            pids_max: None,
-            cpu_quota: None,
-            bounded_runner: false,
-        }
-    }
-
-    #[must_use]
     pub fn from_cli(
         quick_mode: bool,
         timeout_seconds: u64,
@@ -381,7 +369,7 @@ mod tests {
         let workspace_root = std::env::current_dir().expect("cwd");
         let command =
             gate_command_for_attestation(&workspace_root, "rustfmt", None).expect("command");
-        let policy = GateResourcePolicy::pipeline_default();
+        let policy = GateResourcePolicy::from_cli(false, 240, "24G", 1536, "200%", true);
 
         let one = compute_gate_attestation(
             &workspace_root,
