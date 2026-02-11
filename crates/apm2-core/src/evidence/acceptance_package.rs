@@ -212,8 +212,13 @@ impl AcceptancePackageV1 {
     ///
     /// The package ID excludes both `package_id` and `issuer_signature`.
     ///
-    /// Uses explicit length-prefixed framing to ensure canonicalization stability
-    /// independent of JSON serialization details (whitespace, field order).
+    /// Uses explicit length-prefixed framing to ensure canonicalization
+    /// stability independent of JSON serialization details (whitespace,
+    /// field order).
+    ///
+    /// # Errors
+    ///
+    /// Returns `AcceptancePackageError` if canonical content hashing fails.
     pub fn compute_package_id(&self) -> Result<Hash, AcceptancePackageError> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"apm2.acceptance_package.package_id.v2");
@@ -225,6 +230,10 @@ impl AcceptancePackageV1 {
     ///
     /// `issuer_signature` is intentionally excluded.
     /// Uses explicit length-prefixed framing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AcceptancePackageError` if signing payload construction fails.
     pub fn signing_payload_bytes(&self) -> Result<Vec<u8>, AcceptancePackageError> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"apm2.acceptance_package.signing_payload.v2");
@@ -239,7 +248,7 @@ impl AcceptancePackageV1 {
         hasher.update(&self.version.to_le_bytes());
         hasher.update(&self.subject_effect_id);
         hasher.update(&self.receipt_set_digest);
-        
+
         // Receipt pointers are already summarized in receipt_set_digest,
         // but we include the count for explicit structural binding.
         let count = u64::try_from(self.receipt_pointers.len()).unwrap_or(u64::MAX);
@@ -1490,7 +1499,7 @@ mod tests {
         package.sign_with(&deterministic_signer()).unwrap();
 
         let id1 = package.compute_package_id().unwrap();
-        
+
         // Mutate a field that shouldn't affect ID (signature)
         package.issuer_signature = vec![0x00; 64];
         let id2 = package.compute_package_id().unwrap();

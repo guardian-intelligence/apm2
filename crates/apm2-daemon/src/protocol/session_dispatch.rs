@@ -3712,10 +3712,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
         // Internal structural reverification: enforcing trust-anchor binding using
         // the daemon's own key (since we just signed it).
-        let trusted_issuers = TrustedIssuerSet::from_keys(&[self
-            .channel_context_signer
-            .verifying_key()
-            .to_bytes()]);
+        let trusted_issuers =
+            TrustedIssuerSet::from_keys(&[self.channel_context_signer.verifying_key().to_bytes()]);
 
         let cas_result = verify_acceptance_package(&package, &cas_provider, Some(&trusted_issuers));
         if !cas_result.verified {
