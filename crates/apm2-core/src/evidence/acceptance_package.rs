@@ -16,6 +16,13 @@ use crate::crypto::{
 
 const ACCEPTANCE_PACKAGE_VERSION: u32 = 1;
 const ZERO_HASH: Hash = [0u8; 32];
+/// Maximum receipt pointers in a single package. The 6 `ReceiptType` variants
+/// are the practical maximum; 32 provides generous forward-compatibility
+/// headroom.
+const MAX_RECEIPT_POINTERS: usize = 32;
+/// Maximum issuer signature bytes. Ed25519 signatures are exactly 64 bytes;
+/// 128 provides headroom for future signature schemes.
+const MAX_SIGNATURE_BYTES: usize = 128;
 
 /// Portable acceptance evidence package containing all receipt pointers
 /// and verification metadata needed for deterministic third-party
@@ -32,6 +39,7 @@ pub struct AcceptancePackageV1 {
     /// Digest of the complete receipt set.
     pub receipt_set_digest: Hash,
     /// Individual receipt pointers with their verification metadata.
+    #[serde(deserialize_with = "deserialize_bounded_receipt_pointers")]
     pub receipt_pointers: Vec<ReceiptPointer>,
     /// Policy snapshot hash that was active when the decision was made.
     pub policy_snapshot_hash: Hash,
@@ -40,6 +48,7 @@ pub struct AcceptancePackageV1 {
     /// The admission verdict this evidence supports.
     pub verdict: AdmissionVerdict,
     /// Signature over canonical package bytes by the issuing authority.
+    #[serde(deserialize_with = "deserialize_bounded_signature")]
     pub issuer_signature: Vec<u8>,
     /// Verifying key of the issuer (for portable verification).
     pub issuer_verifying_key: [u8; 32],
@@ -284,6 +293,38 @@ fn hash_optional_string(hasher: &mut blake3::Hasher, value: Option<&str>) {
             hasher.update(&[0]);
         },
     }
+}
+
+fn deserialize_bounded_receipt_pointers<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ReceiptPointer>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let pointers: Vec<ReceiptPointer> = Vec::deserialize(deserializer)?;
+    if pointers.len() > MAX_RECEIPT_POINTERS {
+        return Err(serde::de::Error::custom(format!(
+            "receipt_pointers count {} exceeds maximum of {}",
+            pointers.len(),
+            MAX_RECEIPT_POINTERS
+        )));
+    }
+    Ok(pointers)
+}
+
+fn deserialize_bounded_signature<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let bytes: Vec<u8> = Vec::deserialize(deserializer)?;
+    if bytes.len() > MAX_SIGNATURE_BYTES {
+        return Err(serde::de::Error::custom(format!(
+            "issuer_signature length {} exceeds maximum of {}",
+            bytes.len(),
+            MAX_SIGNATURE_BYTES
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Verification result from deterministic reverification.
@@ -1218,6 +1259,52 @@ mod tests {
         );
 
         let _ = fs::remove_file(&fixture_path);
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_receipt_pointers() {
+        let (mut package, _fixtures) = build_fixture_package();
+        let original_pointer = package.receipt_pointers[0].clone();
+        package.receipt_pointers.clear();
+        for i in 0..=MAX_RECEIPT_POINTERS {
+            let mut p = original_pointer.clone();
+            let index_bytes = u16::try_from(i)
+                .expect("test receipt pointer index should fit into u16")
+                .to_le_bytes();
+            p.receipt_digest[0] = index_bytes[0];
+            p.receipt_digest[1] = index_bytes[1];
+            package.receipt_pointers.push(p);
+        }
+        let serialized = serde_json::to_vec(&package)
+            .expect("serialization of oversized package should succeed");
+        let result: Result<AcceptancePackageV1, _> = serde_json::from_slice(&serialized);
+        assert!(
+            result.is_err(),
+            "deserialization must reject oversized receipt_pointers"
+        );
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("exceeds maximum"),
+            "error must mention exceeds maximum, got: {error_msg}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_signature() {
+        let (mut package, _fixtures) = build_fixture_package();
+        package.issuer_signature = vec![0xAA; MAX_SIGNATURE_BYTES + 1];
+        let serialized = serde_json::to_vec(&package)
+            .expect("serialization of oversized signature should succeed");
+        let result: Result<AcceptancePackageV1, _> = serde_json::from_slice(&serialized);
+        assert!(
+            result.is_err(),
+            "deserialization must reject oversized issuer_signature"
+        );
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("exceeds maximum"),
+            "error must mention exceeds maximum, got: {error_msg}"
+        );
     }
 
     fn unique_fixture_path() -> PathBuf {
