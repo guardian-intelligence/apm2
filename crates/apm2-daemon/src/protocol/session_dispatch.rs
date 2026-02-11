@@ -59,6 +59,7 @@
 //! └─────────────────┘     └─────────────────┘
 //! ```
 
+use std::env;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -422,6 +423,80 @@ pub const MAX_TOOL_ID_LEN: usize = 128;
 /// details, or configuration. Messages are truncated and potentially sensitive
 /// patterns are redacted before returning to clients.
 const MAX_ERROR_MESSAGE_LEN: usize = 256;
+
+/// Primary environment variable for GH-DIRECT stage policy selection.
+const GH_DIRECT_STAGE_ENV_PRIMARY: &str = "APM2_GH_DIRECT_STAGE";
+/// Secondary environment variable for GH-DIRECT stage policy selection.
+const GH_DIRECT_STAGE_ENV_SECONDARY: &str = "GH_DIRECT_STAGE";
+/// Optional freshness timestamp (`ns since unix epoch`) for GH-DIRECT state.
+const GH_DIRECT_STAGE_REFRESHED_AT_ENV_PRIMARY: &str = "APM2_GH_DIRECT_STAGE_REFRESHED_AT_NS";
+/// Secondary freshness timestamp (`ns since unix epoch`) for GH-DIRECT state.
+const GH_DIRECT_STAGE_REFRESHED_AT_ENV_SECONDARY: &str = "GH_DIRECT_STAGE_REFRESHED_AT_NS";
+/// Runtime environment selector (production vs non-production).
+const RUNTIME_ENV_PRIMARY: &str = "APM2_RUNTIME_ENV";
+/// Secondary runtime environment selector (production vs non-production).
+const RUNTIME_ENV_SECONDARY: &str = "APM2_ENV";
+/// Break-glass flag for `GH-DIRECT-STAGE-1` production override.
+const GH_DIRECT_BREAK_GLASS_ENV_PRIMARY: &str = "APM2_GH_DIRECT_BREAK_GLASS";
+/// Secondary break-glass flag for `GH-DIRECT-STAGE-1` production override.
+const GH_DIRECT_BREAK_GLASS_ENV_SECONDARY: &str = "GH_DIRECT_BREAK_GLASS";
+/// Maximum accepted age for stage-state freshness evidence (24h).
+const GH_DIRECT_STAGE_MAX_AGE_NS: u64 = 86_400_000_000_000;
+/// Maximum detail length persisted in deny diagnostics.
+const MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhDirectStage {
+    Stage0,
+    Stage1,
+    Stage2,
+}
+
+impl GhDirectStage {
+    #[must_use]
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::Stage0 => "GH-DIRECT-STAGE-0",
+            Self::Stage1 => "GH-DIRECT-STAGE-1",
+            Self::Stage2 => "GH-DIRECT-STAGE-2",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhDirectStageResolution {
+    Explicit,
+    MissingFailClosed,
+    UnknownFailClosed,
+    AmbiguousFailClosed,
+    StaleFailClosed,
+}
+
+impl GhDirectStageResolution {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::MissingFailClosed => "missing_fail_closed",
+            Self::UnknownFailClosed => "unknown_fail_closed",
+            Self::AmbiguousFailClosed => "ambiguous_fail_closed",
+            Self::StaleFailClosed => "stale_fail_closed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GhDirectStageEvaluation {
+    stage: GhDirectStage,
+    resolution: GhDirectStageResolution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectGithubActuationAttempt {
+    class: &'static str,
+    vector: &'static str,
+    detail: String,
+}
 
 /// Sanitizes an error message for safe return over the protocol.
 ///
@@ -1950,6 +2025,419 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         Ok(tick)
     }
 
+    fn parse_gh_direct_stage(value: &str) -> Option<GhDirectStage> {
+        let normalized = value
+            .trim()
+            .to_ascii_uppercase()
+            .replace('_', "-")
+            .replace(' ', "");
+        match normalized.as_str() {
+            "GH-DIRECT-STAGE-0" | "STAGE0" | "0" => Some(GhDirectStage::Stage0),
+            "GH-DIRECT-STAGE-1" | "STAGE1" | "1" => Some(GhDirectStage::Stage1),
+            "GH-DIRECT-STAGE-2" | "STAGE2" | "2" => Some(GhDirectStage::Stage2),
+            _ => None,
+        }
+    }
+
+    fn evaluate_gh_direct_stage_inputs(
+        primary: Option<&str>,
+        secondary: Option<&str>,
+        refreshed_at_ns: Option<u64>,
+        now_ns: u64,
+    ) -> GhDirectStageEvaluation {
+        let primary_parsed = primary.and_then(Self::parse_gh_direct_stage);
+        let secondary_parsed = secondary.and_then(Self::parse_gh_direct_stage);
+
+        if primary.is_none() && secondary.is_none() {
+            return GhDirectStageEvaluation {
+                stage: GhDirectStage::Stage2,
+                resolution: GhDirectStageResolution::MissingFailClosed,
+            };
+        }
+
+        if (primary.is_some() && primary_parsed.is_none())
+            || (secondary.is_some() && secondary_parsed.is_none())
+        {
+            return GhDirectStageEvaluation {
+                stage: GhDirectStage::Stage2,
+                resolution: GhDirectStageResolution::UnknownFailClosed,
+            };
+        }
+
+        if let (Some(left), Some(right)) = (primary_parsed, secondary_parsed) {
+            if left != right {
+                return GhDirectStageEvaluation {
+                    stage: GhDirectStage::Stage2,
+                    resolution: GhDirectStageResolution::AmbiguousFailClosed,
+                };
+            }
+        }
+
+        let resolved_stage = primary_parsed
+            .or(secondary_parsed)
+            .unwrap_or(GhDirectStage::Stage2);
+
+        if let Some(refreshed_ns) = refreshed_at_ns {
+            let age_is_stale = now_ns
+                .checked_sub(refreshed_ns)
+                .is_none_or(|age_ns| age_ns > GH_DIRECT_STAGE_MAX_AGE_NS);
+            let stale = refreshed_ns > now_ns || age_is_stale;
+            if stale {
+                return GhDirectStageEvaluation {
+                    stage: GhDirectStage::Stage2,
+                    resolution: GhDirectStageResolution::StaleFailClosed,
+                };
+            }
+        }
+
+        GhDirectStageEvaluation {
+            stage: resolved_stage,
+            resolution: GhDirectStageResolution::Explicit,
+        }
+    }
+
+    fn read_optional_u64_env(primary_key: &str, secondary_key: &str) -> Result<Option<u64>, ()> {
+        let primary = env::var(primary_key).ok();
+        let secondary = env::var(secondary_key).ok();
+
+        match (primary, secondary) {
+            (None, None) => Ok(None),
+            (Some(raw), None) | (None, Some(raw)) => {
+                raw.trim().parse::<u64>().map(Some).map_err(|_| ())
+            },
+            (Some(left), Some(right)) => {
+                let left_parsed = left.trim().parse::<u64>().map_err(|_| ())?;
+                let right_parsed = right.trim().parse::<u64>().map_err(|_| ())?;
+                if left_parsed == right_parsed {
+                    Ok(Some(left_parsed))
+                } else {
+                    Err(())
+                }
+            },
+        }
+    }
+
+    fn evaluate_gh_direct_stage_state() -> GhDirectStageEvaluation {
+        let primary = env::var(GH_DIRECT_STAGE_ENV_PRIMARY).ok();
+        let secondary = env::var(GH_DIRECT_STAGE_ENV_SECONDARY).ok();
+        let now_ns = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |duration| {
+                duration.as_nanos().try_into().unwrap_or(u64::MAX)
+            });
+
+        let Ok(refreshed_at_ns) = Self::read_optional_u64_env(
+            GH_DIRECT_STAGE_REFRESHED_AT_ENV_PRIMARY,
+            GH_DIRECT_STAGE_REFRESHED_AT_ENV_SECONDARY,
+        ) else {
+            return GhDirectStageEvaluation {
+                stage: GhDirectStage::Stage2,
+                resolution: GhDirectStageResolution::AmbiguousFailClosed,
+            };
+        };
+
+        Self::evaluate_gh_direct_stage_inputs(
+            primary.as_deref(),
+            secondary.as_deref(),
+            refreshed_at_ns,
+            now_ns,
+        )
+    }
+
+    fn parse_runtime_production_mode(value: &str) -> Option<bool> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "prod" | "production" => Some(true),
+            "dev" | "development" | "test" | "local" | "staging" | "nonprod" | "non-production" => {
+                Some(false)
+            },
+            _ => None,
+        }
+    }
+
+    fn is_production_runtime_mode() -> bool {
+        let primary = env::var(RUNTIME_ENV_PRIMARY).ok();
+        let secondary = env::var(RUNTIME_ENV_SECONDARY).ok();
+
+        let primary_mode = primary
+            .as_deref()
+            .and_then(Self::parse_runtime_production_mode);
+        let secondary_mode = secondary
+            .as_deref()
+            .and_then(Self::parse_runtime_production_mode);
+
+        match (primary_mode, secondary_mode, primary, secondary) {
+            (Some(mode), None, _, None) | (None, Some(mode), None, _) => mode,
+            (Some(left), Some(right), _, _) if left == right => left,
+            // Unknown or ambiguous runtime environment is authoritative state
+            // ambiguity and must fail closed to production behavior.
+            _ => true,
+        }
+    }
+
+    fn parse_bool_flag(value: &str) -> Option<bool> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn gh_direct_break_glass_enabled() -> bool {
+        let primary = env::var(GH_DIRECT_BREAK_GLASS_ENV_PRIMARY).ok();
+        let secondary = env::var(GH_DIRECT_BREAK_GLASS_ENV_SECONDARY).ok();
+        let primary_flag = primary.as_deref().and_then(Self::parse_bool_flag);
+        let secondary_flag = secondary.as_deref().and_then(Self::parse_bool_flag);
+
+        match (primary_flag, secondary_flag, primary, secondary) {
+            (Some(flag), None, _, None) | (None, Some(flag), None, _) => flag,
+            (Some(left), Some(right), _, _) if left == right => left,
+            // Unknown/ambiguous break-glass state fails closed to "disabled".
+            _ => false,
+        }
+    }
+
+    #[inline]
+    const fn should_deny_direct_github_attempt(
+        stage_eval: GhDirectStageEvaluation,
+        production_mode: bool,
+        break_glass_enabled: bool,
+    ) -> bool {
+        if !production_mode {
+            return false;
+        }
+        match stage_eval.stage {
+            GhDirectStage::Stage0 | GhDirectStage::Stage2 => true,
+            GhDirectStage::Stage1 => !break_glass_enabled,
+        }
+    }
+
+    fn truncate_attempt_detail(detail: &str) -> String {
+        if detail.len() <= MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN {
+            return detail.to_string();
+        }
+        let truncated_len = MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN.saturating_sub(3);
+        format!("{}...", &detail[..truncated_len])
+    }
+
+    fn detect_forbidden_direct_github_capability_tool_id(
+        tool_id: &str,
+    ) -> Option<DirectGithubActuationAttempt> {
+        let normalized = tool_id.trim();
+        let normalized_lower = normalized.to_ascii_lowercase();
+        let candidate = normalized_lower
+            .strip_prefix("kernel.")
+            .unwrap_or(&normalized_lower);
+
+        let class = candidate
+            .split(['.', ':', '/'])
+            .find(|segment| !segment.is_empty())?;
+
+        let forbidden_class = apm2_core::fac::forbidden_direct_github_capability_class(class)?;
+
+        Some(DirectGithubActuationAttempt {
+            class: forbidden_class,
+            vector: "capability_surface",
+            detail: Self::truncate_attempt_detail(normalized),
+        })
+    }
+
+    fn command_primary_executable(command: &str) -> Option<String> {
+        command.split_whitespace().find_map(|token| {
+            let cleaned = token.trim_matches(['"', '\'']);
+            if cleaned.is_empty() || cleaned.contains('=') {
+                None
+            } else {
+                Some(cleaned.to_ascii_lowercase())
+            }
+        })
+    }
+
+    fn command_invokes_gh_cli(command: &str) -> bool {
+        let Some(exec) = Self::command_primary_executable(command) else {
+            return false;
+        };
+        exec == "gh" || exec.ends_with("/gh") || exec == "gh.exe" || exec.ends_with("\\gh.exe")
+    }
+
+    fn host_targets_github_api(host: &str) -> bool {
+        let lower = host.trim().to_ascii_lowercase();
+        lower == "api.github.com" || lower.ends_with(".api.github.com")
+    }
+
+    fn command_targets_github_api(command: &str) -> bool {
+        let lower = command.to_ascii_lowercase();
+        lower.contains("api.github.com")
+    }
+
+    fn detect_direct_github_runtime_attempt(
+        tool_class: ToolClass,
+        arguments: Option<&serde_json::Value>,
+    ) -> Option<DirectGithubActuationAttempt> {
+        match tool_class {
+            ToolClass::Execute => {
+                let command = arguments
+                    .and_then(|args| args.get("command"))
+                    .and_then(serde_json::Value::as_str)?;
+
+                if Self::command_invokes_gh_cli(command) {
+                    return Some(DirectGithubActuationAttempt {
+                        class: "gh_cli",
+                        vector: "shell_command",
+                        detail: Self::truncate_attempt_detail(command),
+                    });
+                }
+
+                if Self::command_targets_github_api(command) {
+                    return Some(DirectGithubActuationAttempt {
+                        class: "github_api",
+                        vector: "shell_command",
+                        detail: Self::truncate_attempt_detail(command),
+                    });
+                }
+
+                None
+            },
+            ToolClass::Network => {
+                let url_str = arguments
+                    .and_then(|args| args.get("url"))
+                    .and_then(serde_json::Value::as_str)?;
+                if let Ok(parsed_url) = url::Url::parse(url_str)
+                    && let Some(host) = parsed_url.host_str()
+                    && Self::host_targets_github_api(host)
+                {
+                    return Some(DirectGithubActuationAttempt {
+                        class: "github_api",
+                        vector: "network_url",
+                        detail: Self::truncate_attempt_detail(url_str),
+                    });
+                }
+                None
+            },
+            _ => None,
+        }
+    }
+
+    fn emit_projection_isolation_deny_defect(
+        &self,
+        session_id: &str,
+        tool_id: &str,
+        attempt: &DirectGithubActuationAttempt,
+        stage_eval: GhDirectStageEvaluation,
+        production_mode: bool,
+        break_glass_enabled: bool,
+    ) -> Result<(), String> {
+        let Some(ref ledger) = self.ledger else {
+            return Err("ledger unavailable for projection isolation defect emission".to_string());
+        };
+
+        let defect_id = format!("DEF-SIO28-{}", uuid::Uuid::new_v4());
+        let timestamp_ns = self
+            .clock
+            .as_ref()
+            .and_then(|clock| clock.now_hlc().ok().map(|hlc| hlc.wall_ns))
+            .unwrap_or(0);
+        let severity = DefectSeverity::S1;
+
+        let defect_record = DefectRecord::builder(&defect_id, "PROJECTION_ISOLATION_DENY")
+            .severity(severity)
+            .work_id(session_id)
+            .detected_at(timestamp_ns)
+            .signal(DefectSignal::new(
+                SignalType::UnplannedToolCall,
+                format!(
+                    "sio_sig=SIO-SIG-016 class={} vector={} tool_id={} stage={} stage_resolution={} production={} break_glass={} detail={}",
+                    attempt.class,
+                    attempt.vector,
+                    tool_id,
+                    stage_eval.stage.as_label(),
+                    stage_eval.resolution.as_str(),
+                    production_mode,
+                    break_glass_enabled,
+                    attempt.detail
+                ),
+            ))
+            .context(
+                HolonDefectContext::new()
+                    .with_session_id(session_id)
+                    .with_requested_stable_id(tool_id.to_string()),
+            )
+            .build()
+            .map_err(|e| format!("failed to build projection isolation DefectRecord: {e}"))?;
+
+        let defect_json = serde_json::to_vec(&defect_record)
+            .map_err(|e| format!("failed to serialize projection isolation DefectRecord: {e}"))?;
+        let cas_hash = self.cas.as_ref().map_or_else(
+            || blake3::hash(&defect_json).as_bytes().to_vec(),
+            |cas| cas.store(&defect_json).to_vec(),
+        );
+
+        let time_envelope_uri = format!(
+            "htf:projection-isolation:{}:{}",
+            timestamp_ns, attempt.class
+        );
+        let time_envelope_hash = blake3::hash(time_envelope_uri.as_bytes())
+            .as_bytes()
+            .to_vec();
+
+        let defect_event = DefectRecorded {
+            defect_id,
+            defect_type: "PROJECTION_ISOLATION_DENY".to_string(),
+            cas_hash,
+            source: DefectSource::ContextMiss as i32,
+            work_id: session_id.to_string(),
+            severity: severity.as_str().to_string(),
+            detected_at: timestamp_ns,
+            time_envelope_ref: Some(TimeEnvelopeRef {
+                hash: time_envelope_hash,
+            }),
+        };
+
+        ledger
+            .emit_defect_recorded(&defect_event, timestamp_ns)
+            .map_err(|e| format!("failed to emit projection isolation defect: {e}"))?;
+
+        Ok(())
+    }
+
+    fn maybe_deny_direct_github_attempt(
+        &self,
+        session_id: &str,
+        tool_id: &str,
+        attempt: &DirectGithubActuationAttempt,
+    ) -> Result<Option<SessionResponse>, String> {
+        let stage_eval = Self::evaluate_gh_direct_stage_state();
+        let production_mode = Self::is_production_runtime_mode();
+        let break_glass_enabled = Self::gh_direct_break_glass_enabled();
+
+        if !Self::should_deny_direct_github_attempt(
+            stage_eval,
+            production_mode,
+            break_glass_enabled,
+        ) {
+            return Ok(None);
+        }
+
+        self.emit_projection_isolation_deny_defect(
+            session_id,
+            tool_id,
+            attempt,
+            stage_eval,
+            production_mode,
+            break_glass_enabled,
+        )?;
+
+        Ok(Some(SessionResponse::error(
+            SessionErrorCode::SessionErrorToolNotAllowed,
+            format!(
+                "projection isolation denied direct GitHub actuation: class={} vector={} stage={} resolution={} (SIO-SIG-016)",
+                attempt.class,
+                attempt.vector,
+                stage_eval.stage.as_label(),
+                stage_eval.resolution.as_str()
+            ),
+        )))
+    }
+
     #[inline]
     const fn requires_temporal_arbitration(risk_tier: apm2_core::pcac::RiskTier) -> bool {
         matches!(risk_tier, apm2_core::pcac::RiskTier::Tier2Plus)
@@ -2304,6 +2792,44 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
+        let parsed_arguments = serde_json::from_slice::<serde_json::Value>(&request.arguments).ok();
+
+        // RFC-0028 REQ-0008: deny direct projection-sink capability surfaces
+        // from `agent_runtime` before class parsing.
+        if let Some(attempt) =
+            Self::detect_forbidden_direct_github_capability_tool_id(&request.tool_id)
+        {
+            match self.maybe_deny_direct_github_attempt(
+                &token.session_id,
+                &request.tool_id,
+                &attempt,
+            ) {
+                Ok(Some(response)) => {
+                    warn!(
+                        session_id = %token.session_id,
+                        tool_id = %request.tool_id,
+                        class = attempt.class,
+                        vector = attempt.vector,
+                        "RequestTool denied by projection isolation capability-surface policy"
+                    );
+                    return Ok(response);
+                },
+                Ok(None) => {},
+                Err(e) => {
+                    error!(
+                        session_id = %token.session_id,
+                        tool_id = %request.tool_id,
+                        error = %e,
+                        "projection isolation defect emission failed"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInternal,
+                        format!("projection isolation defect emission failed: {e}"),
+                    ));
+                },
+            }
+        }
+
         // TCK-00260: Parse tool_id to ToolClass
         let Some(tool_class) = ToolClass::parse(&request.tool_id) else {
             warn!(
@@ -2317,6 +2843,43 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 format!("unknown tool class: {}", request.tool_id),
             ));
         };
+
+        // RFC-0028 REQ-0008: deny direct GitHub actuation attempts from
+        // `agent_runtime` (`gh` CLI and GitHub API vectors) under GH-DIRECT
+        // stage policy.
+        if let Some(attempt) =
+            Self::detect_direct_github_runtime_attempt(tool_class, parsed_arguments.as_ref())
+        {
+            match self.maybe_deny_direct_github_attempt(
+                &token.session_id,
+                &request.tool_id,
+                &attempt,
+            ) {
+                Ok(Some(response)) => {
+                    warn!(
+                        session_id = %token.session_id,
+                        tool_id = %request.tool_id,
+                        class = attempt.class,
+                        vector = attempt.vector,
+                        "RequestTool denied by projection isolation runtime actuation policy"
+                    );
+                    return Ok(response);
+                },
+                Ok(None) => {},
+                Err(e) => {
+                    error!(
+                        session_id = %token.session_id,
+                        tool_id = %request.tool_id,
+                        error = %e,
+                        "projection isolation defect emission failed"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInternal,
+                        format!("projection isolation defect emission failed: {e}"),
+                    ));
+                },
+            }
+        }
 
         // TCK-00406: Runtime taint ingress enforcement on production request
         // path. Deny and emit durable defect evidence for forbidden flows.
@@ -3150,7 +3713,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         )
         .with_inline_args(request.arguments);
 
-        if let Ok(args_value) = serde_json::from_slice::<serde_json::Value>(&request_arguments) {
+        if let Some(args_value) = parsed_arguments {
             match tool_class {
                 ToolClass::Read | ToolClass::Write | ToolClass::ListFiles => {
                     if let Some(path) = args_value.get("path").and_then(serde_json::Value::as_str) {
@@ -5560,6 +6123,224 @@ mod tests {
             gid: 1000,
             pid: Some(12345),
         }))
+    }
+
+    mod projection_isolation {
+        use super::*;
+        use crate::episode::InMemorySessionRegistry;
+        use crate::protocol::dispatch::{LedgerEventEmitter, StubLedgerEventEmitter};
+        use crate::protocol::messages::RequestToolRequest;
+        use crate::session::{SessionRegistry, SessionState};
+
+        #[test]
+        fn gh_direct_stage_missing_fails_closed_to_stage2() {
+            let evaluation =
+                SessionDispatcher::<InMemoryManifestStore>::evaluate_gh_direct_stage_inputs(
+                    None, None, None, 10_000,
+                );
+            assert_eq!(evaluation.stage, GhDirectStage::Stage2);
+            assert_eq!(
+                evaluation.resolution,
+                GhDirectStageResolution::MissingFailClosed
+            );
+        }
+
+        #[test]
+        fn gh_direct_stage_unknown_fails_closed_to_stage2() {
+            let evaluation =
+                SessionDispatcher::<InMemoryManifestStore>::evaluate_gh_direct_stage_inputs(
+                    Some("unrecognized-stage"),
+                    None,
+                    None,
+                    10_000,
+                );
+            assert_eq!(evaluation.stage, GhDirectStage::Stage2);
+            assert_eq!(
+                evaluation.resolution,
+                GhDirectStageResolution::UnknownFailClosed
+            );
+        }
+
+        #[test]
+        fn gh_direct_stage_ambiguous_fails_closed_to_stage2() {
+            let evaluation =
+                SessionDispatcher::<InMemoryManifestStore>::evaluate_gh_direct_stage_inputs(
+                    Some("GH-DIRECT-STAGE-0"),
+                    Some("GH-DIRECT-STAGE-1"),
+                    None,
+                    10_000,
+                );
+            assert_eq!(evaluation.stage, GhDirectStage::Stage2);
+            assert_eq!(
+                evaluation.resolution,
+                GhDirectStageResolution::AmbiguousFailClosed
+            );
+        }
+
+        #[test]
+        fn gh_direct_stage_stale_fails_closed_to_stage2() {
+            let now_ns: u64 = 90_000_000_000_000;
+            let stale_refreshed_at_ns = now_ns.saturating_sub(GH_DIRECT_STAGE_MAX_AGE_NS + 1);
+            let evaluation =
+                SessionDispatcher::<InMemoryManifestStore>::evaluate_gh_direct_stage_inputs(
+                    Some("GH-DIRECT-STAGE-1"),
+                    None,
+                    Some(stale_refreshed_at_ns),
+                    now_ns,
+                );
+            assert_eq!(evaluation.stage, GhDirectStage::Stage2);
+            assert_eq!(
+                evaluation.resolution,
+                GhDirectStageResolution::StaleFailClosed
+            );
+        }
+
+        #[test]
+        fn gh_direct_stage_explicit_stage1_when_fresh() {
+            let now_ns: u64 = 90_000_000_000_000;
+            let fresh_refreshed_at_ns = now_ns.saturating_sub(1_000_000_000);
+            let evaluation =
+                SessionDispatcher::<InMemoryManifestStore>::evaluate_gh_direct_stage_inputs(
+                    Some("GH-DIRECT-STAGE-1"),
+                    None,
+                    Some(fresh_refreshed_at_ns),
+                    now_ns,
+                );
+            assert_eq!(evaluation.stage, GhDirectStage::Stage1);
+            assert_eq!(evaluation.resolution, GhDirectStageResolution::Explicit);
+        }
+
+        fn make_projection_isolation_dispatcher() -> (
+            SessionDispatcher<InMemoryManifestStore>,
+            Arc<StubLedgerEventEmitter>,
+            TokenMinter,
+        ) {
+            let minter = test_minter();
+            let ledger = Arc::new(StubLedgerEventEmitter::new());
+            let ledger_trait: Arc<dyn LedgerEventEmitter> = ledger.clone();
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            registry
+                .register_session(SessionState {
+                    session_id: "session-001".to_string(),
+                    work_id: "W-PROJECTION-ISOLATION-001".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "lease-001".to_string(),
+                    ephemeral_handle: "handle-projection-isolation-001".to_string(),
+                    policy_resolved_ref: "policy-ref".to_string(),
+                    capability_manifest_hash: vec![0x11; 32],
+                    episode_id: Some("episode-projection-isolation-001".to_string()),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                })
+                .expect("session registration should succeed");
+            let registry_dyn: Arc<dyn crate::session::SessionRegistry> = registry;
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_ledger(ledger_trait)
+                .with_session_registry(registry_dyn);
+
+            (dispatcher, ledger, minter)
+        }
+
+        #[test]
+        fn direct_gh_cli_attempt_denied_with_structured_defect() {
+            let (dispatcher, ledger, minter) = make_projection_isolation_dispatcher();
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "execute".to_string(),
+                arguments: serde_json::to_vec(&serde_json::json!({
+                    "command": "gh api repos/example/repo/statuses/abcdef"
+                }))
+                .unwrap(),
+                dedupe_key: "projection-isolation-gh-cli".to_string(),
+                epoch_seal: None,
+            };
+            let frame = encode_request_tool_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32
+                    );
+                    assert!(
+                        err.message.contains("projection isolation denied"),
+                        "expected projection isolation deny, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("SIO-SIG-016"),
+                        "expected SIO-SIG-016 marker in deny message, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected direct gh cli deny, got: {other:?}"),
+            }
+
+            let defect_events = ledger
+                .get_events_by_work_id("session-001")
+                .into_iter()
+                .filter(|event| event.event_type == "defect_recorded")
+                .collect::<Vec<_>>();
+            assert_eq!(defect_events.len(), 1, "expected one deny defect event");
+
+            let payload: serde_json::Value =
+                serde_json::from_slice(&defect_events[0].payload).unwrap();
+            assert_eq!(
+                payload
+                    .get("defect_type")
+                    .and_then(serde_json::Value::as_str),
+                Some("PROJECTION_ISOLATION_DENY")
+            );
+        }
+
+        #[test]
+        fn direct_github_api_capability_surface_denied_with_defect() {
+            let (dispatcher, ledger, minter) = make_projection_isolation_dispatcher();
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "github_api.create_status".to_string(),
+                arguments: b"{}".to_vec(),
+                dedupe_key: "projection-isolation-cap-class".to_string(),
+                epoch_seal: None,
+            };
+            let frame = encode_request_tool_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32
+                    );
+                    assert!(
+                        err.message.contains("projection isolation denied"),
+                        "expected projection isolation deny, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("class=github_api"),
+                        "expected github_api class in deny message, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected direct github_api class deny, got: {other:?}"),
+            }
+
+            let defect_count = ledger
+                .get_events_by_work_id("session-001")
+                .into_iter()
+                .filter(|event| event.event_type == "defect_recorded")
+                .count();
+            assert_eq!(defect_count, 1, "expected one deny defect event");
+        }
     }
 
     // ========================================================================
