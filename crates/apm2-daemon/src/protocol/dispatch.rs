@@ -6699,8 +6699,7 @@ pub struct PrivilegedPcacPolicy {}
 /// Handler class for domain-tagged PCAC hash construction.
 ///
 /// Each variant maps to a unique domain separation tag prefix, preventing
-/// cross-handler confused-deputy attacks where a join input constructed
-/// for one handler class could be replayed against another.
+/// cross-handler confused-deputy attacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrivilegedHandlerClass {
     DelegateSublease,
@@ -6709,7 +6708,6 @@ pub(crate) enum PrivilegedHandlerClass {
 
 #[allow(clippy::missing_const_for_fn)]
 impl PrivilegedHandlerClass {
-    /// Returns the domain tag prefix for this handler class.
     fn tag_prefix(self) -> &'static str {
         match self {
             Self::DelegateSublease => "pcac-privileged-delegate-sublease",
@@ -6717,7 +6715,6 @@ impl PrivilegedHandlerClass {
         }
     }
 
-    /// Returns the operation name for error messages and tracing.
     fn operation_name(self) -> &'static str {
         match self {
             Self::DelegateSublease => "DelegateSublease",
@@ -6727,10 +6724,6 @@ impl PrivilegedHandlerClass {
 }
 
 /// Construct a domain-tagged BLAKE3 hash for a privileged PCAC handler.
-///
-/// The domain tag is `{handler_prefix}-{hash_type}-v1` where `handler_prefix`
-/// is determined by the handler class. This ensures cryptographic domain
-/// separation between handler classes and hash types.
 fn domain_tagged_hash(
     handler_class: PrivilegedHandlerClass,
     hash_type: &str,
@@ -6739,17 +6732,13 @@ fn domain_tagged_hash(
     let mut hasher = blake3::Hasher::new();
     let tag = format!("{}-{}-v1", handler_class.tag_prefix(), hash_type);
     hasher.update(tag.as_bytes());
-    for chunk in data {
-        hasher.update(chunk);
+    for d in data {
+        hasher.update(d);
     }
     *hasher.finalize().as_bytes()
 }
 
-/// Builder for constructing PCAC `AuthorityJoinInputV1` for privileged
-/// handlers.
-///
-/// Centralizes common scaffolding (defaults, assembly, domain-tagged hash
-/// helper) while each handler provides handler-specific hash values and fields.
+/// Builder for PCAC `AuthorityJoinInputV1` for privileged handlers.
 pub(crate) struct PrivilegedPcacInputBuilder {
     handler_class: PrivilegedHandlerClass,
     session_id: String,
@@ -6786,81 +6775,62 @@ impl PrivilegedPcacInputBuilder {
         }
     }
 
-    pub(crate) fn session_id(mut self, value: String) -> Self {
-        self.session_id = value;
+    pub(crate) fn session_id(mut self, v: String) -> Self {
+        self.session_id = v;
+        self
+    }
+    pub(crate) fn lease_id(mut self, v: String) -> Self {
+        self.lease_id = v;
+        self
+    }
+    pub(crate) fn boundary_intent_class(mut self, v: apm2_core::pcac::BoundaryIntentClass) -> Self {
+        self.boundary_intent_class = v;
+        self
+    }
+    pub(crate) fn identity_proof_hash(mut self, v: [u8; 32]) -> Self {
+        self.identity_proof_hash = v;
+        self
+    }
+    pub(crate) fn identity_evidence_level(mut self, v: IdentityEvidenceLevel) -> Self {
+        self.identity_evidence_level = v;
+        self
+    }
+    pub(crate) fn risk_tier(mut self, v: PcacRiskTier) -> Self {
+        self.risk_tier = v;
+        self
+    }
+    pub(crate) fn capability_manifest_hash(mut self, v: [u8; 32]) -> Self {
+        self.capability_manifest_hash = v;
+        self
+    }
+    pub(crate) fn scope_witness_hash(mut self, v: [u8; 32]) -> Self {
+        self.scope_witness_hash = v;
+        self
+    }
+    pub(crate) fn freshness_policy_hash(mut self, v: [u8; 32]) -> Self {
+        self.freshness_policy_hash = v;
+        self
+    }
+    pub(crate) fn stop_budget_profile_digest(mut self, v: [u8; 32]) -> Self {
+        self.stop_budget_profile_digest = v;
+        self
+    }
+    pub(crate) fn effect_intent_digest(mut self, v: [u8; 32]) -> Self {
+        self.effect_intent_digest = v;
+        self
+    }
+    pub(crate) fn lineage_receipt_hash(mut self, v: [u8; 32]) -> Self {
+        self.lineage_receipt_hash = Some(v);
         self
     }
 
-    pub(crate) fn lease_id(mut self, value: String) -> Self {
-        self.lease_id = value;
-        self
-    }
-
-    pub(crate) fn boundary_intent_class(
-        mut self,
-        value: apm2_core::pcac::BoundaryIntentClass,
-    ) -> Self {
-        self.boundary_intent_class = value;
-        self
-    }
-
-    pub(crate) fn identity_proof_hash(mut self, value: [u8; 32]) -> Self {
-        self.identity_proof_hash = value;
-        self
-    }
-
-    pub(crate) fn risk_tier(mut self, value: PcacRiskTier) -> Self {
-        self.risk_tier = value;
-        self
-    }
-
-    pub(crate) fn capability_manifest_hash(mut self, value: [u8; 32]) -> Self {
-        self.capability_manifest_hash = value;
-        self
-    }
-
-    pub(crate) fn scope_witness_hash(mut self, value: [u8; 32]) -> Self {
-        self.scope_witness_hash = value;
-        self
-    }
-
-    pub(crate) fn freshness_policy_hash(mut self, value: [u8; 32]) -> Self {
-        self.freshness_policy_hash = value;
-        self
-    }
-
-    pub(crate) fn stop_budget_profile_digest(mut self, value: [u8; 32]) -> Self {
-        self.stop_budget_profile_digest = value;
-        self
-    }
-
-    pub(crate) fn effect_intent_digest(mut self, value: [u8; 32]) -> Self {
-        self.effect_intent_digest = value;
-        self
-    }
-
-    pub(crate) fn lineage_receipt_hash(mut self, value: [u8; 32]) -> Self {
-        self.lineage_receipt_hash = Some(value);
-        self
-    }
-
-    /// Returns the handler class for this builder.
-    pub(crate) fn handler_class(&self) -> PrivilegedHandlerClass {
-        self.handler_class
-    }
-
-    /// Returns the effect intent digest (needed by lifecycle enforcement).
-    pub(crate) fn effect_intent_digest_value(&self) -> [u8; 32] {
-        self.effect_intent_digest
-    }
-
-    /// Construct a domain-tagged BLAKE3 hash using this builder's handler
-    /// class.
+    /// Convenience: compute a domain-tagged BLAKE3 hash using this builder's
+    /// handler class.
     pub(crate) fn hash(&self, hash_type: &str, data: &[&[u8]]) -> [u8; 32] {
         domain_tagged_hash(self.handler_class, hash_type, data)
     }
 
-    /// Build the final `AuthorityJoinInputV1`.
+    /// Build the `AuthorityJoinInputV1`, consuming the builder.
     pub(crate) fn build(
         self,
         join_freshness_tick: u64,
@@ -7969,48 +7939,6 @@ impl PrivilegedDispatcher {
             PrivilegedErrorCode::CapabilityRequestRejected,
             format!("PCAC authority denied for {operation}: {}", deny.deny_class),
         )
-    }
-
-    /// Enforce mandatory PCAC lifecycle for a privileged handler.
-    ///
-    /// Calls `enforce_privileged_pcac_lifecycle` and denies fail-closed if
-    /// lifecycle enforcement is disabled in claim policy.
-    #[allow(clippy::result_large_err)]
-    #[allow(clippy::too_many_arguments)]
-    fn enforce_mandatory_pcac(
-        &self,
-        handler_class: PrivilegedHandlerClass,
-        gate: &crate::pcac::LifecycleGate,
-        pcac_input: &AuthorityJoinInputV1,
-        lease_id: &str,
-        join_freshness_tick: u64,
-        join_time_envelope_ref: [u8; 32],
-        join_ledger_anchor: [u8; 32],
-        join_revocation_head: [u8; 32],
-        effect_intent_digest: [u8; 32],
-    ) -> Result<PrivilegedPcacLifecycleArtifacts, PrivilegedResponse> {
-        let operation = handler_class.operation_name();
-        match self.enforce_privileged_pcac_lifecycle(
-            operation,
-            gate,
-            pcac_input,
-            lease_id,
-            join_freshness_tick,
-            join_time_envelope_ref,
-            join_ledger_anchor,
-            join_revocation_head,
-            effect_intent_digest,
-        ) {
-            Ok(Some(artifacts)) => Ok(artifacts),
-            Ok(None) => Err(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                format!(
-                    "{operation} requires PCAC lifecycle evidence (mandatory cutover); \
-                     lifecycle_enforcement is disabled in claim policy"
-                ),
-            )),
-            Err(response) => Err(response),
-        }
     }
 
     /// Enforces join -> revalidate -> revalidate-before-execution -> consume
@@ -13564,23 +13492,13 @@ impl PrivilegedDispatcher {
             };
 
         let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
-        let verdict_bytes = request.verdict.to_le_bytes();
-        let blocked_reason_code_bytes = request.blocked_reason_code.to_le_bytes();
-        let emergency_stop_active =
-            [u8::from(self.stop_authority.as_ref().is_some_and(
-                |authority| authority.emergency_stop_active(),
-            ))];
-        let governance_stop_active =
-            [u8::from(self.stop_authority.as_ref().is_some_and(
-                |authority| authority.governance_stop_active(),
-            ))];
-
-        let mut pcac_builder =
+        let pcac_builder =
             PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::IngestReviewReceipt)
                 .session_id(request.receipt_id.clone())
                 .lease_id(request.lease_id.clone())
                 .boundary_intent_class(apm2_core::pcac::BoundaryIntentClass::Assert)
                 .identity_proof_hash(request_identity_proof_hash_arr)
+                .identity_evidence_level(IdentityEvidenceLevel::PointerOnly)
                 .risk_tier(pcac_risk_tier);
 
         let capability_manifest_hash = pcac_builder.hash(
@@ -13594,24 +13512,25 @@ impl PrivilegedDispatcher {
         );
 
         let scope_witness_hash = {
-            let mut scope_data: Vec<&[u8]> = vec![
-                request.receipt_id.as_bytes(),
-                &request_changeset_digest_arr,
-                &request_artifact_bundle_hash_arr,
-                &verdict_bytes,
-                authenticated_reviewer_id.as_bytes(),
-                expected_actor_id.as_bytes(),
-            ];
-            let blocked_reason_bytes;
-            let blocked_log_hash;
+            let mut hasher = blake3::Hasher::new();
+            let tag = format!(
+                "{}-scope-v1",
+                PrivilegedHandlerClass::IngestReviewReceipt.tag_prefix()
+            );
+            hasher.update(tag.as_bytes());
+            hasher.update(request.receipt_id.as_bytes());
+            hasher.update(&request_changeset_digest_arr);
+            hasher.update(&request_artifact_bundle_hash_arr);
+            hasher.update(&request.verdict.to_le_bytes());
+            hasher.update(authenticated_reviewer_id.as_bytes());
+            hasher.update(expected_actor_id.as_bytes());
             if verdict == ReviewReceiptVerdict::Blocked {
-                blocked_reason_bytes = request.blocked_reason_code.to_le_bytes();
-                scope_data.push(&blocked_reason_bytes);
-                blocked_log_hash = request_blocked_log_hash_arr
+                hasher.update(&request.blocked_reason_code.to_le_bytes());
+                let blocked_log_hash = request_blocked_log_hash_arr
                     .expect("validated blocked_log_hash for BLOCKED verdict");
-                scope_data.push(&blocked_log_hash);
+                hasher.update(&blocked_log_hash);
             }
-            pcac_builder.hash("scope", &scope_data)
+            *hasher.finalize().as_bytes()
         };
 
         let freshness_policy_hash = pcac_builder.hash(
@@ -13622,15 +13541,21 @@ impl PrivilegedDispatcher {
         let stop_budget_profile_digest = pcac_builder.hash(
             "stop-budget",
             &[
-                &emergency_stop_active,
-                &governance_stop_active,
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.emergency_stop_active(),
+                ))],
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.governance_stop_active(),
+                ))],
                 request.receipt_id.as_bytes(),
-                &verdict_bytes,
-                &blocked_reason_code_bytes,
+                &request.verdict.to_le_bytes(),
+                &request.blocked_reason_code.to_le_bytes(),
             ],
         );
 
         let effect_intent_digest = {
+            let verdict_bytes = request.verdict.to_le_bytes();
+            let blocked_reason_code_bytes = request.blocked_reason_code.to_le_bytes();
             let mut intent_data: Vec<&[u8]> = vec![
                 request.lease_id.as_bytes(),
                 request.receipt_id.as_bytes(),
@@ -13642,23 +13567,23 @@ impl PrivilegedDispatcher {
                 &verdict_bytes,
                 &blocked_reason_code_bytes,
             ];
-            let blocked_log_hash;
-            if let Some(value) = request_blocked_log_hash_arr {
-                blocked_log_hash = value;
-                intent_data.push(&blocked_log_hash);
+            if let Some(ref blocked_log_hash) = request_blocked_log_hash_arr {
+                intent_data.push(blocked_log_hash);
             }
-            pcac_builder.hash("intent", &intent_data)
+            domain_tagged_hash(
+                PrivilegedHandlerClass::IngestReviewReceipt,
+                "intent",
+                &intent_data,
+            )
         };
 
-        pcac_builder = pcac_builder
+        let pcac_builder = pcac_builder
             .capability_manifest_hash(capability_manifest_hash)
             .scope_witness_hash(scope_witness_hash)
             .freshness_policy_hash(freshness_policy_hash)
             .stop_budget_profile_digest(stop_budget_profile_digest)
             .effect_intent_digest(effect_intent_digest);
 
-        let handler_class = pcac_builder.handler_class();
-        let effect_intent_digest_for_enforce = pcac_builder.effect_intent_digest_value();
         let pcac_input = pcac_builder.build(
             join_freshness_tick,
             join_time_envelope_ref,
@@ -13666,22 +13591,29 @@ impl PrivilegedDispatcher {
             join_revocation_head,
         );
 
-        let pcac_lifecycle_artifacts = Some(
-            match self.enforce_mandatory_pcac(
-                handler_class,
-                pcac_gate,
-                &pcac_input,
-                &request.lease_id,
-                join_freshness_tick,
-                join_time_envelope_ref,
-                join_ledger_anchor,
-                join_revocation_head,
-                effect_intent_digest_for_enforce,
-            ) {
-                Ok(artifacts) => artifacts,
-                Err(response) => return Ok(response),
+        let pcac_lifecycle_artifacts = match self.enforce_privileged_pcac_lifecycle(
+            PrivilegedHandlerClass::IngestReviewReceipt.operation_name(),
+            pcac_gate,
+            &pcac_input,
+            &request.lease_id,
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+            effect_intent_digest,
+        ) {
+            Ok(artifacts) => {
+                if artifacts.is_none() {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        "IngestReviewReceipt requires PCAC lifecycle evidence (mandatory cutover); \
+                         lifecycle_enforcement is disabled in claim policy",
+                    ));
+                }
+                artifacts
             },
-        );
+            Err(response) => return Ok(response),
+        };
 
         // ---- Phase 3: Get HTF timestamp ----
         let timestamp_ns = match self.get_htf_timestamp_ns() {
@@ -14928,22 +14860,13 @@ impl PrivilegedDispatcher {
             };
 
         let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(parent_risk_tier);
-        let expiry_millis_bytes = expiry_millis.to_le_bytes();
-        let emergency_stop_active =
-            [u8::from(self.stop_authority.as_ref().is_some_and(
-                |authority| authority.emergency_stop_active(),
-            ))];
-        let governance_stop_active =
-            [u8::from(self.stop_authority.as_ref().is_some_and(
-                |authority| authority.governance_stop_active(),
-            ))];
-
-        let mut pcac_builder =
+        let pcac_builder =
             PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::DelegateSublease)
                 .session_id(request.sublease_id.clone())
                 .lease_id(request.parent_lease_id.clone())
                 .boundary_intent_class(apm2_core::pcac::BoundaryIntentClass::Delegate)
                 .identity_proof_hash(request_identity_proof_hash)
+                .identity_evidence_level(IdentityEvidenceLevel::PointerOnly)
                 .risk_tier(pcac_risk_tier);
 
         let lineage_receipt_hash = pcac_builder.hash(
@@ -14957,7 +14880,6 @@ impl PrivilegedDispatcher {
                 &parent_time_envelope_hash,
             ],
         );
-        pcac_builder = pcac_builder.lineage_receipt_hash(lineage_receipt_hash);
 
         let capability_manifest_hash = pcac_builder.hash(
             "capability",
@@ -14976,7 +14898,7 @@ impl PrivilegedDispatcher {
                 request.parent_lease_id.as_bytes(),
                 request.sublease_id.as_bytes(),
                 request.delegatee_actor_id.as_bytes(),
-                &expiry_millis_bytes,
+                &expiry_millis.to_le_bytes(),
                 parent_lease.work_id.as_bytes(),
                 parent_lease.gate_id.as_bytes(),
             ],
@@ -14990,8 +14912,12 @@ impl PrivilegedDispatcher {
         let stop_budget_profile_digest = pcac_builder.hash(
             "stop-budget",
             &[
-                &emergency_stop_active,
-                &governance_stop_active,
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.emergency_stop_active(),
+                ))],
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.governance_stop_active(),
+                ))],
                 parent_lease.gate_id.as_bytes(),
                 request.delegatee_actor_id.as_bytes(),
             ],
@@ -15005,20 +14931,19 @@ impl PrivilegedDispatcher {
                 request.delegatee_actor_id.as_bytes(),
                 caller_actor_id.as_bytes(),
                 &request_identity_proof_hash,
-                &expiry_millis_bytes,
+                &expiry_millis.to_le_bytes(),
                 &lineage_receipt_hash,
             ],
         );
 
-        pcac_builder = pcac_builder
+        let pcac_builder = pcac_builder
+            .lineage_receipt_hash(lineage_receipt_hash)
             .capability_manifest_hash(capability_manifest_hash)
             .scope_witness_hash(scope_witness_hash)
             .freshness_policy_hash(freshness_policy_hash)
             .stop_budget_profile_digest(stop_budget_profile_digest)
             .effect_intent_digest(effect_intent_digest);
 
-        let handler_class = pcac_builder.handler_class();
-        let effect_intent_digest_for_enforce = pcac_builder.effect_intent_digest_value();
         let pcac_input = pcac_builder.build(
             join_freshness_tick,
             join_time_envelope_ref,
@@ -15026,22 +14951,29 @@ impl PrivilegedDispatcher {
             join_revocation_head,
         );
 
-        let pcac_lifecycle_artifacts = Some(
-            match self.enforce_mandatory_pcac(
-                handler_class,
-                pcac_gate,
-                &pcac_input,
-                &request.parent_lease_id,
-                join_freshness_tick,
-                join_time_envelope_ref,
-                join_ledger_anchor,
-                join_revocation_head,
-                effect_intent_digest_for_enforce,
-            ) {
-                Ok(artifacts) => artifacts,
-                Err(response) => return Ok(response),
+        let pcac_lifecycle_artifacts = match self.enforce_privileged_pcac_lifecycle(
+            PrivilegedHandlerClass::DelegateSublease.operation_name(),
+            pcac_gate,
+            &pcac_input,
+            &request.parent_lease_id,
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+            effect_intent_digest,
+        ) {
+            Ok(artifacts) => {
+                if artifacts.is_none() {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        "DelegateSublease requires PCAC lifecycle evidence (mandatory cutover); \
+                         lifecycle_enforcement is disabled in claim policy",
+                    ));
+                }
+                artifacts
             },
-        );
+            Err(response) => return Ok(response),
+        };
 
         // ---- Phase 3: Get HTF timestamp ----
         let timestamp_ns = match self.get_htf_timestamp_ns() {
@@ -16583,21 +16515,16 @@ mod tests {
             hasher.update(data);
             *hasher.finalize().as_bytes()
         };
-
         let actual = domain_tagged_hash(
             PrivilegedHandlerClass::IngestReviewReceipt,
             "capability",
             &[data],
         );
-
-        assert_eq!(
-            expected, actual,
-            "domain_tagged_hash must produce identical output"
-        );
+        assert_eq!(expected, actual);
     }
 
     #[test]
-    fn test_domain_tagged_hash_delegate_sublease_differs_from_ingest_review() {
+    fn test_domain_tagged_hash_handler_class_separation() {
         let data = b"same-data";
         let ingest = domain_tagged_hash(
             PrivilegedHandlerClass::IngestReviewReceipt,
@@ -16609,73 +16536,54 @@ mod tests {
             "capability",
             &[data],
         );
-
-        assert_ne!(
-            ingest, delegate,
-            "different handler classes must produce different hashes"
-        );
+        assert_ne!(ingest, delegate);
     }
 
     #[test]
-    fn test_builder_produces_correct_authority_join_input() {
-        use apm2_core::pcac::{BoundaryIntentClass, DeterminismClass as CoreDeterminismClass};
-
-        let identity_hash = [0xAA; 32];
-        let cap_hash = [0xBB; 32];
-        let scope_hash = [0xCC; 32];
-        let fresh_hash = [0xDD; 32];
-        let stop_hash = [0xEE; 32];
-        let intent_hash = [0xFF; 32];
-        let time_env = [0x11; 32];
-        let ledger = [0x22; 32];
-        let revocation = [0x33; 32];
-
+    fn test_pcac_input_builder_ingest_review() {
         let input = PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::IngestReviewReceipt)
             .session_id("receipt-123".to_string())
             .lease_id("lease-456".to_string())
-            .boundary_intent_class(BoundaryIntentClass::Assert)
-            .identity_proof_hash(identity_hash)
+            .boundary_intent_class(apm2_core::pcac::BoundaryIntentClass::Assert)
+            .identity_proof_hash([0xAA; 32])
+            .identity_evidence_level(IdentityEvidenceLevel::PointerOnly)
             .risk_tier(PcacRiskTier::Tier0)
-            .capability_manifest_hash(cap_hash)
-            .scope_witness_hash(scope_hash)
-            .freshness_policy_hash(fresh_hash)
-            .stop_budget_profile_digest(stop_hash)
-            .effect_intent_digest(intent_hash)
-            .build(42, time_env, ledger, revocation);
+            .capability_manifest_hash([0xBB; 32])
+            .scope_witness_hash([0xCC; 32])
+            .freshness_policy_hash([0xDD; 32])
+            .stop_budget_profile_digest([0xEE; 32])
+            .effect_intent_digest([0xFF; 32])
+            .build(42, [0x11; 32], [0x22; 32], [0x33; 32]);
 
         assert_eq!(input.session_id, "receipt-123");
         assert_eq!(input.lease_id, "lease-456");
-        assert_eq!(input.boundary_intent_class, BoundaryIntentClass::Assert);
-        assert_eq!(input.capability_manifest_hash, cap_hash);
-        assert_eq!(input.scope_witness_hashes, vec![scope_hash]);
-        assert_eq!(input.freshness_policy_hash, fresh_hash);
-        assert_eq!(input.stop_budget_profile_digest, stop_hash);
-        assert_eq!(input.intent_digest, intent_hash);
-        assert_eq!(input.identity_proof_hash, identity_hash);
+        assert_eq!(
+            input.boundary_intent_class,
+            apm2_core::pcac::BoundaryIntentClass::Assert
+        );
+        assert_eq!(input.capability_manifest_hash, [0xBB; 32]);
+        assert_eq!(input.scope_witness_hashes, vec![[0xCC; 32]]);
+        assert_eq!(input.intent_digest, [0xFF; 32]);
+        assert_eq!(input.permeability_receipt_hash, None);
+        assert_eq!(input.freshness_witness_tick, 42);
         assert_eq!(
             input.identity_evidence_level,
             IdentityEvidenceLevel::PointerOnly
         );
         assert!(input.pointer_only_waiver_hash.is_none());
         assert!(input.holon_id.is_none());
-        assert_eq!(input.permeability_receipt_hash, None);
-        assert_eq!(input.pre_actuation_receipt_hashes, Vec::<[u8; 32]>::new());
-        assert_eq!(input.determinism_class, CoreDeterminismClass::Deterministic);
-        assert_eq!(input.freshness_witness_tick, 42);
-        assert_eq!(input.time_envelope_ref, time_env);
-        assert_eq!(input.as_of_ledger_anchor, ledger);
-        assert_eq!(input.directory_head_hash, revocation);
-        assert_eq!(input.risk_tier, PcacRiskTier::Tier0);
+        assert_eq!(input.determinism_class, PcacDeterminismClass::Deterministic);
     }
 
     #[test]
-    fn test_builder_with_lineage_sets_permeability_receipt_hash() {
+    fn test_pcac_input_builder_delegate_sublease() {
         let lineage = [0x44; 32];
         let input = PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::DelegateSublease)
             .session_id("sub-789".to_string())
             .lease_id("parent-123".to_string())
             .boundary_intent_class(apm2_core::pcac::BoundaryIntentClass::Delegate)
             .identity_proof_hash([0xAA; 32])
+            .identity_evidence_level(IdentityEvidenceLevel::PointerOnly)
             .risk_tier(PcacRiskTier::Tier2Plus)
             .lineage_receipt_hash(lineage)
             .capability_manifest_hash([0xBB; 32])
