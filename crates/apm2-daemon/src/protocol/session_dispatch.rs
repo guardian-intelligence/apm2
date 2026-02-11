@@ -11366,6 +11366,7 @@ mod tests {
                 Some(RiskTier::Tier0),
                 &taint_assessment,
                 &request_arguments_b,
+                1_700_000_000_000_000_000,
                 Some(policy_hash),
             )
             .expect("intent-mismatch boundary-flow runtime state should build");
