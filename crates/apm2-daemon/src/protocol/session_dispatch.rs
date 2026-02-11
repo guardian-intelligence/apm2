@@ -71,8 +71,13 @@ use apm2_core::channel::{
 };
 use apm2_core::context::firewall::FirewallViolationDefect;
 use apm2_core::coordination::ContextRefinementRequest;
-use apm2_core::crypto::{Hash, Signer as CryptoSigner};
+use apm2_core::crypto::{EventHasher, Hash, Signer as CryptoSigner};
 use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
+use apm2_core::evidence::{
+    AcceptancePackageV1, AdmissionVerdict as AcceptanceAdmissionVerdict, CasReceiptProvider,
+    LedgerReceiptProvider, ReceiptPointer as AcceptanceReceiptPointer,
+    ReceiptType as AcceptanceReceiptType, verify_acceptance_package,
+};
 #[cfg(test)]
 use apm2_core::fac::taint::{FlowRule, TaintSource, TargetContext};
 use apm2_core::fac::taint::{
@@ -2887,6 +2892,351 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             timing_budget_policy_max_ticks: policy_timing_budget_ticks,
             claimed_timing_budget_ticks,
         })
+    }
+
+    const fn acceptance_receipt_event_type(receipt_type: AcceptanceReceiptType) -> &'static str {
+        match receipt_type {
+            AcceptanceReceiptType::Delegation => "pcac_acceptance_receipt_delegation",
+            AcceptanceReceiptType::Consume => "pcac_acceptance_receipt_consume",
+            AcceptanceReceiptType::Effect => "pcac_acceptance_receipt_effect",
+            AcceptanceReceiptType::Boundary => "pcac_acceptance_receipt_boundary",
+            AcceptanceReceiptType::Declassification => "pcac_acceptance_receipt_declassification",
+            AcceptanceReceiptType::GateAdmission => "pcac_acceptance_receipt_gate_admission",
+        }
+    }
+
+    fn format_acceptance_verification_failure(
+        verifier_name: &str,
+        result: &apm2_core::evidence::VerificationResult,
+    ) -> String {
+        let findings = result
+            .findings
+            .iter()
+            .map(|finding| format!("{}: {}", finding.code, finding.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if findings.is_empty() {
+            format!("{verifier_name} verifier rejected acceptance package")
+        } else {
+            format!("{verifier_name} verifier rejected acceptance package: {findings}")
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_portable_acceptance_package(
+        &self,
+        session_id: &str,
+        lease_id: &str,
+        request_id: &str,
+        tool_class: ToolClass,
+        risk_tier: RiskTier,
+        request_arguments: &[u8],
+        boundary_flow_state: &BoundaryFlowRuntimeState,
+        pending_pcac: Option<&PendingPcacAuthority>,
+        timestamp_ns: u64,
+    ) -> Result<(), String> {
+        if !risk_tier.requires_enhanced_evidence() {
+            return Ok(());
+        }
+
+        let Some(pending_pcac) = pending_pcac else {
+            return Err(
+                "promotion-critical request missing PCAC lifecycle authority (fail-closed)"
+                    .to_string(),
+            );
+        };
+
+        if matches!(
+            boundary_flow_state.declassification_intent,
+            DeclassificationIntentScope::RedundancyPurpose
+        ) && boundary_flow_state
+            .redundancy_declassification_receipt
+            .is_none()
+        {
+            return Err(
+                "promotion-critical request missing authoritative declassification receipt linkage"
+                    .to_string(),
+            );
+        }
+
+        if boundary_flow_state
+            .policy_binding
+            .admitted_policy_root_digest
+            == [0u8; 32]
+        {
+            return Err(
+                "promotion-critical request missing policy snapshot hash (fail-closed)".to_string(),
+            );
+        }
+
+        if pending_pcac.certificate.issued_time_envelope_ref == [0u8; 32] {
+            return Err(
+                "promotion-critical request missing time authority reference (fail-closed)"
+                    .to_string(),
+            );
+        }
+
+        let tool_class_label = tool_class.to_string();
+        let effect_digest = *blake3::hash(request_arguments).as_bytes();
+
+        let gate_admission_payload = serde_json::to_vec(&serde_json::json!({
+            "schema": "apm2.acceptance_receipt.gate_admission.v1",
+            "session_id": session_id,
+            "lease_id": lease_id,
+            "request_id": request_id,
+            "tool_class": tool_class_label,
+            "risk_tier": risk_tier.tier(),
+            "verdict": "admitted",
+            "timestamp_ns": timestamp_ns,
+        }))
+        .map_err(|error| format!("gate-admission receipt serialization failed: {error}"))?;
+
+        let boundary_payload = serde_json::to_vec(&serde_json::json!({
+            "schema": "apm2.acceptance_receipt.boundary.v1",
+            "session_id": session_id,
+            "lease_id": lease_id,
+            "request_id": request_id,
+            "taint_allow": boundary_flow_state.taint_allow,
+            "classification_allow": boundary_flow_state.classification_allow,
+            "declass_receipt_valid": boundary_flow_state.declass_receipt_valid,
+            "declassification_intent": boundary_flow_state.declassification_intent,
+            "redundancy_declassification_receipt": boundary_flow_state.redundancy_declassification_receipt,
+            "policy_binding": boundary_flow_state.policy_binding,
+            "timestamp_ns": timestamp_ns,
+        }))
+        .map_err(|error| format!("boundary receipt serialization failed: {error}"))?;
+
+        let consume_payload = serde_json::to_vec(&serde_json::json!({
+            "schema": "apm2.acceptance_receipt.consume.v1",
+            "session_id": session_id,
+            "lease_id": lease_id,
+            "request_id": request_id,
+            "certificate": &pending_pcac.certificate,
+            "pre_actuation_receipt_hashes": &pending_pcac.pre_actuation_receipt_hashes,
+            "temporal_arbitration_receipts": &pending_pcac.temporal_arbitration_receipts,
+            "timestamp_ns": timestamp_ns,
+        }))
+        .map_err(|error| format!("consume receipt serialization failed: {error}"))?;
+
+        let effect_payload = serde_json::to_vec(&serde_json::json!({
+            "schema": "apm2.acceptance_receipt.effect.v1",
+            "session_id": session_id,
+            "lease_id": lease_id,
+            "request_id": request_id,
+            "tool_class": tool_class.to_string(),
+            "intent_digest": hex::encode(effect_digest),
+            "boundary_intent_class": pending_pcac.boundary_intent_class,
+            "timestamp_ns": timestamp_ns,
+        }))
+        .map_err(|error| format!("effect receipt serialization failed: {error}"))?;
+
+        let mut receipt_payloads = vec![
+            (AcceptanceReceiptType::GateAdmission, gate_admission_payload),
+            (AcceptanceReceiptType::Boundary, boundary_payload),
+            (AcceptanceReceiptType::Consume, consume_payload),
+            (AcceptanceReceiptType::Effect, effect_payload),
+        ];
+
+        if let Some(admission_capacity_token) = pending_pcac.certificate.admission_capacity_token {
+            let delegation_payload = serde_json::to_vec(&serde_json::json!({
+                "schema": "apm2.acceptance_receipt.delegation.v1",
+                "session_id": session_id,
+                "lease_id": lease_id,
+                "request_id": request_id,
+                "principal_id": &pending_pcac.principal_id,
+                "admission_capacity_token": hex::encode(admission_capacity_token),
+                "timestamp_ns": timestamp_ns,
+            }))
+            .map_err(|error| format!("delegation receipt serialization failed: {error}"))?;
+            receipt_payloads.push((AcceptanceReceiptType::Delegation, delegation_payload));
+        }
+
+        if let Some(receipt) = boundary_flow_state
+            .redundancy_declassification_receipt
+            .as_ref()
+        {
+            let declassification_payload = serde_json::to_vec(&serde_json::json!({
+                "schema": "apm2.acceptance_receipt.declassification.v1",
+                "session_id": session_id,
+                "lease_id": lease_id,
+                "request_id": request_id,
+                "receipt": receipt,
+                "timestamp_ns": timestamp_ns,
+            }))
+            .map_err(|error| format!("declassification receipt serialization failed: {error}"))?;
+            receipt_payloads.push((
+                AcceptanceReceiptType::Declassification,
+                declassification_payload,
+            ));
+        }
+
+        let mut cas_provider = CasReceiptProvider::new();
+        let mut ledger_provider = LedgerReceiptProvider::new();
+        let mut receipt_pointers = Vec::with_capacity(receipt_payloads.len());
+
+        for (receipt_type, payload) in receipt_payloads {
+            let receipt_digest = EventHasher::hash_content(&payload);
+            let mut cas_address = None;
+            let mut ledger_event_id = None;
+
+            if let Some(cas) = self.cas.as_ref() {
+                let stored_hash = cas.store(&payload);
+                if stored_hash != receipt_digest {
+                    return Err(format!(
+                        "receipt digest mismatch after CAS store for {:?}: expected {}, got {}",
+                        receipt_type,
+                        hex::encode(receipt_digest),
+                        hex::encode(stored_hash)
+                    ));
+                }
+                let address = format!("cas://{}", hex::encode(stored_hash));
+                cas_provider.insert_with_address(address.clone(), payload.clone());
+                cas_address = Some(address);
+            } else {
+                cas_provider.insert_with_digest(receipt_digest, payload.clone());
+            }
+
+            if let Some(ledger) = self.ledger.as_ref() {
+                let event_type = Self::acceptance_receipt_event_type(receipt_type);
+                let event = ledger
+                    .emit_session_event(
+                        session_id,
+                        event_type,
+                        &payload,
+                        "pcac:acceptance-package",
+                        timestamp_ns,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "failed to persist {event_type} ledger evidence for request {request_id}: {error}"
+                        )
+                    })?;
+                ledger_provider.insert_with_event_id(event.event_id.clone(), event.payload);
+                ledger_event_id = Some(event.event_id);
+            } else {
+                ledger_provider.insert_with_digest(receipt_digest, payload.clone());
+            }
+
+            if cas_address.is_none() && ledger_event_id.is_none() {
+                return Err(
+                    "portable acceptance receipts are unavailable: no CAS or ledger pointers"
+                        .to_string(),
+                );
+            }
+
+            receipt_pointers.push(AcceptanceReceiptPointer {
+                receipt_type,
+                receipt_digest,
+                cas_address,
+                ledger_event_id,
+            });
+        }
+
+        let subject_effect_id = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"apm2.acceptance_package.subject_effect_id.v1");
+            hasher.update(session_id.as_bytes());
+            hasher.update(lease_id.as_bytes());
+            hasher.update(request_id.as_bytes());
+            hasher.update(tool_class.to_string().as_bytes());
+            hasher.update(&effect_digest);
+            *hasher.finalize().as_bytes()
+        };
+
+        let mut package = AcceptancePackageV1 {
+            version: AcceptancePackageV1::current_version(),
+            package_id: [0u8; 32],
+            subject_effect_id,
+            receipt_set_digest: AcceptancePackageV1::compute_receipt_set_digest(&receipt_pointers),
+            receipt_pointers,
+            policy_snapshot_hash: boundary_flow_state
+                .policy_binding
+                .admitted_policy_root_digest,
+            time_authority_ref: pending_pcac.certificate.issued_time_envelope_ref,
+            verdict: AcceptanceAdmissionVerdict::Admitted,
+            issuer_signature: Vec::new(),
+            issuer_verifying_key: [0u8; 32],
+        };
+
+        package
+            .sign_with(self.channel_context_signer.as_ref())
+            .map_err(|error| format!("acceptance package signing failed: {error}"))?;
+
+        let cas_result = verify_acceptance_package(&package, &cas_provider);
+        if !cas_result.verified {
+            return Err(Self::format_acceptance_verification_failure(
+                "cas",
+                &cas_result,
+            ));
+        }
+
+        let ledger_result = verify_acceptance_package(&package, &ledger_provider);
+        if !ledger_result.verified {
+            return Err(Self::format_acceptance_verification_failure(
+                "ledger",
+                &ledger_result,
+            ));
+        }
+
+        if cas_result != ledger_result {
+            return Err(format!(
+                "acceptance package verifier concordance mismatch: cas={cas_result:?}, ledger={ledger_result:?}"
+            ));
+        }
+
+        let package_bytes = serde_json::to_vec(&package)
+            .map_err(|error| format!("acceptance package serialization failed: {error}"))?;
+        let replay_fixture_hash = self.cas.as_ref().map(|cas| cas.store(&package_bytes));
+
+        if let Some(ledger) = self.ledger.as_ref() {
+            let concordance_payload = serde_json::to_vec(&serde_json::json!({
+                "schema": "apm2.acceptance_package_recorded.v1",
+                "request_id": request_id,
+                "session_id": session_id,
+                "lease_id": lease_id,
+                "tool_class": tool_class.to_string(),
+                "risk_tier": risk_tier.tier(),
+                "promotion_critical": true,
+                "package": package,
+                "replay_fixture_hash": replay_fixture_hash.map(hex::encode),
+                "verifier_concordance": {
+                    "cas": {
+                        "verified": cas_result.verified,
+                        "findings": cas_result.findings.iter().map(|finding| serde_json::json!({
+                            "severity": format!("{:?}", finding.severity).to_lowercase(),
+                            "code": finding.code,
+                            "message": finding.message.as_str(),
+                        })).collect::<Vec<_>>(),
+                    },
+                    "ledger": {
+                        "verified": ledger_result.verified,
+                        "findings": ledger_result.findings.iter().map(|finding| serde_json::json!({
+                            "severity": format!("{:?}", finding.severity).to_lowercase(),
+                            "code": finding.code,
+                            "message": finding.message.as_str(),
+                        })).collect::<Vec<_>>(),
+                    },
+                    "concordant": true,
+                },
+                "timestamp_ns": timestamp_ns,
+            }))
+            .map_err(|error| {
+                format!("acceptance concordance payload serialization failed: {error}")
+            })?;
+            ledger
+                .emit_session_event(
+                    session_id,
+                    "pcac_acceptance_package_recorded",
+                    &concordance_payload,
+                    "pcac:acceptance-package",
+                    timestamp_ns,
+                )
+                .map_err(|error| {
+                    format!("acceptance package ledger persistence failed: {error}")
+                })?;
+        }
+
+        Ok(())
     }
 
     fn derive_pcac_risk_tier_from_policy(
@@ -6173,6 +6523,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     ));
                 },
             };
+            let boundary_flow_state_for_package = boundary_flow_state.clone();
 
             match channel_boundary_dispatcher()
                 .validate_channel_boundary_and_issue_context_token_with_flow(
@@ -6187,7 +6538,32 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     context_firewall_verified,
                     boundary_flow_state,
                 ) {
-                Ok(token) => Some(token),
+                Ok(context_token) => {
+                    if let Err(error) = self.emit_portable_acceptance_package(
+                        &token.session_id,
+                        &token.lease_id,
+                        &request_id,
+                        tool_class,
+                        risk_tier,
+                        &request_arguments,
+                        &boundary_flow_state_for_package,
+                        pending_pcac.as_ref(),
+                        timestamp_ns,
+                    ) {
+                        warn!(
+                            session_id = %token.session_id,
+                            tool_class = %tool_class,
+                            request_id = %request_id,
+                            error = %error,
+                            "RequestTool denied: portable acceptance evidence reverification failed (fail-closed)"
+                        );
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorToolNotAllowed,
+                            format!("portable acceptance evidence verification failed: {error}"),
+                        ));
+                    }
+                    Some(context_token)
+                },
                 Err(defects) => {
                     let defects_json = Self::format_channel_boundary_defects(&defects);
                     warn!(
