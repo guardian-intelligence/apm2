@@ -19,6 +19,14 @@ use crate::episode::preactuation::StopAuthority;
 use crate::hmp::admission::ImportAdmissionGate;
 use crate::hmp::{HmpMessageV1, VerificationMethod};
 
+/// Maximum age of a governance message in milliseconds (5 minutes).
+/// Messages older than this relative to `admitted_at_hlc` are rejected as
+/// stale.
+pub const MAX_GOVERNANCE_MESSAGE_AGE_MS: u64 = 300_000;
+/// Maximum future tolerance for governance message timestamps in milliseconds
+/// (30 seconds). Messages with `timestamp_ms` more than this far ahead of
+/// `admitted_at_hlc` are rejected.
+pub const GOVERNANCE_FUTURE_TOLERANCE_MS: u64 = 30_000;
 /// Maximum retained governance action receipts.
 pub const MAX_GOVERNANCE_ACTION_RECEIPTS: usize = 4_096;
 /// Maximum retained breakglass receipts.
@@ -69,6 +77,12 @@ pub enum GovernanceChannelError {
     /// Envelope sender identity does not match payload issuer identity.
     #[error("sender identity mismatch between envelope and payload")]
     SenderMismatch,
+    /// Governance message timestamp is outside the acceptable freshness window.
+    #[error("governance message timestamp freshness check failed: {reason}")]
+    MessageTimestampFreshness {
+        /// Freshness failure reason.
+        reason: String,
+    },
     /// Message target does not match local cell.
     #[error("target cell mismatch: expected '{expected}', got '{actual}'")]
     TargetCellMismatch {
@@ -115,6 +129,10 @@ pub struct BreakglassAuthorization {
     pub valid_from_ms: u64,
     /// Authorization validity end.
     pub valid_until_ms: u64,
+    /// Monotonically increasing sequence number per operator.
+    /// Authorizations with a sequence number <= the previously accepted
+    /// sequence number for the same operator are rejected as replays.
+    pub sequence_number: u64,
     /// Signature over authorization fields.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signature: Vec<u8>,
@@ -187,6 +205,7 @@ impl BreakglassAuthorization {
         write_len_prefixed_string(&mut bytes, &self.reason);
         bytes.extend_from_slice(&self.valid_from_ms.to_be_bytes());
         bytes.extend_from_slice(&self.valid_until_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.sequence_number.to_be_bytes());
         bytes
     }
 
@@ -253,6 +272,8 @@ pub struct BreakglassReceiptV1 {
 #[derive(Debug, Clone)]
 pub struct BreakglassControl {
     active: BTreeMap<String, BreakglassAuthorization>,
+    /// Tracks highest accepted `sequence_number` per `operator_id`.
+    accepted_sequences: BTreeMap<String, u64>,
     receipts: VecDeque<BreakglassReceiptV1>,
     max_active: usize,
     max_receipts: usize,
@@ -270,6 +291,7 @@ impl BreakglassControl {
     pub const fn new(max_active: usize, max_receipts: usize) -> Self {
         Self {
             active: BTreeMap::new(),
+            accepted_sequences: BTreeMap::new(),
             receipts: VecDeque::new(),
             max_active,
             max_receipts,
@@ -288,6 +310,17 @@ impl BreakglassControl {
         verifying_key: &apm2_core::crypto::VerifyingKey,
     ) -> Result<(), GovernanceChannelError> {
         authorization.verify_signature(verifying_key)?;
+        // Enforce monotonic sequence_number per operator (anti-replay)
+        if let Some(&stored_seq) = self.accepted_sequences.get(&authorization.operator_id) {
+            if authorization.sequence_number <= stored_seq {
+                return Err(GovernanceChannelError::BreakglassDenied {
+                    reason: format!(
+                        "sequence_number {} is not greater than previously accepted {} for operator '{}'",
+                        authorization.sequence_number, stored_seq, authorization.operator_id
+                    ),
+                });
+            }
+        }
         if !self.active.contains_key(&authorization.operator_id)
             && self.active.len() >= self.max_active
         {
@@ -295,6 +328,10 @@ impl BreakglassControl {
                 reason: format!("max active authorizations reached ({})", self.max_active),
             });
         }
+        self.accepted_sequences.insert(
+            authorization.operator_id.clone(),
+            authorization.sequence_number,
+        );
         self.active
             .insert(authorization.operator_id.clone(), authorization);
         Ok(())
@@ -610,6 +647,7 @@ impl GovernanceChannelHandler {
             if message.issuer_cell_id != envelope.sender_cell_id {
                 return Err(GovernanceChannelError::SenderMismatch);
             }
+            self.enforce_message_freshness(message.timestamp_ms, admitted_at_hlc)?;
             self.enforce_target_cell(&message.target_cell_id, breakglass_operator_id, envelope)?;
             self.route_stop_class(message.stop_class);
             (GovernanceActionKind::StopOrder, None)
@@ -631,6 +669,7 @@ impl GovernanceChannelHandler {
             if message.cell_id != envelope.sender_cell_id {
                 return Err(GovernanceChannelError::SenderMismatch);
             }
+            self.enforce_message_freshness(message.timestamp_ms, admitted_at_hlc)?;
             self.enforce_target_cell(
                 &self.local_cell_id.clone(),
                 breakglass_operator_id,
@@ -654,6 +693,7 @@ impl GovernanceChannelHandler {
             if message.cell_id != envelope.sender_cell_id {
                 return Err(GovernanceChannelError::SenderMismatch);
             }
+            self.enforce_message_freshness(message.timestamp_ms, admitted_at_hlc)?;
 
             let breakglass_receipt = if self.enforcement_level == GovernanceEnforcementLevel::G2
                 && message.tightens_enforcement()
@@ -707,6 +747,31 @@ impl GovernanceChannelHandler {
                 self.stop_authority.set_governance_stop(true);
             },
         }
+    }
+
+    fn enforce_message_freshness(
+        &self,
+        message_timestamp_ms: u64,
+        admitted_at_hlc: u64,
+    ) -> Result<(), GovernanceChannelError> {
+        let local_cell_id = &self.local_cell_id;
+        // Reject messages from the future (beyond tolerance)
+        if message_timestamp_ms > admitted_at_hlc.saturating_add(GOVERNANCE_FUTURE_TOLERANCE_MS) {
+            return Err(GovernanceChannelError::MessageTimestampFreshness {
+                reason: format!(
+                    "message timestamp {message_timestamp_ms} is too far in the future (admitted_at_hlc={admitted_at_hlc}, tolerance={GOVERNANCE_FUTURE_TOLERANCE_MS}ms, local_cell_id={local_cell_id})"
+                ),
+            });
+        }
+        // Reject stale messages (too old)
+        if admitted_at_hlc.saturating_sub(message_timestamp_ms) > MAX_GOVERNANCE_MESSAGE_AGE_MS {
+            return Err(GovernanceChannelError::MessageTimestampFreshness {
+                reason: format!(
+                    "message timestamp {message_timestamp_ms} is too old (admitted_at_hlc={admitted_at_hlc}, max_age={MAX_GOVERNANCE_MESSAGE_AGE_MS}ms, local_cell_id={local_cell_id})"
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn enforce_target_cell(
@@ -910,6 +975,7 @@ mod tests {
             reason: "incident mitigation".to_string(),
             valid_from_ms: 1_900,
             valid_until_ms: 2_500,
+            sequence_number: 1,
             signature: Vec::new(),
         };
         auth.sign(&operator_signer).expect("auth should sign");

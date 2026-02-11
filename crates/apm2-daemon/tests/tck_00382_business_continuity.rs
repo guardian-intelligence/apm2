@@ -358,6 +358,7 @@ fn tck_00382_it_05_g2_requires_breakglass_for_ratchet_tightening() {
         reason: "incident mitigation".to_string(),
         valid_from_ms: 1_900,
         valid_until_ms: 2_500,
+        sequence_number: 1,
         signature: Vec::new(),
     };
     authorization
@@ -452,4 +453,266 @@ fn tck_00382_it_07_rotation_announcement_is_authenticated_and_routed() {
     );
     assert!(receipt.authenticated);
     assert_eq!(handler.action_receipts().len(), 1);
+}
+
+// IT-00382-08: Stale governance messages are rejected by freshness checks.
+#[test]
+fn tck_00382_it_08_stale_governance_message_rejected() {
+    let signer = Signer::generate();
+    let (state, mut handler) = production_wired_handler();
+
+    let mut message = GovernanceStopOrderV1 {
+        issuer_cell_id: "cell-a".to_string(),
+        target_cell_id: "cell-local".to_string(),
+        stop_class: GovernanceStopClass::GovernanceStop,
+        reason: "stale replay attempt".to_string(),
+        timestamp_ms: 1_000,
+        signature: Vec::new(),
+    };
+    message.sign(&signer).expect("stop order should sign");
+    let payload = serde_json::to_vec(&message).expect("payload should serialize");
+    let envelope = governance_envelope(
+        "HSI.GOVERNANCE.STOP_ORDER.V1",
+        EventHasher::hash_content(&payload),
+    );
+
+    let result = handler.process_message(
+        &envelope,
+        &payload,
+        &signer.verifying_key(),
+        test_hash(0x37),
+        1_000_000,
+        None,
+    );
+    assert!(matches!(
+        result,
+        Err(GovernanceChannelError::MessageTimestampFreshness { .. })
+    ));
+    assert!(
+        !state
+            .stop_authority()
+            .expect("stop authority should remain wired")
+            .governance_stop_active()
+    );
+}
+
+// IT-00382-09: Future governance messages beyond tolerance are rejected.
+#[test]
+fn tck_00382_it_09_future_governance_message_rejected() {
+    let signer = Signer::generate();
+    let (_state, mut handler) = production_wired_handler();
+
+    let mut message = GovernanceStopOrderV1 {
+        issuer_cell_id: "cell-a".to_string(),
+        target_cell_id: "cell-local".to_string(),
+        stop_class: GovernanceStopClass::GovernanceStop,
+        reason: "future replay attempt".to_string(),
+        timestamp_ms: 100_000,
+        signature: Vec::new(),
+    };
+    message.sign(&signer).expect("stop order should sign");
+    let payload = serde_json::to_vec(&message).expect("payload should serialize");
+    let envelope = governance_envelope(
+        "HSI.GOVERNANCE.STOP_ORDER.V1",
+        EventHasher::hash_content(&payload),
+    );
+
+    let result = handler.process_message(
+        &envelope,
+        &payload,
+        &signer.verifying_key(),
+        test_hash(0x38),
+        1_000,
+        None,
+    );
+    assert!(matches!(
+        result,
+        Err(GovernanceChannelError::MessageTimestampFreshness { .. })
+    ));
+}
+
+// IT-00382-10: Fresh governance messages inside window are accepted.
+#[test]
+fn tck_00382_it_10_fresh_governance_message_within_window_accepted() {
+    let signer = Signer::generate();
+    let (_state, mut handler) = production_wired_handler();
+
+    let mut message = GovernanceStopOrderV1 {
+        issuer_cell_id: "cell-a".to_string(),
+        target_cell_id: "cell-local".to_string(),
+        stop_class: GovernanceStopClass::GovernanceStop,
+        reason: "fresh stop request".to_string(),
+        timestamp_ms: 1_000,
+        signature: Vec::new(),
+    };
+    message.sign(&signer).expect("stop order should sign");
+    let payload = serde_json::to_vec(&message).expect("payload should serialize");
+    let envelope = governance_envelope(
+        "HSI.GOVERNANCE.STOP_ORDER.V1",
+        EventHasher::hash_content(&payload),
+    );
+
+    let receipt = handler
+        .process_message(
+            &envelope,
+            &payload,
+            &signer.verifying_key(),
+            test_hash(0x39),
+            1_000,
+            None,
+        )
+        .expect("fresh governance stop should process");
+    assert_eq!(receipt.action_kind, GovernanceActionKind::StopOrder);
+}
+
+// IT-00382-11: Replayed breakglass authorization with same sequence is
+// rejected.
+#[test]
+fn tck_00382_it_11_breakglass_replay_with_stale_sequence_rejected() {
+    let operator_signer = Signer::generate();
+    let (_state, mut handler) = production_wired_handler();
+
+    let mut initial = BreakglassAuthorization {
+        operator_id: "op-001".to_string(),
+        reason: "initial authorization".to_string(),
+        valid_from_ms: 1_000,
+        valid_until_ms: 5_000,
+        sequence_number: 1,
+        signature: Vec::new(),
+    };
+    initial
+        .sign(&operator_signer)
+        .expect("initial authorization should sign");
+    handler
+        .authorize_breakglass(initial, &operator_signer.verifying_key())
+        .expect("initial authorization should register");
+
+    let mut replay = BreakglassAuthorization {
+        operator_id: "op-001".to_string(),
+        reason: "replay authorization".to_string(),
+        valid_from_ms: 1_000,
+        valid_until_ms: 5_000,
+        sequence_number: 1,
+        signature: Vec::new(),
+    };
+    replay
+        .sign(&operator_signer)
+        .expect("replay authorization should sign");
+
+    let result = handler.authorize_breakglass(replay, &operator_signer.verifying_key());
+    assert!(matches!(
+        result,
+        Err(GovernanceChannelError::BreakglassDenied { .. })
+    ));
+}
+
+// IT-00382-12: Replayed breakglass authorization with lower sequence is
+// rejected.
+#[test]
+fn tck_00382_it_12_breakglass_replay_with_lower_sequence_rejected() {
+    let operator_signer = Signer::generate();
+    let (_state, mut handler) = production_wired_handler();
+
+    let mut higher = BreakglassAuthorization {
+        operator_id: "op-001".to_string(),
+        reason: "higher sequence authorization".to_string(),
+        valid_from_ms: 1_000,
+        valid_until_ms: 5_000,
+        sequence_number: 5,
+        signature: Vec::new(),
+    };
+    higher
+        .sign(&operator_signer)
+        .expect("higher authorization should sign");
+    handler
+        .authorize_breakglass(higher, &operator_signer.verifying_key())
+        .expect("higher authorization should register");
+
+    let mut lower = BreakglassAuthorization {
+        operator_id: "op-001".to_string(),
+        reason: "lower sequence authorization".to_string(),
+        valid_from_ms: 1_000,
+        valid_until_ms: 5_000,
+        sequence_number: 3,
+        signature: Vec::new(),
+    };
+    lower
+        .sign(&operator_signer)
+        .expect("lower authorization should sign");
+
+    let result = handler.authorize_breakglass(lower, &operator_signer.verifying_key());
+    assert!(matches!(
+        result,
+        Err(GovernanceChannelError::BreakglassDenied { .. })
+    ));
+}
+
+// IT-00382-13: Strictly increasing breakglass sequence is accepted.
+#[test]
+fn tck_00382_it_13_breakglass_monotonic_sequence_accepted() {
+    let signer = Signer::generate();
+    let operator_signer = Signer::generate();
+    let (_state, mut handler) = production_wired_handler();
+    handler.set_enforcement_level(GovernanceEnforcementLevel::G2);
+
+    let mut first = BreakglassAuthorization {
+        operator_id: "op-001".to_string(),
+        reason: "first authorization".to_string(),
+        valid_from_ms: 1_000,
+        valid_until_ms: 5_000,
+        sequence_number: 1,
+        signature: Vec::new(),
+    };
+    first
+        .sign(&operator_signer)
+        .expect("first authorization should sign");
+    handler
+        .authorize_breakglass(first, &operator_signer.verifying_key())
+        .expect("first authorization should register");
+
+    let mut second = BreakglassAuthorization {
+        operator_id: "op-001".to_string(),
+        reason: "second authorization".to_string(),
+        valid_from_ms: 1_000,
+        valid_until_ms: 5_000,
+        sequence_number: 2,
+        signature: Vec::new(),
+    };
+    second
+        .sign(&operator_signer)
+        .expect("second authorization should sign");
+    handler
+        .authorize_breakglass(second, &operator_signer.verifying_key())
+        .expect("second authorization should replace first");
+
+    let mut message = GovernanceRatchetUpdateV1 {
+        cell_id: "cell-a".to_string(),
+        previous_gate_level: "G1".to_string(),
+        next_gate_level: "G2".to_string(),
+        justification: "confirm replacement".to_string(),
+        timestamp_ms: 2_000,
+        signature: Vec::new(),
+    };
+    message.sign(&signer).expect("ratchet update should sign");
+    let payload = serde_json::to_vec(&message).expect("payload should serialize");
+    let envelope = governance_envelope(
+        "HSI.GOVERNANCE.RATCHET_UPDATE.V1",
+        EventHasher::hash_content(&payload),
+    );
+
+    let receipt = handler
+        .process_message(
+            &envelope,
+            &payload,
+            &signer.verifying_key(),
+            test_hash(0x3a),
+            2_000,
+            Some("op-001"),
+        )
+        .expect("ratchet update should pass with newer breakglass authorization");
+
+    let breakglass_receipt = receipt
+        .breakglass_receipt
+        .expect("breakglass receipt should be present");
+    assert_eq!(breakglass_receipt.reason, "second authorization");
 }
