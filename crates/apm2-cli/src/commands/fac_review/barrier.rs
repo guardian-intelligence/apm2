@@ -599,7 +599,7 @@ fn build_generated_metadata_block(
     Ok(format!("{marker}\n```json\n{json}\n```"))
 }
 
-fn render_comment_with_generated_metadata(
+pub(super) fn render_comment_with_generated_metadata(
     body: &str,
     marker: &str,
     review_type: &str,

@@ -25,11 +25,14 @@ mod logs;
 mod model_pool;
 mod orchestrator;
 mod pipeline;
+mod prepare;
 mod projection;
+mod publish;
 mod push;
 mod restart;
 mod selector;
 mod state;
+mod target;
 mod types;
 
 use std::fs::{self, File};
@@ -48,6 +51,7 @@ pub use decision::DecisionValueArg;
 use dispatch::dispatch_single_review;
 use events::{read_last_event_values, review_events_path};
 use projection::{projection_state_done, projection_state_failed, run_project_inner};
+pub use publish::ReviewPublishTypeArg;
 use state::{
     list_review_pr_numbers, load_review_run_state, read_pulse_file, review_run_state_path,
 };
@@ -376,6 +380,72 @@ pub fn run_findings(
     }
 }
 
+pub fn run_prepare(
+    repo: &str,
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    sha: Option<&str>,
+    json_output: bool,
+) -> u8 {
+    match prepare::run_prepare(repo, pr_number, pr_url, sha, json_output) {
+        Ok(code) => code,
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_prepare_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
+pub fn run_publish(
+    repo: &str,
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    sha: Option<&str>,
+    review_type: ReviewPublishTypeArg,
+    body_file: &Path,
+    json_output: bool,
+) -> u8 {
+    match publish::run_publish(
+        repo,
+        pr_number,
+        pr_url,
+        sha,
+        review_type,
+        body_file,
+        json_output,
+    ) {
+        Ok(code) => code,
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_publish_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_decision_set(
     repo: &str,
@@ -385,6 +455,7 @@ pub fn run_decision_set(
     dimension: &str,
     decision: DecisionValueArg,
     reason: Option<&str>,
+    keep_prepared_inputs: bool,
     json_output: bool,
 ) -> u8 {
     match decision::run_decision_set(
@@ -395,6 +466,7 @@ pub fn run_decision_set(
         dimension,
         decision,
         reason,
+        keep_prepared_inputs,
         json_output,
     ) {
         Ok(code) => code,

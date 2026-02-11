@@ -509,6 +509,10 @@ pub enum ReviewSubcommand {
     Dispatch(ReviewDispatchArgs),
     /// Show FAC review state/events from local operational artifacts.
     Status(ReviewStatusArgs),
+    /// Materialize local review inputs (diff + commit history) under /tmp.
+    Prepare(ReviewPrepareArgs),
+    /// Publish review findings and auto-generate machine-readable metadata.
+    Publish(ReviewPublishArgs),
     /// Retrieve structured review findings for a PR head SHA.
     Findings(ReviewFindingsArgs),
     /// Show or set explicit decision state per review dimension.
@@ -596,6 +600,62 @@ pub struct ReviewFindingsArgs {
     pub json: bool,
 }
 
+/// Arguments for `apm2 fac review prepare`.
+#[derive(Debug, Args)]
+pub struct ReviewPrepareArgs {
+    /// Repository in owner/repo format (used when --pr is provided).
+    #[arg(long, default_value = "guardian-intelligence/apm2")]
+    pub repo: String,
+
+    /// Pull request number.
+    #[arg(long)]
+    pub pr: Option<u32>,
+
+    /// Pull request URL (alternative to --pr).
+    #[arg(long)]
+    pub pr_url: Option<String>,
+
+    /// Optional head SHA override (defaults to PR head SHA).
+    #[arg(long)]
+    pub sha: Option<String>,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac review publish`.
+#[derive(Debug, Args)]
+pub struct ReviewPublishArgs {
+    /// Repository in owner/repo format (used when --pr is provided).
+    #[arg(long, default_value = "guardian-intelligence/apm2")]
+    pub repo: String,
+
+    /// Pull request number.
+    #[arg(long)]
+    pub pr: Option<u32>,
+
+    /// Pull request URL (alternative to --pr).
+    #[arg(long)]
+    pub pr_url: Option<String>,
+
+    /// Optional head SHA override (defaults to PR head SHA).
+    #[arg(long)]
+    pub sha: Option<String>,
+
+    /// Review dimension to publish (`security` or `code-quality`).
+    #[arg(long = "type", value_enum)]
+    pub review_type: fac_review::ReviewPublishTypeArg,
+
+    /// Path to markdown findings body.
+    #[arg(long)]
+    pub body_file: PathBuf,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
 /// Arguments for `apm2 fac review decision`.
 #[derive(Debug, Args)]
 pub struct ReviewDecisionArgs {
@@ -666,6 +726,10 @@ pub struct ReviewDecisionSetArgs {
     /// Optional free-form reason attached to this decision.
     #[arg(long)]
     pub reason: Option<String>,
+
+    /// Keep prepared review input files under /tmp after decision is written.
+    #[arg(long, default_value_t = false)]
+    pub keep_prepared_inputs: bool,
 
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
@@ -969,6 +1033,22 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
             ReviewSubcommand::Status(status_args) => {
                 fac_review::run_status(status_args.pr, status_args.pr_url.as_deref(), json_output)
             },
+            ReviewSubcommand::Prepare(prepare_args) => fac_review::run_prepare(
+                &prepare_args.repo,
+                prepare_args.pr,
+                prepare_args.pr_url.as_deref(),
+                prepare_args.sha.as_deref(),
+                json_output || prepare_args.json,
+            ),
+            ReviewSubcommand::Publish(publish_args) => fac_review::run_publish(
+                &publish_args.repo,
+                publish_args.pr,
+                publish_args.pr_url.as_deref(),
+                publish_args.sha.as_deref(),
+                publish_args.review_type,
+                &publish_args.body_file,
+                json_output || publish_args.json,
+            ),
             ReviewSubcommand::Findings(findings_args) => fac_review::run_findings(
                 &findings_args.repo,
                 findings_args.pr,
@@ -992,6 +1072,7 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
                     &set_args.dimension,
                     set_args.decision,
                     set_args.reason.as_deref(),
+                    set_args.keep_prepared_inputs,
                     json_output || set_args.json,
                 ),
             },
