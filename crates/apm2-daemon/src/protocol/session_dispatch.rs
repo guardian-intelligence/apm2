@@ -2824,15 +2824,102 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
 
         if Self::is_env_wrapper_executable(&exec)
-            && let Some((wrapped_exec, _wrapped_idx)) =
+            && let Some((wrapped_exec, wrapped_idx)) =
                 Self::extract_env_wrapped_executable(tokens, exec_idx + 1)
-            && Self::extract_shell_variable_reference(&wrapped_exec)
+        {
+            if Self::extract_shell_variable_reference(&wrapped_exec)
                 .is_some_and(|name| gh_bound_variables.contains(name))
+            {
+                return true;
+            }
+
+            if Self::is_gh_execution_wrapper_command(&wrapped_exec)
+                && Self::wrapper_references_gh_cli_variable(
+                    &wrapped_exec,
+                    tokens,
+                    wrapped_idx + 1,
+                    gh_bound_variables,
+                )
+            {
+                return true;
+            }
+
+            if Self::is_known_non_execution_command(&wrapped_exec) {
+                return false;
+            }
+
+            return Self::arguments_reference_gh_cli_variable(
+                tokens.iter().skip(wrapped_idx + 1).copied(),
+                gh_bound_variables,
+            );
+        }
+
+        if Self::is_gh_execution_wrapper_command(&exec)
+            && Self::wrapper_references_gh_cli_variable(
+                &exec,
+                tokens,
+                exec_idx + 1,
+                gh_bound_variables,
+            )
         {
             return true;
         }
 
-        false
+        if Self::is_known_non_execution_command(&exec) {
+            return false;
+        }
+
+        Self::arguments_reference_gh_cli_variable(
+            tokens.iter().skip(exec_idx + 1).copied(),
+            gh_bound_variables,
+        )
+    }
+
+    fn is_known_non_execution_command(exec: &str) -> bool {
+        matches!(
+            Self::executable_name(exec),
+            "echo" | "printf" | "cat" | "grep" | "sed" | "awk" | "test" | "["
+        )
+    }
+
+    fn is_gh_execution_wrapper_command(exec: &str) -> bool {
+        matches!(Self::executable_name(exec), "eval" | "exec" | "xargs")
+            || Self::is_shell_wrapper_executable(exec)
+    }
+
+    fn arguments_reference_gh_cli_variable<'a>(
+        mut arguments: impl Iterator<Item = &'a str>,
+        gh_bound_variables: &HashSet<String>,
+    ) -> bool {
+        arguments.any(|token| {
+            Self::extract_shell_variable_reference(token)
+                .is_some_and(|name| gh_bound_variables.contains(name))
+        })
+    }
+
+    fn command_text_references_gh_cli_variable(
+        command: &str,
+        gh_bound_variables: &HashSet<String>,
+    ) -> bool {
+        Self::arguments_reference_gh_cli_variable(command.split_whitespace(), gh_bound_variables)
+    }
+
+    fn wrapper_references_gh_cli_variable(
+        exec: &str,
+        tokens: &[&str],
+        start_idx: usize,
+        gh_bound_variables: &HashSet<String>,
+    ) -> bool {
+        if let Some(inner_command) = Self::extract_wrapper_inline_command(exec, tokens, start_idx)
+            && Self::command_text_references_gh_cli_variable(&inner_command, gh_bound_variables)
+        {
+            return true;
+        }
+
+        Self::arguments_reference_gh_cli_variable(
+            tokens.iter().skip(start_idx).copied(),
+            gh_bound_variables,
+        )
     }
 
     fn arguments_reference_github_api_variable<'a>(
@@ -7473,6 +7560,24 @@ mod tests {
         }
 
         #[test]
+        fn shell_variable_eval_indirection_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "cmd=gh; eval $cmd api /repos",
+                "projection-isolation-var-eval-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn shell_variable_bash_c_indirection_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "cmd=gh; bash -c \"$cmd api /repos\"",
+                "projection-isolation-var-bash-c-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
         fn shell_variable_bound_to_gh_as_echo_argument_is_not_detected_as_direct_attempt() {
             let args = serde_json::json!({ "command": "cmd=gh; echo $cmd" });
             let attempt =
@@ -7483,6 +7588,29 @@ mod tests {
             assert!(
                 attempt.is_none(),
                 "variable references should only be flagged when used as executable position"
+            );
+        }
+
+        #[test]
+        fn shell_variable_bound_to_gh_as_printf_argument_is_not_detected_as_direct_attempt() {
+            let args = serde_json::json!({ "command": "cmd=gh; printf \"%s\" $cmd" });
+            let attempt =
+                SessionDispatcher::<InMemoryManifestStore>::detect_direct_github_runtime_attempt(
+                    ToolClass::Execute,
+                    Some(&args),
+                );
+            assert!(
+                attempt.is_none(),
+                "printf argument references must be treated as non-actuating"
+            );
+        }
+
+        #[test]
+        fn shell_variable_bound_to_gh_as_unknown_argument_denied_fail_closed() {
+            assert_execute_direct_github_attempt_denied(
+                "cmd=gh; customcmd $cmd",
+                "projection-isolation-var-unknown-gh",
+                "gh_cli",
             );
         }
 
