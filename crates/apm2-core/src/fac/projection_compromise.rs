@@ -21,6 +21,7 @@ const MAX_REASON_LENGTH: usize = 1024;
 const MAX_ACTOR_ID_LENGTH: usize = 256;
 const MAX_SIGNAL_ID_LENGTH: usize = 256;
 const MAX_RECEIPT_ID_LENGTH: usize = 256;
+const MAX_REPLAY_RECEIPTS: usize = 4096;
 
 /// Errors returned by projection compromise controls.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -73,6 +74,14 @@ pub enum ProjectionCompromiseError {
     /// No receipts were provided for reconstruction.
     #[error("no replay receipts provided")]
     EmptyReceipts,
+    /// Too many replay receipts provided.
+    #[error("too many replay receipts: {actual} exceeds maximum {max}")]
+    TooManyReceipts {
+        /// Actual count provided.
+        actual: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
     /// Signature verification failed for a signal/receipt.
     #[error("signature verification failed: {detail}")]
     SignatureVerificationFailed {
@@ -1000,6 +1009,12 @@ fn sorted_replay_receipts(
     if receipts.is_empty() {
         return Err(ProjectionCompromiseError::EmptyReceipts);
     }
+    if receipts.len() > MAX_REPLAY_RECEIPTS {
+        return Err(ProjectionCompromiseError::TooManyReceipts {
+            actual: receipts.len(),
+            max: MAX_REPLAY_RECEIPTS,
+        });
+    }
 
     let mut sorted = receipts.to_vec();
     sorted.sort_by(|left, right| {
@@ -1594,6 +1609,60 @@ mod tests {
         assert!(
             matches!(err, ProjectionCompromiseError::UntrustedSignerKey { .. }),
             "expected untrusted signer key error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_projection_state_rejects_excessive_receipts() {
+        let signer = Signer::generate();
+        let channel_id = "repo/main";
+        let time_authority_ref = hash(0x21);
+        let window_ref = hash(0x31);
+        let (source_snapshot, sink_snapshot) = make_snapshots(
+            channel_id,
+            hash(0x41),
+            hash(0x55),
+            time_authority_ref,
+            window_ref,
+        );
+        let source_digest = source_snapshot.snapshot_digest();
+        let sink_digest = sink_snapshot.snapshot_digest();
+
+        let receipt = ProjectionReplayReceiptV1::create_signed(
+            "receipt-0",
+            channel_id,
+            0,
+            hash(0x41),
+            time_authority_ref,
+            window_ref,
+            source_digest,
+            sink_digest,
+            "projector-actor",
+            &signer,
+        )
+        .expect("receipt must be valid");
+
+        let excessive: Vec<_> = (0..=super::MAX_REPLAY_RECEIPTS)
+            .map(|_| receipt.clone())
+            .collect();
+
+        let err = reconstruct_projection_state(
+            channel_id,
+            &excessive,
+            &source_snapshot,
+            &sink_snapshot,
+            &[authority_binding("projector-actor", &signer)],
+            bounds(0, super::MAX_REPLAY_RECEIPTS as u64),
+        )
+        .expect_err("excessive receipts must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                ProjectionCompromiseError::TooManyReceipts { actual, max }
+                    if actual == super::MAX_REPLAY_RECEIPTS + 1 && max == super::MAX_REPLAY_RECEIPTS
+            ),
+            "expected TooManyReceipts, got {err:?}"
         );
     }
 }
