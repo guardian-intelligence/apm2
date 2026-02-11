@@ -23,7 +23,7 @@ use ed25519_dalek::Signer;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::protocol::dispatch::{
     CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX, DEFECT_RECORDED_DOMAIN_PREFIX,
@@ -54,8 +54,24 @@ struct EventHashInput<'a> {
     prev_hash: &'a str,
 }
 
+#[derive(Debug)]
+struct ChainBackfillRow {
+    rowid: i64,
+    event_id: String,
+    event_type: String,
+    work_id: String,
+    actor_id: String,
+    payload: Vec<u8>,
+    signature: Vec<u8>,
+    timestamp_ns: u64,
+}
+
 impl SqliteLedgerEventEmitter {
     const LEDGER_CHAIN_GENESIS: &'static str = "genesis";
+    const LEDGER_METADATA_TABLE: &'static str = "ledger_metadata";
+    const HASH_CHAIN_BACKFILL_COMPLETED_FLAG: &'static str = "hash_chain_backfill_completed_v1";
+    const HASH_CHAIN_CHECKPOINT_KEY: &'static str = "hash_chain_tip_checkpoint_v1";
+    const HASH_CHAIN_BACKFILL_COMPLETED_VALUE: &'static str = "1";
 
     /// Creates a new emitter with the given `SQLite` connection and signing
     /// key.
@@ -81,7 +97,8 @@ impl SqliteLedgerEventEmitter {
             [],
         )?;
         Self::ensure_hash_chain_columns(conn)?;
-        Self::backfill_hash_chain(conn)?;
+        Self::ensure_metadata_table(conn)?;
+        let mut migration_changes_applied = Self::backfill_hash_chain(conn)?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ledger_events_work_id ON ledger_events(work_id)",
             [],
@@ -164,7 +181,7 @@ impl SqliteLedgerEventEmitter {
         // - legacy rowid-based tables are upgraded once to event_id-keyed schema
         // - rows already quarantined are skipped with `INSERT OR IGNORE`
         Self::ensure_receipt_quarantine_table(conn)?;
-        conn.execute(
+        let receipt_quarantine_inserted = conn.execute(
             "INSERT OR IGNORE INTO ledger_events_quarantine \
                  (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
              SELECT le.event_id, le.event_type, le.work_id, le.actor_id, \
@@ -185,13 +202,15 @@ impl SqliteLedgerEventEmitter {
              ",
             [],
         )?;
-        conn.execute(
+        migration_changes_applied |= receipt_quarantine_inserted > 0;
+        let receipt_rows_deleted = conn.execute(
             "DELETE FROM ledger_events WHERE event_id IN ( \
                  SELECT event_id FROM ledger_events_quarantine \
                  WHERE quarantine_reason = 'receipt_id_dedupe_migration' \
              )",
             [],
         )?;
+        migration_changes_applied |= receipt_rows_deleted > 0;
         // Migrate legacy global index shape to scoped review-receipt uniqueness.
         conn.execute("DROP INDEX IF EXISTS idx_unique_receipt_id", [])?;
         conn.execute(
@@ -248,7 +267,7 @@ impl SqliteLedgerEventEmitter {
         // - `INSERT OR IGNORE` skips already-quarantined rows
         // - `MIN(rowid)` keeps the earliest row, quarantines the rest
         // - after quarantine, the unique index creation is safe
-        conn.execute(
+        let changeset_quarantine_inserted = conn.execute(
             "INSERT OR IGNORE INTO ledger_events_quarantine \
                  (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns, quarantine_reason) \
              SELECT le.event_id, le.event_type, le.work_id, le.actor_id, \
@@ -272,19 +291,94 @@ impl SqliteLedgerEventEmitter {
              ",
             [],
         )?;
-        conn.execute(
+        migration_changes_applied |= changeset_quarantine_inserted > 0;
+        let changeset_rows_deleted = conn.execute(
             "DELETE FROM ledger_events WHERE event_id IN ( \
                  SELECT event_id FROM ledger_events_quarantine \
                  WHERE quarantine_reason = 'changeset_digest_dedupe_migration' \
              )",
             [],
         )?;
+        migration_changes_applied |= changeset_rows_deleted > 0;
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_changeset_published \
              ON ledger_events(work_id, json_extract(CAST(payload AS TEXT), '$.changeset_digest')) \
              WHERE event_type = 'changeset_published'",
             [],
         )?;
+        Self::validate_startup_hash_chain_checkpoint(conn, migration_changes_applied).map_err(
+            |message| {
+                error!(
+                    reason = %message,
+                    "ledger hash-chain integrity checkpoint mismatch; refusing startup"
+                );
+                rusqlite::Error::InvalidQuery
+            },
+        )?;
+        Ok(())
+    }
+
+    fn ensure_metadata_table(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute(
+            &format!(
+                "CREATE TABLE IF NOT EXISTS {} ( \
+                    meta_key TEXT PRIMARY KEY, \
+                    meta_value TEXT NOT NULL \
+                )",
+                Self::LEDGER_METADATA_TABLE
+            ),
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn get_metadata_value(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
+        let sql = format!(
+            "SELECT meta_value FROM {} WHERE meta_key = ?1",
+            Self::LEDGER_METADATA_TABLE
+        );
+        conn.query_row(&sql, params![key], |row| row.get::<_, String>(0))
+            .optional()
+    }
+
+    fn set_metadata_value(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
+        let sql = format!(
+            "INSERT INTO {}(meta_key, meta_value) VALUES (?1, ?2) \
+             ON CONFLICT(meta_key) DO UPDATE SET meta_value = excluded.meta_value",
+            Self::LEDGER_METADATA_TABLE
+        );
+        conn.execute(&sql, params![key, value])?;
+        Ok(())
+    }
+
+    fn validate_startup_hash_chain_checkpoint(
+        conn: &Connection,
+        migration_changes_applied: bool,
+    ) -> Result<(), String> {
+        let chain_tip = Self::derive_event_chain_hash_from_db(conn)?;
+        let checkpoint = Self::get_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_KEY)
+            .map_err(|e| format!("failed to read hash-chain checkpoint metadata: {e}"))?;
+        let Some(checkpoint) = checkpoint else {
+            Self::set_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_KEY, &chain_tip)
+                .map_err(|e| format!("failed to initialize hash-chain checkpoint metadata: {e}"))?;
+            return Ok(());
+        };
+
+        if checkpoint != chain_tip {
+            if migration_changes_applied {
+                warn!(
+                    previous_checkpoint = %checkpoint,
+                    current_tip = %chain_tip,
+                    "ledger startup migrations mutated chain tip; reseeding checkpoint"
+                );
+                Self::set_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_KEY, &chain_tip)
+                    .map_err(|e| format!("failed to reseed hash-chain checkpoint metadata: {e}"))?;
+            } else {
+                return Err(format!(
+                    "hash-chain tip mismatch: expected checkpoint={checkpoint}, current_tip={chain_tip}"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -319,62 +413,124 @@ impl SqliteLedgerEventEmitter {
         Ok(())
     }
 
-    fn backfill_hash_chain(conn: &Connection) -> rusqlite::Result<()> {
-        #[derive(Debug)]
-        struct ChainBackfillRow {
-            rowid: i64,
-            event_id: String,
-            event_type: String,
-            work_id: String,
-            actor_id: String,
-            payload: Vec<u8>,
-            signature: Vec<u8>,
-            timestamp_ns: u64,
+    fn backfill_hash_chain(conn: &Connection) -> rusqlite::Result<bool> {
+        if Self::get_metadata_value(conn, Self::HASH_CHAIN_BACKFILL_COMPLETED_FLAG)?.as_deref()
+            == Some(Self::HASH_CHAIN_BACKFILL_COMPLETED_VALUE)
+        {
+            return Ok(false);
         }
 
-        let mut stmt = conn.prepare(
-            "SELECT rowid, event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns \
-             FROM ledger_events ORDER BY timestamp_ns ASC, rowid ASC",
+        let missing_row_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ledger_events \
+             WHERE event_hash IS NULL OR event_hash = '' OR event_hash = 'legacy-uninitialized'",
+            [],
+            |row| row.get(0),
         )?;
-        let rows = stmt
-            .query_map([], |row| {
-                let timestamp_i64: i64 = row.get(7)?;
-                #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
-                let timestamp_ns = timestamp_i64 as u64;
-                Ok(ChainBackfillRow {
-                    rowid: row.get(0)?,
-                    event_id: row.get(1)?,
-                    event_type: row.get(2)?,
-                    work_id: row.get(3)?,
-                    actor_id: row.get(4)?,
-                    payload: row.get(5)?,
-                    signature: row.get(6)?,
-                    timestamp_ns,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
 
-        let mut prev_hash = Self::LEDGER_CHAIN_GENESIS.to_string();
-        for row in rows {
-            let event_hash = Self::compute_event_hash(&EventHashInput {
-                event_id: &row.event_id,
-                event_type: &row.event_type,
-                work_id: &row.work_id,
-                actor_id: &row.actor_id,
-                payload: &row.payload,
-                signature: &row.signature,
-                timestamp_ns: row.timestamp_ns,
-                prev_hash: &prev_hash,
-            });
-
-            conn.execute(
-                "UPDATE ledger_events SET prev_hash = ?1, event_hash = ?2 WHERE rowid = ?3",
-                params![prev_hash, event_hash, row.rowid],
+        if missing_row_count == 0 {
+            Self::set_metadata_value(
+                conn,
+                Self::HASH_CHAIN_BACKFILL_COMPLETED_FLAG,
+                Self::HASH_CHAIN_BACKFILL_COMPLETED_VALUE,
             )?;
-            prev_hash = event_hash;
+            return Ok(false);
         }
-        Ok(())
+
+        warn!(
+            missing_rows = missing_row_count,
+            "ledger hash-chain backfill required; running one-time migration"
+        );
+        // KNOWN LIMITATION (Initial hash-chain migration):
+        // Legacy rows that predate hash-chain fields do not include prior
+        // commitments. Backfill derives commitments from persisted rows as-is
+        // and assumes legacy rows are authentic.
+        warn!(
+            "Backfilling hash chain from legacy uninitialized state. Legacy events are assumed authentic."
+        );
+
+        conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
+        let backfill_result = (|| -> rusqlite::Result<()> {
+            let mut stmt = conn.prepare(
+            "SELECT rowid, event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns \
+             FROM ledger_events \
+             WHERE event_hash IS NULL OR event_hash = '' OR event_hash = 'legacy-uninitialized' \
+             ORDER BY timestamp_ns ASC, rowid ASC",
+        )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let timestamp_i64: i64 = row.get(7)?;
+                    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+                    let timestamp_ns = timestamp_i64 as u64;
+                    Ok(ChainBackfillRow {
+                        rowid: row.get(0)?,
+                        event_id: row.get(1)?,
+                        event_type: row.get(2)?,
+                        work_id: row.get(3)?,
+                        actor_id: row.get(4)?,
+                        payload: row.get(5)?,
+                        signature: row.get(6)?,
+                        timestamp_ns,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+
+            for row in rows {
+                let timestamp_i64 =
+                    i64::try_from(row.timestamp_ns).map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let prev_hash = conn
+                    .query_row(
+                        "SELECT event_hash FROM ledger_events \
+                     WHERE (timestamp_ns < ?1) OR (timestamp_ns = ?1 AND rowid < ?2) \
+                     ORDER BY timestamp_ns DESC, rowid DESC \
+                     LIMIT 1",
+                        params![timestamp_i64, row.rowid],
+                        |db_row| db_row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .filter(|hash| !hash.is_empty() && hash != "legacy-uninitialized")
+                    .unwrap_or_else(|| Self::LEDGER_CHAIN_GENESIS.to_string());
+
+                let event_hash = Self::compute_event_hash(&EventHashInput {
+                    event_id: &row.event_id,
+                    event_type: &row.event_type,
+                    work_id: &row.work_id,
+                    actor_id: &row.actor_id,
+                    payload: &row.payload,
+                    signature: &row.signature,
+                    timestamp_ns: row.timestamp_ns,
+                    prev_hash: &prev_hash,
+                });
+
+                conn.execute(
+                    "UPDATE ledger_events SET prev_hash = ?1, event_hash = ?2 WHERE rowid = ?3",
+                    params![prev_hash, event_hash, row.rowid],
+                )?;
+            }
+
+            let checkpoint = Self::derive_event_chain_hash_from_db(conn).map_err(|e| {
+                warn!(
+                    reason = %e,
+                    "hash-chain validation failed during backfill transaction"
+                );
+                rusqlite::Error::InvalidQuery
+            })?;
+            Self::set_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_KEY, &checkpoint)?;
+            Self::set_metadata_value(
+                conn,
+                Self::HASH_CHAIN_BACKFILL_COMPLETED_FLAG,
+                Self::HASH_CHAIN_BACKFILL_COMPLETED_VALUE,
+            )?;
+            Ok(())
+        })();
+
+        if let Err(error) = backfill_result {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(error);
+        }
+        conn.execute_batch("COMMIT;")?;
+
+        Ok(true)
     }
 
     fn compute_event_hash(input: &EventHashInput<'_>) -> String {
@@ -392,6 +548,11 @@ impl SqliteLedgerEventEmitter {
     }
 
     fn latest_event_hash(conn: &Connection) -> Result<String, LedgerEventError> {
+        Self::latest_event_hash_opt(conn)
+            .map(|hash| hash.unwrap_or_else(|| Self::LEDGER_CHAIN_GENESIS.to_string()))
+    }
+
+    fn latest_event_hash_opt(conn: &Connection) -> Result<Option<String>, LedgerEventError> {
         conn.query_row(
             "SELECT event_hash FROM ledger_events ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
             [],
@@ -401,7 +562,6 @@ impl SqliteLedgerEventEmitter {
         .map_err(|e| LedgerEventError::PersistenceFailed {
             message: format!("sqlite latest event_hash query failed: {e}"),
         })
-        .map(|hash| hash.unwrap_or_else(|| Self::LEDGER_CHAIN_GENESIS.to_string()))
     }
 
     fn canonicalize_payload_with_prev_hash(
@@ -497,6 +657,11 @@ impl SqliteLedgerEventEmitter {
         .map_err(|e| LedgerEventError::PersistenceFailed {
             message: format!("sqlite insert failed: {e}"),
         })?;
+        Self::set_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_KEY, event_hash).map_err(
+            |e| LedgerEventError::PersistenceFailed {
+                message: format!("failed to update hash-chain checkpoint metadata: {e}"),
+            },
+        )?;
         Ok(())
     }
 
@@ -1084,6 +1249,30 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             },
         )
         .ok()
+    }
+
+    fn get_latest_event_hash(&self) -> Result<Option<String>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "connection lock poisoned".to_string())?;
+
+        let hash = conn
+            .query_row(
+                "SELECT event_hash FROM ledger_events ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("sqlite latest event_hash query failed: {e}"))?;
+
+        if hash
+            .as_deref()
+            .is_some_and(|value| value.is_empty() || value == "legacy-uninitialized")
+        {
+            return Err("latest ledger event_hash is uninitialized".to_string());
+        }
+        Ok(hash)
     }
 
     fn derive_event_chain_hash(&self) -> Result<String, String> {

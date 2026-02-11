@@ -88,6 +88,7 @@ use apm2_holon::defect::{
 use bytes::Bytes;
 use prost::Message;
 use serde::Deserialize;
+use subtle::ConstantTimeEq;
 use tracing::{debug, error, info, warn};
 
 use super::dispatch::{
@@ -635,6 +636,7 @@ const MAX_BOUNDARY_CHANNEL_KEY_LENGTH: usize = 256;
 const MAX_BOUNDARY_QUARANTINE_REASON_LENGTH: usize = 1024;
 const QUARANTINE_TTL_SECS: u64 = 300;
 const QUARANTINE_TTL_NS: u64 = QUARANTINE_TTL_SECS * 1_000_000_000;
+const MAX_CONSUMED_RECEIPTS: usize = 100_000;
 
 #[derive(Debug, Clone)]
 struct QuarantinedBoundaryChannel {
@@ -722,6 +724,37 @@ impl BoundaryChannelQuarantineState {
                 reason,
             },
         );
+    }
+}
+
+#[derive(Debug, Default)]
+struct ConsumedRedundancyReceiptCache {
+    bindings: HashMap<String, ConsumedRedundancyReceiptBinding>,
+    insertion_order: VecDeque<String>,
+}
+
+impl ConsumedRedundancyReceiptCache {
+    fn get(&self, receipt_id: &str) -> Option<&ConsumedRedundancyReceiptBinding> {
+        self.bindings.get(receipt_id)
+    }
+
+    fn insert(&mut self, receipt_id: String, binding: ConsumedRedundancyReceiptBinding) {
+        if let Some(existing) = self.bindings.get_mut(&receipt_id) {
+            *existing = binding;
+            return;
+        }
+
+        while self.bindings.len() >= MAX_CONSUMED_RECEIPTS {
+            let Some(oldest_receipt_id) = self.insertion_order.pop_front() else {
+                break;
+            };
+            if self.bindings.remove(&oldest_receipt_id).is_some() {
+                break;
+            }
+        }
+
+        self.insertion_order.push_back(receipt_id.clone());
+        self.bindings.insert(receipt_id, binding);
     }
 }
 
@@ -902,7 +935,7 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     ///
     /// Authoritative single-use state is persisted in the ledger; this cache
     /// avoids repeated scans for recently consumed receipts.
-    consumed_redundancy_receipts: Arc<Mutex<HashMap<String, ConsumedRedundancyReceiptBinding>>>,
+    consumed_redundancy_receipts: Arc<Mutex<ConsumedRedundancyReceiptCache>>,
 }
 
 #[derive(Clone)]
@@ -929,6 +962,13 @@ struct BoundaryFlowHints {
     leakage_budget_receipt: Option<LeakageBudgetHints>,
     #[serde(default)]
     timing_channel: Option<TimingChannelHints>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct BoundaryFlowHintsEnvelope {
+    #[serde(default)]
+    boundary_flow: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1057,7 +1097,9 @@ impl SessionDispatcher<InMemoryManifestStore> {
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
-            consumed_redundancy_receipts: Arc::new(Mutex::new(HashMap::new())),
+            consumed_redundancy_receipts: Arc::new(Mutex::new(
+                ConsumedRedundancyReceiptCache::default(),
+            )),
         }
     }
 
@@ -1093,7 +1135,9 @@ impl SessionDispatcher<InMemoryManifestStore> {
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
-            consumed_redundancy_receipts: Arc::new(Mutex::new(HashMap::new())),
+            consumed_redundancy_receipts: Arc::new(Mutex::new(
+                ConsumedRedundancyReceiptCache::default(),
+            )),
         }
     }
 }
@@ -1134,7 +1178,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
-            consumed_redundancy_receipts: Arc::new(Mutex::new(HashMap::new())),
+            consumed_redundancy_receipts: Arc::new(Mutex::new(
+                ConsumedRedundancyReceiptCache::default(),
+            )),
         }
     }
 
@@ -1175,7 +1221,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
-            consumed_redundancy_receipts: Arc::new(Mutex::new(HashMap::new())),
+            consumed_redundancy_receipts: Arc::new(Mutex::new(
+                ConsumedRedundancyReceiptCache::default(),
+            )),
         }
     }
 
@@ -1232,7 +1280,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
-            consumed_redundancy_receipts: Arc::new(Mutex::new(HashMap::new())),
+            consumed_redundancy_receipts: Arc::new(Mutex::new(
+                ConsumedRedundancyReceiptCache::default(),
+            )),
         }
     }
 
@@ -2153,7 +2203,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             Ok(
                 ToolDecision::Allow { policy_hash, .. }
                 | ToolDecision::DedupeCacheHit { policy_hash, .. },
-            ) => *policy_hash != [0u8; 32] && *policy_hash == admitted_policy_root_digest,
+            ) => {
+                let zero_digest = [0u8; 32];
+                let is_non_zero = !bool::from(policy_hash.ct_eq(&zero_digest));
+                let digest_matches = bool::from(policy_hash.ct_eq(&admitted_policy_root_digest));
+                is_non_zero && digest_matches
+            },
             _ => false,
         }
     }
@@ -2257,17 +2312,15 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     fn extract_boundary_flow_hints(
         request_arguments: &[u8],
     ) -> Result<Option<BoundaryFlowHints>, String> {
-        let Ok(request_json) = serde_json::from_slice::<serde_json::Value>(request_arguments)
-        else {
-            return Ok(None);
-        };
-        let Some(boundary_flow) = request_json.get("boundary_flow") else {
+        let envelope = serde_json::from_slice::<BoundaryFlowHintsEnvelope>(request_arguments)
+            .unwrap_or_default();
+        let Some(boundary_flow) = envelope.boundary_flow else {
             return Ok(None);
         };
         if boundary_flow.is_null() {
             return Ok(None);
         }
-        serde_json::from_value::<BoundaryFlowHints>(boundary_flow.clone())
+        serde_json::from_value::<BoundaryFlowHints>(boundary_flow)
             .map(Some)
             .map_err(|error| format!("invalid boundary_flow hints: {error}"))
     }
@@ -2740,19 +2793,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         })
     }
 
-    /// Derive a PCAC ledger anchor from a validated ledger hash chain.
+    /// Derive a PCAC ledger anchor from the current persisted chain tip.
     ///
-    /// Fail-closed: chain validation errors are surfaced to callers so
-    /// authority checks can deny requests rather than trusting corrupted state.
+    /// Startup validates full-chain integrity; request-time derivation must
+    /// stay O(1) by using the latest persisted `event_hash` value.
     fn derive_pcac_ledger_anchor(ledger: &dyn LedgerEventEmitter) -> Result<Hash, String> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"pcac-ledger-anchor-v1");
         let count = ledger.get_event_count() as u64;
         hasher.update(&count.to_le_bytes());
-        let chain_hash = ledger
-            .derive_event_chain_hash()
-            .map_err(|e| format!("ledger hash-chain validation failed: {e}"))?;
-        hasher.update(chain_hash.as_bytes());
+        let chain_tip = ledger
+            .get_latest_event_hash()
+            .map_err(|e| format!("ledger chain-tip lookup failed: {e}"))?
+            .unwrap_or_else(|| "genesis".to_string());
+        hasher.update(chain_tip.as_bytes());
         Ok(*hasher.finalize().as_bytes())
     }
 
@@ -7721,7 +7775,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pcac_ledger_anchor_fails_closed_on_tampered_intermediate_event() {
+    fn test_pcac_ledger_anchor_uses_latest_tip_and_chain_validation_catches_tampering() {
         use rusqlite::{Connection, params};
 
         use crate::ledger::SqliteLedgerEventEmitter;
@@ -7836,11 +7890,15 @@ mod tests {
                 .expect("tamper update should succeed");
         }
 
-        let tampered_anchor =
-            SessionDispatcher::<InMemoryManifestStore>::derive_pcac_ledger_anchor(&emitter);
+        SessionDispatcher::<InMemoryManifestStore>::derive_pcac_ledger_anchor(&emitter)
+            .expect("request-time ledger anchor derives from latest chain tip");
+
+        let chain_err = emitter
+            .derive_event_chain_hash()
+            .expect_err("startup/recovery chain validation must detect tampering");
         assert!(
-            tampered_anchor.is_err(),
-            "tampered intermediate event must fail chain-anchor derivation"
+            chain_err.contains("hash chain broken"),
+            "tampered intermediate event must fail full chain validation"
         );
     }
 

@@ -550,6 +550,19 @@ pub trait LedgerEventEmitter: Send + Sync {
         None
     }
 
+    /// Returns the latest persisted event hash chain tip in O(1) time.
+    ///
+    /// `Ok(None)` indicates an empty ledger with no persisted events.
+    /// Implementations should use a direct lookup against persisted chain-tip
+    /// state (for `SQLite`: latest `event_hash`) rather than re-deriving the
+    /// full chain.
+    fn get_latest_event_hash(&self) -> Result<Option<String>, String> {
+        if self.get_event_count() == 0 {
+            return Ok(None);
+        }
+        self.derive_event_chain_hash().map(Some)
+    }
+
     /// Derives the authoritative ledger chain tip hash.
     ///
     /// Implementations should fail-closed if chain integrity cannot be
