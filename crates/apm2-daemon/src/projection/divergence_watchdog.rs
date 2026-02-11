@@ -916,33 +916,19 @@ impl TryFrom<i32> for ResolutionType {
 
 impl From<&InterventionFreeze> for ProtoInterventionFreeze {
     fn from(freeze: &InterventionFreeze) -> Self {
-        // Convert domain time_envelope_ref (String) to proto TimeEnvelopeRef
-        // Empty string maps to None; non-empty string maps to Some(TimeEnvelopeRef)
+        // Convert domain time_envelope_ref (String) to proto TimeEnvelopeRef.
+        // Empty string maps to None; non-empty string stores raw UTF-8 bytes
+        // in the proto `hash` field for lossless roundtrip.
         //
-        // TCK-00307 MAJOR 2 FIX: Properly handle time_envelope_ref conversion.
-        // The time_envelope_ref may be a URI like "htf:tick:{ts}" or a hex hash.
+        // TCK-00469 FIX: Store original string as UTF-8 bytes (lossless).
+        // Previous implementation hashed non-hex strings (e.g. "htf:tick:*"),
+        // breaking canonical bytes and signature verification after roundtrip.
         let time_envelope_ref = if freeze.time_envelope_ref.is_empty() {
             None
         } else {
-            // Try hex decode first; if invalid (e.g., URI format), hash the string
-            let hash = if freeze.time_envelope_ref.len() == 64
-                && freeze
-                    .time_envelope_ref
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit())
-            {
-                hex::decode(&freeze.time_envelope_ref).unwrap_or_else(|_| {
-                    blake3::hash(freeze.time_envelope_ref.as_bytes())
-                        .as_bytes()
-                        .to_vec()
-                })
-            } else {
-                // URI format -> hash to derive 32 bytes
-                blake3::hash(freeze.time_envelope_ref.as_bytes())
-                    .as_bytes()
-                    .to_vec()
-            };
-            Some(TimeEnvelopeRef { hash })
+            Some(TimeEnvelopeRef {
+                hash: freeze.time_envelope_ref.as_bytes().to_vec(),
+            })
         };
 
         Self {
@@ -999,13 +985,22 @@ impl TryFrom<&ProtoInterventionFreeze> for InterventionFreeze {
                 ))
             })?;
 
-        // Convert proto time_envelope_ref (Option<TimeEnvelopeRef>) to domain (hex
-        // String) None maps to empty string; Some(TimeEnvelopeRef) maps to
-        // hex-encoded hash
+        // Convert proto time_envelope_ref (Option<TimeEnvelopeRef>) to domain
+        // String. None maps to empty string; Some(TimeEnvelopeRef) recovers
+        // the original UTF-8 string from the proto `hash` bytes (lossless).
+        //
+        // TCK-00469 FIX: Recover original UTF-8 string instead of hex-encoding.
         let time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
-            .map(|ter| hex::encode(&ter.hash))
+            .map(|ter| {
+                String::from_utf8(ter.hash.clone()).map_err(|_| {
+                    DivergenceError::InvalidConfiguration(
+                        "time_envelope_ref contains invalid UTF-8".to_string(),
+                    )
+                })
+            })
+            .transpose()?
             .unwrap_or_default();
 
         Ok(Self {
@@ -1033,33 +1028,19 @@ impl TryFrom<ProtoInterventionFreeze> for InterventionFreeze {
 
 impl From<&InterventionUnfreeze> for ProtoInterventionUnfreeze {
     fn from(unfreeze: &InterventionUnfreeze) -> Self {
-        // Convert domain time_envelope_ref (String) to proto TimeEnvelopeRef
-        // Empty string maps to None; non-empty string maps to Some(TimeEnvelopeRef)
+        // Convert domain time_envelope_ref (String) to proto TimeEnvelopeRef.
+        // Empty string maps to None; non-empty string stores raw UTF-8 bytes
+        // in the proto `hash` field for lossless roundtrip.
         //
-        // TCK-00307 MAJOR 2 FIX: Properly handle time_envelope_ref conversion.
-        // The time_envelope_ref may be a URI like "htf:tick:{ts}" or a hex hash.
+        // TCK-00469 FIX: Store original string as UTF-8 bytes (lossless).
+        // Previous implementation hashed non-hex strings (e.g. "htf:tick:*"),
+        // breaking canonical bytes and signature verification after roundtrip.
         let time_envelope_ref = if unfreeze.time_envelope_ref.is_empty() {
             None
         } else {
-            // Try hex decode first; if invalid (e.g., URI format), hash the string
-            let hash = if unfreeze.time_envelope_ref.len() == 64
-                && unfreeze
-                    .time_envelope_ref
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit())
-            {
-                hex::decode(&unfreeze.time_envelope_ref).unwrap_or_else(|_| {
-                    blake3::hash(unfreeze.time_envelope_ref.as_bytes())
-                        .as_bytes()
-                        .to_vec()
-                })
-            } else {
-                // URI format -> hash to derive 32 bytes
-                blake3::hash(unfreeze.time_envelope_ref.as_bytes())
-                    .as_bytes()
-                    .to_vec()
-            };
-            Some(TimeEnvelopeRef { hash })
+            Some(TimeEnvelopeRef {
+                hash: unfreeze.time_envelope_ref.as_bytes().to_vec(),
+            })
         };
 
         Self {
@@ -1102,13 +1083,22 @@ impl TryFrom<&ProtoInterventionUnfreeze> for InterventionUnfreeze {
             Some(proto.adjudication_id.clone())
         };
 
-        // Convert proto time_envelope_ref (Option<TimeEnvelopeRef>) to domain (hex
-        // String) None maps to empty string; Some(TimeEnvelopeRef) maps to
-        // hex-encoded hash
+        // Convert proto time_envelope_ref (Option<TimeEnvelopeRef>) to domain
+        // String. None maps to empty string; Some(TimeEnvelopeRef) recovers
+        // the original UTF-8 string from the proto `hash` bytes (lossless).
+        //
+        // TCK-00469 FIX: Recover original UTF-8 string instead of hex-encoding.
         let time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
-            .map(|ter| hex::encode(&ter.hash))
+            .map(|ter| {
+                String::from_utf8(ter.hash.clone()).map_err(|_| {
+                    DivergenceError::InvalidConfiguration(
+                        "time_envelope_ref contains invalid UTF-8".to_string(),
+                    )
+                })
+            })
+            .transpose()?
             .unwrap_or_default();
 
         Ok(Self {
@@ -3616,8 +3606,8 @@ pub mod tests {
     #[test]
     fn test_intervention_freeze_proto_conversion() {
         let signer = Signer::generate();
-        // Use a valid 64-character hex string (32 bytes) for time_envelope_ref
-        let time_envelope_hash = hex::encode([0xab; 32]);
+        // TCK-00469: Use runtime htf:tick format to prove lossless roundtrip.
+        let time_envelope_ref_str = "htf:tick:1707123456789000000";
         let freeze = InterventionFreezeBuilder::new("freeze-001")
             .scope(FreezeScope::Repository)
             .scope_value("test-repo")
@@ -3626,7 +3616,7 @@ pub mod tests {
             .expected_trunk_head([0x42; 32])
             .actual_trunk_head([0x99; 32])
             .gate_actor_id("watchdog-001")
-            .time_envelope_ref(&time_envelope_hash)
+            .time_envelope_ref(time_envelope_ref_str)
             .build_and_sign(&signer);
 
         // Manual -> Proto
@@ -3643,11 +3633,11 @@ pub mod tests {
         assert_eq!(proto.actual_trunk_head, freeze.actual_trunk_head.to_vec());
         assert_eq!(proto.gate_actor_id, freeze.gate_actor_id);
         assert_eq!(proto.gate_signature, freeze.gate_signature.to_vec());
-        // Compare time_envelope_ref by converting proto back to hex string
+        // TCK-00469: proto hash field stores raw UTF-8 bytes of the original string.
         let proto_time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
-            .map(|ter| hex::encode(&ter.hash))
+            .map(|ter| String::from_utf8(ter.hash.clone()).unwrap())
             .unwrap_or_default();
         assert_eq!(proto_time_envelope_ref, freeze.time_envelope_ref);
 
@@ -3656,17 +3646,62 @@ pub mod tests {
         assert_eq!(recovered, freeze);
     }
 
+    /// TCK-00469: Verify that freeze with htf:tick format survives proto
+    /// roundtrip and signature verification still passes.
+    #[test]
+    fn test_intervention_freeze_proto_roundtrip_htf_tick_signature() {
+        use ed25519_dalek::Verifier;
+
+        let signer = Signer::generate();
+        let time_envelope_ref_str = "htf:tick:1707123456789000000";
+        let freeze = InterventionFreezeBuilder::new("freeze-sig-001")
+            .scope(FreezeScope::Repository)
+            .scope_value("test-repo")
+            .trigger_defect_id("defect-sig-001")
+            .frozen_at(1_000_000_000)
+            .expected_trunk_head([0x42; 32])
+            .actual_trunk_head([0x99; 32])
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref(time_envelope_ref_str)
+            .try_build_and_sign(&signer)
+            .unwrap();
+
+        // Roundtrip through proto
+        let proto: ProtoInterventionFreeze = freeze.clone().into();
+        let recovered = InterventionFreeze::try_from(proto).unwrap();
+
+        // Canonical bytes must match (lossless roundtrip)
+        assert_eq!(
+            freeze.canonical_bytes(),
+            recovered.canonical_bytes(),
+            "canonical bytes must survive proto roundtrip for htf:tick format"
+        );
+
+        // Signature must still verify on the recovered struct
+        let verifying_key = signer.verifying_key();
+        let signature = ed25519_dalek::Signature::from_bytes(&recovered.gate_signature);
+        let domain_sep = b"INTERVENTION_FREEZE:";
+        let canonical = recovered.canonical_bytes();
+        let mut msg = Vec::with_capacity(domain_sep.len() + canonical.len());
+        msg.extend_from_slice(domain_sep);
+        msg.extend_from_slice(&canonical);
+        assert!(
+            verifying_key.verify(&msg, &signature).is_ok(),
+            "signature must verify after proto roundtrip with htf:tick format"
+        );
+    }
+
     #[test]
     fn test_intervention_unfreeze_proto_conversion() {
         let signer = Signer::generate();
-        // Use a valid 64-character hex string (32 bytes) for time_envelope_ref
-        let time_envelope_hash = hex::encode([0xcd; 32]);
+        // TCK-00469: Use runtime htf:tick format to prove lossless roundtrip.
+        let time_envelope_ref_str = "htf:tick:1707123456789000000";
         let unfreeze = InterventionUnfreezeBuilder::new("freeze-001")
             .resolution_type(ResolutionType::Adjudication)
             .adjudication_id("adj-001")
             .unfrozen_at(2_000_000_000)
             .gate_actor_id("operator-001")
-            .time_envelope_ref(&time_envelope_hash)
+            .time_envelope_ref(time_envelope_ref_str)
             .build_and_sign(&signer);
 
         // Manual -> Proto
@@ -3677,11 +3712,11 @@ pub mod tests {
         assert_eq!(proto.unfrozen_at, unfreeze.unfrozen_at);
         assert_eq!(proto.gate_actor_id, unfreeze.gate_actor_id);
         assert_eq!(proto.gate_signature, unfreeze.gate_signature.to_vec());
-        // Compare time_envelope_ref by converting proto back to hex string
+        // TCK-00469: proto hash field stores raw UTF-8 bytes of the original string.
         let proto_time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
-            .map(|ter| hex::encode(&ter.hash))
+            .map(|ter| String::from_utf8(ter.hash.clone()).unwrap())
             .unwrap_or_default();
         assert_eq!(proto_time_envelope_ref, unfreeze.time_envelope_ref);
 
@@ -3690,16 +3725,58 @@ pub mod tests {
         assert_eq!(recovered, unfreeze);
     }
 
+    /// TCK-00469: Verify that unfreeze with htf:tick format survives proto
+    /// roundtrip and signature verification still passes.
+    #[test]
+    fn test_intervention_unfreeze_proto_roundtrip_htf_tick_signature() {
+        use ed25519_dalek::Verifier;
+
+        let signer = Signer::generate();
+        let time_envelope_ref_str = "htf:tick:1707123456789000000";
+        let unfreeze = InterventionUnfreezeBuilder::new("freeze-sig-002")
+            .resolution_type(ResolutionType::Adjudication)
+            .adjudication_id("adj-sig-002")
+            .unfrozen_at(2_000_000_000)
+            .gate_actor_id("operator-001")
+            .time_envelope_ref(time_envelope_ref_str)
+            .try_build_and_sign(&signer)
+            .unwrap();
+
+        // Roundtrip through proto
+        let proto: ProtoInterventionUnfreeze = unfreeze.clone().into();
+        let recovered = InterventionUnfreeze::try_from(proto).unwrap();
+
+        // Canonical bytes must match (lossless roundtrip)
+        assert_eq!(
+            unfreeze.canonical_bytes(),
+            recovered.canonical_bytes(),
+            "canonical bytes must survive proto roundtrip for htf:tick format"
+        );
+
+        // Signature must still verify on the recovered struct
+        let verifying_key = signer.verifying_key();
+        let signature = ed25519_dalek::Signature::from_bytes(&recovered.gate_signature);
+        let domain_sep = b"INTERVENTION_UNFREEZE:";
+        let canonical = recovered.canonical_bytes();
+        let mut msg = Vec::with_capacity(domain_sep.len() + canonical.len());
+        msg.extend_from_slice(domain_sep);
+        msg.extend_from_slice(&canonical);
+        assert!(
+            verifying_key.verify(&msg, &signature).is_ok(),
+            "signature must verify after proto roundtrip with htf:tick format"
+        );
+    }
+
     #[test]
     fn test_intervention_unfreeze_proto_conversion_none_adjudication() {
         let signer = Signer::generate();
-        // Use a valid 64-character hex string (32 bytes) for time_envelope_ref
-        let time_envelope_hash = hex::encode([0xef; 32]);
+        // TCK-00469: Use runtime htf:tick format to prove lossless roundtrip.
+        let time_envelope_ref_str = "htf:tick:1707123456789000000";
         let unfreeze = InterventionUnfreezeBuilder::new("freeze-001")
             .resolution_type(ResolutionType::Manual)
             .unfrozen_at(2_000_000_000)
             .gate_actor_id("operator-001")
-            .time_envelope_ref(&time_envelope_hash)
+            .time_envelope_ref(time_envelope_ref_str)
             .build_and_sign(&signer);
 
         // Manual -> Proto (None -> empty string)

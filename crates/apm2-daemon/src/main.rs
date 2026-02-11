@@ -58,7 +58,7 @@ use apm2_core::supervisor::Supervisor;
 use apm2_daemon::gate::{GateOrchestrator, GateOrchestratorConfig};
 use apm2_daemon::ledger::{SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use apm2_daemon::metrics::{SharedMetricsRegistry, new_shared_registry};
-use apm2_daemon::projection::{DivergenceWatchdog, DivergenceWatchdogConfig};
+use apm2_daemon::projection::{DivergenceWatchdog, DivergenceWatchdogConfig, SystemTimeSource};
 use apm2_daemon::protocol; // Import from library
 use apm2_daemon::protocol::socket_manager::{SocketManager, SocketManagerConfig};
 use apm2_daemon::state::{DaemonStateHandle, DispatcherState, SharedDispatcherState, SharedState};
@@ -1468,7 +1468,12 @@ async fn async_main(args: Args) -> Result<()> {
     //   - Ledger database must be configured (sqlite_conn is Some)
     //   - Divergence watchdog must be enabled in ecosystem config
     //   - GitHub token must be available via environment variable
-    {
+    //
+    // TCK-00469: The watchdog is wrapped in Arc so both the background polling
+    // task and the DispatcherState share the same instance, enabling IPC
+    // handlers to call register_durable_recovery_evidence / create_unfreeze /
+    // apply_unfreeze.
+    let watchdog_arc_for_dispatcher: Option<Arc<DivergenceWatchdog<SystemTimeSource>>> = {
         let dw_config = &daemon_config.config.daemon.divergence_watchdog;
         if dw_config.enabled {
             // TCK-00408: Fail closed when mandatory persistence dependencies
@@ -1512,7 +1517,7 @@ async fn async_main(args: Args) -> Result<()> {
                 Signer::from_bytes(&lifecycle_signing_key_bytes).map_err(|e| {
                     anyhow::anyhow!("failed to derive watchdog signer from lifecycle key: {e}")
                 })?;
-            let watchdog = DivergenceWatchdog::new(watchdog_signer, watchdog_config);
+            let watchdog = Arc::new(DivergenceWatchdog::new(watchdog_signer, watchdog_config));
 
             info!(
                 repo = %repo_id,
@@ -1538,7 +1543,11 @@ async fn async_main(args: Args) -> Result<()> {
             let watchdog_state = state.clone();
             let watchdog_repo_id = repo_id;
 
+            // TCK-00469: Clone the Arc for the background task; the original
+            // is returned from this block for dispatcher wiring.
+            let watchdog_task_ref = Arc::clone(&watchdog);
             tokio::spawn(async move {
+                let watchdog = watchdog_task_ref;
                 let mut interval = tokio::time::interval(poll_interval);
                 let precautionary_freeze_id = format!("precautionary-{watchdog_repo_id}");
                 let mut consecutive_check_errors: u32 = 0;
@@ -1765,10 +1774,28 @@ async fn async_main(args: Args) -> Result<()> {
                     }
                 }
             });
+
+            Some(watchdog)
         } else {
             info!("Divergence watchdog disabled");
+            None
         }
-    }
+    };
+
+    // TCK-00469: Wire divergence watchdog Arc into dispatcher state so IPC
+    // handlers can call register_durable_recovery_evidence / create_unfreeze /
+    // apply_unfreeze.
+    // Safety: dispatcher_state has not yet been cloned at this point in startup.
+    let dispatcher_state = if let Some(watchdog) = watchdog_arc_for_dispatcher {
+        match Arc::try_unwrap(dispatcher_state) {
+            Ok(inner) => Arc::new(inner.with_divergence_watchdog(watchdog)),
+            Err(_arc) => {
+                unreachable!("dispatcher_state Arc should have single owner at watchdog bootstrap");
+            },
+        }
+    } else {
+        dispatcher_state
+    };
 
     // TCK-00279: Start ProtocolServer-only control plane
     // This is the ONLY control-plane listener. Legacy JSON IPC has been removed per
