@@ -141,9 +141,14 @@ impl SqliteLedgerEventEmitter {
         // SECURITY (TCK-00407 — Receipt Identity Constraints):
         //
         // Enforce two complementary receipt constraints:
-        // - transport-level uniqueness by `receipt_id` (global uniqueness)
+        // - review-receipt uniqueness by `receipt_id` scoped to
+        //   `review_receipt_recorded`/`review_blocked_recorded`
         // - semantic identity uniqueness by tuple `(receipt_id, lease_id, work_id,
-        //   changeset_digest)`
+        //   changeset_digest)` for review receipt events
+        //
+        // Additionally, `redundancy_receipt_consumed` has its own uniqueness
+        // constraint on `receipt_id` so a review receipt and its subsequent
+        // consumption can share the same `receipt_id` without collision.
         //
         // `work_id` in the semantic tuple is sourced from the payload field
         // and falls back to the row's `work_id` column for legacy rows that
@@ -187,10 +192,20 @@ impl SqliteLedgerEventEmitter {
              )",
             [],
         )?;
+        // Migrate legacy global index shape to scoped review-receipt uniqueness.
+        conn.execute("DROP INDEX IF EXISTS idx_unique_receipt_id", [])?;
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_receipt_id \
              ON ledger_events(json_extract(CAST(payload AS TEXT), '$.receipt_id')) \
-             WHERE json_extract(CAST(payload AS TEXT), '$.receipt_id') IS NOT NULL",
+             WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
+             AND json_extract(CAST(payload AS TEXT), '$.receipt_id') IS NOT NULL",
+            [],
+        )?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_receipt_consumed \
+             ON ledger_events(json_extract(CAST(payload AS TEXT), '$.receipt_id')) \
+             WHERE event_type = 'redundancy_receipt_consumed' \
+             AND json_extract(CAST(payload AS TEXT), '$.receipt_id') IS NOT NULL",
             [],
         )?;
         conn.execute(
@@ -3774,10 +3789,10 @@ mod tests {
         );
     }
 
-    /// Regression: `receipt_id` uniqueness is enforced at the `SQLite` boundary
-    /// even when semantic tuple fields differ.
+    /// Regression: review receipt and consumption events can share a receipt ID
+    /// while per-event-type uniqueness remains enforced.
     #[test]
-    fn init_schema_restores_global_receipt_id_uniqueness() {
+    fn init_schema_scopes_receipt_id_uniqueness_by_event_type() {
         let conn = Connection::open_in_memory().unwrap();
         SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
 
@@ -3793,7 +3808,22 @@ mod tests {
             .unwrap();
         assert!(
             has_receipt_id_unique_index,
-            "init_schema must restore idx_unique_receipt_id for DB-level race protection"
+            "init_schema must restore scoped idx_unique_receipt_id for review receipt events"
+        );
+
+        let has_receipt_consumed_unique_index: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'index' AND name = 'idx_unique_receipt_consumed'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            has_receipt_consumed_unique_index,
+            "init_schema must create idx_unique_receipt_consumed for consumption events"
         );
 
         conn.execute(
@@ -3811,6 +3841,22 @@ mod tests {
             ],
         )
         .unwrap();
+
+        conn.execute(
+            "INSERT INTO ledger_events
+                (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "receipt-consumed-base",
+                "redundancy_receipt_consumed",
+                "session-base",
+                "actor-base",
+                br#"{"receipt_id":"RR-UNIQUE-001","request_id":"REQ-BASE","tool_class":"inference"}"#.as_slice(),
+                b"sig-consumed".as_slice(),
+                101_i64
+            ],
+        )
+        .expect("review and consumed events must be allowed to share receipt_id");
 
         let duplicate_err = conn
             .execute(
@@ -3835,6 +3881,135 @@ mod tests {
                 || duplicate_err_text.contains("UNIQUE constraint failed"),
             "expected UNIQUE failure for idx_unique_receipt_id, got: {duplicate_err_text}"
         );
+
+        let duplicate_consumed_err = conn
+            .execute(
+                "INSERT INTO ledger_events
+                    (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "receipt-consumed-duplicate",
+                    "redundancy_receipt_consumed",
+                    "session-other",
+                    "actor-other",
+                    br#"{"receipt_id":"RR-UNIQUE-001","request_id":"REQ-OTHER","tool_class":"inference"}"#.as_slice(),
+                    b"sig-consumed-other".as_slice(),
+                    103_i64
+                ],
+            )
+            .expect_err("duplicate redundancy consumption receipt_id must be rejected");
+        let duplicate_consumed_err_text = duplicate_consumed_err.to_string();
+        assert!(
+            duplicate_consumed_err_text.contains("idx_unique_receipt_consumed")
+                || duplicate_consumed_err_text.contains("UNIQUE constraint failed"),
+            "expected UNIQUE failure for idx_unique_receipt_consumed, got: {duplicate_consumed_err_text}"
+        );
+    }
+
+    #[test]
+    fn derive_event_chain_hash_detects_tampered_intermediate_event_hash() {
+        let emitter = test_emitter();
+        let claim = WorkClaim {
+            work_id: "W-HASH-CHAIN-001".to_string(),
+            lease_id: "L-HASH-CHAIN-001".to_string(),
+            actor_id: "uid:1000".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+
+        emitter
+            .emit_work_claimed(&claim, 1_700_000_000_000_000_000)
+            .expect("work_claimed must emit for hash-chain test");
+        emitter
+            .emit_work_transitioned(&WorkTransition {
+                work_id: "W-HASH-CHAIN-001",
+                from_state: "Open",
+                to_state: "Claimed",
+                rationale_code: "hash_chain_test",
+                previous_transition_count: 0,
+                actor_id: "uid:1000",
+                timestamp_ns: 1_700_000_000_000_000_001,
+            })
+            .expect("work_transitioned must emit for hash-chain test");
+        emitter
+            .emit_session_terminated(
+                "SESS-HASH-CHAIN-001",
+                "W-HASH-CHAIN-001",
+                0,
+                "test-complete",
+                "uid:1000",
+                1_700_000_000_000_000_002,
+            )
+            .expect("session_terminated must emit for hash-chain test");
+
+        emitter
+            .derive_event_chain_hash()
+            .expect("initial event chain derivation should succeed");
+
+        {
+            let conn = emitter
+                .conn
+                .lock()
+                .expect("sqlite lock should be available for tamper mutation");
+            conn.execute(
+                "UPDATE ledger_events SET event_hash = 'tampered' WHERE rowid = 2",
+                [],
+            )
+            .expect("tamper mutation should succeed for regression coverage");
+        }
+
+        let chain_err = emitter
+            .derive_event_chain_hash()
+            .expect_err("tampered intermediate hash must fail chain derivation");
+        assert!(
+            chain_err.contains("hash chain broken") && chain_err.contains("event_hash"),
+            "expected explicit hash-chain break diagnostics, got: {chain_err}"
+        );
+    }
+
+    #[test]
+    fn review_receipt_and_consumption_event_allow_same_receipt_id() {
+        let emitter = test_emitter();
+        let receipt_id = "RR-CONSUME-001";
+        let identity_proof_hash = [0xABu8; 32];
+
+        emitter
+            .emit_review_receipt(
+                "lease-consume-001",
+                "work-consume-001",
+                receipt_id,
+                &[0x01; 32],
+                &[0x02; 32],
+                &[0x03; 32],
+                &[0x04; 32],
+                &[0x05; 32],
+                "reviewer-consume-001",
+                1_700_000_000_000_000_100,
+                &identity_proof_hash,
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                None,
+            )
+            .expect("review receipt emission should succeed");
+
+        emitter
+            .emit_redundancy_receipt_consumed(
+                "session-consume-001",
+                receipt_id,
+                "REQ-CONSUME-001",
+                "inference",
+                "session-consume-001",
+                1_700_000_000_000_000_101,
+            )
+            .expect("consumption event should succeed for same receipt_id as review receipt");
+
+        let consumption = emitter
+            .get_redundancy_receipt_consumption(receipt_id)
+            .expect("consumption lookup should return emitted binding");
+        assert_eq!(consumption.request_id, "REQ-CONSUME-001");
+        assert_eq!(consumption.tool_class, "inference");
     }
 
     /// Verifies that `emit_review_blocked_receipt` includes replay-critical

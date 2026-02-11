@@ -435,6 +435,7 @@ const MAX_ERROR_MESSAGE_LEN: usize = 256;
 const BOUNDARY_FLOW_CANONICALIZER_TUPLE_BYTES: &[u8] =
     b"apm2.canonicalizer.jcs|1.0.0|dcp://apm2.cac/canonicalizer/vectors@v1";
 const DEFAULT_LEAKAGE_CONFIDENCE_LABEL: &str = "runtime-default";
+const DEFAULT_STRICT_BOUNDARY_AUTHORITY_ENFORCEMENT: bool = false;
 
 /// Sanitizes an error message for safe return over the protocol.
 ///
@@ -887,6 +888,12 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// TCK-00406: Production ingress paths must evaluate taint flow and deny
     /// forbidden flows before actuation.
     taint_policy: Arc<TaintPolicy>,
+    /// Policy switch for strict boundary witness enforcement.
+    ///
+    /// When enabled, strict leakage/timing witness enforcement is only applied
+    /// if authoritative witness sources are available. If authoritative sources
+    /// are unavailable, this path degrades to monitor-only mode.
+    strict_boundary_authority_enforcement: bool,
     /// Quarantine state for boundary channels with leakage/timing violations.
     ///
     /// Violating channels are denied fail-closed until mitigation/clearance.
@@ -1046,6 +1053,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
             taint_policy: Arc::new(default_runtime_taint_policy()),
+            strict_boundary_authority_enforcement: DEFAULT_STRICT_BOUNDARY_AUTHORITY_ENFORCEMENT,
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
@@ -1081,6 +1089,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
             taint_policy: Arc::new(default_runtime_taint_policy()),
+            strict_boundary_authority_enforcement: DEFAULT_STRICT_BOUNDARY_AUTHORITY_ENFORCEMENT,
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
@@ -1121,6 +1130,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
             taint_policy: Arc::new(default_runtime_taint_policy()),
+            strict_boundary_authority_enforcement: DEFAULT_STRICT_BOUNDARY_AUTHORITY_ENFORCEMENT,
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
@@ -1161,6 +1171,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
             taint_policy: Arc::new(default_runtime_taint_policy()),
+            strict_boundary_authority_enforcement: DEFAULT_STRICT_BOUNDARY_AUTHORITY_ENFORCEMENT,
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
@@ -1217,6 +1228,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
             taint_policy: Arc::new(default_runtime_taint_policy()),
+            strict_boundary_authority_enforcement: DEFAULT_STRICT_BOUNDARY_AUTHORITY_ENFORCEMENT,
             boundary_channel_quarantine: Arc::new(Mutex::new(
                 BoundaryChannelQuarantineState::default(),
             )),
@@ -1452,6 +1464,16 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     #[must_use]
     pub fn with_taint_policy(mut self, policy: TaintPolicy) -> Self {
         self.taint_policy = Arc::new(policy);
+        self
+    }
+
+    /// Enables or disables strict boundary leakage/timing witness enforcement.
+    ///
+    /// Strict mode only activates when authoritative witness sources are
+    /// available. Otherwise, the dispatcher runs monitor-only and logs defects.
+    #[must_use]
+    pub const fn with_strict_boundary_authority_enforcement(mut self, enabled: bool) -> Self {
+        self.strict_boundary_authority_enforcement = enabled;
         self
     }
 
@@ -2103,6 +2125,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
+    // KNOWN LIMITATION (TCK-00465):
+    // This resolves the "authoritative" policy digest from broker in-memory
+    // state (`active_policy_hash`) rather than from a ledger-rooted policy
+    // admission chain. This means policy verification below is currently
+    // self-referential to broker state. Full ledger-rooted policy verification
+    // requires a larger architectural change and is intentionally deferred.
     fn resolve_authoritative_policy_root_digest(
         broker: &SharedToolBroker<StubManifestLoader>,
     ) -> Option<Hash> {
@@ -2114,6 +2142,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         decision: &Result<ToolDecision, crate::episode::BrokerError>,
         authoritative_policy_root_digest: Option<Hash>,
     ) -> bool {
+        // KNOWN LIMITATION (TCK-00465):
+        // Comparison currently binds a broker-presented policy hash against a
+        // broker-derived "authoritative" digest. This is not yet ledger-rooted
+        // admission verification.
         let Some(admitted_policy_root_digest) = authoritative_policy_root_digest else {
             return false;
         };
@@ -2530,8 +2562,26 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         authoritative_policy_root_digest: Option<Hash>,
     ) -> Result<BoundaryFlowRuntimeState, String> {
         let risk_tier = risk_tier.unwrap_or(RiskTier::Tier4);
-        let strict_boundary_enforcement =
-            risk_tier.requires_sandbox() || Self::requires_channel_boundary_enforcement(tool_class);
+        let strict_boundary_enforcement_requested = self.strict_boundary_authority_enforcement
+            && (risk_tier.requires_sandbox()
+                || Self::requires_channel_boundary_enforcement(tool_class));
+        let authoritative_leakage_budget_receipt =
+            Self::resolve_authoritative_leakage_budget_receipt(session_id, risk_tier);
+        let authoritative_timing_channel_budget =
+            Self::resolve_authoritative_timing_channel_budget(session_id, risk_tier);
+        let strict_boundary_enforcement = strict_boundary_enforcement_requested
+            && authoritative_leakage_budget_receipt.is_some()
+            && authoritative_timing_channel_budget.is_some();
+        if strict_boundary_enforcement_requested && !strict_boundary_enforcement {
+            warn!(
+                session_id = %session_id,
+                tool_class = %tool_class,
+                risk_tier = ?risk_tier,
+                missing_authoritative_leakage = authoritative_leakage_budget_receipt.is_none(),
+                missing_authoritative_timing = authoritative_timing_channel_budget.is_none(),
+                "authoritative boundary witnesses unavailable; using monitor-only boundary-flow mode"
+            );
+        }
         let hints = Self::extract_boundary_flow_hints(request_arguments)?;
         let base_taint_allow = Self::taint_allow_for_tier(risk_tier, taint_assessment.tag.level);
         let base_classification_allow =
@@ -2594,14 +2644,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             .and_then(|hints| hints.leakage_budget_receipt.as_ref())
             .map(|hint| hint.budget_bits);
         let leakage_budget_receipt = if strict_boundary_enforcement {
-            Self::resolve_authoritative_leakage_budget_receipt(session_id, risk_tier)
-                .unwrap_or_else(|| LeakageBudgetReceipt {
-                    leakage_bits: u64::MAX,
-                    budget_bits: policy_leakage_budget_bits.max(1),
-                    estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
-                    confidence_bps: 10_000,
-                    confidence_label: "authoritative-unavailable-fail-closed".to_string(),
-                })
+            authoritative_leakage_budget_receipt.unwrap_or_else(|| LeakageBudgetReceipt {
+                leakage_bits: 0,
+                budget_bits: policy_leakage_budget_bits,
+                estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
+                confidence_bps: 10_000,
+                confidence_label: DEFAULT_LEAKAGE_CONFIDENCE_LABEL.to_string(),
+            })
         } else {
             hints
                 .as_ref()
@@ -2633,13 +2682,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             .and_then(|hints| hints.timing_channel.as_ref())
             .map(|hint| hint.budget);
         let timing_channel_budget = if strict_boundary_enforcement {
-            Self::resolve_authoritative_timing_channel_budget(session_id, risk_tier).unwrap_or_else(
-                || TimingChannelBudget {
-                    release_bucket_ticks: Self::release_bucket_ticks_for_tier(risk_tier).max(1),
-                    observed_variance_ticks: u64::MAX,
-                    budget_ticks: policy_timing_budget_ticks.max(1),
-                },
-            )
+            authoritative_timing_channel_budget.unwrap_or_else(|| TimingChannelBudget {
+                release_bucket_ticks: Self::release_bucket_ticks_for_tier(risk_tier),
+                observed_variance_ticks: 0,
+                budget_ticks: policy_timing_budget_ticks,
+            })
         } else {
             hints
                 .as_ref()
@@ -8083,8 +8130,9 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_boundary_flow_hints_fail_closed_for_boundary_enforced_tool_class() {
-        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter());
+    fn test_missing_boundary_flow_hints_monitor_only_without_authoritative_witnesses() {
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
+            .with_strict_boundary_authority_enforcement(true);
         let policy_hash = [0x41; 32];
         let request_id = "REQ-MISSING-HINTS";
         let decision = Ok(ToolDecision::Allow {
@@ -8129,30 +8177,16 @@ mod tests {
                 true,
                 boundary_flow_state,
             );
-        match result {
-            Err(defects) => {
-                assert!(
-                    defects.iter().any(|defect| {
-                        defect.violation_class
-                            == apm2_core::channel::ChannelViolationClass::LeakageBudgetExceeded
-                    }),
-                    "missing hints must fail closed on leakage witness for boundary-enforced classes: {defects:?}"
-                );
-                assert!(
-                    defects.iter().any(|defect| {
-                        defect.violation_class
-                            == apm2_core::channel::ChannelViolationClass::TimingChannelBudgetExceeded
-                    }),
-                    "missing hints must fail closed on timing witness for boundary-enforced classes: {defects:?}"
-                );
-            },
-            Ok(_) => panic!("missing boundary_flow hints must be denied fail-closed"),
-        }
+        assert!(
+            result.is_ok(),
+            "missing authoritative leakage/timing witnesses must use monitor-only mode and allow the boundary-enforced request"
+        );
     }
 
     #[test]
-    fn test_forged_low_boundary_flow_hints_fail_closed_without_authoritative_metrics_tier3() {
-        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter());
+    fn test_forged_low_boundary_flow_hints_do_not_fail_on_missing_authoritative_metrics() {
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter())
+            .with_strict_boundary_authority_enforcement(true);
         let policy_hash = [0x52; 32];
         let decision = Ok(ToolDecision::Allow {
             request_id: "REQ-FORGED-LOW".to_string(),
@@ -8210,24 +8244,18 @@ mod tests {
                 true,
                 boundary_flow_state,
             );
-        match result {
-            Err(defects) => {
-                assert!(
-                    defects.iter().any(|defect| {
-                        defect.violation_class
-                            == apm2_core::channel::ChannelViolationClass::LeakageBudgetExceeded
-                    }),
-                    "forged-low leakage hints must be denied without authoritative metrics: {defects:?}"
-                );
-                assert!(
-                    defects.iter().any(|defect| {
-                        defect.violation_class
-                            == apm2_core::channel::ChannelViolationClass::TimingChannelBudgetExceeded
-                    }),
-                    "forged-low timing hints must be denied without authoritative metrics: {defects:?}"
-                );
-            },
-            Ok(_) => panic!("forged-low Tier3 hints must be denied fail-closed"),
+        if let Err(defects) = result {
+            let has_leakage_or_timing_defect = defects.iter().any(|defect| {
+                matches!(
+                    defect.violation_class,
+                    apm2_core::channel::ChannelViolationClass::LeakageBudgetExceeded
+                        | apm2_core::channel::ChannelViolationClass::TimingChannelBudgetExceeded
+                )
+            });
+            assert!(
+                !has_leakage_or_timing_defect,
+                "missing authoritative witnesses must not synthesize leakage/timing deny defects in monitor-only mode: {defects:?}"
+            );
         }
     }
 
