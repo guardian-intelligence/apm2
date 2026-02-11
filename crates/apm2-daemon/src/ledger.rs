@@ -2764,8 +2764,11 @@ impl LeaseValidator for SqliteLeaseValidator {
         self.register_full_lease_inner(lease, Some(parent_lease_id))
     }
 
-    fn get_delegation_parent_lease_id(&self, lease_id: &str) -> Option<String> {
-        let conn = self.conn.lock().ok()?;
+    fn get_delegation_parent_lease_id(&self, lease_id: &str) -> Result<Option<String>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| format!("failed to acquire ledger lock: {e}"))?;
         let mut stmt = conn
             .prepare(
                 "SELECT payload FROM ledger_events \
@@ -2774,14 +2777,41 @@ impl LeaseValidator for SqliteLeaseValidator {
                  AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL \
                  ORDER BY rowid DESC LIMIT 1",
             )
-            .ok()?;
+            .map_err(|e| {
+                format!("failed to prepare delegation parent lookup for lease '{lease_id}': {e}")
+            })?;
 
-        let payload_bytes: Vec<u8> = stmt.query_row(params![lease_id], |row| row.get(0)).ok()?;
-        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
-        payload
-            .get("delegated_parent_lease_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
+        let payload_bytes: Option<Vec<u8>> = stmt
+            .query_row(params![lease_id], |row| row.get(0))
+            .optional()
+            .map_err(|e| {
+                format!("failed to query delegation parent metadata for lease '{lease_id}': {e}")
+            })?;
+        let Some(payload_bytes) = payload_bytes else {
+            return Ok(None);
+        };
+
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).map_err(|e| {
+            format!("failed to parse gate_lease_issued payload for lease '{lease_id}': {e}")
+        })?;
+
+        let Some(parent_value) = payload.get("delegated_parent_lease_id") else {
+            return Ok(None);
+        };
+        if parent_value.is_null() {
+            return Ok(None);
+        }
+        let parent_lease_id = parent_value.as_str().ok_or_else(|| {
+            format!(
+                "gate_lease_issued payload for lease '{lease_id}' has non-string delegated_parent_lease_id"
+            )
+        })?;
+        if parent_lease_id.is_empty() {
+            return Err(format!(
+                "gate_lease_issued payload for lease '{lease_id}' has empty delegated_parent_lease_id"
+            ));
+        }
+        Ok(Some(parent_lease_id.to_owned()))
     }
 }
 

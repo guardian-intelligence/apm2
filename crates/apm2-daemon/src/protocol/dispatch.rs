@@ -4917,9 +4917,10 @@ fn persist_delegate_sublease_satisfiability_artifact(
 /// Traverses persisted `SubleaseIssued` lineage by repeatedly reading the
 /// latest event for each lease ID and following its `parent_lease_id`.
 ///
-/// Fail-closed rule: if a lease is marked as delegated in authoritative lease
-/// metadata but no corresponding `SubleaseIssued` evidence exists, traversal
-/// returns an error instead of treating the lease as root.
+/// Fail-closed rule: if lineage metadata lookup fails, if a lease is marked as
+/// delegated but no corresponding `SubleaseIssued` evidence exists, or if an
+/// ancestor lease record is missing, traversal returns an error instead of
+/// treating the lease as root.
 ///
 /// Returns:
 /// - `depth`: number of sublease hops from `parent_lease_id` to the root lease
@@ -4949,19 +4950,33 @@ fn compute_sublease_parent_depth_and_ticks(
             ));
         }
 
-        let maybe_event = event_emitter
-            .get_events_by_work_id(&current_lease)
-            .into_iter()
+        let current_events = event_emitter.get_events_by_work_id(&current_lease);
+        let maybe_event = current_events
+            .iter()
             .rev()
             .find(|event| event.event_type == "SubleaseIssued");
 
         let Some(sublease_event) = maybe_event else {
-            if lease_validator
+            let persisted_parent = lease_validator
                 .get_delegation_parent_lease_id(&current_lease)
-                .is_some()
-            {
+                .map_err(|error| {
+                    format!(
+                        "delegation lineage metadata lookup failed for lease '{current_lease}': \
+                         {error}"
+                    )
+                })?;
+            if persisted_parent.is_some() {
                 return Err(format!(
                     "delegation lineage evidence missing for delegated lease '{current_lease}'"
+                ));
+            }
+            let has_sublease_child_reference = current_events
+                .iter()
+                .any(|event| event.event_type == "SubleaseIssued");
+            if has_sublease_child_reference {
+                return Err(format!(
+                    "delegation lineage root verification failed for lease '{current_lease}': \
+                     SubleaseIssued child reference exists but parent metadata is missing"
                 ));
             }
             return Ok((depth, ticks_used));
@@ -4975,6 +4990,12 @@ fn compute_sublease_parent_depth_and_ticks(
             extract_sublease_replay_bindings(&sublease_event.payload).map_err(|e| {
                 format!("invalid SubleaseIssued replay bindings for lease '{current_lease}': {e}")
             })?;
+        if lease_validator.get_gate_lease(&next_parent).is_none() {
+            return Err(format!(
+                "delegation lineage broken: lease '{current_lease}' references ancestor \
+                 '{next_parent}' with no authoritative gate_lease_issued record"
+            ));
+        }
 
         depth = depth
             .checked_add(1)
@@ -6260,10 +6281,11 @@ pub trait LeaseValidator: Send + Sync {
 
     /// Returns the persisted delegation parent lease ID for `lease_id`.
     ///
-    /// `None` indicates either root issuance or no persisted lineage metadata.
-    fn get_delegation_parent_lease_id(&self, lease_id: &str) -> Option<String> {
+    /// `Ok(None)` indicates root issuance or no persisted lineage metadata.
+    /// Any storage/lookup/parse failures MUST return `Err` (fail-closed).
+    fn get_delegation_parent_lease_id(&self, lease_id: &str) -> Result<Option<String>, String> {
         let _ = lease_id;
-        None
+        Ok(None)
     }
 }
 
@@ -6466,11 +6488,11 @@ impl LeaseValidator for StubLeaseValidator {
         Ok(())
     }
 
-    fn get_delegation_parent_lease_id(&self, lease_id: &str) -> Option<String> {
+    fn get_delegation_parent_lease_id(&self, lease_id: &str) -> Result<Option<String>, String> {
         let guard = self.full_leases.read().expect("lock poisoned");
-        guard
+        Ok(guard
             .get(lease_id)
-            .and_then(|entry| entry.delegated_parent_lease_id.clone())
+            .and_then(|entry| entry.delegated_parent_lease_id.clone()))
     }
 }
 
@@ -27181,6 +27203,23 @@ mod tests {
             let mut current = leaf_lease_id.to_string();
             for hop in 0..depth {
                 let next_parent = format!("{leaf_lease_id}-ancestor-{hop}");
+                let current_lease = dispatcher
+                    .lease_validator
+                    .get_gate_lease(&current)
+                    .expect("lineage seed requires current lease to be persisted");
+                let mut next_parent_lease = current_lease.clone();
+                next_parent_lease.lease_id = next_parent.clone();
+                next_parent_lease.executor_actor_id = actor_id.to_string();
+                next_parent_lease.issued_at = next_parent_lease
+                    .issued_at
+                    .saturating_add(u64::from(hop) + 1);
+                if next_parent_lease.expires_at <= next_parent_lease.issued_at {
+                    next_parent_lease.expires_at = next_parent_lease.issued_at.saturating_add(1);
+                }
+                dispatcher
+                    .lease_validator
+                    .register_full_lease(&next_parent_lease)
+                    .expect("lineage seed should persist ancestor lease");
                 let payload = serde_json::json!({
                     "parent_lease_id": next_parent,
                     "identity_proof_hash": hex::encode([0xA5; 32]),
@@ -29145,6 +29184,106 @@ mod tests {
                 .expect("work claim registration");
         }
 
+        fn setup_delegate_sublease_sqlite_fixture(
+            parent_lease_id: &str,
+            work_id: &str,
+            gate_id: &str,
+        ) -> (
+            PrivilegedDispatcher,
+            ConnectionContext,
+            Arc<Mutex<Connection>>,
+            String,
+        ) {
+            let (dispatcher, ctx, conn) = setup_sqlite_dispatcher();
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orchestrator = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer,
+            ));
+            let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
+            let caller_actor = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
+            let dispatcher = dispatcher
+                .with_gate_orchestrator(orchestrator)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {
+                    require_ajc_for_ingest_review_receipt: false,
+                });
+            let cas = dispatcher
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by sqlite fixture");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: &dispatcher,
+                    cas: cas.as_ref(),
+                    lease_id: parent_lease_id,
+                    work_id,
+                    gate_id,
+                    executor_actor_id: &caller_actor,
+                    policy_hash: [0xAB; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
+            );
+            let mut policy_resolution =
+                test_policy_resolution_with_lineage(work_id, &caller_actor, WorkRole::Reviewer, 0);
+            policy_resolution.resolved_policy_hash = [0xAB; 32];
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                work_id,
+                &caller_actor,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: work_id.to_string(),
+                    lease_id: parent_lease_id.to_string(),
+                    actor_id: caller_actor.clone(),
+                    role: WorkRole::Reviewer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("sqlite delegate fixture claim registration");
+            (dispatcher, ctx, conn, caller_actor)
+        }
+
+        fn emit_sublease_lineage_event(
+            dispatcher: &PrivilegedDispatcher,
+            child_lease_id: &str,
+            parent_lease_id: &str,
+            actor_id: &str,
+            timestamp_ns: u64,
+        ) {
+            let payload = serde_json::json!({
+                "parent_lease_id": parent_lease_id,
+                "identity_proof_hash": hex::encode([0xA5; 32]),
+            });
+            let payload_bytes =
+                serde_json::to_vec(&payload).expect("lineage payload should serialize");
+            dispatcher
+                .event_emitter()
+                .emit_session_event(
+                    child_lease_id,
+                    "SubleaseIssued",
+                    &payload_bytes,
+                    actor_id,
+                    timestamp_ns,
+                )
+                .expect("lineage seed event should insert");
+        }
+
         #[test]
         fn test_ingest_review_receipt_sqlite_tier0_passes() {
             let (dispatcher, ctx, _conn) = setup_sqlite_dispatcher();
@@ -29459,6 +29598,207 @@ mod tests {
                     );
                 },
                 other => panic!("Expected parent-not-found rejection, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_sqlite_missing_ancestor_lease_row_denied() {
+            let parent_lease_id = "sql-parent-missing-ancestor";
+            let missing_ancestor_lease_id = "sql-ancestor-missing";
+            let (dispatcher, ctx, _conn, caller_actor) = setup_delegate_sublease_sqlite_fixture(
+                parent_lease_id,
+                "W-SQL-DS-MISSING-ANCESTOR",
+                "gate-sql-ds",
+            );
+            emit_sublease_lineage_event(
+                &dispatcher,
+                parent_lease_id,
+                missing_ancestor_lease_id,
+                &caller_actor,
+                1_700_000_110,
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: parent_lease_id.to_string(),
+                delegatee_actor_id: "child-sql-missing-ancestor".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-sql-missing-ancestor".to_string(),
+                identity_proof_hash: vec![0x44; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("references ancestor"),
+                        "missing ancestor denial must identify broken lineage edge, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message
+                            .contains("no authoritative gate_lease_issued record"),
+                        "missing ancestor denial must explain missing authoritative lease row, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected missing-ancestor denial, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_sqlite_malformed_gate_lease_payload_denied() {
+            let parent_lease_id = "sql-parent-malformed-ancestor";
+            let ancestor_lease_id = "sql-ancestor-malformed";
+            let (dispatcher, ctx, conn, caller_actor) = setup_delegate_sublease_sqlite_fixture(
+                parent_lease_id,
+                "W-SQL-DS-MALFORMED-ANCESTOR",
+                "gate-sql-ds",
+            );
+            let cas = dispatcher
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by sqlite fixture");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: &dispatcher,
+                    cas: cas.as_ref(),
+                    lease_id: ancestor_lease_id,
+                    work_id: "W-SQL-DS-MALFORMED-ROOT",
+                    gate_id: "gate-sql-ds",
+                    executor_actor_id: &caller_actor,
+                    policy_hash: [0xAB; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
+            );
+            emit_sublease_lineage_event(
+                &dispatcher,
+                parent_lease_id,
+                ancestor_lease_id,
+                &caller_actor,
+                1_700_000_120,
+            );
+
+            {
+                let conn = conn
+                    .lock()
+                    .expect("sqlite connection lock should be available");
+                let payload_bytes: Vec<u8> = conn
+                    .query_row(
+                        "SELECT payload FROM ledger_events \
+                         WHERE event_type = 'gate_lease_issued' \
+                         AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+                         AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL \
+                         ORDER BY rowid DESC LIMIT 1",
+                        rusqlite::params![ancestor_lease_id],
+                        |row| row.get(0),
+                    )
+                    .expect("ancestor gate_lease_issued payload should exist");
+                let mut payload_value: serde_json::Value = serde_json::from_slice(&payload_bytes)
+                    .expect("ancestor payload should deserialize");
+                payload_value["delegated_parent_lease_id"] = serde_json::json!(1337);
+                let malformed_payload = serde_json::to_vec(&payload_value)
+                    .expect("malformed payload fixture should serialize");
+                conn.execute(
+                    "UPDATE ledger_events \
+                     SET payload = ?1 \
+                     WHERE event_type = 'gate_lease_issued' \
+                     AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?2 \
+                     AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL",
+                    rusqlite::params![malformed_payload, ancestor_lease_id],
+                )
+                .expect("ancestor payload mutation should succeed");
+            }
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: parent_lease_id.to_string(),
+                delegatee_actor_id: "child-sql-malformed-ancestor".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-sql-malformed-ancestor".to_string(),
+                identity_proof_hash: vec![0x45; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("lineage metadata lookup failed"),
+                        "malformed payload denial must indicate metadata lookup failure, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("non-string delegated_parent_lease_id"),
+                        "malformed payload denial must identify parse/type defect, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected malformed lineage metadata denial, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_sqlite_valid_ancestor_chain_succeeds() {
+            let parent_lease_id = "sql-parent-valid-ancestor-chain";
+            let ancestor_lease_id = "sql-ancestor-root";
+            let (dispatcher, ctx, _conn, caller_actor) = setup_delegate_sublease_sqlite_fixture(
+                parent_lease_id,
+                "W-SQL-DS-VALID-ANCESTOR",
+                "gate-sql-ds",
+            );
+            let cas = dispatcher
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by sqlite fixture");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: &dispatcher,
+                    cas: cas.as_ref(),
+                    lease_id: ancestor_lease_id,
+                    work_id: "W-SQL-DS-VALID-ANCESTOR-ROOT",
+                    gate_id: "gate-sql-ds",
+                    executor_actor_id: &caller_actor,
+                    policy_hash: [0xAB; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
+            );
+            emit_sublease_lineage_event(
+                &dispatcher,
+                parent_lease_id,
+                ancestor_lease_id,
+                &caller_actor,
+                1_700_000_130,
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: parent_lease_id.to_string(),
+                delegatee_actor_id: "child-sql-valid-ancestor".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-sql-valid-ancestor".to_string(),
+                identity_proof_hash: vec![0x46; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::DelegateSublease(resp) => {
+                    assert_eq!(resp.sublease_id, "sublease-sql-valid-ancestor");
+                    assert_eq!(resp.parent_lease_id, parent_lease_id);
+                    assert_eq!(resp.gate_id, "gate-sql-ds");
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "valid lineage chain response must carry event_id"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "valid lineage chain should pass sqlite delegation checks, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected DelegateSublease success, got {other:?}"),
             }
         }
 
