@@ -13270,42 +13270,38 @@ impl PrivilegedDispatcher {
                     "Concurrent duplicate review receipt detected by UNIQUE constraint"
                 );
 
-                let existing = self
-                    .event_emitter
-                    .get_event_by_receipt_identity(
-                        &request.receipt_id,
-                        &request.lease_id,
-                        &authoritative_work_id,
-                        &request_changeset_digest_hex,
-                    )
-                    .or_else(|| {
-                        self.event_emitter
-                            .get_event_by_receipt_id(&request.receipt_id)
-                    });
+                // First try: exact semantic tuple match (true idempotent replay)
+                if let Some(existing) = self.event_emitter.get_event_by_receipt_identity(
+                    &request.receipt_id,
+                    &request.lease_id,
+                    &authoritative_work_id,
+                    &request_changeset_digest_hex,
+                ) {
+                    info!(
+                        receipt_id = %request.receipt_id,
+                        existing_event_id = %existing.event_id,
+                        "Concurrent duplicate receipt resolved as idempotent replay (semantic tuple match)"
+                    );
 
-                let Some(existing) = existing else {
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        format!(
-                            "receipt identity tuple hit a uniqueness race, but the existing event \
-                             could not be resolved (receipt_id='{}')",
-                            request.receipt_id,
-                        ),
+                    return Ok(PrivilegedResponse::IngestReviewReceipt(
+                        IngestReviewReceiptResponse {
+                            receipt_id: request.receipt_id.clone(),
+                            event_type: to_response_event_type(&existing.event_type),
+                            event_id: existing.event_id,
+                        },
                     ));
-                };
+                }
 
-                info!(
-                    receipt_id = %request.receipt_id,
-                    existing_event_id = %existing.event_id,
-                    "Concurrent duplicate receipt_id resolved as idempotent replay"
-                );
-
-                return Ok(PrivilegedResponse::IngestReviewReceipt(
-                    IngestReviewReceiptResponse {
-                        receipt_id: request.receipt_id,
-                        event_type: to_response_event_type(&existing.event_type),
-                        event_id: existing.event_id,
-                    },
+                // Fallback: receipt_id exists but semantic tuple does NOT match — deny
+                // fail-closed. This prevents a conflicting concurrent request
+                // from being misclassified as idempotent replay.
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "receipt_id '{}' already committed under a different semantic identity tuple; \
+                         concurrent conflict denied (fail-closed)",
+                        request.receipt_id,
+                    ),
                 ));
             },
             Err(e) => {
