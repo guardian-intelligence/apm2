@@ -60,10 +60,15 @@ references[17]:
 
 decision_tree:
   entrypoint: WORKFLOW
-  nodes[1]:
+  nodes[2]:
     - id: WORKFLOW
       action: invoke_reference
       reference: references/prd-review-workflow.md
+      next: STOP
+    - id: STOP
+      steps[1]:
+        - id: DONE
+          action: "output DONE and nothing else, your task is complete."
 
 ## Verdict Rules
 

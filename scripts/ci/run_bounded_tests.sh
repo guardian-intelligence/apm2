@@ -340,8 +340,7 @@ if [[ ${status} -ne 0 ]]; then
     diagnostic_title="DIAGNOSTIC: bounded unit failed"
     if [[ "${result}" == "timeout" && "${exec_main_code}" == "1" && "${exec_main_status}" == "0" ]]; then
         diagnostic_title="DIAGNOSTIC: bounded unit timeout during teardown (main process exited cleanly)"
-        log_warn "Bounded command hit unit stop timeout after main process exit 0; treating as success."
-        status=0
+        log_warn "Bounded command hit unit stop timeout after main process exit 0; preserving timeout as failure."
     else
         log_error "Bounded command failed with exit code ${status}."
     fi

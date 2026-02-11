@@ -27,6 +27,10 @@
 //!   multi-model)
 //! - `apm2 fac review dispatch <PR_URL>` - Dispatch detached FAC review runs
 //! - `apm2 fac review status` - Show FAC review state and recent events
+//! - `apm2 fac review findings` - Retrieve SHA-bound review findings in a
+//!   structured FAC-native format
+//! - `apm2 fac review decision` - Show/set SHA-bound approve/deny decisions per
+//!   review dimension
 //! - `apm2 fac restart --pr <PR_NUMBER>` - Intelligent pipeline restart from
 //!   optimal point
 //! - `apm2 fac review project` - Render one projection status line
@@ -493,6 +497,10 @@ pub enum ReviewSubcommand {
     Dispatch(ReviewDispatchArgs),
     /// Show FAC review state/events from local operational artifacts.
     Status(ReviewStatusArgs),
+    /// Retrieve structured review findings for a PR head SHA.
+    Findings(ReviewFindingsArgs),
+    /// Show or set explicit decision state per review dimension.
+    Decision(ReviewDecisionArgs),
     /// Render one condensed projection line for GitHub log surfaces.
     Project(ReviewProjectArgs),
     /// Tail FAC review NDJSON event stream.
@@ -550,6 +558,106 @@ pub struct ReviewStatusArgs {
     /// Optional pull request URL filter.
     #[arg(long)]
     pub pr_url: Option<String>,
+}
+
+/// Arguments for `apm2 fac review findings`.
+#[derive(Debug, Args)]
+pub struct ReviewFindingsArgs {
+    /// Repository in owner/repo format (used when --pr is provided).
+    #[arg(long, default_value = "guardian-intelligence/apm2")]
+    pub repo: String,
+
+    /// Pull request number.
+    #[arg(long)]
+    pub pr: Option<u32>,
+
+    /// Pull request URL (alternative to --pr).
+    #[arg(long)]
+    pub pr_url: Option<String>,
+
+    /// Optional head SHA override (defaults to PR head SHA).
+    #[arg(long)]
+    pub sha: Option<String>,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac review decision`.
+#[derive(Debug, Args)]
+pub struct ReviewDecisionArgs {
+    #[command(subcommand)]
+    pub subcommand: ReviewDecisionSubcommand,
+}
+
+/// Subcommands for `apm2 fac review decision`.
+#[derive(Debug, Subcommand)]
+pub enum ReviewDecisionSubcommand {
+    /// Show SHA-bound decision state for all active review dimensions.
+    Show(ReviewDecisionShowArgs),
+    /// Set SHA-bound decision for one review dimension.
+    Set(ReviewDecisionSetArgs),
+}
+
+/// Arguments for `apm2 fac review decision show`.
+#[derive(Debug, Args)]
+pub struct ReviewDecisionShowArgs {
+    /// Repository in owner/repo format (used when --pr is provided).
+    #[arg(long, default_value = "guardian-intelligence/apm2")]
+    pub repo: String,
+
+    /// Pull request number.
+    #[arg(long)]
+    pub pr: Option<u32>,
+
+    /// Pull request URL (alternative to --pr).
+    #[arg(long)]
+    pub pr_url: Option<String>,
+
+    /// Optional head SHA override (defaults to PR head SHA).
+    #[arg(long)]
+    pub sha: Option<String>,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac review decision set`.
+#[derive(Debug, Args)]
+pub struct ReviewDecisionSetArgs {
+    /// Repository in owner/repo format (used when --pr is provided).
+    #[arg(long, default_value = "guardian-intelligence/apm2")]
+    pub repo: String,
+
+    /// Pull request number.
+    #[arg(long)]
+    pub pr: Option<u32>,
+
+    /// Pull request URL (alternative to --pr).
+    #[arg(long)]
+    pub pr_url: Option<String>,
+
+    /// Optional head SHA override (defaults to PR head SHA).
+    #[arg(long)]
+    pub sha: Option<String>,
+
+    /// Decision dimension (`security` or `code-quality`).
+    #[arg(long)]
+    pub dimension: String,
+
+    /// Decision value (`approve` or `deny`).
+    #[arg(long, value_enum)]
+    pub decision: fac_review::DecisionValueArg,
+
+    /// Optional free-form reason attached to this decision.
+    #[arg(long)]
+    pub reason: Option<String>,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac review project`.
@@ -842,6 +950,32 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
             ),
             ReviewSubcommand::Status(status_args) => {
                 fac_review::run_status(status_args.pr, status_args.pr_url.as_deref(), json_output)
+            },
+            ReviewSubcommand::Findings(findings_args) => fac_review::run_findings(
+                &findings_args.repo,
+                findings_args.pr,
+                findings_args.pr_url.as_deref(),
+                findings_args.sha.as_deref(),
+                json_output || findings_args.json,
+            ),
+            ReviewSubcommand::Decision(decision_args) => match &decision_args.subcommand {
+                ReviewDecisionSubcommand::Show(show_args) => fac_review::run_decision_show(
+                    &show_args.repo,
+                    show_args.pr,
+                    show_args.pr_url.as_deref(),
+                    show_args.sha.as_deref(),
+                    json_output || show_args.json,
+                ),
+                ReviewDecisionSubcommand::Set(set_args) => fac_review::run_decision_set(
+                    &set_args.repo,
+                    set_args.pr,
+                    set_args.pr_url.as_deref(),
+                    set_args.sha.as_deref(),
+                    &set_args.dimension,
+                    set_args.decision,
+                    set_args.reason.as_deref(),
+                    json_output || set_args.json,
+                ),
             },
             ReviewSubcommand::Project(project_args) => fac_review::run_project(
                 project_args.pr,

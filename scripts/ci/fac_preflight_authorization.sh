@@ -155,12 +155,9 @@ author_association="$(jq -r '.author_association // empty' <<<"$pr_json")"
 if [[ -z "$author_association" ]]; then
     deny "actor_association" "missing_author_association" "pr=${pr_number}"
 fi
+actor_is_trusted_app="false"
 if contains_exact "$actor" "${trusted_app_actors[@]}"; then
-    allow "actor_association" "pr=${pr_number} actor=${actor} grant=trusted_app_actor association=${author_association}"
-elif contains_exact "$author_association" "${allowed_associations[@]}"; then
-    allow "actor_association" "pr=${pr_number} association=${author_association}"
-else
-    deny "actor_association" "unauthorized_author_association" "pr=${pr_number} association=${author_association}"
+    actor_is_trusted_app="true"
 fi
 
 base_ref="$(jq -r '.base.ref // empty' <<<"$pr_json")"
@@ -254,6 +251,17 @@ if [[ "$is_fork" == "true" ]]; then
     allow "fork_trust" "pr=${pr_number} fork=true trust_grant=${trust_grant}"
 else
     allow "fork_trust" "pr=${pr_number} fork=false"
+fi
+
+# Default: author association must be explicitly allowlisted.
+# Narrow exception: trusted app actors may proceed with NONE association only
+# for same-repo, non-fork PRs.
+if contains_exact "$author_association" "${allowed_associations[@]}"; then
+    allow "actor_association" "pr=${pr_number} association=${author_association}"
+elif [[ "$actor_is_trusted_app" == "true" && "$author_association" == "NONE" && "$is_fork" == "false" ]]; then
+    allow "actor_association" "pr=${pr_number} actor=${actor} grant=trusted_app_actor_same_repo_none association=${author_association}"
+else
+    deny "actor_association" "unauthorized_author_association" "pr=${pr_number} association=${author_association} actor=${actor}"
 fi
 
 allow "overall" "event=${event_name} pr=${pr_number} actor=${actor} association=${author_association} base_ref=${base_ref} fork=${is_fork}"

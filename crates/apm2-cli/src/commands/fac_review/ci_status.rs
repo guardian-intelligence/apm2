@@ -29,6 +29,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use super::barrier::resolve_authenticated_gh_login;
 use super::types::now_iso8601;
 
 // ── Marker ───────────────────────────────────────────────────────────────────
@@ -135,6 +136,7 @@ pub fn find_status_comment(
     owner_repo: &str,
     pr_number: u32,
     sha: &str,
+    expected_author_login: Option<&str>,
 ) -> Result<Option<(u64, CiStatus)>, String> {
     let endpoint = format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100");
     let output = Command::new("gh")
@@ -150,16 +152,34 @@ pub fn find_status_comment(
     let comments: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("failed to parse comment response: {e}"))?;
 
-    Ok(latest_status_comment_for_sha(&comments, sha))
+    Ok(latest_status_comment_for_sha(
+        &comments,
+        sha,
+        expected_author_login,
+    ))
 }
 
 fn latest_status_comment_for_sha(
     comments: &[serde_json::Value],
     sha: &str,
+    expected_author_login: Option<&str>,
 ) -> Option<(u64, CiStatus)> {
     let mut latest_match: Option<(u64, CiStatus)> = None;
+    let expected_author_lower = expected_author_login.map(str::to_ascii_lowercase);
 
     for comment in comments {
+        if let Some(expected_author) = expected_author_lower.as_deref() {
+            let author = comment
+                .get("user")
+                .and_then(|value| value.get("login"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if author != expected_author {
+                continue;
+            }
+        }
+
         let body = comment
             .get("body")
             .and_then(serde_json::Value::as_str)
@@ -282,6 +302,7 @@ pub struct ThrottledUpdater {
     owner_repo: String,
     pr_number: u32,
     comment_id: Cell<Option<u64>>,
+    expected_author_login: Option<String>,
 }
 
 impl ThrottledUpdater {
@@ -291,22 +312,41 @@ impl ThrottledUpdater {
             owner_repo: owner_repo.to_string(),
             pr_number,
             comment_id: Cell::new(None),
+            expected_author_login: resolve_authenticated_gh_login(),
         }
     }
 
     fn sync_status_comment(&self, status: &CiStatus) -> Result<(), String> {
         let comment_id = if let Some(id) = self.comment_id.get() {
             id
-        } else if let Some((existing_id, _existing_status)) =
-            find_status_comment(&self.owner_repo, self.pr_number, &status.sha)?
-        {
-            self.comment_id.set(Some(existing_id));
-            existing_id
         } else {
+            let maybe_existing =
+                if let Some(expected_author) = self.expected_author_login.as_deref() {
+                    find_status_comment(
+                        &self.owner_repo,
+                        self.pr_number,
+                        &status.sha,
+                        Some(expected_author),
+                    )?
+                } else {
+                    None
+                };
+
+            if let Some((existing_id, _existing_status)) = maybe_existing {
+                self.comment_id.set(Some(existing_id));
+                existing_id
+            } else {
+                let created_id = create_status_comment(&self.owner_repo, self.pr_number, status)?;
+                self.comment_id.set(Some(created_id));
+                return Ok(());
+            }
+        };
+
+        if comment_id == 0 {
             let created_id = create_status_comment(&self.owner_repo, self.pr_number, status)?;
             self.comment_id.set(Some(created_id));
             return Ok(());
-        };
+        }
 
         update_status_comment(&self.owner_repo, comment_id, status)
     }
@@ -437,19 +477,22 @@ mod tests {
     fn test_latest_status_comment_for_sha_returns_latest_match() {
         let c1 = serde_json::json!({
             "id": 100_u64,
+            "user": { "login": "fac-bot" },
             "body": "<!-- apm2-ci-status:v1 -->\n```yaml\n# apm2-ci-status:v1\nsha: deadbeef\npr: 7\nupdated_at: 2026-02-11T00:00:00Z\ngates:\n  rustfmt:\n    status: PASS\n    duration_secs: 1\n```\n"
         });
         let c2 = serde_json::json!({
             "id": 101_u64,
+            "user": { "login": "fac-bot" },
             "body": "<!-- apm2-ci-status:v1 -->\n```yaml\n# apm2-ci-status:v1\nsha: other-sha\npr: 7\nupdated_at: 2026-02-11T00:00:01Z\ngates:\n  rustfmt:\n    status: FAIL\n    duration_secs: 1\n```\n"
         });
         let c3 = serde_json::json!({
             "id": 102_u64,
+            "user": { "login": "fac-bot" },
             "body": "<!-- apm2-ci-status:v1 -->\n```yaml\n# apm2-ci-status:v1\nsha: deadbeef\npr: 7\nupdated_at: 2026-02-11T00:00:02Z\ngates:\n  rustfmt:\n    status: FAIL\n    duration_secs: 2\n```\n"
         });
 
         let comments = vec![c1, c2, c3];
-        let (id, status) = latest_status_comment_for_sha(&comments, "deadbeef")
+        let (id, status) = latest_status_comment_for_sha(&comments, "deadbeef", None)
             .expect("should find latest status comment");
         assert_eq!(id, 102);
         assert_eq!(status.gates["rustfmt"].status, "FAIL");
@@ -460,15 +503,37 @@ mod tests {
     fn test_latest_status_comment_for_sha_ignores_invalid_entries() {
         let missing_marker = serde_json::json!({
             "id": 10_u64,
+            "user": { "login": "fac-bot" },
             "body": "```yaml\nsha: deadbeef\n```\n"
         });
         let invalid_yaml = serde_json::json!({
             "id": 11_u64,
+            "user": { "login": "fac-bot" },
             "body": "<!-- apm2-ci-status:v1 -->\n```yaml\nthis: is: not: valid: yaml\n```\n"
         });
 
         let comments = vec![missing_marker, invalid_yaml];
-        assert!(latest_status_comment_for_sha(&comments, "deadbeef").is_none());
+        assert!(latest_status_comment_for_sha(&comments, "deadbeef", None).is_none());
+    }
+
+    #[test]
+    fn test_latest_status_comment_for_sha_filters_untrusted_author() {
+        let spoofed = serde_json::json!({
+            "id": 103_u64,
+            "user": { "login": "random-user" },
+            "body": "<!-- apm2-ci-status:v1 -->\n```yaml\n# apm2-ci-status:v1\nsha: deadbeef\npr: 7\nupdated_at: 2026-02-11T00:00:03Z\ngates:\n  rustfmt:\n    status: PASS\n    duration_secs: 1\n```\n"
+        });
+        let trusted = serde_json::json!({
+            "id": 104_u64,
+            "user": { "login": "fac-bot" },
+            "body": "<!-- apm2-ci-status:v1 -->\n```yaml\n# apm2-ci-status:v1\nsha: deadbeef\npr: 7\nupdated_at: 2026-02-11T00:00:04Z\ngates:\n  rustfmt:\n    status: FAIL\n    duration_secs: 2\n```\n"
+        });
+
+        let comments = vec![spoofed, trusted];
+        let (id, status) = latest_status_comment_for_sha(&comments, "deadbeef", Some("fac-bot"))
+            .expect("should find trusted status comment");
+        assert_eq!(id, 104);
+        assert_eq!(status.gates["rustfmt"].status, "FAIL");
     }
 
     // ── Security boundary: no sensitive data in comment body ────────────

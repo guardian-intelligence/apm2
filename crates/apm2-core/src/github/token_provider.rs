@@ -137,15 +137,19 @@ impl GitHubAppTokenProvider {
         }
 
         // 2. Config file private_key_file
+        let mut config_resolution_error: Option<String> = None;
         if let Some(cfg) = config {
             if let Some(ref pem_path) = cfg.private_key_file {
                 match std::fs::read_to_string(pem_path) {
                     Ok(content) if !content.trim().is_empty() => {
                         return Ok(content);
                     },
-                    Ok(_) => {},
+                    Ok(_) => {
+                        config_resolution_error =
+                            Some(format!("config file path {} is empty", pem_path.display()));
+                    },
                     Err(err) => {
-                        return Err(format!(
+                        config_resolution_error = Some(format!(
                             "config file points to {}, but read failed: {err}",
                             pem_path.display()
                         ));
@@ -165,13 +169,29 @@ impl GitHubAppTokenProvider {
                     "keyring entry exists but is empty; re-run `apm2 fac pr auth-setup`"
                         .to_string(),
                 ),
-                Err(keyring::Error::NoEntry) => Err(format!(
-                    "no private key found: set ${env_var_name}, run `apm2 fac pr auth-setup`, \
-                     or store key in keyring ({service}/{account})"
-                )),
-                Err(err) => Err(format!("keyring lookup failed: {err}")),
+                Err(keyring::Error::NoEntry) => config_resolution_error.map_or_else(
+                    || {
+                        Err(format!(
+                            "no private key found: set ${env_var_name}, run `apm2 fac pr auth-setup`, \
+                             or store key in keyring ({service}/{account})"
+                        ))
+                    },
+                    |config_err| {
+                        Err(format!(
+                            "{config_err}; no private key found: set ${env_var_name}, run `apm2 fac pr auth-setup`, \
+                             or store key in keyring ({service}/{account})"
+                        ))
+                    },
+                ),
+                Err(err) => config_resolution_error.map_or_else(
+                    || Err(format!("keyring lookup failed: {err}")),
+                    |config_err| Err(format!("{config_err}; keyring lookup failed: {err}")),
+                ),
             },
-            Err(err) => Err(format!("keyring init failed: {err}")),
+            Err(err) => config_resolution_error.map_or_else(
+                || Err(format!("keyring init failed: {err}")),
+                |config_err| Err(format!("{config_err}; keyring init failed: {err}")),
+            ),
         }
     }
 
@@ -892,5 +912,32 @@ mod unit_tests {
         // Should not fail on scope count
         let result = request.validate();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_resolve_private_key_falls_through_after_config_read_error() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let missing_pem = temp.path().join("missing.pem");
+        let cfg = GitHubAppConfig {
+            app_id: "12345".to_string(),
+            installation_id: "67890".to_string(),
+            private_key_file: Some(missing_pem),
+        };
+
+        let err = GitHubAppTokenProvider::resolve_private_key(
+            "12345",
+            "APM2_TEST_MISSING_PRIVATE_KEY_ENV_SHOULD_NOT_EXIST",
+            Some(&cfg),
+            Some("apm2.tests.nonexistent.service"),
+            Some("apm2.tests.nonexistent.account"),
+        )
+        .expect_err("missing config file and keyring should fail");
+
+        assert!(err.contains("config file points to"));
+        assert!(
+            err.contains("no private key found")
+                || err.contains("keyring lookup failed")
+                || err.contains("keyring init failed")
+        );
     }
 }

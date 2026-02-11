@@ -2,7 +2,7 @@ title: Orchestrator Monitor — Parallel PR Control Loop
 
 decision_tree:
   entrypoint: START
-  nodes[8]:
+  nodes[9]:
     - id: START
       purpose: "Initialize scope and verify prerequisites before any side effects."
       steps[6]:
@@ -38,11 +38,11 @@ decision_tree:
       steps[5]:
         - id: SNAPSHOT
           action: "Capture per-PR fac_review_status + fac_review_project as primary lifecycle signals; use fac_logs and fac_review_tail for diagnosis context."
-        - id: COLLECT_FINDINGS_FROM_PR_COMMENTS
+        - id: COLLECT_FINDINGS_FROM_FAC
           action: |
-            For each PR, query GitHub comments and extract latest security/code-quality findings by marker:
-            `gh pr view <PR_NUMBER> --repo <OWNER/REPO> --json comments --jq '.comments[] | select(.body | contains("apm2-review-metadata:v1:security") or contains("apm2-review-metadata:v1:code-quality")) | {author: .author.login, createdAt, body: .body}'`
-            Use these comment bodies as the source for BLOCKER/MAJOR/MINOR/NIT findings in implementor handoff.
+            For each PR, fetch structured findings via FAC:
+            `apm2 fac review findings --repo <OWNER/REPO> --pr <PR_NUMBER> --json`
+            Use this output as the source for BLOCKER/MAJOR/MINOR/NIT findings in implementor handoff.
         - id: CLASSIFY
           action: |
             For each PR, assign exactly one state:
@@ -89,17 +89,17 @@ decision_tree:
           action: "If an implementor has no progress signal beyond profile idle threshold, replace with fresh agent."
         - id: SATURATION_CHECK
           action: "Use fac_review_status (global) to ensure active FAC review runs remain within profile caps."
-      next: EMIT_TICK_EVIDENCE
+      next: SYNC_TICK_FACTS
 
-    - id: EMIT_TICK_EVIDENCE
-      purpose: "Record why decisions were taken, not only what was taken."
+    - id: SYNC_TICK_FACTS
+      purpose: "Sync machine-verifiable orchestration facts."
       steps[3]:
-        - id: EMIT_STATUS_DASHBOARD
-          action: "Emit current PR states and gate status per PR."
-        - id: EMIT_DISPATCH_PLAN
-          action: "Emit actions executed this tick and skipped actions with reason (slot cap, conservative gate, stale SHA)."
-        - id: EMIT_BLOCKER_LEDGER
-          action: "Emit BLOCKED_UNKNOWN entries with evidence needed to unblock."
+        - id: SYNC_PR_STATE_FACTS
+          action: "Persist current PR states and gate states in FAC projections/log artifacts."
+        - id: SYNC_ACTION_FACTS
+          action: "Persist executed/skipped action facts keyed by PR, SHA, and scheduler slot."
+        - id: SYNC_BLOCKER_FACTS
+          action: "Persist BLOCKED_UNKNOWN facts with evidence selectors required for unblock."
       next: STOP_OR_CONTINUE
 
     - id: STOP_OR_CONTINUE
@@ -108,12 +108,12 @@ decision_tree:
         - id: SUCCESS_STOP
           if: "all scoped PRs are MERGED"
           then:
-            stop: "SUCCESS"
+            next: STOP
 
         - id: PARTIAL_STOP
           if: "all remaining PRs are BLOCKED_UNKNOWN for >=3 consecutive ticks"
           then:
-            stop: "PARTIAL_STOP_WITH_BLOCKERS"
+            next: STOP
 
         - id: CONTINUE
           if: "otherwise"
@@ -126,7 +126,7 @@ decision_tree:
         - id: REQUIRE_DEFAULT_IMPLEMENTOR_SKILL
           action: "Prompt must start with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
         - id: REQUIRE_FINDINGS_SOURCE
-          action: "Build explicit findings list from latest marked GitHub PR review comments (`apm2-review-metadata:v1:security` and `apm2-review-metadata:v1:code-quality`) and include it in handoff."
+          action: "Build explicit findings list from `apm2 fac review findings --repo <OWNER/REPO> --pr <PR_NUMBER> --json` output and include it in handoff."
         - id: INCLUDE_REQUIRED_CONTEXT
           action: |
             Include PR number, branch, HEAD SHA, explicit findings list, and required references:
@@ -142,20 +142,20 @@ decision_tree:
             Do NOT prescribe raw git/gh commands in orchestrator prompts.
         - id: REQUIRE_CONFLICT_EVIDENCE
           action: |
-            Ask the subagent to report branch hygiene evidence in output:
+            Require branch hygiene facts to be verifiable from FAC artifacts:
             worktree path, base commit before sync, base commit after sync, conflict file list (or explicit 'none').
         - id: ENFORCE_BRANCH_HYGIENE_GATE
           action: |
-            If subagent output omits branch sync evidence or reports unresolved conflicts,
-            treat the output as incomplete and redispatch a fresh fix subagent.
+            If branch sync facts are missing from artifacts or unresolved conflicts remain,
+            redispatch a fresh fix subagent.
         - id: REQUIRE_PRE_COMMIT_ORDER
           action: |
             During active edits, run `apm2 fac gates --quick` for short-loop validation.
-            Immediately before push, run `apm2 fac gates` and include per-gate outcomes.
+            Immediately before push, run `apm2 fac gates` and preserve per-gate outcomes in FAC artifacts.
         - id: REQUIRE_FAC_PUSH
           action: "Push only via `apm2 fac push` (`--ticket` preferred, `--branch` fallback)."
         - id: REQUIRE_EVIDENCE
-          action: "Include exact command results and changed file list in implementor response."
+          action: "Require exact command and diff facts in artifacts; do not rely on narrative explanations."
       next: HEARTBEAT_LOOP
 
     - id: REVIEW_GATE_DEFINITION
@@ -168,3 +168,9 @@ decision_tree:
             (2) no FAC projection error lines indicate CI/review failure,
             (3) PR is still observed in FAC lifecycle projections.
       next: HEARTBEAT_LOOP
+
+    - id: STOP
+      purpose: "Terminate."
+      steps[1]:
+        - id: DONE
+          action: "output DONE and nothing else, your task is complete."

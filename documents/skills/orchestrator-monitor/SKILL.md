@@ -28,7 +28,7 @@ notes:
   - "Use `apm2 fac review project --pr <N> --emit-errors` to monitor all gate states (CI gates + reviews) after a push."
   - "Use `apm2 fac review` for reviewer lifecycle actions (`status`, `project`). Use `apm2 fac restart` for recovery."
   - "Use `apm2 fac logs --pr <N>` to discover and display local pipeline/evidence/review log files. Add `--json` for machine-readable output."
-  - "FAC-first policy: orchestration and lifecycle control should use `apm2 fac ...` surfaces. Temporary exception: query GitHub PR comments for latest security/code-quality findings until FAC-native findings retrieval lands (TCK-00481)."
+  - "FAC-first policy: orchestration and lifecycle control should use `apm2 fac ...` surfaces, including findings retrieval via `apm2 fac review findings --pr <N> --json`."
   - "Worktree naming/creation and branch/conflict repair are implementor-owned responsibilities; orchestrator validates outcomes via FAC gate/push telemetry."
 
 references[7]:
@@ -120,14 +120,14 @@ runtime_review_protocol:
     secondary: "apm2 fac review status --pr <PR_NUMBER> (snapshot of reviewer process state)"
     log_discovery: "apm2 fac logs --pr <PR_NUMBER> (lists all local log files for evidence gates, pipeline runs, review dispatch, and events)"
     ci_status_comment: "PR comment with marker `apm2-ci-status:v1` containing YAML gate statuses (rustfmt, clippy, doc, test, security_review, quality_review)"
-    findings_source: "Query PR comments and use markers `apm2-review-metadata:v1:security` and `apm2-review-metadata:v1:code-quality` for reviewer findings payloads."
+    findings_source: "`apm2 fac review findings --pr <PR_NUMBER> --json` (structured severity + reviewer type + SHA binding + evidence pointers)."
   observability_surfaces:
     - "~/.apm2/review_events.ndjson (append-only lifecycle events)"
     - "~/.apm2/review_state.json (active review process/model/backend state)"
     - "~/.apm2/pipeline_logs/pr<PR>-<SHA>.log (per-push pipeline stdout/stderr)"
     - "~/.apm2/review_pulses/pr<PR>_review_pulse_{security|quality}.json (PR-scoped HEAD SHA pulse files)"
     - "PR comment `apm2-ci-status:v1` (machine-readable YAML with all gate statuses and token counts)"
-    - "PR comments with markers `apm2-review-metadata:v1:security` and `apm2-review-metadata:v1:code-quality` (full findings text)."
+    - "`apm2 fac review findings --pr <PR_NUMBER> --json` (authoritative findings projection for orchestrator handoff)."
   required_semantics:
     - "Review runs execute security and quality in parallel when `--type all` is used."
     - "Dispatch is idempotent start-or-join for duplicate PR/SHA requests."
@@ -138,7 +138,7 @@ runtime_review_protocol:
 
 decision_tree:
   entrypoint: START
-  nodes[2]:
+  nodes[3]:
     - id: START
       steps[1]:
         - id: READ_REFERENCES
@@ -147,6 +147,11 @@ decision_tree:
     - id: ORCHESTRATE
       action: invoke_reference
       reference: references/orchestration-loop.md
+      next: STOP
+    - id: STOP
+      steps[1]:
+        - id: DONE
+          action: "output DONE and nothing else, your task is complete."
 
 invariants[15]:
   - "Use conservative gating: if PR state, SHA binding, review verdict, or CI truth is ambiguous, classify as BLOCKED and do not merge."
@@ -162,5 +167,5 @@ invariants[15]:
   - "All implementor-agent dispatches include a warm handoff with implementor_warm_handoff_required_payload."
   - "Default implementor dispatch starts with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
   - "Prefer fresh fix agents after failed review rounds or stalled progress."
-  - "Record every dispatch decision with reason and observed evidence (head SHA, CI, review status)."
+  - "Record every dispatch decision with observed evidence keys (head SHA, CI, review status, action id)."
   - "Throughput optimization should be paired with quality countermetrics (reopen rate, rollback count, repeat BLOCKER rate)."
