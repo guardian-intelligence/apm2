@@ -83,9 +83,13 @@ implementor_warm_handoff_required_reads[17]:
   - path: "@documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md"
     purpose: "RS-41: Safe Patterns"
 
-implementor_warm_handoff_required_payload[4]:
+implementor_warm_handoff_required_payload[6]:
   - field: implementor_skill_invocation
     requirement: "Dispatch prompt MUST begin with `/implementor-default <TICKET_ID or PR_CONTEXT>`; `/ticket` is deprecated."
+  - field: implementor_core_instruction_source
+    requirement: "State that `@documents/skills/implementor-default/SKILL.md` and its `references[...]` are the primary execution contract for implementation."
+  - field: prompt_scope_boundary
+    requirement: "Keep orchestrator-authored prompt content narrow: include only PR/ticket-specific deltas (current SHA, findings, blockers, required evidence, worktree path) and avoid duplicating generic workflow already defined in implementor-default."
   - field: required_reads
     requirement: "Include implementor_warm_handoff_required_reads and explicitly instruct REQUIRED READING before editing."
   - field: latest_review_findings
@@ -169,6 +173,7 @@ invariants[15]:
   - "Fix subagents resolve merge conflicts to zero before making code changes."
   - "All implementor-agent dispatches include a warm handoff with implementor_warm_handoff_required_payload."
   - "Default implementor dispatch starts with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
+  - "Implementor handoff prompts use implementor-default as the primary instruction source and add only ticket/PR-specific deltas."
   - "Prefer fresh fix agents after failed review rounds or stalled progress."
   - "Record every dispatch decision with observed evidence keys (head SHA, CI, review status, action id)."
   - "Throughput optimization should be paired with quality countermetrics (reopen rate, rollback count, repeat BLOCKER rate)."
