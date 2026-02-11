@@ -59,6 +59,7 @@
 //! └─────────────────┘     └─────────────────┘
 //! ```
 
+use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -469,6 +470,7 @@ impl GhDirectStage {
 enum GhDirectStageResolution {
     Explicit,
     MissingFailClosed,
+    MissingFreshnessFailClosed,
     UnknownFailClosed,
     AmbiguousFailClosed,
     StaleFailClosed,
@@ -480,6 +482,7 @@ impl GhDirectStageResolution {
         match self {
             Self::Explicit => "explicit",
             Self::MissingFailClosed => "missing_fail_closed",
+            Self::MissingFreshnessFailClosed => "missing_freshness_fail_closed",
             Self::UnknownFailClosed => "unknown_fail_closed",
             Self::AmbiguousFailClosed => "ambiguous_fail_closed",
             Self::StaleFailClosed => "stale_fail_closed",
@@ -2079,6 +2082,17 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             .or(secondary_parsed)
             .unwrap_or(GhDirectStage::Stage2);
 
+        if matches!(
+            resolved_stage,
+            GhDirectStage::Stage0 | GhDirectStage::Stage1
+        ) && refreshed_at_ns.is_none()
+        {
+            return GhDirectStageEvaluation {
+                stage: GhDirectStage::Stage2,
+                resolution: GhDirectStageResolution::MissingFreshnessFailClosed,
+            };
+        }
+
         if let Some(refreshed_ns) = refreshed_at_ns {
             let age_is_stale = now_ns
                 .checked_sub(refreshed_ns)
@@ -2218,7 +2232,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             return detail.to_string();
         }
         let truncated_len = MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN.saturating_sub(3);
-        format!("{}...", &detail[..truncated_len])
+        let safe_boundary = detail
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .chain(std::iter::once(detail.len()))
+            .take_while(|idx| *idx <= truncated_len)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &detail[..safe_boundary])
     }
 
     fn detect_forbidden_direct_github_capability_tool_id(
@@ -2245,6 +2266,15 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
     fn normalize_shell_token(token: &str) -> &str {
         token.trim_matches(|ch| matches!(ch, '"' | '\''))
+    }
+
+    fn trim_shell_word_boundary(token: &str) -> &str {
+        token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | ';' | ',' | '(' | ')' | '{' | '}' | '[' | ']' | ':'
+            )
+        })
     }
 
     fn command_primary_executable_from_tokens(
@@ -2275,6 +2305,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
     fn is_env_wrapper_executable(exec: &str) -> bool {
         matches!(Self::executable_name(exec), "env" | "env.exe")
+    }
+
+    fn is_shell_eval_builtin(exec: &str) -> bool {
+        matches!(Self::executable_name(exec), "eval")
     }
 
     fn is_shell_wrapper_executable(exec: &str) -> bool {
@@ -2437,6 +2471,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         tokens: &[&str],
         start_idx: usize,
     ) -> Option<String> {
+        if Self::is_shell_eval_builtin(exec) {
+            return Self::join_command_tokens(tokens, start_idx);
+        }
         if Self::is_shell_wrapper_executable(exec) {
             return Self::extract_shell_wrapper_inline_command(tokens, start_idx);
         }
@@ -2444,6 +2481,109 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             return Self::extract_interpreter_wrapper_inline_command(exec, tokens, start_idx);
         }
         None
+    }
+
+    fn token_contains_gh_reference(token: &str) -> bool {
+        let stripped = Self::trim_shell_word_boundary(Self::normalize_shell_token(token));
+        if stripped.is_empty() {
+            return false;
+        }
+
+        let lower = stripped.to_ascii_lowercase();
+        Self::is_gh_executable(&lower)
+            || Self::is_gh_executable(lower.trim_start_matches("$("))
+            || Self::is_gh_executable(lower.trim_start_matches('$'))
+    }
+
+    fn command_contains_gh_token(command: &str) -> bool {
+        command
+            .split_whitespace()
+            .any(Self::token_contains_gh_reference)
+    }
+
+    fn extract_shell_variable_reference(token: &str) -> Option<&str> {
+        let stripped = Self::trim_shell_word_boundary(Self::normalize_shell_token(token));
+        let raw_reference = stripped.strip_prefix('$')?;
+        if raw_reference.is_empty() {
+            return None;
+        }
+        let variable = raw_reference
+            .strip_prefix('{')
+            .and_then(|inner| inner.strip_suffix('}'))
+            .unwrap_or(raw_reference)
+            .trim_end_matches(|ch: char| ch != '_' && !ch.is_ascii_alphanumeric());
+        if variable.is_empty()
+            || !variable
+                .chars()
+                .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        {
+            return None;
+        }
+        Some(variable)
+    }
+
+    fn command_invokes_gh_cli_via_shell_variable(command: &str) -> bool {
+        let mut gh_bound_variables = HashSet::new();
+        for token in command.split_whitespace() {
+            let cleaned = Self::trim_shell_word_boundary(Self::normalize_shell_token(token));
+            let Some((name, raw_value)) = cleaned.split_once('=') else {
+                continue;
+            };
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+            {
+                continue;
+            }
+            let value = Self::trim_shell_word_boundary(raw_value);
+            if value.is_empty() {
+                continue;
+            }
+            let value_lower = value.to_ascii_lowercase();
+            if Self::is_gh_executable(&value_lower) {
+                gh_bound_variables.insert(name.to_string());
+            }
+        }
+
+        if gh_bound_variables.is_empty() {
+            return false;
+        }
+
+        command.split_whitespace().any(|token| {
+            Self::extract_shell_variable_reference(token)
+                .is_some_and(|name| gh_bound_variables.contains(name))
+        })
+    }
+
+    fn command_substitution_contains_gh_reference(command: &str, depth: usize) -> bool {
+        let mut stack: Vec<usize> = Vec::new();
+        let bytes = command.as_bytes();
+        let mut idx = 0usize;
+
+        while idx < bytes.len() {
+            if bytes[idx] == b'$' && bytes.get(idx + 1) == Some(&b'(') {
+                stack.push(idx + 2);
+                idx += 2;
+                continue;
+            }
+
+            if bytes[idx] == b')'
+                && let Some(start) = stack.pop()
+                && start <= idx
+            {
+                let inner = &command[start..idx];
+                if Self::command_invokes_gh_cli_inner(inner, depth + 1)
+                    || Self::command_contains_gh_token(inner)
+                {
+                    return true;
+                }
+            }
+
+            idx += 1;
+        }
+
+        false
     }
 
     fn command_invokes_gh_cli_inner(command: &str, depth: usize) -> bool {
@@ -2481,6 +2621,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             return Self::command_invokes_gh_cli_inner(&inner_command, depth + 1);
         }
 
+        // Heuristic fallbacks for shell indirection that simple token parsing
+        // cannot model exactly (command substitution and variable expansion).
+        if Self::command_substitution_contains_gh_reference(command, depth)
+            || Self::command_invokes_gh_cli_via_shell_variable(command)
+        {
+            return true;
+        }
+
         false
     }
 
@@ -2493,11 +2641,44 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         lower == "api.github.com" || lower.ends_with(".api.github.com")
     }
 
+    fn argument_targets_github_api(argument: &str) -> bool {
+        let normalized = Self::trim_shell_word_boundary(Self::normalize_shell_token(argument));
+        if normalized.is_empty() {
+            return false;
+        }
+
+        let lower = normalized.to_ascii_lowercase();
+        if lower.contains("api.github.com") {
+            return true;
+        }
+
+        if let Some(host_candidate) = lower.strip_prefix("host:")
+            && Self::host_targets_github_api(host_candidate)
+        {
+            return true;
+        }
+
+        if let Ok(parsed_url) = url::Url::parse(normalized)
+            && let Some(host) = parsed_url.host_str()
+            && Self::host_targets_github_api(host)
+        {
+            return true;
+        }
+
+        false
+    }
+
     fn command_targets_github_api(command: &str) -> bool {
         let lower = command.to_ascii_lowercase();
         lower.contains("api.github.com")
+            || command
+                .split_whitespace()
+                .any(Self::argument_targets_github_api)
     }
 
+    // SECURITY (RFC-0028 REQ-0008): command-text inspection is a heuristic,
+    // defense-in-depth signal only. The primary security boundary is RoleSpec
+    // capability rejection at the capability/egress boundary.
     fn detect_direct_github_runtime_attempt(
         tool_class: ToolClass,
         arguments: Option<&serde_json::Value>,
@@ -6439,6 +6620,22 @@ mod tests {
             assert_eq!(evaluation.resolution, GhDirectStageResolution::Explicit);
         }
 
+        #[test]
+        fn gh_direct_stage_stage1_without_freshness_fails_closed_to_stage2() {
+            let evaluation =
+                SessionDispatcher::<InMemoryManifestStore>::evaluate_gh_direct_stage_inputs(
+                    Some("GH-DIRECT-STAGE-1"),
+                    None,
+                    None,
+                    10_000,
+                );
+            assert_eq!(evaluation.stage, GhDirectStage::Stage2);
+            assert_eq!(
+                evaluation.resolution,
+                GhDirectStageResolution::MissingFreshnessFailClosed
+            );
+        }
+
         fn make_projection_isolation_dispatcher() -> (
             SessionDispatcher<InMemoryManifestStore>,
             Arc<StubLedgerEventEmitter>,
@@ -6537,6 +6734,58 @@ mod tests {
             );
         }
 
+        fn assert_network_direct_github_attempt_denied(url: &str, dedupe_key: &str) {
+            let (dispatcher, ledger, minter) = make_projection_isolation_dispatcher();
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "network".to_string(),
+                arguments: serde_json::to_vec(&serde_json::json!({
+                    "url": url,
+                    "method": "GET"
+                }))
+                .unwrap(),
+                dedupe_key: dedupe_key.to_string(),
+                epoch_seal: None,
+            };
+            let frame = encode_request_tool_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32
+                    );
+                    assert!(
+                        err.message.contains("projection isolation denied"),
+                        "expected projection isolation deny, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("class=github_api"),
+                        "expected github_api class in deny message, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("vector=network_url"),
+                        "expected network_url vector in deny message, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected direct GitHub network deny, got: {other:?}"),
+            }
+
+            let defect_count = ledger
+                .get_events_by_work_id("session-001")
+                .into_iter()
+                .filter(|event| event.event_type == "defect_recorded")
+                .count();
+            assert_eq!(defect_count, 1, "expected one deny defect event");
+        }
+
         #[test]
         fn direct_gh_cli_attempt_denied_with_structured_defect() {
             assert_execute_direct_github_attempt_denied(
@@ -6583,11 +6832,89 @@ mod tests {
         }
 
         #[test]
+        fn substitution_wrapped_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "bash -c \"$(echo gh) api /repos\"",
+                "projection-isolation-subst-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn eval_indirection_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "eval \"gh api /repos\"",
+                "projection-isolation-eval-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn shell_variable_indirection_gh_api_attempt_denied_with_structured_defect() {
+            assert_execute_direct_github_attempt_denied(
+                "cmd=gh; $cmd api /repos",
+                "projection-isolation-var-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
         fn nested_api_github_host_in_shell_argument_denied_with_structured_defect() {
             assert_execute_direct_github_attempt_denied(
                 "bash -c \"curl -sSf https://api.github.com/repos/example/repo\"",
                 "projection-isolation-nested-api-host",
                 "github_api",
+            );
+        }
+
+        #[test]
+        fn unicode_multibyte_execute_detail_truncates_without_panic() {
+            let unicode_payload = "界".repeat(MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN);
+            let command = format!("gh api /repos/example/repo/issues --body {unicode_payload}");
+            let args = serde_json::json!({ "command": command });
+            let attempt =
+                SessionDispatcher::<InMemoryManifestStore>::detect_direct_github_runtime_attempt(
+                    ToolClass::Execute,
+                    Some(&args),
+                )
+                .expect("expected direct gh attempt detection");
+            assert!(attempt.detail.len() <= MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN);
+            assert!(attempt.detail.ends_with("..."));
+        }
+
+        #[test]
+        fn unicode_multibyte_network_url_detail_truncates_without_panic() {
+            let unicode_suffix = "界".repeat(MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN);
+            let url = format!("https://api.github.com/repos/example/repo/issues/{unicode_suffix}");
+            let args = serde_json::json!({ "url": url, "method": "GET" });
+            let attempt =
+                SessionDispatcher::<InMemoryManifestStore>::detect_direct_github_runtime_attempt(
+                    ToolClass::Network,
+                    Some(&args),
+                )
+                .expect("expected direct github API detection");
+            assert!(attempt.detail.len() <= MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN);
+            assert!(attempt.detail.ends_with("..."));
+        }
+
+        #[test]
+        fn unicode_multibyte_execute_attempt_denied_without_panic() {
+            let unicode_payload = "界".repeat(MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN);
+            let command = format!("gh api /repos/example/repo/issues --body {unicode_payload}");
+            assert_execute_direct_github_attempt_denied(
+                &command,
+                "projection-isolation-unicode-gh",
+                "gh_cli",
+            );
+        }
+
+        #[test]
+        fn unicode_multibyte_network_url_attempt_denied_without_panic() {
+            let unicode_suffix = "界".repeat(MAX_GH_DIRECT_ATTEMPT_DETAIL_LEN);
+            let url = format!("https://api.github.com/repos/example/repo/issues/{unicode_suffix}");
+            assert_network_direct_github_attempt_denied(
+                &url,
+                "projection-isolation-unicode-network",
             );
         }
 
