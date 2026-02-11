@@ -606,12 +606,24 @@ fn delegation_meet_exact_v1_digest(
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"apm2.delegation_meet_exact_v1.digest");
-    hasher.update(DELEGATION_MEET_SCHEMA_ID.as_bytes());
+    let update_len_prefixed = |hasher: &mut blake3::Hasher, bytes: &[u8]| {
+        let len =
+            u64::try_from(bytes.len()).expect("usize length always fits into u64 for framing");
+        hasher.update(&len.to_le_bytes());
+        hasher.update(bytes);
+    };
+    update_len_prefixed(&mut hasher, DELEGATION_MEET_SCHEMA_ID.as_bytes());
     hasher.update(&DELEGATION_MEET_SCHEMA_MAJOR.to_be_bytes());
-    hasher.update(DELEGATION_MEET_EXACT_V1_ALGORITHM_ID.as_bytes());
-    hasher.update(&parent.canonical_bytes());
-    hasher.update(&overlay.canonical_bytes());
-    hasher.update(&delegated.canonical_bytes());
+    update_len_prefixed(
+        &mut hasher,
+        DELEGATION_MEET_EXACT_V1_ALGORITHM_ID.as_bytes(),
+    );
+    let parent_bytes = parent.canonical_bytes();
+    let overlay_bytes = overlay.canonical_bytes();
+    let delegated_bytes = delegated.canonical_bytes();
+    update_len_prefixed(&mut hasher, &parent_bytes);
+    update_len_prefixed(&mut hasher, &overlay_bytes);
+    update_len_prefixed(&mut hasher, &delegated_bytes);
     hasher.finalize().into()
 }
 

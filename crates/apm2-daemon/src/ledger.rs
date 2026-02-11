@@ -2783,33 +2783,6 @@ impl LeaseValidator for SqliteLeaseValidator {
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
     }
-
-    fn rollback_full_lease(&self, lease_id: &str) -> Result<(), String> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| format!("failed to acquire ledger lock: {e}"))?;
-        let rows_affected = conn
-            .execute(
-                "DELETE FROM ledger_events
-                 WHERE rowid IN (
-                     SELECT rowid FROM ledger_events
-                     WHERE event_type = 'gate_lease_issued'
-                     AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1
-                     AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL
-                     ORDER BY rowid DESC
-                     LIMIT 1
-                 )",
-                params![lease_id],
-            )
-            .map_err(|e| format!("failed to rollback lease event: {e}"))?;
-        if rows_affected == 0 {
-            return Err(format!(
-                "no persisted full lease found for lease_id: {lease_id}"
-            ));
-        }
-        Ok(())
-    }
 }
 
 // ============================================================================
