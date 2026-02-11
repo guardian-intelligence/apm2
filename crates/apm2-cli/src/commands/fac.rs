@@ -542,6 +542,13 @@ pub struct ReviewRunArgs {
     /// start.
     #[arg(long)]
     pub expected_head_sha: Option<String>,
+
+    /// Force re-running on the same SHA even when a terminal run already
+    /// exists for this review type.
+    ///
+    /// This does not bypass merge-conflict checks against `main`.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
 }
 
 /// Arguments for `apm2 fac review dispatch`.
@@ -562,6 +569,13 @@ pub struct ReviewDispatchArgs {
     /// Optional expected head SHA (40 hex) to fail closed on stale dispatch.
     #[arg(long)]
     pub expected_head_sha: Option<String>,
+
+    /// Force re-dispatch on the same SHA even when a terminal run already
+    /// exists for this review type.
+    ///
+    /// This does not bypass merge-conflict checks against `main`.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
 }
 
 /// Arguments for `apm2 fac review status`.
@@ -1022,12 +1036,14 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
                 &run_args.pr_url,
                 run_args.review_type,
                 run_args.expected_head_sha.as_deref(),
+                run_args.force,
                 json_output,
             ),
             ReviewSubcommand::Dispatch(dispatch_args) => fac_review::run_dispatch(
                 &dispatch_args.pr_url,
                 dispatch_args.review_type,
                 dispatch_args.expected_head_sha.as_deref(),
+                dispatch_args.force,
                 json_output,
             ),
             ReviewSubcommand::Status(status_args) => {

@@ -11,6 +11,7 @@ use apm2_daemon::telemetry::is_cgroup_v2_available;
 
 use super::evidence::{EvidenceGateOptions, run_evidence_gates};
 use super::gate_cache::GateCache;
+use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
 use crate::exit_codes::codes as exit_codes;
 
 const MAX_BOUNDED_TEST_TIMEOUT_SECONDS: u64 = 240;
@@ -152,21 +153,38 @@ fn run_gates_inner(
         return Err(format!("unexpected short SHA: {sha}"));
     }
 
+    // 3. Merge-conflict gate always runs first, even in quick mode and cache-hit
+    //    paths.
+    let merge_gate = evaluate_merge_conflict_gate(&workspace_root, &sha)?;
+    if merge_gate.status == "FAIL" {
+        return Ok(GatesSummary {
+            sha,
+            passed: false,
+            bounded: false,
+            quick,
+            cache_status: "disabled (merge conflicts)".to_string(),
+            gates: vec![merge_gate],
+        });
+    }
+
     // 3. Check gate cache (unless --force). Quick mode never reads/writes
     // cache because it intentionally skips the heavyweight test gate.
     if !force && !quick {
         if let Some(cached) = GateCache::load(&sha) {
             if cached.all_passed() {
                 eprintln!("all gates cached as PASS for {sha} — use --force to re-run");
-                let gates = cached
+                let mut gates = vec![merge_gate];
+                let mut cached_gates = cached
                     .gates
                     .iter()
+                    .filter(|(name, _)| name.as_str() != "merge_conflict_main")
                     .map(|(name, result)| GateResult {
                         name: name.clone(),
                         status: result.status.clone(),
                         duration_secs: result.duration_secs,
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+                gates.append(&mut cached_gates);
                 return Ok(GatesSummary {
                     sha,
                     passed: true,
@@ -201,6 +219,7 @@ fn run_gates_inner(
     let opts = EvidenceGateOptions {
         test_command,
         skip_test_gate: quick,
+        skip_merge_conflict_gate: true,
     };
 
     // 5. Run evidence gates.
@@ -217,7 +236,8 @@ fn run_gates_inner(
         cache.save()?;
     }
 
-    let mut gates: Vec<GateResult> = gate_results
+    let mut gates = vec![merge_gate];
+    let mut evidence_gates: Vec<GateResult> = gate_results
         .iter()
         .map(|r| GateResult {
             name: r.gate_name.clone(),
@@ -225,6 +245,7 @@ fn run_gates_inner(
             duration_secs: r.duration_secs,
         })
         .collect();
+    gates.append(&mut evidence_gates);
     if quick {
         // Keep test visible in summary even when skipped for inner-loop runs.
         let insert_index = gates
@@ -273,6 +294,21 @@ fn validate_timeout_seconds(timeout_seconds: u64) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn evaluate_merge_conflict_gate(workspace_root: &Path, sha: &str) -> Result<GateResult, String> {
+    let started = Instant::now();
+    let report = check_merge_conflicts_against_main(workspace_root, sha)?;
+    let duration = started.elapsed().as_secs();
+    let passed = !report.has_conflicts();
+    if !passed {
+        eprintln!("{}", render_merge_conflict_summary(&report));
+    }
+    Ok(GateResult {
+        name: "merge_conflict_main".to_string(),
+        status: if passed { "PASS" } else { "FAIL" }.to_string(),
+        duration_secs: duration,
+    })
 }
 
 /// Build the bounded test runner command, mirroring the old `fac check`

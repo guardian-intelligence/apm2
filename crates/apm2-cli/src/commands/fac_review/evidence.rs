@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 
 use super::ci_status::{CiStatus, ThrottledUpdater};
 use super::gate_cache::GateCache;
+use super::merge_conflicts::{
+    check_merge_conflicts_against_main, render_merge_conflict_log, render_merge_conflict_summary,
+};
 use super::types::{apm2_home_dir, now_iso8601};
 
 /// Options for customizing evidence gate execution.
@@ -18,6 +21,8 @@ pub struct EvidenceGateOptions {
     pub test_command: Option<Vec<String>>,
     /// Skip the heavyweight test gate for quick inner-loop validation.
     pub skip_test_gate: bool,
+    /// Skip merge-conflict gate when caller already pre-validated it.
+    pub skip_merge_conflict_gate: bool,
 }
 
 /// Result of a single evidence gate execution.
@@ -31,6 +36,7 @@ pub struct EvidenceGateResult {
 const SHORT_TEST_OUTPUT_HINT_THRESHOLD_BYTES: usize = 1024;
 const GATE_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const TEST_TIMEOUT_SLA_MESSAGE: &str = "p100 SLA for tests is 4 minutes, p99 is 180s, p50 is 80s. If tests are taking longer that is a bug. Never increase this timeout. Investigate why tests that you added have increased the test time.";
+const MERGE_CONFLICT_GATE_NAME: &str = "merge_conflict_main";
 
 struct GateCommandOutput {
     status: ExitStatus,
@@ -151,6 +157,58 @@ fn append_short_test_failure_hint(log_path: &Path, combined_output_bytes: usize)
         file,
         "  apm2 fac gates --memory-max 24G  # default is 24G; increase if needed"
     );
+}
+
+fn run_merge_conflict_gate(
+    workspace_root: &Path,
+    sha: &str,
+    evidence_dir: &Path,
+) -> (bool, u64, String) {
+    let gate_name = MERGE_CONFLICT_GATE_NAME;
+    let log_path = evidence_dir.join(format!("{gate_name}.log"));
+    let started = Instant::now();
+
+    match check_merge_conflicts_against_main(workspace_root, sha) {
+        Ok(report) => {
+            let duration = started.elapsed().as_secs();
+            let passed = !report.has_conflicts();
+            let _ = fs::write(&log_path, render_merge_conflict_log(&report));
+            if !passed {
+                eprintln!("{}", render_merge_conflict_summary(&report));
+            }
+            let status = if passed { "PASS" } else { "FAIL" };
+            emit_evidence_line(sha, gate_name, status, duration, &log_path, None);
+            let ts = now_iso8601();
+            (
+                passed,
+                duration,
+                format!(
+                    "ts={ts} sha={sha} gate={gate_name} status={status} log={}",
+                    log_path.display()
+                ),
+            )
+        },
+        Err(err) => {
+            let duration = started.elapsed().as_secs();
+            let _ = fs::write(
+                &log_path,
+                format!("merge conflict gate execution error: {err}\n"),
+            );
+            emit_evidence_line(sha, gate_name, "FAIL", duration, &log_path, None);
+            eprintln!("merge_conflict_main: FAIL reason={err}");
+            let ts = now_iso8601();
+            let sanitized_err = err.split_whitespace().collect::<Vec<_>>().join("_");
+            (
+                false,
+                duration,
+                format!(
+                    "ts={ts} sha={sha} gate={gate_name} status=FAIL log={} error={}",
+                    log_path.display(),
+                    sanitized_err
+                ),
+            )
+        },
+    }
 }
 
 /// Run a single evidence gate and emit the result.
@@ -313,6 +371,30 @@ pub fn run_evidence_gates(
     let mut all_passed = true;
     let mut evidence_lines = Vec::new();
     let mut gate_results = Vec::new();
+
+    let skip_merge_conflict_gate = opts.is_some_and(|o| o.skip_merge_conflict_gate);
+    if !skip_merge_conflict_gate {
+        // Phase 0: merge conflict gate (always first, including quick mode).
+        let (merge_passed, merge_duration, merge_line) =
+            run_merge_conflict_gate(workspace_root, sha, &evidence_dir);
+        gate_results.push(EvidenceGateResult {
+            gate_name: MERGE_CONFLICT_GATE_NAME.to_string(),
+            passed: merge_passed,
+            duration_secs: merge_duration,
+        });
+        if !merge_passed {
+            all_passed = false;
+        }
+        evidence_lines.push(merge_line);
+        if !merge_passed {
+            if let Some(file) = projection_log {
+                for line in &evidence_lines {
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+            return Ok((false, gate_results));
+        }
+    }
 
     // Phase 1: cargo fmt/clippy/doc.
     for &(gate_name, cmd_args) in gates {
@@ -540,6 +622,27 @@ pub fn run_evidence_gates_with_status(
 
     let mut all_passed = true;
     let mut evidence_lines = Vec::new();
+
+    // Phase 0: merge conflict gate (always first, even if cache has PASS).
+    {
+        let gate_name = MERGE_CONFLICT_GATE_NAME;
+        status.set_running(gate_name);
+        updater.update(&status);
+
+        let (passed, duration, line) = run_merge_conflict_gate(workspace_root, sha, &evidence_dir);
+        status.set_result(gate_name, passed, duration);
+        updater.update(&status);
+        evidence_lines.push(line);
+        if !passed {
+            updater.force_update(&status);
+            if let Some(file) = projection_log {
+                for line in &evidence_lines {
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+            return Ok(false);
+        }
+    }
 
     // Phase 1: cargo fmt/clippy/doc.
     for &(gate_name, cmd_args) in gates {

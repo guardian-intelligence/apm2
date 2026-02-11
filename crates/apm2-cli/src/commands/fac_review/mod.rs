@@ -22,6 +22,7 @@ mod gate_cache;
 mod gates;
 mod liveness;
 mod logs;
+mod merge_conflicts;
 mod model_pool;
 mod orchestrator;
 mod pipeline;
@@ -48,7 +49,7 @@ use barrier::{
 };
 // Re-export public API for use by `fac.rs`
 pub use decision::DecisionValueArg;
-use dispatch::dispatch_single_review;
+use dispatch::dispatch_single_review_with_force;
 use events::{read_last_event_values, review_events_path};
 use projection::{projection_state_done, projection_state_failed, run_project_inner};
 pub use publish::ReviewPublishTypeArg;
@@ -165,6 +166,7 @@ pub fn run_review(
     pr_url: &str,
     review_type: ReviewRunType,
     expected_head_sha: Option<&str>,
+    force: bool,
     json_output: bool,
 ) -> u8 {
     let event_offset = review_events_path()
@@ -172,7 +174,7 @@ pub fn run_review(
         .and_then(|path| fs::metadata(path).ok().map(|meta| meta.len()))
         .unwrap_or(0);
 
-    match orchestrator::run_review_inner(pr_url, review_type, expected_head_sha) {
+    match orchestrator::run_review_inner(pr_url, review_type, expected_head_sha, force) {
         Ok(summary) => {
             let success = summary.security.as_ref().is_none_or(|entry| entry.success)
                 && summary.quality.as_ref().is_none_or(|entry| entry.success);
@@ -270,9 +272,10 @@ pub fn run_dispatch(
     pr_url: &str,
     review_type: ReviewRunType,
     expected_head_sha: Option<&str>,
+    force: bool,
     json_output: bool,
 ) -> u8 {
-    match run_dispatch_inner(pr_url, review_type, expected_head_sha) {
+    match run_dispatch_inner(pr_url, review_type, expected_head_sha, force) {
         Ok(summary) => {
             if json_output {
                 let payload = serde_json::json!({
@@ -799,6 +802,7 @@ fn run_dispatch_inner(
     pr_url: &str,
     review_type: ReviewRunType,
     expected_head_sha: Option<&str>,
+    force: bool,
 ) -> Result<DispatchSummary, String> {
     let (owner_repo, pr_number) = parse_pr_url(pr_url)?;
     let current_head_sha = barrier::fetch_pr_head_sha(&owner_repo, pr_number)?;
@@ -810,7 +814,6 @@ fn run_dispatch_inner(
             ));
         }
     }
-
     let dispatch_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -824,13 +827,14 @@ fn run_dispatch_inner(
 
     let mut results = Vec::with_capacity(kinds.len());
     for kind in kinds {
-        let result = dispatch_single_review(
+        let result = dispatch_single_review_with_force(
             pr_url,
             &owner_repo,
             pr_number,
             kind,
             &current_head_sha,
             dispatch_epoch,
+            force,
         )?;
         results.push(result);
     }
@@ -874,7 +878,7 @@ fn run_kickoff_inner(
     ensure_gh_cli_ready()?;
 
     let started = Instant::now();
-    let dispatch = run_dispatch_inner(&ctx.pr_url, ReviewRunType::All, Some(&ctx.head_sha))?;
+    let dispatch = run_dispatch_inner(&ctx.pr_url, ReviewRunType::All, Some(&ctx.head_sha), false)?;
     let mut after_seq = 0_u64;
     let deadline = Instant::now() + Duration::from_secs(max_wait_seconds);
     let mut terminal_state = "failure:timeout".to_string();

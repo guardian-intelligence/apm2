@@ -116,6 +116,7 @@ fn analyze_ci_status(status: &CiStatus) -> RestartStrategy {
 
     // Evidence gate names (must match evidence.rs gate definitions).
     let evidence_gates = [
+        "merge_conflict_main",
         "rustfmt",
         "clippy",
         "doc",
