@@ -1468,6 +1468,9 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         receipt_id: &str,
         request_id: &str,
         tool_class: &str,
+        intent_digest: &[u8; 32],
+        argument_content_digest: &[u8; 32],
+        channel_key: &str,
         actor_id: &str,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
@@ -1478,6 +1481,9 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "receipt_id": receipt_id,
             "request_id": request_id,
             "tool_class": tool_class,
+            "intent_digest": hex::encode(intent_digest),
+            "argument_content_digest": hex::encode(argument_content_digest),
+            "channel_key": channel_key,
             "actor_id": actor_id,
             "timestamp_ns": timestamp_ns,
         });
@@ -1506,6 +1512,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             receipt_id = %receipt_id,
             request_id = %request_id,
             tool_class = %tool_class,
+            intent_digest = %hex::encode(intent_digest),
+            channel_key = %channel_key,
             "Persisted RedundancyReceiptConsumed event"
         );
         Ok(signed_event)
@@ -1515,6 +1523,13 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         &self,
         receipt_id: &str,
     ) -> Option<RedundancyReceiptConsumption> {
+        fn parse_hash32(value: Option<&serde_json::Value>) -> Option<[u8; 32]> {
+            let hex = value?.as_str()?;
+            let bytes = hex::decode(hex).ok()?;
+            let arr: [u8; 32] = bytes.try_into().ok()?;
+            Some(arr)
+        }
+
         let conn = self.conn.lock().ok()?;
 
         let payload: Vec<u8> = conn
@@ -1534,6 +1549,12 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             receipt_id: payload.get("receipt_id")?.as_str()?.to_string(),
             request_id: payload.get("request_id")?.as_str()?.to_string(),
             tool_class: payload.get("tool_class")?.as_str()?.to_string(),
+            intent_digest: parse_hash32(payload.get("intent_digest")),
+            argument_content_digest: parse_hash32(payload.get("argument_content_digest")),
+            channel_key: payload
+                .get("channel_key")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
         })
     }
 
@@ -4889,6 +4910,9 @@ mod tests {
                 receipt_id,
                 "REQ-CONSUME-001",
                 "inference",
+                &[0xA1; 32],
+                &[0xB2; 32],
+                "session-001::inference",
                 "session-consume-001",
                 1_700_000_000_000_000_101,
             )
@@ -4899,6 +4923,12 @@ mod tests {
             .expect("consumption lookup should return emitted binding");
         assert_eq!(consumption.request_id, "REQ-CONSUME-001");
         assert_eq!(consumption.tool_class, "inference");
+        assert_eq!(consumption.intent_digest, Some([0xA1; 32]));
+        assert_eq!(consumption.argument_content_digest, Some([0xB2; 32]));
+        assert_eq!(
+            consumption.channel_key.as_deref(),
+            Some("session-001::inference")
+        );
     }
 
     /// Verifies that `emit_review_blocked_receipt` includes replay-critical
