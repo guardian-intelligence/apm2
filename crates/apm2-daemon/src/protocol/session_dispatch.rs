@@ -94,7 +94,6 @@ use tracing::{debug, error, info, warn};
 
 use super::dispatch::{
     BoundaryFlowRuntimeState, ConnectionContext, LedgerEventEmitter, PrivilegedDispatcher,
-    SignedLedgerEvent,
 };
 use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
@@ -2279,92 +2278,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
-    fn parse_hash_hex(candidate: &str) -> Option<Hash> {
-        let trimmed = candidate.strip_prefix("0x").unwrap_or(candidate);
-        if trimmed.len() != 64 {
-            return None;
-        }
-        let bytes = hex::decode(trimmed).ok()?;
-        let hash: [u8; 32] = bytes.as_slice().try_into().ok()?;
-        Some(hash)
-    }
-
-    fn parse_hash_array(candidate: &[serde_json::Value]) -> Option<Hash> {
-        if candidate.len() != 32 {
-            return None;
-        }
-        let mut hash = [0u8; 32];
-        for (index, value) in candidate.iter().enumerate() {
-            let byte = value.as_u64()?;
-            let byte = u8::try_from(byte).ok()?;
-            hash[index] = byte;
-        }
-        Some(hash)
-    }
-
-    fn parse_hash_value(candidate: &serde_json::Value) -> Option<Hash> {
-        match candidate {
-            serde_json::Value::String(value) => Self::parse_hash_hex(value),
-            serde_json::Value::Array(values) => Self::parse_hash_array(values),
-            _ => None,
-        }
-    }
-
-    const TRUSTED_GATE_POLICY_EVENT_TYPE: &'static str = "gate.policy_resolved";
-    const TRUSTED_GATE_POLICY_ACTOR_ID: &'static str = "orchestrator:gate-lifecycle";
-
-    fn parse_trusted_policy_root_digest_from_gate_event(
-        event: &SignedLedgerEvent,
-    ) -> Result<Option<Hash>, String> {
-        if event.event_type != Self::TRUSTED_GATE_POLICY_EVENT_TYPE
-            || event.actor_id != Self::TRUSTED_GATE_POLICY_ACTOR_ID
-        {
-            return Ok(None);
-        }
-
-        let wrapper = serde_json::from_slice::<serde_json::Value>(&event.payload)
-            .map_err(|error| format!("trusted gate policy payload decode failed: {error}"))?;
-
-        let wrapper_event_type = wrapper
-            .get("event_type")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "trusted gate policy wrapper missing event_type".to_string())?;
-        if wrapper_event_type != Self::TRUSTED_GATE_POLICY_EVENT_TYPE {
-            return Err(format!(
-                "trusted gate policy wrapper event_type mismatch: expected={}, got={wrapper_event_type}",
-                Self::TRUSTED_GATE_POLICY_EVENT_TYPE
-            ));
-        }
-
-        let payload_hex = wrapper
-            .get("payload")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "trusted gate policy wrapper missing payload".to_string())?;
-        let payload_bytes = hex::decode(payload_hex).map_err(|error| {
-            format!("trusted gate policy inner payload is not valid hex: {error}")
-        })?;
-        let payload = serde_json::from_slice::<serde_json::Value>(&payload_bytes)
-            .map_err(|error| format!("trusted gate policy inner payload decode failed: {error}"))?;
-
-        let policy_hash_value = payload
-            .get("PolicyResolved")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|policy_resolved| policy_resolved.get("policy_hash"))
-            .or_else(|| payload.get("policy_hash"))
-            .ok_or_else(|| "trusted gate policy payload missing policy_hash".to_string())?;
-        let Some(policy_hash) = Self::parse_hash_value(policy_hash_value) else {
-            return Err("trusted gate policy payload policy_hash is invalid".to_string());
-        };
-        Ok((policy_hash != [0u8; 32]).then_some(policy_hash))
-    }
-
+    #[allow(clippy::unnecessary_wraps)]
     fn resolve_policy_root_digest_from_ledger(
-        ledger: &dyn LedgerEventEmitter,
+        _ledger: &dyn LedgerEventEmitter,
     ) -> Result<Option<Hash>, String> {
-        let Some(event) = ledger.get_latest_gate_policy_resolved_event() else {
-            return Ok(None);
-        };
-        Self::parse_trusted_policy_root_digest_from_gate_event(&event)
+        // SECURITY: Policy-root derivation from ledger events is disabled.
+        // The previous approach accepted payload-derived hash material from
+        // replayed ledger rows. Session-originated EmitEvent data can inject
+        // attacker-chosen hash fields, so this cannot be treated as
+        // authoritative policy provenance.
+        //
+        // Policy-root verification requires a dedicated daemon/governance-only
+        // signed event type that session EmitEvent cannot produce. Until that
+        // exists, fail closed.
+        Ok(None)
     }
 
     fn resolve_authoritative_policy_root_digest(
@@ -11582,12 +11509,12 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_policy_digest_ignores_untrusted_latest_session_event() {
+    fn authoritative_policy_digest_resolution_is_fail_closed() {
         use crate::protocol::dispatch::StubLedgerEventEmitter;
 
-        let trusted_policy_hash = [0xA5; 32];
-        let forged_policy_hash = [0x5A; 32];
         let ledger = StubLedgerEventEmitter::new();
+        let trusted_policy_hash = vec![0xA5_u8; 32];
+        let forged_policy_hash = vec![0x5A_u8; 32];
 
         let trusted_payload = serde_json::to_vec(&serde_json::json!({
             "PolicyResolved": {
@@ -11629,9 +11556,8 @@ mod tests {
             )
             .expect("authoritative policy digest resolution should succeed");
         assert_eq!(
-            resolved,
-            Some(trusted_policy_hash),
-            "authoritative policy digest must come from trusted gate-lifecycle provenance only"
+            resolved, None,
+            "policy-root derivation from ledger events is intentionally disabled (fail-closed)"
         );
     }
 
