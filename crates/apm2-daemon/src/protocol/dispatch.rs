@@ -12621,6 +12621,18 @@ impl PrivilegedDispatcher {
                 format!("identity_proof_hash validation failed: {e}"),
             ));
         }
+        // WVR-0103: Log once that identity proof hash is validated as
+        // shape-only commitment (Phase 1 / pre-CAS transport).
+        {
+            static PROOF_WAIVER_WARN: std::sync::Once = std::sync::Once::new();
+            PROOF_WAIVER_WARN.call_once(|| {
+                warn!(
+                    waiver = "WVR-0103",
+                    "identity proof hash validated as shape-only commitment; \
+                     full CAS dereference + IdentityProofV1::verify() deferred (WVR-0103)"
+                );
+            });
+        }
 
         // Validate changeset_digest is exactly 32 bytes
         if request.changeset_digest.len() != 32 {
@@ -13157,7 +13169,7 @@ impl PrivilegedDispatcher {
             lease_id: request.lease_id.clone(),
             permeability_receipt_hash: None,
             identity_proof_hash: request_identity_proof_hash_arr,
-            identity_evidence_level: IdentityEvidenceLevel::Verified,
+            identity_evidence_level: IdentityEvidenceLevel::PointerOnly,
             pointer_only_waiver_hash: None,
             directory_head_hash: join_revocation_head,
             freshness_policy_hash,
@@ -28750,7 +28762,7 @@ mod tests {
         }
 
         #[test]
-        fn test_ingest_review_receipt_privileged_pcac_join_uses_verified_evidence() {
+        fn test_ingest_review_receipt_privileged_pcac_join_uses_pointer_only_evidence() {
             use apm2_core::pcac::{
                 AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyV1,
                 AuthorityJoinCertificateV1, AuthorityJoinInputV1, AuthorityJoinKernel,
@@ -28909,8 +28921,8 @@ mod tests {
 
             let observed = observed_levels.lock().expect("lock poisoned");
             assert!(
-                observed.contains(&IdentityEvidenceLevel::Verified),
-                "IngestReviewReceipt must construct join input with Verified identity evidence (WVR-0103 retired)"
+                observed.contains(&IdentityEvidenceLevel::PointerOnly),
+                "IngestReviewReceipt must construct join input with PointerOnly identity evidence (WVR-0103 active)"
             );
         }
 
