@@ -98,6 +98,10 @@ struct RoleLaunchChannelContext {
     boundary_flow_policy_binding: Option<BoundaryFlowPolicyBinding>,
     leakage_budget_receipt: Option<LeakageBudgetReceipt>,
     timing_channel_budget: Option<TimingChannelBudget>,
+    leakage_budget_policy_max_bits: Option<u64>,
+    declared_leakage_budget_bits: Option<u64>,
+    timing_budget_policy_max_ticks: Option<u64>,
+    declared_timing_budget_ticks: Option<u64>,
 }
 
 impl RoleLaunchChannelContext {
@@ -117,6 +121,10 @@ impl RoleLaunchChannelContext {
             boundary_flow_policy_binding: None,
             leakage_budget_receipt: None,
             timing_channel_budget: None,
+            leakage_budget_policy_max_bits: None,
+            declared_leakage_budget_bits: None,
+            timing_budget_policy_max_ticks: None,
+            declared_timing_budget_ticks: None,
         }
     }
 
@@ -154,6 +162,10 @@ impl RoleLaunchChannelContext {
                 observed_variance_ticks: 3,
                 budget_ticks: 10,
             }),
+            leakage_budget_policy_max_bits: Some(8),
+            declared_leakage_budget_bits: None,
+            timing_budget_policy_max_ticks: Some(10),
+            declared_timing_budget_ticks: None,
         }
     }
 }
@@ -481,6 +493,10 @@ fn resolve_channel_context(
         boundary_flow_policy_binding: check.boundary_flow_policy_binding,
         leakage_budget_receipt: check.leakage_budget_receipt,
         timing_channel_budget: check.timing_channel_budget,
+        leakage_budget_policy_max_bits: check.leakage_budget_policy_max_bits,
+        declared_leakage_budget_bits: check.declared_leakage_budget_bits,
+        timing_budget_policy_max_ticks: check.timing_budget_policy_max_ticks,
+        declared_timing_budget_ticks: check.declared_timing_budget_ticks,
     }
 }
 
@@ -658,6 +674,10 @@ fn enforce_channel_boundary(
         boundary_flow_policy_binding: channel_context.boundary_flow_policy_binding.clone(),
         leakage_budget_receipt: channel_context.leakage_budget_receipt.clone(),
         timing_channel_budget: channel_context.timing_channel_budget.clone(),
+        leakage_budget_policy_max_bits: channel_context.leakage_budget_policy_max_bits,
+        declared_leakage_budget_bits: channel_context.declared_leakage_budget_bits,
+        timing_budget_policy_max_ticks: channel_context.timing_budget_policy_max_ticks,
+        declared_timing_budget_ticks: channel_context.declared_timing_budget_ticks,
     };
     let defects = validate_channel_boundary(&check);
     if defects.is_empty() {
@@ -1622,6 +1642,10 @@ mod tests {
                 observed_variance_ticks: 3,
                 budget_ticks: 10,
             }),
+            leakage_budget_policy_max_bits: Some(8),
+            declared_leakage_budget_bits: None,
+            timing_budget_policy_max_ticks: Some(10),
+            declared_timing_budget_ticks: None,
         }
     }
 

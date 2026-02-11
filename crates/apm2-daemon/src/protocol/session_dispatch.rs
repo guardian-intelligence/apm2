@@ -866,6 +866,18 @@ struct BoundaryFlowHints {
     timing_channel: Option<TimingChannelHints>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct RequestToolArgumentsBoundaryFlowEnvelope {
+    #[serde(default)]
+    boundary_flow: Option<BoundaryFlowHints>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequestToolArgumentsBoundaryFlowProbe {
+    #[serde(default)]
+    boundary_flow: Option<serde::de::IgnoredAny>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum DeclassificationIntentHint {
@@ -907,6 +919,20 @@ struct TimingChannelHints {
     budget: u64,
     #[serde(rename = "release_bucket_ticks")]
     release_bucket: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct AuthoritativeRedundancyReceiptPayload {
+    receipt_id: String,
+    lease_id: String,
+    work_id: String,
+    #[serde(default)]
+    declassification_intent: Option<DeclassificationIntentHint>,
+    #[serde(default)]
+    scoped_fragment_only: Option<bool>,
+    #[serde(default)]
+    plaintext_semantics_exposed: Option<bool>,
 }
 
 #[cfg(not(test))]
@@ -2066,16 +2092,23 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     fn extract_boundary_flow_hints(
         request_arguments: &[u8],
     ) -> Result<Option<BoundaryFlowHints>, String> {
-        let Ok(arguments_value) = serde_json::from_slice::<serde_json::Value>(request_arguments)
+        let typed_parse =
+            serde_json::from_slice::<RequestToolArgumentsBoundaryFlowEnvelope>(request_arguments);
+        let typed_error = match typed_parse {
+            Ok(arguments) => return Ok(arguments.boundary_flow),
+            Err(error) => error,
+        };
+
+        let Ok(probe) =
+            serde_json::from_slice::<RequestToolArgumentsBoundaryFlowProbe>(request_arguments)
         else {
             return Ok(None);
         };
-        let Some(boundary_flow) = arguments_value.get("boundary_flow") else {
+        if probe.boundary_flow.is_none() {
             return Ok(None);
-        };
-        serde_json::from_value::<BoundaryFlowHints>(boundary_flow.clone())
-            .map(Some)
-            .map_err(|error| format!("invalid boundary_flow hints: {error}"))
+        }
+
+        Err(format!("invalid boundary_flow hints: {typed_error}"))
     }
 
     const fn leakage_budget_bits_for_tier(risk_tier: RiskTier) -> u64 {
@@ -2170,13 +2203,71 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
+    fn resolve_authoritative_redundancy_receipt(
+        &self,
+        session_id: &str,
+        lease_id: &str,
+        receipt_id: &str,
+    ) -> Option<RedundancyDeclassificationReceipt> {
+        if receipt_id.is_empty()
+            || receipt_id.len() > apm2_core::channel::MAX_DECLASSIFICATION_RECEIPT_ID_LENGTH
+        {
+            return None;
+        }
+
+        let expected_work_id = self
+            .session_registry
+            .as_ref()
+            .and_then(|registry| registry.get_session(session_id))
+            .map(|session| session.work_id)?;
+
+        let event = self.ledger.as_ref()?.get_event_by_receipt_id(receipt_id)?;
+        if event.event_type != "review_receipt_recorded" {
+            return None;
+        }
+
+        let payload =
+            serde_json::from_slice::<AuthoritativeRedundancyReceiptPayload>(&event.payload).ok()?;
+        if payload.receipt_id != receipt_id
+            || payload.lease_id != lease_id
+            || payload.work_id != expected_work_id
+        {
+            return None;
+        }
+        if !matches!(
+            payload.declassification_intent,
+            Some(DeclassificationIntentHint::RedundancyPurpose)
+        ) {
+            return None;
+        }
+
+        let receipt = RedundancyDeclassificationReceipt {
+            receipt_id: payload.receipt_id,
+            scoped_fragment_only: payload.scoped_fragment_only?,
+            plaintext_semantics_exposed: payload.plaintext_semantics_exposed?,
+        };
+        if receipt.receipt_id.is_empty()
+            || receipt.receipt_id.len() > apm2_core::channel::MAX_DECLASSIFICATION_RECEIPT_ID_LENGTH
+            || !receipt.scoped_fragment_only
+            || receipt.plaintext_semantics_exposed
+        {
+            return None;
+        }
+        Some(receipt)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn build_boundary_flow_runtime_state(
+        &self,
+        session_id: &str,
+        lease_id: &str,
         decision: &Result<ToolDecision, crate::episode::BrokerError>,
-        risk_tier: RiskTier,
+        risk_tier: Option<RiskTier>,
         taint_assessment: &apm2_core::fac::taint::RuntimeTaintAssessment,
         request_arguments: &[u8],
         policy_verified: bool,
     ) -> Result<BoundaryFlowRuntimeState, String> {
+        let risk_tier = risk_tier.unwrap_or(RiskTier::Tier4);
         let hints = Self::extract_boundary_flow_hints(request_arguments)?;
         let base_taint_allow = Self::taint_allow_for_tier(risk_tier, taint_assessment.tag.level);
         let base_classification_allow =
@@ -2204,20 +2295,25 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 declassification_intent,
                 DeclassificationIntentScope::RedundancyPurpose
             ) {
-                let receipt_id = declassification.receipt_id.clone().unwrap_or_default();
-                let receipt = RedundancyDeclassificationReceipt {
-                    receipt_id,
-                    scoped_fragment_only: declassification.scoped_fragment_only.unwrap_or(false),
-                    plaintext_semantics_exposed: declassification
-                        .plaintext_semantics_exposed
-                        .unwrap_or(true),
-                };
-                declass_receipt_valid = !receipt.receipt_id.is_empty()
-                    && receipt.receipt_id.len()
-                        <= apm2_core::channel::MAX_DECLASSIFICATION_RECEIPT_ID_LENGTH
-                    && receipt.scoped_fragment_only
-                    && !receipt.plaintext_semantics_exposed;
-                redundancy_receipt = Some(receipt);
+                let claimed_receipt_id = declassification.receipt_id.clone().unwrap_or_default();
+                let mut authoritative_receipt = self.resolve_authoritative_redundancy_receipt(
+                    session_id,
+                    lease_id,
+                    &claimed_receipt_id,
+                );
+                if let Some(receipt) = authoritative_receipt.as_ref() {
+                    let claim_mismatch = declassification
+                        .scoped_fragment_only
+                        .is_some_and(|claimed| claimed != receipt.scoped_fragment_only)
+                        || declassification
+                            .plaintext_semantics_exposed
+                            .is_some_and(|claimed| claimed != receipt.plaintext_semantics_exposed);
+                    if claim_mismatch {
+                        authoritative_receipt = None;
+                    }
+                }
+                redundancy_receipt = authoritative_receipt;
+                declass_receipt_valid = redundancy_receipt.is_some();
                 if declass_receipt_valid {
                     classification_allow = true;
                 }
@@ -2238,43 +2334,64 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             declass_receipt_valid = false;
         }
 
-        let default_leakage_budget_bits = Self::leakage_budget_bits_for_tier(risk_tier);
-        let leakage_budget_receipt = hints
+        let policy_leakage_budget_bits = Self::leakage_budget_bits_for_tier(risk_tier);
+        let (claimed_leakage_budget_bits, leakage_budget_receipt) = hints
             .as_ref()
             .and_then(|hints| hints.leakage_budget_receipt.as_ref())
             .map_or_else(
-                || LeakageBudgetReceipt {
-                    leakage_bits: 0,
-                    budget_bits: default_leakage_budget_bits,
-                    estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
-                    confidence_bps: 10_000,
-                    confidence_label: DEFAULT_LEAKAGE_CONFIDENCE_LABEL.to_string(),
+                || {
+                    (
+                        None,
+                        LeakageBudgetReceipt {
+                            leakage_bits: 0,
+                            budget_bits: policy_leakage_budget_bits,
+                            estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
+                            confidence_bps: 10_000,
+                            confidence_label: DEFAULT_LEAKAGE_CONFIDENCE_LABEL.to_string(),
+                        },
+                    )
                 },
-                |hint| LeakageBudgetReceipt {
-                    leakage_bits: hint.leakage_bits,
-                    budget_bits: hint.budget_bits,
-                    estimator_family: hint.estimator_family,
-                    confidence_bps: hint.confidence_bps,
-                    confidence_label: hint
-                        .confidence_label
-                        .clone()
-                        .unwrap_or_else(|| DEFAULT_LEAKAGE_CONFIDENCE_LABEL.to_string()),
+                |hint| {
+                    (
+                        Some(hint.budget_bits),
+                        LeakageBudgetReceipt {
+                            leakage_bits: hint.leakage_bits,
+                            budget_bits: hint.budget_bits.min(policy_leakage_budget_bits),
+                            estimator_family: hint.estimator_family,
+                            confidence_bps: hint.confidence_bps,
+                            confidence_label: hint
+                                .confidence_label
+                                .clone()
+                                .unwrap_or_else(|| DEFAULT_LEAKAGE_CONFIDENCE_LABEL.to_string()),
+                        },
+                    )
                 },
             );
 
-        let timing_channel_budget = hints
+        let policy_timing_budget_ticks = Self::timing_budget_ticks_for_tier(risk_tier);
+        let (claimed_timing_budget_ticks, timing_channel_budget) = hints
             .as_ref()
             .and_then(|hints| hints.timing_channel.as_ref())
             .map_or_else(
-                || TimingChannelBudget {
-                    release_bucket_ticks: Self::release_bucket_ticks_for_tier(risk_tier),
-                    observed_variance_ticks: 0,
-                    budget_ticks: Self::timing_budget_ticks_for_tier(risk_tier),
+                || {
+                    (
+                        None,
+                        TimingChannelBudget {
+                            release_bucket_ticks: Self::release_bucket_ticks_for_tier(risk_tier),
+                            observed_variance_ticks: 0,
+                            budget_ticks: policy_timing_budget_ticks,
+                        },
+                    )
                 },
-                |hint| TimingChannelBudget {
-                    release_bucket_ticks: hint.release_bucket,
-                    observed_variance_ticks: hint.observed_variance,
-                    budget_ticks: hint.budget,
+                |hint| {
+                    (
+                        Some(hint.budget),
+                        TimingChannelBudget {
+                            release_bucket_ticks: hint.release_bucket,
+                            observed_variance_ticks: hint.observed_variance,
+                            budget_ticks: hint.budget.min(policy_timing_budget_ticks),
+                        },
+                    )
                 },
             );
 
@@ -2287,6 +2404,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             policy_binding: Self::derive_policy_binding(decision, policy_verified),
             leakage_budget_receipt,
             timing_channel_budget,
+            leakage_budget_policy_max_bits: policy_leakage_budget_bits,
+            claimed_leakage_budget_bits,
+            timing_budget_policy_max_ticks: policy_timing_budget_ticks,
+            claimed_timing_budget_ticks,
         })
     }
 
@@ -3956,9 +4077,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             let broker_verified = Self::tool_decision_broker_verified(&decision);
             let capability_verified = Self::tool_decision_capability_verified(&decision);
             let context_firewall_verified = defects.is_empty();
-            let boundary_flow_state = match Self::build_boundary_flow_runtime_state(
+            let boundary_flow_state = match self.build_boundary_flow_runtime_state(
+                &token.session_id,
+                &token.lease_id,
                 &decision,
-                risk_tier,
+                Some(risk_tier),
                 &taint_assessment,
                 &request_arguments,
                 policy_ledger_verified,
@@ -6747,7 +6870,7 @@ mod tests {
     }
 
     #[test]
-    fn test_boundary_downgrade_without_declassification_receipt_denied() {
+    fn test_forged_boundary_flow_declassification_claim_denied_without_authoritative_receipt() {
         use crate::episode::preactuation::{PreActuationGate, StopAuthority};
         use crate::episode::{
             Capability, CapabilityManifestBuilder, CapabilityScope, InMemorySessionRegistry,
@@ -6846,7 +6969,10 @@ mod tests {
                     "prompt": "sensitive",
                     "boundary_flow": {
                         "declassification": {
-                            "intent": "redundancy_purpose"
+                            "intent": "redundancy_purpose",
+                            "receipt_id": "RR-FORGED-001",
+                            "scoped_fragment_only": true,
+                            "plaintext_semantics_exposed": false
                         }
                     }
                 }))
@@ -6883,7 +7009,7 @@ mod tests {
     }
 
     #[test]
-    fn test_leakage_overrun_quarantines_boundary_channel() {
+    fn test_inflated_leakage_budget_claim_is_clamped_and_quarantines_boundary_channel() {
         use crate::episode::preactuation::{PreActuationGate, StopAuthority};
         use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
         use crate::htf::{ClockConfig, HolonicClock};
@@ -6969,7 +7095,7 @@ mod tests {
                     "boundary_flow": {
                         "leakage_budget_receipt": {
                             "leakage_bits": 64,
-                            "budget_bits": 8,
+                            "budget_bits": 999_999,
                             "estimator_family": "mutual_information_upper_bound",
                             "confidence_bps": 9200,
                             "confidence_label": "adversarial-overrun"
@@ -6996,6 +7122,17 @@ mod tests {
                     assert!(
                         err.message.contains("leakage_budget_exceeded"),
                         "leakage overrun denial must include leakage defect: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message
+                            .contains("declared leakage budget exceeds policy ceiling"),
+                        "inflated leakage budget must be rejected against policy ceilings: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("budget_bits=24"),
+                        "effective leakage budget must clamp to Tier0 policy max (24 bits): {}",
                         err.message
                     );
                 },
@@ -7037,7 +7174,7 @@ mod tests {
     }
 
     #[test]
-    fn test_timing_overrun_quarantines_boundary_channel() {
+    fn test_inflated_timing_budget_claim_is_clamped_and_quarantines_boundary_channel() {
         use crate::episode::preactuation::{PreActuationGate, StopAuthority};
         use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
         use crate::htf::{ClockConfig, HolonicClock};
@@ -7123,7 +7260,7 @@ mod tests {
                     "boundary_flow": {
                         "timing_channel": {
                             "observed_variance_ticks": 40,
-                            "budget_ticks": 5,
+                            "budget_ticks": 999_999,
                             "release_bucket_ticks": 8
                         }
                     }
@@ -7148,6 +7285,17 @@ mod tests {
                     assert!(
                         err.message.contains("timing_channel_budget_exceeded"),
                         "timing overrun denial must include timing defect: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message
+                            .contains("declared timing budget exceeds policy ceiling"),
+                        "inflated timing budget must be rejected against policy ceilings: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("observed=40 > budget=20"),
+                        "effective timing budget must clamp to Tier0 policy max (20 ticks): {}",
                         err.message
                     );
                 },
@@ -7199,6 +7347,7 @@ mod tests {
             .elapsed()
             .expect("current time should be after unix epoch")
             .as_secs();
+        #[allow(deprecated)]
         let token = channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token(
                 &signer,

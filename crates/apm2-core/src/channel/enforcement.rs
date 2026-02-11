@@ -201,6 +201,18 @@ pub struct ChannelBoundaryCheck {
     pub leakage_budget_receipt: Option<LeakageBudgetReceipt>,
     /// Timing-channel release-bucketing witness.
     pub timing_channel_budget: Option<TimingChannelBudget>,
+    /// Policy-derived maximum leakage budget in bits.
+    #[serde(default)]
+    pub leakage_budget_policy_max_bits: Option<u64>,
+    /// Client-claimed leakage budget in bits before policy clamping.
+    #[serde(default)]
+    pub declared_leakage_budget_bits: Option<u64>,
+    /// Policy-derived maximum timing budget in ticks.
+    #[serde(default)]
+    pub timing_budget_policy_max_ticks: Option<u64>,
+    /// Client-claimed timing budget in ticks before policy clamping.
+    #[serde(default)]
+    pub declared_timing_budget_ticks: Option<u64>,
 }
 
 /// Serialized channel context payload signed by the daemon signer.
@@ -229,6 +241,14 @@ struct ChannelContextTokenPayloadV1 {
     boundary_flow_policy_binding: Option<BoundaryFlowPolicyBinding>,
     leakage_budget_receipt: Option<LeakageBudgetReceipt>,
     timing_channel_budget: Option<TimingChannelBudget>,
+    #[serde(default)]
+    leakage_budget_policy_max_bits: Option<u64>,
+    #[serde(default)]
+    declared_leakage_budget_bits: Option<u64>,
+    #[serde(default)]
+    timing_budget_policy_max_ticks: Option<u64>,
+    #[serde(default)]
+    declared_timing_budget_ticks: Option<u64>,
 }
 
 /// Serialized signed channel context token.
@@ -482,6 +502,10 @@ fn issue_channel_context_token_with_freshness(
         boundary_flow_policy_binding: check.boundary_flow_policy_binding.clone(),
         leakage_budget_receipt: check.leakage_budget_receipt.clone(),
         timing_channel_budget: check.timing_channel_budget.clone(),
+        leakage_budget_policy_max_bits: check.leakage_budget_policy_max_bits,
+        declared_leakage_budget_bits: check.declared_leakage_budget_bits,
+        timing_budget_policy_max_ticks: check.timing_budget_policy_max_ticks,
+        declared_timing_budget_ticks: check.declared_timing_budget_ticks,
     };
 
     let payload_json = canonical_payload(&payload)?;
@@ -600,6 +624,10 @@ pub fn decode_channel_context_token(
         boundary_flow_policy_binding: payload.payload.boundary_flow_policy_binding,
         leakage_budget_receipt: payload.payload.leakage_budget_receipt,
         timing_channel_budget: payload.payload.timing_channel_budget,
+        leakage_budget_policy_max_bits: payload.payload.leakage_budget_policy_max_bits,
+        declared_leakage_budget_bits: payload.payload.declared_leakage_budget_bits,
+        timing_budget_policy_max_ticks: payload.payload.timing_budget_policy_max_ticks,
+        declared_timing_budget_ticks: payload.payload.declared_timing_budget_ticks,
     })
 }
 
@@ -786,6 +814,36 @@ fn validate_leakage_budget(check: &ChannelBoundaryCheck, defects: &mut Vec<Chann
         ));
     }
 
+    if let Some(policy_max_bits) = check.leakage_budget_policy_max_bits {
+        if policy_max_bits == 0 {
+            defects.push(ChannelBoundaryDefect::new(
+                ChannelViolationClass::LeakageBudgetExceeded,
+                "policy leakage budget ceiling is zero (fail-closed)",
+            ));
+        } else {
+            if receipt.budget_bits > policy_max_bits {
+                defects.push(ChannelBoundaryDefect::new(
+                    ChannelViolationClass::LeakageBudgetExceeded,
+                    format!(
+                        "leakage budget exceeds policy ceiling: budget_bits={} > policy_max_bits={policy_max_bits}",
+                        receipt.budget_bits
+                    ),
+                ));
+            }
+
+            if let Some(claimed_budget_bits) = check.declared_leakage_budget_bits {
+                if claimed_budget_bits > policy_max_bits {
+                    defects.push(ChannelBoundaryDefect::new(
+                        ChannelViolationClass::LeakageBudgetExceeded,
+                        format!(
+                            "declared leakage budget exceeds policy ceiling: declared_budget_bits={claimed_budget_bits} > policy_max_bits={policy_max_bits}",
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
     if receipt.leakage_bits > receipt.budget_bits {
         defects.push(ChannelBoundaryDefect::new(
             ChannelViolationClass::LeakageBudgetExceeded,
@@ -812,6 +870,36 @@ fn validate_timing_budget(check: &ChannelBoundaryCheck, defects: &mut Vec<Channe
             "timing-channel budget witness malformed",
         ));
         return;
+    }
+
+    if let Some(policy_max_ticks) = check.timing_budget_policy_max_ticks {
+        if policy_max_ticks == 0 {
+            defects.push(ChannelBoundaryDefect::new(
+                ChannelViolationClass::TimingChannelBudgetExceeded,
+                "policy timing budget ceiling is zero (fail-closed)",
+            ));
+        } else {
+            if timing.budget_ticks > policy_max_ticks {
+                defects.push(ChannelBoundaryDefect::new(
+                    ChannelViolationClass::TimingChannelBudgetExceeded,
+                    format!(
+                        "timing budget exceeds policy ceiling: budget_ticks={} > policy_max_ticks={policy_max_ticks}",
+                        timing.budget_ticks
+                    ),
+                ));
+            }
+
+            if let Some(claimed_budget_ticks) = check.declared_timing_budget_ticks {
+                if claimed_budget_ticks > policy_max_ticks {
+                    defects.push(ChannelBoundaryDefect::new(
+                        ChannelViolationClass::TimingChannelBudgetExceeded,
+                        format!(
+                            "declared timing budget exceeds policy ceiling: declared_budget_ticks={claimed_budget_ticks} > policy_max_ticks={policy_max_ticks}",
+                        ),
+                    ));
+                }
+            }
+        }
     }
 
     if timing.observed_variance_ticks > timing.budget_ticks {
@@ -916,6 +1004,10 @@ mod tests {
             boundary_flow_policy_binding: Some(valid_policy_binding()),
             leakage_budget_receipt: Some(valid_leakage_receipt()),
             timing_channel_budget: Some(valid_timing_budget()),
+            leakage_budget_policy_max_bits: Some(8),
+            declared_leakage_budget_bits: None,
+            timing_budget_policy_max_ticks: Some(10),
+            declared_timing_budget_ticks: None,
         }
     }
 
@@ -1199,6 +1291,34 @@ mod tests {
     }
 
     #[test]
+    fn test_declared_leakage_budget_above_policy_ceiling_denied() {
+        let mut check = baseline_check();
+        check.declared_leakage_budget_bits = Some(999_999);
+
+        let defects = validate_channel_boundary(&check);
+        assert!(defects.iter().any(|defect| {
+            defect.violation_class == ChannelViolationClass::LeakageBudgetExceeded
+                && defect
+                    .detail
+                    .contains("declared leakage budget exceeds policy ceiling")
+        }));
+    }
+
+    #[test]
+    fn test_declared_timing_budget_above_policy_ceiling_denied() {
+        let mut check = baseline_check();
+        check.declared_timing_budget_ticks = Some(999_999);
+
+        let defects = validate_channel_boundary(&check);
+        assert!(defects.iter().any(|defect| {
+            defect.violation_class == ChannelViolationClass::TimingChannelBudgetExceeded
+                && defect
+                    .detail
+                    .contains("declared timing budget exceeds policy ceiling")
+        }));
+    }
+
+    #[test]
     fn test_channel_context_token_roundtrip() {
         let check = baseline_check();
         let signer = Signer::generate();
@@ -1236,6 +1356,10 @@ mod tests {
             boundary_flow_policy_binding: Some(valid_policy_binding()),
             leakage_budget_receipt: Some(valid_leakage_receipt()),
             timing_channel_budget: Some(valid_timing_budget()),
+            leakage_budget_policy_max_bits: Some(8),
+            declared_leakage_budget_bits: None,
+            timing_budget_policy_max_ticks: Some(10),
+            declared_timing_budget_ticks: None,
         };
 
         let bytes1 = canonical_payload(&payload).expect("payload should serialize");
@@ -1268,6 +1392,10 @@ mod tests {
             boundary_flow_policy_binding: Some(valid_policy_binding()),
             leakage_budget_receipt: Some(valid_leakage_receipt()),
             timing_channel_budget: Some(valid_timing_budget()),
+            leakage_budget_policy_max_bits: Some(8),
+            declared_leakage_budget_bits: None,
+            timing_budget_policy_max_ticks: Some(10),
+            declared_timing_budget_ticks: None,
         };
         let payload_json = canonical_payload(&payload).expect("payload should serialize");
         let token_payload = ChannelContextTokenV1 {

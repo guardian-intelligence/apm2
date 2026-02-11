@@ -104,6 +104,10 @@ fn admitted_boundary_check() -> ChannelBoundaryCheck {
             observed_variance_ticks: 3,
             budget_ticks: 10,
         }),
+        leakage_budget_policy_max_bits: Some(8),
+        declared_leakage_budget_bits: None,
+        timing_budget_policy_max_ticks: Some(10),
+        declared_timing_budget_ticks: None,
     }
 }
 

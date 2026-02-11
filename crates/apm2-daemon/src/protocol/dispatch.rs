@@ -6654,6 +6654,14 @@ pub struct BoundaryFlowRuntimeState {
     pub leakage_budget_receipt: LeakageBudgetReceipt,
     /// Timing-channel release-bucketing witness.
     pub timing_channel_budget: TimingChannelBudget,
+    /// Policy-derived leakage budget ceiling for the request risk tier.
+    pub leakage_budget_policy_max_bits: u64,
+    /// Client-claimed leakage budget before policy clamping.
+    pub claimed_leakage_budget_bits: Option<u64>,
+    /// Policy-derived timing budget ceiling for the request risk tier.
+    pub timing_budget_policy_max_ticks: u64,
+    /// Client-claimed timing budget before policy clamping.
+    pub claimed_timing_budget_ticks: Option<u64>,
 }
 
 impl BoundaryFlowRuntimeState {
@@ -6691,6 +6699,10 @@ impl BoundaryFlowRuntimeState {
                 observed_variance_ticks: 0,
                 budget_ticks: 1,
             },
+            leakage_budget_policy_max_bits: 8,
+            claimed_leakage_budget_bits: None,
+            timing_budget_policy_max_ticks: 1,
+            claimed_timing_budget_ticks: None,
         }
     }
 }
@@ -6774,6 +6786,10 @@ impl PrivilegedDispatcher {
             boundary_flow_policy_binding: Some(boundary_flow.policy_binding),
             leakage_budget_receipt: Some(boundary_flow.leakage_budget_receipt),
             timing_channel_budget: Some(boundary_flow.timing_channel_budget),
+            leakage_budget_policy_max_bits: Some(boundary_flow.leakage_budget_policy_max_bits),
+            declared_leakage_budget_bits: boundary_flow.claimed_leakage_budget_bits,
+            timing_budget_policy_max_ticks: Some(boundary_flow.timing_budget_policy_max_ticks),
+            declared_timing_budget_ticks: boundary_flow.claimed_timing_budget_ticks,
         }
     }
 
@@ -6782,6 +6798,10 @@ impl PrivilegedDispatcher {
     /// # Errors
     ///
     /// Returns boundary defects when validation fails or token issuance fails.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use validate_channel_boundary_and_issue_context_token_with_flow for explicit boundary-flow evidence"
+    )]
     #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
     pub fn validate_channel_boundary_and_issue_context_token(
         &self,
@@ -16848,6 +16868,7 @@ mod tests {
                 .elapsed()
                 .expect("current time should be after unix epoch")
                 .as_secs();
+            #[allow(deprecated)]
             let token = dispatcher
                 .validate_channel_boundary_and_issue_context_token(
                     &signer,
