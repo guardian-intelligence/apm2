@@ -109,7 +109,9 @@ impl SqliteLedgerEventEmitter {
         Self { conn, signing_key }
     }
 
-    /// Initializes the database schema.
+    /// Initializes the database schema using a deterministic test-only signing
+    /// key. **Not for production use** — production callers must use
+    /// [`Self::init_schema_with_signing_key`] with the daemon lifecycle key.
     pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         // `init_schema` is used by test-only paths that do not yet pass the
         // daemon lifecycle signing key. Use a deterministic local key so
@@ -443,10 +445,15 @@ impl SqliteLedgerEventEmitter {
 
     fn checkpoint_canonical_bytes(checkpoint: &HashChainCheckpoint) -> Vec<u8> {
         let event_id = checkpoint.event_id.as_deref().unwrap_or_default();
-        let mut canonical = Vec::with_capacity(8 + event_id.len() + checkpoint.event_hash.len());
+        let event_id_bytes = event_id.as_bytes();
+        let event_hash_bytes = checkpoint.event_hash.as_bytes();
+        let mut canonical =
+            Vec::with_capacity(8 + 8 + event_id_bytes.len() + 8 + event_hash_bytes.len());
         canonical.extend_from_slice(&checkpoint.rowid.to_le_bytes());
-        canonical.extend_from_slice(event_id.as_bytes());
-        canonical.extend_from_slice(checkpoint.event_hash.as_bytes());
+        canonical.extend_from_slice(&(event_id_bytes.len() as u64).to_le_bytes());
+        canonical.extend_from_slice(event_id_bytes);
+        canonical.extend_from_slice(&(event_hash_bytes.len() as u64).to_le_bytes());
+        canonical.extend_from_slice(event_hash_bytes);
         canonical
     }
 

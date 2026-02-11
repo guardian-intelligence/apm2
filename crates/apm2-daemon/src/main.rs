@@ -327,7 +327,22 @@ fn load_or_create_ledger_signing_key(
     let key_path = ledger_signing_key_path(daemon_config);
 
     if let Some(parent) = key_path.parent() {
-        std::fs::create_dir_all(parent).context("failed to create ledger signer key directory")?;
+        if !parent.exists() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)
+                    .context("failed to create ledger signer key directory")?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::create_dir_all(parent)
+                    .context("failed to create ledger signer key directory")?;
+            }
+        }
     }
 
     match std::fs::symlink_metadata(&key_path) {
