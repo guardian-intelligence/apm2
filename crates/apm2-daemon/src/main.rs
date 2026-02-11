@@ -322,56 +322,91 @@ fn ledger_signing_key_path(daemon_config: &DaemonConfig) -> PathBuf {
 fn load_or_create_ledger_signing_key(
     daemon_config: &DaemonConfig,
 ) -> Result<ed25519_dalek::SigningKey> {
+    use std::io::ErrorKind;
+
     let key_path = ledger_signing_key_path(daemon_config);
 
     if let Some(parent) = key_path.parent() {
         std::fs::create_dir_all(parent).context("failed to create ledger signer key directory")?;
     }
 
-    if key_path.exists() {
-        let key_bytes =
-            std::fs::read(&key_path).context("failed to read ledger signer key file")?;
-        if key_bytes.len() != 32 {
-            anyhow::bail!(
-                "invalid ledger signer key file: expected 32 bytes, got {}",
-                key_bytes.len()
-            );
-        }
+    match std::fs::symlink_metadata(&key_path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                anyhow::bail!(
+                    "ledger signer key path '{}' must not be a symlink",
+                    key_path.display()
+                );
+            }
+            if !file_type.is_file() {
+                anyhow::bail!(
+                    "ledger signer key path '{}' must be a regular file",
+                    key_path.display()
+                );
+            }
 
-        let key_seed: [u8; 32] = key_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("failed to decode ledger signer key seed"))?;
-        info!(key_path = %key_path.display(), "Loaded persistent ledger signing key");
-        Ok(ed25519_dalek::SigningKey::from_bytes(&key_seed))
-    } else {
-        use rand::rngs::OsRng;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
 
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
-        let key_bytes = signing_key.to_bytes();
+                let mode = metadata.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    anyhow::bail!(
+                        "ledger signer key file '{}' has insecure permissions {:o}; expected 0600",
+                        key_path.display(),
+                        mode
+                    );
+                }
+            }
 
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
+            let key_bytes =
+                std::fs::read(&key_path).context("failed to read ledger signer key file")?;
+            if key_bytes.len() != 32 {
+                anyhow::bail!(
+                    "invalid ledger signer key file: expected 32 bytes, got {}",
+                    key_bytes.len()
+                );
+            }
 
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&key_path)
-                .context("failed to create ledger signer key file")?;
-            file.write_all(&key_bytes)
-                .context("failed to write ledger signer key")?;
-        }
+            let key_seed: [u8; 32] = key_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("failed to decode ledger signer key seed"))?;
+            info!(key_path = %key_path.display(), "Loaded persistent ledger signing key");
+            Ok(ed25519_dalek::SigningKey::from_bytes(&key_seed))
+        },
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            use rand::rngs::OsRng;
 
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&key_path, &key_bytes).context("failed to write ledger signer key")?;
-        }
+            let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+            let key_bytes = signing_key.to_bytes();
 
-        info!(key_path = %key_path.display(), "Generated new persistent ledger signing key");
-        Ok(signing_key)
+            #[cfg(unix)]
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&key_path)
+                    .context("failed to create ledger signer key file")?;
+                file.write_all(&key_bytes)
+                    .context("failed to write ledger signer key")?;
+            }
+
+            #[cfg(not(unix))]
+            {
+                std::fs::write(&key_path, &key_bytes)
+                    .context("failed to write ledger signer key")?;
+            }
+
+            info!(key_path = %key_path.display(), "Generated new persistent ledger signing key");
+            Ok(signing_key)
+        },
+        Err(error) => Err(error).context("failed to read ledger signer key metadata"),
     }
 }
 
@@ -937,9 +972,8 @@ async fn async_main(args: Args) -> Result<()> {
         let conn = Connection::open(path).context("failed to open ledger database")?;
 
         // Initialize schemas and perform startup checkpoint validation using
-        // the trusted daemon verifying key.
-        let verifying_key = ledger_signing_key.verifying_key();
-        SqliteLedgerEventEmitter::init_schema_with_verifying_key(&conn, &verifying_key)
+        // the trusted daemon lifecycle signing key.
+        SqliteLedgerEventEmitter::init_schema_with_signing_key(&conn, &ledger_signing_key)
             .context("failed to init ledger events schema")?;
         SqliteWorkRegistry::init_schema(&conn).context("failed to init work claims schema")?;
 

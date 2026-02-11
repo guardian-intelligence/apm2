@@ -150,6 +150,8 @@ use super::messages::{
     UnsubscribePulseResponse,
     UpdateStopFlagsRequest,
     UpdateStopFlagsResponse,
+    VerifyLedgerChainRequest,
+    VerifyLedgerChainResponse,
     WorkListRequest,
     WorkListResponse,
     WorkRole,
@@ -5920,6 +5922,9 @@ pub enum PrivilegedMessageType {
     // --- Sublease Delegation (RFC-0019, TCK-00340) ---
     /// `DelegateSublease` request (IPC-PRIV-072)
     DelegateSublease    = 72,
+    // --- Ledger Integrity Audit (TCK-00487) ---
+    /// `VerifyLedgerChain` request (IPC-PRIV-073)
+    VerifyLedgerChain   = 73,
 }
 
 impl PrivilegedMessageType {
@@ -5972,6 +5977,8 @@ impl PrivilegedMessageType {
             70 => Some(Self::PublishChangeSet),
             // Sublease delegation (TCK-00340)
             72 => Some(Self::DelegateSublease),
+            // Ledger integrity audit (TCK-00487)
+            73 => Some(Self::VerifyLedgerChain),
             _ => None,
         }
     }
@@ -6022,6 +6029,7 @@ impl PrivilegedMessageType {
             Self::UnsubscribePulse,
             Self::PublishChangeSet,
             Self::DelegateSublease,
+            Self::VerifyLedgerChain,
         ]
     }
 
@@ -6069,7 +6077,8 @@ impl PrivilegedMessageType {
             | Self::SubscribePulse
             | Self::UnsubscribePulse
             | Self::PublishChangeSet
-            | Self::DelegateSublease => true,
+            | Self::DelegateSublease
+            | Self::VerifyLedgerChain => true,
             // Server-to-client notification only — not a client request.
             Self::PulseEvent => false,
         }
@@ -6114,6 +6123,7 @@ impl PrivilegedMessageType {
             Self::UnsubscribePulse => "hsi.pulse.unsubscribe",
             Self::PublishChangeSet => "hsi.changeset.publish",
             Self::DelegateSublease => "hsi.sublease.delegate",
+            Self::VerifyLedgerChain => "hsi.ledger.verify_chain",
             Self::PulseEvent => "hsi.pulse.event",
         }
     }
@@ -6153,6 +6163,7 @@ impl PrivilegedMessageType {
             Self::UnsubscribePulse => "UNSUBSCRIBE_PULSE",
             Self::PublishChangeSet => "PUBLISH_CHANGESET",
             Self::DelegateSublease => "DELEGATE_SUBLEASE",
+            Self::VerifyLedgerChain => "VERIFY_LEDGER_CHAIN",
             Self::PulseEvent => "PULSE_EVENT",
         }
     }
@@ -6192,6 +6203,7 @@ impl PrivilegedMessageType {
             Self::UnsubscribePulse => "apm2.unsubscribe_pulse_request.v1",
             Self::PublishChangeSet => "apm2.publish_changeset_request.v1",
             Self::DelegateSublease => "apm2.delegate_sublease_request.v1",
+            Self::VerifyLedgerChain => "apm2.verify_ledger_chain_request.v1",
             Self::PulseEvent => "apm2.pulse_event_request.v1",
         }
     }
@@ -6231,6 +6243,7 @@ impl PrivilegedMessageType {
             Self::UnsubscribePulse => "apm2.unsubscribe_pulse_response.v1",
             Self::PublishChangeSet => "apm2.publish_changeset_response.v1",
             Self::DelegateSublease => "apm2.delegate_sublease_response.v1",
+            Self::VerifyLedgerChain => "apm2.verify_ledger_chain_response.v1",
             Self::PulseEvent => "apm2.pulse_event_response.v1",
         }
     }
@@ -6309,6 +6322,8 @@ pub enum PrivilegedResponse {
     PublishChangeSet(PublishChangeSetResponse),
     /// Successful `DelegateSublease` response (TCK-00340).
     DelegateSublease(DelegateSubleaseResponse),
+    /// Successful `VerifyLedgerChain` response (TCK-00487).
+    VerifyLedgerChain(VerifyLedgerChainResponse),
     /// Error response.
     Error(PrivilegedError),
 }
@@ -6469,6 +6484,10 @@ impl PrivilegedResponse {
             },
             Self::DelegateSublease(resp) => {
                 buf.push(PrivilegedMessageType::DelegateSublease.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::VerifyLedgerChain(resp) => {
+                buf.push(PrivilegedMessageType::VerifyLedgerChain.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::Error(err) => {
@@ -8493,6 +8512,36 @@ impl PrivilegedDispatcher {
         self.event_emitter.verify_chain_admin()
     }
 
+    fn handle_verify_ledger_chain(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
+        VerifyLedgerChainRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+            ProtocolError::Serialization {
+                reason: format!("invalid VerifyLedgerChainRequest: {e}"),
+            }
+        })?;
+
+        let rows_validated =
+            u64::try_from(self.event_emitter.get_event_count()).unwrap_or(u64::MAX);
+        let response = match self.verify_ledger_chain_admin() {
+            Ok(tip_hash) => VerifyLedgerChainResponse {
+                verified: true,
+                rows_validated,
+                tip_hash: tip_hash.clone(),
+                message: format!(
+                    "full-chain verification succeeded (rows_validated={rows_validated}, tip_hash={tip_hash})"
+                ),
+            },
+            Err(error) => VerifyLedgerChainResponse {
+                verified: false,
+                rows_validated,
+                tip_hash: String::new(),
+                message: format!(
+                    "full-chain verification failed after validating {rows_validated} row(s): {error}"
+                ),
+            },
+        };
+        Ok(PrivilegedResponse::VerifyLedgerChain(response))
+    }
+
     /// Returns a reference to the token minter.
     ///
     /// # TCK-00287
@@ -9183,6 +9232,8 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::PublishChangeSet => self.handle_publish_changeset(payload, ctx),
             // TCK-00340: Sublease delegation for child holon authorization
             PrivilegedMessageType::DelegateSublease => self.handle_delegate_sublease(payload, ctx),
+            // TCK-00487: explicit full-chain operator verification
+            PrivilegedMessageType::VerifyLedgerChain => self.handle_verify_ledger_chain(payload),
         };
 
         // TCK-00268: Emit IPC request completion metrics
@@ -9234,6 +9285,8 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::PublishChangeSet => "PublishChangeSet",
                 // TCK-00340
                 PrivilegedMessageType::DelegateSublease => "DelegateSublease",
+                // TCK-00487
+                PrivilegedMessageType::VerifyLedgerChain => "VerifyLedgerChain",
             };
             let status = match &result {
                 Ok(PrivilegedResponse::Error(_)) => "error",
@@ -17386,6 +17439,14 @@ pub fn encode_delegate_sublease_request(request: &DelegateSubleaseRequest) -> By
     Bytes::from(buf)
 }
 
+/// Encodes a `VerifyLedgerChainRequest` into a wire frame.
+#[must_use]
+pub fn encode_verify_ledger_chain_request(request: &VerifyLedgerChainRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::VerifyLedgerChain.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
 // ============================================================================
 // Process Management Request Encoding (TCK-00342)
 // ============================================================================
@@ -18045,6 +18106,33 @@ mod tests {
                 payload["request_context"]["requested_updates"]["emergency_stop_active"],
                 true
             );
+        }
+
+        #[test]
+        fn test_verify_ledger_chain_tag_and_routing() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            assert_eq!(PrivilegedMessageType::VerifyLedgerChain.tag(), 73);
+            assert_eq!(
+                PrivilegedMessageType::from_tag(73),
+                Some(PrivilegedMessageType::VerifyLedgerChain)
+            );
+
+            let frame = encode_verify_ledger_chain_request(&VerifyLedgerChainRequest {});
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::VerifyLedgerChain(resp) => {
+                    assert!(resp.verified, "empty stub ledger should verify");
+                    assert_eq!(resp.rows_validated, 0);
+                    assert!(!resp.message.is_empty(), "response should include details");
+                },
+                other => panic!("expected VerifyLedgerChain response, got: {other:?}"),
+            }
         }
 
         #[test]
@@ -28650,6 +28738,15 @@ mod tests {
             assert_eq!(
                 PrivilegedMessageType::from_tag(72),
                 Some(PrivilegedMessageType::DelegateSublease)
+            );
+        }
+
+        #[test]
+        fn test_verify_ledger_chain_message_type_tag() {
+            assert_eq!(PrivilegedMessageType::VerifyLedgerChain.tag(), 73);
+            assert_eq!(
+                PrivilegedMessageType::from_tag(73),
+                Some(PrivilegedMessageType::VerifyLedgerChain)
             );
         }
 
