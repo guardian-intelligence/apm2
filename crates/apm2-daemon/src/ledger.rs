@@ -3357,6 +3357,11 @@ pub struct SqliteLeaseValidator {
 
 impl SqliteLeaseValidator {
     /// Creates a new validator with the given `SQLite` connection.
+    ///
+    /// Generates an ephemeral signing key — suitable for tests only.
+    /// Production code MUST use `new_with_signing_key` with the daemon
+    /// lifecycle signing key.
+    #[cfg(test)]
     #[must_use]
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
         use rand::rngs::OsRng;
