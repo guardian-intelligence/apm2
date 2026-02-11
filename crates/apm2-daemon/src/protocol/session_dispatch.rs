@@ -89,7 +89,6 @@ use apm2_holon::defect::{
 use bytes::Bytes;
 use prost::Message;
 use serde::Deserialize;
-use subtle::ConstantTimeEq;
 use tracing::{debug, error, info, warn};
 
 use super::dispatch::{
@@ -2265,6 +2264,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         )
     }
 
+    fn policy_ledger_verified_from_ajc(
+        certificate: Option<&apm2_core::pcac::AuthorityJoinCertificateV1>,
+    ) -> bool {
+        certificate.is_some_and(|cert| cert.as_of_ledger_anchor != [0u8; 32])
+    }
+
     const fn presented_policy_digest(
         decision: &Result<ToolDecision, crate::episode::BrokerError>,
     ) -> Option<Hash> {
@@ -2275,90 +2280,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 | ToolDecision::DedupeCacheHit { policy_hash, .. },
             ) => Some(*policy_hash),
             _ => None,
-        }
-    }
-
-    #[allow(clippy::unnecessary_wraps)]
-    fn resolve_policy_root_digest_from_ledger(
-        _ledger: &dyn LedgerEventEmitter,
-    ) -> Result<Option<Hash>, String> {
-        // SECURITY: Policy-root derivation from ledger events is disabled.
-        // The previous approach accepted payload-derived hash material from
-        // replayed ledger rows. Session-originated EmitEvent data can inject
-        // attacker-chosen hash fields, so this cannot be treated as
-        // authoritative policy provenance.
-        //
-        // Policy-root verification requires a dedicated daemon/governance-only
-        // signed event type that session EmitEvent cannot produce. Until that
-        // exists, fail closed.
-        Ok(None)
-    }
-
-    fn resolve_authoritative_policy_root_digest(
-        &self,
-        broker: &SharedToolBroker<StubManifestLoader>,
-    ) -> Option<Hash> {
-        let broker_digest = broker.active_policy_hash();
-        if broker_digest == [0u8; 32] {
-            return None;
-        }
-
-        let Some(ledger) = self.ledger.as_ref() else {
-            return Some(broker_digest);
-        };
-
-        match Self::resolve_policy_root_digest_from_ledger(ledger.as_ref()) {
-            Ok(Some(ledger_digest)) => {
-                if !bool::from(ledger_digest.ct_eq(&broker_digest)) {
-                    warn!(
-                        broker_policy_root_digest = %hex::encode(broker_digest),
-                        ledger_policy_root_digest = %hex::encode(ledger_digest),
-                        "policy-root mismatch between broker and ledger authority; failing closed"
-                    );
-                    return None;
-                }
-                Some(ledger_digest)
-            },
-            Ok(None) => {
-                warn!(
-                    broker_policy_root_digest = %hex::encode(broker_digest),
-                    "ledger policy-root resolution unavailable; failing closed"
-                );
-                None
-            },
-            Err(error) => {
-                warn!(
-                    broker_policy_root_digest = %hex::encode(broker_digest),
-                    error = %error,
-                    "ledger policy-root resolution failed; failing closed"
-                );
-                None
-            },
-        }
-    }
-
-    fn tool_decision_policy_verified(
-        decision: &Result<ToolDecision, crate::episode::BrokerError>,
-        authoritative_policy_root_digest: Option<Hash>,
-    ) -> bool {
-        // KNOWN LIMITATION (TCK-00465):
-        // Comparison currently binds a broker-presented policy hash against a
-        // broker-derived "authoritative" digest. This is not yet ledger-rooted
-        // admission verification.
-        let Some(admitted_policy_root_digest) = authoritative_policy_root_digest else {
-            return false;
-        };
-        match decision {
-            Ok(
-                ToolDecision::Allow { policy_hash, .. }
-                | ToolDecision::DedupeCacheHit { policy_hash, .. },
-            ) => {
-                let zero_digest = [0u8; 32];
-                let is_non_zero = !bool::from(policy_hash.ct_eq(&zero_digest));
-                let digest_matches = bool::from(policy_hash.ct_eq(&admitted_policy_root_digest));
-                is_non_zero && digest_matches
-            },
-            _ => false,
         }
     }
 
@@ -2821,6 +2742,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         risk_tier: Option<RiskTier>,
         taint_assessment: &apm2_core::fac::taint::RuntimeTaintAssessment,
         request_arguments: &[u8],
+        // When Some, this is the broker's active policy hash admitted as
+        // authoritative because the PCAC kernel validated the full authority
+        // chain (including `as_of_ledger_anchor`) via AJC issuance.
+        // When None, no ledger-rooted policy authority was established.
         authoritative_policy_root_digest: Option<Hash>,
     ) -> Result<BoundaryFlowRuntimeState, String> {
         let risk_tier = risk_tier.unwrap_or(RiskTier::Tier4);
@@ -6210,10 +6135,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 &decision,
                 Ok(ToolDecision::Allow { .. } | ToolDecision::DedupeCacheHit { .. })
             ) {
-            let authoritative_policy_root_digest =
-                self.resolve_authoritative_policy_root_digest(&broker);
-            let policy_ledger_verified =
-                Self::tool_decision_policy_verified(&decision, authoritative_policy_root_digest);
+            // AJC-rooted authority: if the PCAC kernel issued an
+            // AuthorityJoinCertificate with a validated `as_of_ledger_anchor`,
+            // the tool decision is ledger-rooted.
+            let policy_ledger_verified = Self::policy_ledger_verified_from_ajc(
+                pending_pcac.as_ref().map(|pcac| &pcac.certificate),
+            );
             let broker_verified = Self::tool_decision_broker_verified(&decision);
             let capability_verified = Self::tool_decision_capability_verified(&decision);
             let context_firewall_verified = defects.is_empty();
@@ -6226,7 +6153,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 Some(risk_tier),
                 &taint_assessment,
                 &request_arguments,
-                authoritative_policy_root_digest,
+                if pending_pcac.is_some() {
+                    Some(broker.active_policy_hash())
+                } else {
+                    None
+                },
             ) {
                 Ok(state) => state,
                 Err(error) => {
@@ -11478,12 +11409,6 @@ mod tests {
                 &decision
             )
         );
-        assert!(
-            !SessionDispatcher::<InMemoryManifestStore>::tool_decision_policy_verified(
-                &decision,
-                Some([0x11; 32]),
-            )
-        );
     }
 
     #[test]
@@ -11500,65 +11425,44 @@ mod tests {
                 &decision
             )
         );
-        assert!(
-            !SessionDispatcher::<InMemoryManifestStore>::tool_decision_policy_verified(
-                &decision,
-                Some([0x33; 32]),
-            )
-        );
+        assert!(!SessionDispatcher::<InMemoryManifestStore>::policy_ledger_verified_from_ajc(None));
     }
 
     #[test]
-    fn authoritative_policy_digest_resolution_is_fail_closed() {
-        use crate::protocol::dispatch::StubLedgerEventEmitter;
+    fn test_policy_ledger_verified_uses_ajc_authority() {
+        use apm2_core::pcac::{
+            AuthorityJoinCertificateV1, BoundaryIntentClass, IdentityEvidenceLevel, RiskTier,
+        };
 
-        let ledger = StubLedgerEventEmitter::new();
-        let trusted_policy_hash = vec![0xA5_u8; 32];
-        let forged_policy_hash = vec![0x5A_u8; 32];
+        let cert = AuthorityJoinCertificateV1 {
+            ajc_id: [0x11; 32],
+            authority_join_hash: [0x22; 32],
+            intent_digest: [0x33; 32],
+            boundary_intent_class: BoundaryIntentClass::Actuate,
+            risk_tier: RiskTier::Tier1,
+            issued_time_envelope_ref: [0x44; 32],
+            as_of_ledger_anchor: [0x55; 32],
+            expires_at_tick: u64::MAX,
+            issued_at_tick: 1,
+            revocation_head_hash: [0x66; 32],
+            identity_evidence_level: IdentityEvidenceLevel::Verified,
+            admission_capacity_token: None,
+        };
 
-        let trusted_payload = serde_json::to_vec(&serde_json::json!({
-            "PolicyResolved": {
-                "work_id": "W-POLICY-ROOT-001",
-                "policy_hash": trusted_policy_hash,
-                "timestamp_ms": 1_u64,
-            }
-        }))
-        .expect("trusted payload serialization should succeed");
-        ledger
-            .emit_session_event(
-                "session-gate",
-                "gate.policy_resolved",
-                &trusted_payload,
-                "orchestrator:gate-lifecycle",
-                1,
-            )
-            .expect("trusted gate policy event should persist");
-
-        // Latest event is attacker-controlled session data carrying a forged
-        // policy_hash. Authoritative policy derivation must ignore it.
-        let forged_payload = serde_json::to_vec(&serde_json::json!({
-            "policy_hash": forged_policy_hash,
-        }))
-        .expect("forged payload serialization should succeed");
-        ledger
-            .emit_session_event(
-                "session-attacker",
-                "gate.policy_resolved",
-                &forged_payload,
-                "session-attacker",
-                2,
-            )
-            .expect("forged session event should persist");
-
-        let resolved =
-            SessionDispatcher::<InMemoryManifestStore>::resolve_policy_root_digest_from_ledger(
-                &ledger,
-            )
-            .expect("authoritative policy digest resolution should succeed");
-        assert_eq!(
-            resolved, None,
-            "policy-root derivation from ledger events is intentionally disabled (fail-closed)"
+        assert!(
+            SessionDispatcher::<InMemoryManifestStore>::policy_ledger_verified_from_ajc(Some(
+                &cert
+            ))
         );
+
+        let mut cert_no_anchor = cert;
+        cert_no_anchor.as_of_ledger_anchor = [0u8; 32];
+        assert!(
+            !SessionDispatcher::<InMemoryManifestStore>::policy_ledger_verified_from_ajc(Some(
+                &cert_no_anchor
+            ))
+        );
+        assert!(!SessionDispatcher::<InMemoryManifestStore>::policy_ledger_verified_from_ajc(None));
     }
 
     // ========================================================================
