@@ -786,7 +786,19 @@ impl BoundaryChannelQuarantineState {
             return true;
         }
 
-        if self.channels.len() >= MAX_QUARANTINED_BOUNDARY_CHANNELS {
+        while self.channels.len() >= MAX_QUARANTINED_BOUNDARY_CHANNELS {
+            let Some(oldest_key) = self.insertion_order.front().cloned() else {
+                return false;
+            };
+            let Some(entry) = self.channels.get(&oldest_key) else {
+                self.insertion_order.pop_front();
+                continue;
+            };
+            if entry.is_expired(since_ns) {
+                self.channels.remove(&oldest_key);
+                self.insertion_order.pop_front();
+                continue;
+            }
             return false;
         }
 
@@ -1043,7 +1055,7 @@ struct BoundaryFlowHints {
 #[serde(rename_all = "snake_case")]
 struct BoundaryFlowHintsEnvelope {
     #[serde(default)]
-    boundary_flow: Option<serde_json::Value>,
+    boundary_flow: Option<BoundaryFlowHints>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -2379,23 +2391,19 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 Some(ledger_digest)
             },
             Ok(None) => {
-                // TODO(security): TCK-XXXXX - replace heuristic ledger payload
-                // extraction with explicit ledger-rooted policy-root indexing.
                 warn!(
                     broker_policy_root_digest = %hex::encode(broker_digest),
-                    "ledger policy-root resolution unavailable; continuing with broker root"
+                    "ledger policy-root resolution unavailable; failing closed"
                 );
-                Some(broker_digest)
+                None
             },
             Err(error) => {
-                // TODO(security): TCK-XXXXX - replace heuristic ledger payload
-                // extraction with explicit ledger-rooted policy-root indexing.
                 warn!(
                     broker_policy_root_digest = %hex::encode(broker_digest),
                     error = %error,
-                    "ledger policy-root resolution failed; continuing with broker root"
+                    "ledger policy-root resolution failed; failing closed"
                 );
-                Some(broker_digest)
+                None
             },
         }
     }
@@ -2531,17 +2539,19 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     fn extract_boundary_flow_hints(
         request_arguments: &[u8],
     ) -> Result<Option<BoundaryFlowHints>, String> {
-        let envelope = serde_json::from_slice::<BoundaryFlowHintsEnvelope>(request_arguments)
-            .unwrap_or_default();
-        let Some(boundary_flow) = envelope.boundary_flow else {
-            return Ok(None);
+        let envelope = match serde_json::from_slice::<BoundaryFlowHintsEnvelope>(request_arguments)
+        {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                return match error.classify() {
+                    serde_json::error::Category::Data => {
+                        Err(format!("invalid boundary_flow hints: {error}"))
+                    },
+                    _ => Ok(None),
+                };
+            },
         };
-        if boundary_flow.is_null() {
-            return Ok(None);
-        }
-        serde_json::from_value::<BoundaryFlowHints>(boundary_flow)
-            .map(Some)
-            .map_err(|error| format!("invalid boundary_flow hints: {error}"))
+        Ok(envelope.boundary_flow)
     }
 
     const fn leakage_budget_bits_for_tier(risk_tier: RiskTier) -> u64 {
@@ -6358,7 +6368,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                     session_id = %token.session_id,
                                     tool_class = %tool_class,
                                     capacity = MAX_QUARANTINED_BOUNDARY_CHANNELS,
-                                    "boundary quarantine full; denying request without evicting existing quarantines"
+                                    "boundary quarantine full with no expired entries; denying request"
                                 );
                             },
                             Err(error) => {
@@ -11262,7 +11272,7 @@ mod tests {
     }
 
     #[test]
-    fn test_boundary_channel_quarantine_capacity_refuses_new_insertions_without_eviction() {
+    fn test_boundary_channel_quarantine_capacity_refuses_new_insertions_without_expired_entries() {
         use std::collections::HashSet;
 
         let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter());
@@ -11307,13 +11317,13 @@ mod tests {
             .quarantine_boundary_channel(
                 overflow_session_id,
                 overflow_channel_key.clone(),
-                "overflow quarantine should be refused".to_string(),
+                "overflow quarantine should be refused when no entries are expired".to_string(),
                 9_999,
             )
             .expect("overflow quarantine attempt should not fail");
         assert!(
             !inserted,
-            "overflow quarantine insertion must be refused without evicting active quarantines",
+            "overflow quarantine insertion must be refused when capacity is full and no entries are expired",
         );
 
         let state = dispatcher
@@ -11334,7 +11344,74 @@ mod tests {
                 .channels
                 .keys()
                 .all(|key| preserved_keys.contains(key)),
-            "existing quarantines must be preserved; overflow insertion cannot evict",
+            "existing quarantines must be preserved when no entries are expired",
+        );
+    }
+
+    #[test]
+    fn test_boundary_channel_quarantine_capacity_evicts_oldest_expired_entry() {
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter());
+        let initial_timestamp_ns = 1;
+
+        for idx in 0..MAX_QUARANTINED_BOUNDARY_CHANNELS {
+            let session_id = format!("session-{idx}");
+            let channel_key = SessionDispatcher::<InMemoryManifestStore>::boundary_channel_key(
+                &session_id,
+                ToolClass::Inference,
+            );
+            assert!(
+                dispatcher
+                    .quarantine_boundary_channel(
+                        &session_id,
+                        channel_key,
+                        format!("seed quarantine {idx}"),
+                        initial_timestamp_ns,
+                    )
+                    .expect("seed quarantine insertion should succeed"),
+                "quarantine insertion should succeed before capacity is reached",
+            );
+        }
+
+        let oldest_channel_key = SessionDispatcher::<InMemoryManifestStore>::boundary_channel_key(
+            "session-0",
+            ToolClass::Inference,
+        );
+        let overflow_session_id = "session-overflow";
+        let overflow_channel_key = SessionDispatcher::<InMemoryManifestStore>::boundary_channel_key(
+            overflow_session_id,
+            ToolClass::Inference,
+        );
+        let overflow_timestamp_ns = initial_timestamp_ns + QUARANTINE_TTL_NS + 1;
+
+        let inserted = dispatcher
+            .quarantine_boundary_channel(
+                overflow_session_id,
+                overflow_channel_key.clone(),
+                "overflow quarantine should evict oldest expired entry".to_string(),
+                overflow_timestamp_ns,
+            )
+            .expect("overflow quarantine insertion should not fail");
+        assert!(
+            inserted,
+            "overflow quarantine insertion must succeed by evicting an expired entry",
+        );
+
+        let state = dispatcher
+            .boundary_channel_quarantine
+            .lock()
+            .expect("quarantine lock should not be poisoned");
+        assert_eq!(
+            state.channels.len(),
+            MAX_QUARANTINED_BOUNDARY_CHANNELS,
+            "capacity must remain constant after eviction-backed insertion",
+        );
+        assert!(
+            !state.channels.contains_key(&oldest_channel_key),
+            "oldest expired entry should be evicted to make room",
+        );
+        assert!(
+            state.channels.contains_key(&overflow_channel_key),
+            "overflow channel should be inserted after eviction",
         );
     }
 
