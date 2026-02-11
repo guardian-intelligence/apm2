@@ -306,9 +306,11 @@ pub struct AuthorityJoinInputV1 {
     pub pre_actuation_receipt_hashes: Vec<Hash>,
 
     /// Hash commitment to authoritative leakage witness evidence.
+    #[serde(default)]
     pub leakage_witness_hash: Hash,
 
     /// Hash commitment to authoritative timing-variance witness evidence.
+    #[serde(default)]
     pub timing_witness_hash: Hash,
 
     // -- Risk classification --
