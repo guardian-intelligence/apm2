@@ -54,6 +54,8 @@ struct EventHashInput<'a> {
     prev_hash: &'a str,
 }
 
+const REDUNDANCY_RECEIPT_CONSUMED_EVENT: &str = "redundancy_receipt_consumed";
+
 #[derive(Debug)]
 struct ChainBackfillRow {
     rowid: i64,
@@ -235,6 +237,15 @@ impl SqliteLedgerEventEmitter {
              ON ledger_events(json_extract(CAST(payload AS TEXT), '$.receipt_id')) \
              WHERE event_type = 'redundancy_receipt_consumed' \
              AND json_extract(CAST(payload AS TEXT), '$.receipt_id') IS NOT NULL",
+            [],
+        )?;
+        // SECURITY (TCK-00485 BLOCKER): dedicated lookup index for receipt
+        // consumption events avoids linear scans in
+        // `get_redundancy_receipt_consumption`.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_redundancy_receipt_consumed_receipt_id \
+             ON ledger_events(json_extract(CAST(payload AS TEXT), '$.receipt_id')) \
+             WHERE event_type = 'redundancy_receipt_consumed'",
             [],
         )?;
         conn.execute(
@@ -1601,7 +1612,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         const RECEIPT_CONSUMED_DOMAIN_PREFIX: &[u8] = b"apm2.event.redundancy_receipt_consumed:";
         let payload = serde_json::json!({
-            "event_type": "redundancy_receipt_consumed",
+            "event_type": REDUNDANCY_RECEIPT_CONSUMED_EVENT,
             "session_id": session_id,
             "receipt_id": receipt_id,
             "request_id": request_id,
@@ -1621,7 +1632,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             })?;
         let prev_hash = Self::latest_event_hash(&conn)?;
         let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
-            "redundancy_receipt_consumed",
+            REDUNDANCY_RECEIPT_CONSUMED_EVENT,
             session_id,
             actor_id,
             payload,
@@ -1660,10 +1671,10 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         let payload: Vec<u8> = conn
             .query_row(
                 "SELECT payload FROM ledger_events
-                 WHERE event_type = 'redundancy_receipt_consumed'
-                 AND json_extract(CAST(payload AS TEXT), '$.receipt_id') = ?1
+                 WHERE event_type = ?1
+                 AND json_extract(CAST(payload AS TEXT), '$.receipt_id') = ?2
                  ORDER BY rowid DESC LIMIT 1",
-                params![receipt_id],
+                params![REDUNDANCY_RECEIPT_CONSUMED_EVENT, receipt_id],
                 |row| row.get(0),
             )
             .optional()
@@ -4773,6 +4784,21 @@ mod tests {
         assert!(
             has_receipt_consumed_unique_index,
             "init_schema must create idx_unique_receipt_consumed for consumption events"
+        );
+
+        let has_receipt_consumed_lookup_index: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'index' AND name = 'idx_redundancy_receipt_consumed_receipt_id'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            has_receipt_consumed_lookup_index,
+            "init_schema must create lookup index for redundancy receipt consumption events"
         );
 
         conn.execute(

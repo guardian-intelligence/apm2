@@ -5713,26 +5713,23 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         DeclassificationIntentHint::RedundancyPurpose
                     ) =>
                 {
-                    let Some(authority) = self.resolve_authoritative_redundancy_receipt(
+                    let authority = self.resolve_authoritative_redundancy_receipt(
                         &token.session_id,
                         &token.lease_id,
                         &request_id,
                         tool_class,
                         request_scope_intent_digest,
                         declassification,
-                    ) else {
+                    );
+                    if authority.is_none() {
                         warn!(
                             session_id = %token.session_id,
                             tool_class = %tool_class,
                             request_id = %request_id,
                             "PCAC denied: redundancy-purpose declassification receipt unavailable/invalid at join time"
                         );
-                        return Ok(SessionResponse::error(
-                            SessionErrorCode::SessionErrorToolNotAllowed,
-                            "PCAC authority denied: redundancy declassification receipt unavailable (fail-closed)",
-                        ));
-                    };
-                    Some(authority)
+                    }
+                    authority
                 },
                 Some(declassification)
                     if matches!(declassification.intent, DeclassificationIntentHint::Unknown) =>
