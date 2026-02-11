@@ -91,8 +91,7 @@ fn short_error_context(raw: &[u8]) -> String {
 fn canonical_json_bytes<T: Serialize>(value: &T) -> Vec<u8> {
     match serde_json::to_string(value) {
         Ok(json) => canonicalize_json(&json)
-            .map(|canonical| canonical.into_bytes())
-            .unwrap_or_else(|_| json.into_bytes()),
+            .map_or_else(|_| json.into_bytes(), std::string::String::into_bytes),
         Err(err) => format!("serialize_error:{err}").into_bytes(),
     }
 }
