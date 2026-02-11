@@ -342,27 +342,37 @@ if [[ ${status} -ne 0 ]]; then
 
     memory_peak_display="$(format_bytes_best_effort "${memory_peak}")"
 
-    diagnostic_title="DIAGNOSTIC: bounded unit failed"
+    # systemd may report timeout while stopping the unit after the main command
+    # already exited successfully. Treat this as success with warning.
     if [[ "${result}" == "timeout" && "${exec_main_code}" == "1" && "${exec_main_status}" == "0" ]]; then
-        diagnostic_title="DIAGNOSTIC: bounded unit timeout during teardown (main process exited cleanly)"
-        log_warn "Bounded command hit unit stop timeout after main process exit 0; preserving timeout as failure."
+        log_warn "Bounded command hit unit stop timeout after main process exit 0; treating as success."
+        {
+            echo "DIAGNOSTIC: bounded unit timeout during teardown (main process exited cleanly)"
+            printf '  unit:             %s\n' "${UNIT}"
+            printf '  result:           %s\n' "${result}"
+            printf '  exec_main_code:   %s\n' "${exec_main_code}"
+            printf '  exec_main_status: %s\n' "${exec_main_status}"
+            printf '  memory_peak:      %s\n' "${memory_peak_display}"
+            printf '  memory_max:       %s\n' "${MEMORY_MAX}"
+            printf '  timeout_seconds:  %s\n' "${TIMEOUT_SECONDS}"
+            printf '  verdict:          %s\n' "pass_with_warning"
+        } >&2
+        status=0
     else
         log_error "Bounded command failed with exit code ${status}."
-    fi
-
-    {
-        echo "${diagnostic_title}"
-        printf '  unit:             %s\n' "${UNIT}"
-        printf '  result:           %s\n' "${result}"
-        printf '  exec_main_code:   %s\n' "${exec_main_code}"
-        printf '  exec_main_status: %s\n' "${exec_main_status}"
-        printf '  memory_peak:      %s\n' "${memory_peak_display}"
-        printf '  memory_max:       %s\n' "${MEMORY_MAX}"
-        printf '  timeout_seconds:  %s\n' "${TIMEOUT_SECONDS}"
-    } >&2
-
-    if [[ "${result}" == "timeout" ]]; then
-        echo "${TEST_TIMEOUT_SLA_MESSAGE}" >&2
+        {
+            echo "DIAGNOSTIC: bounded unit failed"
+            printf '  unit:             %s\n' "${UNIT}"
+            printf '  result:           %s\n' "${result}"
+            printf '  exec_main_code:   %s\n' "${exec_main_code}"
+            printf '  exec_main_status: %s\n' "${exec_main_status}"
+            printf '  memory_peak:      %s\n' "${memory_peak_display}"
+            printf '  memory_max:       %s\n' "${MEMORY_MAX}"
+            printf '  timeout_seconds:  %s\n' "${TIMEOUT_SECONDS}"
+        } >&2
+        if [[ "${result}" == "timeout" ]]; then
+            echo "${TEST_TIMEOUT_SLA_MESSAGE}" >&2
+        fi
     fi
 
     if ! systemctl --user reset-failed "${UNIT}" >/dev/null 2>&1; then
