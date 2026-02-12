@@ -178,6 +178,24 @@ pub struct ProjectionIntent {
     pub admitted_at: u64,
 }
 
+/// Lifecycle artifact references persisted on admitted projection intents.
+///
+/// These fields bind projection-side effects to the PCAC lifecycle tuple
+/// evaluated immediately before effect execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntentLifecycleArtifacts {
+    /// AJC identifier from the lifecycle gate output.
+    pub ajc_id: [u8; 32],
+    /// Intent digest consumed before projection effect execution.
+    pub intent_digest: [u8; 32],
+    /// Effect selector digest from the consume record.
+    pub consume_selector_digest: [u8; 32],
+    /// Tick at which consume succeeded.
+    pub consume_tick: u64,
+    /// HTF envelope reference at consume time.
+    pub time_envelope_ref: [u8; 32],
+}
+
 // =============================================================================
 // DeferredReplayEntry
 // =============================================================================
@@ -218,6 +236,11 @@ const INTENT_BUFFER_SCHEMA_SQL: &str = r"
         eval_tick INTEGER NOT NULL,
         verdict TEXT NOT NULL DEFAULT 'pending',
         deny_reason TEXT NOT NULL DEFAULT '',
+        lifecycle_ajc_id BLOB NULL,
+        lifecycle_intent_digest BLOB NULL,
+        lifecycle_consume_selector_digest BLOB NULL,
+        lifecycle_consume_tick INTEGER NULL,
+        lifecycle_time_envelope_ref BLOB NULL,
         created_at INTEGER NOT NULL,
         admitted_at INTEGER NOT NULL DEFAULT 0,
         UNIQUE(work_id, changeset_digest)
@@ -296,6 +319,7 @@ impl IntentBuffer {
             guard
                 .execute_batch(INTENT_BUFFER_SCHEMA_SQL)
                 .map_err(|e| IntentBufferError::Database(format!("schema init failed: {e}")))?;
+            Self::ensure_projection_intent_lifecycle_columns(&guard)?;
         }
         Ok(Self { conn })
     }
@@ -312,6 +336,58 @@ impl IntentBuffer {
             Connection::open_in_memory().map_err(|e| IntentBufferError::Database(e.to_string()))?;
         let conn = Arc::new(Mutex::new(conn));
         Self::new(conn)
+    }
+
+    fn ensure_projection_intent_lifecycle_columns(
+        conn: &Connection,
+    ) -> Result<(), IntentBufferError> {
+        const COLUMNS: [(&str, &str); 5] = [
+            ("lifecycle_ajc_id", "BLOB NULL"),
+            ("lifecycle_intent_digest", "BLOB NULL"),
+            ("lifecycle_consume_selector_digest", "BLOB NULL"),
+            ("lifecycle_consume_tick", "INTEGER NULL"),
+            ("lifecycle_time_envelope_ref", "BLOB NULL"),
+        ];
+
+        for (column, definition) in COLUMNS {
+            if !Self::projection_intent_column_exists(conn, column)? {
+                let sql =
+                    format!("ALTER TABLE projection_intents ADD COLUMN {column} {definition}");
+                conn.execute(&sql, []).map_err(|e| {
+                    IntentBufferError::Database(format!(
+                        "failed to add projection_intents.{column}: {e}"
+                    ))
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn projection_intent_column_exists(
+        conn: &Connection,
+        column: &str,
+    ) -> Result<bool, IntentBufferError> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(projection_intents)")
+            .map_err(|e| IntentBufferError::Database(format!("table_info failed: {e}")))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| IntentBufferError::Database(format!("table_info query failed: {e}")))?;
+
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| IntentBufferError::Database(format!("table_info row failed: {e}")))?
+        {
+            let name: String = row.get(1).map_err(|e| {
+                IntentBufferError::Database(format!("table_info parse failed: {e}"))
+            })?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     // =========================================================================
@@ -416,6 +492,53 @@ impl IntentBuffer {
                 params![admitted_at as i64, intent_id],
             )
             .map_err(|e| IntentBufferError::Database(format!("admit failed: {e}")))?;
+
+        Ok(rows > 0)
+    }
+
+    /// Persists lifecycle artifact references on an existing intent.
+    ///
+    /// This is used by the projection worker to bind admitted intents to the
+    /// lifecycle gate outputs evaluated immediately before effect execution.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)` if the intent was found and updated.
+    /// - `Ok(false)` if no intent row matched `intent_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IntentBufferError::Database`] on SQL failure.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn attach_lifecycle_artifacts(
+        &self,
+        intent_id: &str,
+        artifacts: &IntentLifecycleArtifacts,
+    ) -> Result<bool, IntentBufferError> {
+        validate_field("intent_id", intent_id)?;
+
+        let guard = self.lock()?;
+        let rows = guard
+            .execute(
+                "UPDATE projection_intents
+                 SET lifecycle_ajc_id = ?1,
+                     lifecycle_intent_digest = ?2,
+                     lifecycle_consume_selector_digest = ?3,
+                     lifecycle_consume_tick = ?4,
+                     lifecycle_time_envelope_ref = ?5
+                 WHERE intent_id = ?6",
+                params![
+                    artifacts.ajc_id.as_slice(),
+                    artifacts.intent_digest.as_slice(),
+                    artifacts.consume_selector_digest.as_slice(),
+                    artifacts.consume_tick as i64,
+                    artifacts.time_envelope_ref.as_slice(),
+                    intent_id,
+                ],
+            )
+            .map_err(|e| {
+                IntentBufferError::Database(format!("attach_lifecycle_artifacts failed: {e}"))
+            })?;
 
         Ok(rows > 0)
     }
@@ -2133,6 +2256,133 @@ mod tests {
 
         // Count must be exactly MAX (evicted 1, inserted 1).
         assert_eq!(buf.backlog_count().expect("count"), MAX_BACKLOG_ITEMS);
+    }
+
+    #[test]
+    fn test_attach_lifecycle_artifacts_updates_intent_row() {
+        let buf = make_buffer();
+        buf.insert(
+            "intent-lifecycle-001",
+            "work-001",
+            &make_digest(0x42),
+            &make_digest(0xAB),
+            "pending",
+            100,
+            1_000_000,
+        )
+        .expect("insert intent");
+
+        let artifacts = IntentLifecycleArtifacts {
+            ajc_id: make_digest(0xA1),
+            intent_digest: make_digest(0xB2),
+            consume_selector_digest: make_digest(0xC3),
+            consume_tick: 4242,
+            time_envelope_ref: make_digest(0xD4),
+        };
+
+        let updated = buf
+            .attach_lifecycle_artifacts("intent-lifecycle-001", &artifacts)
+            .expect("attach lifecycle artifacts");
+        assert!(updated, "intent row should be updated");
+
+        let guard = buf.conn.lock().expect("lock");
+        let (ajc_id, intent_digest, selector_digest, consume_tick, time_envelope_ref): (
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            i64,
+            Vec<u8>,
+        ) = guard
+            .query_row(
+                "SELECT lifecycle_ajc_id,
+                        lifecycle_intent_digest,
+                        lifecycle_consume_selector_digest,
+                        lifecycle_consume_tick,
+                        lifecycle_time_envelope_ref
+                 FROM projection_intents
+                 WHERE intent_id = ?1",
+                params!["intent-lifecycle-001"],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read lifecycle columns");
+
+        assert_eq!(ajc_id, artifacts.ajc_id);
+        assert_eq!(intent_digest, artifacts.intent_digest);
+        assert_eq!(selector_digest, artifacts.consume_selector_digest);
+        let expected_consume_tick =
+            i64::try_from(artifacts.consume_tick).expect("consume tick fits i64");
+        assert_eq!(consume_tick, expected_consume_tick);
+        assert_eq!(time_envelope_ref, artifacts.time_envelope_ref);
+    }
+
+    #[test]
+    fn test_new_adds_missing_lifecycle_columns_for_legacy_schema() {
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("sqlite open"),
+        ));
+        {
+            let guard = conn.lock().expect("lock");
+            guard
+                .execute_batch(
+                    "CREATE TABLE projection_intents (
+                         intent_id TEXT PRIMARY KEY,
+                         work_id TEXT NOT NULL,
+                         changeset_digest BLOB NOT NULL,
+                         ledger_head BLOB NOT NULL,
+                         projected_status TEXT NOT NULL,
+                         eval_tick INTEGER NOT NULL,
+                         verdict TEXT NOT NULL DEFAULT 'pending',
+                         deny_reason TEXT NOT NULL DEFAULT '',
+                         created_at INTEGER NOT NULL,
+                         admitted_at INTEGER NOT NULL DEFAULT 0,
+                         UNIQUE(work_id, changeset_digest)
+                     );
+                     CREATE TABLE deferred_replay_backlog (
+                         intent_id TEXT PRIMARY KEY,
+                         work_id TEXT NOT NULL,
+                         backlog_digest BLOB NOT NULL,
+                         replay_horizon_tick INTEGER NOT NULL,
+                         replayed_at INTEGER NOT NULL DEFAULT 0,
+                         converged INTEGER NOT NULL DEFAULT 0
+                     );",
+                )
+                .expect("legacy schema init");
+        }
+
+        let _buf = IntentBuffer::new(Arc::clone(&conn)).expect("intent buffer init");
+
+        let guard = conn.lock().expect("lock");
+        let mut stmt = guard
+            .prepare("PRAGMA table_info(projection_intents)")
+            .expect("table_info");
+        let mut columns = std::collections::HashSet::new();
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query table_info");
+        for col in rows {
+            columns.insert(col.expect("column name"));
+        }
+
+        for expected in [
+            "lifecycle_ajc_id",
+            "lifecycle_intent_digest",
+            "lifecycle_consume_selector_digest",
+            "lifecycle_consume_tick",
+            "lifecycle_time_envelope_ref",
+        ] {
+            assert!(
+                columns.contains(expected),
+                "missing expected migrated column: {expected}"
+            );
+        }
     }
 
     // =========================================================================

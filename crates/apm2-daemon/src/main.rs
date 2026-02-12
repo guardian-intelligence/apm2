@@ -1425,10 +1425,11 @@ async fn async_main(args: Args) -> Result<()> {
                 // All three must be present for has_economics_gate() to return true.
                 // If any fails to initialize, the worker starts without the gate.
                 //
-                // SECURITY (MAJOR-1 fix): When the gate is NOT wired, events
-                // that carry economics selectors are DENIED (fail-closed). The
-                // worker can still project legacy events without economics
-                // selectors. This prevents init failure from silently bypassing
+                // SECURITY (MAJOR-1 fix): When the gate is NOT wired, ALL
+                // events are DENIED (fail-closed). Events with economics
+                // selectors are denied due to missing gate; events without
+                // selectors are denied due to missing economics selectors.
+                // This prevents init failure from silently bypassing
                 // economics enforcement.
                 {
                     use apm2_daemon::projection::{ConfigBackedResolver, IntentBuffer};
@@ -1524,9 +1525,10 @@ async fn async_main(args: Args) -> Result<()> {
                         );
                     } else {
                         warn!(
-                            "Economics admission gate INACTIVE: events with economics \
-                             selectors will be DENIED (fail-closed). Legacy events \
-                             without selectors will project normally."
+                            "Economics admission gate INACTIVE: ALL events will be \
+                             DENIED (fail-closed). Events with economics selectors \
+                             are denied due to missing gate; events without selectors \
+                             are denied due to missing economics selectors."
                         );
                     }
                 }

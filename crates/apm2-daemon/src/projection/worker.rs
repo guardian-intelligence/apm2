@@ -28,8 +28,8 @@
 //! 2. Assemble gate inputs from `ReviewReceiptRecorded` payload
 //! 3. Resolve continuity profile, sink snapshot, and window via resolver
 //! 4. Evaluate `evaluate_projection_continuity()` economics gate
-//! 5. On ALLOW: insert intent, proceed to projection effect, then admit after
-//!    successful projection
+//! 5. On ALLOW: insert intent, enforce projection lifecycle gate (`join ->
+//!    revalidate -> consume`), then execute projection effect
 //! 6. On DENY: record denied intent in `IntentBuffer`, skip projection
 //!
 //! **Fail-closed**: Missing gate inputs (temporal authority, profile,
@@ -39,13 +39,14 @@
 //! double-projection of the same `(work_id, changeset_digest)`.
 //!
 //! **Implementation scope**: The current implementation provides
-//! economics-gated admission with idempotent-insert replay prevention
-//! (via `IntentBuffer` uniqueness constraint on `(work_id,
-//! changeset_digest)`). Canonical PCAC lifecycle integration (join,
-//! revalidate, consume primitives) is deferred to a future ticket.
-//! The enforcement guarantees are:
+//! economics-gated admission with canonical PCAC lifecycle enforcement
+//! (`join -> revalidate -> consume`) immediately before projection effects,
+//! plus idempotent-insert replay prevention via `IntentBuffer` uniqueness
+//! on `(work_id, changeset_digest)`. The enforcement guarantees are:
 //! - No projection without passing the economics gate.
 //! - Events without economics selectors are DENIED, not bypassed.
+//! - No projection effect without passing lifecycle `join -> revalidate ->
+//!   consume`.
 //! - No double-projection of the same `(work_id, changeset_digest)`.
 //! - Retry-safe: transient projection failures leave the intent as PENDING,
 //!   allowing re-attempt on the next delivery.
@@ -70,6 +71,10 @@ use apm2_core::economics::{
     ProjectionSinkContinuityProfileV1, evaluate_projection_continuity,
 };
 use apm2_core::evidence::ContentAddressedStore;
+use apm2_core::pcac::{
+    AuthorityDenyClass, AuthorityJoinInputV1, BoundaryIntentClass, DeterminismClass,
+    IdentityEvidenceLevel, PcacPolicyKnobs, RiskTier,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -78,8 +83,9 @@ use super::continuity_resolver::{
     ContinuityProfileResolver, ResolvedContinuityProfile, ResolvedContinuityWindow,
 };
 use super::github_sync::{GitHubAdapterConfig, GitHubProjectionAdapter, ProjectionAdapter};
-use super::intent_buffer::IntentBuffer;
+use super::intent_buffer::{IntentBuffer, IntentLifecycleArtifacts};
 use super::projection_receipt::ProjectedStatus;
+use crate::pcac::{InProcessKernel, LifecycleGate};
 use crate::protocol::dispatch::SignedLedgerEvent;
 
 // =============================================================================
@@ -244,6 +250,8 @@ pub mod lifecycle_deny {
     /// All `review_receipt_recorded` events must carry economics
     /// selectors; absence is a gate bypass attempt or malformed event.
     pub const MISSING_SELECTORS: &str = "missing_economics_selectors";
+    /// Mandatory lifecycle selectors absent (fail-closed).
+    pub const MISSING_LIFECYCLE_SELECTORS: &str = "missing_lifecycle_selectors";
 }
 
 /// Default sink identifier for single-sink projection (GitHub).
@@ -1613,21 +1621,24 @@ impl ProjectionWorkerConfig {
 /// economics selectors (`eval_tick`, `time_authority_ref`, `window_ref`,
 /// `boundary_id`).
 ///
-/// Events without economics selectors use the legacy ungated projection
-/// path; the gate enforces only when selectors are present. This is the
-/// correct transitional behavior during gradual rollout.
+/// Events without economics selectors are denied fail-closed
+/// (`missing_economics_selectors`).
+///
+/// After economics ALLOW, the worker enforces projection lifecycle gate
+/// sequencing (`join -> revalidate -> consume`) before any side effect.
 ///
 /// If the gate is NOT wired (init failure), events carrying economics
-/// selectors are DENIED (fail-closed). Legacy events without selectors
-/// still project normally.
+/// selectors are DENIED (fail-closed). Events without economics
+/// selectors are also DENIED (fail-closed: no bypass path).
 ///
 /// **Implementation scope**: The current implementation provides
 /// economics-gated admission with idempotent-insert replay prevention
 /// (via `IntentBuffer` uniqueness on `(work_id, changeset_digest)`).
 /// The enforcement guarantees are: no projection of economics-selector
 /// events without passing the economics gate, no double-projection
-/// of the same `(work_id, changeset_digest)`, and retry-safe handling
-/// of transient projection failures (PENDING intents allow re-attempt).
+/// of the same `(work_id, changeset_digest)`, no projection without passing
+/// lifecycle `join -> revalidate -> consume`, and retry-safe handling of
+/// transient projection failures (PENDING intents allow re-attempt).
 pub struct ProjectionWorker {
     config: ProjectionWorkerConfig,
     work_index: WorkIndex,
@@ -1647,6 +1658,9 @@ pub struct ProjectionWorker {
     /// Signer for constructing signed continuity window and profile
     /// artifacts at gate evaluation time (TCK-00505).
     gate_signer: Option<Arc<Signer>>,
+    /// Lifecycle gate enforced after economics ALLOW and before projection
+    /// side effects (`join -> revalidate -> consume`).
+    projection_lifecycle_gate: Option<Arc<LifecycleGate>>,
     /// Structured telemetry for admission gate decisions (TCK-00505).
     telemetry: Arc<AdmissionTelemetry>,
     /// Shutdown flag.
@@ -1693,6 +1707,12 @@ impl ProjectionWorker {
         // log warnings but not fail-open to GitHub.
         let adapter = None;
 
+        let lifecycle_kernel = Arc::new(InProcessKernel::new(1));
+        let projection_lifecycle_gate = Arc::new(LifecycleGate::with_tick_kernel(
+            lifecycle_kernel.clone(),
+            lifecycle_kernel,
+        ));
+
         Ok(Self {
             config,
             work_index,
@@ -1704,6 +1724,7 @@ impl ProjectionWorker {
             intent_buffer: None,
             continuity_resolver: None,
             gate_signer: None,
+            projection_lifecycle_gate: Some(projection_lifecycle_gate),
             telemetry: Arc::new(AdmissionTelemetry::new()),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
@@ -1778,6 +1799,14 @@ impl ProjectionWorker {
     /// audit trails.
     pub fn set_gate_signer(&mut self, signer: Arc<Signer>) {
         self.gate_signer = Some(signer);
+    }
+
+    /// Overrides the lifecycle gate used before projection side effects.
+    ///
+    /// This is primarily intended for deterministic tests or for wiring a
+    /// daemon-owned lifecycle gate instance.
+    pub fn set_projection_lifecycle_gate(&mut self, gate: Arc<LifecycleGate>) {
+        self.projection_lifecycle_gate = Some(gate);
     }
 
     /// Returns whether a GitHub adapter is configured.
@@ -2262,13 +2291,12 @@ impl ProjectionWorker {
     /// `time_authority_ref`, `window_ref`, `boundary_id`):
     ///
     /// 1. If the gate is wired: evaluate economics admission, insert intent as
-    ///    PENDING, proceed to projection, then admit AFTER successful
-    ///    projection.
+    ///    PENDING, enforce lifecycle gate (`join -> revalidate -> consume`),
+    ///    proceed to projection, then admit AFTER successful projection.
     /// 2. If the gate is NOT wired: DENY (fail-closed for events with economics
     ///    selectors).
     ///
-    /// Events without economics selectors use the legacy ungated
-    /// projection path; the gate enforces only when selectors are present.
+    /// Events without economics selectors are denied fail-closed.
     ///
     /// Missing gate inputs result in DENY (fail-closed).
     ///
@@ -2435,6 +2463,7 @@ impl ProjectionWorker {
         #[allow(unused_assignments)]
         // Only the economics-gate-active path reaches post-block code; others return early.
         let mut pending_intent_id: Option<String> = None;
+        let mut pending_lifecycle_artifacts: Option<IntentLifecycleArtifacts> = None;
 
         if !has_econ_selectors {
             // Fail-closed: events without economics selectors are DENIED.
@@ -2580,7 +2609,80 @@ impl ProjectionWorker {
             });
         }
 
-        // Project to GitHub if adapter is configured
+        if let Some(ref intent_id) = pending_intent_id {
+            let Some(lifecycle_gate) = self.projection_lifecycle_gate.as_ref() else {
+                let reason = "projection lifecycle gate not initialized (fail-closed)";
+                self.telemetry
+                    .missing_gate_denied_count
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                let intent_buffer = self.intent_buffer.as_ref().ok_or_else(|| {
+                    ProjectionWorkerError::IntentBufferError(
+                        "intent buffer unavailable for lifecycle deny recording".to_string(),
+                    )
+                })?;
+                deny_pending_intent(intent_buffer, intent_id, reason)?;
+                return Err(ProjectionWorkerError::LifecycleDenied {
+                    reason: reason.to_string(),
+                    subcategory: lifecycle_deny::MISSING_GATE.to_string(),
+                });
+            };
+
+            let lifecycle_result = evaluate_projection_lifecycle_gate(
+                lifecycle_gate,
+                &payload,
+                self.telemetry.as_ref(),
+                &event.event_id,
+            );
+            match lifecycle_result {
+                Ok(artifacts) => {
+                    pending_lifecycle_artifacts = Some(artifacts);
+                },
+                Err(err) => {
+                    let deny_reason = match &err {
+                        ProjectionWorkerError::LifecycleDenied { reason, .. } => reason.clone(),
+                        _ => err.to_string(),
+                    };
+                    let intent_buffer = self.intent_buffer.as_ref().ok_or_else(|| {
+                        ProjectionWorkerError::IntentBufferError(
+                            "intent buffer unavailable for lifecycle deny recording".to_string(),
+                        )
+                    })?;
+                    deny_pending_intent(intent_buffer, intent_id, &deny_reason)?;
+                    return Err(err);
+                },
+            }
+        }
+
+        // Project to GitHub if adapter is configured.
+        // SECURITY: If an intent was admitted (pending_intent_id is Some) but the
+        // adapter is absent, we must NOT silently admit the intent without a
+        // projection effect. Deny the intent and return an error so the event
+        // is retried once the adapter becomes available.
+        if pending_intent_id.is_some() && self.adapter.is_none() {
+            let reason = "projection adapter not configured; cannot apply projection effect for admitted intent (fail-closed)";
+            warn!(
+                work_id = %work_id,
+                receipt_id = %receipt_id,
+                reason = %reason,
+                "Denying projection: adapter absent for selector-bearing event with pending intent"
+            );
+            let intent_buffer = self.intent_buffer.as_ref().ok_or_else(|| {
+                ProjectionWorkerError::IntentBufferError(
+                    "intent buffer not available for adapter-absent deny recording".to_string(),
+                )
+            })?;
+            if let Some(ref intent_id) = pending_intent_id {
+                deny_pending_intent(intent_buffer, intent_id, reason)?;
+            }
+            self.telemetry
+                .missing_gate_denied_count
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            return Err(ProjectionWorkerError::LifecycleDenied {
+                reason: reason.to_string(),
+                subcategory: lifecycle_deny::MISSING_GATE.to_string(),
+            });
+        }
+
         if let Some(ref adapter) = self.adapter {
             // Major fix: Thread blocking in async context
             // Register commit SHA for status projection using async method with
@@ -2749,8 +2851,20 @@ impl ProjectionWorker {
             let intent_id_owned = intent_id.clone();
             let event_timestamp_ns = event.timestamp_ns;
             let telemetry = Arc::clone(&self.telemetry);
+            let lifecycle_artifacts = pending_lifecycle_artifacts;
 
             tokio::task::spawn_blocking(move || {
+                if let Some(artifacts) = lifecycle_artifacts {
+                    let attached = intent_buffer
+                        .attach_lifecycle_artifacts(&intent_id_owned, &artifacts)
+                        .map_err(|e| ProjectionWorkerError::IntentBufferError(e.to_string()))?;
+                    if !attached {
+                        return Err(ProjectionWorkerError::IntentBufferError(
+                            "failed to persist lifecycle artifacts on admitted intent".to_string(),
+                        ));
+                    }
+                }
+
                 let admitted = intent_buffer
                     .admit(&intent_id_owned, event_timestamp_ns)
                     .map_err(|e| ProjectionWorkerError::IntentBufferError(e.to_string()))?;
@@ -2862,6 +2976,278 @@ fn record_denied_intent(
     }
 
     Ok(())
+}
+
+/// Marks an existing pending intent as denied.
+///
+/// Used when a post-admission gate (for example projection lifecycle) fails
+/// after the intent was inserted as PENDING.
+fn deny_pending_intent(
+    intent_buffer: &IntentBuffer,
+    intent_id: &str,
+    reason: &str,
+) -> Result<(), ProjectionWorkerError> {
+    let denied = intent_buffer
+        .deny(intent_id, reason)
+        .map_err(|e| ProjectionWorkerError::IntentBufferError(e.to_string()))?;
+    if !denied {
+        debug!(
+            intent_id = %intent_id,
+            reason = %reason,
+            "deny_pending_intent returned false (intent already non-pending)"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProjectionLifecycleSelectors {
+    ajc_id: [u8; 32],
+    intent_digest: [u8; 32],
+    consume_selector_digest: [u8; 32],
+    consume_tick: u64,
+    pcac_time_envelope_ref: [u8; 32],
+}
+
+fn extract_projection_lifecycle_selectors(
+    payload: &serde_json::Value,
+) -> Option<ProjectionLifecycleSelectors> {
+    let ajc_id = extract_hash32_field(payload, "ajc_id")?;
+    let intent_digest = extract_hash32_field(payload, "intent_digest")?;
+    let consume_selector_digest = extract_hash32_field(payload, "consume_selector_digest")?;
+    let consume_tick = payload
+        .get("consume_tick")
+        .and_then(serde_json::Value::as_u64)?;
+    if consume_tick == 0 {
+        return None;
+    }
+    let pcac_time_envelope_ref = extract_hash32_field(payload, "pcac_time_envelope_ref")?;
+
+    Some(ProjectionLifecycleSelectors {
+        ajc_id,
+        intent_digest,
+        consume_selector_digest,
+        consume_tick,
+        pcac_time_envelope_ref,
+    })
+}
+
+const fn lifecycle_subcategory_from_deny_class(deny_class: &AuthorityDenyClass) -> &'static str {
+    match deny_class {
+        AuthorityDenyClass::RevocationFrontierAdvanced
+        | AuthorityDenyClass::UnknownRevocationHead { .. } => lifecycle_deny::REVOKED,
+        AuthorityDenyClass::StaleFreshnessAtJoin
+        | AuthorityDenyClass::StaleFreshnessAtRevalidate
+        | AuthorityDenyClass::CertificateExpired { .. }
+        | AuthorityDenyClass::FreshnessExceeded { .. }
+        | AuthorityDenyClass::LedgerAnchorDrift => lifecycle_deny::STALE,
+        _ => lifecycle_deny::CONSUMED,
+    }
+}
+
+fn increment_lifecycle_counter(telemetry: &AdmissionTelemetry, subcategory: &str) {
+    match subcategory {
+        lifecycle_deny::REVOKED => {
+            telemetry
+                .lifecycle_revoked_count
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        },
+        lifecycle_deny::STALE => {
+            telemetry
+                .lifecycle_stale_count
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        },
+        _ => {
+            telemetry
+                .lifecycle_consumed_count
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        },
+    }
+}
+
+fn build_projection_lifecycle_join_input(
+    payload: &serde_json::Value,
+    selectors: ProjectionLifecycleSelectors,
+    eval_tick: u64,
+    ledger_anchor: [u8; 32],
+) -> Result<AuthorityJoinInputV1, ProjectionWorkerError> {
+    let capability_manifest_hash = extract_hash32_field(payload, "capability_manifest_hash")
+        .ok_or_else(|| ProjectionWorkerError::LifecycleDenied {
+            reason: "missing capability_manifest_hash for lifecycle join".to_string(),
+            subcategory: lifecycle_deny::MISSING_LIFECYCLE_SELECTORS.to_string(),
+        })?;
+    let context_pack_hash =
+        extract_hash32_field(payload, "context_pack_hash").ok_or_else(|| {
+            ProjectionWorkerError::LifecycleDenied {
+                reason: "missing context_pack_hash for lifecycle join".to_string(),
+                subcategory: lifecycle_deny::MISSING_LIFECYCLE_SELECTORS.to_string(),
+            }
+        })?;
+    let role_spec_hash = extract_hash32_field(payload, "role_spec_hash").ok_or_else(|| {
+        ProjectionWorkerError::LifecycleDenied {
+            reason: "missing role_spec_hash for lifecycle join".to_string(),
+            subcategory: lifecycle_deny::MISSING_LIFECYCLE_SELECTORS.to_string(),
+        }
+    })?;
+    let identity_proof_hash =
+        extract_hash32_field(payload, "identity_proof_hash").ok_or_else(|| {
+            ProjectionWorkerError::LifecycleDenied {
+                reason: "missing identity_proof_hash for lifecycle join".to_string(),
+                subcategory: lifecycle_deny::MISSING_LIFECYCLE_SELECTORS.to_string(),
+            }
+        })?;
+    let lease_id = payload_nonempty_str(payload, "lease_id").map_err(|_| {
+        ProjectionWorkerError::LifecycleDenied {
+            reason: "missing lease_id for lifecycle join".to_string(),
+            subcategory: lifecycle_deny::MISSING_LIFECYCLE_SELECTORS.to_string(),
+        }
+    })?;
+
+    let freshness_tick = eval_tick.max(1);
+
+    Ok(AuthorityJoinInputV1 {
+        session_id: lease_id.to_string(),
+        holon_id: None,
+        intent_digest: selectors.intent_digest,
+        boundary_intent_class: BoundaryIntentClass::Actuate,
+        capability_manifest_hash,
+        scope_witness_hashes: vec![context_pack_hash, role_spec_hash],
+        lease_id: lease_id.to_string(),
+        permeability_receipt_hash: Some(role_spec_hash),
+        identity_proof_hash,
+        identity_evidence_level: IdentityEvidenceLevel::Verified,
+        pointer_only_waiver_hash: None,
+        directory_head_hash: ledger_anchor,
+        freshness_policy_hash: role_spec_hash,
+        freshness_witness_tick: freshness_tick,
+        stop_budget_profile_digest: capability_manifest_hash,
+        pre_actuation_receipt_hashes: Vec::new(),
+        leakage_witness_hash: context_pack_hash,
+        timing_witness_hash: role_spec_hash,
+        risk_tier: RiskTier::Tier1,
+        determinism_class: DeterminismClass::Deterministic,
+        time_envelope_ref: selectors.pcac_time_envelope_ref,
+        as_of_ledger_anchor: ledger_anchor,
+    })
+}
+
+fn evaluate_projection_lifecycle_gate(
+    lifecycle_gate: &LifecycleGate,
+    payload: &serde_json::Value,
+    telemetry: &AdmissionTelemetry,
+    event_id: &str,
+) -> Result<IntentLifecycleArtifacts, ProjectionWorkerError> {
+    let selectors = extract_projection_lifecycle_selectors(payload).ok_or_else(|| {
+        ProjectionWorkerError::LifecycleDenied {
+            reason: "missing lifecycle selectors for projection effect gate".to_string(),
+            subcategory: lifecycle_deny::MISSING_LIFECYCLE_SELECTORS.to_string(),
+        }
+    })?;
+    debug!(
+        payload_ajc_id = %hex::encode(selectors.ajc_id),
+        payload_intent_digest = %hex::encode(selectors.intent_digest),
+        payload_consume_selector_digest = %hex::encode(selectors.consume_selector_digest),
+        payload_consume_tick = selectors.consume_tick,
+        "Evaluating projection lifecycle selectors"
+    );
+
+    let eval_tick = payload
+        .get("eval_tick")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(selectors.consume_tick)
+        .max(1);
+    let window_ref = extract_hash32_field(payload, "window_ref").ok_or_else(|| {
+        ProjectionWorkerError::LifecycleDenied {
+            reason: "missing window_ref for lifecycle gate".to_string(),
+            subcategory: lifecycle_deny::STALE.to_string(),
+        }
+    })?;
+    let ledger_anchor = {
+        let digest = blake3::hash(event_id.as_bytes());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(digest.as_bytes());
+        out
+    };
+    let join_input =
+        build_projection_lifecycle_join_input(payload, selectors, eval_tick, ledger_anchor)?;
+    let policy = PcacPolicyKnobs::default();
+
+    lifecycle_gate.advance_tick(eval_tick);
+    let cert = lifecycle_gate
+        .join_and_revalidate(
+            &join_input,
+            selectors.pcac_time_envelope_ref,
+            ledger_anchor,
+            window_ref,
+            &policy,
+        )
+        .map_err(|deny| {
+            let subcategory = lifecycle_subcategory_from_deny_class(&deny.deny_class);
+            increment_lifecycle_counter(telemetry, subcategory);
+            ProjectionWorkerError::LifecycleDenied {
+                reason: format!(
+                    "projection lifecycle join/revalidate denied: {}",
+                    deny.deny_class
+                ),
+                subcategory: subcategory.to_string(),
+            }
+        })?;
+
+    lifecycle_gate.advance_tick(selectors.consume_tick.max(eval_tick));
+    lifecycle_gate
+        .revalidate_before_execution(
+            &cert,
+            selectors.pcac_time_envelope_ref,
+            ledger_anchor,
+            window_ref,
+            &policy,
+        )
+        .map_err(|deny| {
+            let subcategory = lifecycle_subcategory_from_deny_class(&deny.deny_class);
+            increment_lifecycle_counter(telemetry, subcategory);
+            ProjectionWorkerError::LifecycleDenied {
+                reason: format!(
+                    "projection lifecycle revalidate denied: {}",
+                    deny.deny_class
+                ),
+                subcategory: subcategory.to_string(),
+            }
+        })?;
+
+    let (consumed_witness, consume_record) = lifecycle_gate
+        .consume_before_effect(
+            &cert,
+            join_input.intent_digest,
+            join_input.boundary_intent_class,
+            true,
+            selectors.pcac_time_envelope_ref,
+            window_ref,
+            &policy,
+        )
+        .map_err(|deny| {
+            let subcategory = lifecycle_subcategory_from_deny_class(&deny.deny_class);
+            increment_lifecycle_counter(telemetry, subcategory);
+            ProjectionWorkerError::LifecycleDenied {
+                reason: format!("projection lifecycle consume denied: {}", deny.deny_class),
+                subcategory: subcategory.to_string(),
+            }
+        })?;
+
+    debug!(
+        ajc_id = %hex::encode(cert.ajc_id),
+        intent_digest = %hex::encode(consumed_witness.intent_digest),
+        consume_selector_digest = %hex::encode(consume_record.effect_selector_digest),
+        consume_tick = consumed_witness.consumed_at_tick,
+        "Projection lifecycle gate passed (join -> revalidate -> consume)"
+    );
+
+    Ok(IntentLifecycleArtifacts {
+        ajc_id: cert.ajc_id,
+        intent_digest: consumed_witness.intent_digest,
+        consume_selector_digest: consume_record.effect_selector_digest,
+        consume_tick: consumed_witness.consumed_at_tick,
+        time_envelope_ref: consumed_witness.consumed_time_envelope_ref,
+    })
 }
 
 /// Constructs a signed [`ProjectionContinuityWindowV1`] from resolved config
@@ -4667,6 +5053,10 @@ mod tests {
             lifecycle_deny::MISSING_SELECTORS,
             "missing_economics_selectors"
         );
+        assert_eq!(
+            lifecycle_deny::MISSING_LIFECYCLE_SELECTORS,
+            "missing_lifecycle_selectors"
+        );
     }
 
     // ----- Test: extract_hash32_field -----
@@ -5900,123 +6290,329 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // Regression: missing economics selectors -> DENY (no bypass path)
-    // =========================================================================
+    fn run_review_poll_once(worker: &mut ProjectionWorker) -> Result<(), ProjectionWorkerError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async { worker.process_review_receipts().await })
+    }
 
-    /// Events without economics selectors must be DENIED, not projected.
-    /// Previously, such events bypassed the gate entirely via the "legacy
-    /// ungated path". This test ensures the fail-closed fix works: no
-    /// selectors = no projection.
-    #[test]
-    fn test_missing_economics_selectors_deny() {
-        // Build an intent buffer so the deny can be durably recorded.
-        let intent_conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
-        let intent_buffer =
-            crate::projection::intent_buffer::IntentBuffer::new(Arc::clone(&intent_conn)).unwrap();
+    fn insert_review_receipt_event(
+        conn: &Arc<Mutex<Connection>>,
+        event_id: &str,
+        work_id: &str,
+        payload: &serde_json::Value,
+        timestamp_ns: i64,
+    ) {
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO ledger_events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    event_id,
+                    "review_receipt_recorded",
+                    work_id,
+                    "actor-reviewer",
+                    serde_json::to_vec(payload).expect("serialize payload"),
+                    vec![0u8; 64],
+                    timestamp_ns
+                ],
+            )
+            .expect("insert review_receipt_recorded");
+    }
 
-        // Payload WITHOUT economics selectors (no eval_tick, time_authority_ref,
-        // window_ref, boundary_id).
-        let payload_no_selectors = serde_json::json!({
-            "receipt_id": "r-no-sel",
-            "verdict": "success",
-            "changeset_digest": hex::encode([0x42u8; 32])
-        });
-        assert!(
-            !payload_has_economics_selectors(&payload_no_selectors),
-            "Precondition: payload should lack economics selectors"
-        );
-
-        // Record the deny using the same path the worker would take.
-        let reason = "event missing economics selectors (fail-closed: no bypass path)";
-        let changeset_digest = [0x42u8; 32];
-        let result = record_denied_intent(
-            &intent_buffer,
-            "r-no-sel",
-            "work-no-sel",
-            &changeset_digest,
-            ProjectedStatus::Success,
-            0, // eval_tick absent
-            1000,
-            reason,
-        );
-        assert!(
-            result.is_ok(),
-            "Durable deny recording should succeed for missing-selectors path"
-        );
-
-        // Verify the intent was inserted and denied.
-        let guard = intent_conn.lock().unwrap();
-        let (verdict, deny_reason): (String, Option<String>) = guard
+    fn review_tailer_watermark(conn: &Arc<Mutex<Connection>>) -> Option<(i64, String)> {
+        conn.lock()
+            .expect("lock")
             .query_row(
-                "SELECT verdict, deny_reason FROM projection_intents WHERE intent_id = ?",
-                rusqlite::params!["proj-r-no-sel"],
+                "SELECT last_processed_ns, last_event_id
+                 FROM tailer_watermark
+                 WHERE tailer_id = 'projection_worker:review_receipt_recorded'",
+                [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .expect("Intent should exist in buffer");
-        assert_eq!(verdict, "denied", "Intent should be durably denied");
+            .optional()
+            .expect("watermark query")
+    }
+
+    fn comment_receipt_count(conn: &Arc<Mutex<Connection>>) -> i64 {
+        conn.lock()
+            .expect("lock")
+            .query_row("SELECT COUNT(*) FROM comment_receipts", [], |row| {
+                row.get(0)
+            })
+            .expect("comment count")
+    }
+
+    fn make_review_payload(
+        work_id: &str,
+        receipt_id: &str,
+        changeset_digest: [u8; 32],
+        hashes: &TestLinkageHashes,
+    ) -> serde_json::Value {
+        let mut payload = valid_receipt_linkage_payload(work_id, hashes);
+        payload["receipt_id"] = serde_json::json!(receipt_id);
+        payload["changeset_digest"] = serde_json::json!(hex::encode(changeset_digest));
+        payload["verdict"] = serde_json::json!("success");
+        payload
+    }
+
+    fn add_economics_selectors(payload: &mut serde_json::Value) {
+        payload["eval_tick"] = serde_json::json!(42_u64);
+        payload["time_authority_ref"] = serde_json::json!(hex::encode([0x91u8; 32]));
+        payload["window_ref"] = serde_json::json!(hex::encode([0x92u8; 32]));
+        payload["boundary_id"] = serde_json::json!(DEFAULT_SINK_ID);
+    }
+
+    fn attach_mock_adapter(worker: &mut ProjectionWorker) {
+        let github_config =
+            GitHubAdapterConfig::new("https://api.github.com", "owner", "repo").expect("config");
+        let adapter = GitHubProjectionAdapter::new_mock(Signer::generate(), github_config)
+            .expect("mock adapter");
+        worker.set_adapter(adapter);
+    }
+
+    // =========================================================================
+    // Regression: missing economics selectors are denied and not projected
+    // =========================================================================
+
+    #[test]
+    fn test_missing_economics_selectors_denied_and_not_projected() {
+        let conn = create_test_db();
+        let mut worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker");
+        let cas = MemoryCas::default();
+        let hashes = make_test_linkage_hashes(&cas);
+        worker.set_authoritative_cas(Arc::new(cas));
+        attach_mock_adapter(&mut worker);
+
+        let intent_conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("sqlite open"),
+        ));
+        worker
+            .set_intent_buffer(IntentBuffer::new(Arc::clone(&intent_conn)).expect("intent buffer"));
+
+        worker
+            .work_index()
+            .register_pr("work-no-selectors", 123, "owner", "repo", "deadbeef")
+            .expect("register pr");
+
+        let payload = make_review_payload(
+            "work-no-selectors",
+            "receipt-no-selectors",
+            [0x41u8; 32],
+            &hashes,
+        );
+        insert_review_receipt_event(
+            &conn,
+            "evt-no-selectors",
+            "work-no-selectors",
+            &payload,
+            1000,
+        );
+
+        run_review_poll_once(&mut worker).expect("poll");
+
+        let watermark = review_tailer_watermark(&conn).expect("watermark");
+        assert_eq!(watermark.1, "evt-no-selectors");
+        assert_eq!(
+            comment_receipt_count(&conn),
+            0,
+            "selector-less event must not call projection adapter"
+        );
+
+        let guard = intent_conn.lock().expect("lock");
+        let (verdict, deny_reason): (String, String) = guard
+            .query_row(
+                "SELECT verdict, deny_reason FROM projection_intents WHERE intent_id = ?1",
+                params!["proj-receipt-no-selectors"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("denied intent row");
+        assert_eq!(verdict, "denied");
         assert!(
-            deny_reason
-                .as_deref()
-                .unwrap_or("")
-                .contains("missing economics selectors"),
-            "Deny reason should mention missing economics selectors, got: {deny_reason:?}"
+            deny_reason.contains("missing economics selectors"),
+            "unexpected deny reason: {deny_reason}"
         );
     }
 
     // =========================================================================
-    // Regression: missing-gate deny path records durable deny before ACK
+    // Regression: missing-gate ACK only with durable deny evidence
     // =========================================================================
 
-    /// When the economics gate is inactive (init failed) and an event carries
-    /// economics selectors, the deny must be durably recorded in
-    /// `IntentBuffer` BEFORE the event is acknowledged. Previously, the deny
-    /// was returned without durable recording, losing the audit trail.
     #[test]
-    fn test_missing_gate_deny_records_durable_deny() {
-        let intent_conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
-        let intent_buffer =
-            crate::projection::intent_buffer::IntentBuffer::new(Arc::clone(&intent_conn)).unwrap();
-
-        let changeset_digest = [0x42u8; 32];
-        let reason = "economics gate not initialized but event carries economics \
-             selectors (fail-closed)";
-
-        // Simulate the missing-gate deny path: record the deny durably.
-        let result = record_denied_intent(
-            &intent_buffer,
-            "r-gate-miss",
-            "work-gate-miss",
-            &changeset_digest,
-            ProjectedStatus::Success,
-            42, // eval_tick present in payload
-            2000,
-            reason,
+    fn test_missing_gate_ack_requires_durable_deny_recording() {
+        // Case A: intent buffer present -> deny is durable -> ACK allowed.
+        let conn_a = create_test_db();
+        let mut worker_a =
+            ProjectionWorker::new(Arc::clone(&conn_a), ProjectionWorkerConfig::new())
+                .expect("worker");
+        let cas_a = MemoryCas::default();
+        let hashes_a = make_test_linkage_hashes(&cas_a);
+        worker_a.set_authoritative_cas(Arc::new(cas_a));
+        attach_mock_adapter(&mut worker_a);
+        let intent_conn_a = Arc::new(Mutex::new(Connection::open_in_memory().expect("sqlite")));
+        worker_a.set_intent_buffer(
+            IntentBuffer::new(Arc::clone(&intent_conn_a)).expect("intent buffer"),
         );
+        worker_a
+            .work_index()
+            .register_pr("work-missing-gate-a", 123, "owner", "repo", "deadbeef")
+            .expect("register pr");
+
+        let mut payload_a = make_review_payload(
+            "work-missing-gate-a",
+            "receipt-missing-gate-a",
+            [0x51u8; 32],
+            &hashes_a,
+        );
+        add_economics_selectors(&mut payload_a);
+        insert_review_receipt_event(
+            &conn_a,
+            "evt-missing-gate-a",
+            "work-missing-gate-a",
+            &payload_a,
+            1000,
+        );
+
+        run_review_poll_once(&mut worker_a).expect("poll");
         assert!(
-            result.is_ok(),
-            "Durable deny recording should succeed for missing-gate path"
+            review_tailer_watermark(&conn_a).is_some(),
+            "event should ACK when deny evidence is durable"
+        );
+        let guard_a = intent_conn_a.lock().expect("lock");
+        let verdict_a: String = guard_a
+            .query_row(
+                "SELECT verdict FROM projection_intents WHERE intent_id = ?1",
+                params!["proj-receipt-missing-gate-a"],
+                |row| row.get(0),
+            )
+            .expect("intent verdict");
+        assert_eq!(verdict_a, "denied");
+
+        // Case B: intent buffer absent -> deny cannot persist -> event is not ACKed.
+        let conn_b = create_test_db();
+        let mut worker_b =
+            ProjectionWorker::new(Arc::clone(&conn_b), ProjectionWorkerConfig::new())
+                .expect("worker");
+        let cas_b = MemoryCas::default();
+        let hashes_b = make_test_linkage_hashes(&cas_b);
+        worker_b.set_authoritative_cas(Arc::new(cas_b));
+        attach_mock_adapter(&mut worker_b);
+        worker_b
+            .work_index()
+            .register_pr("work-missing-gate-b", 123, "owner", "repo", "deadbeef")
+            .expect("register pr");
+
+        let mut payload_b = make_review_payload(
+            "work-missing-gate-b",
+            "receipt-missing-gate-b",
+            [0x52u8; 32],
+            &hashes_b,
+        );
+        add_economics_selectors(&mut payload_b);
+        insert_review_receipt_event(
+            &conn_b,
+            "evt-missing-gate-b",
+            "work-missing-gate-b",
+            &payload_b,
+            1000,
         );
 
-        // Verify the intent was inserted and denied.
-        let guard = intent_conn.lock().unwrap();
-        let (verdict, deny_reason): (String, Option<String>) = guard
+        run_review_poll_once(&mut worker_b).expect("poll");
+        assert!(
+            review_tailer_watermark(&conn_b).is_none(),
+            "event must not ACK when deny evidence cannot be persisted"
+        );
+        assert_eq!(
+            comment_receipt_count(&conn_b),
+            0,
+            "missing-gate deny must never project"
+        );
+    }
+
+    #[test]
+    fn test_missing_lifecycle_selectors_denied_before_projection() {
+        let conn = create_test_db();
+        let mut worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker");
+        let cas = MemoryCas::default();
+        let hashes = make_test_linkage_hashes(&cas);
+        worker.set_authoritative_cas(Arc::new(cas));
+        attach_mock_adapter(&mut worker);
+
+        let intent_conn = Arc::new(Mutex::new(Connection::open_in_memory().expect("sqlite")));
+        worker
+            .set_intent_buffer(IntentBuffer::new(Arc::clone(&intent_conn)).expect("intent buffer"));
+        let gate_signer = Signer::generate();
+        worker.set_continuity_resolver(Arc::new(MockContinuityResolver::with_defaults_for_signer(
+            &gate_signer,
+        )));
+        worker.set_gate_signer(Arc::new(gate_signer));
+        worker
+            .work_index()
+            .register_pr("work-missing-lifecycle", 123, "owner", "repo", "deadbeef")
+            .expect("register pr");
+
+        let mut payload = make_review_payload(
+            "work-missing-lifecycle",
+            "receipt-missing-lifecycle",
+            [0x61u8; 32],
+            &hashes,
+        );
+        add_economics_selectors(&mut payload);
+        insert_review_receipt_event(
+            &conn,
+            "evt-missing-lifecycle",
+            "work-missing-lifecycle",
+            &payload,
+            1000,
+        );
+
+        run_review_poll_once(&mut worker).expect("poll");
+
+        assert!(
+            review_tailer_watermark(&conn).is_some(),
+            "missing lifecycle selectors should produce acknowledgeable deny after persistence"
+        );
+        assert_eq!(
+            comment_receipt_count(&conn),
+            0,
+            "lifecycle deny must block projection"
+        );
+        let guard = intent_conn.lock().expect("lock");
+        let (verdict, deny_reason): (String, String) = guard
             .query_row(
-                "SELECT verdict, deny_reason FROM projection_intents WHERE intent_id = ?",
-                rusqlite::params!["proj-r-gate-miss"],
+                "SELECT verdict, deny_reason FROM projection_intents WHERE intent_id = ?1",
+                params!["proj-receipt-missing-lifecycle"],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .expect("Intent should exist in buffer");
-        assert_eq!(
-            verdict, "denied",
-            "Intent should be durably denied (missing-gate path)"
-        );
+            .expect("intent row");
+        assert_eq!(verdict, "denied");
         assert!(
-            deny_reason
-                .as_deref()
-                .unwrap_or("")
-                .contains("not initialized"),
-            "Deny reason should mention gate not initialized, got: {deny_reason:?}"
+            deny_reason.contains("missing lifecycle selectors"),
+            "unexpected deny reason: {deny_reason}"
         );
+    }
+
+    #[test]
+    fn test_lifecycle_subcategory_mapping() {
+        let consumed =
+            lifecycle_subcategory_from_deny_class(&AuthorityDenyClass::AlreadyConsumed {
+                ajc_id: [0x11u8; 32],
+            });
+        assert_eq!(consumed, lifecycle_deny::CONSUMED);
+
+        let revoked =
+            lifecycle_subcategory_from_deny_class(&AuthorityDenyClass::RevocationFrontierAdvanced);
+        assert_eq!(revoked, lifecycle_deny::REVOKED);
+
+        let stale =
+            lifecycle_subcategory_from_deny_class(&AuthorityDenyClass::CertificateExpired {
+                expired_at: 10,
+                current_tick: 11,
+            });
+        assert_eq!(stale, lifecycle_deny::STALE);
     }
 }
