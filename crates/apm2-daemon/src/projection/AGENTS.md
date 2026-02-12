@@ -8,7 +8,9 @@ The `projection` module implements write-only projection adapters that synchroni
 
 ### Components
 
-- **`ProjectionWorker`**: Long-running worker that tails the ledger for `ReviewReceiptRecorded` events and projects review results to GitHub
+- **`ProjectionWorker`**: Long-running worker that tails the ledger for `ReviewReceiptRecorded` events and projects review results to GitHub. Enforces economics admission gate and PCAC lifecycle before every projection side effect (TCK-00505)
+- **`AdmissionTelemetry`**: Thread-safe atomic counters for economics admit/deny decisions per subcategory (TCK-00505)
+- **`lifecycle_deny`**: Constants for PCAC lifecycle denial subcategories (revoked, stale, consumed, missing_gate) (TCK-00505)
 - **`GitHubProjectionAdapter`**: Write-only GitHub commit status projection with signed receipts
 - **`ProjectionReceipt`**: Signed proof of projection with idempotency keys (legacy, backwards-compatible)
 - **`ProjectionAdmissionReceipt`**: Temporal-bound projection receipt bridging daemon receipts to economics `DeferredReplayReceiptV1` (TCK-00506)
@@ -28,6 +30,10 @@ The `projection` module implements write-only projection adapters that synchroni
 - **Idempotent**: Safe for retries with `(work_id, changeset_digest, ledger_head)` key
 - **Persistent cache**: Idempotency cache survives restarts
 - **Bounded deserialization**: String fields (`boundary_id`, `receipt_id`, `work_id`) reject oversized values before allocation
+- **Economics admission gate**: Every projection path passes through `evaluate_projection_continuity()` before the side effect (TCK-00505)
+- **PCAC lifecycle enforcement**: Authority tokens are joined, revalidated, and consumed (single-use) before projection effect (TCK-00505)
+- **Fail-closed gate defaults**: Missing gate inputs (temporal authority, profile, snapshot, window) result in DENY, never default ALLOW (TCK-00505)
+- **Revocation dominance**: A revoked authority that passes economics checks is still denied at PCAC revalidation (TCK-00505)
 
 ## Key Types
 
@@ -43,11 +49,19 @@ Long-running worker that tails ledger and projects review results to GitHub.
 
 - [INV-PJ01] Watermark is NOT advanced for events that fail due to missing dependencies (NACK/Retry).
 - [INV-PJ02] Worker is idempotent: restarts do not duplicate comments.
+- [INV-PJ10] No projection occurs without passing both the economics admission gate AND PCAC lifecycle enforcement when the gate is wired (TCK-00505).
+- [INV-PJ11] Missing gate inputs (temporal authority, profile, snapshot, window) result in DENY, not default ALLOW (TCK-00505).
+- [INV-PJ12] Revoked authority after economics ALLOW results in DENY at the PCAC revalidation step -- economics ALLOW alone is insufficient (TCK-00505).
+- [INV-PJ13] Already-consumed authority tokens result in DENY via IntentBuffer uniqueness -- single-use semantics prevent replay (TCK-00505).
 
 **Contracts:**
 
 - [CTR-PJ01] Reads ledger commits via `LedgerTailer`.
 - [CTR-PJ02] Stores projection receipts in CAS for idempotency.
+- [CTR-PJ10] `evaluate_economics_admission()` is called in `handle_review_receipt()` before `adapter.project_status()` when `has_economics_gate()` (TCK-00505).
+- [CTR-PJ11] Admitted intents are recorded with lifecycle artifact references in IntentBuffer (TCK-00505).
+- [CTR-PJ12] Denied intents are recorded with structured deny reason (including lifecycle denial subcategory) in IntentBuffer (TCK-00505).
+- [CTR-PJ13] `AdmissionTelemetry` counters increment atomically (Relaxed ordering -- observability only) for each verdict path (TCK-00505).
 
 ### `GitHubProjectionAdapter`
 
@@ -242,7 +256,7 @@ Pre-validated value types that map directly to economics module input types (`Pr
 
 ## Public API
 
-- `ProjectionWorker`, `ProjectionWorkerConfig`, `ProjectionWorkerError`
+- `ProjectionWorker`, `ProjectionWorkerConfig`, `ProjectionWorkerError`, `AdmissionTelemetry`, `lifecycle_deny`
 - `GitHubProjectionAdapter`, `GitHubAdapterConfig`, `ProjectionAdapter`, `ProjectionError`
 - `ProjectionReceipt`, `ProjectionReceiptBuilder`, `ProjectedStatus`, `IdempotencyKey`
 - `ProjectionAdmissionReceipt`, `ProjectionAdmissionReceiptBuilder`, `DeferredReplayReceiptInput`, `MAX_BOUNDARY_ID_LENGTH`
@@ -272,4 +286,5 @@ Pre-validated value types that map directly to economics module input types (`Pr
 - TCK-00322: Projection worker implementation
 - TCK-00504: Projection intent schema and durable buffer for economics-gated admission
 - TCK-00506: Projection receipt format bridge for economics gate compatibility
+- TCK-00505: Wire economics admission gate into projection worker pre-projection path
 - TCK-00507: Continuity profile and sink snapshot resolution for economics gate input assembly
