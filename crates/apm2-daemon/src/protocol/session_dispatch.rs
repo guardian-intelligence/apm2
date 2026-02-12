@@ -21847,10 +21847,17 @@ mod tests {
                     .expect("default ClockConfig should succeed"),
             );
 
+            // TCK-00498: Wire a PCAC lifecycle gate to satisfy the authority
+            // lifecycle guard in authoritative mode (ledger wired).
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(Arc::new(
+                crate::pcac::InProcessKernel::new(1),
+            )));
+
             let dispatcher = SessionDispatcher::new(minter.clone())
                 .with_session_registry(registry)
                 .with_ledger(ledger)
-                .with_clock(clock);
+                .with_clock(clock)
+                .with_pcac_lifecycle_gate(pcac_gate);
 
             let token = test_token(&minter);
             let request = EmitEventRequest {

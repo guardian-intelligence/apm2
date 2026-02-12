@@ -29,6 +29,7 @@ use apm2_daemon::episode::{
     Capability, CapabilityManifestBuilder, CapabilityScope, RiskTier, ToolClass,
 };
 use apm2_daemon::htf::{ClockConfig, HolonicClock};
+use apm2_daemon::pcac::{InProcessKernel, LifecycleGate};
 use apm2_daemon::protocol::LedgerEventEmitter;
 use apm2_daemon::protocol::credentials::PeerCredentials;
 use apm2_daemon::protocol::dispatch::{ConnectionContext, StubLedgerEventEmitter};
@@ -77,6 +78,14 @@ fn make_session_ctx() -> ConnectionContext {
 /// no clock is configured. Tests that use `EmitEvent` must configure a clock.
 fn test_clock() -> Arc<HolonicClock> {
     Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("failed to create test clock"))
+}
+
+/// Creates a test PCAC lifecycle gate for dispatchers in authoritative mode.
+///
+/// Per TCK-00498, `EmitEvent`/`PublishEvidence` in authoritative mode require
+/// an authority lifecycle gate (kernel or PCAC). This helper provides one.
+fn test_pcac_gate() -> Arc<LifecycleGate> {
+    Arc::new(LifecycleGate::new(Arc::new(InProcessKernel::new(1))))
 }
 
 fn make_test_manifest(tools: Vec<ToolClass>) -> apm2_daemon::episode::CapabilityManifest {
@@ -295,7 +304,8 @@ fn session_event_evidence_persist_emit_event_success() {
 
     let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store)
         .with_ledger(ledger.clone())
-        .with_clock(clock);
+        .with_clock(clock)
+        .with_pcac_lifecycle_gate(test_pcac_gate());
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
@@ -375,8 +385,9 @@ fn session_event_evidence_persist_publish_evidence_success() {
     let cas_config = DurableCasConfig::new(temp_dir.path().join("cas"));
     let cas: Arc<dyn ContentAddressedStore> = Arc::new(DurableCas::new(cas_config).unwrap());
 
-    let dispatcher =
-        SessionDispatcher::with_manifest_store(minter.clone(), store).with_cas(cas.clone());
+    let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store)
+        .with_cas(cas.clone())
+        .with_pcac_lifecycle_gate(test_pcac_gate());
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
@@ -525,10 +536,11 @@ fn session_event_evidence_persist_full_config_integration() {
     let manifest = make_test_manifest(vec![ToolClass::Read, ToolClass::Write, ToolClass::Execute]);
     store.register("session-001", manifest);
 
-    // Create fully-configured dispatcher with clock
+    // Create fully-configured dispatcher with clock and PCAC gate (TCK-00498)
     let dispatcher = SessionDispatcher::with_all_stores(minter.clone(), store, ledger, cas)
         .with_clock(clock)
-        .with_taint_policy(test_tool_argument_taint_policy());
+        .with_taint_policy(test_tool_argument_taint_policy())
+        .with_pcac_lifecycle_gate(test_pcac_gate());
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
@@ -550,12 +562,14 @@ fn session_event_evidence_persist_full_config_integration() {
                 "RequestTool should return TOOL_NOT_ALLOWED"
             );
             // TCK-00426: In authoritative mode (ledger+CAS wired), the PCAC gate
-            // fail-closed check fires before the broker check. Both are valid
-            // TOOL_NOT_ALLOWED denials.
+            // fail-closed check fires before the broker check. TCK-00498: with
+            // PCAC gate wired, PCAC lifecycle runs but may fail on missing
+            // session registry. All are valid TOOL_NOT_ALLOWED denials.
             assert!(
                 err.message.contains("broker unavailable")
-                    || err.message.contains("PCAC authority gate not wired"),
-                "Error should indicate broker unavailable or PCAC gate missing: {}",
+                    || err.message.contains("PCAC authority gate not wired")
+                    || err.message.contains("PCAC authority denied"),
+                "Error should indicate broker unavailable, PCAC gate missing, or PCAC denied: {}",
                 err.message
             );
         },
@@ -623,7 +637,8 @@ fn session_event_evidence_persist_emit_event_sequence_monotonic() {
 
     let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store)
         .with_ledger(ledger)
-        .with_clock(clock);
+        .with_clock(clock)
+        .with_pcac_lifecycle_gate(test_pcac_gate());
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
@@ -663,7 +678,9 @@ fn session_event_evidence_persist_publish_evidence_retention_hints() {
     let cas_config = DurableCasConfig::new(temp_dir.path().join("cas"));
     let cas: Arc<dyn ContentAddressedStore> = Arc::new(DurableCas::new(cas_config).unwrap());
 
-    let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store).with_cas(cas);
+    let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store)
+        .with_cas(cas)
+        .with_pcac_lifecycle_gate(test_pcac_gate());
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
