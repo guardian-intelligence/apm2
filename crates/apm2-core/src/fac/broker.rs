@@ -1399,10 +1399,12 @@ mod tests {
     #[allow(clippy::cast_possible_truncation)]
     fn policy_digest_store_cap_enforced() {
         let mut broker = FacBroker::new();
-        for i in 0..MAX_ADMITTED_POLICY_DIGESTS {
+        for i in 1..=MAX_ADMITTED_POLICY_DIGESTS {
+            let i = u16::try_from(i).expect("loop index must fit");
+            let i_bytes = i.to_le_bytes();
             let mut digest = [0u8; 32];
-            digest[0] = (i & 0xFF) as u8;
-            digest[1] = ((i >> 8) & 0xFF) as u8;
+            digest[0] = i_bytes[0];
+            digest[1] = i_bytes[1];
             broker.admit_policy_digest(digest).expect("should admit");
         }
 
@@ -1535,14 +1537,18 @@ mod tests {
     fn admit_policy_digest_duplicate_is_idempotent_with_capacity_at_max() {
         let mut broker = FacBroker::new();
         for i in 0..MAX_ADMITTED_POLICY_DIGESTS {
+            let i = u16::try_from(i + 1).expect("loop index must fit");
             let mut digest = [0u8; 32];
-            digest[0] = (i & 0xFF) as u8;
-            digest[1] = ((i >> 8) & 0xFF) as u8;
+            digest[0] = i.to_le_bytes()[0];
+            digest[1] = i.to_le_bytes()[1];
             broker.admit_policy_digest(digest).expect("should admit");
         }
 
         let mut duplicate = [0u8; 32];
-        duplicate[0] = (MAX_ADMITTED_POLICY_DIGESTS - 1) as u8;
+        let duplicate_last = u16::try_from(MAX_ADMITTED_POLICY_DIGESTS).expect("fits u16");
+        let duplicate_last = duplicate_last.to_le_bytes();
+        duplicate[0] = duplicate_last[0];
+        duplicate[1] = duplicate_last[1];
         let result = broker.admit_policy_digest(duplicate);
         assert!(
             result.is_ok(),
