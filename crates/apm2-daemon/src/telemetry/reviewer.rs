@@ -557,6 +557,7 @@ pub fn read_reviewer_projection_events(
     let mut latest_seq = 0_u64;
 
     for source in sources {
+        let tolerate_partial_line = source == *events_path;
         let file = File::open(&source)
             .map_err(|err| ReviewerTelemetryError::io(source.clone(), err.to_string()))?;
         let mut reader = BufReader::new(file);
@@ -575,7 +576,6 @@ pub fn read_reviewer_projection_events(
                 break;
             }
             line_no += 1;
-            let line_had_trailing_newline = raw_line.ends_with('\n');
             let line = raw_line.trim_end_matches(&['\r', '\n'][..]);
             if line.trim().is_empty() {
                 continue;
@@ -583,9 +583,11 @@ pub fn read_reviewer_projection_events(
             let value = match serde_json::from_str::<Value>(line) {
                 Ok(value) => value,
                 Err(err) => {
-                    if !line_had_trailing_newline
+                    let parse_error = err.to_string();
+                    let is_partial_json = parse_error.contains("EOF while parsing");
+                    if tolerate_partial_line
                         && line.trim_start().starts_with('{')
-                        && !line.trim_end().ends_with('}')
+                        && is_partial_json
                     {
                         continue;
                     }

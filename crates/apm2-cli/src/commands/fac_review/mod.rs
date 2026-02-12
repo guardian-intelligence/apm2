@@ -385,8 +385,9 @@ pub fn run_wait(
     ) {
         Ok((status, attempts, elapsed)) => {
             let elapsed_seconds = elapsed.as_secs();
+            let has_failed = status.terminal_failure
+                || review_types_terminal_failed(&status, review_type_filter);
             if json_output {
-                let has_failed = review_types_terminal_failed(&status, review_type_filter);
                 let payload = serde_json::json!({
                     "schema": "apm2.fac.review.wait.v1",
                     "status": "completed",
@@ -417,14 +418,7 @@ pub fn run_wait(
                 println!("  Attempts: {attempts}");
                 println!("  Elapsed: {elapsed_seconds}s");
                 println!("  Final: {}", status.line);
-                println!(
-                    "  Fail Closed: {}",
-                    if review_types_terminal_failed(&status, review_type_filter) {
-                        "yes"
-                    } else {
-                        "no"
-                    }
-                );
+                println!("  Fail Closed: {}", if has_failed { "yes" } else { "no" });
                 if !status.errors.is_empty() {
                     println!("  Errors:");
                     for error in &status.errors {
@@ -436,7 +430,7 @@ pub fn run_wait(
                 }
             }
 
-            if review_types_terminal_failed(&status, review_type_filter) {
+            if has_failed {
                 exit_codes::GENERIC_ERROR
             } else {
                 exit_codes::SUCCESS
@@ -707,7 +701,7 @@ pub fn run_project(
             }
         },
         Err(err) => {
-            if json_output {
+            if json_output || format_json {
                 let payload = serde_json::json!({
                     "schema": "apm2.fac.review.project.v1",
                     "status": "unavailable",
