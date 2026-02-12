@@ -585,31 +585,6 @@ impl AdmissionKernelV1 {
             });
         }
 
-        if let Some(ref journal) = self.effect_journal {
-            let binding = EffectJournalBindingV1 {
-                request_id,
-                request_digest: plan.spine_ext.canonical_request_digest,
-                as_of_ledger_anchor: plan.as_of_ledger_anchor.clone(),
-                policy_root_digest: plan.policy_root_digest,
-                policy_root_epoch: plan.policy_root_epoch,
-                leakage_witness_seed_hash: plan.leakage_witness_seed.content_hash(),
-                timing_witness_seed_hash: plan.timing_witness_seed.content_hash(),
-                boundary_profile_id: plan.request.boundary_profile_id.clone(),
-                enforcement_tier: plan.enforcement_tier,
-                ajc_id,
-                authority_join_hash: plan.certificate.authority_join_hash,
-                session_id: plan.request.session_id.clone(),
-                tool_class: plan.request.tool_class.clone(),
-                declared_idempotent: plan.request.declared_idempotent,
-            };
-
-            journal
-                .record_started(&binding)
-                .map_err(|e| AdmitError::BundleSealFailure {
-                    reason: format!("effect journal record_started failed: {e}"),
-                })?;
-        }
-
         // Derive idempotency key for propagation to tool/broker adapters.
         let idempotency_key = IdempotencyKeyV1::derive(request_id, ajc_id);
 
@@ -684,6 +659,37 @@ impl AdmissionKernelV1 {
 
         // Validate bundle before sealing (fail-closed).
         bundle.validate()?;
+
+        // Phase P.1 (TCK-00501): Effect journal — record Started.
+        //
+        // Placed AFTER all fallible pre-dispatch steps (bundle construction,
+        // validation) to prevent false in-doubt classification if bundle
+        // validation fails. The only remaining operation after this point
+        // is the infallible `content_hash()` and result assembly.
+        if let Some(ref journal) = self.effect_journal {
+            let binding = EffectJournalBindingV1 {
+                request_id,
+                request_digest: plan.spine_ext.canonical_request_digest,
+                as_of_ledger_anchor: plan.as_of_ledger_anchor.clone(),
+                policy_root_digest: plan.policy_root_digest,
+                policy_root_epoch: plan.policy_root_epoch,
+                leakage_witness_seed_hash: plan.leakage_witness_seed.content_hash(),
+                timing_witness_seed_hash: plan.timing_witness_seed.content_hash(),
+                boundary_profile_id: plan.request.boundary_profile_id.clone(),
+                enforcement_tier: plan.enforcement_tier,
+                ajc_id,
+                authority_join_hash: plan.certificate.authority_join_hash,
+                session_id: plan.request.session_id.clone(),
+                tool_class: plan.request.tool_class.clone(),
+                declared_idempotent: plan.request.declared_idempotent,
+            };
+
+            journal
+                .record_started(&binding)
+                .map_err(|e| AdmitError::BundleSealFailure {
+                    reason: format!("effect journal record_started failed: {e}"),
+                })?;
+        }
 
         // Seal: compute the deterministic content hash.
         let bundle_digest = bundle.content_hash();

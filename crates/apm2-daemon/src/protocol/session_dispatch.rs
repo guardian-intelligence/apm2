@@ -7844,6 +7844,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     hsi_envelope_binding_digest,
                     stop_budget_digest,
                     pcac_policy,
+                    // TODO(TCK-00501): Source declared_idempotent from
+                    // manifest/capability metadata. Currently hardcoded to
+                    // false because `Capability` does not yet carry a
+                    // `declared_idempotent` field. Until the manifest schema
+                    // is extended, resolve_in_doubt will always deny
+                    // re-execution (fail-closed). This is safe but prevents
+                    // the AllowReExecution path from being reachable in
+                    // production.
                     declared_idempotent: false,
                     lease_id: token.lease_id.clone(),
                     identity_proof_hash,
@@ -8366,6 +8374,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     ));
                 },
             }
+        }
+
+        // TCK-00501: Propagate idempotency key from admission result into
+        // broker transport for external deduplication.
+        if let Some(ref result) = admission_result {
+            broker_request =
+                broker_request.with_idempotency_key(Some(result.idempotency_key.as_hex()));
         }
 
         // Call broker.request() asynchronously using tokio runtime
@@ -11221,6 +11236,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             hsi_envelope_binding_digest,
             stop_budget_digest,
             pcac_policy,
+            // TODO(TCK-00501): Source declared_idempotent from
+            // manifest/capability metadata (see KernelRequestV1 in
+            // handle_tool_request for rationale).
             declared_idempotent: false,
             lease_id: token.lease_id.clone(),
             identity_proof_hash,

@@ -548,14 +548,18 @@ impl super::effect_journal::EffectJournal for MockEffectJournal {
     ) -> Result<(), super::effect_journal::EffectJournalError> {
         binding.validate()?;
         let mut entries = self.entries.lock().expect("lock");
-        if entries.contains_key(&binding.request_id) {
-            return Err(
-                super::effect_journal::EffectJournalError::InvalidTransition {
-                    request_id: binding.request_id,
-                    current: *entries.get(&binding.request_id).unwrap(),
-                    target: super::effect_journal::EffectExecutionState::Started,
-                },
-            );
+        if let Some(&state) = entries.get(&binding.request_id) {
+            // Allow NotStarted -> Started (re-execution after resolve_in_doubt).
+            if state != super::effect_journal::EffectExecutionState::NotStarted {
+                return Err(
+                    super::effect_journal::EffectJournalError::InvalidTransition {
+                        request_id: binding.request_id,
+                        current: state,
+                        target: super::effect_journal::EffectExecutionState::Started,
+                    },
+                );
+            }
+            entries.remove(&binding.request_id);
         }
         entries.insert(
             binding.request_id,
@@ -4268,6 +4272,171 @@ fn test_tck_00497_witness_evidence_json_round_trip() {
         deser.measured_values.len(),
         2,
         "measured_values must survive round-trip"
+    );
+}
+
+// =============================================================================
+// TCK-00501 MAJOR 2: record_started must NOT be persisted before fallible
+// pre-effect steps (bundle validation). This test verifies that when
+// PCAC consume fails, the effect journal has NO Started entry.
+// =============================================================================
+
+/// A tracking mock journal that records whether `record_started` was called.
+struct TrackingEffectJournal {
+    started_called: std::sync::Mutex<bool>,
+}
+
+impl TrackingEffectJournal {
+    fn new() -> Self {
+        Self {
+            started_called: std::sync::Mutex::new(false),
+        }
+    }
+
+    fn was_started_called(&self) -> bool {
+        *self.started_called.lock().expect("lock")
+    }
+}
+
+impl super::effect_journal::EffectJournal for TrackingEffectJournal {
+    fn record_started(
+        &self,
+        binding: &super::effect_journal::EffectJournalBindingV1,
+    ) -> Result<(), super::effect_journal::EffectJournalError> {
+        binding.validate()?;
+        *self.started_called.lock().expect("lock") = true;
+        Ok(())
+    }
+
+    fn record_completed(
+        &self,
+        _request_id: &Hash,
+    ) -> Result<(), super::effect_journal::EffectJournalError> {
+        Ok(())
+    }
+
+    fn query_state(&self, _request_id: &Hash) -> super::effect_journal::EffectExecutionState {
+        super::effect_journal::EffectExecutionState::NotStarted
+    }
+
+    fn query_binding(
+        &self,
+        _request_id: &Hash,
+    ) -> Option<super::effect_journal::EffectJournalBindingV1> {
+        None
+    }
+
+    fn resolve_in_doubt(
+        &self,
+        request_id: &Hash,
+        _boundary_confirms_not_executed: bool,
+    ) -> Result<super::effect_journal::InDoubtResolutionV1, super::effect_journal::EffectJournalError>
+    {
+        Err(
+            super::effect_journal::EffectJournalError::ReExecutionDenied {
+                request_id: *request_id,
+                enforcement_tier: EnforcementTier::FailClosed,
+                declared_idempotent: false,
+                reason: "tracking mock: not implemented".into(),
+            },
+        )
+    }
+
+    fn len(&self) -> usize {
+        0
+    }
+}
+
+#[test]
+fn test_tck_00501_consume_failure_does_not_leave_stale_started_entry() {
+    // TCK-00501 MAJOR 2 regression test: when execute() fails before
+    // bundle validation (e.g., PCAC consume failure), the effect journal
+    // must NOT have a Started entry. This validates that record_started
+    // is positioned AFTER all fallible pre-effect steps.
+    let tracking_journal = Arc::new(TrackingEffectJournal::new());
+
+    let kernel = AdmissionKernelV1::new(
+        Arc::new(MockPcacKernel::with_consume_error(
+            AuthorityDenyClass::IntentDigestMismatch {
+                expected: test_hash(3),
+                actual: test_hash(99),
+            },
+        )),
+        witness_provider(),
+    )
+    .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+    .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+    .with_anti_rollback(Arc::new(MockAntiRollback::passing()))
+    .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+    .with_effect_journal(tracking_journal.clone());
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+
+    // Execute fails because consume is denied.
+    let result = kernel.execute(&mut plan, test_hash(90), test_hash(91));
+    assert!(result.is_err(), "execute must fail due to consume error");
+
+    // The journal must NOT have recorded Started — the failure occurred
+    // before bundle construction/validation, so record_started (which is
+    // after bundle.validate()) must not have been called.
+    assert!(
+        !tracking_journal.was_started_called(),
+        "record_started must NOT be called when execute fails before bundle validation"
+    );
+}
+
+#[test]
+fn test_tck_00501_successful_execute_records_started_in_journal() {
+    // Positive test: verify that a successful execute() DOES call
+    // record_started on the effect journal.
+    let tracking_journal = Arc::new(TrackingEffectJournal::new());
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(Arc::new(MockAntiRollback::passing()))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+        .with_effect_journal(tracking_journal.clone());
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+
+    let result = kernel.execute(&mut plan, test_hash(90), test_hash(91));
+    assert!(result.is_ok(), "execute should succeed");
+
+    assert!(
+        tracking_journal.was_started_called(),
+        "record_started MUST be called on successful execute"
+    );
+}
+
+// =============================================================================
+// TCK-00501 MAJOR 1: idempotency key derivation test
+// =============================================================================
+
+#[test]
+fn test_tck_00501_idempotency_key_is_derived_on_successful_execute() {
+    // Verify that the admission result contains a non-zero idempotency key
+    // even though declared_idempotent is not yet sourced from the manifest.
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    // The idempotency key must be derived and non-empty.
+    let key_hex = result.idempotency_key.as_hex();
+    assert!(
+        !key_hex.is_empty(),
+        "idempotency key must be derived (non-empty hex)"
+    );
+    assert!(
+        key_hex.len() >= 64,
+        "idempotency key hex must be at least 64 chars (32 bytes), got {}",
+        key_hex.len()
     );
 }
 

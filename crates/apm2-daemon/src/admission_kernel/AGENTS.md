@@ -79,7 +79,8 @@ Result of successful execution containing capability tokens, consume receipts, b
 - [CTR-AK15] Seeds in `AdmissionResultV1` match the plan-time seeds (same content hash).
 - [CTR-AK16] Runtime post-effect path MUST use `kernel.finalize_post_effect_witness()` with the result's seeds as the single source of truth for seed/provider/temporal binding validation. Ad-hoc validation is forbidden.
 - [CTR-AK17] Monitor tiers MUST construct a `MonitorWaiverV1` and pass it to `finalize_post_effect_witness()`. Silent log-and-continue bypass is forbidden (QUALITY MAJOR 2).
-- [CTR-AK21] `idempotency_key` MUST be propagated to all external broker/tool calls that support idempotency. Callers use `idempotency_key.as_hex()` for transport encoding.
+- [CTR-AK21] `idempotency_key` MUST be propagated to all external broker/tool calls that support idempotency. Callers use `idempotency_key.as_hex()` for transport encoding. The key is now propagated into `BrokerToolRequest.idempotency_key` via `with_idempotency_key()` in session dispatch (TCK-00501 MAJOR 1 fix).
+- [CTR-AK23] `declared_idempotent` in `KernelRequestV1` is currently hardcoded to `false` because `Capability` does not yet carry this field. This makes `resolve_in_doubt` always deny in production (fail-closed safe). TODO(TCK-00501): source from manifest/capability metadata when the schema is extended.
 - [CTR-AK22] Post-effect path MUST call `effect_journal.record_completed()` after successful effect execution. Failure to record completion causes `Unknown` state on crash recovery, which triggers fail-closed in-doubt handling.
 
 ### `AdmissionSpineJoinExtV1` (types.rs)
@@ -136,7 +137,7 @@ Crash-safe effect execution journal (TCK-00501). Tracks effect execution state p
 - [INV-AK44] In-memory entry count bounded by `MAX_JOURNAL_ENTRIES` (1,000,000). Overflow returns `EffectJournalError::JournalFull`.
 - [INV-AK45] Exclusive file lock (`flock LOCK_EX`) prevents concurrent journal access from multiple daemon instances.
 - [INV-AK46] Binding data is validated (`validate()`) before persistence; zero hashes and empty fields are rejected.
-- [INV-AK47] `record_started()` rejects duplicate `request_id` entries (idempotency guard).
+- [INV-AK47] `record_started()` rejects duplicate `request_id` entries UNLESS state is `NotStarted` (from `resolve_in_doubt`), which permits re-execution by removing the stale entry before inserting the new binding.
 - [INV-AK48] `resolve_in_doubt()` persists resolution atomically (fsync 'R' tag) BEFORE updating in-memory state; prevents infinite resolution loops on crash (TCK-00501 fix).
 - [INV-AK49] Fail-closed tiers MUST have an effect journal wired; `execute()` denies with `MissingPrerequisite` if journal is absent for `FailClosed` tier (TCK-00501 fix).
 - [INV-AK50] Journal file is created with mode `0o600` (owner-only read/write) to prevent world-readable exposure of request IDs, session IDs, and policy root digests (TCK-00501 fix).
@@ -243,9 +244,9 @@ plan():    validate -> prerequisite resolution -> witness seed creation ->
            PCAC join -> PCAC revalidate
 execute(): single-use check -> prerequisite re-check (fail-closed) ->
            fresh revalidate (verifier anchor) -> quarantine reserve ->
-           durable consume -> bundle seal (TCK-00493) ->
-           effect journal record_started (TCK-00501) ->
-           idempotency key derivation (TCK-00501) ->
+           durable consume -> bundle construction + validation (TCK-00493) ->
+           effect journal record_started (TCK-00501, after validation) ->
+           bundle seal -> idempotency key derivation (TCK-00501) ->
            capability mint (tier-gated) -> boundary span -> result
 
 POST-EFFECT FINALIZATION (caller responsibility, TCK-00502):

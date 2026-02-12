@@ -485,7 +485,7 @@ pub enum InDoubtResolutionV1 {
 /// # State Machine
 ///
 /// Valid transitions:
-/// - `None` -> `Started` (via `record_started`)
+/// - `None`/`NotStarted` -> `Started` (via `record_started`)
 /// - `Started` -> `Completed` (via `record_completed`)
 /// - `Started` -> `Unknown` (via restart recovery only; not a direct API)
 ///
@@ -517,7 +517,8 @@ pub trait EffectJournal: Send + Sync {
     /// # Errors
     ///
     /// - `InvalidTransition` if the request already has a `Started`,
-    ///   `Completed`, or `Unknown` entry.
+    ///   `Completed`, or `Unknown` entry (but NOT `NotStarted`, which permits
+    ///   re-execution after `resolve_in_doubt`).
     /// - `CapacityExhausted` if the journal is full.
     /// - `IoError` if the durable write fails.
     fn record_started(&self, binding: &EffectJournalBindingV1) -> Result<(), EffectJournalError>;
@@ -871,12 +872,19 @@ impl EffectJournal for FileBackedEffectJournal {
         let mut entries = self.entries.lock().expect("entries lock poisoned");
 
         // Check for existing entry (state machine enforcement).
+        // NotStarted (from resolve_in_doubt) is permitted — remove the stale
+        // entry so the new binding can be inserted below. The old 'S' + 'R'
+        // records remain in the journal file; the new 'S' record appended
+        // below takes precedence on replay.
         if let Some(existing) = entries.get(&request_id) {
-            return Err(EffectJournalError::InvalidTransition {
-                request_id,
-                current: existing.state,
-                target: EffectExecutionState::Started,
-            });
+            if existing.state != EffectExecutionState::NotStarted {
+                return Err(EffectJournalError::InvalidTransition {
+                    request_id,
+                    current: existing.state,
+                    target: EffectExecutionState::Started,
+                });
+            }
+            entries.remove(&request_id);
         }
 
         // Enforce capacity limit BEFORE any state mutation.
@@ -1904,52 +1912,81 @@ mod tests {
 
     #[test]
     fn resolve_in_doubt_allows_re_execution_after_restart() {
-        // End-to-end: Started -> crash -> resolve -> NotStarted ->
-        // re-execute (record_started again) -> record_completed.
+        // End-to-end: Started -> crash -> resolve_in_doubt(allow) ->
+        // record_started (same request_id) -> record_completed.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("effect.journal");
 
         let request_id = test_hash(0x82);
         let binding = test_binding(request_id, true); // idempotent
 
-        // Session 1: Started, crash.
+        // Session 1: Started, then simulate crash (drop journal).
         {
             let journal = FileBackedEffectJournal::open(&path).unwrap();
             journal.record_started(&binding).unwrap();
+            assert_eq!(
+                journal.query_state(&request_id),
+                EffectExecutionState::Started
+            );
         }
 
-        // Session 2: resolve -> NotStarted, then crash again.
+        // Session 2: replay classifies as Unknown, resolve allows re-execution.
         {
             let journal = FileBackedEffectJournal::open(&path).unwrap();
             assert_eq!(
                 journal.query_state(&request_id),
-                EffectExecutionState::Unknown
+                EffectExecutionState::Unknown,
+                "after crash, Started without Completed must replay as Unknown"
             );
-            let _res = journal.resolve_in_doubt(&request_id, true).unwrap();
+
+            let resolution = journal.resolve_in_doubt(&request_id, true).unwrap();
+            match &resolution {
+                InDoubtResolutionV1::AllowReExecution { idempotency_key } => {
+                    assert!(
+                        !idempotency_key.as_hex().is_empty(),
+                        "idempotency key must be non-empty"
+                    );
+                },
+                InDoubtResolutionV1::Deny { reason } => {
+                    panic!("expected AllowReExecution, got Deny: {reason}");
+                },
+            }
             assert_eq!(
                 journal.query_state(&request_id),
-                EffectExecutionState::NotStarted
+                EffectExecutionState::NotStarted,
+                "resolve_in_doubt must transition Unknown -> NotStarted"
+            );
+
+            // Re-execute: record_started for the SAME request_id succeeds
+            // because the state is NotStarted (from resolve_in_doubt).
+            journal
+                .record_started(&binding)
+                .expect("record_started must succeed for NotStarted entry (re-execution)");
+            assert_eq!(
+                journal.query_state(&request_id),
+                EffectExecutionState::Started,
+                "after re-execution record_started, state must be Started"
+            );
+
+            // Complete the re-execution.
+            journal
+                .record_completed(&request_id)
+                .expect("record_completed must succeed after re-execution");
+            assert_eq!(
+                journal.query_state(&request_id),
+                EffectExecutionState::Completed,
+                "after record_completed, state must be Completed"
             );
         }
 
-        // Session 3: replay should show NotStarted; re-execute succeeds.
+        // Session 3: replay after full re-execution cycle shows Completed.
         let journal = FileBackedEffectJournal::open(&path).unwrap();
         assert_eq!(
             journal.query_state(&request_id),
-            EffectExecutionState::NotStarted
+            EffectExecutionState::Completed,
+            "replay after re-execution cycle must show Completed"
         );
-
-        // Re-execution: a new Started record for the same request_id.
-        // Since state is NotStarted, this would require a new binding.
-        // The old entry was transitioned to NotStarted. However, the
-        // current state machine only allows Started from None (no entry).
-        // After resolve_in_doubt, the entry exists as NotStarted, so
-        // re-execution with the same request_id is not directly possible
-        // via record_started (which checks for existing entries). This is
-        // correct: the idempotency key mechanism handles re-execution
-        // identity, and a new request_id should be used for the retry.
-        // The test validates the state machine is consistent.
-        assert_eq!(journal.len(), 1);
+        assert_eq!(journal.len(), 1, "only one logical entry for request_id");
     }
 
     // =========================================================================
