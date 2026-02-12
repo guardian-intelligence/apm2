@@ -249,14 +249,14 @@ pub use types::ReviewRunType;
 |----------|-------------|
 | `run_review(pr_url, type, sha, force, json)` | Run security/quality reviews synchronously |
 | `run_dispatch(pr_url, type, sha, force, json)` | Dispatch reviews as detached processes |
-| `run_status(pr_number, pr_url, json)` | Show review run status |
-| `run_findings(repo, pr, url, sha, json)` | Aggregate review findings |
+| `run_status(pr_number, pr_url, type_filter, json)` | Show review run status (optionally one reviewer lane) |
+| `run_findings(repo, pr, url, sha, refresh, json)` | Aggregate review findings with optional cache refresh |
 | `run_comment(repo, pr, url, sha, severity, type, body, json)` | Publish a single SHA-bound finding comment |
 | `run_prepare(repo, pr, url, sha, json)` | Prepare review inputs |
 | `run_publish(repo, pr, url, sha, type, body, json)` | Publish review comment to GitHub |
 | `run_decision_set(repo, pr, url, sha, dim, dec, reason, keep, json)` | Set review decision |
 | `run_decision_show(repo, pr, url, sha, json)` | Show review decisions |
-| `run_project(pr, sha, since, after_seq, errors, fail_term, json)` | Project review state from NDJSON events |
+| `run_project(pr, sha, since, after_seq, errors, fail_term, json)` | Best-effort projection for debug/log surfaces; non-critical by default |
 | `run_tail(lines, follow)` | Tail review event log |
 | `run_push(repo, remote, branch, ticket)` | Push review branch with commit signing |
 | `run_restart(repo, pr, url, force, json)` | CI-aware pipeline restart |

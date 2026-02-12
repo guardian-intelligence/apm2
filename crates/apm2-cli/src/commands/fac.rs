@@ -520,6 +520,22 @@ pub struct ReviewDispatchArgs {
     pub force: bool,
 }
 
+/// Review lane filter for `apm2 fac review status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReviewStatusTypeArg {
+    Security,
+    Quality,
+}
+
+impl ReviewStatusTypeArg {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Security => "security",
+            Self::Quality => "quality",
+        }
+    }
+}
+
 /// Arguments for `apm2 fac review status`.
 #[derive(Debug, Args)]
 pub struct ReviewStatusArgs {
@@ -530,6 +546,14 @@ pub struct ReviewStatusArgs {
     /// Optional pull request URL filter.
     #[arg(long)]
     pub pr_url: Option<String>,
+
+    /// Optional reviewer lane filter (`security` or `quality`).
+    #[arg(long = "type", value_enum)]
+    pub review_type: Option<ReviewStatusTypeArg>,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac review findings`.
@@ -550,6 +574,10 @@ pub struct ReviewFindingsArgs {
     /// Optional head SHA override (defaults to PR head SHA).
     #[arg(long)]
     pub sha: Option<String>,
+
+    /// Ignore local cached comments and re-fetch from GitHub projection.
+    #[arg(long, default_value_t = false)]
+    pub refresh: bool,
 
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
@@ -1013,9 +1041,12 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
                 dispatch_args.force,
                 json_output,
             ),
-            ReviewSubcommand::Status(status_args) => {
-                fac_review::run_status(status_args.pr, status_args.pr_url.as_deref(), json_output)
-            },
+            ReviewSubcommand::Status(status_args) => fac_review::run_status(
+                status_args.pr,
+                status_args.pr_url.as_deref(),
+                status_args.review_type.map(ReviewStatusTypeArg::as_str),
+                json_output || status_args.json,
+            ),
             ReviewSubcommand::Prepare(prepare_args) => fac_review::run_prepare(
                 &prepare_args.repo,
                 prepare_args.pr,
@@ -1037,6 +1068,7 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
                 findings_args.pr,
                 findings_args.pr_url.as_deref(),
                 findings_args.sha.as_deref(),
+                findings_args.refresh,
                 json_output || findings_args.json,
             ),
             ReviewSubcommand::Comment(comment_args) => fac_review::run_comment(

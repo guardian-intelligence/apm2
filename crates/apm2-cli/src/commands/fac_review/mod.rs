@@ -329,8 +329,13 @@ pub fn run_dispatch(
     }
 }
 
-pub fn run_status(pr_number: Option<u32>, pr_url: Option<&str>, json_output: bool) -> u8 {
-    match run_status_inner(pr_number, pr_url, json_output) {
+pub fn run_status(
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    review_type_filter: Option<&str>,
+    json_output: bool,
+) -> u8 {
+    match run_status_inner(pr_number, pr_url, review_type_filter, json_output) {
         Ok(fail_closed) => {
             if fail_closed {
                 exit_codes::GENERIC_ERROR
@@ -362,9 +367,10 @@ pub fn run_findings(
     pr_number: Option<u32>,
     pr_url: Option<&str>,
     sha: Option<&str>,
+    refresh: bool,
     json_output: bool,
 ) -> u8 {
-    match findings::run_findings(repo, pr_number, pr_url, sha, json_output) {
+    match findings::run_findings(repo, pr_number, pr_url, sha, refresh, json_output) {
         Ok(code) => code,
         Err(err) => {
             if json_output {
@@ -575,13 +581,6 @@ pub fn run_project(
 ) -> u8 {
     match run_project_inner(pr_number, head_sha, since_epoch, after_seq) {
         Ok(status) => {
-            let fail_closed_state = matches!(
-                status.security.as_str(),
-                "no-run-state" | "corrupt-state" | "ambiguous-state"
-            ) || matches!(
-                status.quality.as_str(),
-                "no-run-state" | "corrupt-state" | "ambiguous-state"
-            );
             if json_output {
                 println!(
                     "{}",
@@ -599,7 +598,7 @@ pub fn run_project(
                 }
             }
 
-            if fail_closed_state || (fail_on_terminal && status.terminal_failure) {
+            if fail_on_terminal && status.terminal_failure {
                 exit_codes::GENERIC_ERROR
             } else {
                 exit_codes::SUCCESS
@@ -608,6 +607,8 @@ pub fn run_project(
         Err(err) => {
             if json_output {
                 let payload = serde_json::json!({
+                    "schema": "apm2.fac.review.project.v1",
+                    "status": "unavailable",
                     "error": "fac_review_project_failed",
                     "message": err,
                 });
@@ -617,9 +618,10 @@ pub fn run_project(
                         .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
                 );
             } else {
-                eprintln!("ERROR: {err}");
+                eprintln!("WARN: fac review project unavailable: {err}");
             }
-            exit_codes::GENERIC_ERROR
+            // Projection is a debug/observability surface; do not fail callers by default.
+            exit_codes::SUCCESS
         },
     }
 }
@@ -763,8 +765,18 @@ fn run_dispatch_inner(
 fn run_status_inner(
     pr_number: Option<u32>,
     pr_url: Option<&str>,
+    review_type_filter: Option<&str>,
     json_output: bool,
 ) -> Result<bool, String> {
+    let normalized_review_type = review_type_filter.map(|value| value.trim().to_ascii_lowercase());
+    if let Some(value) = normalized_review_type.as_deref() {
+        if !matches!(value, "security" | "quality") {
+            return Err(format!(
+                "invalid review type filter `{value}` (expected security|quality)"
+            ));
+        }
+    }
+
     let derived_pr = if let Some(url) = pr_url {
         let (_, number) = parse_pr_url(url)?;
         Some(number)
@@ -787,11 +799,14 @@ fn run_status_inner(
     } else {
         list_review_pr_numbers()?
     };
+    let review_types = normalized_review_type
+        .as_deref()
+        .map_or_else(|| vec!["security", "quality"], |value| vec![value]);
 
     let mut entries = Vec::new();
     let mut fail_closed = false;
     for pr in &target_prs {
-        for review_type in ["security", "quality"] {
+        for review_type in &review_types {
             let state_path = review_run_state_path(*pr, review_type)?;
             match load_review_run_state(*pr, review_type)? {
                 state::ReviewRunStateLoad::Present(state) => {
@@ -857,18 +872,41 @@ fn run_status_inner(
                     .get("pr_number")
                     .and_then(serde_json::Value::as_u64)
                     .is_some_and(|value| value == u64::from(number))
+            }) && normalized_review_type.as_deref().is_none_or(|wanted| {
+                event
+                    .get("review_type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| {
+                        value.eq_ignore_ascii_case(wanted) || value.eq_ignore_ascii_case("all")
+                    })
             })
         })
         .collect::<Vec<_>>();
 
-    let pulse_security = filter_pr
-        .map(|number| read_pulse_file(number, "security"))
-        .transpose()?
-        .flatten();
-    let pulse_quality = filter_pr
-        .map(|number| read_pulse_file(number, "quality"))
-        .transpose()?
-        .flatten();
+    let pulse_security = if let Some(number) = filter_pr {
+        if normalized_review_type
+            .as_deref()
+            .is_some_and(|value| value != "security")
+        {
+            None
+        } else {
+            read_pulse_file(number, "security")?
+        }
+    } else {
+        None
+    };
+    let pulse_quality = if let Some(number) = filter_pr {
+        if normalized_review_type
+            .as_deref()
+            .is_some_and(|value| value != "quality")
+        {
+            None
+        } else {
+            read_pulse_file(number, "quality")?
+        }
+    } else {
+        None
+    };
 
     let current_head_sha = filter_pr.and_then(|number| {
         entries
@@ -894,6 +932,7 @@ fn run_status_inner(
         let payload = serde_json::json!({
             "schema": "apm2.fac.review.status.v1",
             "filter_pr": filter_pr,
+            "filter_review_type": normalized_review_type,
             "fail_closed": fail_closed,
             "entries": entries,
             "recent_events": filtered_events,
@@ -912,6 +951,9 @@ fn run_status_inner(
     println!("FAC Review Status");
     if let Some(number) = filter_pr {
         println!("  Filter PR: #{number}");
+        if let Some(review_type) = normalized_review_type.as_deref() {
+            println!("  Filter Type: {review_type}");
+        }
         println!(
             "  Current Head SHA: {}",
             current_head_sha.as_deref().unwrap_or("-")
@@ -954,6 +996,17 @@ fn run_status_inner(
     println!("  Pulse Files:");
     if filter_pr.is_none() {
         println!("    (set --pr or --pr-url to inspect PR-scoped pulse files)");
+    } else if let Some(review_type) = normalized_review_type.as_deref() {
+        let value = if review_type == "security" {
+            pulse_security
+                .as_ref()
+                .map_or_else(|| "missing".to_string(), |pulse| pulse.head_sha.clone())
+        } else {
+            pulse_quality
+                .as_ref()
+                .map_or_else(|| "missing".to_string(), |pulse| pulse.head_sha.clone())
+        };
+        println!("    {review_type}: {value}");
     } else {
         println!(
             "    security: {}",

@@ -21,6 +21,12 @@ const SECURITY_MARKER: &str = "<!-- apm2-review-metadata:v1:security -->";
 const QUALITY_MARKER: &str = "<!-- apm2-review-metadata:v1:code-quality -->";
 const FINDING_MARKER_PREFIX: &str = "<!-- apm2-finding:v1:";
 
+#[derive(Debug, Clone)]
+struct IssueCommentsFetch {
+    comments: Vec<IssueComment>,
+    from_cache: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct FindingsReport {
     schema: String,
@@ -146,19 +152,35 @@ pub fn run_findings(
     pr_number: Option<u32>,
     pr_url: Option<&str>,
     sha: Option<&str>,
+    refresh: bool,
     json_output: bool,
 ) -> Result<u8, String> {
     let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
     let resolved_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
     let expected_author_login = resolve_expected_author_login(&owner_repo, resolved_pr)?;
-    let comments = fetch_issue_comments(&owner_repo, resolved_pr)?;
-    let report = build_findings_report(
+    let initial_comments = fetch_issue_comments(&owner_repo, resolved_pr, refresh)?;
+    let mut report = build_findings_report(
         &owner_repo,
         resolved_pr,
         &resolved_sha,
-        &comments,
+        &initial_comments.comments,
         &expected_author_login,
     );
+    if !refresh
+        && initial_comments.from_cache
+        && report.fail_closed
+        && projection_store::gh_read_fallback_enabled()
+    {
+        if let Ok(refreshed) = fetch_issue_comments(&owner_repo, resolved_pr, true) {
+            report = build_findings_report(
+                &owner_repo,
+                resolved_pr,
+                &resolved_sha,
+                &refreshed.comments,
+                &expected_author_login,
+            );
+        }
+    }
     emit_report(&report, json_output)?;
 
     if report.fail_closed {
@@ -200,11 +222,20 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
     Ok(value)
 }
 
-fn fetch_issue_comments(owner_repo: &str, pr_number: u32) -> Result<Vec<IssueComment>, String> {
-    if let Some(cached) =
-        projection_store::load_issue_comments_cache::<IssueComment>(owner_repo, pr_number)?
-    {
-        return Ok(cached);
+fn fetch_issue_comments(
+    owner_repo: &str,
+    pr_number: u32,
+    refresh: bool,
+) -> Result<IssueCommentsFetch, String> {
+    if !refresh {
+        if let Some(cached) =
+            projection_store::load_issue_comments_cache::<IssueComment>(owner_repo, pr_number)?
+        {
+            return Ok(IssueCommentsFetch {
+                comments: cached,
+                from_cache: true,
+            });
+        }
     }
 
     if !projection_store::gh_read_fallback_enabled() {
@@ -241,7 +272,10 @@ fn fetch_issue_comments(owner_repo: &str, pr_number: u32) -> Result<Vec<IssueCom
         "findings.fetch_issue_comments",
     );
     let _ = projection_store::save_issue_comments_cache(owner_repo, pr_number, &collected);
-    Ok(collected)
+    Ok(IssueCommentsFetch {
+        comments: collected,
+        from_cache: false,
+    })
 }
 
 fn resolve_expected_author_login(owner_repo: &str, pr_number: u32) -> Result<String, String> {
