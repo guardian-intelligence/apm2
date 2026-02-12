@@ -7545,15 +7545,46 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 }),
             })
         } else if self.is_authoritative_mode() {
-            // BLOCKER 4 FIX: Authoritative mode requires mandatory PCAC gate wiring.
-            warn!(
-                session_id = %token.session_id,
-                "RequestTool denied: PCAC authority gate not wired in authoritative mode (fail-closed)"
-            );
-            return Ok(SessionResponse::error(
-                SessionErrorCode::SessionErrorToolNotAllowed,
-                "PCAC authority gate not wired in authoritative mode (fail-closed)",
-            ));
+            // TCK-00494 FIX: In authoritative mode without PCAC gate, the
+            // AdmissionKernel is a valid alternative authority gate for
+            // fail-closed tiers. Only deny when BOTH gates are unavailable.
+            // This is consistent with the early guard at the top of
+            // handle_request_tool (lines ~6940-6977).
+            if self.admission_kernel.is_none() {
+                // Neither PCAC LifecycleGate nor AdmissionKernel is wired.
+                // Check if this tool class maps to a fail-closed tier.
+                let tool_risk_tier = self
+                    .manifest_store
+                    .as_ref()
+                    .and_then(|store| store.get_manifest(&token.session_id))
+                    .and_then(|manifest| {
+                        manifest
+                            .find_by_tool_class(tool_class)
+                            .next()
+                            .map(|cap| cap.risk_tier_required)
+                    });
+                let is_fail_closed = tool_risk_tier.as_ref().is_some_and(|tier| {
+                    matches!(tier, RiskTier::Tier2 | RiskTier::Tier3 | RiskTier::Tier4)
+                });
+
+                if is_fail_closed {
+                    warn!(
+                        session_id = %token.session_id,
+                        "RequestTool denied: no authority lifecycle gate wired in \
+                         authoritative mode for fail-closed tier (no AdmissionKernel, \
+                         no PCAC LifecycleGate)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        "no authority lifecycle gate wired for fail-closed tier in \
+                         authoritative mode (fail-closed, no legacy fallback)",
+                    ));
+                }
+            }
+            // Either AdmissionKernel is wired (valid alternative authority
+            // gate) or this is a monitor-tier request that does not require
+            // PCAC gating. Proceed without PCAC pending authority.
+            None
         } else {
             None
         };
@@ -21688,6 +21719,106 @@ mod tests {
                 );
             }
             // Non-kernel-guard responses are acceptable.
+        }
+
+        /// **Kernel-present + PCAC-missing test (QUALITY MAJOR 1 fix)**:
+        ///
+        /// In authoritative mode, when the `AdmissionKernel` IS wired but the
+        /// `LifecycleGate` (PCAC gate) is NOT, fail-closed tier (Tier2/3/4)
+        /// tool requests MUST NOT be denied by the authority gate guard.
+        /// The `AdmissionKernel` satisfies the "at least one authority gate"
+        /// requirement specified by the TCK-00494 contract.
+        ///
+        /// The request will likely fail for other reasons (broker missing,
+        /// clock missing, etc.) but MUST NOT hit the "no authority lifecycle
+        /// gate wired" or "PCAC authority gate not wired" denial.
+        #[test]
+        fn kernel_present_pcac_missing_allows_fail_closed_tiers() {
+            for risk_tier in [RiskTier::Tier2, RiskTier::Tier3, RiskTier::Tier4] {
+                let minter = test_minter();
+                let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+                let capability = Capability {
+                    capability_id: format!("cap-read-{risk_tier:?}"),
+                    tool_class: ToolClass::Read,
+                    scope: CapabilityScope::default(),
+                    risk_tier_required: risk_tier,
+                };
+                let manifest = CapabilityManifestBuilder::new("manifest-tck-00494-kernel-alt")
+                    .delegator("test-delegator")
+                    .capabilities(vec![capability])
+                    .tool_allowlist(vec![ToolClass::Read])
+                    .build()
+                    .expect("manifest build should succeed");
+                manifest_store.register("session-001", manifest);
+
+                let ledger: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
+                    Arc::new(StubLedgerEventEmitter::new());
+
+                let session_registry = Arc::new(InMemorySessionRegistry::new());
+                let session_registry_dyn = register_session(&session_registry, "session-001");
+
+                // Build a minimal AdmissionKernelV1 (the test only needs the
+                // dispatcher to see it as `Some(...)` — the kernel itself is
+                // not invoked because the handler hits other missing-dependency
+                // denials first).
+                let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> = Arc::new(
+                    crate::pcac::InProcessKernel::new(1).with_verifier_economics(
+                        apm2_core::pcac::VerifierEconomicsProfile::default(),
+                    ),
+                );
+                let witness_cfg = crate::admission_kernel::WitnessProviderConfig {
+                    provider_id: "test-provider/kernel-present-pcac-missing".to_string(),
+                    provider_build_digest: *blake3::hash(b"test-build-digest").as_bytes(),
+                };
+                let kernel = Arc::new(crate::admission_kernel::AdmissionKernelV1::new(
+                    pcac_kernel,
+                    witness_cfg,
+                ));
+
+                let dispatcher =
+                    SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                        .with_ledger(ledger)
+                        .with_session_registry(session_registry_dyn)
+                        .with_admission_kernel(kernel);
+                // NOTE: No .with_pcac_lifecycle_gate() — this is the test
+                // scenario where AdmissionKernel is the sole authority gate.
+
+                let token = test_token(&minter);
+                let ctx = make_session_ctx();
+
+                let request = RequestToolRequest {
+                    session_token: serde_json::to_string(&token).unwrap(),
+                    tool_id: "read".to_string(),
+                    arguments: vec![],
+                    dedupe_key: format!("kernel-present-{risk_tier:?}"),
+                    epoch_seal: None,
+                };
+                let frame = encode_request_tool_request(&request);
+                let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+                // The response MUST NOT be the kernel-guard denial or the
+                // old PCAC-missing hard deny. Any other error (broker
+                // missing, clock missing, etc.) is acceptable — we are only
+                // verifying that the authority gate contract is satisfied by
+                // the AdmissionKernel alone.
+                if let SessionResponse::Error(ref err) = response {
+                    assert!(
+                        !err.message
+                            .contains("no authority lifecycle gate wired for fail-closed tier"),
+                        "{risk_tier:?}: kernel-present must not trigger authority gate \
+                         denial. Got: {}",
+                        err.message
+                    );
+                    assert!(
+                        !err.message
+                            .contains("PCAC authority gate not wired in authoritative mode"),
+                        "{risk_tier:?}: kernel-present must not trigger old PCAC-missing \
+                         hard deny. Got: {}",
+                        err.message
+                    );
+                }
+            }
         }
     }
 }

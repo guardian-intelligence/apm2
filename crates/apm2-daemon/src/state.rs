@@ -1129,8 +1129,26 @@ impl DispatcherState {
                     // file-lock contention with the lifecycle gate's durable
                     // kernel.
                     {
-                        let admission_consume_log_path =
-                            consume_log_path.with_extension("admission_consume.log");
+                        // Derive admission consume log as a sibling of the
+                        // PCAC consume log with a clear `_admission_consume`
+                        // suffix. We replace the `pcac_consume` stem portion
+                        // with `pcac_admission_consume` so that the resulting
+                        // filename is unambiguous (e.g.
+                        // `<db>.pcac_admission_consume.log` instead of the
+                        // confusing `.admission_consume.log` double-extension
+                        // produced by `with_extension`).
+                        let admission_consume_log_path = {
+                            let name = consume_log_path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("pcac_consume.log");
+                            let admission_name =
+                                name.replace("pcac_consume", "pcac_admission_consume");
+                            consume_log_path
+                                .parent()
+                                .unwrap_or(consume_log_path.as_path())
+                                .join(admission_name)
+                        };
                         let admission_durable_index = crate::pcac::FileBackedConsumeIndex::open(
                             &admission_consume_log_path,
                             Some(crate::pcac::DurableConsumeMetrics::global()),
