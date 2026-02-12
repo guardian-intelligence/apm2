@@ -328,6 +328,51 @@ fn command_available(command: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+fn strip_deleted_executable_suffix(path: &Path) -> Option<PathBuf> {
+    let file_name = path.file_name()?.to_str()?;
+    let stripped = file_name.strip_suffix(" (deleted)")?;
+    let mut sanitized = path.to_path_buf();
+    sanitized.set_file_name(stripped);
+    Some(sanitized)
+}
+
+fn is_regular_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+fn first_existing_dispatch_executable(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find(|candidate| is_regular_file(candidate))
+        .cloned()
+}
+
+fn resolve_dispatch_executable_path(workspace_root: &Path) -> Result<PathBuf, String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|err| format!("failed to resolve current executable: {err}"))?;
+    let mut candidates = Vec::new();
+    if let Some(sanitized) = strip_deleted_executable_suffix(&current_exe) {
+        candidates.push(sanitized);
+    }
+    candidates.push(current_exe.clone());
+    candidates.push(workspace_root.join("target").join("debug").join("apm2"));
+    candidates.push(workspace_root.join("target").join("release").join("apm2"));
+
+    if let Some(executable) = first_existing_dispatch_executable(&candidates) {
+        return Ok(executable);
+    }
+
+    let rendered = candidates
+        .iter()
+        .map(|candidate| candidate.display().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    Err(format!(
+        "failed to resolve dispatch executable (current_exe={}, candidates={rendered})",
+        current_exe.display()
+    ))
+}
+
 // ── Run-state contract helpers ──────────────────────────────────────────────
 
 fn attach_run_state_contract_for_home(
@@ -1033,8 +1078,7 @@ fn spawn_detached_review(
     expected_head_sha: &str,
     dispatch_epoch: u64,
 ) -> Result<DispatchReviewResult, String> {
-    let exe_path = std::env::current_exe()
-        .map_err(|err| format!("failed to resolve current executable: {err}"))?;
+    let exe_path = resolve_dispatch_executable_path(workspace_root)?;
     let head_short = &expected_head_sha[..expected_head_sha.len().min(8)];
     let ts = Utc::now().format("%Y%m%dT%H%M%SZ");
 
@@ -1150,8 +1194,9 @@ mod tests {
     use super::{
         DispatchIdempotencyKey, DispatchReviewResult, ReviewRunStateLoad, acquire_dispatch_lock,
         dispatch_single_review_for_home_with_spawn,
-        dispatch_single_review_for_home_with_spawn_force, review_dispatch_scope_lock_path_for_home,
-        run_state_has_live_process, write_pending_dispatch_for_home,
+        dispatch_single_review_for_home_with_spawn_force, first_existing_dispatch_executable,
+        review_dispatch_scope_lock_path_for_home, run_state_has_live_process,
+        strip_deleted_executable_suffix, write_pending_dispatch_for_home,
     };
     use crate::commands::fac_review::state::{
         get_process_start_time, load_review_run_state_for_home, review_run_state_path_for_home,
@@ -1193,6 +1238,36 @@ mod tests {
         let pid = child.id();
         let _ = child.wait();
         pid
+    }
+
+    #[test]
+    fn strip_deleted_executable_suffix_strips_deleted_marker() {
+        let path = std::path::Path::new("/tmp/apm2 (deleted)");
+        let sanitized = strip_deleted_executable_suffix(path).expect("sanitized path");
+        assert_eq!(sanitized, std::path::PathBuf::from("/tmp/apm2"));
+    }
+
+    #[test]
+    fn strip_deleted_executable_suffix_leaves_clean_path_unmodified() {
+        let path = std::path::Path::new("/tmp/apm2");
+        assert!(
+            strip_deleted_executable_suffix(path).is_none(),
+            "clean path should not change"
+        );
+    }
+
+    #[test]
+    fn first_existing_dispatch_executable_selects_first_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("apm2-first");
+        let second = temp.path().join("apm2-second");
+        fs::write(&first, b"first").expect("write first executable stub");
+        fs::write(&second, b"second").expect("write second executable stub");
+        let missing = temp.path().join("missing");
+
+        let selected = first_existing_dispatch_executable(&[missing, first.clone(), second])
+            .expect("select executable");
+        assert_eq!(selected, first);
     }
 
     fn spawn_long_lived_pid() -> u32 {
