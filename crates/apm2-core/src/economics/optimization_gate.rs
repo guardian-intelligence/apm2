@@ -52,7 +52,9 @@
 //! reason code. There is no "default pass" path.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
+use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey};
 use serde::{Deserialize, Deserializer, Serialize};
 use subtle::ConstantTimeEq;
 
@@ -294,6 +296,19 @@ pub const DENY_DISCLOSURE_CHANNELS_OVERFLOW: &str = "optimization_disclosure_cha
 pub const DENY_PROPOSAL_DISCLOSURE_CHANNELS_OVERFLOW: &str =
     "optimization_proposal_disclosure_channels_overflow";
 
+/// Deny: disclosure-control policy signature failed Ed25519 verification.
+pub const DENY_DISCLOSURE_POLICY_SIGNATURE_INVALID: &str =
+    "optimization_disclosure_policy_signature_invalid";
+
+/// Deny: disclosure-control policy signature bytes are malformed (not a valid
+/// Ed25519 signature).
+pub const DENY_DISCLOSURE_POLICY_SIGNATURE_MALFORMED: &str =
+    "optimization_disclosure_policy_signature_malformed";
+
+/// Deny: trusted verification key bytes are invalid (not a valid Ed25519 public
+/// key).
+pub const DENY_DISCLOSURE_POLICY_KEY_INVALID: &str = "optimization_disclosure_policy_key_invalid";
+
 // ---------------------------------------------------------------------------
 // Bounded serde deserializers
 // ---------------------------------------------------------------------------
@@ -475,24 +490,45 @@ fn deserialize_bounded_disclosure_channels<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    let channels = BTreeSet::<String>::deserialize(deserializer)?;
-    if channels.len() > MAX_APPROVED_DISCLOSURE_CHANNELS {
-        return Err(serde::de::Error::custom(format!(
-            "disclosure_channels length {} exceeds maximum {}",
-            channels.len(),
-            MAX_APPROVED_DISCLOSURE_CHANNELS,
-        )));
-    }
-    for ch in &channels {
-        if ch.len() > MAX_DISCLOSURE_CHANNEL_CLASS_LENGTH {
-            return Err(serde::de::Error::custom(format!(
-                "disclosure_channel_class length {} exceeds maximum {}",
-                ch.len(),
-                MAX_DISCLOSURE_CHANNEL_CLASS_LENGTH,
-            )));
+    struct BoundedChannelSetVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for BoundedChannelSetVisitor {
+        type Value = BTreeSet<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "a set of at most {MAX_APPROVED_DISCLOSURE_CHANNELS} disclosure channels"
+            )
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut set = BTreeSet::new();
+            let mut count = 0usize;
+            while let Some(value) = seq.next_element::<String>()? {
+                count += 1;
+                if count > MAX_APPROVED_DISCLOSURE_CHANNELS {
+                    return Err(serde::de::Error::custom(format!(
+                        "disclosure channel count {count} exceeds maximum {MAX_APPROVED_DISCLOSURE_CHANNELS}"
+                    )));
+                }
+                if value.len() > MAX_DISCLOSURE_CHANNEL_CLASS_LENGTH {
+                    return Err(serde::de::Error::custom(format!(
+                        "disclosure_channel_class length {} exceeds maximum {}",
+                        value.len(),
+                        MAX_DISCLOSURE_CHANNEL_CLASS_LENGTH,
+                    )));
+                }
+                set.insert(value);
+            }
+            Ok(set)
         }
     }
-    Ok(channels)
+
+    deserializer.deserialize_seq(BoundedChannelSetVisitor)
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,7 +1197,7 @@ fn is_forbidden_github_capability(capability_id: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Validates that a disclosure-control policy snapshot is present, current,
-/// signed, and structurally valid.
+/// signed, cryptographically verified, and structurally valid.
 ///
 /// Checks:
 /// - Snapshot is not `None` (fail-closed: missing policy is denied).
@@ -1173,12 +1209,24 @@ fn is_forbidden_github_capability(capability_id: &str) -> bool {
 /// - Epoch is not stale (age <= `max_age_ticks`).
 /// - Approved channels set does not exceed
 ///   [`MAX_APPROVED_DISCLOSURE_CHANNELS`].
+/// - Ed25519 signature cryptographically verifies against the trusted authority
+///   key and the policy digest.
+///
+/// # Parameters
+///
+/// - `snapshot`: The disclosure-control policy snapshot to validate, or `None`
+///   if the proposal has no policy binding.
+/// - `trusted_verifying_key`: 32-byte Ed25519 public key of the trusted
+///   disclosure-control authority. Used to verify the snapshot signature.
+/// - `current_tick`: The current HTF tick for freshness evaluation.
+/// - `max_age_ticks`: Maximum allowed epoch age in ticks.
 ///
 /// # Errors
 ///
 /// Returns a stable deny reason string if any check fails.
 pub fn validate_disclosure_policy(
     snapshot: Option<&DisclosurePolicySnapshot>,
+    trusted_verifying_key: &[u8; 32],
     current_tick: u64,
     max_age_ticks: u64,
 ) -> Result<(), &'static str> {
@@ -1229,6 +1277,18 @@ pub fn validate_disclosure_policy(
     if snap.approved_channels.len() > MAX_APPROVED_DISCLOSURE_CHANNELS {
         return Err(DENY_DISCLOSURE_CHANNELS_OVERFLOW);
     }
+
+    // Cryptographic signature verification (Ed25519).
+    // Construct the verifying key from trusted authority bytes.
+    let vk = VerifyingKey::from_bytes(trusted_verifying_key)
+        .map_err(|_| DENY_DISCLOSURE_POLICY_KEY_INVALID)?;
+
+    // Construct the Ed25519 signature from the snapshot bytes.
+    let sig = Ed25519Signature::from_bytes(&snap.signature);
+
+    // Verify the signature against the policy digest.
+    vk.verify_strict(&snap.policy_digest, &sig)
+        .map_err(|_| DENY_DISCLOSURE_POLICY_SIGNATURE_INVALID)?;
 
     Ok(())
 }
@@ -1347,6 +1407,7 @@ pub fn evaluate_optimization_gate(
     evidence_quality: Option<&EvidenceQualityReport>,
     authority_surface_evidence: Option<&AuthoritySurfaceEvidence>,
     disclosure_policy: Option<&DisclosurePolicySnapshot>,
+    trusted_disclosure_verifying_key: &[u8; 32],
     arbitration_outcome: ArbitrationOutcome,
     current_tick: u64,
     max_evidence_age_ticks: u64,
@@ -1372,6 +1433,7 @@ pub fn evaluate_optimization_gate(
     // Gate 1 (REQ-0007): Disclosure-control policy validity
     if let Err(reason) = validate_disclosure_policy(
         disclosure_policy,
+        trusted_disclosure_verifying_key,
         current_tick,
         MAX_DISCLOSURE_POLICY_AGE_TICKS,
     ) {
@@ -1613,10 +1675,25 @@ fn is_zero_hash(hash: &[u8; 32]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::{Signer, SigningKey};
+
     use super::*;
 
     fn hash(byte: u8) -> [u8; 32] {
         [byte; 32]
+    }
+
+    /// Fixed seed for deterministic test Ed25519 keypair generation.
+    const TEST_SIGNING_KEY_SEED: [u8; 32] = [0x42u8; 32];
+
+    /// Returns a deterministic Ed25519 signing key for tests.
+    fn test_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&TEST_SIGNING_KEY_SEED)
+    }
+
+    /// Returns the 32-byte verifying (public) key bytes for the test keypair.
+    fn test_verifying_key_bytes() -> [u8; 32] {
+        test_signing_key().verifying_key().to_bytes()
     }
 
     fn test_countermetric_profile() -> CountermetricProfile {
@@ -1656,14 +1733,19 @@ mod tests {
         }
     }
 
+    /// Creates a disclosure-policy snapshot with a valid Ed25519 signature
+    /// over the policy digest, signed by the deterministic test keypair.
     fn test_disclosure_policy_snapshot() -> DisclosurePolicySnapshot {
+        let sk = test_signing_key();
+        let digest = hash(0xBB);
+        let sig = sk.sign(&digest);
         DisclosurePolicySnapshot {
             phase_id: "phase_alpha".to_string(),
             mode: DisclosurePolicyMode::TradeSecretOnly,
             epoch_tick: 900,
             state: DisclosurePolicyState::Current,
-            policy_digest: hash(0xBB),
-            signature: [0x55u8; 64],
+            policy_digest: digest,
+            signature: sig.to_bytes(),
             approved_channels: BTreeSet::new(),
         }
     }
@@ -2179,6 +2261,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2213,6 +2296,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2238,6 +2322,7 @@ mod tests {
             None,
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2265,6 +2350,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2289,6 +2375,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2316,6 +2403,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2344,6 +2432,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedDeny,
             1000,
             200,
@@ -2371,6 +2460,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2397,6 +2487,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2409,6 +2500,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2433,6 +2525,7 @@ mod tests {
             Some(&evidence),
             None,
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2461,6 +2554,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2499,6 +2593,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2529,6 +2624,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2731,6 +2827,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2758,6 +2855,7 @@ mod tests {
             Some(&evidence),
             None, // missing authority surface evidence
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2789,6 +2887,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2818,6 +2917,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2846,6 +2946,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2874,6 +2975,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -2890,12 +2992,15 @@ mod tests {
     #[test]
     fn test_disclosure_policy_current_allows() {
         let snap = test_disclosure_policy_snapshot();
-        assert!(validate_disclosure_policy(Some(&snap), 1000, 500).is_ok());
+        assert!(
+            validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500).is_ok()
+        );
     }
 
     #[test]
     fn test_disclosure_policy_missing_denied() {
-        let err = validate_disclosure_policy(None, 1000, 500).unwrap_err();
+        let err =
+            validate_disclosure_policy(None, &test_verifying_key_bytes(), 1000, 500).unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_MISSING);
     }
 
@@ -2903,7 +3008,8 @@ mod tests {
     fn test_disclosure_policy_stale_state_denied() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.state = DisclosurePolicyState::Stale;
-        let err = validate_disclosure_policy(Some(&snap), 1000, 500).unwrap_err();
+        let err = validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500)
+            .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_STALE);
     }
 
@@ -2911,7 +3017,8 @@ mod tests {
     fn test_disclosure_policy_ambiguous_state_denied() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.state = DisclosurePolicyState::Ambiguous;
-        let err = validate_disclosure_policy(Some(&snap), 1000, 500).unwrap_err();
+        let err = validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500)
+            .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_AMBIGUOUS);
     }
 
@@ -2919,7 +3026,8 @@ mod tests {
     fn test_disclosure_policy_unknown_state_denied() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.state = DisclosurePolicyState::Unknown;
-        let err = validate_disclosure_policy(Some(&snap), 1000, 500).unwrap_err();
+        let err = validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500)
+            .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_UNKNOWN);
     }
 
@@ -2927,7 +3035,8 @@ mod tests {
     fn test_disclosure_policy_unsigned_denied() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.signature = [0u8; 64];
-        let err = validate_disclosure_policy(Some(&snap), 1000, 500).unwrap_err();
+        let err = validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500)
+            .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_UNSIGNED);
     }
 
@@ -2935,7 +3044,8 @@ mod tests {
     fn test_disclosure_policy_zero_digest_denied() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.policy_digest = [0u8; 32];
-        let err = validate_disclosure_policy(Some(&snap), 1000, 500).unwrap_err();
+        let err = validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500)
+            .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_DIGEST_ZERO);
     }
 
@@ -2943,7 +3053,8 @@ mod tests {
     fn test_disclosure_policy_empty_phase_id_denied() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.phase_id = String::new();
-        let err = validate_disclosure_policy(Some(&snap), 1000, 500).unwrap_err();
+        let err = validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500)
+            .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_PHASE_ID_EMPTY);
     }
 
@@ -2951,7 +3062,8 @@ mod tests {
     fn test_disclosure_policy_future_tick_denied() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.epoch_tick = 1001;
-        let err = validate_disclosure_policy(Some(&snap), 1000, 500).unwrap_err();
+        let err = validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500)
+            .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_FUTURE_TICK);
     }
 
@@ -2959,7 +3071,8 @@ mod tests {
     fn test_disclosure_policy_stale_epoch_denied() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.epoch_tick = 100;
-        let err = validate_disclosure_policy(Some(&snap), 1000, 500).unwrap_err();
+        let err = validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500)
+            .unwrap_err();
         assert_eq!(err, DENY_DISCLOSURE_POLICY_STALE);
     }
 
@@ -2967,7 +3080,9 @@ mod tests {
     fn test_disclosure_policy_exact_age_allows() {
         let mut snap = test_disclosure_policy_snapshot();
         snap.epoch_tick = 500;
-        assert!(validate_disclosure_policy(Some(&snap), 1000, 500).is_ok());
+        assert!(
+            validate_disclosure_policy(Some(&snap), &test_verifying_key_bytes(), 1000, 500).is_ok()
+        );
     }
 
     // =======================================================================
@@ -3119,6 +3234,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             None, // missing disclosure policy
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -3147,6 +3263,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -3179,6 +3296,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -3209,6 +3327,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -3237,6 +3356,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -3262,6 +3382,7 @@ mod tests {
             Some(&evidence),
             None, // missing authority surface
             None, // missing disclosure policy
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -3326,6 +3447,7 @@ mod tests {
             Some(&evidence),
             Some(&surface),
             Some(&policy),
+            &test_verifying_key_bytes(),
             ArbitrationOutcome::AgreedAllow,
             1000,
             200,
@@ -3334,5 +3456,96 @@ mod tests {
         assert_eq!(decision.verdict, OptimizationGateVerdict::Allow);
         // Verify the policy digest is bound in the trace
         assert_eq!(decision.trace.disclosure_policy_digest, hash(0xBB));
+    }
+
+    // =======================================================================
+    // Ed25519 signature verification tests (BLOCKER 1 remediation)
+    // =======================================================================
+
+    #[test]
+    fn test_disclosure_policy_valid_signature_allows() {
+        let snap = test_disclosure_policy_snapshot();
+        let vk = test_verifying_key_bytes();
+        assert!(validate_disclosure_policy(Some(&snap), &vk, 1000, 500).is_ok());
+    }
+
+    #[test]
+    fn test_disclosure_policy_invalid_signature_denied() {
+        let mut snap = test_disclosure_policy_snapshot();
+        // Corrupt the signature (non-zero but invalid)
+        snap.signature = [0xFFu8; 64];
+        let vk = test_verifying_key_bytes();
+        let err = validate_disclosure_policy(Some(&snap), &vk, 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_SIGNATURE_INVALID);
+    }
+
+    #[test]
+    fn test_disclosure_policy_wrong_key_denied() {
+        let snap = test_disclosure_policy_snapshot();
+        // Use a different key (not the one that signed)
+        let other_seed = [0x99u8; 32];
+        let other_signing = SigningKey::from_bytes(&other_seed);
+        let other_verifying = other_signing.verifying_key().to_bytes();
+        let err = validate_disclosure_policy(Some(&snap), &other_verifying, 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_SIGNATURE_INVALID);
+    }
+
+    #[test]
+    fn test_disclosure_policy_invalid_key_bytes_denied() {
+        let snap = test_disclosure_policy_snapshot();
+        // Search for a 32-byte pattern that VerifyingKey::from_bytes rejects
+        // (not all y-coordinates decompress to valid curve points).
+        let mut found_invalid = false;
+        for probe in 0u8..=255 {
+            let mut candidate = [probe; 32];
+            // Clear the sign bit to keep y < 2^255
+            candidate[31] &= 0x7F;
+            if VerifyingKey::from_bytes(&candidate).is_err() {
+                let err =
+                    validate_disclosure_policy(Some(&snap), &candidate, 1000, 500).unwrap_err();
+                assert_eq!(err, DENY_DISCLOSURE_POLICY_KEY_INVALID);
+                found_invalid = true;
+                break;
+            }
+        }
+        assert!(
+            found_invalid,
+            "could not find a byte pattern that fails VerifyingKey::from_bytes"
+        );
+    }
+
+    #[test]
+    fn test_disclosure_policy_signature_over_wrong_digest_denied() {
+        let sk = test_signing_key();
+        let vk = test_verifying_key_bytes();
+        let digest = hash(0xBB);
+        let sig = sk.sign(&digest);
+        // Snapshot has a different digest than what was signed
+        let mut snap = test_disclosure_policy_snapshot();
+        snap.policy_digest = hash(0xCC); // different from 0xBB
+        snap.signature = sig.to_bytes();
+        let err = validate_disclosure_policy(Some(&snap), &vk, 1000, 500).unwrap_err();
+        assert_eq!(err, DENY_DISCLOSURE_POLICY_SIGNATURE_INVALID);
+    }
+
+    #[test]
+    fn test_disclosure_policy_ed25519_end_to_end() {
+        // Generate keypair, sign a digest, build snapshot, verify passes
+        let sk = test_signing_key();
+        let vk_bytes = sk.verifying_key().to_bytes();
+        let digest = [0xAA; 32];
+        let sig = sk.sign(&digest);
+
+        let snap = DisclosurePolicySnapshot {
+            phase_id: "phase_beta".to_string(),
+            mode: DisclosurePolicyMode::OpenSource,
+            epoch_tick: 800,
+            state: DisclosurePolicyState::Current,
+            policy_digest: digest,
+            signature: sig.to_bytes(),
+            approved_channels: BTreeSet::new(),
+        };
+
+        assert!(validate_disclosure_policy(Some(&snap), &vk_bytes, 1000, 500).is_ok());
     }
 }
