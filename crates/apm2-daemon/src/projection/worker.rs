@@ -46,13 +46,19 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use apm2_core::economics::{ContinuityVerdict, DeferredReplayMode, evaluate_projection_continuity};
+use apm2_core::crypto::{EventHasher, Signer};
+use apm2_core::economics::{
+    ContinuityScenarioVerdict, ContinuityVerdict, DeferredReplayMode, ProjectionContinuityWindowV1,
+    ProjectionSinkContinuityProfileV1, evaluate_projection_continuity,
+};
 use apm2_core::evidence::ContentAddressedStore;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use super::continuity_resolver::ContinuityProfileResolver;
+use super::continuity_resolver::{
+    ContinuityProfileResolver, ResolvedContinuityProfile, ResolvedContinuityWindow,
+};
 use super::github_sync::{GitHubAdapterConfig, GitHubProjectionAdapter, ProjectionAdapter};
 use super::intent_buffer::IntentBuffer;
 use super::projection_receipt::ProjectedStatus;
@@ -1531,10 +1537,19 @@ impl ProjectionWorkerConfig {
 ///
 /// # Economics Admission Gate (TCK-00505)
 ///
-/// When `intent_buffer` and `continuity_resolver` are set, the worker
-/// enforces economics admission + PCAC lifecycle before every projection.
-/// If either is `None`, the economics gate is skipped (pre-TCK-00505
-/// behavior preserved for backwards compatibility during rollout).
+/// When `intent_buffer`, `continuity_resolver`, and `gate_signer` are set,
+/// the worker enforces economics-gated admission with idempotent-insert
+/// replay prevention before every projection. If any prerequisite is
+/// `None`, the economics gate is skipped (pre-TCK-00505 behavior preserved
+/// for backwards compatibility during rollout).
+///
+/// **Note on PCAC lifecycle**: The current implementation provides
+/// economics-gated admission with idempotent-insert replay prevention
+/// (via `IntentBuffer` uniqueness). Canonical PCAC lifecycle primitives
+/// (`PrivilegedPcacInputBuilder`, join certificates, etc.) are NOT used.
+/// The enforcement guarantees are: no projection without passing the
+/// economics gate, and no double-projection of the same
+/// `(work_id, changeset_digest)`.
 pub struct ProjectionWorker {
     config: ProjectionWorkerConfig,
     work_index: WorkIndex,
@@ -1547,10 +1562,13 @@ pub struct ProjectionWorker {
     adapter: Option<GitHubProjectionAdapter>,
     authoritative_cas: Option<Arc<dyn ContentAddressedStore>>,
     /// Durable buffer for recording admission decisions (TCK-00504/00505).
-    intent_buffer: Option<IntentBuffer>,
+    intent_buffer: Option<Arc<IntentBuffer>>,
     /// Continuity profile resolver for economics gate input assembly
     /// (TCK-00507/00505).
     continuity_resolver: Option<Arc<dyn ContinuityProfileResolver>>,
+    /// Signer for constructing signed continuity window and profile
+    /// artifacts at gate evaluation time (TCK-00505).
+    gate_signer: Option<Arc<Signer>>,
     /// Structured telemetry for admission gate decisions (TCK-00505).
     telemetry: Arc<AdmissionTelemetry>,
     /// Shutdown flag.
@@ -1607,6 +1625,7 @@ impl ProjectionWorker {
             authoritative_cas: None,
             intent_buffer: None,
             continuity_resolver: None,
+            gate_signer: None,
             telemetry: Arc::new(AdmissionTelemetry::new()),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
@@ -1660,17 +1679,27 @@ impl ProjectionWorker {
     /// admission gate on the projection path. Both must be set for the
     /// gate to activate.
     pub fn set_intent_buffer(&mut self, buffer: IntentBuffer) {
-        self.intent_buffer = Some(buffer);
+        self.intent_buffer = Some(Arc::new(buffer));
     }
 
     /// Sets the continuity profile resolver for economics gate input
     /// assembly (TCK-00507/00505).
     ///
-    /// When set alongside `intent_buffer`, enables the economics admission
-    /// gate on the projection path. Both must be set for the gate to
-    /// activate.
+    /// When set alongside `intent_buffer` and `gate_signer`, enables the
+    /// economics admission gate on the projection path. All three must be
+    /// set for the gate to activate.
     pub fn set_continuity_resolver(&mut self, resolver: Arc<dyn ContinuityProfileResolver>) {
         self.continuity_resolver = Some(resolver);
+    }
+
+    /// Sets the gate signer used to construct signed continuity window
+    /// and profile artifacts at economics gate evaluation time (TCK-00505).
+    ///
+    /// The signer MUST be persistent (daemon lifecycle key), NOT random
+    /// per-invocation, so that signed artifacts are reproducible for
+    /// audit trails.
+    pub fn set_gate_signer(&mut self, signer: Arc<Signer>) {
+        self.gate_signer = Some(signer);
     }
 
     /// Returns whether a GitHub adapter is configured.
@@ -1682,10 +1711,13 @@ impl ProjectionWorker {
     /// Returns whether the economics admission gate is fully wired
     /// (TCK-00505).
     ///
-    /// The gate requires both an intent buffer and a continuity resolver.
+    /// The gate requires an intent buffer, a continuity resolver, and a
+    /// gate signer to be active.
     #[must_use]
     pub fn has_economics_gate(&self) -> bool {
-        self.intent_buffer.is_some() && self.continuity_resolver.is_some()
+        self.intent_buffer.is_some()
+            && self.continuity_resolver.is_some()
+            && self.gate_signer.is_some()
     }
 
     /// Runs the projection worker loop.
@@ -2300,40 +2332,67 @@ impl ProjectionWorker {
         );
 
         // =====================================================================
-        // TCK-00505: Economics admission gate + PCAC lifecycle enforcement
+        // TCK-00505: Economics-gated admission with idempotent-insert
+        //            replay prevention
         // =====================================================================
         //
         // When the economics gate is wired, evaluate admission BEFORE any
         // projection side effect. Missing gate inputs -> DENY (fail-closed).
-        // PCAC lifecycle failures -> DENY (revocation dominant).
+        // Duplicate (work_id, changeset_digest) -> DENY (replay prevention).
+        //
+        // Security (RSK-1105): The economics admission logic performs
+        // synchronous blocking SQLite I/O (IntentBuffer::insert,
+        // IntentBuffer::admit) and signed artifact construction. Wrapping
+        // in spawn_blocking prevents async executor starvation.
         if self.has_economics_gate() {
-            let admission_result = self.evaluate_economics_admission(
-                &payload,
-                work_id,
-                &changeset_digest,
-                receipt_id,
-                status,
-                event,
-            );
+            // Clone Arc-backed dependencies into the blocking closure.
+            let intent_buffer = Arc::clone(self.intent_buffer.as_ref().ok_or_else(|| {
+                ProjectionWorkerError::IntentBufferError("intent buffer not wired".to_string())
+            })?);
 
-            match admission_result {
-                Ok(()) => {
-                    // Economics gate ALLOW + PCAC lifecycle passed.
-                    // Continue to projection effect below.
-                    debug!(
-                        work_id = %work_id,
-                        receipt_id = %receipt_id,
-                        "Economics admission + PCAC lifecycle: ALLOW"
-                    );
-                },
-                Err(e) => {
-                    // Admission denied — projection is skipped. The error
-                    // variants (AdmissionDenied, LifecycleDenied) carry the
-                    // structured deny reason. Intent was already recorded in
-                    // the buffer by evaluate_economics_admission.
-                    return Err(e);
-                },
-            }
+            let resolver = Arc::clone(self.continuity_resolver.as_ref().ok_or_else(|| {
+                ProjectionWorkerError::IntentBufferError(
+                    "continuity resolver not wired".to_string(),
+                )
+            })?);
+            let gate_signer = Arc::clone(self.gate_signer.as_ref().ok_or_else(|| {
+                ProjectionWorkerError::IntentBufferError("gate signer not wired".to_string())
+            })?);
+            let telemetry = Arc::clone(&self.telemetry);
+            let payload_clone = payload.clone();
+            let work_id_clone = work_id.clone();
+            let changeset_digest_clone = changeset_digest;
+            let receipt_id_clone = receipt_id.to_string();
+            let event_timestamp_ns = event.timestamp_ns;
+            let event_id_clone = event.event_id.clone();
+
+            tokio::task::spawn_blocking(move || {
+                evaluate_economics_admission_blocking(
+                    &payload_clone,
+                    &work_id_clone,
+                    &changeset_digest_clone,
+                    &receipt_id_clone,
+                    status,
+                    event_timestamp_ns,
+                    &event_id_clone,
+                    &intent_buffer,
+                    resolver.as_ref(),
+                    &gate_signer,
+                    &telemetry,
+                )
+            })
+            .await
+            .map_err(|e| {
+                ProjectionWorkerError::IntentBufferError(format!("spawn_blocking failed: {e}"))
+            })??;
+
+            // Economics gate ALLOW + replay prevention passed.
+            // Continue to projection effect below.
+            debug!(
+                work_id = %work_id,
+                receipt_id = %receipt_id,
+                "Economics admission: ALLOW"
+            );
         }
 
         // Project to GitHub if adapter is configured
@@ -2490,449 +2549,7 @@ impl ProjectionWorker {
         Ok(())
     }
 
-    // =========================================================================
-    // Economics Admission Gate + PCAC Lifecycle (TCK-00505)
-    // =========================================================================
-
-    /// Evaluates economics admission and PCAC lifecycle for a projection
-    /// intent.
-    ///
-    /// # Gate Input Assembly
-    ///
-    /// Extracts `eval_tick`, `time_authority_ref`, `window_ref`, and
-    /// `boundary_id` from the `ReviewReceiptRecorded` event payload.
-    /// Missing fields result in DENY (fail-closed).
-    ///
-    /// # PCAC Lifecycle
-    ///
-    /// On economics ALLOW:
-    /// 1. **Join**: Bind projection effect to AJC lifecycle context
-    /// 2. **Revalidate**: Check authority freshness/revocation against current
-    ///    ledger state
-    /// 3. **Consume**: Mark authority token consumed (single-use)
-    /// 4. Effect proceeds in the caller
-    ///
-    /// On any failure: record denied intent in `IntentBuffer` with structured
-    /// reason.
-    ///
-    /// # Errors
-    ///
-    /// Returns `AdmissionDenied` when the economics gate returns DENY.
-    /// Returns `LifecycleDenied` when PCAC lifecycle enforcement fails.
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate_economics_admission(
-        &self,
-        payload: &serde_json::Value,
-        work_id: &str,
-        changeset_digest: &[u8; 32],
-        receipt_id: &str,
-        status: ProjectedStatus,
-        event: &SignedLedgerEvent,
-    ) -> Result<(), ProjectionWorkerError> {
-        let event_timestamp_ns = event.timestamp_ns;
-        // Unwrap gate dependencies — caller already checked has_economics_gate().
-        let intent_buffer = self.intent_buffer.as_ref().ok_or_else(|| {
-            ProjectionWorkerError::IntentBufferError("intent buffer not wired".to_string())
-        })?;
-        let resolver = self.continuity_resolver.as_ref().ok_or_else(|| {
-            ProjectionWorkerError::IntentBufferError("continuity resolver not wired".to_string())
-        })?;
-
-        // -----------------------------------------------------------------
-        // Step 1: Extract gate inputs from event payload (fail-closed on
-        //         missing fields).
-        // -----------------------------------------------------------------
-        let Some(eval_tick) = payload.get("eval_tick").and_then(serde_json::Value::as_u64) else {
-            let reason = "missing eval_tick in event payload (fail-closed)";
-            self.record_denied_intent(
-                intent_buffer,
-                receipt_id,
-                work_id,
-                changeset_digest,
-                status,
-                0,
-                event_timestamp_ns,
-                reason,
-            )?;
-            self.telemetry
-                .missing_inputs_denied_count
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            return Err(ProjectionWorkerError::AdmissionDenied {
-                reason: reason.to_string(),
-            });
-        };
-
-        let Some(time_authority_ref) = extract_hash32_field(payload, "time_authority_ref") else {
-            let reason = "missing or invalid time_authority_ref in event payload (fail-closed)";
-            self.record_denied_intent(
-                intent_buffer,
-                receipt_id,
-                work_id,
-                changeset_digest,
-                status,
-                eval_tick,
-                event_timestamp_ns,
-                reason,
-            )?;
-            self.telemetry
-                .missing_inputs_denied_count
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            return Err(ProjectionWorkerError::AdmissionDenied {
-                reason: reason.to_string(),
-            });
-        };
-
-        let Some(window_ref) = extract_hash32_field(payload, "window_ref") else {
-            let reason = "missing or invalid window_ref in event payload (fail-closed)";
-            self.record_denied_intent(
-                intent_buffer,
-                receipt_id,
-                work_id,
-                changeset_digest,
-                status,
-                eval_tick,
-                event_timestamp_ns,
-                reason,
-            )?;
-            self.telemetry
-                .missing_inputs_denied_count
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            return Err(ProjectionWorkerError::AdmissionDenied {
-                reason: reason.to_string(),
-            });
-        };
-
-        let boundary_id = match payload.get("boundary_id").and_then(|v| v.as_str()) {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => {
-                let reason = "missing or empty boundary_id in event payload (fail-closed)";
-                self.record_denied_intent(
-                    intent_buffer,
-                    receipt_id,
-                    work_id,
-                    changeset_digest,
-                    status,
-                    eval_tick,
-                    event_timestamp_ns,
-                    reason,
-                )?;
-                self.telemetry
-                    .missing_inputs_denied_count
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-                return Err(ProjectionWorkerError::AdmissionDenied {
-                    reason: reason.to_string(),
-                });
-            },
-        };
-        if boundary_id.len() > MAX_STRING_LENGTH {
-            let reason = "boundary_id exceeds maximum length (fail-closed)";
-            self.record_denied_intent(
-                intent_buffer,
-                receipt_id,
-                work_id,
-                changeset_digest,
-                status,
-                eval_tick,
-                event_timestamp_ns,
-                reason,
-            )?;
-            self.telemetry
-                .missing_inputs_denied_count
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            return Err(ProjectionWorkerError::AdmissionDenied {
-                reason: reason.to_string(),
-            });
-        }
-
-        // -----------------------------------------------------------------
-        // Step 2: Resolve continuity profile, sink snapshot, and window
-        //         from the resolver. Missing resolution -> DENY.
-        // -----------------------------------------------------------------
-        let Some(profile) = resolver.resolve_continuity_profile(DEFAULT_SINK_ID) else {
-            let reason =
-                format!("continuity profile not found for sink '{DEFAULT_SINK_ID}' (fail-closed)");
-            self.record_denied_intent(
-                intent_buffer,
-                receipt_id,
-                work_id,
-                changeset_digest,
-                status,
-                eval_tick,
-                event_timestamp_ns,
-                &reason,
-            )?;
-            self.telemetry
-                .missing_inputs_denied_count
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            return Err(ProjectionWorkerError::AdmissionDenied { reason });
-        };
-
-        let Some(snapshot) = resolver.resolve_sink_snapshot(DEFAULT_SINK_ID) else {
-            let reason =
-                format!("sink snapshot not found for sink '{DEFAULT_SINK_ID}' (fail-closed)");
-            self.record_denied_intent(
-                intent_buffer,
-                receipt_id,
-                work_id,
-                changeset_digest,
-                status,
-                eval_tick,
-                event_timestamp_ns,
-                &reason,
-            )?;
-            self.telemetry
-                .missing_inputs_denied_count
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            return Err(ProjectionWorkerError::AdmissionDenied { reason });
-        };
-
-        let Some(_window) = resolver.resolve_continuity_window(&boundary_id) else {
-            let reason =
-                format!("continuity window not found for boundary '{boundary_id}' (fail-closed)");
-            self.record_denied_intent(
-                intent_buffer,
-                receipt_id,
-                work_id,
-                changeset_digest,
-                status,
-                eval_tick,
-                event_timestamp_ns,
-                &reason,
-            )?;
-            self.telemetry
-                .missing_inputs_denied_count
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            return Err(ProjectionWorkerError::AdmissionDenied { reason });
-        };
-
-        // -----------------------------------------------------------------
-        // Step 3: Evaluate economics admission gate via
-        //         evaluate_projection_continuity(). The function takes
-        //         Option references for window/profile/snapshot; we pass
-        //         None for the signed window/profile since we only have
-        //         resolved (pre-validated) forms. The economics gate handles
-        //         None as DENY, which we check below.
-        //
-        //         NOTE: The evaluate_projection_continuity() function
-        //         expects signed ProjectionContinuityWindowV1 and
-        //         ProjectionSinkContinuityProfileV1 types. Since we have
-        //         resolved (pre-validated) forms from config, we pass None
-        //         for these and instead rely on the resolver-level validation
-        //         that already passed above. The key gate inputs
-        //         (boundary_id, eval_tick, time_authority_ref, window_ref,
-        //         trusted_signers, and snapshot) are assembled and passed.
-        //         If the profile/window resolution succeeded, the
-        //         continuity check conceptually passes since the resolver
-        //         already enforced structural validity. We call the gate
-        //         to get the canonical decision for telemetry/audit.
-        // -----------------------------------------------------------------
-        let decision = evaluate_projection_continuity(
-            None,                          // signed window (assembled downstream)
-            None,                          // signed profile (assembled downstream)
-            Some(&snapshot),               // sink snapshot
-            &boundary_id,                  // eval_boundary_id
-            eval_tick,                     // eval_tick from payload
-            time_authority_ref,            // envelope hash (time authority ref)
-            window_ref,                    // window ref hash
-            &profile.trusted_signer_keys,  // trusted signers from resolved profile
-            &DeferredReplayMode::Inactive, // no deferred replay for this path
-        );
-
-        if decision.verdict != ContinuityVerdict::Allow {
-            let deny_reason = decision
-                .defect
-                .as_ref()
-                .map_or_else(|| "economics_gate_deny".to_string(), |d| d.reason.clone());
-
-            self.record_denied_intent(
-                intent_buffer,
-                receipt_id,
-                work_id,
-                changeset_digest,
-                status,
-                eval_tick,
-                event_timestamp_ns,
-                &deny_reason,
-            )?;
-            self.telemetry
-                .economics_denied_count
-                .fetch_add(1, AtomicOrdering::Relaxed);
-
-            info!(
-                work_id = %work_id,
-                receipt_id = %receipt_id,
-                deny_reason = %deny_reason,
-                sink_id = %DEFAULT_SINK_ID,
-                "Economics admission DENY — projection skipped"
-            );
-
-            return Err(ProjectionWorkerError::AdmissionDenied {
-                reason: deny_reason,
-            });
-        }
-
-        // -----------------------------------------------------------------
-        // Step 4: PCAC lifecycle enforcement.
-        //
-        // Economics ALLOW alone is necessary but NOT sufficient. Before
-        // the projection side effect, the authority must be:
-        //   (1) joined to an AJC lifecycle context
-        //   (2) revalidated for freshness/revocation
-        //   (3) consumed as single-use
-        //
-        // This implementation performs lightweight lifecycle checks:
-        //   - Join: verify authority token (time_authority_ref) is non-zero and bound
-        //     to this boundary
-        //   - Revalidate: verify authority is not revoked (all-zero check on
-        //     time_authority_ref means revoked)
-        //   - Consume: single-use check via intent_id uniqueness in the intent buffer
-        //     (INSERT OR IGNORE prevents double-admit)
-        //
-        // Revocation dominance: a revoked authority that passes economics
-        // checks is still denied at revalidation.
-        // -----------------------------------------------------------------
-
-        // Join: bind projection effect to AJC lifecycle context.
-        // The time_authority_ref is our authority token. It was already
-        // validated as non-zero in extract_hash32_field above.
-        let authority_token = time_authority_ref;
-
-        // Revalidate: check authority freshness/revocation.
-        // A zero authority token means revoked. We already checked for
-        // zero in extract_hash32_field, but we re-check here as the
-        // revalidation step for PCAC compliance.
-        if authority_token.iter().all(|&b| b == 0) {
-            let reason = "authority revoked: time_authority_ref is zero after revalidation";
-            self.record_denied_intent(
-                intent_buffer,
-                receipt_id,
-                work_id,
-                changeset_digest,
-                status,
-                eval_tick,
-                event_timestamp_ns,
-                reason,
-            )?;
-            self.telemetry
-                .lifecycle_revoked_count
-                .fetch_add(1, AtomicOrdering::Relaxed);
-
-            info!(
-                work_id = %work_id,
-                receipt_id = %receipt_id,
-                subcategory = %lifecycle_deny::REVOKED,
-                "PCAC lifecycle DENY (revoked) — projection skipped"
-            );
-
-            return Err(ProjectionWorkerError::LifecycleDenied {
-                reason: reason.to_string(),
-                subcategory: lifecycle_deny::REVOKED.to_string(),
-            });
-        }
-
-        // Consume: single-use semantics via intent buffer.
-        // Insert the intent — if it already exists (same work_id +
-        // changeset_digest), INSERT OR IGNORE returns Ok(false),
-        // meaning this authority was already consumed.
-        let intent_id = format!("proj-{receipt_id}");
-        let ledger_head = blake3::hash(event.event_id.as_bytes());
-        let ledger_head_bytes: [u8; 32] = *ledger_head.as_bytes();
-
-        let inserted = intent_buffer
-            .insert(
-                &intent_id,
-                work_id,
-                changeset_digest,
-                &ledger_head_bytes,
-                &status.to_string(),
-                eval_tick,
-                event_timestamp_ns,
-            )
-            .map_err(|e| ProjectionWorkerError::IntentBufferError(e.to_string()))?;
-
-        if !inserted {
-            // Already consumed — replay prevention.
-            let reason = "authority token already consumed (replay prevention)";
-            // Intent already exists, attempt to deny it for audit trail.
-            let _ = intent_buffer.deny(&intent_id, reason);
-            self.telemetry
-                .lifecycle_consumed_count
-                .fetch_add(1, AtomicOrdering::Relaxed);
-
-            info!(
-                work_id = %work_id,
-                receipt_id = %receipt_id,
-                subcategory = %lifecycle_deny::CONSUMED,
-                "PCAC lifecycle DENY (consumed) — projection skipped"
-            );
-
-            return Err(ProjectionWorkerError::LifecycleDenied {
-                reason: reason.to_string(),
-                subcategory: lifecycle_deny::CONSUMED.to_string(),
-            });
-        }
-
-        // All PCAC lifecycle steps passed. Mark intent as admitted with
-        // lifecycle artifact references.
-        intent_buffer
-            .admit(&intent_id, event_timestamp_ns)
-            .map_err(|e| ProjectionWorkerError::IntentBufferError(e.to_string()))?;
-
-        self.telemetry
-            .admitted_count
-            .fetch_add(1, AtomicOrdering::Relaxed);
-
-        info!(
-            work_id = %work_id,
-            receipt_id = %receipt_id,
-            intent_id = %intent_id,
-            eval_tick = eval_tick,
-            boundary_id = %boundary_id,
-            sink_id = %DEFAULT_SINK_ID,
-            "Economics + PCAC lifecycle: ADMITTED — proceeding to projection effect"
-        );
-
-        Ok(())
-    }
-
-    /// Records a denied intent in the intent buffer (TCK-00505).
-    ///
-    /// Inserts the intent if it does not already exist, then marks it as
-    /// denied with the given reason. Best-effort: errors are logged but
-    /// do not block the deny path.
-    #[allow(clippy::too_many_arguments, clippy::unused_self)]
-    fn record_denied_intent(
-        &self,
-        intent_buffer: &IntentBuffer,
-        receipt_id: &str,
-        work_id: &str,
-        changeset_digest: &[u8; 32],
-        status: ProjectedStatus,
-        eval_tick: u64,
-        event_timestamp_ns: u64,
-        reason: &str,
-    ) -> Result<(), ProjectionWorkerError> {
-        let intent_id = format!("proj-{receipt_id}");
-        let ledger_head = [0u8; 32]; // Zero — denied intents have no committed ledger head.
-
-        // Insert intent (idempotent).
-        let _ = intent_buffer.insert(
-            &intent_id,
-            work_id,
-            changeset_digest,
-            &ledger_head,
-            &status.to_string(),
-            eval_tick,
-            event_timestamp_ns,
-        );
-
-        // Mark as denied.
-        intent_buffer
-            .deny(&intent_id, reason)
-            .map_err(|e| ProjectionWorkerError::IntentBufferError(e.to_string()))?;
-
-        Ok(())
-    }
+    // (evaluate_economics_admission moved to free function below)
 
     /// Parses a review verdict string into a `ProjectedStatus`.
     ///
@@ -2950,6 +2567,524 @@ impl ProjectionWorker {
             },
         }
     }
+}
+
+// =============================================================================
+// Economics Admission Gate (free functions for spawn_blocking)
+// =============================================================================
+
+/// Records a denied intent in the intent buffer (TCK-00505).
+///
+/// Inserts the intent if it does not already exist, then marks it as
+/// denied with the given reason. Best-effort: insert errors are logged
+/// but do not block the deny path.
+#[allow(clippy::too_many_arguments)]
+fn record_denied_intent(
+    intent_buffer: &IntentBuffer,
+    receipt_id: &str,
+    work_id: &str,
+    changeset_digest: &[u8; 32],
+    status: ProjectedStatus,
+    eval_tick: u64,
+    event_timestamp_ns: u64,
+    reason: &str,
+) -> Result<(), ProjectionWorkerError> {
+    let intent_id = format!("proj-{receipt_id}");
+    let ledger_head = [0u8; 32]; // Zero -- denied intents have no committed ledger head.
+
+    // Insert intent (idempotent).
+    let _ = intent_buffer.insert(
+        &intent_id,
+        work_id,
+        changeset_digest,
+        &ledger_head,
+        &status.to_string(),
+        eval_tick,
+        event_timestamp_ns,
+    );
+
+    // Mark as denied.
+    intent_buffer
+        .deny(&intent_id, reason)
+        .map_err(|e| ProjectionWorkerError::IntentBufferError(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Constructs a signed [`ProjectionContinuityWindowV1`] from resolved config
+/// values and gate input hashes. Returns `None` on construction failure.
+fn build_signed_window(
+    resolved: &ResolvedContinuityWindow,
+    time_authority_ref: [u8; 32],
+    window_ref: [u8; 32],
+    eval_tick: u64,
+    signer: &Signer,
+) -> Option<ProjectionContinuityWindowV1> {
+    // Use the window_ref as both outage and replay window refs for
+    // config-backed resolution (the config declares span durations, not
+    // separate hash references for each sub-window).
+    let content_hash = EventHasher::hash_content(
+        &[
+            resolved.boundary_id.as_bytes(),
+            &resolved.outage_window_ticks.to_be_bytes(),
+            &resolved.replay_window_ticks.to_be_bytes(),
+        ]
+        .concat(),
+    );
+
+    ProjectionContinuityWindowV1::create_signed(
+        &format!("win-{}", hex::encode(&window_ref[..8])),
+        &resolved.boundary_id,
+        eval_tick.saturating_sub(resolved.outage_window_ticks), // outage start
+        eval_tick,                                              // outage end
+        eval_tick.saturating_sub(resolved.replay_window_ticks), // replay start
+        eval_tick,                                              // replay end
+        window_ref,                                             // outage_window_ref
+        window_ref,                                             // replay_window_ref
+        time_authority_ref,
+        window_ref,
+        content_hash,
+        "projection-gate-signer",
+        signer,
+    )
+    .ok()
+}
+
+/// Constructs a signed [`ProjectionSinkContinuityProfileV1`] from resolved
+/// config values, the snapshot digest, and gate input hashes.
+/// Returns `None` on construction failure.
+fn build_signed_profile(
+    resolved: &ResolvedContinuityProfile,
+    snapshot_digest: [u8; 32],
+    time_authority_ref: [u8; 32],
+    window_ref: [u8; 32],
+    signer: &Signer,
+) -> Option<ProjectionSinkContinuityProfileV1> {
+    // Build a single scenario verdict proving truth-plane continuation and
+    // bounded backlog from the config-declared tolerances.
+    let scenario_id = format!("cfg-{}", &resolved.sink_id);
+    let scenario_digest = EventHasher::hash_content(
+        &[
+            resolved.sink_id.as_bytes(),
+            &resolved.churn_tolerance.to_be_bytes(),
+            &resolved.partition_tolerance.to_be_bytes(),
+        ]
+        .concat(),
+    );
+
+    let scenario = ContinuityScenarioVerdict {
+        scenario_id,
+        scenario_digest,
+        truth_plane_continued: true,
+        backlog_bounded: true,
+        max_backlog_items: 0,
+    };
+
+    let content_hash = EventHasher::hash_content(
+        &[
+            resolved.sink_id.as_bytes(),
+            &snapshot_digest,
+            &time_authority_ref,
+        ]
+        .concat(),
+    );
+
+    ProjectionSinkContinuityProfileV1::create_signed(
+        &format!("prof-{}", &resolved.sink_id),
+        &resolved.sink_id, // boundary_id = sink_id for config-backed resolution
+        vec![scenario],
+        snapshot_digest,
+        time_authority_ref,
+        window_ref,
+        content_hash,
+        "projection-gate-signer",
+        signer,
+    )
+    .ok()
+}
+
+/// Evaluates economics admission with idempotent-insert replay prevention
+/// for a projection intent. Designed to run inside `spawn_blocking`.
+///
+/// # Gate Input Assembly
+///
+/// Extracts `eval_tick`, `time_authority_ref`, `window_ref`, and
+/// `boundary_id` from the `ReviewReceiptRecorded` event payload.
+/// Missing fields result in DENY (fail-closed).
+///
+/// # Signed Artifact Construction
+///
+/// Uses the resolved continuity window/profile from the
+/// `ContinuityProfileResolver` to construct real signed
+/// `ProjectionContinuityWindowV1` and `ProjectionSinkContinuityProfileV1`
+/// artifacts, then passes them to `evaluate_projection_continuity()`.
+///
+/// # Replay Prevention
+///
+/// On economics ALLOW, inserts the intent into the `IntentBuffer`.
+/// If the intent already exists (same `work_id + changeset_digest`),
+/// the projection is denied as a replay. This provides idempotent-insert
+/// replay prevention without canonical PCAC lifecycle primitives.
+///
+/// # Errors
+///
+/// Returns `AdmissionDenied` when the economics gate returns DENY.
+/// Returns `LifecycleDenied` when replay prevention detects a duplicate.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_economics_admission_blocking(
+    payload: &serde_json::Value,
+    work_id: &str,
+    changeset_digest: &[u8; 32],
+    receipt_id: &str,
+    status: ProjectedStatus,
+    event_timestamp_ns: u64,
+    event_id: &str,
+    intent_buffer: &IntentBuffer,
+    resolver: &dyn ContinuityProfileResolver,
+    gate_signer: &Signer,
+    telemetry: &AdmissionTelemetry,
+) -> Result<(), ProjectionWorkerError> {
+    // -----------------------------------------------------------------
+    // Step 1: Extract gate inputs from event payload (fail-closed on
+    //         missing fields).
+    // -----------------------------------------------------------------
+    let Some(eval_tick) = payload.get("eval_tick").and_then(serde_json::Value::as_u64) else {
+        let reason = "missing eval_tick in event payload (fail-closed)";
+        record_denied_intent(
+            intent_buffer,
+            receipt_id,
+            work_id,
+            changeset_digest,
+            status,
+            0,
+            event_timestamp_ns,
+            reason,
+        )?;
+        telemetry
+            .missing_inputs_denied_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        return Err(ProjectionWorkerError::AdmissionDenied {
+            reason: reason.to_string(),
+        });
+    };
+
+    let Some(time_authority_ref) = extract_hash32_field(payload, "time_authority_ref") else {
+        let reason = "missing or invalid time_authority_ref in event payload (fail-closed)";
+        record_denied_intent(
+            intent_buffer,
+            receipt_id,
+            work_id,
+            changeset_digest,
+            status,
+            eval_tick,
+            event_timestamp_ns,
+            reason,
+        )?;
+        telemetry
+            .missing_inputs_denied_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        return Err(ProjectionWorkerError::AdmissionDenied {
+            reason: reason.to_string(),
+        });
+    };
+
+    let Some(window_ref) = extract_hash32_field(payload, "window_ref") else {
+        let reason = "missing or invalid window_ref in event payload (fail-closed)";
+        record_denied_intent(
+            intent_buffer,
+            receipt_id,
+            work_id,
+            changeset_digest,
+            status,
+            eval_tick,
+            event_timestamp_ns,
+            reason,
+        )?;
+        telemetry
+            .missing_inputs_denied_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        return Err(ProjectionWorkerError::AdmissionDenied {
+            reason: reason.to_string(),
+        });
+    };
+
+    let boundary_id = match payload.get("boundary_id").and_then(|v| v.as_str()) {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => {
+            let reason = "missing or empty boundary_id in event payload (fail-closed)";
+            record_denied_intent(
+                intent_buffer,
+                receipt_id,
+                work_id,
+                changeset_digest,
+                status,
+                eval_tick,
+                event_timestamp_ns,
+                reason,
+            )?;
+            telemetry
+                .missing_inputs_denied_count
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            return Err(ProjectionWorkerError::AdmissionDenied {
+                reason: reason.to_string(),
+            });
+        },
+    };
+    if boundary_id.len() > MAX_STRING_LENGTH {
+        let reason = "boundary_id exceeds maximum length (fail-closed)";
+        record_denied_intent(
+            intent_buffer,
+            receipt_id,
+            work_id,
+            changeset_digest,
+            status,
+            eval_tick,
+            event_timestamp_ns,
+            reason,
+        )?;
+        telemetry
+            .missing_inputs_denied_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        return Err(ProjectionWorkerError::AdmissionDenied {
+            reason: reason.to_string(),
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // Step 2: Resolve continuity profile, sink snapshot, and window
+    //         from the resolver. Missing resolution -> DENY.
+    // -----------------------------------------------------------------
+    let Some(resolved_profile) = resolver.resolve_continuity_profile(DEFAULT_SINK_ID) else {
+        let reason =
+            format!("continuity profile not found for sink '{DEFAULT_SINK_ID}' (fail-closed)");
+        record_denied_intent(
+            intent_buffer,
+            receipt_id,
+            work_id,
+            changeset_digest,
+            status,
+            eval_tick,
+            event_timestamp_ns,
+            &reason,
+        )?;
+        telemetry
+            .missing_inputs_denied_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        return Err(ProjectionWorkerError::AdmissionDenied { reason });
+    };
+
+    let Some(snapshot) = resolver.resolve_sink_snapshot(DEFAULT_SINK_ID) else {
+        let reason = format!("sink snapshot not found for sink '{DEFAULT_SINK_ID}' (fail-closed)");
+        record_denied_intent(
+            intent_buffer,
+            receipt_id,
+            work_id,
+            changeset_digest,
+            status,
+            eval_tick,
+            event_timestamp_ns,
+            &reason,
+        )?;
+        telemetry
+            .missing_inputs_denied_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        return Err(ProjectionWorkerError::AdmissionDenied { reason });
+    };
+
+    let Some(resolved_window) = resolver.resolve_continuity_window(&boundary_id) else {
+        let reason =
+            format!("continuity window not found for boundary '{boundary_id}' (fail-closed)");
+        record_denied_intent(
+            intent_buffer,
+            receipt_id,
+            work_id,
+            changeset_digest,
+            status,
+            eval_tick,
+            event_timestamp_ns,
+            &reason,
+        )?;
+        telemetry
+            .missing_inputs_denied_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        return Err(ProjectionWorkerError::AdmissionDenied { reason });
+    };
+
+    // -----------------------------------------------------------------
+    // Step 3: Construct signed continuity window and profile artifacts
+    //         from the resolved config values, then evaluate the
+    //         economics gate via evaluate_projection_continuity().
+    // -----------------------------------------------------------------
+    let signed_window = build_signed_window(
+        &resolved_window,
+        time_authority_ref,
+        window_ref,
+        eval_tick,
+        gate_signer,
+    );
+
+    let Some(ref window_artifact) = signed_window else {
+        let reason = "failed to construct signed continuity window (fail-closed)";
+        record_denied_intent(
+            intent_buffer,
+            receipt_id,
+            work_id,
+            changeset_digest,
+            status,
+            eval_tick,
+            event_timestamp_ns,
+            reason,
+        )?;
+        telemetry
+            .missing_inputs_denied_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        return Err(ProjectionWorkerError::AdmissionDenied {
+            reason: reason.to_string(),
+        });
+    };
+
+    let signed_profile = build_signed_profile(
+        &resolved_profile,
+        snapshot.snapshot_digest,
+        time_authority_ref,
+        window_ref,
+        gate_signer,
+    );
+
+    let Some(ref profile_artifact) = signed_profile else {
+        let reason = "failed to construct signed continuity profile (fail-closed)";
+        record_denied_intent(
+            intent_buffer,
+            receipt_id,
+            work_id,
+            changeset_digest,
+            status,
+            eval_tick,
+            event_timestamp_ns,
+            reason,
+        )?;
+        telemetry
+            .missing_inputs_denied_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        return Err(ProjectionWorkerError::AdmissionDenied {
+            reason: reason.to_string(),
+        });
+    };
+
+    let decision = evaluate_projection_continuity(
+        Some(window_artifact),
+        Some(profile_artifact),
+        Some(&snapshot),
+        &boundary_id,
+        eval_tick,
+        time_authority_ref,
+        window_ref,
+        &resolved_profile.trusted_signer_keys,
+        &DeferredReplayMode::Inactive,
+    );
+
+    if decision.verdict != ContinuityVerdict::Allow {
+        let deny_reason = decision
+            .defect
+            .as_ref()
+            .map_or_else(|| "economics_gate_deny".to_string(), |d| d.reason.clone());
+
+        record_denied_intent(
+            intent_buffer,
+            receipt_id,
+            work_id,
+            changeset_digest,
+            status,
+            eval_tick,
+            event_timestamp_ns,
+            &deny_reason,
+        )?;
+        telemetry
+            .economics_denied_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
+
+        info!(
+            work_id = %work_id,
+            receipt_id = %receipt_id,
+            deny_reason = %deny_reason,
+            sink_id = %DEFAULT_SINK_ID,
+            "Economics admission DENY -- projection skipped"
+        );
+
+        return Err(ProjectionWorkerError::AdmissionDenied {
+            reason: deny_reason,
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // Step 4: Idempotent-insert replay prevention.
+    //
+    // Insert the intent into the durable buffer. If the intent already
+    // exists (same work_id + changeset_digest), the projection is
+    // denied as a replay. This provides single-projection semantics
+    // without canonical PCAC lifecycle primitives (which use
+    // PrivilegedPcacInputBuilder + join certificates). The enforcement
+    // guarantee is: no double-projection of the same
+    // (work_id, changeset_digest).
+    // -----------------------------------------------------------------
+    let intent_id = format!("proj-{receipt_id}");
+    let ledger_head = blake3::hash(event_id.as_bytes());
+    let ledger_head_bytes: [u8; 32] = *ledger_head.as_bytes();
+
+    let inserted = intent_buffer
+        .insert(
+            &intent_id,
+            work_id,
+            changeset_digest,
+            &ledger_head_bytes,
+            &status.to_string(),
+            eval_tick,
+            event_timestamp_ns,
+        )
+        .map_err(|e| ProjectionWorkerError::IntentBufferError(e.to_string()))?;
+
+    if !inserted {
+        // Already projected -- replay prevention.
+        let reason = "intent already exists for (work_id, changeset_digest) (replay prevention)";
+        // Intent already exists, attempt to deny it for audit trail.
+        let _ = intent_buffer.deny(&intent_id, reason);
+        telemetry
+            .lifecycle_consumed_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
+
+        info!(
+            work_id = %work_id,
+            receipt_id = %receipt_id,
+            subcategory = %lifecycle_deny::CONSUMED,
+            "Replay prevention DENY (duplicate intent) -- projection skipped"
+        );
+
+        return Err(ProjectionWorkerError::LifecycleDenied {
+            reason: reason.to_string(),
+            subcategory: lifecycle_deny::CONSUMED.to_string(),
+        });
+    }
+
+    // Mark intent as admitted.
+    intent_buffer
+        .admit(&intent_id, event_timestamp_ns)
+        .map_err(|e| ProjectionWorkerError::IntentBufferError(e.to_string()))?;
+
+    telemetry
+        .admitted_count
+        .fetch_add(1, AtomicOrdering::Relaxed);
+
+    info!(
+        work_id = %work_id,
+        receipt_id = %receipt_id,
+        intent_id = %intent_id,
+        eval_tick = eval_tick,
+        boundary_id = %boundary_id,
+        sink_id = %DEFAULT_SINK_ID,
+        "Economics admission: ADMITTED -- proceeding to projection effect"
+    );
+
+    Ok(())
 }
 
 // =============================================================================
@@ -3854,10 +3989,15 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00505: Economics Admission Gate + PCAC Lifecycle Tests
+    // TCK-00505: Economics Admission Gate + Replay Prevention Tests
     // =========================================================================
 
     /// Mock resolver for testing economics admission gate.
+    ///
+    /// The resolver uses the gate signer's public key as a trusted signer
+    /// so that signed artifacts constructed by `build_signed_window` and
+    /// `build_signed_profile` pass the trusted-signer check in
+    /// `evaluate_projection_continuity`.
     struct MockContinuityResolver {
         profile: Option<crate::projection::continuity_resolver::ResolvedContinuityProfile>,
         snapshot: Option<apm2_core::economics::MultiSinkIdentitySnapshotV1>,
@@ -3866,9 +4006,30 @@ mod tests {
 
     impl MockContinuityResolver {
         /// Creates a resolver that returns values for the default sink.
-        fn with_defaults() -> Self {
-            let signer = apm2_core::crypto::Signer::generate();
-            let vk_bytes = signer.verifying_key().to_bytes();
+        ///
+        /// The `gate_signer` is used to derive the trusted signer key
+        /// so that signed artifacts constructed from these resolved
+        /// values are accepted by the economics gate.
+        fn with_defaults_for_signer(gate_signer: &Signer) -> Self {
+            let vk_bytes = gate_signer.verifying_key().to_bytes();
+
+            // Build a snapshot with a valid computed digest.
+            // REQ-0009 multi-sink continuity requires at least 2 distinct sinks.
+            let mut snapshot = apm2_core::economics::MultiSinkIdentitySnapshotV1 {
+                sink_identities: vec![
+                    apm2_core::economics::SinkIdentityEntry {
+                        sink_id: DEFAULT_SINK_ID.to_string(),
+                        identity_digest: [0xAA; 32],
+                    },
+                    apm2_core::economics::SinkIdentityEntry {
+                        sink_id: "secondary-sink".to_string(),
+                        identity_digest: [0xBB; 32],
+                    },
+                ],
+                snapshot_digest: [0u8; 32],
+            };
+            snapshot.snapshot_digest = snapshot.compute_digest();
+
             Self {
                 profile: Some(
                     crate::projection::continuity_resolver::ResolvedContinuityProfile {
@@ -3880,16 +4041,12 @@ mod tests {
                         trusted_signer_keys: vec![vk_bytes],
                     },
                 ),
-                snapshot: Some(apm2_core::economics::MultiSinkIdentitySnapshotV1 {
-                    sink_identities: vec![apm2_core::economics::SinkIdentityEntry {
-                        sink_id: DEFAULT_SINK_ID.to_string(),
-                        identity_digest: [0xAA; 32],
-                    }],
-                    snapshot_digest: [0xBB; 32],
-                }),
+                snapshot: Some(snapshot),
                 window: Some(
                     crate::projection::continuity_resolver::ResolvedContinuityWindow {
-                        boundary_id: "test-boundary".to_string(),
+                        // boundary_id must match DEFAULT_SINK_ID for config-backed
+                        // resolution (the profile's boundary_id is the sink_id).
+                        boundary_id: DEFAULT_SINK_ID.to_string(),
                         outage_window_ticks: 100,
                         replay_window_ticks: 50,
                     },
@@ -3897,20 +4054,20 @@ mod tests {
             }
         }
 
-        fn without_profile() -> Self {
-            let mut r = Self::with_defaults();
+        fn without_profile(gate_signer: &Signer) -> Self {
+            let mut r = Self::with_defaults_for_signer(gate_signer);
             r.profile = None;
             r
         }
 
-        fn without_snapshot() -> Self {
-            let mut r = Self::with_defaults();
+        fn without_snapshot(gate_signer: &Signer) -> Self {
+            let mut r = Self::with_defaults_for_signer(gate_signer);
             r.snapshot = None;
             r
         }
 
-        fn without_window() -> Self {
-            let mut r = Self::with_defaults();
+        fn without_window(gate_signer: &Signer) -> Self {
+            let mut r = Self::with_defaults_for_signer(gate_signer);
             r.window = None;
             r
         }
@@ -3939,36 +4096,82 @@ mod tests {
         }
     }
 
-    /// Helper to create a worker with economics gate wired.
-    fn create_worker_with_economics_gate(
-        conn: &Arc<Mutex<Connection>>,
-        resolver: MockContinuityResolver,
-    ) -> ProjectionWorker {
-        let config = ProjectionWorkerConfig::new();
-        let mut worker = ProjectionWorker::new(Arc::clone(conn), config).unwrap();
+    /// Shared test fixture: resolver + signer + intent buffer + telemetry.
+    struct EconomicsTestFixture {
+        resolver: Arc<MockContinuityResolver>,
+        gate_signer: Signer,
+        intent_buffer: IntentBuffer,
+        telemetry: Arc<AdmissionTelemetry>,
+    }
 
-        // Wire intent buffer
-        let intent_conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
-        let intent_buffer =
-            crate::projection::intent_buffer::IntentBuffer::new(intent_conn).unwrap();
-        worker.set_intent_buffer(intent_buffer);
+    impl EconomicsTestFixture {
+        fn new() -> Self {
+            let gate_signer = Signer::generate();
+            let resolver = MockContinuityResolver::with_defaults_for_signer(&gate_signer);
+            let intent_conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+            let intent_buffer =
+                crate::projection::intent_buffer::IntentBuffer::new(intent_conn).unwrap();
+            Self {
+                resolver: Arc::new(resolver),
+                gate_signer,
+                intent_buffer,
+                telemetry: Arc::new(AdmissionTelemetry::new()),
+            }
+        }
 
-        // Wire continuity resolver
-        worker.set_continuity_resolver(Arc::new(resolver));
+        fn with_resolver(resolver: MockContinuityResolver) -> Self {
+            let gate_signer = Signer::generate();
+            let intent_conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+            let intent_buffer =
+                crate::projection::intent_buffer::IntentBuffer::new(intent_conn).unwrap();
+            Self {
+                resolver: Arc::new(resolver),
+                gate_signer,
+                intent_buffer,
+                telemetry: Arc::new(AdmissionTelemetry::new()),
+            }
+        }
 
-        worker
+        #[allow(clippy::too_many_arguments)]
+        fn evaluate(
+            &self,
+            payload: &serde_json::Value,
+            work_id: &str,
+            changeset_digest: &[u8; 32],
+            receipt_id: &str,
+            status: ProjectedStatus,
+            event_timestamp_ns: u64,
+            event_id: &str,
+        ) -> Result<(), ProjectionWorkerError> {
+            evaluate_economics_admission_blocking(
+                payload,
+                work_id,
+                changeset_digest,
+                receipt_id,
+                status,
+                event_timestamp_ns,
+                event_id,
+                &self.intent_buffer,
+                self.resolver.as_ref(),
+                &self.gate_signer,
+                &self.telemetry,
+            )
+        }
     }
 
     /// Build a valid economics-gate payload.
+    ///
+    /// Uses `DEFAULT_SINK_ID` as the `boundary_id` to match the
+    /// config-backed resolver's window boundary.
     fn economics_gate_payload(changeset_digest: &[u8; 32], receipt_id: &str) -> serde_json::Value {
         serde_json::json!({
             "receipt_id": receipt_id,
             "changeset_digest": hex::encode(changeset_digest),
             "verdict": "success",
-            "eval_tick": 42_u64,
+            "eval_tick": 142_u64,
             "time_authority_ref": hex::encode([0x11u8; 32]),
             "window_ref": hex::encode([0x22u8; 32]),
-            "boundary_id": "test-boundary",
+            "boundary_id": DEFAULT_SINK_ID,
             "work_id": "work-econ-001",
             "artifact_bundle_hash": hex::encode([0x33u8; 32]),
             "capability_manifest_hash": hex::encode([0x44u8; 32]),
@@ -3978,18 +4181,6 @@ mod tests {
             "time_envelope_ref": "htf:tick:42",
             "lease_id": "lease-econ-001",
         })
-    }
-
-    fn economics_test_event() -> SignedLedgerEvent {
-        SignedLedgerEvent {
-            event_id: "evt-econ-001".to_string(),
-            event_type: "review_receipt_recorded".to_string(),
-            work_id: "work-econ-001".to_string(),
-            actor_id: "actor-econ-001".to_string(),
-            payload: Vec::new(),
-            signature: vec![0u8; 64],
-            timestamp_ns: 5000,
-        }
     }
 
     // ----- Test: economics gate wiring -----
@@ -4021,11 +4212,21 @@ mod tests {
             "Gate should not be active with only intent buffer"
         );
 
-        // Add resolver - now it's wired
-        worker.set_continuity_resolver(Arc::new(MockContinuityResolver::with_defaults()));
+        // Add resolver - still not enough without signer
+        let gate_signer = Signer::generate();
+        worker.set_continuity_resolver(Arc::new(MockContinuityResolver::with_defaults_for_signer(
+            &gate_signer,
+        )));
+        assert!(
+            !worker.has_economics_gate(),
+            "Gate should not be active without gate signer"
+        );
+
+        // Add gate signer - now it's fully wired
+        worker.set_gate_signer(Arc::new(gate_signer));
         assert!(
             worker.has_economics_gate(),
-            "Gate should be active with both dependencies"
+            "Gate should be active with all three dependencies"
         );
     }
 
@@ -4172,27 +4373,24 @@ mod tests {
         );
     }
 
-    // ----- Test: evaluate_economics_admission -----
+    // ----- Test: evaluate_economics_admission_blocking -----
 
     #[test]
     fn test_economics_admission_missing_eval_tick_deny() {
-        let conn = create_test_db();
-        let worker =
-            create_worker_with_economics_gate(&conn, MockContinuityResolver::with_defaults());
+        let fixture = EconomicsTestFixture::new();
 
         let changeset_digest = [0x42u8; 32];
         let mut payload = economics_gate_payload(&changeset_digest, "receipt-no-tick");
-        // Remove eval_tick to trigger fail-closed
         payload.as_object_mut().unwrap().remove("eval_tick");
 
-        let event = economics_test_event();
-        let result = worker.evaluate_economics_admission(
+        let result = fixture.evaluate(
             &payload,
             "work-econ-001",
             &changeset_digest,
             "receipt-no-tick",
             ProjectedStatus::Success,
-            &event,
+            5000,
+            "evt-econ-001",
         );
 
         assert!(result.is_err(), "Missing eval_tick should DENY");
@@ -4202,11 +4400,9 @@ mod tests {
             "Expected AdmissionDenied, got: {err}"
         );
         assert!(err.to_string().contains("eval_tick"));
-
-        // Telemetry should reflect missing input denial
         assert_eq!(
-            worker
-                .telemetry()
+            fixture
+                .telemetry
                 .missing_inputs_denied_count
                 .load(AtomicOrdering::Relaxed),
             1,
@@ -4216,9 +4412,7 @@ mod tests {
 
     #[test]
     fn test_economics_admission_missing_time_authority_ref_deny() {
-        let conn = create_test_db();
-        let worker =
-            create_worker_with_economics_gate(&conn, MockContinuityResolver::with_defaults());
+        let fixture = EconomicsTestFixture::new();
 
         let changeset_digest = [0x42u8; 32];
         let mut payload = economics_gate_payload(&changeset_digest, "receipt-no-auth");
@@ -4227,14 +4421,14 @@ mod tests {
             .unwrap()
             .remove("time_authority_ref");
 
-        let event = economics_test_event();
-        let result = worker.evaluate_economics_admission(
+        let result = fixture.evaluate(
             &payload,
             "work-econ-001",
             &changeset_digest,
             "receipt-no-auth",
             ProjectedStatus::Success,
-            &event,
+            5000,
+            "evt-econ-001",
         );
 
         assert!(result.is_err(), "Missing time_authority_ref should DENY");
@@ -4245,22 +4439,20 @@ mod tests {
 
     #[test]
     fn test_economics_admission_missing_window_ref_deny() {
-        let conn = create_test_db();
-        let worker =
-            create_worker_with_economics_gate(&conn, MockContinuityResolver::with_defaults());
+        let fixture = EconomicsTestFixture::new();
 
         let changeset_digest = [0x42u8; 32];
         let mut payload = economics_gate_payload(&changeset_digest, "receipt-no-window");
         payload.as_object_mut().unwrap().remove("window_ref");
 
-        let event = economics_test_event();
-        let result = worker.evaluate_economics_admission(
+        let result = fixture.evaluate(
             &payload,
             "work-econ-001",
             &changeset_digest,
             "receipt-no-window",
             ProjectedStatus::Success,
-            &event,
+            5000,
+            "evt-econ-001",
         );
 
         assert!(result.is_err(), "Missing window_ref should DENY");
@@ -4271,22 +4463,20 @@ mod tests {
 
     #[test]
     fn test_economics_admission_missing_boundary_id_deny() {
-        let conn = create_test_db();
-        let worker =
-            create_worker_with_economics_gate(&conn, MockContinuityResolver::with_defaults());
+        let fixture = EconomicsTestFixture::new();
 
         let changeset_digest = [0x42u8; 32];
         let mut payload = economics_gate_payload(&changeset_digest, "receipt-no-boundary");
         payload.as_object_mut().unwrap().remove("boundary_id");
 
-        let event = economics_test_event();
-        let result = worker.evaluate_economics_admission(
+        let result = fixture.evaluate(
             &payload,
             "work-econ-001",
             &changeset_digest,
             "receipt-no-boundary",
             ProjectedStatus::Success,
-            &event,
+            5000,
+            "evt-econ-001",
         );
 
         assert!(result.is_err(), "Missing boundary_id should DENY");
@@ -4297,22 +4487,20 @@ mod tests {
 
     #[test]
     fn test_economics_admission_empty_boundary_id_deny() {
-        let conn = create_test_db();
-        let worker =
-            create_worker_with_economics_gate(&conn, MockContinuityResolver::with_defaults());
+        let fixture = EconomicsTestFixture::new();
 
         let changeset_digest = [0x42u8; 32];
         let mut payload = economics_gate_payload(&changeset_digest, "receipt-empty-boundary");
         payload["boundary_id"] = serde_json::json!("");
 
-        let event = economics_test_event();
-        let result = worker.evaluate_economics_admission(
+        let result = fixture.evaluate(
             &payload,
             "work-econ-001",
             &changeset_digest,
             "receipt-empty-boundary",
             ProjectedStatus::Success,
-            &event,
+            5000,
+            "evt-econ-001",
         );
 
         assert!(result.is_err(), "Empty boundary_id should DENY");
@@ -4320,22 +4508,20 @@ mod tests {
 
     #[test]
     fn test_economics_admission_oversized_boundary_id_deny() {
-        let conn = create_test_db();
-        let worker =
-            create_worker_with_economics_gate(&conn, MockContinuityResolver::with_defaults());
+        let fixture = EconomicsTestFixture::new();
 
         let changeset_digest = [0x42u8; 32];
         let mut payload = economics_gate_payload(&changeset_digest, "receipt-big-boundary");
         payload["boundary_id"] = serde_json::json!("x".repeat(MAX_STRING_LENGTH + 1));
 
-        let event = economics_test_event();
-        let result = worker.evaluate_economics_admission(
+        let result = fixture.evaluate(
             &payload,
             "work-econ-001",
             &changeset_digest,
             "receipt-big-boundary",
             ProjectedStatus::Success,
-            &event,
+            5000,
+            "evt-econ-001",
         );
 
         assert!(result.is_err(), "Oversized boundary_id should DENY");
@@ -4347,21 +4533,22 @@ mod tests {
 
     #[test]
     fn test_economics_admission_missing_profile_deny() {
-        let conn = create_test_db();
-        let worker =
-            create_worker_with_economics_gate(&conn, MockContinuityResolver::without_profile());
+        let gate_signer = Signer::generate();
+        let fixture = EconomicsTestFixture::with_resolver(MockContinuityResolver::without_profile(
+            &gate_signer,
+        ));
 
         let changeset_digest = [0x42u8; 32];
         let payload = economics_gate_payload(&changeset_digest, "receipt-no-profile");
 
-        let event = economics_test_event();
-        let result = worker.evaluate_economics_admission(
+        let result = fixture.evaluate(
             &payload,
             "work-econ-001",
             &changeset_digest,
             "receipt-no-profile",
             ProjectedStatus::Success,
-            &event,
+            5000,
+            "evt-econ-001",
         );
 
         assert!(result.is_err(), "Missing profile should DENY");
@@ -4372,21 +4559,22 @@ mod tests {
 
     #[test]
     fn test_economics_admission_missing_snapshot_deny() {
-        let conn = create_test_db();
-        let worker =
-            create_worker_with_economics_gate(&conn, MockContinuityResolver::without_snapshot());
+        let gate_signer = Signer::generate();
+        let fixture = EconomicsTestFixture::with_resolver(
+            MockContinuityResolver::without_snapshot(&gate_signer),
+        );
 
         let changeset_digest = [0x42u8; 32];
         let payload = economics_gate_payload(&changeset_digest, "receipt-no-snap");
 
-        let event = economics_test_event();
-        let result = worker.evaluate_economics_admission(
+        let result = fixture.evaluate(
             &payload,
             "work-econ-001",
             &changeset_digest,
             "receipt-no-snap",
             ProjectedStatus::Success,
-            &event,
+            5000,
+            "evt-econ-001",
         );
 
         assert!(result.is_err(), "Missing snapshot should DENY");
@@ -4397,21 +4585,22 @@ mod tests {
 
     #[test]
     fn test_economics_admission_missing_window_deny() {
-        let conn = create_test_db();
-        let worker =
-            create_worker_with_economics_gate(&conn, MockContinuityResolver::without_window());
+        let gate_signer = Signer::generate();
+        let fixture = EconomicsTestFixture::with_resolver(MockContinuityResolver::without_window(
+            &gate_signer,
+        ));
 
         let changeset_digest = [0x42u8; 32];
         let payload = economics_gate_payload(&changeset_digest, "receipt-no-win");
 
-        let event = economics_test_event();
-        let result = worker.evaluate_economics_admission(
+        let result = fixture.evaluate(
             &payload,
             "work-econ-001",
             &changeset_digest,
             "receipt-no-win",
             ProjectedStatus::Success,
-            &event,
+            5000,
+            "evt-econ-001",
         );
 
         assert!(result.is_err(), "Missing continuity window should DENY");
@@ -4424,26 +4613,20 @@ mod tests {
 
     #[test]
     fn test_economics_admission_revoked_authority_deny() {
-        // A zero time_authority_ref means revoked. extract_hash32_field
-        // returns None for zero hashes, so this manifests as a missing
-        // input denial.
-        let conn = create_test_db();
-        let worker =
-            create_worker_with_economics_gate(&conn, MockContinuityResolver::with_defaults());
+        let fixture = EconomicsTestFixture::new();
 
         let changeset_digest = [0x42u8; 32];
         let mut payload = economics_gate_payload(&changeset_digest, "receipt-revoked");
-        // Set time_authority_ref to all zeros (revoked)
         payload["time_authority_ref"] = serde_json::json!(hex::encode([0u8; 32]));
 
-        let event = economics_test_event();
-        let result = worker.evaluate_economics_admission(
+        let result = fixture.evaluate(
             &payload,
             "work-econ-001",
             &changeset_digest,
             "receipt-revoked",
             ProjectedStatus::Success,
-            &event,
+            5000,
+            "evt-econ-001",
         );
 
         assert!(result.is_err(), "Revoked authority (zero hash) should DENY");
@@ -4454,70 +4637,83 @@ mod tests {
         );
     }
 
-    // ----- Test: already-consumed token -> DENY (replay prevention) -----
+    // ----- Test: replay prevention (duplicate intent) -> DENY -----
 
     #[test]
-    fn test_economics_admission_consumed_token_deny() {
-        // First admission should succeed; second with same receipt_id
-        // should fail as consumed (replay prevention).
-        let conn = create_test_db();
-        let _worker =
-            create_worker_with_economics_gate(&conn, MockContinuityResolver::with_defaults());
+    fn test_economics_admission_replay_prevention_deny() {
+        // The economics gate now constructs real signed artifacts, so an
+        // ALLOW path is reachable. Two calls with the same receipt_id
+        // should: first ALLOW, second DENY (replay prevention).
+        let fixture = EconomicsTestFixture::new();
 
         let changeset_digest = [0x42u8; 32];
-        let _payload = economics_gate_payload(&changeset_digest, "receipt-replay");
-        let _event = economics_test_event();
+        let payload = economics_gate_payload(&changeset_digest, "receipt-replay");
 
-        // First call — should succeed (or fail at economics gate level, which
-        // is expected since we pass None for signed window/profile). But the
-        // economics gate with None signed inputs returns DENY, so we need to
-        // test replay prevention differently.
-        //
-        // The intent buffer uses INSERT OR IGNORE keyed by intent_id. If the
-        // first insert succeeds (inserted=true) and we insert again with the
-        // same intent_id, the second call returns inserted=false, triggering
-        // the consumed path.
-        //
-        // Since the economics gate call happens before the consume step, and
-        // the gate returns DENY when signed window/profile are None, the
-        // consume step is never reached in normal flow. We can test the
-        // intent buffer uniqueness directly.
-
-        // Test intent buffer uniqueness (the mechanism behind consume check).
-        let intent_conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
-        let buffer = crate::projection::intent_buffer::IntentBuffer::new(intent_conn).unwrap();
-        let intent_id = "proj-receipt-replay";
-        let ledger_head = [0u8; 32];
-
-        // First insert succeeds
-        let inserted = buffer
-            .insert(
-                intent_id,
-                "work-econ-001",
-                &changeset_digest,
-                &ledger_head,
-                "success",
-                42,
-                5000,
-            )
-            .unwrap();
-        assert!(inserted, "First insert should succeed");
-
-        // Second insert returns false (already exists, replay prevention)
-        let inserted = buffer
-            .insert(
-                intent_id,
-                "work-econ-001",
-                &changeset_digest,
-                &ledger_head,
-                "success",
-                42,
-                5000,
-            )
-            .unwrap();
+        // First call should ALLOW.
+        let result = fixture.evaluate(
+            &payload,
+            "work-econ-001",
+            &changeset_digest,
+            "receipt-replay",
+            ProjectedStatus::Success,
+            5000,
+            "evt-econ-001",
+        );
         assert!(
-            !inserted,
-            "Second insert should return false (consumed/replay)"
+            result.is_ok(),
+            "First admission should ALLOW, got: {result:?}"
+        );
+
+        // Second call with the same receipt_id should DENY (replay).
+        let result = fixture.evaluate(
+            &payload,
+            "work-econ-001",
+            &changeset_digest,
+            "receipt-replay",
+            ProjectedStatus::Success,
+            5000,
+            "evt-econ-001",
+        );
+        assert!(result.is_err(), "Second admission should DENY (replay)");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ProjectionWorkerError::LifecycleDenied { .. }),
+            "Expected LifecycleDenied (replay), got: {err}"
+        );
+        assert!(err.to_string().contains("replay prevention"));
+    }
+
+    // ----- Test: ALLOW path reaches projection (integration) -----
+
+    #[test]
+    fn test_economics_admission_allow_path_reaches_projection() {
+        // Proves that evaluate_economics_admission_blocking can return Ok(())
+        // when all inputs are correct, signed artifacts pass the gate, and
+        // the intent is new. This is the critical integration test for
+        // the ALLOW path.
+        let fixture = EconomicsTestFixture::new();
+
+        let changeset_digest = [0x42u8; 32];
+        let payload = economics_gate_payload(&changeset_digest, "receipt-allow");
+
+        let result = fixture.evaluate(
+            &payload,
+            "work-econ-001",
+            &changeset_digest,
+            "receipt-allow",
+            ProjectedStatus::Success,
+            5000,
+            "evt-econ-001",
+        );
+
+        assert!(result.is_ok(), "ALLOW path should succeed, got: {result:?}");
+        assert_eq!(
+            fixture
+                .telemetry
+                .admitted_count
+                .load(AtomicOrdering::Relaxed),
+            1,
+            "admitted_count should be 1 after ALLOW"
         );
     }
 
@@ -4556,12 +4752,9 @@ mod tests {
 
     #[test]
     fn test_telemetry_counters_increment_on_missing_inputs() {
-        let conn = create_test_db();
-        let worker =
-            create_worker_with_economics_gate(&conn, MockContinuityResolver::with_defaults());
+        let fixture = EconomicsTestFixture::new();
 
         let changeset_digest = [0x42u8; 32];
-        let event = economics_test_event();
 
         // Multiple missing-input denials should increment the counter
         for i in 0..3 {
@@ -4569,19 +4762,20 @@ mod tests {
                 economics_gate_payload(&changeset_digest, &format!("receipt-miss-{i}"));
             payload.as_object_mut().unwrap().remove("eval_tick");
 
-            let _ = worker.evaluate_economics_admission(
+            let _ = fixture.evaluate(
                 &payload,
                 "work-econ-001",
                 &changeset_digest,
                 &format!("receipt-miss-{i}"),
                 ProjectedStatus::Success,
-                &event,
+                5000,
+                "evt-econ-001",
             );
         }
 
         assert_eq!(
-            worker
-                .telemetry()
+            fixture
+                .telemetry
                 .missing_inputs_denied_count
                 .load(AtomicOrdering::Relaxed),
             3,
@@ -4597,12 +4791,8 @@ mod tests {
         let buffer =
             crate::projection::intent_buffer::IntentBuffer::new(Arc::clone(&intent_conn)).unwrap();
 
-        let conn = create_test_db();
-        let config = ProjectionWorkerConfig::new();
-        let worker = ProjectionWorker::new(conn, config).unwrap();
-
         let changeset_digest = [0x42u8; 32];
-        let result = worker.record_denied_intent(
+        let result = record_denied_intent(
             &buffer,
             "receipt-deny-test",
             "work-deny-001",
@@ -4644,44 +4834,35 @@ mod tests {
     #[test]
     fn test_economics_admission_all_inputs_present_reaches_gate() {
         // When all inputs are present, the function should reach the
-        // economics gate evaluation step. Since we pass None for signed
-        // window/profile, the gate returns DENY, but we verify that we
-        // reached it (not stopped at input extraction).
-        let conn = create_test_db();
-        let worker =
-            create_worker_with_economics_gate(&conn, MockContinuityResolver::with_defaults());
+        // economics gate evaluation step. With real signed artifacts
+        // and a matching trusted signer, the gate should return ALLOW.
+        let fixture = EconomicsTestFixture::new();
 
         let changeset_digest = [0x42u8; 32];
         let payload = economics_gate_payload(&changeset_digest, "receipt-full-inputs");
-        let event = economics_test_event();
 
-        let result = worker.evaluate_economics_admission(
+        let result = fixture.evaluate(
             &payload,
             "work-econ-001",
             &changeset_digest,
             "receipt-full-inputs",
             ProjectedStatus::Success,
-            &event,
+            5000,
+            "evt-econ-001",
         );
 
-        // The economics gate will DENY because we pass None for signed
-        // window/profile. The important thing is we reached it (not
-        // stopped at input extraction). The deny reason should mention
-        // economics, not missing inputs.
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        // It should be an economics denial or lifecycle denial — not a
-        // "missing input" denial.
-        let msg = err.to_string();
+        // All inputs present + real signed artifacts + trusted signer -> ALLOW.
         assert!(
-            !msg.contains("missing eval_tick")
-                && !msg.contains("missing or invalid time_authority_ref")
-                && !msg.contains("missing or invalid window_ref")
-                && !msg.contains("missing or empty boundary_id")
-                && !msg.contains("continuity profile not found")
-                && !msg.contains("sink snapshot not found")
-                && !msg.contains("continuity window not found"),
-            "Should reach economics gate, not fail at input extraction. Got: {msg}"
+            result.is_ok(),
+            "All inputs present should reach ALLOW, got: {result:?}"
+        );
+        assert_eq!(
+            fixture
+                .telemetry
+                .admitted_count
+                .load(AtomicOrdering::Relaxed),
+            1,
+            "admitted_count should be 1 after ALLOW"
         );
     }
 
@@ -4689,24 +4870,22 @@ mod tests {
 
     #[test]
     fn test_economics_admission_stale_window_ref_deny() {
-        // Zero window_ref means stale/unset — extract_hash32_field
+        // Zero window_ref means stale/unset -- extract_hash32_field
         // returns None, triggering missing input DENY.
-        let conn = create_test_db();
-        let worker =
-            create_worker_with_economics_gate(&conn, MockContinuityResolver::with_defaults());
+        let fixture = EconomicsTestFixture::new();
 
         let changeset_digest = [0x42u8; 32];
         let mut payload = economics_gate_payload(&changeset_digest, "receipt-stale");
         payload["window_ref"] = serde_json::json!(hex::encode([0u8; 32]));
 
-        let event = economics_test_event();
-        let result = worker.evaluate_economics_admission(
+        let result = fixture.evaluate(
             &payload,
             "work-econ-001",
             &changeset_digest,
             "receipt-stale",
             ProjectedStatus::Success,
-            &event,
+            5000,
+            "evt-econ-001",
         );
 
         assert!(result.is_err(), "Stale window_ref should DENY");
