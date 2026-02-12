@@ -9072,6 +9072,48 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
+        // ================================================================
+        // TCK-00501: Record effect completion in the journal after
+        // successful witness closure and outcome index persistence.
+        //
+        // This transitions the journal state from Started -> Completed,
+        // ensuring that a restart after this point will NOT classify
+        // the effect as Unknown (in-doubt). Without this call, every
+        // successfully executed effect remains in Started state and
+        // would be classified as Unknown on restart.
+        //
+        // For fail-closed tiers, completion recording failure is an
+        // error: the effect executed but we cannot record it, meaning
+        // restart will classify it as Unknown.
+        // ================================================================
+        if let Some(ref admission_res) = admission_result {
+            if let Ok(SessionResponse::RequestTool(ref resp)) = response {
+                if resp.decision == i32::from(DecisionType::Allow) {
+                    if let Some(ref journal) = admission_res.effect_journal {
+                        if let Err(e) = journal.record_completed(&admission_res.bundle.request_id) {
+                            warn!(
+                                session_id = %token.session_id,
+                                error = %e,
+                                "effect journal record_completed failed"
+                            );
+                            // For fail-closed tiers, completion recording failure
+                            // is treated as an error — the effect executed but
+                            // we cannot record it, so restart will classify it
+                            // as Unknown.
+                            if admission_res.boundary_span.enforcement_tier
+                                == crate::admission_kernel::types::EnforcementTier::FailClosed
+                            {
+                                response = Ok(SessionResponse::error(
+                                    SessionErrorCode::SessionErrorInternal,
+                                    format!("effect journal completion recording failed: {e}"),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if !defects.is_empty() {
             let has_mandatory_termination_defect = defects
                 .iter()
@@ -25163,6 +25205,109 @@ mod tests {
                 }
             }
 
+            /// In-memory mock effect journal for tests.
+            struct MockEffectJournal {
+                entries: std::sync::Mutex<
+                    std::collections::HashMap<
+                        apm2_core::crypto::Hash,
+                        crate::admission_kernel::effect_journal::EffectExecutionState,
+                    >,
+                >,
+                bindings: std::sync::Mutex<
+                    std::collections::HashMap<
+                        apm2_core::crypto::Hash,
+                        crate::admission_kernel::effect_journal::EffectJournalBindingV1,
+                    >,
+                >,
+            }
+
+            impl MockEffectJournal {
+                fn new() -> Self {
+                    Self {
+                        entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+                        bindings: std::sync::Mutex::new(std::collections::HashMap::new()),
+                    }
+                }
+            }
+
+            impl crate::admission_kernel::effect_journal::EffectJournal for MockEffectJournal {
+                fn record_started(
+                    &self,
+                    binding: &crate::admission_kernel::effect_journal::EffectJournalBindingV1,
+                ) -> Result<(), crate::admission_kernel::effect_journal::EffectJournalError>
+                {
+                    binding.validate()?;
+                    let mut entries = self.entries.lock().expect("lock");
+                    entries.insert(
+                        binding.request_id,
+                        crate::admission_kernel::effect_journal::EffectExecutionState::Started,
+                    );
+                    self.bindings
+                        .lock()
+                        .expect("lock")
+                        .insert(binding.request_id, binding.clone());
+                    Ok(())
+                }
+
+                fn record_completed(
+                    &self,
+                    request_id: &apm2_core::crypto::Hash,
+                ) -> Result<(), crate::admission_kernel::effect_journal::EffectJournalError>
+                {
+                    let mut entries = self.entries.lock().expect("lock");
+                    entries.insert(
+                        *request_id,
+                        crate::admission_kernel::effect_journal::EffectExecutionState::Completed,
+                    );
+                    Ok(())
+                }
+
+                fn query_state(
+                    &self,
+                    request_id: &apm2_core::crypto::Hash,
+                ) -> crate::admission_kernel::effect_journal::EffectExecutionState {
+                    self.entries
+                        .lock()
+                        .expect("lock")
+                        .get(request_id)
+                        .copied()
+                        .unwrap_or(
+                        crate::admission_kernel::effect_journal::EffectExecutionState::NotStarted,
+                    )
+                }
+
+                fn query_binding(
+                    &self,
+                    request_id: &apm2_core::crypto::Hash,
+                ) -> Option<crate::admission_kernel::effect_journal::EffectJournalBindingV1>
+                {
+                    self.bindings.lock().expect("lock").get(request_id).cloned()
+                }
+
+                fn resolve_in_doubt(
+                    &self,
+                    request_id: &apm2_core::crypto::Hash,
+                    _boundary_confirms_not_executed: bool,
+                ) -> Result<
+                    crate::admission_kernel::effect_journal::InDoubtResolutionV1,
+                    crate::admission_kernel::effect_journal::EffectJournalError,
+                > {
+                    Err(
+                        crate::admission_kernel::effect_journal::EffectJournalError::ReExecutionDenied {
+                            request_id: *request_id,
+                            enforcement_tier:
+                                crate::admission_kernel::types::EnforcementTier::FailClosed,
+                            declared_idempotent: false,
+                            reason: "mock: not implemented".into(),
+                        },
+                    )
+                }
+
+                fn len(&self) -> usize {
+                    self.entries.lock().expect("lock").len()
+                }
+            }
+
             // -- Build a kernel with all prerequisites passing --
             let pcac_kernel: Arc<dyn AuthorityJoinKernel> = Arc::new(PassingPcacKernel);
             let witness_cfg = crate::admission_kernel::WitnessProviderConfig {
@@ -25174,7 +25319,8 @@ mod tests {
                     .with_ledger_verifier(Arc::new(PassingLedgerVerifier))
                     .with_policy_resolver(Arc::new(PassingPolicyResolver))
                     .with_anti_rollback(Arc::new(PassingAntiRollback))
-                    .with_quarantine_guard(Arc::new(PassingQuarantineGuard)),
+                    .with_quarantine_guard(Arc::new(PassingQuarantineGuard))
+                    .with_effect_journal(Arc::new(MockEffectJournal::new())),
             );
 
             let minter = test_minter();

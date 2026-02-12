@@ -117,7 +117,7 @@ Explicit waiver for monitor-tier witness bypass (TCK-00497). Monitor tiers may s
 
 Crash-safe effect execution journal (TCK-00501). Tracks effect execution state per `RequestId` with a durable, append-only, file-backed journal. Modeled after `FileBackedConsumeIndex` with exclusive file locking and streaming replay.
 
-**State machine:** `NotStarted -> Started -> Completed`. On crash recovery (replay), entries with `Started` but no `Completed` are classified as `Unknown`.
+**State machine:** `NotStarted -> Started -> Completed`. On crash recovery (replay), entries with `Started` but no `Completed` are classified as `Unknown`. An `Unknown` entry can be resolved to `NotStarted` via `resolve_in_doubt()` (persisted as 'R' tag) when both conditions (idempotent + boundary confirms) are met.
 
 **Key types:**
 
@@ -129,7 +129,7 @@ Crash-safe effect execution journal (TCK-00501). Tracks effect execution state p
 
 **Invariants:**
 
-- [INV-AK40] Journal entries are append-only; no in-place mutation or deletion.
+- [INV-AK40] Journal entries are append-only; no in-place mutation or deletion. Tags: 'S' (Started), 'C' (Completed), 'R' (Resolved: Unknown -> NotStarted).
 - [INV-AK41] `Started` without `Completed` on replay produces `Unknown`, never silent re-execution.
 - [INV-AK42] `Unknown` state denies output release unless explicit `AllowReExecution` resolution with matching `request_id` and `idempotency_key` is provided.
 - [INV-AK43] Journal replay tolerates torn tail entries (partial writes from crash) by skipping unparseable trailing lines.
@@ -137,6 +137,10 @@ Crash-safe effect execution journal (TCK-00501). Tracks effect execution state p
 - [INV-AK45] Exclusive file lock (`flock LOCK_EX`) prevents concurrent journal access from multiple daemon instances.
 - [INV-AK46] Binding data is validated (`validate()`) before persistence; zero hashes and empty fields are rejected.
 - [INV-AK47] `record_started()` rejects duplicate `request_id` entries (idempotency guard).
+- [INV-AK48] `resolve_in_doubt()` persists resolution atomically (fsync 'R' tag) BEFORE updating in-memory state; prevents infinite resolution loops on crash (TCK-00501 fix).
+- [INV-AK49] Fail-closed tiers MUST have an effect journal wired; `execute()` denies with `MissingPrerequisite` if journal is absent for `FailClosed` tier (TCK-00501 fix).
+- [INV-AK50] Journal file is created with mode `0o600` (owner-only read/write) to prevent world-readable exposure of request IDs, session IDs, and policy root digests (TCK-00501 fix).
+- [INV-AK51] Post-effect path MUST call `record_completed()` after successful effect execution to transition journal state from `Started` to `Completed`; wired in `session_dispatch.rs` (TCK-00501 fix).
 
 ### `EffectCapability`, `LedgerWriteCapability`, `QuarantineCapability` (capabilities.rs)
 

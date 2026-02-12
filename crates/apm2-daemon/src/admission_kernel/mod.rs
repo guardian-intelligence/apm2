@@ -575,6 +575,16 @@ impl AdmissionKernelV1 {
         let request_id = plan.request.request_id;
         let intent_digest = plan.request.intent_digest;
 
+        // MANDATORY: fail-closed tiers MUST have an effect journal wired.
+        // Without a journal, crash windows cannot be classified and the
+        // daemon would silently skip crash-safety guarantees, violating
+        // the fail-closed contract (REQ-0029).
+        if plan.enforcement_tier == EnforcementTier::FailClosed && self.effect_journal.is_none() {
+            return Err(AdmitError::MissingPrerequisite {
+                prerequisite: "EffectJournal".into(),
+            });
+        }
+
         if let Some(ref journal) = self.effect_journal {
             let binding = EffectJournalBindingV1 {
                 request_id,
