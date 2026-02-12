@@ -414,6 +414,10 @@ pub struct LogsArgs {
     /// Selector token to resolve (typed by `--selector-type`).
     #[arg(long)]
     pub selector: Option<String>,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac pipeline` (hidden, internal).
@@ -1024,7 +1028,7 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
             &args.repo,
             args.selector_type.as_deref(),
             args.selector.as_deref(),
-            json_output,
+            json_output || args.json,
         ),
         FacSubcommand::Pipeline(args) => {
             fac_review::run_pipeline(&args.repo, &args.pr_url, args.pr, &args.sha)
@@ -2364,7 +2368,18 @@ fn handle_protocol_error(json_output: bool, error: &ProtocolClientError) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     use super::*;
+
+    #[derive(Parser, Debug)]
+    struct FacLogsCliHarness {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+
+        #[command(subcommand)]
+        subcommand: FacSubcommand,
+    }
 
     #[test]
     fn test_work_status_response_serialization() {
@@ -2709,5 +2724,35 @@ mod tests {
             "schema": "apm2.projection.v1"
         });
         assert_eq!(detect_receipt_type(&json), "projection_receipt");
+    }
+
+    #[test]
+    fn test_logs_subcommand_json_flag_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "logs", "--pr", "615", "--json"])
+            .expect("logs parser should accept subcommand json flag");
+
+        assert!(!parsed.json);
+        match parsed.subcommand {
+            FacSubcommand::Logs(args) => {
+                assert_eq!(args.pr, Some(615));
+                assert!(args.json);
+            },
+            other => panic!("expected logs subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_logs_global_json_flag_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "--json", "logs", "--pr", "615"])
+            .expect("logs parser should accept global json flag");
+
+        assert!(parsed.json);
+        match parsed.subcommand {
+            FacSubcommand::Logs(args) => {
+                assert_eq!(args.pr, Some(615));
+                assert!(!args.json);
+            },
+            other => panic!("expected logs subcommand, got {other:?}"),
+        }
     }
 }
