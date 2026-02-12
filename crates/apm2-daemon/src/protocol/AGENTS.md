@@ -89,11 +89,13 @@ Session-scoped endpoint dispatcher for RFC-0017. Routes session requests after v
 - [INV-PR04] Session endpoints require valid `session_token`.
 - [INV-PR05] Invalid/expired tokens return `SESSION_ERROR_INVALID`.
 - [INV-PR06] Token validation uses constant-time HMAC comparison.
+- [INV-PR11] In authoritative mode, fail-closed tiers (Tier2/3/4) MUST be denied if neither `AdmissionKernel` nor `LifecycleGate` is wired (TCK-00494 no-bypass invariant). No silent fallback to ungated effect-capable path.
 
 **Contracts:**
 
 - [CTR-PR06] Token is validated BEFORE any handler logic executes.
 - [CTR-PR07] Messages use bounded decoding (CTR-1603).
+- [CTR-PR08] Authority lifecycle guard fires after decode/validate/transport checks but BEFORE PCAC lifecycle and broker dispatch (TCK-00494). Requires at least one authority gate (`AdmissionKernel` or `LifecycleGate`) for fail-closed tier tool requests in authoritative mode.
 
 ### `SessionToken`
 

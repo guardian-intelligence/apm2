@@ -1121,7 +1121,54 @@ impl DispatcherState {
                     anti_entropy_pcac_gate = Some(Arc::clone(&pcac_gate));
                     privileged_dispatcher =
                         privileged_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
-                    session_dispatcher = session_dispatcher.with_pcac_lifecycle_gate(pcac_gate);
+                    session_dispatcher =
+                        session_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
+
+                    // TCK-00494: Wire AdmissionKernel for plan/execute-gated
+                    // admission. Uses a SEPARATE consume index file to avoid
+                    // file-lock contention with the lifecycle gate's durable
+                    // kernel.
+                    {
+                        let admission_consume_log_path =
+                            consume_log_path.with_extension("admission_consume.log");
+                        let admission_durable_index = crate::pcac::FileBackedConsumeIndex::open(
+                            &admission_consume_log_path,
+                            Some(crate::pcac::DurableConsumeMetrics::global()),
+                        )
+                        .map_err(|e| {
+                            format!(
+                                "failed to open admission kernel consume index at {}: {e}",
+                                admission_consume_log_path.display()
+                            )
+                        })?;
+                        let admission_tick_kernel = Arc::new(
+                            crate::pcac::InProcessKernel::new(1).with_verifier_economics(
+                                apm2_core::pcac::VerifierEconomicsProfile::default(),
+                            ),
+                        );
+                        let admission_durable_kernel =
+                            crate::pcac::DurableKernel::new_with_shared_kernel(
+                                admission_tick_kernel,
+                                Box::new(admission_durable_index),
+                            );
+                        let admission_pcac: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                            Arc::new(admission_durable_kernel);
+
+                        let witness_provider = crate::admission_kernel::WitnessProviderConfig {
+                            provider_id: "apm2-daemon/admission_kernel".to_string(),
+                            provider_build_digest: *blake3::hash(b"apm2-daemon-build-v1")
+                                .as_bytes(),
+                        };
+
+                        let admission_kernel =
+                            Arc::new(crate::admission_kernel::AdmissionKernelV1::new(
+                                admission_pcac,
+                                witness_provider,
+                            ));
+                        session_dispatcher =
+                            session_dispatcher.with_admission_kernel(admission_kernel);
+                    }
+
                     if let Some(sovereignty_state) = sovereignty_state {
                         session_dispatcher =
                             session_dispatcher.with_sovereignty_state(sovereignty_state);
@@ -1522,6 +1569,47 @@ impl DispatcherState {
                 .with_stop_conditions_store(stop_conditions_store)
                 .with_v1_manifest_store(v1_manifest_store)
                 .with_pcac_lifecycle_gate(pcac_gate);
+
+        // TCK-00494: Wire AdmissionKernel for plan/execute-gated admission.
+        // This is the CAS-backed production path — authoritative mode with
+        // durable CAS requires fail-closed kernel gating.
+        // The admission kernel uses a SEPARATE consume index file to avoid
+        // file-lock contention with the lifecycle gate's durable kernel.
+        {
+            let admission_consume_log_path = cas_path.as_ref().join("pcac_admission_consume.log");
+            let admission_durable_index = crate::pcac::FileBackedConsumeIndex::open(
+                &admission_consume_log_path,
+                Some(crate::pcac::DurableConsumeMetrics::global()),
+            )
+            .map_err(|e| crate::cas::DurableCasError::InitializationFailed {
+                message: format!(
+                    "failed to open admission kernel consume index at {}: {e}",
+                    admission_consume_log_path.display()
+                ),
+            })?;
+            let admission_tick_kernel = Arc::new(
+                crate::pcac::InProcessKernel::new(1)
+                    .with_verifier_economics(apm2_core::pcac::VerifierEconomicsProfile::default()),
+            );
+            let admission_durable_kernel = crate::pcac::DurableKernel::new_with_shared_kernel(
+                admission_tick_kernel,
+                Box::new(admission_durable_index),
+            );
+            let admission_pcac: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(admission_durable_kernel);
+
+            let witness_provider = crate::admission_kernel::WitnessProviderConfig {
+                provider_id: "apm2-daemon/admission_kernel".to_string(),
+                provider_build_digest: *blake3::hash(b"apm2-daemon-build-v1").as_bytes(),
+            };
+
+            let admission_kernel = Arc::new(crate::admission_kernel::AdmissionKernelV1::new(
+                admission_pcac,
+                witness_provider,
+            ));
+            session_dispatcher = session_dispatcher.with_admission_kernel(admission_kernel);
+        }
+
         if let Some(sovereignty_state) = sovereignty_state {
             session_dispatcher = session_dispatcher.with_sovereignty_state(sovereignty_state);
         }
