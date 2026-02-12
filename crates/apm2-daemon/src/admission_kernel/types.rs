@@ -25,6 +25,52 @@ use super::capabilities::{EffectCapability, LedgerWriteCapability, QuarantineCap
 use super::prerequisites::LedgerAnchorV1;
 
 // =============================================================================
+// Bounded deserialization helpers (SECURITY BLOCKER 2, TCK-00492)
+// =============================================================================
+
+/// Bounded string deserialization module.
+///
+/// Prevents denial-of-service via unbounded allocation when deserializing string fields
+/// from untrusted input. Each string is rejected if it exceeds the
+/// corresponding `MAX_*` limit.
+mod bounded_deser {
+    use serde::{self, Deserialize, Deserializer};
+
+    /// Macro to generate bounded deserializer functions with compile-time
+    /// maximum length constants.
+    macro_rules! bounded_string_deser {
+        ($fn_name:ident, $max:expr) => {
+            pub fn $fn_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let s = String::deserialize(deserializer)?;
+                if s.len() > $max {
+                    return Err(serde::de::Error::custom(concat!(
+                        "string exceeds maximum length of ",
+                        stringify!($max),
+                        " bytes"
+                    )));
+                }
+                Ok(s)
+            }
+        };
+    }
+
+    // Bounded deserializers for each field type.
+    // These enforce MAX_* limits at deserialization time, preventing
+    // attackers from forcing large allocations via malicious payloads.
+    bounded_string_deser!(deser_kernel_string, super::MAX_KERNEL_STRING_LENGTH);
+    bounded_string_deser!(deser_tool_class, super::MAX_TOOL_CLASS_LENGTH);
+    bounded_string_deser!(deser_boundary_profile, super::MAX_BOUNDARY_PROFILE_LENGTH);
+    bounded_string_deser!(
+        deser_witness_provider_id,
+        super::MAX_WITNESS_PROVIDER_ID_LENGTH
+    );
+    bounded_string_deser!(deser_witness_class, super::MAX_KERNEL_STRING_LENGTH);
+}
+
+// =============================================================================
 // Resource limits
 // =============================================================================
 
@@ -226,6 +272,29 @@ impl KernelRequestV1 {
                 reason: "freshness_policy_hash is zero".into(),
             });
         }
+        // QUALITY MAJOR 1 (TCK-00492): Non-zero checks for ALL mandatory
+        // digest fields. These were previously missing, allowing requests
+        // with unbound digests to pass validation.
+        if self.hsi_contract_manifest_digest == ZERO {
+            return Err(AdmitError::InvalidRequest {
+                reason: "hsi_contract_manifest_digest is zero".into(),
+            });
+        }
+        if self.hsi_envelope_binding_digest == ZERO {
+            return Err(AdmitError::InvalidRequest {
+                reason: "hsi_envelope_binding_digest is zero".into(),
+            });
+        }
+        if self.stop_budget_digest == ZERO {
+            return Err(AdmitError::InvalidRequest {
+                reason: "stop_budget_digest is zero".into(),
+            });
+        }
+        if self.revocation_head_hash == ZERO {
+            return Err(AdmitError::InvalidRequest {
+                reason: "revocation_head_hash is zero".into(),
+            });
+        }
 
         Ok(())
     }
@@ -250,10 +319,13 @@ pub struct AdmissionSpineJoinExtV1 {
     /// Stable request identifier.
     pub request_id: Hash,
     /// Session identifier.
+    #[serde(deserialize_with = "bounded_deser::deser_kernel_string")]
     pub session_id: String,
     /// Tool class identifier.
+    #[serde(deserialize_with = "bounded_deser::deser_tool_class")]
     pub tool_class: String,
     /// Boundary profile identifier.
+    #[serde(deserialize_with = "bounded_deser::deser_boundary_profile")]
     pub boundary_profile_id: String,
     /// Policy-derived enforcement tier.
     pub enforcement_tier: EnforcementTier,
@@ -341,14 +413,18 @@ impl AdmissionSpineJoinExtV1 {
 #[serde(deny_unknown_fields)]
 pub struct WitnessSeedV1 {
     /// Witness class (e.g., "leakage", "timing").
+    #[serde(deserialize_with = "bounded_deser::deser_witness_class")]
     pub witness_class: String,
     /// Stable request identifier.
     pub request_id: Hash,
     /// Session identifier.
+    #[serde(deserialize_with = "bounded_deser::deser_kernel_string")]
     pub session_id: String,
     /// Tool class identifier.
+    #[serde(deserialize_with = "bounded_deser::deser_tool_class")]
     pub tool_class: String,
     /// Boundary profile identifier.
+    #[serde(deserialize_with = "bounded_deser::deser_boundary_profile")]
     pub boundary_profile_id: String,
     /// Ledger anchor hash at seed creation time.
     pub ledger_anchor_hash: Hash,
@@ -357,6 +433,7 @@ pub struct WitnessSeedV1 {
     /// Cryptographic nonce for uniqueness.
     pub nonce: Hash,
     /// Witness provider identifier (module id / build digest).
+    #[serde(deserialize_with = "bounded_deser::deser_witness_provider_id")]
     pub provider_id: String,
     /// Witness provider build digest for measurement binding.
     pub provider_build_digest: Hash,

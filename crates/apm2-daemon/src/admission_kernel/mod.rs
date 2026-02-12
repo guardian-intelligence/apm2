@@ -50,17 +50,11 @@ use apm2_core::pcac::{
 use capabilities::{EffectCapability, LedgerWriteCapability, QuarantineCapability};
 use prerequisites::{AntiRollbackAnchor, LedgerAnchorV1, LedgerTrustVerifier, PolicyRootResolver};
 use rand::RngCore;
+use subtle::ConstantTimeEq;
 use types::{
     AdmissionPlanV1, AdmissionResultV1, AdmissionSpineJoinExtV1, AdmitError, BoundarySpanV1,
-    EnforcementTier, KernelRequestV1, PlanState, WitnessSeedV1,
+    EnforcementTier, KernelRequestV1, MAX_WITNESS_PROVIDER_ID_LENGTH, PlanState, WitnessSeedV1,
 };
-
-// =============================================================================
-// Resource limits
-// =============================================================================
-
-/// Maximum length for the witness provider identifier used by this kernel.
-const MAX_WITNESS_PROVIDER_ID_LEN: usize = 256;
 
 // =============================================================================
 // QuarantineGuard trait
@@ -113,12 +107,20 @@ impl WitnessProviderConfig {
     ///
     /// Returns an error if `provider_id` is empty or too long.
     pub fn validate(&self) -> Result<(), AdmitError> {
-        if self.provider_id.is_empty() || self.provider_id.len() > MAX_WITNESS_PROVIDER_ID_LEN {
+        if self.provider_id.is_empty() || self.provider_id.len() > MAX_WITNESS_PROVIDER_ID_LENGTH {
             return Err(AdmitError::WitnessSeedFailure {
                 reason: format!(
-                    "provider_id must be 1..={MAX_WITNESS_PROVIDER_ID_LEN} bytes, got {}",
+                    "provider_id must be 1..={MAX_WITNESS_PROVIDER_ID_LENGTH} bytes, got {}",
                     self.provider_id.len()
                 ),
+            });
+        }
+        // QUALITY MAJOR 2 (TCK-00492): Non-zero provider_build_digest.
+        // A zero build digest means the provider measurement is unbound,
+        // which would allow any binary to impersonate this witness provider.
+        if self.provider_build_digest == [0u8; 32] {
+            return Err(AdmitError::WitnessSeedFailure {
+                reason: "provider_build_digest is zero (unbound measurement)".into(),
             });
         }
         Ok(())
@@ -432,7 +434,10 @@ impl AdmissionKernelV1 {
             self.verify_anti_rollback(plan.enforcement_tier, &fresh_ledger.anchor)?;
 
             // Detect policy root drift between plan and execute.
-            if fresh_policy.digest != plan.policy_root_digest {
+            // SECURITY BLOCKER 1 (TCK-00492): Use constant-time comparison
+            // for digest equality to prevent timing side-channels that could
+            // leak the expected policy root digest byte-by-byte.
+            if !bool::from(fresh_policy.digest.ct_eq(&plan.policy_root_digest)) {
                 return Err(AdmitError::ExecutePrerequisiteDrift {
                     prerequisite: "PolicyRoot".into(),
                     reason: "policy root digest drifted between plan and execute".into(),
@@ -710,7 +715,8 @@ fn generate_nonce() -> Hash {
 /// Compute a canonical request digest from the kernel request.
 ///
 /// This digest covers ALL request fields in deterministic order with
-/// length-prefixed variable-length fields.
+/// length-prefixed variable-length fields, including `risk_tier` and
+/// `pcac_policy` (QUALITY MINOR 1, TCK-00492).
 #[allow(clippy::cast_possible_truncation)] // String fields are bounded by MAX_* constants (<=256), safe for u32.
 fn compute_canonical_request_digest(request: &KernelRequestV1) -> Hash {
     let mut hasher = blake3::Hasher::new();
@@ -754,12 +760,74 @@ fn compute_canonical_request_digest(request: &KernelRequestV1) -> Hash {
             hasher.update(&[0x00]); // absence tag
         },
     }
+    // QUALITY MINOR 1 (TCK-00492): Include risk_tier and pcac_policy
+    // in canonical digest. These fields influence admission decisions
+    // (enforcement tier derivation, lifecycle enforcement mode) and
+    // must be bound to prevent request substitution attacks.
+    hasher.update(match request.risk_tier {
+        apm2_core::pcac::RiskTier::Tier0 => &[0x00],
+        apm2_core::pcac::RiskTier::Tier1 => &[0x01],
+        apm2_core::pcac::RiskTier::Tier2Plus => &[0x02],
+        _ => &[0xFF], // Unknown variant — deterministic fallback tag.
+    });
+    // pcac_policy fields: lifecycle_enforcement, min_tier2_identity_evidence,
+    // freshness_max_age_ticks, tier2_sovereignty_mode, pointer_only_waiver.
+    hasher.update(&[u8::from(request.pcac_policy.lifecycle_enforcement)]);
+    hasher.update(match request.pcac_policy.min_tier2_identity_evidence {
+        IdentityEvidenceLevel::Verified => &[0x01],
+        IdentityEvidenceLevel::PointerOnly => &[0x02],
+        _ => &[0xFF],
+    });
+    hasher.update(&request.pcac_policy.freshness_max_age_ticks.to_le_bytes());
+    hasher.update(match request.pcac_policy.tier2_sovereignty_mode {
+        apm2_core::pcac::SovereigntyEnforcementMode::Strict => &[0x01],
+        apm2_core::pcac::SovereigntyEnforcementMode::Monitor => &[0x02],
+        apm2_core::pcac::SovereigntyEnforcementMode::Disabled => &[0x03],
+        _ => &[0xFF],
+    });
+    match &request.pcac_policy.pointer_only_waiver {
+        Some(waiver) => {
+            hasher.update(&[0x01]); // presence tag
+            hasher.update(waiver.waiver_id.as_bytes());
+            hasher.update(&(waiver.waiver_id.len() as u32).to_le_bytes());
+            hasher.update(&waiver.expires_at_tick.to_le_bytes());
+            hasher.update(&waiver.scope_binding_hash);
+        },
+        None => {
+            hasher.update(&[0x00]); // absence tag
+        },
+    }
     *hasher.finalize().as_bytes()
 }
 
 /// Build the PCAC `AuthorityJoinInputV1` from kernel request bindings.
 ///
-/// Uses the canonical builder pattern per RFC-0019 §5.3 and RS-42.
+/// # Canonical Builder Equivalence (SECURITY MAJOR 1, TCK-00492)
+///
+/// This function is the admission kernel's module-equivalent of
+/// `PrivilegedPcacInputBuilder` (defined in `protocol::dispatch`).
+/// It cannot reuse `PrivilegedPcacInputBuilder` directly because:
+///
+/// 1. **Domain tag scheme**: `PrivilegedPcacInputBuilder` uses
+///    `PrivilegedHandlerClass`-parameterized domain tags (e.g.,
+///    `"register-recovery-evidence-boundary_leakage_witness_hash-v1"`), whereas
+///    the admission kernel uses kernel-specific domain tags
+///    (`"apm2-admission-kernel-boundary-leakage-witness-hash-v1"`). Reusing
+///    dispatch's builder would produce different witness hashes, breaking
+///    digest compatibility.
+///
+/// 2. **Field coverage**: The admission kernel requires
+///    `pointer_only_waiver_hash` passthrough and uses the verifier-selected
+///    ledger anchor (not a client-supplied hash) for `as_of_ledger_anchor`.
+///    `PrivilegedPcacInputBuilder` does not support `pointer_only_waiver_hash`.
+///
+/// 3. **Witness hash construction**: The kernel's witness hashes include
+///    `spine_ext_hash` as binding context, which is unique to the admission
+///    kernel lifecycle.
+///
+/// The field mapping below is structurally equivalent to
+/// `PrivilegedPcacInputBuilder::build()` per RS-42 canonical lifecycle
+/// requirements.
 ///
 /// # Arguments
 ///

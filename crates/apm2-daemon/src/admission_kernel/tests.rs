@@ -1583,3 +1583,203 @@ fn test_join_input_uses_verifier_anchor_not_client_hash() {
         "plan anchor must differ from client-supplied directory_head_hash"
     );
 }
+
+// =============================================================================
+// QUALITY MAJOR 1 (TCK-00492): Zero-digest rejection for mandatory fields
+// =============================================================================
+
+#[test]
+fn test_zero_hsi_contract_manifest_digest_denied() {
+    let kernel = fully_wired_kernel();
+    let mut request = valid_request(RiskTier::Tier2Plus);
+    request.hsi_contract_manifest_digest = [0u8; 32];
+    let result = kernel.plan(&request);
+    assert!(
+        result.is_err(),
+        "zero hsi_contract_manifest_digest must be denied"
+    );
+    match result.unwrap_err() {
+        AdmitError::InvalidRequest { reason } => {
+            assert!(
+                reason.contains("hsi_contract_manifest_digest"),
+                "reason should mention hsi_contract_manifest_digest: {reason}"
+            );
+        },
+        other => panic!("expected InvalidRequest, got: {other}"),
+    }
+}
+
+#[test]
+fn test_zero_hsi_envelope_binding_digest_denied() {
+    let kernel = fully_wired_kernel();
+    let mut request = valid_request(RiskTier::Tier2Plus);
+    request.hsi_envelope_binding_digest = [0u8; 32];
+    let result = kernel.plan(&request);
+    assert!(
+        result.is_err(),
+        "zero hsi_envelope_binding_digest must be denied"
+    );
+    match result.unwrap_err() {
+        AdmitError::InvalidRequest { reason } => {
+            assert!(
+                reason.contains("hsi_envelope_binding_digest"),
+                "reason should mention hsi_envelope_binding_digest: {reason}"
+            );
+        },
+        other => panic!("expected InvalidRequest, got: {other}"),
+    }
+}
+
+#[test]
+fn test_zero_stop_budget_digest_denied() {
+    let kernel = fully_wired_kernel();
+    let mut request = valid_request(RiskTier::Tier2Plus);
+    request.stop_budget_digest = [0u8; 32];
+    let result = kernel.plan(&request);
+    assert!(result.is_err(), "zero stop_budget_digest must be denied");
+    match result.unwrap_err() {
+        AdmitError::InvalidRequest { reason } => {
+            assert!(
+                reason.contains("stop_budget_digest"),
+                "reason should mention stop_budget_digest: {reason}"
+            );
+        },
+        other => panic!("expected InvalidRequest, got: {other}"),
+    }
+}
+
+#[test]
+fn test_zero_revocation_head_hash_denied() {
+    let kernel = fully_wired_kernel();
+    let mut request = valid_request(RiskTier::Tier2Plus);
+    request.revocation_head_hash = [0u8; 32];
+    let result = kernel.plan(&request);
+    assert!(result.is_err(), "zero revocation_head_hash must be denied");
+    match result.unwrap_err() {
+        AdmitError::InvalidRequest { reason } => {
+            assert!(
+                reason.contains("revocation_head_hash"),
+                "reason should mention revocation_head_hash: {reason}"
+            );
+        },
+        other => panic!("expected InvalidRequest, got: {other}"),
+    }
+}
+
+// =============================================================================
+// QUALITY MAJOR 2 (TCK-00492): Zero provider_build_digest denial
+// =============================================================================
+
+#[test]
+fn test_zero_provider_build_digest_denied() {
+    let bad_provider = WitnessProviderConfig {
+        provider_id: "apm2-daemon/admission_kernel/test".to_string(),
+        provider_build_digest: [0u8; 32], // zero — unbound measurement
+    };
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), bad_provider)
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(Arc::new(MockAntiRollback::passing()))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let result = kernel.plan(&request);
+
+    assert!(
+        result.is_err(),
+        "zero provider_build_digest must deny plan creation"
+    );
+    match result.unwrap_err() {
+        AdmitError::WitnessSeedFailure { reason } => {
+            assert!(
+                reason.contains("provider_build_digest"),
+                "reason should mention provider_build_digest: {reason}"
+            );
+        },
+        other => panic!("expected WitnessSeedFailure, got: {other}"),
+    }
+}
+
+// =============================================================================
+// SECURITY BLOCKER 2 (TCK-00492): Bounded deserialization for String fields
+// =============================================================================
+
+#[test]
+fn test_spine_ext_bounded_deserialization_rejects_oversized_session_id() {
+    use super::types::MAX_KERNEL_STRING_LENGTH;
+
+    // Build a valid spine ext, then serialize, patch session_id to be
+    // oversized, and deserialize — must fail.
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    // Serialize the spine ext to JSON.
+    let json = serde_json::to_string(&plan.spine_ext).expect("serialize should succeed");
+
+    // Replace session_id with an oversized value.
+    let oversized_session = "X".repeat(MAX_KERNEL_STRING_LENGTH + 1);
+    let patched = json.replace(&plan.spine_ext.session_id, &oversized_session);
+
+    let result: Result<super::types::AdmissionSpineJoinExtV1, _> = serde_json::from_str(&patched);
+    assert!(
+        result.is_err(),
+        "deserialization must reject oversized session_id (len={})",
+        oversized_session.len()
+    );
+}
+
+#[test]
+fn test_witness_seed_bounded_deserialization_rejects_oversized_provider_id() {
+    use super::types::MAX_WITNESS_PROVIDER_ID_LENGTH;
+
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    let json = serde_json::to_string(&plan.leakage_witness_seed).expect("serialize should succeed");
+
+    let oversized_provider = "Y".repeat(MAX_WITNESS_PROVIDER_ID_LENGTH + 1);
+    let patched = json.replace(&plan.leakage_witness_seed.provider_id, &oversized_provider);
+
+    let result: Result<super::types::WitnessSeedV1, _> = serde_json::from_str(&patched);
+    assert!(
+        result.is_err(),
+        "deserialization must reject oversized provider_id (len={})",
+        oversized_provider.len()
+    );
+}
+
+// =============================================================================
+// QUALITY MINOR 1 (TCK-00492): risk_tier and pcac_policy in canonical digest
+// =============================================================================
+
+#[test]
+fn test_canonical_request_digest_differs_by_risk_tier() {
+    let request_t0 = valid_request(RiskTier::Tier0);
+    let mut request_t2 = valid_request(RiskTier::Tier0);
+    request_t2.risk_tier = RiskTier::Tier2Plus;
+
+    let digest_t0 = super::compute_canonical_request_digest(&request_t0);
+    let digest_t2 = super::compute_canonical_request_digest(&request_t2);
+
+    assert_ne!(
+        digest_t0, digest_t2,
+        "canonical request digest must differ when risk_tier differs"
+    );
+}
+
+#[test]
+fn test_canonical_request_digest_differs_by_pcac_policy() {
+    let request_a = valid_request(RiskTier::Tier2Plus);
+    let mut request_b = valid_request(RiskTier::Tier2Plus);
+    request_b.pcac_policy.lifecycle_enforcement = !request_b.pcac_policy.lifecycle_enforcement;
+
+    let digest_a = super::compute_canonical_request_digest(&request_a);
+    let digest_b = super::compute_canonical_request_digest(&request_b);
+
+    assert_ne!(
+        digest_a, digest_b,
+        "canonical request digest must differ when pcac_policy differs"
+    );
+}
