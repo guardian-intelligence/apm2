@@ -210,7 +210,10 @@ pub struct GatesArgs {
     #[arg(long, default_value_t = false)]
     pub quick: bool,
 
-    /// Wall timeout for bounded test execution (seconds).
+    /// Steady-state wall timeout for bounded test execution (seconds).
+    ///
+    /// FAC may temporarily widen this window for cold-cache warm-up runs when
+    /// the default value is used.
     #[arg(long, default_value_t = 240)]
     pub timeout_seconds: u64,
 

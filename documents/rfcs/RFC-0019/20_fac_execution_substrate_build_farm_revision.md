@@ -38,15 +38,43 @@ This amendment is a build-farm "kernel" spec. The following are MUSTs:
 
 1. **Safety > speed.** The substrate MUST prevent catastrophic host failure (disk/mem/CPU/PIDs/IO exhaustion) even with multiple autonomous agents.
 2. **Incremental deployability.** Every phase MUST be useful on a single VPS, MUST have rollback, and MUST NOT require a distributed system.
-3. **Networkless semantics.** Job/lane semantics MUST NOT assume networking. Networking is a bolt-on transport layer later.
+3. **Networkless control-plane semantics.** Job/lane semantics MUST NOT assume inter-node networking or remote services. Networking MAY exist for tool/dependency retrieval (e.g., crates.io), but MUST NOT be required for correctness of scheduling, leases, receipts, or cache-reuse decisions. Any network use MUST be explicit, best-effort, and never authoritative.
 4. **Declarative substrate target.** The design MUST map cleanly to flakes now and future NixOS modules later.
 5. **Fail-closed attestation semantics.** If anything that can affect correctness changes, gate-cache reuse MUST NOT silently continue.
 6. **No ambient user state reliance.** FAC MUST NOT depend on aliases/dotfiles/`~/.cargo/config.toml`; FAC MUST set policy explicitly.
 7. **No new long-lived bash daemons.** Control plane MUST be Rust and/or systemd-managed units. Bash scripts may exist only as transitional leaf executors.
 
+## 0.2 Scope and non-goals (normative)
+
+This amendment is explicitly scoped to **local host survivability + correctness** for running FAC evidence gates on a single node, with seams for later distribution.
+
+### In scope
+* Resource governance + backpressure for **evidence-gate execution** (`apm2 fac gates`, `apm2 fac pipeline` evidence phase, and new warm/GC maintenance).
+* Correctness fail-closed semantics for **gate-cache reuse** (attestation inputs, provenance binding, policy hashing).
+* Deterministic, symlink-safe cleanup primitives and disk preflight/GC enforcement.
+* Local-first queue/leasing semantics that do **not** require networking.
+
+### Out of scope (non-goals)
+* Any redesign of FAC cryptography, PCAC/AJC semantics, or ledger protocol.
+* "Full sandboxing" (containers/VMs) as a hard requirement in v1.
+* Distributed routing, remote compilation caches, or multi-node consensus scheduling (later phases may add transport, not new semantics).
+
+## 0.3 Repo-grounded primitives to reuse (normative)
+
+To avoid inventing redundant mechanisms, FESv1 MUST reuse existing repo primitives where they already meet the safety/correctness needs:
+
+* **APM2 home root:** `apm2_home_dir()` already defines `$APM2_HOME` and is used by FAC gate cache + evidence logs today.
+* **Existing v2 gate cache + attestation:** `private/fac/gate_cache_v2` and `fac_review/gate_attestation.rs` are the current authority for reuse decisions; amendments must compose with that, not fork it.
+* **Proven slot leasing pattern:** `fac_review/model_pool.rs::acquire_provider_slot` is the existing file-lock + jitter + RAII pattern; reuse it rather than inventing a second locking scheme.
+* **Canonical JSON:** `apm2_core::determinism::canonicalize_json` is the canonicalizer; do not create ad-hoc "sorted keys" serializers.
+* **Hash vocabulary alignment:** the repo already standardizes BLAKE3 "hash refs" with the `b3-256:` prefix (see `apm2_core::crypto` / schema registry traits). New substrate digests MUST use the same prefix and encoding unless explicitly justified.
+
+If this amendment proposes a new primitive that overlaps an existing one, it MUST justify why reuse is insufficient (and what the migration path is).
+
 ## 0.1 Terminology (local build-farm primitives)
 
 * **Lane**: A bounded, cullable execution context with deterministic identity, dedicated workspace+target namespace, and a fixed resource profile.
+  **Normative clarification:** In FESv1, *lanes are the sole concurrency primitive*. Any "slot/compute slot" terminology elsewhere is an alias for "lane" and MUST NOT be implemented as a second independent semaphore.
 * **Job**: An immutable spec (what to run, against which inputs) that is queued, leased to a lane, executed, and yields receipts.
 * **Receipt stream**: An append-only, mergeable set of immutable receipts; receipts are the ground truth, not runtime state.
   Ordering for presentation MUST be derived from HTF stamps when available, otherwise from a deterministic fallback tuple
@@ -137,6 +165,18 @@ Correctness footgun (missing in the draft, and currently **fail-open**):
   * prove `HEAD==sha` + clean tree for any cacheable pipeline run, OR
   * execute from an isolated checkout at `sha` (preferred), OR
   * incorporate a dirty-diff digest into attestation input material and disable cache reuse when unknown.
+
+### 1.2.1 Repo-grounded additional hazard: evidence logs are global and race-prone
+
+Today, evidence logs are written under a fixed path per gate:
+* `~/.apm2/private/fac/evidence/{gate}.log`
+
+This is **not concurrency-safe**. Multiple simultaneous `apm2 fac gates` runs (across worktrees, or pipeline + local gates) can:
+* truncate each other's logs,
+* interleave output,
+* and destroy forensic value during incident/debugging.
+
+FESv1 MUST define **per-job (or per-lane) log namespaces** and MUST NOT write to a single global `{gate}.log` path once concurrent execution is supported.
 
 ### 1.3 Gate cache and attestation today
 
@@ -274,7 +314,7 @@ Each lane is:
   produced from a node-local **bare mirror** (see §4.2.1)
 * a long-lived, **cullable** execution context (resettable without touching other lanes)
 * a fixed resource profile (enforced via systemd/cgroups)
-* a dedicated target namespace: `$APM2_HOME/private/fac/lanes/<lane_id>/target/<toolchain_fingerprint>`
+* a dedicated target namespace (**the** target pool): `$APM2_HOME/private/fac/lanes/<lane_id>/target/<toolchain_fingerprint>`
 * a dedicated log namespace: `$APM2_HOME/private/fac/lanes/<lane_id>/logs`
 
 Lane lifecycle (persisted via receipts + lease records; runtime is not authoritative):
@@ -307,6 +347,8 @@ The substrate MUST enforce a finite number of concurrent heavy jobs by construct
 * `lane_count` is finite (default derived from memory policy; on the current box: 3).
 * each lane runs **at most one job at a time** (exclusive lease).
 * each job executes under lane resource limits (CPU/memory/PIDs/IO + timeouts).
+
+**Non-duplication invariant:** FESv1 MUST NOT introduce a second concurrency governor ("compute slots") independent from lane leasing. If a later section discusses "slots", those slots MUST map 1:1 to lanes and reuse the lane lock/lease record.
 
 ### 4.4 Leasing (mechanism, not vibes)
 
@@ -370,13 +412,20 @@ GC and lane reset MUST NOT use naive recursive deletion (e.g., `rm -rf` or `std:
 
 Required deletion primitive: `safe_rmtree_v1(root, allowed_parent)`:
 
-* canonicalize `allowed_parent` and `root`
-* verify `root.starts_with(allowed_parent)` after canonicalization
-* refuse to operate if **any path component** between `allowed_parent` and `root` is a symlink
-* delete by walking directory entries using `symlink_metadata()` and:
-  * unlink symlinks as files (do not follow)
-  * recurse into directories only after verifying they are not symlinks
-* on any ambiguity or TOCTOU suspicion → fail closed and mark lane CORRUPT (requires manual reset)
+* Inputs MUST be absolute paths. `allowed_parent` MUST be a directory owned by the current user and mode 0700 (or stricter).
+* The implementation MUST NOT rely on `std::fs::canonicalize()` as its primary safety check (it follows symlinks and creates TOCTOU windows).
+* The implementation MUST enforce **no symlink traversal** using one of:
+  * (preferred) file-descriptor-relative walking (`openat`/`cap-std`) with `O_NOFOLLOW` and `AT_SYMLINK_NOFOLLOW`-style checks, or
+  * a conservative "refuse-on-ambiguity" walk that verifies each component with `symlink_metadata()` immediately before opening/removing it.
+* `root` MUST be verified to be strictly under `allowed_parent` **by path component**, not by string prefix.
+* The deleter MUST:
+  * unlink symlinks as files (never follow),
+  * refuse to cross filesystem boundaries unless explicitly allowed by policy,
+  * and refuse to delete if it encounters unexpected file types (device nodes, sockets) unless policy explicitly allows.
+* On any ambiguity or suspicious race, `safe_rmtree_v1` MUST:
+  * abort,
+  * write a "refused_delete" receipt,
+  * and mark the lane CORRUPT.
 
 This is non-negotiable: one symlink bug can delete the host.
 
@@ -400,6 +449,15 @@ Implementations MUST:
 * enforce `max_gate_capture_bytes` for any in-memory summaries (e.g., last N KB),
 * record truncation in receipts/metadata so debugging remains possible without risking host stability.
 
+Additional hard requirements (normative):
+* Log paths MUST be unique per (lane_id, job_id, gate_name). A global `{gate}.log` path is forbidden once concurrency exists.
+* Implementations MUST continue draining pipes after `max_gate_log_bytes` is reached to avoid child-process deadlock (i.e., "truncate on disk, discard thereafter").
+* If logs are truncated, the receipt MUST include:
+  * `log_truncated: true`
+  * `log_bytes_written`
+  * `log_bytes_discarded_estimate` (best-effort counter)
+  * and the sentinel marker MUST be deterministic (stable bytes) so the log digest is stable.
+
 ---
 
 ## 5. Interfaces (precise; implementable)
@@ -418,9 +476,13 @@ Required layout:
 * `private/fac/lanes/<lane_id>/workspace/`
 * `private/fac/lanes/<lane_id>/target/<toolchain_fingerprint>/`
 * `private/fac/lanes/<lane_id>/logs/`
+* `private/fac/lanes/<lane_id>/logs/<job_id>/` (per-job log namespace; required once queueing/concurrency exists)
 * `private/fac/queue/{pending,claimed,done,cancelled}/`
 * `private/fac/receipts/` (content-addressed receipt objects; see §5.3)
 * `private/fac/locks/` (lane locks, queue locks, optional global locks)
+* `private/fac/evidence/` (**legacy**; existing global per-gate logs; will be deprecated in favor of per-lane/per-job logs)
+* `private/fac/repo_mirror/` (bare mirrors; §4.2.1)
+* `private/fac/cargo_home/` (FAC-managed `CARGO_HOME`; §5.4 / §10.4)
 
 Legacy compatibility:
 * `private/fac/gate_cache_v2/` remains during migration; new receipts MUST record enough to migrate away from it later.
@@ -497,13 +559,15 @@ All schemas MUST:
 Canonical hashing rules:
 * Hash input is canonical JSON bytes. Implementations MUST reuse the repo's canonicalization primitive
   (`apm2_core::determinism::canonicalize_json`) rather than ad-hoc "sorted keys" serializers.
-* Hash algorithm for lane/job receipts is **BLAKE3** with domain separation:
-  * `hash = blake3("apm2:fac:<schema_id>:v1\0" || canonical_json_bytes)`
-* Hashes are encoded as lowercase hex and prefixed: `blake3:<hex>`
+* Hash algorithm for substrate receipts/specs is **BLAKE3-256**, aligned with existing APM2 hash refs.
+  Implementations MUST use the same hex encoding and prefix format used in the repo (`b3-256:<hex>`).
+* Domain separation is achieved by hashing `schema` + NUL + canonical JSON:
+  `hash_bytes = (schema_id || "\0" || canonical_json_bytes)`
+  `digest = blake3(hash_bytes)`
 
 Storage rules:
 * Each receipt is stored content-addressed:
-  * `$APM2_HOME/private/fac/receipts/<hash>.json`
+  * `$APM2_HOME/private/fac/receipts/<hex>.json` (filename is hex only; `b3-256:` prefix is a logical ref, not part of the path)
 * Queue objects are stored by job_id:
   * `$APM2_HOME/private/fac/queue/pending/<job_id>.json`
 
@@ -513,7 +577,7 @@ Storage rules:
 {
   "schema": "apm2.fac.lane_profile.v1",
   "lane_id": "lane-00",
-  "node_fingerprint": "blake3:…",
+  "node_fingerprint": "b3-256:…",
   "resource_profile": {
     "cpu_quota_percent": 200,
     "memory_max_bytes": 25769803776,
@@ -525,7 +589,7 @@ Storage rules:
     "job_runtime_max_seconds": 1800
   },
   "policy": {
-    "fac_policy_hash": "sha256:…",
+    "fac_policy_hash": "b3-256:…",
     "nextest_profile": "ci",
     "deny_ambient_cargo_home": true
   }
@@ -536,7 +600,7 @@ Lane profile storage:
 * `$APM2_HOME/private/fac/lanes/<lane_id>/profile.v1.json`
 
 Lane profile hash:
-* `LaneProfileHash = blake3(canonical(LaneProfileV1))`
+* `LaneProfileHash = b3-256(canonical(LaneProfileV1))`
 
 #### 5.3.1.1 `FacPolicyV1` (mandatory hashed policy object)
 
@@ -549,7 +613,20 @@ It MUST include (at minimum):
 * safe deletion root allowlist (GC and resets)
 * provenance policy (mirror_commit vs patch_injection admission rules)
 
+Required environment policy fields (normative minimum):
+* `env_clear_by_default: bool` (default true for bounded execution)
+* `env_allowlist: [string]` (exact variable names)
+* `env_denylist_prefixes: [string]` (e.g., `AWS_`, `GITHUB_`, `SSH_`, `OPENAI_`), applied after allowlist to prevent "oops we allowed too much"
+* `env_set: { key: value }` for enforced variables:
+  * `CARGO_HOME=$APM2_HOME/private/fac/cargo_home`
+  * `CARGO_TARGET_DIR=$APM2_HOME/private/fac/lanes/<lane_id>/target/<toolchain_fingerprint>`
+  * `NEXTEST_TEST_THREADS=<computed>`
+  * `CARGO_BUILD_JOBS=<computed>`
+
+If `env_clear_by_default` is true, implementations MUST ensure required runtime variables (PATH, TERM when needed) are explicitly set, not inherited implicitly.
+
 Any change to `FacPolicyV1` MUST change `FacPolicyHash` (fail-closed).
+`FacPolicyHash` MUST be computed using the same `b3-256:` hash ref rules as other substrate objects.
 
 #### 5.3.2 `LaneLeaseV1`
 
@@ -598,6 +675,14 @@ Storage:
 Dirty-tree rule (reframed to match FESv1 provenance):
 * `patch_injection` is the **only** way to run dirty content while preserving fail-closed cache semantics.
 * Any run executed from an ambient caller worktree is permitted only in explicitly-uncacheable modes (e.g., `--quick`).
+
+**Required schema correction (digest vocabulary):**
+If `patch_injection` is used, the patch object MUST use `b3-256:` digests (not `blake3:`) and MUST specify where bytes live.
+This amendment allows two storage backends (choose one; do not invent a third):
+1) `bytes_backend: "fac_blobs_v1"` with bytes stored under `$APM2_HOME/private/fac/blobs/<hex>`
+2) `bytes_backend: "apm2_cas"` with bytes stored under the existing CAS root (requires explicit GC policy decisions; see §6.2)
+
+If `bytes_backend` is omitted or unknown, gate-cache reuse MUST be disabled (fail-closed).
 
 #### 5.3.4 `FacJobReceiptV1`
 
@@ -674,7 +759,7 @@ Minimum required changes to the current attestation:
 Policy hashing:
 
 * define a single authoritative `FacPolicyV1` in Rust (and optionally emitted to `$APM2_HOME/private/fac/policy/fac_policy.v1.json` for inspection)
-* `FacPolicyHash = sha256(canonical_json(FacPolicyV1))`
+* `FacPolicyHash = b3-256(canonical_json(FacPolicyV1))`
 * any change to timeouts, resource caps, allowlists, or tool requirements MUST change `FacPolicyHash`
 
 ---
@@ -704,7 +789,8 @@ Default policy for the current node class:
 GC MAY delete only:
 * lane targets under `private/fac/lanes/*/target/*` (excluding leased/running lanes)
 * lane logs under `private/fac/lanes/*/logs` beyond retention/quota
-* FAC evidence logs under `private/fac/evidence` beyond retention/quota
+* FAC evidence logs under `private/fac/evidence` beyond retention/quota (legacy; eventually only per-lane/per-job logs)
+* FAC-managed cargo cache roots under `private/fac/cargo_home` **only as an escalation step** (cargo registry/git caches can dominate disk usage on small disks)
 * (optional) gate cache entries beyond TTL (legacy)
 * (future) sccache dirs under FAC-controlled roots, if enabled
 
@@ -740,13 +826,14 @@ Rollback:
 Deliverables:
 * implement `LaneProfileV1`, deterministic `lane_id` set (default 3 lanes on this box)
 * implement lane lease locks + lease records
-* implement per-lane `CARGO_TARGET_DIR` under lane target namespace
+* implement per-lane `CARGO_TARGET_DIR` under lane target namespace (**this is the target pool; no separate target_pool root**)
 * implement `apm2 fac lane status`
 * implement `apm2 fac gates` acquiring a lane lease internally
 
 Acceptance criteria:
 * three concurrent `apm2 fac gates` invocations never exceed lane count
 * target reuse collapses disk usage vs many worktrees (qualitative)
+* evidence logs are per-lane/per-job and do not clobber across concurrent runs
 
 Rollback:
 * `APM2_FAC_LANES=0` (or `--legacy`) runs old path; lane directories remain but are inert
@@ -806,7 +893,7 @@ An evidence bundle is a content-addressed set with a manifest:
 
 ### 8.2 Hashing + addressing
 
-* each blob is addressed by `blake3:<hex>`
+* each blob is addressed by `b3-256:<hex>`
 * manifest schema (proposed): `apm2.fac.evidence_bundle_manifest.v1`
 * bundle id = blake3(canonical(manifest))
 
@@ -902,9 +989,9 @@ Why this exists:
 
 Policy:
 
-* Every "heavy" FAC operation (gates, pipeline evidence, warm) acquires a compute slot.
-* On slot acquisition, FAC sets:
-  * `CARGO_TARGET_DIR=$APM2_HOME/private/fac/target_pool/<toolchain_fingerprint>/slot_<i>`
+* Every "heavy" FAC operation (gates, pipeline evidence, warm) acquires a **lane lease**.
+* On lane acquisition, FAC sets:
+  * `CARGO_TARGET_DIR=$APM2_HOME/private/fac/lanes/<lane_id>/target/<toolchain_fingerprint>`
   * `CARGO_BUILD_JOBS=<computed>`
   * `NEXTEST_TEST_THREADS=<computed>`
 * FAC must **override** any ambient `CARGO_TARGET_DIR` rather than inheriting it.
@@ -949,8 +1036,7 @@ Rationale:
 
 We standardize:
 
-* `FAC_TARGET_POOL_ROOT = $APM2_HOME/private/fac/target_pool`
-* `CARGO_TARGET_DIR = $FAC_TARGET_POOL_ROOT/<toolchain_fingerprint>/slot_<i>`
+* `CARGO_TARGET_DIR = $APM2_HOME/private/fac/lanes/<lane_id>/target/<toolchain_fingerprint>`
 
 If sccache is enabled later:
 
@@ -1247,62 +1333,21 @@ Include:
 
 ## 13. Global resource governor: stop pretending per-command limits are sufficient
 
-### 13.1 The missing control plane
+### 13.1 Lane leasing is the global resource governor (normative)
 
-Today, only the test gate is bounded by `systemd-run`. That does not provide "host survivability" under multiple agents.
+This section is **subsumed by lane leasing (§4.4)**. FESv1 MUST NOT implement an additional independent "compute slot" semaphore.
+Instead:
+* Lane count is the concurrency limit.
+* The lane lock file is the lease token.
+* The lane lease record is the metadata sidecar used by GC/debugging.
 
-This amendment introduces a minimal, incremental control plane:
-
-* A local **compute lease** system (file-lock-based) that limits concurrent heavy operations.
-
-### 13.2 Compute lease model (Phase 1)
-
-Implement a token semaphore under:
-
-* `$APM2_HOME/private/fac/locks/compute_slot_<i>.lock` for i ∈ [0, N)
-
-Do not invent this from scratch: the repo already has a proven pattern for "slot leasing via file locks"
-(`fac_review/model_pool.rs::acquire_provider_slot`). Reuse that approach (jitter, timeout, RAII guard).
-
-Default N computed as:
-
-* `N = min(3, floor((total_mem_gib - reserve_gib) / mem_per_gate_gib))`
-
-  * reserve_gib default: 20
-  * mem_per_gate_gib default: 24 (aligned with bounded tests)
-
-For your box, N should evaluate to 3.
-
-Any heavy operation must acquire a slot:
-
+All "heavy" FAC operations MUST acquire a lane lease:
 * `apm2 fac gates` (full mode)
 * `apm2 fac warm`
-* `apm2 fac pipeline` evidence phase (background push/restart path)
+* `apm2 fac pipeline` evidence phase
 * `apm2 fac gc` when invoked in enforcement mode (preflight-triggered), because it competes for IO
 
-Lease is held for the duration; released on exit (Drop guard).
-
-### 13.2.3 Lease metadata (required for GC safety + debugging)
-
-On acquisition, write a sidecar JSON (not locked, but best-effort, overwrite-safe):
-
-* `$APM2_HOME/private/fac/locks/compute_slot_<i>.json`
-
-Fields:
-
-* pid
-* command (gates/warm/pipeline/gc)
-* workspace_root
-* started_at
-* toolchain_fingerprint (see §10.1)
-
-This single mechanism prevents:
-
-* 10 agents all running clippy/doc simultaneously
-* warm stampedes
-* silent death-by-IO
-
-### 13.3 Compute-aware `CARGO_BUILD_JOBS` (Phase 1)
+### 13.2 Lane-aware `CARGO_BUILD_JOBS` + `NEXTEST_TEST_THREADS` (Phase 1)
 
 When a process acquires a compute slot, it computes a default `CARGO_BUILD_JOBS`:
 
@@ -1618,6 +1663,12 @@ ticket_meta:
       - "Attestation digest changes when .cargo/config.toml changes."
       - "Attestation digest changes when rustfmt version changes."
       - "No gate cache reuse occurs across these changes."
+
+5. Concurrency + log safety checks (new; mandatory):
+   * Run two simultaneous `apm2 fac gates` runs and confirm:
+     * logs do not clobber each other (distinct per-lane/per-job paths),
+     * log caps are enforced without deadlocking child processes,
+     * evidence digests (when recorded) refer to the correct job's logs.
 ```
 
 ### TCK-00505 — Implement `apm2 fac gc` with enforced disk preflight (worktree targets + target pool + caches)
@@ -1671,7 +1722,7 @@ ticket_meta:
       MUST protect against symlink traversal: only delete canonical paths under allowed roots, and refuse if any path component is a symlink.
 ```
 
-### TCK-00506 — Compute lease semaphore + target pool substrate (cap concurrency, reuse builds)
+### TCK-00506 — Lane leasing + lane-scoped target pool (cap concurrency, reuse builds)
 
 ```yaml
 ticket_meta:
@@ -1679,7 +1730,7 @@ ticket_meta:
   template_version: "2026-01-29"
   ticket:
     id: "TCK-00506"
-    title: "Add FAC compute slots + target pool substrate (cap concurrency, reuse builds across worktrees)"
+    title: "Add FAC lane leasing + lane-scoped target pool (cap concurrency, reuse builds across worktrees)"
     status: "OPEN"
   binds:
     prd_id: "PRD-0009"
@@ -1693,13 +1744,13 @@ ticket_meta:
     tickets: []
   scope:
     in_scope:
-      - "Introduce file-lock-based compute slots under $APM2_HOME/private/fac/locks/compute_slot_<i>.lock."
-      - "Acquire a slot for apm2 fac warm, apm2 fac gates (full mode), and pipeline evidence execution."
+      - "Introduce file-lock-based lane leases under $APM2_HOME/private/fac/locks/lanes/<lane_id>.lock."
+      - "Acquire a lane for apm2 fac warm, apm2 fac gates (full mode), and pipeline evidence execution."
       - "Use slot count default derived from memory policy (96GB -> 3 slots)."
       - "Compute conservative default CARGO_BUILD_JOBS based on cpu_count / slots."
       - "Set NEXTEST_TEST_THREADS based on cpu_count / slots to prevent runtime oversubscription."
       - "Implement slot metadata sidecar ($APM2_HOME/private/fac/locks/compute_slot_<i>.json) for GC safety + debugging."
-      - "Implement target pool: on slot acquisition set CARGO_TARGET_DIR=$APM2_HOME/private/fac/target_pool/<toolchain_fingerprint>/slot_<i> (override any ambient CARGO_TARGET_DIR)."
+      - "Implement target pool: on lane acquisition set CARGO_TARGET_DIR=$APM2_HOME/private/fac/lanes/<lane_id>/target/<toolchain_fingerprint> (override any ambient CARGO_TARGET_DIR)."
     out_of_scope:
       - "Distributed leasing across nodes (future holonic lease integration)."
   plan:

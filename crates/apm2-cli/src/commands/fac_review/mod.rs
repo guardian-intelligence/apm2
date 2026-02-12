@@ -39,6 +39,7 @@ mod restart;
 mod selector;
 mod state;
 mod target;
+mod timeout_policy;
 mod types;
 mod worktree;
 
