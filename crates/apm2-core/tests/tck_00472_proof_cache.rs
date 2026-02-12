@@ -20,26 +20,30 @@ const fn default_policy() -> ProofCachePolicy {
     }
 }
 
+/// Creates a properly bound `VerificationInput` where `proof_key ==
+/// blake3::hash(payload)`.
 fn make_input(id: u8) -> VerificationInput {
+    let payload = vec![id];
+    let proof_key = *blake3::hash(&payload).as_bytes();
+    VerificationInput { proof_key, payload }
+}
+
+/// Creates a properly bound `VerificationInput` from a `usize` where
+/// `proof_key == blake3::hash(payload)`.
+fn make_input_from_usize(id: usize) -> VerificationInput {
+    let payload = id.to_le_bytes().to_vec();
+    let proof_key = *blake3::hash(&payload).as_bytes();
+    VerificationInput { proof_key, payload }
+}
+
+/// Creates an UNBOUND `VerificationInput` where `proof_key !=
+/// blake3::hash(payload)`. Used to test the proof-key binding validation.
+fn make_unbound_input(id: u8) -> VerificationInput {
     let mut key = [0u8; 32];
     key[0] = id;
     VerificationInput {
         proof_key: key,
         payload: vec![id],
-    }
-}
-
-fn make_input_from_usize(id: usize) -> VerificationInput {
-    let bytes = id.to_le_bytes();
-    let mut key = [0u8; 32];
-    for (i, b) in bytes.iter().enumerate() {
-        if i < 32 {
-            key[i] = *b;
-        }
-    }
-    VerificationInput {
-        proof_key: key,
-        payload: bytes.to_vec(),
     }
 }
 
@@ -52,7 +56,7 @@ fn assert_defect_code(err: ProofCacheError, expected: ProofCacheDefectCode) {
         ProofCacheError::Defect(d) => {
             assert_eq!(d.code, expected);
         },
-        _ => panic!("expected ProofCacheError::Defect, got {err:?}"),
+        other => panic!("expected ProofCacheError::Defect, got {other:?}"),
     }
 }
 
@@ -282,10 +286,12 @@ fn cache_disabled_always_computes() {
 fn verify_batch_preserves_input_order() {
     let mut cache = ProofCache::new(default_policy()).expect("cache creation");
 
-    let inputs = vec![make_input(10), make_input(20), make_input(30)];
+    let input_deny = make_input(20);
+    let deny_key = input_deny.proof_key;
+    let inputs = vec![make_input(10), input_deny, make_input(30)];
     let results = cache
         .verify_batch(&inputs, 0, |input| {
-            if input.proof_key[0] == 20 {
+            if input.proof_key == deny_key {
                 VerificationResult::Deny(ProofCacheDefect {
                     code: ProofCacheDefectCode::UnresolvedCacheBinding,
                     message: "deliberately denied for test".into(),
@@ -475,4 +481,194 @@ fn mixed_hit_miss_batch() {
     assert_eq!(results[1], VerificationResult::Pass);
     assert_eq!(compute_count, 1, "only input 2 should be computed");
     assert_eq!(cache.metrics().cache_hits, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Security fix tests: proof-key binding, clock regression, no-reuse insertion
+// ---------------------------------------------------------------------------
+
+/// MAJOR 1 test: `proof_key != blake3(payload)` must produce
+/// `UnresolvedCacheBinding` deny.
+#[test]
+fn proof_key_payload_mismatch_denied() {
+    let mut cache = ProofCache::new(default_policy()).expect("cache creation");
+
+    // Create an unbound input where proof_key != blake3::hash(payload).
+    let unbound = make_unbound_input(42);
+
+    let results = cache
+        .verify_batch(std::slice::from_ref(&unbound), 0, pass_verifier)
+        .expect("batch");
+    assert_eq!(results.len(), 1);
+    match &results[0] {
+        VerificationResult::Deny(d) => {
+            assert_eq!(d.code, ProofCacheDefectCode::UnresolvedCacheBinding);
+            assert!(
+                d.message.contains("does not match BLAKE3"),
+                "message should reference BLAKE3 mismatch: {}",
+                d.message
+            );
+        },
+        VerificationResult::Pass => panic!("unbound proof key must produce Deny"),
+    }
+}
+
+/// MAJOR 1 test: cache hit with altered payload must be denied.
+/// First batch: valid entry cached. Second batch: same `proof_key` but
+/// different payload. The binding check must catch the mismatch before the
+/// cache lookup.
+#[test]
+fn cache_hit_with_altered_payload_denied() {
+    let mut cache = ProofCache::new(default_policy()).expect("cache creation");
+
+    // First batch: valid bound input.
+    let valid = make_input(1);
+    let cached_key = valid.proof_key;
+    let results = cache
+        .verify_batch(std::slice::from_ref(&valid), 0, pass_verifier)
+        .expect("batch 1");
+    assert_eq!(results[0], VerificationResult::Pass);
+
+    // Second batch: same proof_key but different payload (tampered).
+    let tampered = VerificationInput {
+        proof_key: cached_key,
+        payload: vec![0xFF, 0xFE, 0xFD], // different payload
+    };
+    let results = cache
+        .verify_batch(std::slice::from_ref(&tampered), 1, pass_verifier)
+        .expect("batch 2");
+    assert_eq!(results.len(), 1);
+    match &results[0] {
+        VerificationResult::Deny(d) => {
+            assert_eq!(d.code, ProofCacheDefectCode::UnresolvedCacheBinding);
+        },
+        VerificationResult::Pass => panic!("tampered payload must produce Deny"),
+    }
+}
+
+/// MAJOR 2 test: clock regression at lookup level must produce
+/// `StaleCacheEntry`.
+#[test]
+fn clock_regression_lookup_denied() {
+    let mut cache = ProofCache::new(default_policy()).expect("cache creation");
+    let key = [0xCC; 32];
+
+    // Insert at tick 100.
+    cache
+        .insert(key, VerificationResult::Pass, 100)
+        .expect("insert");
+
+    // Lookup at tick 50 — clock has regressed.
+    let err = cache
+        .lookup(&key, 50)
+        .expect_err("clock regression must deny");
+    match err {
+        ProofCacheError::Defect(d) => {
+            assert_eq!(d.code, ProofCacheDefectCode::StaleCacheEntry);
+            assert!(
+                d.message.contains("clock regression"),
+                "message should reference clock regression: {}",
+                d.message
+            );
+        },
+        other => panic!("expected ProofCacheError::Defect, got {other:?}"),
+    }
+}
+
+/// MAJOR 2 test: clock regression in batch must produce deny result.
+#[test]
+fn clock_regression_in_batch_denied() {
+    let mut cache = ProofCache::new(default_policy()).expect("cache creation");
+    let input = make_input(7);
+
+    // First batch at tick 100 — populates cache.
+    let results = cache
+        .verify_batch(std::slice::from_ref(&input), 100, pass_verifier)
+        .expect("batch 1");
+    assert_eq!(results[0], VerificationResult::Pass);
+
+    // Second batch at tick 50 — clock regression.
+    let results = cache
+        .verify_batch(std::slice::from_ref(&input), 50, pass_verifier)
+        .expect("batch 2");
+    assert_eq!(results.len(), 1);
+    match &results[0] {
+        VerificationResult::Deny(d) => {
+            assert_eq!(d.code, ProofCacheDefectCode::StaleCacheEntry);
+            assert!(
+                d.message.contains("clock regression"),
+                "message should reference clock regression: {}",
+                d.message
+            );
+        },
+        VerificationResult::Pass => panic!("clock regression must produce Deny"),
+    }
+}
+
+/// MINOR 1 test: `allow_reuse=false` must not insert entries into the cache.
+#[test]
+fn no_reuse_does_not_insert_entries() {
+    let policy = ProofCachePolicy {
+        max_entries: 2,
+        allow_reuse: false,
+        ..default_policy()
+    };
+    let mut cache = ProofCache::new(policy).expect("cache creation");
+
+    // Process 10 unique inputs with allow_reuse=false.
+    let inputs: Vec<VerificationInput> = (0u8..10).map(make_input).collect();
+    let results = cache
+        .verify_batch(&inputs, 0, pass_verifier)
+        .expect("batch");
+
+    // All must pass (no capacity denials despite max_entries=2).
+    assert_eq!(results.len(), 10);
+    for (i, result) in results.iter().enumerate() {
+        assert_eq!(
+            *result,
+            VerificationResult::Pass,
+            "input {i} should pass when allow_reuse=false"
+        );
+    }
+
+    // Cache should be empty since insertion was bypassed.
+    assert!(
+        cache.is_empty(),
+        "cache must be empty when allow_reuse=false"
+    );
+    assert_eq!(cache.len(), 0);
+}
+
+/// MINOR 1 test: `allow_reuse=false` with very small capacity and high
+/// cardinality must never produce `CacheCapacityExceeded`.
+#[test]
+fn no_reuse_high_cardinality_no_capacity_deny() {
+    let policy = ProofCachePolicy {
+        max_entries: 1,
+        allow_reuse: false,
+        ..default_policy()
+    };
+    let mut cache = ProofCache::new(policy).expect("cache creation");
+
+    // Process 100 unique inputs with max_entries=1 and allow_reuse=false.
+    let inputs: Vec<VerificationInput> = (0u8..100).map(make_input).collect();
+    let results = cache
+        .verify_batch(&inputs, 0, pass_verifier)
+        .expect("batch");
+
+    // All must pass — no capacity denials.
+    assert_eq!(results.len(), 100);
+    for (i, result) in results.iter().enumerate() {
+        assert_eq!(
+            *result,
+            VerificationResult::Pass,
+            "input {i} should pass — no insertion means no capacity overflow"
+        );
+    }
+
+    // Cache must remain empty.
+    assert!(
+        cache.is_empty(),
+        "cache must be empty when allow_reuse=false"
+    );
 }

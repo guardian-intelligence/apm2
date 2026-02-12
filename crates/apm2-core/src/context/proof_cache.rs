@@ -293,6 +293,18 @@ impl ProofCache {
 
         let key_hex = hex::encode(proof_key);
 
+        // Clock regression check: deny if tick has gone backwards.
+        if current_tick < entry.creation_tick {
+            return Err(ProofCacheError::Defect(ProofCacheDefect {
+                code: ProofCacheDefectCode::StaleCacheEntry,
+                message: format!(
+                    "clock regression: current tick {current_tick} < creation tick {}",
+                    entry.creation_tick,
+                ),
+                proof_key_hex: Some(key_hex),
+            }));
+        }
+
         // Freshness check: tick-based TTL.
         let age = current_tick.saturating_sub(entry.creation_tick);
         if age > self.policy.max_ttl_ticks {
@@ -416,6 +428,22 @@ impl ProofCache {
         let mut seen_count: usize = 0;
 
         for input in inputs {
+            // Enforce proof_key = BLAKE3(payload) at trust boundary.
+            let expected_key = *blake3::hash(&input.payload).as_bytes();
+            if expected_key != input.proof_key {
+                let result = VerificationResult::Deny(ProofCacheDefect {
+                    code: ProofCacheDefectCode::UnresolvedCacheBinding,
+                    message: format!(
+                        "proof key does not match BLAKE3 hash of payload (key={})",
+                        hex::encode(input.proof_key)
+                    ),
+                    proof_key_hex: Some(hex::encode(input.proof_key)),
+                });
+                unique_results.insert(input.proof_key, result);
+                seen_count = seen_count.saturating_add(1);
+                continue;
+            }
+
             if unique_results.contains_key(&input.proof_key) {
                 // Already resolved in this batch.
                 continue;
@@ -429,24 +457,25 @@ impl ProofCache {
                     unique_results.insert(input.proof_key, result);
                 },
                 Ok(CacheVerdict::Miss) => {
-                    // Compute.
                     self.metrics.cache_misses = self.metrics.cache_misses.saturating_add(1);
                     let result = verifier_fn(input);
-                    // Insert into cache (best-effort — capacity exceeded is
-                    // surfaced as a deny for this input).
-                    match self.insert(input.proof_key, result.clone(), current_tick) {
-                        Ok(()) => {},
-                        Err(ProofCacheError::Defect(defect))
-                            if defect.code == ProofCacheDefectCode::CacheCapacityExceeded =>
-                        {
-                            // Record as deny for this key; do not propagate as
-                            // batch-level error — the input still gets a
-                            // deterministic deny.
-                            unique_results
-                                .insert(input.proof_key, VerificationResult::Deny(defect));
-                            continue;
-                        },
-                        Err(e) => return Err(e),
+                    if self.policy.allow_reuse {
+                        // Insert into cache (best-effort — capacity exceeded is
+                        // surfaced as a deny for this input).
+                        match self.insert(input.proof_key, result.clone(), current_tick) {
+                            Ok(()) => {},
+                            Err(ProofCacheError::Defect(defect))
+                                if defect.code == ProofCacheDefectCode::CacheCapacityExceeded =>
+                            {
+                                // Record as deny for this key; do not propagate
+                                // as batch-level error — the input still gets a
+                                // deterministic deny.
+                                unique_results
+                                    .insert(input.proof_key, VerificationResult::Deny(defect));
+                                continue;
+                            },
+                            Err(e) => return Err(e),
+                        }
                     }
                     unique_results.insert(input.proof_key, result);
                 },
@@ -505,13 +534,12 @@ mod tests {
         }
     }
 
+    /// Creates a properly bound `VerificationInput` where `proof_key ==
+    /// blake3::hash(payload)`.
     fn make_input(id: u8) -> VerificationInput {
-        let mut key = [0u8; 32];
-        key[0] = id;
-        VerificationInput {
-            proof_key: key,
-            payload: vec![id],
-        }
+        let payload = vec![id];
+        let proof_key = *blake3::hash(&payload).as_bytes();
+        VerificationInput { proof_key, payload }
     }
 
     fn pass_verifier(_input: &VerificationInput) -> VerificationResult {
@@ -688,10 +716,12 @@ mod tests {
     #[test]
     fn verify_batch_preserves_input_order() {
         let mut cache = ProofCache::new(default_policy()).expect("ok");
-        let inputs = vec![make_input(3), make_input(1), make_input(2)];
+        let input_deny = make_input(2);
+        let deny_key = input_deny.proof_key;
+        let inputs = vec![make_input(3), make_input(1), input_deny];
         let results = cache
             .verify_batch(&inputs, 0, |input| {
-                if input.proof_key[0] == 2 {
+                if input.proof_key == deny_key {
                     VerificationResult::Deny(ProofCacheDefect {
                         code: ProofCacheDefectCode::UnresolvedCacheBinding,
                         message: "test deny".into(),

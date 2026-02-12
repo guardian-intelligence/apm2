@@ -312,13 +312,17 @@ Bounded, policy-gated proof cache for verification amortization. Maps proof keys
 - [INV-CX21] Stale entries (TTL exceeded) produce deterministic deny with `StaleCacheEntry`
 - [INV-CX22] Revoked entries (older revocation generation) produce deterministic deny with `RevokedCacheEntry`
 - [INV-CX23] Cache reuse is policy-gated: `allow_reuse=false` disables cache hits entirely
+- [INV-CX24] Proof key binding: `proof_key` must equal `BLAKE3(payload)` at the `verify_batch` trust boundary; mismatches produce `UnresolvedCacheBinding` deny
+- [INV-CX25] Clock regression guard: `lookup()` denies with `StaleCacheEntry` when `current_tick < entry.creation_tick` (prevents stale proof reuse on regressed ticks)
+- [INV-CX26] No-reuse insertion bypass: when `allow_reuse=false`, `verify_batch` skips cache insertion entirely, preventing capacity exhaustion from transient computations
 
 **Contracts:**
 
-- [CTR-CX20] `lookup(key, tick)` returns `Hit`/`Miss`/`Err(Defect)` — never silently serves stale data
+- [CTR-CX20] `lookup(key, tick)` returns `Hit`/`Miss`/`Err(Defect)` — never silently serves stale data; rejects clock regression
 - [CTR-CX21] `insert(key, result, tick)` enforces capacity bounds atomically (check-then-insert with `&mut self`)
-- [CTR-CX22] `verify_batch(inputs, tick, verifier_fn)` deduplicates by proof key, serves cache hits, computes only misses, returns results in input order
+- [CTR-CX22] `verify_batch(inputs, tick, verifier_fn)` validates proof-key binding, deduplicates by proof key, serves cache hits, computes only misses, returns results in input order
 - [CTR-CX23] `invalidate_generation()` bumps revocation generation counter (saturating), invalidating all older entries on next lookup
+- [CTR-CX24] `verify_batch` with `allow_reuse=false` never calls `insert()`, so capacity limits cannot be reached from transient verification workloads
 
 **Resource Limits:**
 
