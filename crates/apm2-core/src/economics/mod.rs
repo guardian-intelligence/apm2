@@ -23,9 +23,9 @@ pub use profile::{
 };
 pub use queue_admission::{
     AntiEntropyAdmissionRequest, AntiEntropyBudget, AntiEntropyDirection, ConvergenceHorizonRef,
-    ConvergenceReceipt, EnvelopeSignature, FreshnessHorizonRef, HtfEvaluationWindow,
+    ConvergenceReceipt, EnvelopeSignature, FreshnessHorizonRef, HtfEvaluationWindow, NoOpVerifier,
     QueueAdmissionDecision, QueueAdmissionRequest, QueueAdmissionTrace, QueueAdmissionVerdict,
-    QueueDenyDefect, QueueLane, QueueSchedulerState, RevocationFrontierSnapshot,
+    QueueDenyDefect, QueueLane, QueueSchedulerState, RevocationFrontierSnapshot, SignatureVerifier,
     TimeAuthorityEnvelopeV1, evaluate_anti_entropy_admission, evaluate_queue_admission,
     validate_convergence_horizon_tp003, validate_envelope_tp001, validate_freshness_horizon_tp002,
 };

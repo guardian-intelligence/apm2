@@ -300,40 +300,44 @@ All admission decisions require valid temporal authority:
 - `TimeAuthorityEnvelopeV1` -- Signed temporal authority envelope with boundary binding
 - `HtfEvaluationWindow` -- Evaluation window (boundary_id, authority_clock, tick range)
 - `QueueAdmissionRequest` / `AntiEntropyAdmissionRequest` -- Admission request inputs
-- `QueueAdmissionDecision` -- Verdict + defect + trace output
-- `QueueSchedulerState` -- Per-lane backlog and max-wait tracking (not `Sync`)
-- `AntiEntropyBudget` -- Budget tracker for anti-entropy admission (not `Sync`)
+- `QueueAdmissionDecision` -- Verdict + trace output; defect accessed via `decision.defect()` (delegating to `trace.defect`)
+- `QueueSchedulerState` -- Per-lane backlog and max-wait tracking (not internally synchronized)
+- `AntiEntropyBudget` -- Budget tracker for anti-entropy admission (not internally synchronized)
+- `SignatureVerifier` -- Trait for cryptographic signature verification; injected into TP-EIO29-001 evaluation
+- `NoOpVerifier` -- Default fail-closed verifier; always denies (`DENY_SIGNATURE_VERIFICATION_NOT_CONFIGURED`)
 
 ### Invariants
 
 - [INV-QA01] All unknown, missing, stale, unsigned, or invalid temporal authority states deny fail-closed.
-- [INV-QA02] Stop/revoke and control lanes preserve declared tick floors under adversarial load.
+- [INV-QA02] Stop/revoke and control lanes preserve declared tick floors and reserved capacity under adversarial load. High-priority lanes (StopRevoke, Control) admit items even when total queue is at capacity, as long as lane backlog is below reserved capacity.
 - [INV-QA03] Anti-entropy is pull-only; push requests are unconditionally denied.
 - [INV-QA04] Anti-entropy is budget-bound; oversized proof ranges are denied.
 - [INV-QA05] Lane backlog and total queue capacity are hard-capped (MAX_LANE_BACKLOG=4096, MAX_TOTAL_QUEUE_ITEMS=16384).
 - [INV-QA06] Envelope signature comparison uses constant-time equality (`subtle::ConstantTimeEq`).
 - [INV-QA07] Emergency stop/revoke carve-out: tp001 failure alone does not block stop_revoke lane (authority-reducing operations), but tp002/tp003 failures still deny.
+- [INV-QA08] All protocol-boundary `String` and `Vec` fields use bounded serde deserializers to prevent OOM during deserialization from untrusted input.
+- [INV-QA09] `tp001_passed` is never `true` without real cryptographic signature verification via an injected `SignatureVerifier`. The default `NoOpVerifier` denies fail-closed.
 
 ### Contracts
 
-- [CTR-QA01] `evaluate_queue_admission()` enforces TP-001/002/003, tick-floor invariants, and capacity checks in order.
+- [CTR-QA01] `evaluate_queue_admission()` enforces TP-001/002/003, tick-floor invariants, and capacity checks (with lane-reservation bypass for high-priority lanes) in order.
 - [CTR-QA02] `evaluate_anti_entropy_admission()` enforces pull-only, proof size, TP-001, TP-003, and budget in order.
-- [CTR-QA03] `validate_envelope_tp001()` rejects empty boundary_id, empty authority_clock, inverted tick ranges, zero TTL, excessive TTL, zero content hash, unsigned envelopes, zero-byte signatures, and `deny_on_unknown=false`.
+- [CTR-QA03] `validate_envelope_tp001()` rejects empty boundary_id, empty authority_clock, inverted tick ranges, zero TTL, excessive TTL, zero content hash, unsigned envelopes, zero-byte signatures, `deny_on_unknown=false`, and cryptographic verification failure.
 - [CTR-QA04] All deny decisions produce a `QueueDenyDefect` with stable reason code, lane, predicate_id, denied_at_tick, envelope_hash, and boundary_id.
-- [CTR-QA05] `QueueSchedulerState` and `AntiEntropyBudget` require exclusive access (not `Sync`); callers must hold appropriate locks.
+- [CTR-QA05] `QueueSchedulerState` and `AntiEntropyBudget` require exclusive access (not internally synchronized); callers must hold appropriate locks.
 
 ### Public API
 
 #### Temporal Predicate Validators
 
-- `validate_envelope_tp001(envelope, eval_window) -> Result<(), &str>` -- TP-EIO29-001 validation
+- `validate_envelope_tp001(envelope, eval_window, verifier) -> Result<(), &str>` -- TP-EIO29-001 validation (structural + crypto via injected verifier)
 - `validate_freshness_horizon_tp002(horizon, frontier, window) -> Result<(), &str>` -- TP-EIO29-002 validation
 - `validate_convergence_horizon_tp003(horizon, receipts, sets) -> Result<(), &str>` -- TP-EIO29-003 validation
 
 #### Admission Evaluators
 
-- `evaluate_queue_admission(request, scheduler) -> QueueAdmissionDecision` -- Queue admission (must_use)
-- `evaluate_anti_entropy_admission(request, budget) -> QueueAdmissionDecision` -- Anti-entropy admission (must_use)
+- `evaluate_queue_admission(request, scheduler, verifier) -> QueueAdmissionDecision` -- Queue admission (must_use)
+- `evaluate_anti_entropy_admission(request, budget, verifier) -> QueueAdmissionDecision` -- Anti-entropy admission (must_use)
 
 ## Related Modules
 

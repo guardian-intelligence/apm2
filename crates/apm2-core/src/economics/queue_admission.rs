@@ -34,7 +34,8 @@
 //!
 //! `DOMAIN_SECURITY` is in scope. All unknown or ambiguous states fail closed.
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
@@ -93,7 +94,153 @@ pub const MAX_STOP_REVOKE_WAIT_TICKS: u64 = 100;
 /// Maximum wait ticks for control lane items.
 pub const MAX_CONTROL_WAIT_TICKS: u64 = 500;
 
+/// Maximum string length for deny defect reason codes.
+pub const MAX_DENY_REASON_LENGTH: usize = 256;
+
 const ZERO_HASH: Hash = [0u8; 32];
+
+// ============================================================================
+// Bounded serde helpers (OOM-safe deserialization)
+// ============================================================================
+
+/// Deserializes a `String` with a hard length bound to prevent OOM during
+/// deserialization from untrusted input.
+fn deserialize_bounded_string<'de, D>(
+    deserializer: D,
+    max_len: usize,
+    field_name: &'static str,
+) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s.len() > max_len {
+        return Err(de::Error::custom(format!(
+            "string field '{}' exceeds maximum length ({} > {})",
+            field_name,
+            s.len(),
+            max_len
+        )));
+    }
+    Ok(s)
+}
+
+/// Deserializes a `Vec<T>` with a hard item-count bound to prevent OOM during
+/// deserialization from untrusted input.
+fn deserialize_bounded_vec<'de, D, T>(
+    deserializer: D,
+    max_items: usize,
+    field_name: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T> {
+        max_items: usize,
+        field_name: &'static str,
+        _marker: std::marker::PhantomData<T>,
+    }
+
+    impl<'de, T> Visitor<'de> for BoundedVecVisitor<T>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a sequence with at most {} items",
+                self.max_items
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut vec = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(self.max_items));
+
+            while let Some(item) = seq.next_element()? {
+                if vec.len() >= self.max_items {
+                    return Err(de::Error::custom(format!(
+                        "collection '{}' exceeds maximum size of {}",
+                        self.field_name, self.max_items
+                    )));
+                }
+                vec.push(item);
+            }
+
+            Ok(vec)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor {
+        max_items,
+        field_name,
+        _marker: std::marker::PhantomData,
+    })
+}
+
+// Field-specific deserializers for `#[serde(deserialize_with = "...")]`.
+
+fn deser_boundary_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_BOUNDARY_ID_LENGTH, "boundary_id")
+}
+
+fn deser_authority_clock<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_BOUNDARY_ID_LENGTH, "authority_clock")
+}
+
+fn deser_signature_set<'de, D>(deserializer: D) -> Result<Vec<EnvelopeSignature>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_ENVELOPE_SIGNATURES, "signature_set")
+}
+
+fn deser_convergence_receipts<'de, D>(deserializer: D) -> Result<Vec<ConvergenceReceipt>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(
+        deserializer,
+        MAX_CONVERGENCE_RECEIPTS,
+        "convergence_receipts",
+    )
+}
+
+fn deser_required_authority_sets<'de, D>(deserializer: D) -> Result<Vec<Hash>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(
+        deserializer,
+        MAX_REQUIRED_AUTHORITY_SETS,
+        "required_authority_sets",
+    )
+}
+
+fn deser_deny_reason<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_DENY_REASON_LENGTH, "reason")
+}
+
+fn deser_defect_boundary_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_BOUNDARY_ID_LENGTH, "boundary_id")
+}
 
 // ============================================================================
 // Deny reasons (stable strings for replay verification)
@@ -251,8 +398,12 @@ impl std::fmt::Display for QueueLane {
 #[serde(deny_unknown_fields)]
 pub struct TimeAuthorityEnvelopeV1 {
     /// Boundary identifier (must match evaluation context).
+    /// Bounded at deserialization time to `MAX_BOUNDARY_ID_LENGTH` bytes.
+    #[serde(deserialize_with = "deser_boundary_id")]
     pub boundary_id: String,
     /// Authority clock identifier (must match evaluation context).
+    /// Bounded at deserialization time to `MAX_BOUNDARY_ID_LENGTH` bytes.
+    #[serde(deserialize_with = "deser_authority_clock")]
     pub authority_clock: String,
     /// Start tick of the envelope's validity window.
     pub tick_start: u64,
@@ -264,7 +415,8 @@ pub struct TimeAuthorityEnvelopeV1 {
     pub deny_on_unknown: bool,
     /// Signature set proving envelope authenticity.
     /// Each entry is a 32-byte signer public key concatenated with a 64-byte
-    /// signature.
+    /// signature. Bounded at deserialization time to `MAX_ENVELOPE_SIGNATURES`.
+    #[serde(deserialize_with = "deser_signature_set")]
     pub signature_set: Vec<EnvelopeSignature>,
     /// Content hash of the envelope payload (for CAS binding).
     pub content_hash: Hash,
@@ -390,7 +542,7 @@ impl TimeAuthorityEnvelopeV1 {
             if is_zero_hash(&sig.signer_id) {
                 return Err(DENY_ENVELOPE_UNSIGNED);
             }
-            if sig.signature == [0u8; 64] {
+            if sig.signature.ct_eq(&[0u8; 64]).unwrap_u8() == 1 {
                 return Err(DENY_ENVELOPE_UNSIGNED);
             }
         }
@@ -407,8 +559,12 @@ impl TimeAuthorityEnvelopeV1 {
 #[serde(deny_unknown_fields)]
 pub struct HtfEvaluationWindow {
     /// Boundary identifier for this window.
+    /// Bounded at deserialization time to `MAX_BOUNDARY_ID_LENGTH` bytes.
+    #[serde(deserialize_with = "deser_boundary_id")]
     pub boundary_id: String,
     /// Authority clock for this window.
+    /// Bounded at deserialization time to `MAX_BOUNDARY_ID_LENGTH` bytes.
+    #[serde(deserialize_with = "deser_authority_clock")]
     pub authority_clock: String,
     /// Start tick of the evaluation window.
     pub tick_start: u64,
@@ -489,8 +645,12 @@ pub struct QueueAdmissionRequest {
     /// Anti-entropy convergence horizon for TP-EIO29-003.
     pub convergence_horizon: Option<ConvergenceHorizonRef>,
     /// Convergence receipts for required authority sets.
+    /// Bounded at deserialization time to `MAX_CONVERGENCE_RECEIPTS`.
+    #[serde(deserialize_with = "deser_convergence_receipts")]
     pub convergence_receipts: Vec<ConvergenceReceipt>,
     /// Required authority set hashes for convergence checks.
+    /// Bounded at deserialization time to `MAX_REQUIRED_AUTHORITY_SETS`.
+    #[serde(deserialize_with = "deser_required_authority_sets")]
     pub required_authority_sets: Vec<Hash>,
     /// Cost of this request in abstract queue-budget units.
     pub cost: u64,
@@ -527,8 +687,12 @@ pub struct AntiEntropyAdmissionRequest {
     /// Anti-entropy convergence horizon for TP-EIO29-003.
     pub convergence_horizon: Option<ConvergenceHorizonRef>,
     /// Convergence receipts for required authority sets.
+    /// Bounded at deserialization time to `MAX_CONVERGENCE_RECEIPTS`.
+    #[serde(deserialize_with = "deser_convergence_receipts")]
     pub convergence_receipts: Vec<ConvergenceReceipt>,
     /// Required authority set hashes for convergence.
+    /// Bounded at deserialization time to `MAX_REQUIRED_AUTHORITY_SETS`.
+    #[serde(deserialize_with = "deser_required_authority_sets")]
     pub required_authority_sets: Vec<Hash>,
     /// Proof byte count for oversized check.
     pub proof_bytes: u64,
@@ -560,6 +724,8 @@ pub enum QueueAdmissionVerdict {
 #[serde(deny_unknown_fields)]
 pub struct QueueDenyDefect {
     /// Stable deny reason code.
+    /// Bounded at deserialization time to `MAX_DENY_REASON_LENGTH` bytes.
+    #[serde(deserialize_with = "deser_deny_reason")]
     pub reason: String,
     /// The lane that was targeted (or None for anti-entropy).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -572,6 +738,8 @@ pub struct QueueDenyDefect {
     /// Time authority envelope hash (zero if missing).
     pub envelope_hash: Hash,
     /// Evaluation window `boundary_id`.
+    /// Bounded at deserialization time to `MAX_BOUNDARY_ID_LENGTH` bytes.
+    #[serde(deserialize_with = "deser_defect_boundary_id")]
     pub boundary_id: String,
 }
 
@@ -616,16 +784,28 @@ impl QueueAdmissionTrace {
 }
 
 /// Queue admission decision with trace.
+///
+/// The deny defect (if any) is available via
+/// [`QueueAdmissionDecision::defect()`] which delegates to `trace.defect`.
+/// There is no separate top-level defect field — the trace is the single source
+/// of truth for defect data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueueAdmissionDecision {
     /// Verdict.
     pub verdict: QueueAdmissionVerdict,
-    /// Deny defect (present when verdict is not Allow).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub defect: Option<QueueDenyDefect>,
-    /// Deterministic trace.
+    /// Deterministic trace (contains defect when verdict is Deny).
     pub trace: QueueAdmissionTrace,
+}
+
+impl QueueAdmissionDecision {
+    /// Returns the deny defect, if present.
+    ///
+    /// This is a convenience accessor that delegates to `self.trace.defect`.
+    #[must_use]
+    pub const fn defect(&self) -> Option<&QueueDenyDefect> {
+        self.trace.defect.as_ref()
+    }
 }
 
 /// Queue admission errors.
@@ -660,8 +840,9 @@ pub struct LaneState {
 ///
 /// # Synchronization Protocol
 ///
-/// This struct is not `Sync`. Callers must ensure exclusive access during
-/// admission evaluation (typically by holding a lock on the queue scheduler).
+/// This struct is not internally synchronized. Callers must ensure exclusive
+/// access during admission evaluation (typically by holding a lock on the
+/// queue scheduler).
 #[derive(Debug, Clone)]
 pub struct QueueSchedulerState {
     /// Per-lane state indexed by lane ordinal.
@@ -719,6 +900,11 @@ impl QueueSchedulerState {
 
     /// Records admission of an item to a lane.
     ///
+    /// High-priority lanes (`StopRevoke`, `Control`) may admit items even
+    /// when the total queue is at capacity, as long as the lane's backlog
+    /// is below its reserved capacity. This prevents low-priority traffic
+    /// floods from starving critical lanes (INV-QA02).
+    ///
     /// # Errors
     ///
     /// Returns a deny reason if lane or total capacity would be exceeded.
@@ -728,7 +914,12 @@ impl QueueSchedulerState {
             return Err(DENY_LANE_BACKLOG_EXCEEDED);
         }
         if self.total_items >= MAX_TOTAL_QUEUE_ITEMS {
-            return Err(DENY_TOTAL_QUEUE_EXCEEDED);
+            let reserved = Self::reserved_capacity(lane);
+            let lane_backlog = self.lanes[lane as usize].backlog;
+            if reserved == 0 || lane_backlog >= reserved {
+                return Err(DENY_TOTAL_QUEUE_EXCEEDED);
+            }
+            // High-priority lane uses reservation — admitted.
         }
         self.lanes[lane as usize].backlog = self.lanes[lane as usize].backlog.saturating_add(1);
         self.total_items = self.total_items.saturating_add(1);
@@ -789,9 +980,9 @@ impl Default for QueueSchedulerState {
 ///
 /// # Synchronization Protocol
 ///
-/// This struct is not `Sync`. Callers must ensure exclusive access during
-/// budget evaluation (typically by holding a lock on the anti-entropy
-/// scheduler).
+/// This struct is not internally synchronized. Callers must ensure exclusive
+/// access during budget evaluation (typically by holding a lock on the
+/// anti-entropy scheduler).
 #[derive(Debug, Clone)]
 pub struct AntiEntropyBudget {
     /// Total budget consumed in the current window.
@@ -842,6 +1033,51 @@ impl AntiEntropyBudget {
 }
 
 // ============================================================================
+// Signature verifier trait
+// ============================================================================
+
+/// Deny: signature verification not configured (fail-closed).
+pub const DENY_SIGNATURE_VERIFICATION_NOT_CONFIGURED: &str =
+    "signature_verification_not_configured";
+
+/// Trait for cryptographic signature verification against envelope signatures.
+///
+/// Callers must inject a concrete implementation. The default
+/// [`NoOpVerifier`] always returns `Err` (fail-closed) so that
+/// `tp001_passed` is never `true` without real cryptographic verification.
+pub trait SignatureVerifier: Send + Sync {
+    /// Verifies that `signature` over `message` was produced by
+    /// `signer_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static reason string on verification failure.
+    fn verify(
+        &self,
+        signer_id: &Hash,
+        message: &[u8],
+        signature: &[u8; 64],
+    ) -> Result<(), &'static str>;
+}
+
+/// Default fail-closed verifier. Always returns
+/// `Err("signature_verification_not_configured")`.
+///
+/// This ensures `tp001_passed` is never `true` without a real verifier.
+pub struct NoOpVerifier;
+
+impl SignatureVerifier for NoOpVerifier {
+    fn verify(
+        &self,
+        _signer_id: &Hash,
+        _message: &[u8],
+        _signature: &[u8; 64],
+    ) -> Result<(), &'static str> {
+        Err(DENY_SIGNATURE_VERIFICATION_NOT_CONFIGURED)
+    }
+}
+
+// ============================================================================
 // TP-EIO29-001 evaluation
 // ============================================================================
 
@@ -853,10 +1089,12 @@ impl AntiEntropyBudget {
 /// 3. Envelope tick range covers the evaluation window
 /// 4. TTL is fresh relative to the evaluation window
 /// 5. `deny_on_unknown` is true
+/// 6. All signatures verify cryptographically via `verifier`
 ///
-/// Cryptographic signature verification is included structurally
-/// (non-zero signatures are required) but actual Ed25519 verification
-/// is deferred to the caller's trust infrastructure.
+/// If `verifier` is `None`, signature verification is skipped and the
+/// function denies fail-closed (returns
+/// `DENY_SIGNATURE_VERIFICATION_NOT_CONFIGURED`). This ensures
+/// `tp001_passed` is never `true` without real crypto verification.
 ///
 /// # Errors
 ///
@@ -864,6 +1102,7 @@ impl AntiEntropyBudget {
 pub fn validate_envelope_tp001(
     envelope: Option<&TimeAuthorityEnvelopeV1>,
     eval_window: &HtfEvaluationWindow,
+    verifier: Option<&dyn SignatureVerifier>,
 ) -> Result<(), &'static str> {
     let envelope = envelope.ok_or(DENY_ENVELOPE_MISSING)?;
 
@@ -890,7 +1129,30 @@ pub fn validate_envelope_tp001(
         return Err(DENY_ENVELOPE_STALE);
     }
 
+    // Cryptographic signature verification (fail-closed when no verifier).
+    let sig_verifier = verifier.unwrap_or(&NoOpVerifier);
+    let canonical = envelope_canonical_bytes(envelope);
+    for sig in &envelope.signature_set {
+        sig_verifier.verify(&sig.signer_id, &canonical, &sig.signature)?;
+    }
+
     Ok(())
+}
+
+/// Returns deterministic canonical bytes for envelope signature verification.
+fn envelope_canonical_bytes(envelope: &TimeAuthorityEnvelopeV1) -> Vec<u8> {
+    // Build a deterministic byte representation:
+    // boundary_id || authority_clock || tick_start || tick_end || ttl_ticks ||
+    // deny_on_unknown || content_hash
+    let mut buf = Vec::with_capacity(256);
+    buf.extend_from_slice(envelope.boundary_id.as_bytes());
+    buf.extend_from_slice(envelope.authority_clock.as_bytes());
+    buf.extend_from_slice(&envelope.tick_start.to_le_bytes());
+    buf.extend_from_slice(&envelope.tick_end.to_le_bytes());
+    buf.extend_from_slice(&envelope.ttl_ticks.to_le_bytes());
+    buf.push(u8::from(envelope.deny_on_unknown));
+    buf.extend_from_slice(&envelope.content_hash);
+    buf
 }
 
 // ============================================================================
@@ -1006,10 +1268,14 @@ pub fn validate_convergence_horizon_tp003(
 ///
 /// All unknown, missing, stale, or invalid temporal authority states
 /// deny fail-closed.
+///
+/// `verifier` is used for cryptographic signature verification in
+/// TP-EIO29-001. Pass `None` to use the fail-closed [`NoOpVerifier`].
 #[must_use]
 pub fn evaluate_queue_admission(
     request: &QueueAdmissionRequest,
     scheduler: &QueueSchedulerState,
+    verifier: Option<&dyn SignatureVerifier>,
 ) -> QueueAdmissionDecision {
     let current_tick = request.current_tick;
     let lane = request.lane;
@@ -1020,12 +1286,17 @@ pub fn evaluate_queue_admission(
     let boundary_id = &request.eval_window.boundary_id;
 
     // Evaluate all three temporal predicates
-    let (tp001_passed, tp002_passed, tp003_passed) =
-        match evaluate_temporal_predicates(request, lane, current_tick, envelope_hash, boundary_id)
-        {
-            Ok(tp) => tp,
-            Err(decision) => return decision,
-        };
+    let (tp001_passed, tp002_passed, tp003_passed) = match evaluate_temporal_predicates(
+        request,
+        lane,
+        current_tick,
+        envelope_hash,
+        boundary_id,
+        verifier,
+    ) {
+        Ok(tp) => tp,
+        Err(decision) => return decision,
+    };
 
     // Check structural constraints (tick-floors, capacity)
     if let Err(decision) = check_structural_constraints(
@@ -1054,7 +1325,6 @@ pub fn evaluate_queue_admission(
 
     QueueAdmissionDecision {
         verdict: QueueAdmissionVerdict::Allow,
-        defect: None,
         trace,
     }
 }
@@ -1068,9 +1338,11 @@ fn evaluate_temporal_predicates(
     current_tick: u64,
     envelope_hash: Hash,
     boundary_id: &str,
+    verifier: Option<&dyn SignatureVerifier>,
 ) -> Result<(bool, bool, bool), QueueAdmissionDecision> {
     // TP-EIO29-001: Time authority envelope validity
-    let tp001_result = validate_envelope_tp001(request.envelope.as_ref(), &request.eval_window);
+    let tp001_result =
+        validate_envelope_tp001(request.envelope.as_ref(), &request.eval_window, verifier);
     let tp001_passed = tp001_result.is_ok();
     // For stop_revoke lane, allow local monotonic emergency time if full
     // envelope fails (fail-open to authority reduction only).
@@ -1174,9 +1446,20 @@ fn check_structural_constraints(
         return Err(deny_queue(&mk_ctx(DENY_LANE_BACKLOG_EXCEEDED)));
     }
 
-    // Total queue capacity
+    // Total queue capacity with lane-reservation bypass.
+    //
+    // High-priority lanes (StopRevoke, Control) have reserved capacity that
+    // allows them to admit items even when the common pool is full. This
+    // prevents low-priority traffic from starving critical lanes (INV-QA02).
     if scheduler.total_items() >= MAX_TOTAL_QUEUE_ITEMS {
-        return Err(deny_queue(&mk_ctx(DENY_TOTAL_QUEUE_EXCEEDED)));
+        let reserved = QueueSchedulerState::reserved_capacity(lane);
+        let lane_backlog = scheduler.lane(lane).backlog;
+        // Only allow if lane has a reservation AND is below its reserved
+        // capacity.
+        if reserved == 0 || lane_backlog >= reserved {
+            return Err(deny_queue(&mk_ctx(DENY_TOTAL_QUEUE_EXCEEDED)));
+        }
+        // High-priority lane uses reservation — admitted.
     }
 
     Ok(())
@@ -1188,10 +1471,14 @@ fn check_structural_constraints(
 /// Anti-entropy is pull-only and budget-bound. Push requests are denied.
 /// Oversized proof ranges are denied. TP-EIO29-001 and TP-EIO29-003 are
 /// enforced.
+///
+/// `verifier` is used for cryptographic signature verification in
+/// TP-EIO29-001. Pass `None` to use the fail-closed [`NoOpVerifier`].
 #[must_use]
 pub fn evaluate_anti_entropy_admission(
     request: &AntiEntropyAdmissionRequest,
     budget: &AntiEntropyBudget,
+    verifier: Option<&dyn SignatureVerifier>,
 ) -> QueueAdmissionDecision {
     let current_tick = request.current_tick;
     let envelope_hash = request
@@ -1225,7 +1512,8 @@ pub fn evaluate_anti_entropy_admission(
     }
 
     // TP-EIO29-001
-    let tp001_result = validate_envelope_tp001(request.envelope.as_ref(), &request.eval_window);
+    let tp001_result =
+        validate_envelope_tp001(request.envelope.as_ref(), &request.eval_window, verifier);
     let tp001_passed = tp001_result.is_ok();
     if !tp001_passed {
         let reason = tp001_result.unwrap_err();
@@ -1272,7 +1560,6 @@ pub fn evaluate_anti_entropy_admission(
 
     QueueAdmissionDecision {
         verdict: QueueAdmissionVerdict::Allow,
-        defect: None,
         trace,
     }
 }
@@ -1308,7 +1595,7 @@ fn deny_queue(ctx: &DenyContext<'_>) -> QueueAdmissionDecision {
     let trace = QueueAdmissionTrace {
         lane: ctx.lane,
         verdict: QueueAdmissionVerdict::Deny,
-        defect: Some(defect.clone()),
+        defect: Some(defect),
         tp001_passed: ctx.tp001_passed,
         tp002_passed: ctx.tp002_passed,
         tp003_passed: ctx.tp003_passed,
@@ -1317,7 +1604,6 @@ fn deny_queue(ctx: &DenyContext<'_>) -> QueueAdmissionDecision {
 
     QueueAdmissionDecision {
         verdict: QueueAdmissionVerdict::Deny,
-        defect: Some(defect),
         trace,
     }
 }
@@ -1344,6 +1630,28 @@ mod tests {
 
     fn test_hash(byte: u8) -> Hash {
         [byte; 32]
+    }
+
+    /// Verifier that accepts all signatures (for tests that do not exercise
+    /// cryptographic verification).
+    struct AcceptAllVerifier;
+
+    impl SignatureVerifier for AcceptAllVerifier {
+        fn verify(
+            &self,
+            _signer_id: &Hash,
+            _message: &[u8],
+            _signature: &[u8; 64],
+        ) -> Result<(), &'static str> {
+            Ok(())
+        }
+    }
+
+    /// Convenience: all evaluator tests use this verifier to keep existing
+    /// semantics (structural checks pass without real crypto).
+    #[allow(clippy::unnecessary_wraps)]
+    fn test_verifier() -> Option<&'static dyn SignatureVerifier> {
+        Some(&AcceptAllVerifier as &dyn SignatureVerifier)
     }
 
     fn valid_envelope() -> TimeAuthorityEnvelopeV1 {
@@ -1438,14 +1746,18 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn tp001_valid_envelope_passes() {
-        let result = validate_envelope_tp001(Some(&valid_envelope()), &valid_eval_window());
+    fn tp001_valid_envelope_passes_with_verifier() {
+        let result = validate_envelope_tp001(
+            Some(&valid_envelope()),
+            &valid_eval_window(),
+            test_verifier(),
+        );
         assert!(result.is_ok());
     }
 
     #[test]
     fn tp001_missing_envelope_denies() {
-        let result = validate_envelope_tp001(None, &valid_eval_window());
+        let result = validate_envelope_tp001(None, &valid_eval_window(), test_verifier());
         assert_eq!(result.unwrap_err(), DENY_ENVELOPE_MISSING);
     }
 
@@ -1453,7 +1765,8 @@ mod tests {
     fn tp001_unsigned_envelope_denies() {
         let mut envelope = valid_envelope();
         envelope.signature_set.clear();
-        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        let result =
+            validate_envelope_tp001(Some(&envelope), &valid_eval_window(), test_verifier());
         assert_eq!(result.unwrap_err(), DENY_ENVELOPE_UNSIGNED);
     }
 
@@ -1461,7 +1774,8 @@ mod tests {
     fn tp001_zero_signer_denies() {
         let mut envelope = valid_envelope();
         envelope.signature_set[0].signer_id = [0u8; 32];
-        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        let result =
+            validate_envelope_tp001(Some(&envelope), &valid_eval_window(), test_verifier());
         assert_eq!(result.unwrap_err(), DENY_ENVELOPE_UNSIGNED);
     }
 
@@ -1469,7 +1783,8 @@ mod tests {
     fn tp001_zero_signature_denies() {
         let mut envelope = valid_envelope();
         envelope.signature_set[0].signature = [0u8; 64];
-        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        let result =
+            validate_envelope_tp001(Some(&envelope), &valid_eval_window(), test_verifier());
         assert_eq!(result.unwrap_err(), DENY_ENVELOPE_UNSIGNED);
     }
 
@@ -1478,7 +1793,7 @@ mod tests {
         let envelope = valid_envelope();
         let mut window = valid_eval_window();
         window.boundary_id = "other-boundary".to_string();
-        let result = validate_envelope_tp001(Some(&envelope), &window);
+        let result = validate_envelope_tp001(Some(&envelope), &window, test_verifier());
         assert_eq!(result.unwrap_err(), DENY_ENVELOPE_BOUNDARY_MISMATCH);
     }
 
@@ -1487,7 +1802,7 @@ mod tests {
         let envelope = valid_envelope();
         let mut window = valid_eval_window();
         window.authority_clock = "other-clock".to_string();
-        let result = validate_envelope_tp001(Some(&envelope), &window);
+        let result = validate_envelope_tp001(Some(&envelope), &window, test_verifier());
         assert_eq!(result.unwrap_err(), DENY_ENVELOPE_CLOCK_MISMATCH);
     }
 
@@ -1495,7 +1810,8 @@ mod tests {
     fn tp001_window_not_covered_denies() {
         let mut envelope = valid_envelope();
         envelope.tick_end = 1499; // Does not cover eval_window.tick_end=1500
-        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        let result =
+            validate_envelope_tp001(Some(&envelope), &valid_eval_window(), test_verifier());
         assert_eq!(result.unwrap_err(), DENY_ENVELOPE_WINDOW_UNCOVERED);
     }
 
@@ -1503,7 +1819,8 @@ mod tests {
     fn tp001_stale_envelope_denies() {
         let mut envelope = valid_envelope();
         envelope.ttl_ticks = 400; // tick_start(1000) + 400 = 1400 < eval_window.tick_end(1500)
-        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        let result =
+            validate_envelope_tp001(Some(&envelope), &valid_eval_window(), test_verifier());
         assert_eq!(result.unwrap_err(), DENY_ENVELOPE_STALE);
     }
 
@@ -1511,7 +1828,8 @@ mod tests {
     fn tp001_deny_on_unknown_false_denies() {
         let mut envelope = valid_envelope();
         envelope.deny_on_unknown = false;
-        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        let result =
+            validate_envelope_tp001(Some(&envelope), &valid_eval_window(), test_verifier());
         assert_eq!(result.unwrap_err(), DENY_ENVELOPE_DENY_ON_UNKNOWN_FALSE);
     }
 
@@ -1519,7 +1837,8 @@ mod tests {
     fn tp001_zero_content_hash_denies() {
         let mut envelope = valid_envelope();
         envelope.content_hash = [0u8; 32];
-        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        let result =
+            validate_envelope_tp001(Some(&envelope), &valid_eval_window(), test_verifier());
         assert_eq!(result.unwrap_err(), DENY_ENVELOPE_HASH_ZERO);
     }
 
@@ -1527,7 +1846,8 @@ mod tests {
     fn tp001_empty_boundary_id_denies() {
         let mut envelope = valid_envelope();
         envelope.boundary_id = String::new();
-        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        let result =
+            validate_envelope_tp001(Some(&envelope), &valid_eval_window(), test_verifier());
         assert_eq!(result.unwrap_err(), DENY_ENVELOPE_BOUNDARY_ID_INVALID);
     }
 
@@ -1535,7 +1855,8 @@ mod tests {
     fn tp001_oversized_boundary_id_denies() {
         let mut envelope = valid_envelope();
         envelope.boundary_id = "x".repeat(MAX_BOUNDARY_ID_LENGTH + 1);
-        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        let result =
+            validate_envelope_tp001(Some(&envelope), &valid_eval_window(), test_verifier());
         assert_eq!(result.unwrap_err(), DENY_ENVELOPE_BOUNDARY_ID_INVALID);
     }
 
@@ -1543,7 +1864,8 @@ mod tests {
     fn tp001_zero_ttl_denies() {
         let mut envelope = valid_envelope();
         envelope.ttl_ticks = 0;
-        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        let result =
+            validate_envelope_tp001(Some(&envelope), &valid_eval_window(), test_verifier());
         assert_eq!(result.unwrap_err(), DENY_ENVELOPE_TTL_ZERO);
     }
 
@@ -1551,7 +1873,8 @@ mod tests {
     fn tp001_excessive_ttl_denies() {
         let mut envelope = valid_envelope();
         envelope.ttl_ticks = MAX_TTL_TICKS + 1;
-        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        let result =
+            validate_envelope_tp001(Some(&envelope), &valid_eval_window(), test_verifier());
         assert_eq!(result.unwrap_err(), DENY_ENVELOPE_TTL_EXCESSIVE);
     }
 
@@ -1560,7 +1883,8 @@ mod tests {
         let mut envelope = valid_envelope();
         envelope.tick_start = 2001;
         envelope.tick_end = 2000;
-        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        let result =
+            validate_envelope_tp001(Some(&envelope), &valid_eval_window(), test_verifier());
         assert_eq!(result.unwrap_err(), DENY_ENVELOPE_TICK_RANGE_INVALID);
     }
 
@@ -1574,8 +1898,52 @@ mod tests {
                 signature: [0xBB; 64],
             })
             .collect();
-        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        let result =
+            validate_envelope_tp001(Some(&envelope), &valid_eval_window(), test_verifier());
         assert_eq!(result.unwrap_err(), DENY_ENVELOPE_TOO_MANY_SIGNATURES);
+    }
+
+    // ========================================================================
+    // Signature verifier trait
+    // ========================================================================
+
+    #[test]
+    fn tp001_no_verifier_denies_fail_closed() {
+        // When no verifier is provided, the NoOpVerifier denies.
+        let result = validate_envelope_tp001(Some(&valid_envelope()), &valid_eval_window(), None);
+        assert_eq!(
+            result.unwrap_err(),
+            DENY_SIGNATURE_VERIFICATION_NOT_CONFIGURED
+        );
+    }
+
+    #[test]
+    fn tp001_noop_verifier_denies_fail_closed() {
+        let noop = NoOpVerifier;
+        let result =
+            validate_envelope_tp001(Some(&valid_envelope()), &valid_eval_window(), Some(&noop));
+        assert_eq!(
+            result.unwrap_err(),
+            DENY_SIGNATURE_VERIFICATION_NOT_CONFIGURED
+        );
+    }
+
+    #[test]
+    fn tp001_accept_all_verifier_passes() {
+        let result = validate_envelope_tp001(
+            Some(&valid_envelope()),
+            &valid_eval_window(),
+            test_verifier(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn tp001_random_signature_bytes_denied_without_real_verifier() {
+        // Random non-zero signature bytes pass structural checks but fail
+        // without a real verifier (NoOpVerifier denies).
+        let result = validate_envelope_tp001(Some(&valid_envelope()), &valid_eval_window(), None);
+        assert!(result.is_err());
     }
 
     // ========================================================================
@@ -1786,9 +2154,9 @@ mod tests {
     fn queue_admit_valid_request_allows() {
         let request = valid_queue_request(QueueLane::Consume);
         let scheduler = QueueSchedulerState::new();
-        let decision = evaluate_queue_admission(&request, &scheduler);
+        let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
         assert_eq!(decision.verdict, QueueAdmissionVerdict::Allow);
-        assert!(decision.defect.is_none());
+        assert!(decision.defect().is_none());
         assert!(decision.trace.tp001_passed);
         assert!(decision.trace.tp002_passed);
         assert!(decision.trace.tp003_passed);
@@ -1799,10 +2167,10 @@ mod tests {
         let mut request = valid_queue_request(QueueLane::Consume);
         request.envelope = None;
         let scheduler = QueueSchedulerState::new();
-        let decision = evaluate_queue_admission(&request, &scheduler);
+        let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
         assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
         assert_eq!(
-            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            decision.defect().map(|d| d.reason.as_str()),
             Some(DENY_ENVELOPE_MISSING)
         );
     }
@@ -1816,7 +2184,7 @@ mod tests {
         let mut request = valid_queue_request(QueueLane::StopRevoke);
         request.envelope = None;
         let scheduler = QueueSchedulerState::new();
-        let decision = evaluate_queue_admission(&request, &scheduler);
+        let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
         assert_eq!(decision.verdict, QueueAdmissionVerdict::Allow);
         // tp001 should be flagged as failed
         assert!(!decision.trace.tp001_passed);
@@ -1826,15 +2194,13 @@ mod tests {
 
     #[test]
     fn queue_admit_stop_revoke_denies_when_tp002_also_fails() {
-        // Stop/revoke lane emergency carve-out for tp001 does not exempt from
-        // tp002 failures. Missing freshness horizon still denies.
         let mut request = valid_queue_request(QueueLane::StopRevoke);
         request.envelope = None;
         request.freshness_horizon = None;
         let scheduler = QueueSchedulerState::new();
-        let decision = evaluate_queue_admission(&request, &scheduler);
+        let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
         assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
-        let defect = decision.defect.as_ref().expect("should have defect");
+        let defect = decision.defect().expect("should have defect");
         assert_eq!(defect.predicate_id, Some(TemporalPredicateId::TpEio29002));
     }
 
@@ -1843,7 +2209,7 @@ mod tests {
         let scheduler = QueueSchedulerState::new();
         for lane in QueueLane::all() {
             let request = valid_queue_request(lane);
-            let decision = evaluate_queue_admission(&request, &scheduler);
+            let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
             assert_eq!(
                 decision.verdict,
                 QueueAdmissionVerdict::Allow,
@@ -1857,23 +2223,24 @@ mod tests {
         let request = valid_queue_request(QueueLane::Bulk);
         let mut scheduler = QueueSchedulerState::new();
         scheduler.lanes[QueueLane::Bulk as usize].backlog = MAX_LANE_BACKLOG;
-        let decision = evaluate_queue_admission(&request, &scheduler);
+        let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
         assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
         assert_eq!(
-            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            decision.defect().map(|d| d.reason.as_str()),
             Some(DENY_LANE_BACKLOG_EXCEEDED)
         );
     }
 
     #[test]
     fn queue_total_capacity_exceeded_denies() {
+        // Non-reserved lane (Consume) must be denied when total is full.
         let request = valid_queue_request(QueueLane::Consume);
         let mut scheduler = QueueSchedulerState::new();
         scheduler.total_items = MAX_TOTAL_QUEUE_ITEMS;
-        let decision = evaluate_queue_admission(&request, &scheduler);
+        let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
         assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
         assert_eq!(
-            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            decision.defect().map(|d| d.reason.as_str()),
             Some(DENY_TOTAL_QUEUE_EXCEEDED)
         );
     }
@@ -1885,10 +2252,10 @@ mod tests {
         scheduler.lanes[QueueLane::StopRevoke as usize].backlog = 1;
         scheduler.lanes[QueueLane::StopRevoke as usize].max_wait_ticks =
             MAX_STOP_REVOKE_WAIT_TICKS + 1;
-        let decision = evaluate_queue_admission(&request, &scheduler);
+        let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
         assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
         assert_eq!(
-            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            decision.defect().map(|d| d.reason.as_str()),
             Some(DENY_TICK_FLOOR_STOP_REVOKE)
         );
     }
@@ -1899,11 +2266,109 @@ mod tests {
         let mut scheduler = QueueSchedulerState::new();
         scheduler.lanes[QueueLane::Control as usize].backlog = 1;
         scheduler.lanes[QueueLane::Control as usize].max_wait_ticks = MAX_CONTROL_WAIT_TICKS + 1;
-        let decision = evaluate_queue_admission(&request, &scheduler);
+        let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
         assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
         assert_eq!(
-            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            decision.defect().map(|d| d.reason.as_str()),
             Some(DENY_TICK_FLOOR_CONTROL)
+        );
+    }
+
+    // ========================================================================
+    // Lane reservation bypass (FINDING 2 — anti-starvation)
+    // ========================================================================
+
+    #[test]
+    fn test_stop_revoke_admitted_when_total_full_but_reservation_available() {
+        let request = valid_queue_request(QueueLane::StopRevoke);
+        let mut scheduler = QueueSchedulerState::new();
+        scheduler.total_items = MAX_TOTAL_QUEUE_ITEMS;
+        // StopRevoke backlog is below its reserved capacity.
+        scheduler.lanes[QueueLane::StopRevoke as usize].backlog = 0;
+        let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
+        assert_eq!(
+            decision.verdict,
+            QueueAdmissionVerdict::Allow,
+            "StopRevoke must admit when total full but reservation available"
+        );
+    }
+
+    #[test]
+    fn test_control_admitted_when_total_full_but_reservation_available() {
+        let request = valid_queue_request(QueueLane::Control);
+        let mut scheduler = QueueSchedulerState::new();
+        scheduler.total_items = MAX_TOTAL_QUEUE_ITEMS;
+        scheduler.lanes[QueueLane::Control as usize].backlog = 0;
+        let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
+        assert_eq!(
+            decision.verdict,
+            QueueAdmissionVerdict::Allow,
+            "Control must admit when total full but reservation available"
+        );
+    }
+
+    #[test]
+    fn test_stop_revoke_denied_when_reservation_exhausted() {
+        let request = valid_queue_request(QueueLane::StopRevoke);
+        let mut scheduler = QueueSchedulerState::new();
+        scheduler.total_items = MAX_TOTAL_QUEUE_ITEMS;
+        let reserved = QueueSchedulerState::reserved_capacity(QueueLane::StopRevoke);
+        scheduler.lanes[QueueLane::StopRevoke as usize].backlog = reserved;
+        let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
+        assert_eq!(
+            decision.verdict,
+            QueueAdmissionVerdict::Deny,
+            "StopRevoke must deny when reservation exhausted"
+        );
+        assert_eq!(
+            decision.defect().map(|d| d.reason.as_str()),
+            Some(DENY_TOTAL_QUEUE_EXCEEDED)
+        );
+    }
+
+    #[test]
+    fn test_bulk_denied_when_total_full() {
+        let request = valid_queue_request(QueueLane::Bulk);
+        let mut scheduler = QueueSchedulerState::new();
+        scheduler.total_items = MAX_TOTAL_QUEUE_ITEMS;
+        let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
+        assert_eq!(
+            decision.verdict,
+            QueueAdmissionVerdict::Deny,
+            "Bulk must deny when total full (no reservation)"
+        );
+    }
+
+    #[test]
+    fn test_adversarial_low_priority_flood_cannot_block_stop_revoke() {
+        // Fill the queue entirely with Bulk traffic.
+        let mut scheduler = QueueSchedulerState::new();
+        scheduler.total_items = MAX_TOTAL_QUEUE_ITEMS;
+        scheduler.lanes[QueueLane::Bulk as usize].backlog = MAX_LANE_BACKLOG;
+        // StopRevoke has zero backlog — reservation should allow admission.
+        scheduler.lanes[QueueLane::StopRevoke as usize].backlog = 0;
+
+        let request = valid_queue_request(QueueLane::StopRevoke);
+        let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
+        assert_eq!(
+            decision.verdict,
+            QueueAdmissionVerdict::Allow,
+            "adversarial low-priority flood must not block stop_revoke"
+        );
+    }
+
+    #[test]
+    fn scheduler_record_admission_reservation_aware() {
+        let mut scheduler = QueueSchedulerState::new();
+        scheduler.total_items = MAX_TOTAL_QUEUE_ITEMS;
+        // StopRevoke should admit via reservation.
+        assert!(scheduler.record_admission(QueueLane::StopRevoke).is_ok());
+        // Non-reserved lane must fail.
+        let mut sched2 = QueueSchedulerState::new();
+        sched2.total_items = MAX_TOTAL_QUEUE_ITEMS;
+        assert_eq!(
+            sched2.record_admission(QueueLane::Bulk).unwrap_err(),
+            DENY_TOTAL_QUEUE_EXCEEDED
         );
     }
 
@@ -1915,7 +2380,7 @@ mod tests {
     fn anti_entropy_valid_pull_allows() {
         let request = valid_anti_entropy_request();
         let budget = AntiEntropyBudget::default_budget();
-        let decision = evaluate_anti_entropy_admission(&request, &budget);
+        let decision = evaluate_anti_entropy_admission(&request, &budget, test_verifier());
         assert_eq!(decision.verdict, QueueAdmissionVerdict::Allow);
     }
 
@@ -1924,10 +2389,10 @@ mod tests {
         let mut request = valid_anti_entropy_request();
         request.direction = AntiEntropyDirection::Push;
         let budget = AntiEntropyBudget::default_budget();
-        let decision = evaluate_anti_entropy_admission(&request, &budget);
+        let decision = evaluate_anti_entropy_admission(&request, &budget, test_verifier());
         assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
         assert_eq!(
-            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            decision.defect().map(|d| d.reason.as_str()),
             Some(DENY_ANTI_ENTROPY_PUSH_REJECTED)
         );
     }
@@ -1938,10 +2403,10 @@ mod tests {
         request.proof_bytes = 1001;
         request.max_proof_bytes = 1000;
         let budget = AntiEntropyBudget::default_budget();
-        let decision = evaluate_anti_entropy_admission(&request, &budget);
+        let decision = evaluate_anti_entropy_admission(&request, &budget, test_verifier());
         assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
         assert_eq!(
-            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            decision.defect().map(|d| d.reason.as_str()),
             Some(DENY_ANTI_ENTROPY_OVERSIZED)
         );
     }
@@ -1950,10 +2415,10 @@ mod tests {
     fn anti_entropy_budget_exhausted_denies() {
         let request = valid_anti_entropy_request();
         let budget = AntiEntropyBudget::new(5); // cost is 10, budget is 5
-        let decision = evaluate_anti_entropy_admission(&request, &budget);
+        let decision = evaluate_anti_entropy_admission(&request, &budget, test_verifier());
         assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
         assert_eq!(
-            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            decision.defect().map(|d| d.reason.as_str()),
             Some(DENY_ANTI_ENTROPY_BUDGET_EXHAUSTED)
         );
     }
@@ -1963,10 +2428,10 @@ mod tests {
         let mut request = valid_anti_entropy_request();
         request.envelope = None;
         let budget = AntiEntropyBudget::default_budget();
-        let decision = evaluate_anti_entropy_admission(&request, &budget);
+        let decision = evaluate_anti_entropy_admission(&request, &budget, test_verifier());
         assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
         assert_eq!(
-            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            decision.defect().map(|d| d.reason.as_str()),
             Some(DENY_ENVELOPE_MISSING)
         );
     }
@@ -1976,10 +2441,10 @@ mod tests {
         let mut request = valid_anti_entropy_request();
         request.convergence_horizon = None;
         let budget = AntiEntropyBudget::default_budget();
-        let decision = evaluate_anti_entropy_admission(&request, &budget);
+        let decision = evaluate_anti_entropy_admission(&request, &budget, test_verifier());
         assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
         assert_eq!(
-            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            decision.defect().map(|d| d.reason.as_str()),
             Some(DENY_CONVERGENCE_HORIZON_UNRESOLVED)
         );
     }
@@ -2125,8 +2590,8 @@ mod tests {
     fn trace_canonical_bytes_deterministic() {
         let request = valid_queue_request(QueueLane::Consume);
         let scheduler = QueueSchedulerState::new();
-        let d1 = evaluate_queue_admission(&request, &scheduler);
-        let d2 = evaluate_queue_admission(&request, &scheduler);
+        let d1 = evaluate_queue_admission(&request, &scheduler, test_verifier());
+        let d2 = evaluate_queue_admission(&request, &scheduler, test_verifier());
 
         let bytes1 = d1.trace.canonical_bytes().expect("should serialize");
         let bytes2 = d2.trace.canonical_bytes().expect("should serialize");
@@ -2150,7 +2615,7 @@ mod tests {
             let mut sched = scheduler.clone();
             sched.lanes[QueueLane::Replay as usize].backlog = i.min(MAX_LANE_BACKLOG);
             sched.total_items = i.min(MAX_TOTAL_QUEUE_ITEMS);
-            let decision = evaluate_queue_admission(&request, &sched);
+            let decision = evaluate_queue_admission(&request, &sched, test_verifier());
             match decision.verdict {
                 QueueAdmissionVerdict::Allow => admitted += 1,
                 QueueAdmissionVerdict::Deny => denied += 1,
@@ -2181,7 +2646,7 @@ mod tests {
 
         // Control lane should still admit
         let request = valid_queue_request(QueueLane::Control);
-        let decision = evaluate_queue_admission(&request, &scheduler);
+        let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
         assert_eq!(
             decision.verdict,
             QueueAdmissionVerdict::Allow,
@@ -2190,7 +2655,7 @@ mod tests {
 
         // Stop/revoke should still admit
         let request = valid_queue_request(QueueLane::StopRevoke);
-        let decision = evaluate_queue_admission(&request, &scheduler);
+        let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
         assert_eq!(
             decision.verdict,
             QueueAdmissionVerdict::Allow,
@@ -2212,7 +2677,7 @@ mod tests {
         for _ in 0..MAX_ANTI_ENTROPY_BUDGET + 100 {
             let mut request = valid_anti_entropy_request();
             request.cost = 1;
-            let decision = evaluate_anti_entropy_admission(&request, &budget);
+            let decision = evaluate_anti_entropy_admission(&request, &budget, test_verifier());
             match decision.verdict {
                 QueueAdmissionVerdict::Allow => {
                     let _ = budget.try_consume(request.cost);
@@ -2241,7 +2706,7 @@ mod tests {
             request.freshness_horizon = None;
             request.revocation_frontier = None;
             request.convergence_horizon = None;
-            let decision = evaluate_queue_admission(&request, &scheduler);
+            let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
 
             if lane == QueueLane::StopRevoke {
                 // Stop/revoke has emergency carve-out but still fails on tp002
@@ -2276,6 +2741,163 @@ mod tests {
     }
 
     // ========================================================================
+    // Bounded deserialization tests (FINDING 1 — DoS prevention)
+    // ========================================================================
+
+    #[test]
+    fn test_deserialize_oversized_boundary_id_rejected() {
+        let oversized_id = "x".repeat(MAX_BOUNDARY_ID_LENGTH + 1);
+        let json = format!(
+            r#"{{
+                "boundary_id": "{oversized_id}",
+                "authority_clock": "clock-main",
+                "tick_start": 1000,
+                "tick_end": 2000,
+                "ttl_ticks": 1500,
+                "deny_on_unknown": true,
+                "signature_set": [],
+                "content_hash": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+            }}"#
+        );
+        let result = serde_json::from_str::<TimeAuthorityEnvelopeV1>(&json);
+        assert!(
+            result.is_err(),
+            "oversized boundary_id must be rejected during deserialization"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds maximum length"),
+            "error should mention length: {err}"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_oversized_signature_set_rejected() {
+        // Build JSON with 17 signatures (MAX_ENVELOPE_SIGNATURES=16).
+        let sig_json = r#"{"signer_id": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1], "signature": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]}"#;
+        let sigs: Vec<&str> = (0..=MAX_ENVELOPE_SIGNATURES).map(|_| sig_json).collect();
+        let json = format!(
+            r#"{{
+                "boundary_id": "b",
+                "authority_clock": "c",
+                "tick_start": 1000,
+                "tick_end": 2000,
+                "ttl_ticks": 1500,
+                "deny_on_unknown": true,
+                "signature_set": [{}],
+                "content_hash": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+            }}"#,
+            sigs.join(",")
+        );
+        let result = serde_json::from_str::<TimeAuthorityEnvelopeV1>(&json);
+        assert!(
+            result.is_err(),
+            "oversized signature_set must be rejected during deserialization"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_oversized_convergence_receipts_rejected() {
+        let receipt_json = r#"{"authority_set_hash": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1], "proof_hash": [2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2], "converged": true}"#;
+        let receipts: Vec<&str> = (0..=MAX_CONVERGENCE_RECEIPTS)
+            .map(|_| receipt_json)
+            .collect();
+        let json = format!(
+            r#"{{
+                "lane": "bulk",
+                "envelope": null,
+                "eval_window": {{ "boundary_id": "b", "authority_clock": "c", "tick_start": 0, "tick_end": 0 }},
+                "freshness_horizon": null,
+                "revocation_frontier": null,
+                "convergence_horizon": null,
+                "convergence_receipts": [{}],
+                "required_authority_sets": [],
+                "cost": 0,
+                "current_tick": 0
+            }}"#,
+            receipts.join(",")
+        );
+        let result = serde_json::from_str::<QueueAdmissionRequest>(&json);
+        assert!(
+            result.is_err(),
+            "oversized convergence_receipts must be rejected during deserialization"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_oversized_required_authority_sets_rejected() {
+        let hash_json = "[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]";
+        let sets: Vec<&str> = (0..=MAX_REQUIRED_AUTHORITY_SETS)
+            .map(|_| hash_json)
+            .collect();
+        let json = format!(
+            r#"{{
+                "lane": "bulk",
+                "envelope": null,
+                "eval_window": {{ "boundary_id": "b", "authority_clock": "c", "tick_start": 0, "tick_end": 0 }},
+                "freshness_horizon": null,
+                "revocation_frontier": null,
+                "convergence_horizon": null,
+                "convergence_receipts": [],
+                "required_authority_sets": [{}],
+                "cost": 0,
+                "current_tick": 0
+            }}"#,
+            sets.join(",")
+        );
+        let result = serde_json::from_str::<QueueAdmissionRequest>(&json);
+        assert!(
+            result.is_err(),
+            "oversized required_authority_sets must be rejected during deserialization"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_valid_payloads_still_work() {
+        // Confirm that valid payloads still round-trip correctly after adding bounds.
+        let envelope = valid_envelope();
+        let json = serde_json::to_string(&envelope).expect("serialize");
+        let parsed: TimeAuthorityEnvelopeV1 =
+            serde_json::from_str(&json).expect("should deserialize");
+        assert_eq!(envelope, parsed);
+
+        let window = valid_eval_window();
+        let json = serde_json::to_string(&window).expect("serialize");
+        let parsed: HtfEvaluationWindow = serde_json::from_str(&json).expect("should deserialize");
+        assert_eq!(window, parsed);
+
+        let request = valid_queue_request(QueueLane::Consume);
+        let json = serde_json::to_string(&request).expect("serialize");
+        let parsed: QueueAdmissionRequest =
+            serde_json::from_str(&json).expect("should deserialize");
+        assert_eq!(request, parsed);
+
+        let ae_request = valid_anti_entropy_request();
+        let json = serde_json::to_string(&ae_request).expect("serialize");
+        let parsed: AntiEntropyAdmissionRequest =
+            serde_json::from_str(&json).expect("should deserialize");
+        assert_eq!(ae_request, parsed);
+    }
+
+    #[test]
+    fn test_deserialize_oversized_deny_reason_rejected() {
+        let oversized_reason = "x".repeat(MAX_DENY_REASON_LENGTH + 1);
+        let json = format!(
+            r#"{{
+                "reason": "{oversized_reason}",
+                "denied_at_tick": 0,
+                "envelope_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "boundary_id": "b"
+            }}"#
+        );
+        let result = serde_json::from_str::<QueueDenyDefect>(&json);
+        assert!(
+            result.is_err(),
+            "oversized deny reason must be rejected during deserialization"
+        );
+    }
+
+    // ========================================================================
     // QueueLane Display
     // ========================================================================
 
@@ -2287,5 +2909,20 @@ mod tests {
         assert_eq!(QueueLane::Replay.to_string(), "replay");
         assert_eq!(QueueLane::ProjectionReplay.to_string(), "projection_replay");
         assert_eq!(QueueLane::Bulk.to_string(), "bulk");
+    }
+
+    // ========================================================================
+    // Defect accessor
+    // ========================================================================
+
+    #[test]
+    fn decision_defect_accessor_matches_trace() {
+        let mut request = valid_queue_request(QueueLane::Consume);
+        request.envelope = None;
+        let scheduler = QueueSchedulerState::new();
+        let decision = evaluate_queue_admission(&request, &scheduler, test_verifier());
+        assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
+        // The defect() accessor must delegate to trace.defect.
+        assert_eq!(decision.defect(), decision.trace.defect.as_ref());
     }
 }
