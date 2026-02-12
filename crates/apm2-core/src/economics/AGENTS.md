@@ -339,13 +339,67 @@ All admission decisions require valid temporal authority:
 - `evaluate_queue_admission(request, scheduler, verifier) -> QueueAdmissionDecision` -- Queue admission (must_use)
 - `evaluate_anti_entropy_admission(request, budget, verifier) -> QueueAdmissionDecision` -- Anti-entropy admission (must_use)
 
+## Replay-Recovery Bounds (REQ-0005)
+
+The `replay_recovery` submodule implements replay-recovery bounds and idempotency closure (RFC-0029 REQ-0005).
+
+### Receipt Types
+
+- `ReplayConvergenceReceiptV1` -- Signed receipt proving bounded idempotent convergence of a replay within an HTF window. Carries `time_authority_ref` and `window_ref` hash bindings.
+- `RecoveryAdmissibilityReceiptV1` -- Signed receipt proving recovery admissibility for a partial-loss rebuild within an HTF window.
+
+Both receipt types use domain-separated Ed25519 signatures (`REPLAY_CONVERGENCE_RECEIPT:` and `RECOVERY_ADMISSIBILITY_RECEIPT:` prefixes).
+
+### Temporal Predicates
+
+- **TP-EIO29-004** (`replay_convergence_horizon_satisfied`): Replay convergence horizon must be resolved; backlog must be resolved; all receipts must be structurally valid, boundary-matched, within horizon, and converged.
+- **TP-EIO29-007** (`replay_idempotency_monotone`): Adjacent windows must have no duplicate authoritative effects and no revoked effects in later window. All effect identity digests must be non-zero.
+
+### Key Types
+
+- `ReplayConvergenceHorizonRef` -- Horizon reference for TP-EIO29-004 evaluation
+- `BacklogState` -- Backlog state snapshot for TP-EIO29-004
+- `AdjacentWindowPair` -- Adjacent-window pair for TP-EIO29-007
+- `IdempotencyCheckInput` -- Complete input for TP-EIO29-007 evaluation
+- `ReplayRecoveryDecision` -- Combined verdict with structured deny defect
+- `ReplayRecoveryDenyDefect` -- Auditable deny defect with reason, predicate ID, boundary, tick, and envelope/window hashes
+
+### Invariants
+
+- [INV-RR01] All unknown, missing, stale, unsigned, or invalid replay/recovery states deny fail-closed.
+- [INV-RR02] Revoked effects must not appear in the later window.
+- [INV-RR03] Authoritative effects must not duplicate across adjacent windows.
+- [INV-RR04] Zero effect identity digests deny fail-closed.
+- [INV-RR05] Receipt and effect collections are hard-capped (MAX_REPLAY_RECEIPTS=256, MAX_EFFECT_IDENTITIES=4096, MAX_REVOKED_EFFECTS=4096).
+- [INV-RR06] Domain-separated signatures prevent cross-receipt-type replay.
+
+### Contracts
+
+- [CTR-RR01] `validate_replay_convergence_tp004()` enforces horizon resolution, backlog resolution, receipt structural validity, boundary match, horizon bounds, and convergence.
+- [CTR-RR02] `validate_replay_idempotency_tp007()` enforces window adjacency, revoked-effect exclusion, authoritative-effect dedup, and zero-digest rejection.
+- [CTR-RR03] `evaluate_replay_recovery()` combines TP-EIO29-004 and optional TP-EIO29-007 into a single admission decision with structured deny defects.
+- [CTR-RR04] All deny decisions produce a `ReplayRecoveryDenyDefect` with stable reason code, predicate ID, boundary, tick, and hash bindings.
+
+### Public API
+
+- `ReplayConvergenceReceiptV1::create_signed(...)` -- Create and sign a replay convergence receipt
+- `ReplayConvergenceReceiptV1::verify_signature()` -- Verify receipt Ed25519 signature
+- `ReplayConvergenceReceiptV1::validate()` -- Structural validation (no signature check)
+- `RecoveryAdmissibilityReceiptV1::create_signed(...)` -- Create and sign a recovery admissibility receipt
+- `RecoveryAdmissibilityReceiptV1::verify_signature()` -- Verify receipt Ed25519 signature
+- `RecoveryAdmissibilityReceiptV1::validate()` -- Structural validation
+- `validate_replay_convergence_tp004(horizon, backlog, receipts, boundary_id)` -- TP-EIO29-004 validation
+- `validate_replay_idempotency_tp007(windows, effects_t, effects_t1, revoked_t1)` -- TP-EIO29-007 validation
+- `evaluate_replay_recovery(...)` -- Combined TP-EIO29-004 + TP-EIO29-007 evaluation
+
 ## Related Modules
 
 - [`apm2_core::evidence`](../evidence/AGENTS.md) -- CAS (`ContentAddressedStore`, `MemoryCas`) used for profile storage
-- [`apm2_core::crypto`](../crypto/AGENTS.md) -- BLAKE3 hashing for profile content addressing
+- [`apm2_core::crypto`](../crypto/AGENTS.md) -- BLAKE3 hashing for profile content addressing; Ed25519 signing for receipt signatures
 - [`apm2_core::determinism`](../determinism/AGENTS.md) -- `canonicalize_json` used for deterministic serialization
 - [`apm2_core::budget`](../budget/AGENTS.md) -- Budget tracking and enforcement at the session level
-- [`apm2_core::pcac::temporal_arbitration`](../pcac/AGENTS.md) -- `TemporalPredicateId` enum (TpEio29001/002/003/008) used for predicate tracking in admission traces
+- [`apm2_core::pcac::temporal_arbitration`](../pcac/AGENTS.md) -- `TemporalPredicateId` enum (TpEio29001/002/003/004/007/008) used for predicate tracking in admission traces
+- [`apm2_core::fac::domain_separator`](../fac/AGENTS.md) -- `sign_with_domain` / `verify_with_domain` for domain-separated receipt signatures
 
 ## References
 
