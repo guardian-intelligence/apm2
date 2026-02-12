@@ -55,6 +55,6 @@ mod store;
 mod tests;
 
 pub use store::{
-    DurableQuarantineGuard, QuarantineEntry, QuarantineEntryId, QuarantinePriority,
+    DurableQuarantineGuard, InsertResult, QuarantineEntry, QuarantineEntryId, QuarantinePriority,
     QuarantineStore, QuarantineStoreConfig, QuarantineStoreError, SqliteQuarantineBackend,
 };

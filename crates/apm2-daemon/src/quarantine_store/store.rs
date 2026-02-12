@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use apm2_core::crypto::Hash;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use crate::admission_kernel::QuarantineGuard;
@@ -230,6 +231,20 @@ pub struct QuarantineStore {
     next_id: QuarantineEntryId,
 }
 
+/// Result of a successful quarantine insertion, including any evicted
+/// entry ID for backend synchronization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertResult {
+    /// The ID assigned to the newly inserted entry.
+    pub entry_id: QuarantineEntryId,
+    /// The ID of the entry that was evicted to make room, if any.
+    /// Callers with a persistence backend MUST delete this entry from
+    /// persistent storage to prevent ghost records (SECURITY BLOCKER:
+    /// evicted entries surviving in the DB cause permanent capacity loss
+    /// on restart via `load_all`).
+    pub evicted_id: Option<QuarantineEntryId>,
+}
+
 impl QuarantineStore {
     /// Creates a new empty store with default configuration.
     #[must_use]
@@ -274,6 +289,12 @@ impl QuarantineStore {
     /// 2. Lowest priority entries strictly below incoming — evicted next.
     /// 3. If no evictable entry exists — denied (fail-closed).
     ///
+    /// # Returns
+    ///
+    /// On success, returns an `InsertResult` containing the new entry ID and
+    /// the evicted entry ID (if eviction occurred). Callers with a persistence
+    /// backend MUST delete the evicted entry from storage.
+    ///
     /// # Errors
     ///
     /// Returns `QuarantineStoreError` if:
@@ -292,7 +313,7 @@ impl QuarantineStore {
         expires_at_tick: u64,
         reason: &str,
         current_tick: u64,
-    ) -> Result<QuarantineEntryId, QuarantineStoreError> {
+    ) -> Result<InsertResult, QuarantineStoreError> {
         // Input validation (DoS protection)
         if session_id.len() > MAX_SESSION_ID_LENGTH {
             return Err(QuarantineStoreError::SessionIdTooLong {
@@ -326,13 +347,18 @@ impl QuarantineStore {
         }
 
         // Global capacity check with priority-aware eviction
-        if self.entries.len() >= self.config.max_global_entries
-            && !self.try_evict_one(priority, current_tick)
-        {
-            return Err(QuarantineStoreError::Saturated {
-                incoming_priority: priority,
-            });
-        }
+        let evicted_id = if self.entries.len() >= self.config.max_global_entries {
+            match self.try_evict_one(priority, current_tick) {
+                Some(evicted) => Some(evicted),
+                None => {
+                    return Err(QuarantineStoreError::Saturated {
+                        incoming_priority: priority,
+                    });
+                },
+            }
+        } else {
+            None
+        };
 
         // Create and insert the entry
         let id = self.next_id;
@@ -356,7 +382,10 @@ impl QuarantineStore {
             .entry(session_id.to_string())
             .or_insert(0) += 1;
 
-        Ok(id)
+        Ok(InsertResult {
+            entry_id: id,
+            evicted_id,
+        })
     }
 
     /// Removes an entry by ID.
@@ -395,9 +424,23 @@ impl QuarantineStore {
     }
 
     /// Looks up an entry by its reservation hash.
+    ///
+    /// Uses constant-time comparison (`subtle::ConstantTimeEq`) and a full
+    /// linear scan (no short-circuit) to prevent timing side-channel leakage
+    /// about reservation hash values or match positions (RSK-1909).
     #[must_use]
     pub fn find_by_reservation_hash(&self, hash: &Hash) -> Option<&QuarantineEntry> {
-        self.entries.values().find(|e| e.reservation_hash == *hash)
+        let mut matched: Option<&QuarantineEntry> = None;
+        for entry in self.entries.values() {
+            // Constant-time equality: does not short-circuit on first
+            // differing byte.  We always scan every entry regardless of
+            // whether we already found a match, so lookup time is constant
+            // with respect to match position.
+            if bool::from(entry.reservation_hash.ct_eq(hash)) {
+                matched = Some(entry);
+            }
+        }
+        matched
     }
 
     /// Returns an iterator over all entries.
@@ -444,8 +487,14 @@ impl QuarantineStore {
     /// 2. Non-expired entries with priority strictly below incoming — lowest
     ///    priority first, then oldest (lowest ID) as tiebreaker.
     ///
-    /// Returns `true` if an entry was evicted.
-    fn try_evict_one(&mut self, incoming_priority: QuarantinePriority, current_tick: u64) -> bool {
+    /// Returns `Some(evicted_id)` if an entry was evicted, `None` otherwise.
+    /// The caller MUST propagate the evicted ID to the persistence backend
+    /// to prevent ghost records in the database (SECURITY BLOCKER fix).
+    fn try_evict_one(
+        &mut self,
+        incoming_priority: QuarantinePriority,
+        current_tick: u64,
+    ) -> Option<QuarantineEntryId> {
         // Phase 1: Try to evict an expired entry (any priority)
         let expired_id = self
             .entries
@@ -456,7 +505,7 @@ impl QuarantineStore {
 
         if let Some(id) = expired_id {
             self.remove(id);
-            return true;
+            return Some(id);
         }
 
         // Phase 2: Try to evict the lowest-priority entry strictly below incoming
@@ -469,10 +518,10 @@ impl QuarantineStore {
 
         if let Some(id) = evictable_id {
             self.remove(id);
-            return true;
+            return Some(id);
         }
 
-        false
+        None
     }
 }
 
@@ -795,9 +844,9 @@ impl SqliteQuarantineBackend {
                     ),
                 });
             }
-            if result.len() >= MAX_GLOBAL_ENTRIES {
-                break;
-            }
+            // Note: the SQL query already includes `LIMIT ?1` with
+            // `MAX_GLOBAL_ENTRIES`, so an additional length check here is
+            // redundant and was removed (SECURITY MINOR 1).
 
             result.push(QuarantineEntry {
                 id: id as u64,
@@ -946,7 +995,7 @@ impl DurableQuarantineGuard {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let id = store.insert(
+        let result = store.insert(
             session_id,
             priority,
             request_id,
@@ -958,15 +1007,27 @@ impl DurableQuarantineGuard {
             current_tick,
         )?;
 
-        // Persist to SQLite (fail-closed: if persistence fails, roll back)
-        let entry = store.entries.get(&id).expect("just inserted");
+        // Remove evicted entry from DB to prevent ghost records
+        // (SECURITY BLOCKER fix: evicted entries that remain in SQLite
+        // would be reloaded by `load_all` on restart, permanently
+        // occupying capacity slots).
+        if let Some(evicted_id) = result.evicted_id {
+            if let Err(e) = self.backend.remove_entry(evicted_id) {
+                // Roll back in-memory insertion to maintain consistency
+                store.remove(result.entry_id);
+                return Err(e);
+            }
+        }
+
+        // Persist new entry to SQLite (fail-closed: if persistence fails, roll back)
+        let entry = store.entries.get(&result.entry_id).expect("just inserted");
         if let Err(e) = self.backend.persist_entry(entry) {
             // Roll back in-memory insertion
-            store.remove(id);
+            store.remove(result.entry_id);
             return Err(e);
         }
 
-        Ok((id, reservation_hash))
+        Ok((result.entry_id, reservation_hash))
     }
 
     /// Removes an entry and updates persistence.
@@ -1079,7 +1140,7 @@ impl QuarantineGuard for DurableQuarantineGuard {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let id = store
+        let result = store
             .insert(
                 session_id,
                 self.default_priority,
@@ -1093,10 +1154,18 @@ impl QuarantineGuard for DurableQuarantineGuard {
             )
             .map_err(|e| e.to_string())?;
 
+        // Remove evicted entry from DB to prevent ghost records
+        if let Some(evicted_id) = result.evicted_id {
+            if let Err(e) = self.backend.remove_entry(evicted_id) {
+                store.remove(result.entry_id);
+                return Err(e.to_string());
+            }
+        }
+
         // Persist to SQLite (fail-closed)
-        let entry = store.entries.get(&id).expect("just inserted");
+        let entry = store.entries.get(&result.entry_id).expect("just inserted");
         if let Err(e) = self.backend.persist_entry(entry) {
-            store.remove(id);
+            store.remove(result.entry_id);
             return Err(e.to_string());
         }
 

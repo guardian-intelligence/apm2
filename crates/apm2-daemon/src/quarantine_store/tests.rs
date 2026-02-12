@@ -59,7 +59,7 @@ fn store_new_is_empty() {
 #[test]
 fn store_insert_and_lookup() {
     let mut store = QuarantineStore::with_config(small_config());
-    let id = store
+    let result = store
         .insert(
             "session-1",
             QuarantinePriority::Normal,
@@ -72,6 +72,8 @@ fn store_insert_and_lookup() {
             100,
         )
         .unwrap();
+    let id = result.entry_id;
+    assert!(result.evicted_id.is_none()); // No eviction on non-full store
 
     assert_eq!(store.len(), 1);
     assert!(!store.is_empty());
@@ -99,7 +101,8 @@ fn store_remove() {
             "test",
             100,
         )
-        .unwrap();
+        .unwrap()
+        .entry_id;
 
     assert!(store.remove(id));
     assert_eq!(store.len(), 0);
@@ -179,7 +182,7 @@ fn eviction_prefers_expired_entries() {
 
     // Insert a Low priority entry at tick 100 — should evict the oldest expired
     // entry (entry 1), regardless of its High priority
-    let new_id = store
+    let insert_result = store
         .insert(
             "s3",
             QuarantinePriority::Low,
@@ -192,6 +195,12 @@ fn eviction_prefers_expired_entries() {
             100,
         )
         .unwrap();
+    let new_id = insert_result.entry_id;
+    // Verify eviction was reported (entry 1 had id=1)
+    assert!(
+        insert_result.evicted_id.is_some(),
+        "eviction should be reported"
+    );
 
     assert_eq!(store.len(), 4);
     // Expired entry 1 (High priority) should have been evicted
@@ -1525,6 +1534,367 @@ fn restore_entry_advances_next_id() {
             "new",
             200,
         )
-        .unwrap();
+        .unwrap()
+        .entry_id;
     assert!(id > 100);
+}
+
+// =============================================================================
+// Regression: SECURITY BLOCKER 1 — Ghost Record Prevention
+// =============================================================================
+
+/// Regression test: when `DurableQuarantineGuard::insert` triggers eviction,
+/// the evicted entry must be removed from both in-memory store AND `SQLite`
+/// backend. Before this fix, evicted entries remained as "ghost" records in
+/// the database, consuming capacity permanently on restart via `load_all`.
+#[test]
+fn eviction_removes_ghost_records_from_sqlite() {
+    let tmp = create_temp_db();
+    let (tick, tick_provider) = make_tick_provider(100);
+
+    // Use a tiny config so we can fill it quickly
+    let config = QuarantineStoreConfig {
+        max_global_entries: 2,
+        max_per_session_entries: 4,
+        max_tracked_sessions: 8,
+    };
+
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+    let guard = DurableQuarantineGuard::new(backend, config.clone())
+        .unwrap()
+        .with_tick_provider(tick_provider)
+        .with_default_ttl_ticks(1000);
+
+    // Fill to capacity with Low priority entries
+    guard
+        .insert(
+            "s1",
+            QuarantinePriority::Low,
+            test_hash(1),
+            test_hash(11),
+            500,
+            "entry-1",
+        )
+        .unwrap();
+    guard
+        .insert(
+            "s2",
+            QuarantinePriority::Low,
+            test_hash(2),
+            test_hash(12),
+            500,
+            "entry-2",
+        )
+        .unwrap();
+
+    // Verify SQLite has 2 entries
+    {
+        let verify_backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+        let loaded = verify_backend.load_all().unwrap();
+        assert_eq!(
+            loaded.len(),
+            2,
+            "SQLite should have 2 entries before eviction"
+        );
+    }
+
+    // Insert a High priority entry — this should evict one Low entry
+    guard
+        .insert(
+            "s3",
+            QuarantinePriority::High,
+            test_hash(3),
+            test_hash(13),
+            500,
+            "entry-3-evicts-low",
+        )
+        .unwrap();
+
+    assert_eq!(
+        guard.len(),
+        2,
+        "in-memory store should still have 2 entries"
+    );
+
+    // CRITICAL: Verify SQLite also has exactly 2 entries (not 3).
+    // Before the fix, the evicted Low entry would remain as a ghost record.
+    {
+        let verify_backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+        let loaded = verify_backend.load_all().unwrap();
+        assert_eq!(
+            loaded.len(),
+            2,
+            "SQLite should have 2 entries after eviction (no ghost records)"
+        );
+        // Verify the new entry is present
+        assert!(
+            loaded.iter().any(|e| e.reason == "entry-3-evicts-low"),
+            "new entry should be in SQLite"
+        );
+    }
+
+    // CRITICAL: Simulate restart — recovered guard should have exactly 2
+    // entries, not 3 (which would happen if ghost records existed).
+    {
+        let (_, tick_provider2) = make_tick_provider(200);
+        let backend2 = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+        let guard2 = DurableQuarantineGuard::new(backend2, config)
+            .unwrap()
+            .with_tick_provider(tick_provider2);
+
+        assert_eq!(
+            guard2.len(),
+            2,
+            "after restart, store should have 2 entries (no ghost capacity loss)"
+        );
+    }
+
+    let _ = tick;
+}
+
+/// Regression test: eviction triggered by expired entries during insert must
+/// also clean the evicted entry from `SQLite`.
+#[test]
+fn expired_eviction_during_insert_removes_from_sqlite() {
+    let tmp = create_temp_db();
+    let (tick, tick_provider) = make_tick_provider(100);
+
+    let config = QuarantineStoreConfig {
+        max_global_entries: 2,
+        max_per_session_entries: 4,
+        max_tracked_sessions: 8,
+    };
+
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+    let guard = DurableQuarantineGuard::new(backend, config.clone())
+        .unwrap()
+        .with_tick_provider(tick_provider)
+        .with_default_ttl_ticks(50); // Short TTL
+
+    // Fill to capacity — both entries will expire at tick 150
+    guard
+        .insert(
+            "s1",
+            QuarantinePriority::Normal,
+            test_hash(1),
+            test_hash(11),
+            50, // expires at tick 150
+            "will-expire-1",
+        )
+        .unwrap();
+    guard
+        .insert(
+            "s2",
+            QuarantinePriority::Normal,
+            test_hash(2),
+            test_hash(12),
+            50, // expires at tick 150
+            "will-expire-2",
+        )
+        .unwrap();
+
+    // Advance past expiry
+    tick.store(200, Ordering::Relaxed);
+
+    // Insert a new entry — should evict one expired entry to make room
+    guard
+        .insert(
+            "s3",
+            QuarantinePriority::Normal,
+            test_hash(3),
+            test_hash(13),
+            500,
+            "fresh-entry",
+        )
+        .unwrap();
+
+    // Verify SQLite has exactly 2 entries (1 expired + 1 fresh), not 3
+    {
+        let verify_backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+        let loaded = verify_backend.load_all().unwrap();
+        assert_eq!(
+            loaded.len(),
+            2,
+            "SQLite should have 2 entries (evicted expired entry removed)"
+        );
+    }
+
+    // Restart should recover exactly 2 entries
+    {
+        let (_, tick_provider2) = make_tick_provider(200);
+        let backend2 = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+        let guard2 = DurableQuarantineGuard::new(backend2, config)
+            .unwrap()
+            .with_tick_provider(tick_provider2);
+        assert_eq!(guard2.len(), 2);
+    }
+}
+
+/// Regression test: the trait-level `reserve()` also cleans evicted entries
+/// from `SQLite` when eviction occurs.
+#[test]
+fn trait_reserve_cleans_evicted_from_sqlite() {
+    let tmp = create_temp_db();
+    let (tick, tick_provider) = make_tick_provider(100);
+
+    let config = QuarantineStoreConfig {
+        max_global_entries: 2,
+        max_per_session_entries: 4,
+        max_tracked_sessions: 8,
+    };
+
+    let backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+    let guard = DurableQuarantineGuard::new(backend, config)
+        .unwrap()
+        .with_tick_provider(tick_provider)
+        .with_default_ttl_ticks(50) // short TTL
+        .with_default_priority(QuarantinePriority::Normal);
+
+    // Fill via trait interface
+    guard
+        .reserve("session-a", &test_hash(1), &test_hash(11))
+        .unwrap();
+    guard
+        .reserve("session-b", &test_hash(2), &test_hash(12))
+        .unwrap();
+
+    // Advance past expiry
+    tick.store(200, Ordering::Relaxed);
+
+    // Reserve another — should evict one expired entry
+    guard
+        .reserve("session-c", &test_hash(3), &test_hash(13))
+        .unwrap();
+
+    // Verify SQLite has exactly 2 entries, not 3
+    {
+        let verify_backend = SqliteQuarantineBackend::open(tmp.path()).unwrap();
+        let loaded = verify_backend.load_all().unwrap();
+        assert_eq!(
+            loaded.len(),
+            2,
+            "SQLite should have 2 entries via trait reserve (no ghost records)"
+        );
+    }
+}
+
+// =============================================================================
+// Regression: SECURITY MAJOR 1 — Constant-Time Hash Comparison
+// =============================================================================
+
+/// Verify that `find_by_reservation_hash` returns the correct entry
+/// even when using constant-time comparison (correctness test).
+#[test]
+fn find_by_reservation_hash_constant_time_correctness() {
+    let mut store = QuarantineStore::with_config(small_config());
+
+    // Insert multiple entries with distinct reservation hashes
+    for i in 0..4u8 {
+        store
+            .insert(
+                &format!("s{i}"),
+                QuarantinePriority::Normal,
+                test_hash(i),
+                test_hash(10 + i),
+                test_hash(20 + i), // reservation hash
+                100,
+                500,
+                "test",
+                100,
+            )
+            .unwrap();
+    }
+
+    // Find each by reservation hash
+    for i in 0..4u8 {
+        let entry = store.find_by_reservation_hash(&test_hash(20 + i));
+        assert!(
+            entry.is_some(),
+            "should find entry with reservation hash {}",
+            20 + i
+        );
+        assert_eq!(entry.unwrap().session_id, format!("s{i}"));
+    }
+
+    // Non-existent hash returns None
+    assert!(store.find_by_reservation_hash(&test_hash(99)).is_none());
+}
+
+/// Verify that `find_by_reservation_hash` scans ALL entries (no short-circuit)
+/// by checking that the last inserted entry is found correctly.
+#[test]
+fn find_by_reservation_hash_finds_last_entry() {
+    let mut store = QuarantineStore::with_config(small_config());
+
+    // Insert 8 entries (max capacity of small_config)
+    for i in 0..8u8 {
+        store
+            .insert(
+                &format!("s{}", i % 4),
+                QuarantinePriority::Normal,
+                test_hash(i),
+                test_hash(10 + i),
+                test_hash(20 + i),
+                100,
+                500,
+                "test",
+                100,
+            )
+            .unwrap();
+    }
+
+    // Find the last-inserted entry (tests full scan, no short-circuit)
+    let entry = store.find_by_reservation_hash(&test_hash(27));
+    assert!(entry.is_some());
+    assert_eq!(entry.unwrap().session_id, "s3");
+}
+
+// =============================================================================
+// InsertResult: evicted_id tracking
+// =============================================================================
+
+/// Verify that `InsertResult.evicted_id` is `None` when no eviction occurs
+/// and `Some(id)` when eviction occurs.
+#[test]
+fn insert_result_reports_evicted_id() {
+    let mut store = QuarantineStore::with_config(tiny_config()); // max_global=4
+
+    // Fill without eviction
+    for i in 0..4u8 {
+        let result = store
+            .insert(
+                &format!("s{i}"),
+                QuarantinePriority::Low,
+                test_hash(i),
+                test_hash(10 + i),
+                test_hash(20 + i),
+                100,
+                500,
+                "test",
+                100,
+            )
+            .unwrap();
+        assert!(
+            result.evicted_id.is_none(),
+            "no eviction expected for entry {i}"
+        );
+    }
+
+    // Insert with eviction (High priority evicts one Low)
+    let result = store
+        .insert(
+            "s-high",
+            QuarantinePriority::High,
+            test_hash(50),
+            test_hash(60),
+            test_hash(70),
+            100,
+            500,
+            "high-priority",
+            100,
+        )
+        .unwrap();
+    assert!(result.evicted_id.is_some(), "eviction should be reported");
+    // The evicted entry should be the oldest Low (id=1)
+    assert_eq!(result.evicted_id.unwrap(), 1);
 }

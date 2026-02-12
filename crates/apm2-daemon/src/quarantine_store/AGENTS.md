@@ -25,6 +25,8 @@ Production implementation of `QuarantineGuard`. Wraps an in-memory `QuarantineSt
 - [INV-QS03] Recovery loads persisted entries on construction.
 - [INV-QS04] All collections bounded by `MAX_*` constants.
 - [INV-QS05] `QuarantineGuard::reserve()` uses the caller-provided `session_id` for per-session quota isolation. No shared default session bucket exists.
+- [INV-QS06] Evicted entries are removed from both in-memory store AND SQLite backend. `insert()` returns `InsertResult` containing `evicted_id` which callers MUST propagate to `backend.remove_entry()`. Failure to do so causes ghost records that permanently consume capacity on restart.
+- [INV-QS07] `find_by_reservation_hash()` uses `subtle::ConstantTimeEq` with full linear scan (no short-circuit) to prevent timing side-channel leakage about reservation hash values (RSK-1909).
 
 ### `QuarantineStore` (store.rs)
 
@@ -35,6 +37,7 @@ In-memory store with `BTreeMap<EntryId, Entry>` and `HashMap<SessionId, count>`.
 1. Expired entries evicted first (any priority, oldest first by ID).
 2. Unexpired entries with priority strictly below incoming evicted next.
 3. No evictable entry = deny insertion (fail-closed / saturation-safe).
+4. `insert()` returns `InsertResult { entry_id, evicted_id }` — callers with persistence MUST delete the evicted entry from DB.
 
 **Contracts:**
 
@@ -43,6 +46,7 @@ In-memory store with `BTreeMap<EntryId, Entry>` and `HashMap<SessionId, count>`.
 - [CTR-QS03] Session tracking: max `MAX_TRACKED_SESSIONS` distinct sessions.
 - [CTR-QS04] Input validation: session ID and reason bounded by `MAX_SESSION_ID_LENGTH` / `MAX_REASON_LENGTH`.
 - [CTR-QS05] Unexpired entries with priority >= incoming are never evicted.
+- [CTR-QS06] Reservation hash lookup uses constant-time comparison (`subtle::ConstantTimeEq`) to prevent timing attacks.
 
 ### `SqliteQuarantineBackend` (store.rs)
 
@@ -86,6 +90,8 @@ Four-level priority: `Low(0)`, `Normal(1)`, `High(2)`, `Critical(3)`.
 - Bounded SQL queries prevent memory exhaustion from corrupted databases.
 - Quarantine DB files created with 0600 permissions (owner-only access).
 - Per-session quota isolation via caller-provided `session_id` (no shared default bucket).
+- Constant-time hash comparison via `subtle::ConstantTimeEq` for reservation hash lookup (RSK-1909 timing side-channel prevention).
+- Eviction-on-insert synchronizes both in-memory and SQLite backend, preventing ghost records that would cause permanent capacity loss on restart.
 
 ## Related Modules
 
