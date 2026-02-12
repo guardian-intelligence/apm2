@@ -1426,6 +1426,19 @@ pub struct AdmissionResultV1 {
     ///
     /// `None` when no effect journal is wired.
     pub effect_journal: Option<std::sync::Arc<dyn super::effect_journal::EffectJournal>>,
+    /// Pre-built journal binding data for the caller to call
+    /// `record_started` at the true pre-dispatch boundary
+    /// (TCK-00501 SEC-MAJOR-1 fix).
+    ///
+    /// The caller MUST call `journal.record_started(&binding)` just
+    /// before the actual effect dispatch (`broker.execute()` for tool
+    /// requests, or ledger/CAS writes for session endpoints). This
+    /// ensures `Started` entries are only created when the effect is
+    /// truly about to be dispatched, preventing false in-doubt
+    /// classification from intervening failures.
+    ///
+    /// `None` when no effect journal is wired.
+    pub journal_binding: Option<super::effect_journal::EffectJournalBindingV1>,
 }
 
 // Intentionally no Clone or Serialize — capability tokens are non-cloneable.
@@ -1451,6 +1464,7 @@ impl std::fmt::Debug for AdmissionResultV1 {
             )
             .field("idempotency_key", &hex::encode(self.idempotency_key.key))
             .field("has_effect_journal", &self.effect_journal.is_some())
+            .field("has_journal_binding", &self.journal_binding.is_some())
             .finish()
     }
 }

@@ -58,7 +58,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read as _, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -158,6 +158,8 @@ impl std::fmt::Display for EffectExecutionState {
 pub enum EffectJournalError {
     /// I/O error during durable write or fsync.
     IoError {
+        /// The I/O error kind for programmatic matching.
+        kind: std::io::ErrorKind,
         /// Description of the I/O error.
         reason: String,
     },
@@ -218,7 +220,9 @@ pub enum EffectJournalError {
 impl std::fmt::Display for EffectJournalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::IoError { reason } => write!(f, "effect journal I/O error: {reason}"),
+            Self::IoError { kind, reason } => {
+                write!(f, "effect journal I/O error ({kind:?}): {reason}")
+            },
             Self::InvalidTransition {
                 request_id,
                 current,
@@ -237,10 +241,14 @@ impl std::fmt::Display for EffectJournalError {
                 write!(f, "corrupt effect journal entry at line {line}: {reason}")
             },
             Self::ReExecutionDenied {
-                request_id, reason, ..
+                request_id,
+                enforcement_tier,
+                declared_idempotent,
+                reason,
             } => write!(
                 f,
-                "re-execution denied for {}: {reason}",
+                "re-execution denied for {} (tier={enforcement_tier}, \
+                 idempotent={declared_idempotent}): {reason}",
                 hex::encode(request_id)
             ),
             Self::OutputReleaseDenied {
@@ -262,6 +270,7 @@ impl std::error::Error for EffectJournalError {}
 impl From<std::io::Error> for EffectJournalError {
     fn from(e: std::io::Error) -> Self {
         Self::IoError {
+            kind: e.kind(),
             reason: e.to_string(),
         }
     }
@@ -287,6 +296,7 @@ impl From<std::io::Error> for EffectJournalError {
 /// authority_join_hash || session_id_len || session_id ||
 /// tool_class_len || tool_class || declared_idempotent`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EffectJournalBindingV1 {
     /// Stable request identifier (journal key).
     pub request_id: Hash,
@@ -722,17 +732,13 @@ impl FileBackedEffectJournal {
             )
         })?;
 
-        // MINOR-1 fix: Remediate permissions on pre-existing files.
+        // Remediate permissions on pre-existing files.
         // OpenOptions::mode(0o600) only applies on file creation; a
         // pre-existing file with broader permissions (e.g., 0o644 from
         // a previous version or manual creation) would remain world-readable.
         // Enforce 0o600 unconditionally after open+lock to close this gap.
         #[cfg(unix)]
-        {
-            use std::fs::Permissions;
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, Permissions::from_mode(0o600))?;
-        }
+        enforce_journal_permissions(&path)?;
 
         // Replay existing entries in streaming fashion.
         // SECURITY: Use bounded read_line instead of unbounded
@@ -748,27 +754,40 @@ impl FileBackedEffectJournal {
             let mut byte_offset: u64 = 0;
             let mut line_idx: usize = 0;
             let mut pending_error: Option<(usize, u64, String)> = None;
-            let mut line = String::new();
 
             loop {
-                line.clear();
-                let bytes_read = reader.read_line(&mut line)?;
+                // BLOCKER FIX (TCK-00501): Bounded read to prevent
+                // memory exhaustion from oversized journal lines.
+                //
+                // BufRead::read_line() allocates the FULL line before any
+                // length check — a single 4 GiB line would OOM before the
+                // post-read check. Instead, use Read::take() + read_until()
+                // with Vec<u8> to cap the read at MAX_JOURNAL_LINE_LEN + 1
+                // bytes, then detect oversized lines BEFORE conversion.
+                let mut buf: Vec<u8> = Vec::new();
+                let bytes_read = (&mut reader)
+                    .take((MAX_JOURNAL_LINE_LEN as u64) + 1)
+                    .read_until(b'\n', &mut buf)?;
                 if bytes_read == 0 {
                     break; // EOF
                 }
-                // DoS prevention: reject oversized lines before any
-                // further processing. A legitimate journal line is well
-                // under MAX_JOURNAL_LINE_LEN; exceeding it indicates
-                // corruption or adversarial tampering.
-                if line.len() > MAX_JOURNAL_LINE_LEN {
+                // Detect oversized lines: if we filled the buffer without
+                // hitting a newline, the line exceeds MAX_JOURNAL_LINE_LEN.
+                if buf.len() > MAX_JOURNAL_LINE_LEN && buf.last() != Some(&b'\n') {
                     return Err(EffectJournalError::CorruptEntry {
                         line: line_idx + 1,
                         reason: format!(
                             "journal line exceeds maximum length ({} > {MAX_JOURNAL_LINE_LEN})",
-                            line.len()
+                            buf.len()
                         ),
                     });
                 }
+                // Convert to UTF-8 String (fail-closed on invalid UTF-8).
+                let line =
+                    String::from_utf8(buf).map_err(|e| EffectJournalError::CorruptEntry {
+                        line: line_idx + 1,
+                        reason: format!("journal line is not valid UTF-8: {e}"),
+                    })?;
 
                 // Strip trailing newline for consistent trimming.
                 let content = if line.ends_with('\n') {
@@ -894,14 +913,10 @@ impl FileBackedEffectJournal {
             #[cfg(unix)]
             truncate_opts.mode(0o600);
             let truncate_file = truncate_opts.open(&path)?;
-            // MINOR-1 fix: Remediate permissions on truncation reopen
+            // Remediate permissions on truncation reopen
             // (same rationale as the primary open path above).
             #[cfg(unix)]
-            {
-                use std::fs::Permissions;
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, Permissions::from_mode(0o600))?;
-            }
+            enforce_journal_permissions(&path)?;
             truncate_file.set_len(truncate_pos)?;
             truncate_file.sync_all()?;
         }
@@ -972,6 +987,7 @@ impl EffectJournal for FileBackedEffectJournal {
         // Serialize binding to JSON for journal line.
         let binding_json =
             serde_json::to_string(binding).map_err(|e| EffectJournalError::IoError {
+                kind: std::io::ErrorKind::InvalidData,
                 reason: format!("binding serialization failed: {e}"),
             })?;
 
@@ -1262,6 +1278,20 @@ fn parse_journal_line(line: &str) -> Result<(char, Hash, Option<EffectJournalBin
         },
         other => Err(format!("unknown journal tag: {other}")),
     }
+}
+
+/// Enforce restrictive permissions on the journal file (Unix only).
+///
+/// `OpenOptions::mode(0o600)` only applies on creation; pre-existing
+/// files retain their original permissions. This function unconditionally
+/// enforces 0o600 to prevent world-readable journal files that leak
+/// request IDs, session IDs, policy root digests, and AJC IDs.
+#[cfg(unix)]
+fn enforce_journal_permissions(path: &Path) -> Result<(), EffectJournalError> {
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 /// Parse a 64-character hex string into a 32-byte hash.

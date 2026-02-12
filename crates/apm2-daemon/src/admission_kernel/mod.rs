@@ -660,14 +660,16 @@ impl AdmissionKernelV1 {
         // Validate bundle before sealing (fail-closed).
         bundle.validate()?;
 
-        // Phase P.1 (TCK-00501): Effect journal — record Started.
-        //
-        // Placed AFTER all fallible pre-dispatch steps (bundle construction,
-        // validation) to prevent false in-doubt classification if bundle
-        // validation fails. The only remaining operation after this point
-        // is the infallible `content_hash()` and result assembly.
-        if let Some(ref journal) = self.effect_journal {
-            let binding = EffectJournalBindingV1 {
+        // Phase P.1 (TCK-00501 SEC-MAJOR-1 fix): Build journal binding
+        // but do NOT call record_started here. The binding is exposed in
+        // AdmissionResultV1 so the CALLER can call record_started at the
+        // true pre-dispatch boundary (just before broker.execute() in
+        // handle_request_tool, or just before ledger/CAS writes in
+        // session endpoint handlers). This prevents false in-doubt
+        // classification from orphaned Started entries when fallible
+        // operations between execute() and actual dispatch fail.
+        let journal_binding = if self.effect_journal.is_some() {
+            Some(EffectJournalBindingV1 {
                 request_id,
                 request_digest: plan.spine_ext.canonical_request_digest,
                 as_of_ledger_anchor: plan.as_of_ledger_anchor.clone(),
@@ -682,14 +684,10 @@ impl AdmissionKernelV1 {
                 session_id: plan.request.session_id.clone(),
                 tool_class: plan.request.tool_class.clone(),
                 declared_idempotent: plan.request.declared_idempotent,
-            };
-
-            journal
-                .record_started(&binding)
-                .map_err(|e| AdmitError::BundleSealFailure {
-                    reason: format!("effect journal record_started failed: {e}"),
-                })?;
-        }
+            })
+        } else {
+            None
+        };
 
         // Seal: compute the deterministic content hash.
         let bundle_digest = bundle.content_hash();
@@ -716,6 +714,7 @@ impl AdmissionKernelV1 {
             timing_witness_seed,
             idempotency_key,
             effect_journal: self.effect_journal.clone(),
+            journal_binding,
         })
     }
 

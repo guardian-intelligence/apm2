@@ -4349,10 +4349,10 @@ impl super::effect_journal::EffectJournal for TrackingEffectJournal {
 
 #[test]
 fn test_tck_00501_consume_failure_does_not_leave_stale_started_entry() {
-    // TCK-00501 MAJOR 2 regression test: when execute() fails before
-    // bundle validation (e.g., PCAC consume failure), the effect journal
-    // must NOT have a Started entry. This validates that record_started
-    // is positioned AFTER all fallible pre-effect steps.
+    // TCK-00501 regression test: when execute() fails (e.g., PCAC consume
+    // failure), no journal_binding is returned to the caller, so
+    // record_started is never called. This validates that failed execute()
+    // cannot produce orphaned Started entries.
     let tracking_journal = Arc::new(TrackingEffectJournal::new());
 
     let kernel = AdmissionKernelV1::new(
@@ -4387,9 +4387,15 @@ fn test_tck_00501_consume_failure_does_not_leave_stale_started_entry() {
 }
 
 #[test]
-fn test_tck_00501_successful_execute_records_started_in_journal() {
-    // Positive test: verify that a successful execute() DOES call
-    // record_started on the effect journal.
+fn test_tck_00501_successful_execute_returns_journal_binding() {
+    // Positive test: verify that a successful execute() returns a
+    // journal_binding that the caller can use to call record_started
+    // at the true pre-dispatch boundary (TCK-00501 SEC-MAJOR-1 fix).
+    //
+    // execute() no longer calls record_started directly — instead it
+    // exposes the binding in AdmissionResultV1 so the caller controls
+    // when Started is persisted, preventing false in-doubt classification
+    // from orphaned Started entries.
     let tracking_journal = Arc::new(TrackingEffectJournal::new());
 
     let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
@@ -4402,12 +4408,38 @@ fn test_tck_00501_successful_execute_records_started_in_journal() {
     let request = valid_request(RiskTier::Tier2Plus);
     let mut plan = kernel.plan(&request).expect("plan should succeed");
 
-    let result = kernel.execute(&mut plan, test_hash(90), test_hash(91));
-    assert!(result.is_ok(), "execute should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    // execute() must NOT call record_started — caller controls timing.
+    assert!(
+        !tracking_journal.was_started_called(),
+        "execute() must NOT call record_started (caller responsibility)"
+    );
+
+    // journal_binding must be present when effect journal is wired.
+    let binding = result
+        .journal_binding
+        .as_ref()
+        .expect("journal_binding MUST be present when effect journal is wired");
+
+    // Verify binding is well-formed (non-zero request_id, valid fields).
+    binding
+        .validate()
+        .expect("journal_binding must pass validation");
+
+    // Caller can now call record_started at the dispatch boundary.
+    result
+        .effect_journal
+        .as_ref()
+        .expect("effect_journal MUST be present")
+        .record_started(binding)
+        .expect("record_started must succeed with returned binding");
 
     assert!(
         tracking_journal.was_started_called(),
-        "record_started MUST be called on successful execute"
+        "record_started MUST succeed when called by caller with returned binding"
     );
 }
 

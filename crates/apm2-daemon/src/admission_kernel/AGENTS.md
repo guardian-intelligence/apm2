@@ -74,7 +74,7 @@ Single-use admission plan containing join-time bindings. Not `Clone`, `Copy`, `S
 
 ### `AdmissionResultV1` (types.rs)
 
-Result of successful execution containing capability tokens, consume receipts, boundary span, witness seeds, idempotency key, and effect journal handle. The `leakage_witness_seed` and `timing_witness_seed` fields are carried through from the consumed plan so the runtime post-effect path can invoke `finalize_post_effect_witness` with actual seeds rather than ad-hoc hash-only checks (TCK-00497 QUALITY MAJOR 1). The `idempotency_key` and `effect_journal` fields support crash-safe effect execution (TCK-00501).
+Result of successful execution containing capability tokens, consume receipts, boundary span, witness seeds, idempotency key, effect journal handle, and journal binding. The `leakage_witness_seed` and `timing_witness_seed` fields are carried through from the consumed plan so the runtime post-effect path can invoke `finalize_post_effect_witness` with actual seeds rather than ad-hoc hash-only checks (TCK-00497 QUALITY MAJOR 1). The `idempotency_key`, `effect_journal`, and `journal_binding` fields support crash-safe effect execution (TCK-00501). The `journal_binding` is built by `execute()` but NOT persisted; the caller controls when `record_started` is called to prevent false in-doubt classification (SEC-MAJOR-1 fix).
 
 - [CTR-AK15] Seeds in `AdmissionResultV1` match the plan-time seeds (same content hash).
 - [CTR-AK16] Runtime post-effect path MUST use `kernel.finalize_post_effect_witness()` with the result's seeds as the single source of truth for seed/provider/temporal binding validation. Ad-hoc validation is forbidden.
@@ -144,6 +144,11 @@ Crash-safe effect execution journal (TCK-00501). Tracks effect execution state p
 - [INV-AK51] Post-effect path MUST call `record_completed()` after successful effect execution to transition journal state from `Started` to `Completed`; wired in `session_dispatch.rs` (TCK-00501 fix).
 - [INV-AK52] C and R journal records enforce exact 64 hex char length (not minimum). Trailing garbage after the hex is rejected as `CorruptEntry` during replay (MAJOR-1 fix, TCK-00501 round 6).
 - [INV-AK53] S journal records verify line-key `request_id` matches `binding.request_id`. A mismatch is rejected as `CorruptEntry` during replay to prevent identity confusion between lookup key and authoritative binding (MAJOR-2 fix, TCK-00501 round 6).
+- [INV-AK54] Journal replay uses bounded read (`Read::take()` + `read_until()` with `Vec<u8>`) capped at `MAX_JOURNAL_LINE_LEN + 1` bytes per line. Oversized lines are detected BEFORE memory allocation, preventing OOM from malicious/corrupted journal files (BLOCKER fix, TCK-00501 round 7).
+- [INV-AK55] `EffectJournalBindingV1` has `#[serde(deny_unknown_fields)]` to reject corrupted/tampered entries with extra JSON fields during replay (MAJOR-2 fix, TCK-00501 round 7).
+- [INV-AK56] `EffectJournalError::IoError` preserves `std::io::ErrorKind` for programmatic matching (MAJOR-1 fix, TCK-00501 round 7).
+- [INV-AK57] Kernel plan/execute runs whenever `admission_kernel` is wired, regardless of `pcac_lifecycle_gate` presence. The PCAC gate handles authority lifecycle; the kernel additionally provides effect journal crash-safety tracking. Both run when both are wired in production (SEC-MAJOR-2 fix, TCK-00501 round 7).
+- [INV-AK58] Permission remediation (`enforce_journal_permissions`) is extracted to a helper function and called at both open and truncation paths (NIT fix, TCK-00501 round 7).
 
 ### `EffectCapability`, `LedgerWriteCapability`, `QuarantineCapability` (capabilities.rs)
 

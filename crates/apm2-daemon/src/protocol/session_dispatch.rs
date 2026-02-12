@@ -7695,16 +7695,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         };
 
         // ================================================================
-        // TCK-00494 BLOCKER FIX: AdmissionKernel plan/execute invocation.
+        // TCK-00494 BLOCKER FIX + TCK-00501 SEC-MAJOR-2 FIX:
+        // AdmissionKernel plan/execute invocation.
         //
-        // When the AdmissionKernel is wired and the PCAC LifecycleGate is
-        // NOT (kernel is sole authority gate), we MUST invoke the kernel's
-        // plan() and execute() lifecycle before broker dispatch.
+        // The kernel MUST run WHENEVER it is wired, regardless of whether
+        // the PCAC LifecycleGate is also present. The kernel provides the
+        // effect journal lifecycle (record_started/record_completed) that
+        // the PCAC gate does not. Production wires BOTH pcac_lifecycle_gate
+        // AND admission_kernel, so the previous condition
+        // `pcac_lifecycle_gate.is_none()` caused the kernel (and therefore
+        // the effect journal) to be entirely bypassed in production.
         //
-        // This closes the authority bypass where admission_kernel.is_some()
-        // passed the no-bypass guard but the handler never actually called
-        // plan()/execute(), allowing fail-closed tier requests to reach the
-        // effect-capable broker path ungated.
+        // The PCAC gate handles authority lifecycle (join/revalidate/consume);
+        // the kernel additionally provides effect journal crash-safety
+        // tracking. Both run when both are wired.
         //
         // For fail-closed tiers: kernel plan+execute is MANDATORY.
         // For monitor tiers: kernel plan+execute runs if wired (defense in
@@ -7714,9 +7718,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // granted. Without it, broker dispatch MUST NOT proceed for
         // fail-closed tiers.
         // ================================================================
-        let admission_result = if self.pcac_lifecycle_gate.is_none() && self.is_authoritative_mode()
-        {
-            if let Some(ref kernel) = self.admission_kernel {
+        let admission_result = if let Some(ref kernel) = self.admission_kernel {
+            if self.is_authoritative_mode() {
                 // Resolve the PCAC risk tier for this tool class.
                 let pcac_risk_tier = self
                     .derive_pcac_risk_tier_from_policy(&token.session_id, tool_class)
@@ -7933,11 +7936,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
                 Some(result)
             } else {
-                // No kernel wired in authoritative mode without PCAC gate.
-                // The no-bypass guard at the top already handles fail-closed
-                // tier denial; monitor tiers proceed without kernel.
+                // Not in authoritative mode: kernel plan/execute not required.
                 None
             }
+        } else if self.pcac_lifecycle_gate.is_none() && self.is_authoritative_mode() {
+            // No kernel AND no PCAC gate in authoritative mode.
+            // The no-bypass guard at the top already handles fail-closed
+            // tier denial; monitor tiers proceed without kernel.
+            None
         } else {
             None
         };
@@ -8381,6 +8387,34 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         if let Some(ref result) = admission_result {
             broker_request =
                 broker_request.with_idempotency_key(Some(result.idempotency_key.as_hex()));
+        }
+
+        // ================================================================
+        // TCK-00501 SEC-MAJOR-1 FIX: Record effect journal Started at the
+        // TRUE pre-dispatch boundary — immediately before broker.execute().
+        //
+        // All fallible pre-dispatch steps (ToolActuation evidence
+        // persistence, EpisodeId construction, risk tier resolution,
+        // BrokerToolRequest assembly) have completed. If record_started
+        // fails, deny the request (fail-closed). This prevents false
+        // in-doubt classification from orphaned Started entries.
+        // ================================================================
+        if let Some(ref result) = admission_result {
+            if let (Some(journal), Some(binding)) =
+                (&result.effect_journal, &result.journal_binding)
+            {
+                if let Err(e) = journal.record_started(binding) {
+                    warn!(
+                        session_id = %token.session_id,
+                        error = %e,
+                        "effect journal record_started failed at pre-dispatch boundary (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("effect journal record_started failed: {e}"),
+                    ));
+                }
+            }
         }
 
         // Call broker.request() asynchronously using tokio runtime
@@ -11033,13 +11067,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             );
 
             // CONTRACT: PCAC lifecycle has been fully enforced and
-            // evidence persisted. Return Ok(None) -- the caller may
-            // proceed to the authoritative effect.
-            return Ok(None);
+            // evidence persisted. If the kernel is NOT wired, the caller
+            // may proceed. If the kernel IS wired, fall through to also
+            // run kernel plan/execute for effect journal tracking
+            // (TCK-00501 SEC-MAJOR-2 fix).
+            if self.admission_kernel.is_none() {
+                return Ok(None);
+            }
+            // Fall through to kernel plan/execute below.
         }
 
-        // At this point: authoritative mode, kernel is wired, no PCAC gate.
-        // Route through kernel plan/execute.
+        // Route through kernel plan/execute for effect journal tracking.
+        // This runs when:
+        // (a) PCAC gate is present AND kernel is wired (production path), or
+        // (b) Only kernel is wired (no PCAC gate).
         let Some(kernel) = self.admission_kernel.as_ref() else {
             // Should not reach here given the guard above, but fail-closed.
             return Err(SessionResponse::error(
@@ -11648,6 +11689,27 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // Increment sequence counter atomically
         let seq = self.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
 
+        // TCK-00501 SEC-MAJOR-1 FIX: Record effect journal Started at the
+        // true pre-dispatch boundary for EmitEvent — immediately before
+        // the ledger write.
+        if let Some(ref result) = admission_result {
+            if let (Some(journal), Some(binding)) =
+                (&result.effect_journal, &result.journal_binding)
+            {
+                if let Err(e) = journal.record_started(binding) {
+                    warn!(
+                        session_id = %token.session_id,
+                        error = %e,
+                        "effect journal record_started failed for EmitEvent (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("effect journal record_started failed for EmitEvent: {e}"),
+                    ));
+                }
+            }
+        }
+
         // TCK-00290 BLOCKER 2: Use emit_session_event with proper parameters
         // - event_type: The actual event type from the request (not coerced)
         // - payload: The actual payload bytes from the request (not discarded)
@@ -11951,6 +12013,27 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 self.persist_session_endpoint_admission_evidence("publish_evidence", &token, result)
             {
                 return Ok(deny_response);
+            }
+        }
+
+        // TCK-00501 SEC-MAJOR-1 FIX: Record effect journal Started at the
+        // true pre-dispatch boundary for PublishEvidence — immediately
+        // before the CAS write.
+        if let Some(ref result) = admission_result {
+            if let (Some(journal), Some(binding)) =
+                (&result.effect_journal, &result.journal_binding)
+            {
+                if let Err(e) = journal.record_started(binding) {
+                    warn!(
+                        session_id = %token.session_id,
+                        error = %e,
+                        "effect journal record_started failed for PublishEvidence (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("effect journal record_started failed for PublishEvidence: {e}"),
+                    ));
+                }
             }
         }
 
