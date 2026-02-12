@@ -30,9 +30,9 @@ use super::prerequisites::LedgerAnchorV1;
 
 /// Bounded string deserialization module.
 ///
-/// Prevents denial-of-service via unbounded allocation when deserializing string fields
-/// from untrusted input. Each string is rejected if it exceeds the
-/// corresponding `MAX_*` limit.
+/// Prevents denial-of-service via unbounded allocation when deserializing
+/// string fields from untrusted input. Each string is rejected if it exceeds
+/// the corresponding `MAX_*` limit.
 mod bounded_deser {
     use serde::{self, Deserialize, Deserializer};
 
