@@ -25,6 +25,14 @@
 //! - **Deterministic ordering**: All queries use `ORDER BY rowid` for
 //!   deterministic row selection.
 //!
+//! # Concurrency
+//!
+//! The [`IntentBuffer`] API is **synchronous** and performs blocking `SQLite`
+//! I/O. Since `apm2-daemon` is an async application, callers **must not**
+//! invoke these methods directly on a tokio worker thread. Instead, wrap calls
+//! in [`tokio::task::spawn_blocking`] (or an equivalent offloading mechanism)
+//! to avoid stalling the async executor.
+//!
 //! # Migration Safety
 //!
 //! The schema uses `CREATE TABLE IF NOT EXISTS` and does **not** alter existing
@@ -434,6 +442,7 @@ impl IntentBuffer {
     /// Returns [`IntentBufferError::Database`] on SQL failure.
     pub fn deny(&self, intent_id: &str, reason: &str) -> Result<bool, IntentBufferError> {
         validate_field("intent_id", intent_id)?;
+        validate_field("deny_reason", reason)?;
 
         let guard = self.lock()?;
         // Only deny pending intents — check admission state BEFORE mutation.
@@ -462,6 +471,7 @@ impl IntentBuffer {
         &self,
         intent_id: &str,
     ) -> Result<Option<ProjectionIntent>, IntentBufferError> {
+        validate_field("intent_id", intent_id)?;
         let guard = self.lock()?;
         let result = guard
             .query_row(
@@ -579,7 +589,7 @@ impl IntentBuffer {
         validate_field("intent_id", intent_id)?;
         validate_field("work_id", work_id)?;
 
-        let guard = self.lock()?;
+        let mut guard = self.lock_mut()?;
 
         // Check for existing entry (idempotent insert).
         let exists: bool = guard
@@ -596,26 +606,34 @@ impl IntentBuffer {
             return Ok(false);
         }
 
-        // Check capacity and evict if needed.
-        // We do this atomically within a single mutex acquisition to prevent
-        // TOCTOU: another writer cannot sneak in between count and insert.
-        let evicted = self.evict_if_needed_locked(&guard)?;
+        // Wrap eviction + insertion in a transaction so that if the INSERT
+        // fails, eviction is rolled back and INV-IB03 is upheld (evicted IDs
+        // are only returned when the whole operation commits).
+        let tx = guard
+            .transaction()
+            .map_err(|e| IntentBufferError::Database(format!("begin transaction failed: {e}")))?;
+
+        // Check capacity and evict if needed (inside the transaction).
+        let evicted = Self::evict_if_needed_in_tx(&tx)?;
 
         // Insert the new entry.
-        guard
-            .execute(
-                "INSERT INTO deferred_replay_backlog
+        tx.execute(
+            "INSERT INTO deferred_replay_backlog
                  (intent_id, work_id, backlog_digest, replay_horizon_tick,
                   replayed_at, converged)
                  VALUES (?1, ?2, ?3, ?4, 0, 0)",
-                params![
-                    intent_id,
-                    work_id,
-                    backlog_digest.as_slice(),
-                    replay_horizon_tick as i64,
-                ],
-            )
-            .map_err(|e| IntentBufferError::Database(format!("insert_backlog failed: {e}")))?;
+            params![
+                intent_id,
+                work_id,
+                backlog_digest.as_slice(),
+                replay_horizon_tick as i64,
+            ],
+        )
+        .map_err(|e| IntentBufferError::Database(format!("insert_backlog failed: {e}")))?;
+
+        // Commit the transaction — eviction + insert succeed or fail together.
+        tx.commit()
+            .map_err(|e| IntentBufferError::Database(format!("commit failed: {e}")))?;
 
         if !evicted.is_empty() {
             return Err(IntentBufferError::BacklogEviction {
@@ -648,6 +666,7 @@ impl IntentBuffer {
         intent_id: &str,
         replayed_at: u64,
     ) -> Result<bool, IntentBufferError> {
+        validate_field("intent_id", intent_id)?;
         let guard = self.lock()?;
         let rows = guard
             .execute(
@@ -676,6 +695,7 @@ impl IntentBuffer {
     ///
     /// Returns [`IntentBufferError::Database`] on SQL failure.
     pub fn mark_converged(&self, intent_id: &str) -> Result<bool, IntentBufferError> {
+        validate_field("intent_id", intent_id)?;
         let guard = self.lock()?;
         let rows = guard
             .execute(
@@ -698,6 +718,7 @@ impl IntentBuffer {
         &self,
         intent_id: &str,
     ) -> Result<Option<DeferredReplayEntry>, IntentBufferError> {
+        validate_field("intent_id", intent_id)?;
         let guard = self.lock()?;
         let result = guard
             .query_row(
@@ -797,18 +818,27 @@ impl IntentBuffer {
     // Internal helpers
     // =========================================================================
 
-    /// Acquires the mutex lock.
+    /// Acquires the mutex lock (immutable guard).
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, IntentBufferError> {
         self.conn
             .lock()
             .map_err(|e| IntentBufferError::MutexPoisoned(format!("{e}")))
     }
 
-    /// Evicts oldest entries if backlog is at or above [`MAX_BACKLOG_ITEMS`].
-    /// Called while holding the mutex. Returns evicted intent IDs.
+    /// Acquires the mutex lock (mutable guard, required for transactions).
+    fn lock_mut(&self) -> Result<std::sync::MutexGuard<'_, Connection>, IntentBufferError> {
+        self.conn
+            .lock()
+            .map_err(|e| IntentBufferError::MutexPoisoned(format!("{e}")))
+    }
+
+    /// Evicts oldest entries if backlog is at or above [`MAX_BACKLOG_ITEMS`],
+    /// executing within the provided transaction. Returns evicted intent IDs.
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    fn evict_if_needed_locked(&self, conn: &Connection) -> Result<Vec<String>, IntentBufferError> {
-        let count: i64 = conn
+    fn evict_if_needed_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+    ) -> Result<Vec<String>, IntentBufferError> {
+        let count: i64 = tx
             .query_row("SELECT COUNT(*) FROM deferred_replay_backlog", [], |row| {
                 row.get(0)
             })
@@ -819,19 +849,20 @@ impl IntentBuffer {
         }
 
         // Evict 1 entry to make room for the new insert.
-        self.evict_to_target_locked(conn, MAX_BACKLOG_ITEMS - 1)
+        Self::evict_to_target_on(tx, MAX_BACKLOG_ITEMS - 1)
     }
 
     /// Evicts oldest entries (by rowid) to bring count to `target_count`.
     /// Returns the intent IDs of evicted entries.
+    ///
+    /// Works on any type that dereferences to [`Connection`] (bare connection,
+    /// transaction, etc.).
     #[allow(
         clippy::cast_sign_loss,
         clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::unused_self
+        clippy::cast_possible_wrap
     )]
-    fn evict_to_target_locked(
-        &self,
+    fn evict_to_target_on(
         conn: &Connection,
         target_count: usize,
     ) -> Result<Vec<String>, IntentBufferError> {
@@ -885,6 +916,17 @@ impl IntentBuffer {
 
         Ok(evicted_ids)
     }
+
+    /// Evicts oldest entries (by rowid) to bring count to `target_count`.
+    /// Instance method wrapper for the public API.
+    #[allow(clippy::unused_self)]
+    fn evict_to_target_locked(
+        &self,
+        conn: &Connection,
+        target_count: usize,
+    ) -> Result<Vec<String>, IntentBufferError> {
+        Self::evict_to_target_on(conn, target_count)
+    }
 }
 
 // =============================================================================
@@ -897,14 +939,24 @@ fn row_to_intent(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectionIntent> 
     let changeset_blob: Vec<u8> = row.get(2)?;
     let ledger_blob: Vec<u8> = row.get(3)?;
 
-    let mut changeset_digest = [0u8; 32];
-    let mut ledger_head = [0u8; 32];
-    if changeset_blob.len() == 32 {
-        changeset_digest.copy_from_slice(&changeset_blob);
-    }
-    if ledger_blob.len() == 32 {
-        ledger_head.copy_from_slice(&ledger_blob);
-    }
+    let changeset_digest: [u8; 32] = changeset_blob.as_slice().try_into().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Blob,
+            format!(
+                "changeset_digest: expected 32 bytes, got {}",
+                changeset_blob.len()
+            )
+            .into(),
+        )
+    })?;
+    let ledger_head: [u8; 32] = ledger_blob.as_slice().try_into().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Blob,
+            format!("ledger_head: expected 32 bytes, got {}", ledger_blob.len()).into(),
+        )
+    })?;
 
     let verdict_str: String = row.get(6)?;
     let verdict = IntentVerdict::from_str_checked(&verdict_str).unwrap_or(IntentVerdict::Denied); // Fail-closed: unknown verdict -> denied
@@ -931,10 +983,17 @@ fn row_to_intent(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectionIntent> 
 #[allow(clippy::cast_sign_loss)]
 fn row_to_backlog_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeferredReplayEntry> {
     let backlog_blob: Vec<u8> = row.get(2)?;
-    let mut backlog_digest = [0u8; 32];
-    if backlog_blob.len() == 32 {
-        backlog_digest.copy_from_slice(&backlog_blob);
-    }
+    let backlog_digest: [u8; 32] = backlog_blob.as_slice().try_into().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Blob,
+            format!(
+                "backlog_digest: expected 32 bytes, got {}",
+                backlog_blob.len()
+            )
+            .into(),
+        )
+    })?;
 
     let replay_horizon_tick: i64 = row.get(3)?;
     let replayed_at: i64 = row.get(4)?;
@@ -1838,6 +1897,242 @@ mod tests {
             .expect("get")
             .expect("exists");
         assert_eq!(entry.replayed_at, 3_000_000);
+    }
+
+    // =========================================================================
+    // Deny reason validation tests
+    // =========================================================================
+
+    #[test]
+    fn test_deny_rejects_empty_reason() {
+        let buf = make_buffer();
+        buf.insert(
+            "intent-001",
+            "work-001",
+            &make_digest(0x42),
+            &make_digest(0xAB),
+            "pending",
+            100,
+            1_000_000,
+        )
+        .expect("insert");
+
+        let result = buf.deny("intent-001", "");
+        assert!(
+            matches!(result, Err(IntentBufferError::MissingField("deny_reason"))),
+            "empty deny reason must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_deny_rejects_oversized_reason() {
+        let buf = make_buffer();
+        buf.insert(
+            "intent-001",
+            "work-001",
+            &make_digest(0x42),
+            &make_digest(0xAB),
+            "pending",
+            100,
+            1_000_000,
+        )
+        .expect("insert");
+
+        let long_reason = "x".repeat(MAX_FIELD_LENGTH + 1);
+        let result = buf.deny("intent-001", &long_reason);
+        assert!(
+            matches!(
+                result,
+                Err(IntentBufferError::FieldTooLong {
+                    field: "deny_reason",
+                    ..
+                })
+            ),
+            "oversized deny reason must be rejected"
+        );
+    }
+
+    // =========================================================================
+    // Identifier validation on getters/setters tests
+    // =========================================================================
+
+    #[test]
+    fn test_get_intent_rejects_empty_id() {
+        let buf = make_buffer();
+        let result = buf.get_intent("");
+        assert!(matches!(
+            result,
+            Err(IntentBufferError::MissingField("intent_id"))
+        ));
+    }
+
+    #[test]
+    fn test_get_intent_rejects_oversized_id() {
+        let buf = make_buffer();
+        let long_id = "x".repeat(MAX_FIELD_LENGTH + 1);
+        let result = buf.get_intent(&long_id);
+        assert!(matches!(
+            result,
+            Err(IntentBufferError::FieldTooLong {
+                field: "intent_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_mark_replayed_rejects_empty_id() {
+        let buf = make_buffer();
+        let result = buf.mark_replayed("", 1_000);
+        assert!(matches!(
+            result,
+            Err(IntentBufferError::MissingField("intent_id"))
+        ));
+    }
+
+    #[test]
+    fn test_mark_converged_rejects_empty_id() {
+        let buf = make_buffer();
+        let result = buf.mark_converged("");
+        assert!(matches!(
+            result,
+            Err(IntentBufferError::MissingField("intent_id"))
+        ));
+    }
+
+    #[test]
+    fn test_get_backlog_entry_rejects_empty_id() {
+        let buf = make_buffer();
+        let result = buf.get_backlog_entry("");
+        assert!(matches!(
+            result,
+            Err(IntentBufferError::MissingField("intent_id"))
+        ));
+    }
+
+    // =========================================================================
+    // Blob deserialization corruption detection tests
+    // =========================================================================
+
+    #[test]
+    fn test_corrupt_changeset_blob_detected() {
+        let buf = make_buffer();
+        // Insert a valid intent first.
+        buf.insert(
+            "intent-001",
+            "work-001",
+            &make_digest(0x42),
+            &make_digest(0xAB),
+            "pending",
+            100,
+            1_000_000,
+        )
+        .expect("insert");
+
+        // Manually corrupt the changeset_digest blob to wrong length.
+        {
+            let guard = buf.conn.lock().expect("lock");
+            guard
+                .execute(
+                    "UPDATE projection_intents SET changeset_digest = X'DEADBEEF' WHERE intent_id = 'intent-001'",
+                    [],
+                )
+                .expect("corrupt");
+        }
+
+        let result = buf.get_intent("intent-001");
+        assert!(
+            result.is_err(),
+            "corrupt blob must produce an error, not a zero-fill"
+        );
+    }
+
+    #[test]
+    fn test_corrupt_backlog_blob_detected() {
+        let buf = make_buffer();
+        buf.insert(
+            "intent-001",
+            "work-001",
+            &make_digest(0x42),
+            &make_digest(0xAB),
+            "pending",
+            100,
+            1_000_000,
+        )
+        .expect("insert intent");
+        buf.insert_backlog("intent-001", "work-001", &make_digest(0xDD), 500)
+            .expect("insert backlog");
+
+        // Manually corrupt the backlog_digest blob to wrong length.
+        {
+            let guard = buf.conn.lock().expect("lock");
+            guard
+                .execute(
+                    "UPDATE deferred_replay_backlog SET backlog_digest = X'CAFE' WHERE intent_id = 'intent-001'",
+                    [],
+                )
+                .expect("corrupt");
+        }
+
+        let result = buf.get_backlog_entry("intent-001");
+        assert!(
+            result.is_err(),
+            "corrupt backlog blob must produce an error, not a zero-fill"
+        );
+    }
+
+    // =========================================================================
+    // Transactional eviction + insertion test
+    // =========================================================================
+
+    #[test]
+    fn test_insert_backlog_eviction_is_transactional() {
+        // Verify that after a successful eviction+insert, the count is
+        // correct and evicted entries are gone. This confirms the
+        // transaction committed atomically.
+        let buf = make_buffer();
+        fill_backlog(&buf, MAX_BACKLOG_ITEMS);
+        assert_eq!(buf.backlog_count().expect("count"), MAX_BACKLOG_ITEMS);
+
+        let n = MAX_BACKLOG_ITEMS;
+        let id = format!("intent-{n:06}");
+        let wid = format!("work-{n:06}");
+        buf.insert(
+            &id,
+            &wid,
+            &make_digest(0xFE),
+            &make_digest(0xAB),
+            "pending",
+            999_999,
+            1_000_000,
+        )
+        .expect("insert intent");
+
+        let result = buf.insert_backlog(&id, &wid, &make_digest(0xFE), 999_999);
+        match &result {
+            Err(IntentBufferError::BacklogEviction {
+                evicted_count,
+                evicted_intent_ids,
+            }) => {
+                assert_eq!(*evicted_count, 1);
+                // The evicted entry must actually be gone from the DB
+                // (transaction committed).
+                for evicted_id in evicted_intent_ids {
+                    let entry = buf.get_backlog_entry(evicted_id).expect("get");
+                    assert!(
+                        entry.is_none(),
+                        "evicted entry {evicted_id} should be deleted"
+                    );
+                }
+                // The new entry must exist.
+                let entry = buf.get_backlog_entry(&id).expect("get");
+                assert!(entry.is_some(), "new entry should exist after txn commit");
+            },
+            other => panic!("expected BacklogEviction, got: {other:?}"),
+        }
+
+        // Count must be exactly MAX (evicted 1, inserted 1).
+        assert_eq!(buf.backlog_count().expect("count"), MAX_BACKLOG_ITEMS);
     }
 
     // =========================================================================
