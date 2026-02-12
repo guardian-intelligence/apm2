@@ -1,6 +1,6 @@
 # Economics Module
 
-> Canonical economics profiles and deterministic budget admission for RFC-0029 REQ-0001.
+> Canonical economics profiles, deterministic budget admission (REQ-0001), and HTF-bound queue admission with anti-entropy anti-starvation enforcement (REQ-0004) for RFC-0029.
 
 ## Overview
 
@@ -274,12 +274,74 @@ let decision = evaluator.evaluate(
 assert_eq!(decision.verdict, BudgetAdmissionVerdict::Allow);
 ```
 
+## Queue Admission (REQ-0004)
+
+The `queue_admission` submodule implements HTF-bound queue admission and anti-entropy anti-starvation enforcement (RFC-0029 REQ-0004).
+
+### Queue Lane Model
+
+Queue lanes are ordered by priority: `StopRevoke > Control > Consume > Replay > ProjectionReplay > Bulk`.
+
+- **StopRevoke**: strict priority, 200 permille reservation, 100-tick floor guarantee
+- **Control**: guaranteed minimum, 150 permille reservation, 500-tick floor guarantee
+- **Consume/Replay/ProjectionReplay/Bulk**: weighted deficit round-robin, no reservations
+
+### Temporal Predicates
+
+All admission decisions require valid temporal authority:
+
+- **TP-EIO29-001**: `TimeAuthorityEnvelopeV1` must be present, signed, fresh, boundary-bound, and `deny_on_unknown=true`
+- **TP-EIO29-002**: Freshness horizon must resolve; current window must not exceed horizon; revocation frontier must be current
+- **TP-EIO29-003**: All required authority sets must have matching, converged receipts with valid proof hashes
+
+### Key Types
+
+- `QueueLane` -- 6-variant enum with priority ordering and lane reservations
+- `TimeAuthorityEnvelopeV1` -- Signed temporal authority envelope with boundary binding
+- `HtfEvaluationWindow` -- Evaluation window (boundary_id, authority_clock, tick range)
+- `QueueAdmissionRequest` / `AntiEntropyAdmissionRequest` -- Admission request inputs
+- `QueueAdmissionDecision` -- Verdict + defect + trace output
+- `QueueSchedulerState` -- Per-lane backlog and max-wait tracking (not `Sync`)
+- `AntiEntropyBudget` -- Budget tracker for anti-entropy admission (not `Sync`)
+
+### Invariants
+
+- [INV-QA01] All unknown, missing, stale, unsigned, or invalid temporal authority states deny fail-closed.
+- [INV-QA02] Stop/revoke and control lanes preserve declared tick floors under adversarial load.
+- [INV-QA03] Anti-entropy is pull-only; push requests are unconditionally denied.
+- [INV-QA04] Anti-entropy is budget-bound; oversized proof ranges are denied.
+- [INV-QA05] Lane backlog and total queue capacity are hard-capped (MAX_LANE_BACKLOG=4096, MAX_TOTAL_QUEUE_ITEMS=16384).
+- [INV-QA06] Envelope signature comparison uses constant-time equality (`subtle::ConstantTimeEq`).
+- [INV-QA07] Emergency stop/revoke carve-out: tp001 failure alone does not block stop_revoke lane (authority-reducing operations), but tp002/tp003 failures still deny.
+
+### Contracts
+
+- [CTR-QA01] `evaluate_queue_admission()` enforces TP-001/002/003, tick-floor invariants, and capacity checks in order.
+- [CTR-QA02] `evaluate_anti_entropy_admission()` enforces pull-only, proof size, TP-001, TP-003, and budget in order.
+- [CTR-QA03] `validate_envelope_tp001()` rejects empty boundary_id, empty authority_clock, inverted tick ranges, zero TTL, excessive TTL, zero content hash, unsigned envelopes, zero-byte signatures, and `deny_on_unknown=false`.
+- [CTR-QA04] All deny decisions produce a `QueueDenyDefect` with stable reason code, lane, predicate_id, denied_at_tick, envelope_hash, and boundary_id.
+- [CTR-QA05] `QueueSchedulerState` and `AntiEntropyBudget` require exclusive access (not `Sync`); callers must hold appropriate locks.
+
+### Public API
+
+#### Temporal Predicate Validators
+
+- `validate_envelope_tp001(envelope, eval_window) -> Result<(), &str>` -- TP-EIO29-001 validation
+- `validate_freshness_horizon_tp002(horizon, frontier, window) -> Result<(), &str>` -- TP-EIO29-002 validation
+- `validate_convergence_horizon_tp003(horizon, receipts, sets) -> Result<(), &str>` -- TP-EIO29-003 validation
+
+#### Admission Evaluators
+
+- `evaluate_queue_admission(request, scheduler) -> QueueAdmissionDecision` -- Queue admission (must_use)
+- `evaluate_anti_entropy_admission(request, budget) -> QueueAdmissionDecision` -- Anti-entropy admission (must_use)
+
 ## Related Modules
 
 - [`apm2_core::evidence`](../evidence/AGENTS.md) -- CAS (`ContentAddressedStore`, `MemoryCas`) used for profile storage
 - [`apm2_core::crypto`](../crypto/AGENTS.md) -- BLAKE3 hashing for profile content addressing
 - [`apm2_core::determinism`](../determinism/AGENTS.md) -- `canonicalize_json` used for deterministic serialization
 - [`apm2_core::budget`](../budget/AGENTS.md) -- Budget tracking and enforcement at the session level
+- [`apm2_core::pcac::temporal_arbitration`](../pcac/AGENTS.md) -- `TemporalPredicateId` enum (TpEio29001/002/003/008) used for predicate tracking in admission traces
 
 ## References
 

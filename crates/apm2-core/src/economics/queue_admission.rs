@@ -1,0 +1,2291 @@
+// AGENT-AUTHORED
+//! HTF-bound queue admission and anti-entropy anti-starvation enforcement.
+//!
+//! Implements RFC-0029 REQ-0004:
+//! - Lane reservations and tick-floor invariants for stop/revoke and control
+//!   lanes
+//! - TP-EIO29-001/002/003 enforcement in queue and anti-entropy admission paths
+//! - Structured deny defects for stale, unsigned, missing, or invalid temporal
+//!   authority
+//! - Pull-only, budget-bound anti-entropy admission
+//!
+//! # Queue Lane Model
+//!
+//! Queue lanes are ordered by priority: `StopRevoke > Control > Consume >
+//! Replay > ProjectionReplay > Bulk`. Stop/revoke has strict priority with a
+//! guaranteed reservation. Control has a guaranteed minimum reservation. All
+//! other lanes use weighted deficit round-robin.
+//!
+//! # Temporal Authority Model
+//!
+//! All admission decisions require a valid `TimeAuthorityEnvelopeV1`. The
+//! envelope must be signed, fresh (within TTL), and bound to the correct
+//! `(boundary_id, authority_clock)` context. Missing, stale, unsigned, or
+//! invalid envelopes produce fail-closed denials with structured defects.
+//!
+//! # Anti-Entropy Model
+//!
+//! Anti-entropy is pull-only and budget-bound. No unsolicited authority
+//! acceptance from pushed data-plane payloads is admissible. Oversized proof
+//! ranges or proof bytes are denied. TP-EIO29-003 convergence horizon checks
+//! gate anti-entropy admission.
+//!
+//! # Security Domain
+//!
+//! `DOMAIN_SECURITY` is in scope. All unknown or ambiguous states fail closed.
+
+use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
+use thiserror::Error;
+
+use crate::crypto::Hash;
+use crate::determinism::canonicalize_json;
+use crate::pcac::temporal_arbitration::TemporalPredicateId;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Maximum number of pending items across all lanes.
+///
+/// Hard cap to prevent unbounded memory growth under adversarial load.
+pub const MAX_TOTAL_QUEUE_ITEMS: usize = 16_384;
+
+/// Maximum backlog per individual lane.
+///
+/// Per-lane cap prevents a single lane from consuming the entire queue budget.
+pub const MAX_LANE_BACKLOG: usize = 4_096;
+
+/// Maximum anti-entropy budget per evaluation window (in abstract cost units).
+pub const MAX_ANTI_ENTROPY_BUDGET: u64 = 1_000;
+
+/// Maximum number of convergence receipts per anti-entropy admission check.
+pub const MAX_CONVERGENCE_RECEIPTS: usize = 256;
+
+/// Maximum number of required authority sets for anti-entropy convergence.
+pub const MAX_REQUIRED_AUTHORITY_SETS: usize = 64;
+
+/// Maximum string length for boundary and clock identifiers.
+pub const MAX_BOUNDARY_ID_LENGTH: usize = 256;
+
+/// Maximum number of signatures in a time authority envelope.
+pub const MAX_ENVELOPE_SIGNATURES: usize = 16;
+
+/// Maximum TTL value in ticks (approximately 1 day at 1MHz).
+pub const MAX_TTL_TICKS: u64 = 86_400_000_000;
+
+/// Minimum reservation fraction for stop/revoke lane (parts per 1000).
+///
+/// Stop/revoke lane is guaranteed at least this fraction of total queue
+/// capacity.
+pub const STOP_REVOKE_RESERVATION_PERMILLE: u32 = 200;
+
+/// Minimum reservation fraction for control lane (parts per 1000).
+///
+/// Control lane is guaranteed at least this fraction of total queue capacity.
+pub const CONTROL_RESERVATION_PERMILLE: u32 = 150;
+
+/// Maximum wait ticks for stop/revoke lane items.
+///
+/// Items waiting longer than this are considered a tick-floor violation.
+pub const MAX_STOP_REVOKE_WAIT_TICKS: u64 = 100;
+
+/// Maximum wait ticks for control lane items.
+pub const MAX_CONTROL_WAIT_TICKS: u64 = 500;
+
+const ZERO_HASH: Hash = [0u8; 32];
+
+// ============================================================================
+// Deny reasons (stable strings for replay verification)
+// ============================================================================
+
+/// Deny: time authority envelope is missing.
+pub const DENY_ENVELOPE_MISSING: &str = "time_authority_envelope_missing";
+/// Deny: time authority envelope has zero/null hash.
+pub const DENY_ENVELOPE_HASH_ZERO: &str = "time_authority_envelope_hash_zero";
+/// Deny: envelope signature set is empty.
+pub const DENY_ENVELOPE_UNSIGNED: &str = "time_authority_envelope_unsigned";
+/// Deny: envelope signature verification failed.
+pub const DENY_ENVELOPE_SIGNATURE_INVALID: &str = "time_authority_envelope_signature_invalid";
+/// Deny: envelope `boundary_id` mismatch.
+pub const DENY_ENVELOPE_BOUNDARY_MISMATCH: &str = "time_authority_envelope_boundary_mismatch";
+/// Deny: envelope `authority_clock` mismatch.
+pub const DENY_ENVELOPE_CLOCK_MISMATCH: &str = "time_authority_envelope_clock_mismatch";
+/// Deny: envelope does not cover the evaluation window.
+pub const DENY_ENVELOPE_WINDOW_UNCOVERED: &str = "time_authority_envelope_window_uncovered";
+/// Deny: envelope TTL is stale.
+pub const DENY_ENVELOPE_STALE: &str = "time_authority_envelope_stale";
+/// Deny: envelope `deny_on_unknown` is false (must be true).
+pub const DENY_ENVELOPE_DENY_ON_UNKNOWN_FALSE: &str =
+    "time_authority_envelope_deny_on_unknown_false";
+/// Deny: freshness horizon reference is unresolved.
+pub const DENY_FRESHNESS_HORIZON_UNRESOLVED: &str = "freshness_horizon_unresolved";
+/// Deny: current window exceeds freshness horizon.
+pub const DENY_FRESHNESS_HORIZON_EXCEEDED: &str = "freshness_horizon_exceeded";
+/// Deny: revocation frontier is stale or missing.
+pub const DENY_REVOCATION_FRONTIER_STALE: &str = "revocation_frontier_stale";
+/// Deny: anti-entropy convergence horizon unresolved.
+pub const DENY_CONVERGENCE_HORIZON_UNRESOLVED: &str = "anti_entropy_convergence_horizon_unresolved";
+/// Deny: required authority set not converged.
+pub const DENY_AUTHORITY_SET_NOT_CONVERGED: &str = "required_authority_set_not_converged";
+/// Deny: convergence receipt missing for required set.
+pub const DENY_CONVERGENCE_RECEIPT_MISSING: &str = "convergence_receipt_missing";
+/// Deny: lane backlog exceeded.
+pub const DENY_LANE_BACKLOG_EXCEEDED: &str = "queue_lane_backlog_exceeded";
+/// Deny: total queue capacity exceeded.
+pub const DENY_TOTAL_QUEUE_EXCEEDED: &str = "queue_total_capacity_exceeded";
+/// Deny: anti-entropy budget exhausted.
+pub const DENY_ANTI_ENTROPY_BUDGET_EXHAUSTED: &str = "anti_entropy_budget_exhausted";
+/// Deny: anti-entropy request is push (not pull).
+pub const DENY_ANTI_ENTROPY_PUSH_REJECTED: &str = "anti_entropy_push_not_pull_rejected";
+/// Deny: anti-entropy proof range oversized.
+pub const DENY_ANTI_ENTROPY_OVERSIZED: &str = "anti_entropy_proof_range_oversized";
+/// Deny: tick-floor invariant violated for stop/revoke lane.
+pub const DENY_TICK_FLOOR_STOP_REVOKE: &str = "tick_floor_violated_stop_revoke";
+/// Deny: tick-floor invariant violated for control lane.
+pub const DENY_TICK_FLOOR_CONTROL: &str = "tick_floor_violated_control";
+/// Deny: unknown temporal authority state.
+pub const DENY_UNKNOWN_TEMPORAL_STATE: &str = "unknown_temporal_authority_state";
+/// Deny: envelope `boundary_id` is empty or oversized.
+pub const DENY_ENVELOPE_BOUNDARY_ID_INVALID: &str = "time_authority_envelope_boundary_id_invalid";
+/// Deny: envelope `authority_clock` is empty or oversized.
+pub const DENY_ENVELOPE_CLOCK_INVALID: &str = "time_authority_envelope_clock_invalid";
+/// Deny: envelope tick range is invalid (start > end).
+pub const DENY_ENVELOPE_TICK_RANGE_INVALID: &str = "time_authority_envelope_tick_range_invalid";
+/// Deny: envelope TTL is zero.
+pub const DENY_ENVELOPE_TTL_ZERO: &str = "time_authority_envelope_ttl_zero";
+/// Deny: envelope TTL exceeds maximum.
+pub const DENY_ENVELOPE_TTL_EXCESSIVE: &str = "time_authority_envelope_ttl_excessive";
+/// Deny: envelope signatures exceed maximum count.
+pub const DENY_ENVELOPE_TOO_MANY_SIGNATURES: &str = "time_authority_envelope_too_many_signatures";
+
+// ============================================================================
+// Queue lane types
+// ============================================================================
+
+/// Queue lanes ordered by priority (highest first).
+///
+/// Mapping from RFC-0029 formal model: `L = {stop_revoke, control, consume,
+/// replay, projection_replay, bulk}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueLane {
+    /// Stop and revocation orders. Strict priority, guaranteed reservation.
+    StopRevoke       = 0,
+    /// Control traffic. Guaranteed minimum reservation.
+    Control          = 1,
+    /// Consume/effect execution traffic.
+    Consume          = 2,
+    /// Replay traffic for convergence.
+    Replay           = 3,
+    /// Projection replay traffic.
+    ProjectionReplay = 4,
+    /// Bulk/low-priority traffic.
+    Bulk             = 5,
+}
+
+impl QueueLane {
+    /// Returns `true` if this lane has a guaranteed tick-floor reservation.
+    #[must_use]
+    pub const fn has_tick_floor_guarantee(self) -> bool {
+        matches!(self, Self::StopRevoke | Self::Control)
+    }
+
+    /// Returns the maximum wait ticks for this lane, if it has a tick-floor
+    /// guarantee.
+    #[must_use]
+    pub const fn max_wait_ticks(self) -> Option<u64> {
+        match self {
+            Self::StopRevoke => Some(MAX_STOP_REVOKE_WAIT_TICKS),
+            Self::Control => Some(MAX_CONTROL_WAIT_TICKS),
+            _ => None,
+        }
+    }
+
+    /// Returns the reservation permille for this lane (parts per 1000), or 0.
+    #[must_use]
+    pub const fn reservation_permille(self) -> u32 {
+        match self {
+            Self::StopRevoke => STOP_REVOKE_RESERVATION_PERMILLE,
+            Self::Control => CONTROL_RESERVATION_PERMILLE,
+            _ => 0,
+        }
+    }
+
+    /// Returns all lane variants in priority order.
+    #[must_use]
+    pub const fn all() -> [Self; 6] {
+        [
+            Self::StopRevoke,
+            Self::Control,
+            Self::Consume,
+            Self::Replay,
+            Self::ProjectionReplay,
+            Self::Bulk,
+        ]
+    }
+}
+
+impl std::fmt::Display for QueueLane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StopRevoke => write!(f, "stop_revoke"),
+            Self::Control => write!(f, "control"),
+            Self::Consume => write!(f, "consume"),
+            Self::Replay => write!(f, "replay"),
+            Self::ProjectionReplay => write!(f, "projection_replay"),
+            Self::Bulk => write!(f, "bulk"),
+        }
+    }
+}
+
+// ============================================================================
+// Time authority envelope
+// ============================================================================
+
+/// Signed time authority envelope for temporal admission gates.
+///
+/// Implements `TimeAuthorityEnvelopeV1` from RFC-0029 TP-EIO29-001.
+/// All queue admission paths require a valid envelope or deny fail-closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimeAuthorityEnvelopeV1 {
+    /// Boundary identifier (must match evaluation context).
+    pub boundary_id: String,
+    /// Authority clock identifier (must match evaluation context).
+    pub authority_clock: String,
+    /// Start tick of the envelope's validity window.
+    pub tick_start: u64,
+    /// End tick of the envelope's validity window (inclusive).
+    pub tick_end: u64,
+    /// Time-to-live in ticks from `tick_start`.
+    pub ttl_ticks: u64,
+    /// When true, unknown state denies admission (must be true for admission).
+    pub deny_on_unknown: bool,
+    /// Signature set proving envelope authenticity.
+    /// Each entry is a 32-byte signer public key concatenated with a 64-byte
+    /// signature.
+    pub signature_set: Vec<EnvelopeSignature>,
+    /// Content hash of the envelope payload (for CAS binding).
+    pub content_hash: Hash,
+}
+
+/// A single signature in the envelope's signature set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvelopeSignature {
+    /// 32-byte Ed25519 public key of the signer.
+    pub signer_id: [u8; 32],
+    /// 64-byte Ed25519 signature over the canonical envelope payload.
+    #[serde(with = "envelope_signature_serde")]
+    pub signature: [u8; 64],
+}
+
+mod envelope_signature_serde {
+    use serde::de::{self, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(value)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct Sig64Visitor;
+
+        impl<'de> Visitor<'de> for Sig64Visitor {
+            type Value = [u8; 64];
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a byte sequence of exactly 64 bytes")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut arr = [0u8; 64];
+                for (index, slot) in arr.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| de::Error::invalid_length(index, &self))?;
+                }
+                if seq.next_element::<u8>()?.is_some() {
+                    return Err(de::Error::custom("signature too long: more than 64 bytes"));
+                }
+                Ok(arr)
+            }
+
+            fn visit_bytes<E>(self, bytes: &[u8]) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if bytes.len() != 64 {
+                    return Err(E::custom(format!(
+                        "expected 64 bytes for signature, got {}",
+                        bytes.len()
+                    )));
+                }
+                let mut arr = [0u8; 64];
+                arr.copy_from_slice(bytes);
+                Ok(arr)
+            }
+
+            fn visit_byte_buf<E>(self, bytes: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_bytes(&bytes)
+            }
+        }
+
+        deserializer.deserialize_any(Sig64Visitor)
+    }
+}
+
+impl TimeAuthorityEnvelopeV1 {
+    /// Validates envelope shape and fail-closed invariants.
+    ///
+    /// This performs structural validation only. Cryptographic signature
+    /// verification is performed separately via [`validate_envelope_tp001`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable deny reason string for any structural violation.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.boundary_id.is_empty() || self.boundary_id.len() > MAX_BOUNDARY_ID_LENGTH {
+            return Err(DENY_ENVELOPE_BOUNDARY_ID_INVALID);
+        }
+        if self.authority_clock.is_empty() || self.authority_clock.len() > MAX_BOUNDARY_ID_LENGTH {
+            return Err(DENY_ENVELOPE_CLOCK_INVALID);
+        }
+        if self.tick_start > self.tick_end {
+            return Err(DENY_ENVELOPE_TICK_RANGE_INVALID);
+        }
+        if self.ttl_ticks == 0 {
+            return Err(DENY_ENVELOPE_TTL_ZERO);
+        }
+        if self.ttl_ticks > MAX_TTL_TICKS {
+            return Err(DENY_ENVELOPE_TTL_EXCESSIVE);
+        }
+        if !self.deny_on_unknown {
+            return Err(DENY_ENVELOPE_DENY_ON_UNKNOWN_FALSE);
+        }
+        if self.signature_set.is_empty() {
+            return Err(DENY_ENVELOPE_UNSIGNED);
+        }
+        if self.signature_set.len() > MAX_ENVELOPE_SIGNATURES {
+            return Err(DENY_ENVELOPE_TOO_MANY_SIGNATURES);
+        }
+        if is_zero_hash(&self.content_hash) {
+            return Err(DENY_ENVELOPE_HASH_ZERO);
+        }
+        // Verify no zero signer IDs or zero signatures
+        for sig in &self.signature_set {
+            if is_zero_hash(&sig.signer_id) {
+                return Err(DENY_ENVELOPE_UNSIGNED);
+            }
+            if sig.signature == [0u8; 64] {
+                return Err(DENY_ENVELOPE_UNSIGNED);
+            }
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Evaluation window
+// ============================================================================
+
+/// HTF evaluation window for temporal predicate checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HtfEvaluationWindow {
+    /// Boundary identifier for this window.
+    pub boundary_id: String,
+    /// Authority clock for this window.
+    pub authority_clock: String,
+    /// Start tick of the evaluation window.
+    pub tick_start: u64,
+    /// End tick of the evaluation window (inclusive).
+    pub tick_end: u64,
+}
+
+// ============================================================================
+// Freshness horizon (TP-EIO29-002)
+// ============================================================================
+
+/// Freshness horizon reference for TP-EIO29-002 evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshnessHorizonRef {
+    /// Content-addressed hash of the freshness horizon definition.
+    pub horizon_hash: Hash,
+    /// End tick of the freshness horizon window.
+    pub tick_end: u64,
+    /// Whether this reference has been resolved against CAS.
+    pub resolved: bool,
+}
+
+/// Revocation frontier snapshot for TP-EIO29-002.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevocationFrontierSnapshot {
+    /// Content-addressed hash of the frontier state.
+    pub frontier_hash: Hash,
+    /// Whether the frontier is current (not stale).
+    pub current: bool,
+}
+
+// ============================================================================
+// Anti-entropy convergence (TP-EIO29-003)
+// ============================================================================
+
+/// Convergence horizon reference for TP-EIO29-003 evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConvergenceHorizonRef {
+    /// Content-addressed hash of the convergence horizon definition.
+    pub horizon_hash: Hash,
+    /// Whether this reference has been resolved against CAS.
+    pub resolved: bool,
+}
+
+/// Convergence receipt proving a required authority set has converged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConvergenceReceipt {
+    /// Identity of the authority set that converged.
+    pub authority_set_hash: Hash,
+    /// Content hash of the convergence proof.
+    pub proof_hash: Hash,
+    /// Whether convergence was achieved within the horizon.
+    pub converged: bool,
+}
+
+// ============================================================================
+// Queue admission request
+// ============================================================================
+
+/// A queue admission request binding a lane to temporal authority evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueAdmissionRequest {
+    /// Target lane for this request.
+    pub lane: QueueLane,
+    /// Time authority envelope (None = missing = deny).
+    pub envelope: Option<TimeAuthorityEnvelopeV1>,
+    /// Evaluation window for temporal predicate checks.
+    pub eval_window: HtfEvaluationWindow,
+    /// Freshness horizon reference for TP-EIO29-002.
+    pub freshness_horizon: Option<FreshnessHorizonRef>,
+    /// Revocation frontier snapshot for TP-EIO29-002.
+    pub revocation_frontier: Option<RevocationFrontierSnapshot>,
+    /// Anti-entropy convergence horizon for TP-EIO29-003.
+    pub convergence_horizon: Option<ConvergenceHorizonRef>,
+    /// Convergence receipts for required authority sets.
+    pub convergence_receipts: Vec<ConvergenceReceipt>,
+    /// Required authority set hashes for convergence checks.
+    pub required_authority_sets: Vec<Hash>,
+    /// Cost of this request in abstract queue-budget units.
+    pub cost: u64,
+    /// Current HTF tick at admission time.
+    pub current_tick: u64,
+}
+
+// ============================================================================
+// Anti-entropy admission request
+// ============================================================================
+
+/// Direction of an anti-entropy request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AntiEntropyDirection {
+    /// Pull-based: requesting data from a peer. Admissible.
+    Pull,
+    /// Push-based: unsolicited data from a peer. Denied.
+    Push,
+}
+
+/// Anti-entropy admission request with budget and convergence evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AntiEntropyAdmissionRequest {
+    /// Direction of the anti-entropy request.
+    pub direction: AntiEntropyDirection,
+    /// Time authority envelope (None = missing = deny).
+    pub envelope: Option<TimeAuthorityEnvelopeV1>,
+    /// Evaluation window for temporal predicate checks.
+    pub eval_window: HtfEvaluationWindow,
+    /// Budget cost of this anti-entropy request.
+    pub cost: u64,
+    /// Anti-entropy convergence horizon for TP-EIO29-003.
+    pub convergence_horizon: Option<ConvergenceHorizonRef>,
+    /// Convergence receipts for required authority sets.
+    pub convergence_receipts: Vec<ConvergenceReceipt>,
+    /// Required authority set hashes for convergence.
+    pub required_authority_sets: Vec<Hash>,
+    /// Proof byte count for oversized check.
+    pub proof_bytes: u64,
+    /// Maximum allowed proof bytes.
+    pub max_proof_bytes: u64,
+    /// Current HTF tick at admission time.
+    pub current_tick: u64,
+}
+
+// ============================================================================
+// Queue admission verdict and trace
+// ============================================================================
+
+/// Admission verdict for queue and anti-entropy requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum QueueAdmissionVerdict {
+    /// Request is admissible.
+    Allow,
+    /// Request is denied fail-closed.
+    Deny,
+    /// Request triggers freeze (transient disagreement).
+    Freeze,
+}
+
+/// Structured deny defect for queue admission failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueDenyDefect {
+    /// Stable deny reason code.
+    pub reason: String,
+    /// The lane that was targeted (or None for anti-entropy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane: Option<QueueLane>,
+    /// Predicate that failed (if applicable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predicate_id: Option<TemporalPredicateId>,
+    /// Current tick at denial time.
+    pub denied_at_tick: u64,
+    /// Time authority envelope hash (zero if missing).
+    pub envelope_hash: Hash,
+    /// Evaluation window `boundary_id`.
+    pub boundary_id: String,
+}
+
+/// Deterministic admission trace for queue decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueAdmissionTrace {
+    /// Lane targeted by the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane: Option<QueueLane>,
+    /// Verdict.
+    pub verdict: QueueAdmissionVerdict,
+    /// Deny defect (present when verdict is not Allow).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defect: Option<QueueDenyDefect>,
+    /// TP-EIO29-001 evaluation result.
+    pub tp001_passed: bool,
+    /// TP-EIO29-002 evaluation result.
+    pub tp002_passed: bool,
+    /// TP-EIO29-003 evaluation result.
+    pub tp003_passed: bool,
+    /// Current tick at evaluation time.
+    pub evaluated_at_tick: u64,
+}
+
+impl QueueAdmissionTrace {
+    /// Returns deterministic canonical JSON bytes for replay verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when serialization or canonicalization fails.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, QueueAdmissionError> {
+        let json = serde_json::to_string(self).map_err(|e| QueueAdmissionError::Serialization {
+            message: e.to_string(),
+        })?;
+        let canonical =
+            canonicalize_json(&json).map_err(|e| QueueAdmissionError::Serialization {
+                message: e.to_string(),
+            })?;
+        Ok(canonical.into_bytes())
+    }
+}
+
+/// Queue admission decision with trace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueAdmissionDecision {
+    /// Verdict.
+    pub verdict: QueueAdmissionVerdict,
+    /// Deny defect (present when verdict is not Allow).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defect: Option<QueueDenyDefect>,
+    /// Deterministic trace.
+    pub trace: QueueAdmissionTrace,
+}
+
+/// Queue admission errors.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum QueueAdmissionError {
+    /// Serialization or canonicalization failed.
+    #[error("queue admission serialization failed: {message}")]
+    Serialization {
+        /// Error message.
+        message: String,
+    },
+}
+
+// ============================================================================
+// Queue scheduler state
+// ============================================================================
+
+/// Per-lane state for the queue scheduler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneState {
+    /// Current backlog count.
+    pub backlog: usize,
+    /// Maximum recorded wait in ticks for the oldest item.
+    pub max_wait_ticks: u64,
+}
+
+/// Queue scheduler state tracking per-lane backlogs and total capacity.
+///
+/// This is a snapshot of the scheduler state at admission time. It does not
+/// contain the actual queue items (which are managed externally).
+///
+/// # Synchronization Protocol
+///
+/// This struct is not `Sync`. Callers must ensure exclusive access during
+/// admission evaluation (typically by holding a lock on the queue scheduler).
+#[derive(Debug, Clone)]
+pub struct QueueSchedulerState {
+    /// Per-lane state indexed by lane ordinal.
+    lanes: [LaneState; 6],
+    /// Total items across all lanes.
+    total_items: usize,
+}
+
+impl QueueSchedulerState {
+    /// Creates a new empty scheduler state.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            lanes: [
+                LaneState {
+                    backlog: 0,
+                    max_wait_ticks: 0,
+                },
+                LaneState {
+                    backlog: 0,
+                    max_wait_ticks: 0,
+                },
+                LaneState {
+                    backlog: 0,
+                    max_wait_ticks: 0,
+                },
+                LaneState {
+                    backlog: 0,
+                    max_wait_ticks: 0,
+                },
+                LaneState {
+                    backlog: 0,
+                    max_wait_ticks: 0,
+                },
+                LaneState {
+                    backlog: 0,
+                    max_wait_ticks: 0,
+                },
+            ],
+            total_items: 0,
+        }
+    }
+
+    /// Returns the lane state for the given lane.
+    #[must_use]
+    pub const fn lane(&self, lane: QueueLane) -> &LaneState {
+        &self.lanes[lane as usize]
+    }
+
+    /// Returns the total items across all lanes.
+    #[must_use]
+    pub const fn total_items(&self) -> usize {
+        self.total_items
+    }
+
+    /// Records admission of an item to a lane.
+    ///
+    /// # Errors
+    ///
+    /// Returns a deny reason if lane or total capacity would be exceeded.
+    pub const fn record_admission(&mut self, lane: QueueLane) -> Result<(), &'static str> {
+        let lane_state = &self.lanes[lane as usize];
+        if lane_state.backlog >= MAX_LANE_BACKLOG {
+            return Err(DENY_LANE_BACKLOG_EXCEEDED);
+        }
+        if self.total_items >= MAX_TOTAL_QUEUE_ITEMS {
+            return Err(DENY_TOTAL_QUEUE_EXCEEDED);
+        }
+        self.lanes[lane as usize].backlog = self.lanes[lane as usize].backlog.saturating_add(1);
+        self.total_items = self.total_items.saturating_add(1);
+        Ok(())
+    }
+
+    /// Records completion/removal of an item from a lane.
+    pub const fn record_completion(&mut self, lane: QueueLane) {
+        let lane_state = &mut self.lanes[lane as usize];
+        lane_state.backlog = lane_state.backlog.saturating_sub(1);
+        self.total_items = self.total_items.saturating_sub(1);
+    }
+
+    /// Updates the maximum wait ticks for a lane.
+    pub const fn update_max_wait(&mut self, lane: QueueLane, wait_ticks: u64) {
+        let lane_state = &mut self.lanes[lane as usize];
+        if wait_ticks > lane_state.max_wait_ticks {
+            lane_state.max_wait_ticks = wait_ticks;
+        }
+    }
+
+    /// Checks tick-floor invariants for stop/revoke and control lanes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a deny reason if any guaranteed lane exceeds its maximum wait.
+    pub const fn check_tick_floor_invariants(&self) -> Result<(), &'static str> {
+        let stop_state = &self.lanes[QueueLane::StopRevoke as usize];
+        if stop_state.max_wait_ticks > MAX_STOP_REVOKE_WAIT_TICKS && stop_state.backlog > 0 {
+            return Err(DENY_TICK_FLOOR_STOP_REVOKE);
+        }
+        let control_state = &self.lanes[QueueLane::Control as usize];
+        if control_state.max_wait_ticks > MAX_CONTROL_WAIT_TICKS && control_state.backlog > 0 {
+            return Err(DENY_TICK_FLOOR_CONTROL);
+        }
+        Ok(())
+    }
+
+    /// Returns the reserved capacity for a lane based on total capacity.
+    #[must_use]
+    pub const fn reserved_capacity(lane: QueueLane) -> usize {
+        let permille = lane.reservation_permille() as usize;
+        (MAX_TOTAL_QUEUE_ITEMS * permille) / 1000
+    }
+}
+
+impl Default for QueueSchedulerState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// Anti-entropy budget tracker
+// ============================================================================
+
+/// Budget tracker for anti-entropy admission within an HTF evaluation window.
+///
+/// # Synchronization Protocol
+///
+/// This struct is not `Sync`. Callers must ensure exclusive access during
+/// budget evaluation (typically by holding a lock on the anti-entropy
+/// scheduler).
+#[derive(Debug, Clone)]
+pub struct AntiEntropyBudget {
+    /// Total budget consumed in the current window.
+    consumed: u64,
+    /// Maximum budget for the current window.
+    max_budget: u64,
+}
+
+impl AntiEntropyBudget {
+    /// Creates a new budget tracker with the given maximum.
+    #[must_use]
+    pub const fn new(max_budget: u64) -> Self {
+        Self {
+            consumed: 0,
+            max_budget,
+        }
+    }
+
+    /// Creates a new budget tracker with the default maximum.
+    #[must_use]
+    pub const fn default_budget() -> Self {
+        Self::new(MAX_ANTI_ENTROPY_BUDGET)
+    }
+
+    /// Returns the remaining budget.
+    #[must_use]
+    pub const fn remaining(&self) -> u64 {
+        self.max_budget.saturating_sub(self.consumed)
+    }
+
+    /// Attempts to consume budget for a request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a deny reason if the budget would be exceeded.
+    pub const fn try_consume(&mut self, cost: u64) -> Result<(), &'static str> {
+        if cost > self.remaining() {
+            return Err(DENY_ANTI_ENTROPY_BUDGET_EXHAUSTED);
+        }
+        self.consumed = self.consumed.saturating_add(cost);
+        Ok(())
+    }
+
+    /// Resets budget for a new window.
+    pub const fn reset(&mut self) {
+        self.consumed = 0;
+    }
+}
+
+// ============================================================================
+// TP-EIO29-001 evaluation
+// ============================================================================
+
+/// Validates a time authority envelope against TP-EIO29-001.
+///
+/// Checks:
+/// 1. Envelope is present and structurally valid
+/// 2. Boundary ID and authority clock match the evaluation window
+/// 3. Envelope tick range covers the evaluation window
+/// 4. TTL is fresh relative to the evaluation window
+/// 5. `deny_on_unknown` is true
+///
+/// Cryptographic signature verification is included structurally
+/// (non-zero signatures are required) but actual Ed25519 verification
+/// is deferred to the caller's trust infrastructure.
+///
+/// # Errors
+///
+/// Returns a stable deny reason for any violation.
+pub fn validate_envelope_tp001(
+    envelope: Option<&TimeAuthorityEnvelopeV1>,
+    eval_window: &HtfEvaluationWindow,
+) -> Result<(), &'static str> {
+    let envelope = envelope.ok_or(DENY_ENVELOPE_MISSING)?;
+
+    // Structural validation
+    envelope.validate()?;
+
+    // Boundary and clock context match
+    if envelope.boundary_id != eval_window.boundary_id {
+        return Err(DENY_ENVELOPE_BOUNDARY_MISMATCH);
+    }
+    if envelope.authority_clock != eval_window.authority_clock {
+        return Err(DENY_ENVELOPE_CLOCK_MISMATCH);
+    }
+
+    // Window coverage: envelope must cover the evaluation window
+    if envelope.tick_start > eval_window.tick_start || envelope.tick_end < eval_window.tick_end {
+        return Err(DENY_ENVELOPE_WINDOW_UNCOVERED);
+    }
+
+    // TTL freshness: tick_start + ttl_ticks must reach at least
+    // eval_window.tick_end
+    let ttl_end = envelope.tick_start.saturating_add(envelope.ttl_ticks);
+    if ttl_end < eval_window.tick_end {
+        return Err(DENY_ENVELOPE_STALE);
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// TP-EIO29-002 evaluation
+// ============================================================================
+
+/// Validates freshness horizon against TP-EIO29-002.
+///
+/// Checks:
+/// 1. Freshness horizon reference resolves
+/// 2. Current window `tick_end` does not exceed freshness horizon `tick_end`
+/// 3. Revocation frontier is current
+///
+/// # Errors
+///
+/// Returns a stable deny reason for any violation.
+pub fn validate_freshness_horizon_tp002(
+    freshness_horizon: Option<&FreshnessHorizonRef>,
+    revocation_frontier: Option<&RevocationFrontierSnapshot>,
+    eval_window: &HtfEvaluationWindow,
+) -> Result<(), &'static str> {
+    let horizon = freshness_horizon.ok_or(DENY_FRESHNESS_HORIZON_UNRESOLVED)?;
+
+    if !horizon.resolved {
+        return Err(DENY_FRESHNESS_HORIZON_UNRESOLVED);
+    }
+    if is_zero_hash(&horizon.horizon_hash) {
+        return Err(DENY_FRESHNESS_HORIZON_UNRESOLVED);
+    }
+
+    // Current window must not exceed freshness horizon
+    if eval_window.tick_end > horizon.tick_end {
+        return Err(DENY_FRESHNESS_HORIZON_EXCEEDED);
+    }
+
+    // Revocation frontier must be current
+    let frontier = revocation_frontier.ok_or(DENY_REVOCATION_FRONTIER_STALE)?;
+    if !frontier.current {
+        return Err(DENY_REVOCATION_FRONTIER_STALE);
+    }
+    if is_zero_hash(&frontier.frontier_hash) {
+        return Err(DENY_REVOCATION_FRONTIER_STALE);
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// TP-EIO29-003 evaluation
+// ============================================================================
+
+/// Validates anti-entropy convergence horizon against TP-EIO29-003.
+///
+/// Checks:
+/// 1. Convergence horizon reference resolves
+/// 2. All required authority sets have matching convergence receipts
+/// 3. All receipts indicate convergence within the horizon
+///
+/// # Errors
+///
+/// Returns a stable deny reason for any violation.
+pub fn validate_convergence_horizon_tp003(
+    convergence_horizon: Option<&ConvergenceHorizonRef>,
+    convergence_receipts: &[ConvergenceReceipt],
+    required_authority_sets: &[Hash],
+) -> Result<(), &'static str> {
+    let horizon = convergence_horizon.ok_or(DENY_CONVERGENCE_HORIZON_UNRESOLVED)?;
+
+    if !horizon.resolved {
+        return Err(DENY_CONVERGENCE_HORIZON_UNRESOLVED);
+    }
+    if is_zero_hash(&horizon.horizon_hash) {
+        return Err(DENY_CONVERGENCE_HORIZON_UNRESOLVED);
+    }
+
+    // Bound checks to prevent DoS
+    if required_authority_sets.len() > MAX_REQUIRED_AUTHORITY_SETS {
+        return Err(DENY_AUTHORITY_SET_NOT_CONVERGED);
+    }
+    if convergence_receipts.len() > MAX_CONVERGENCE_RECEIPTS {
+        return Err(DENY_CONVERGENCE_RECEIPT_MISSING);
+    }
+
+    // Every required authority set must have a matching, converged receipt
+    for required_set in required_authority_sets {
+        if is_zero_hash(required_set) {
+            return Err(DENY_AUTHORITY_SET_NOT_CONVERGED);
+        }
+
+        let receipt = convergence_receipts
+            .iter()
+            .find(|r| hashes_equal(&r.authority_set_hash, required_set));
+
+        match receipt {
+            None => return Err(DENY_CONVERGENCE_RECEIPT_MISSING),
+            Some(r) if !r.converged => return Err(DENY_AUTHORITY_SET_NOT_CONVERGED),
+            Some(r) if is_zero_hash(&r.proof_hash) => {
+                return Err(DENY_CONVERGENCE_RECEIPT_MISSING);
+            },
+            Some(_) => {}, // converged with valid proof
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Queue admission evaluator
+// ============================================================================
+
+/// Evaluates queue admission for a request against temporal authority
+/// predicates and scheduler state.
+///
+/// All unknown, missing, stale, or invalid temporal authority states
+/// deny fail-closed.
+#[must_use]
+pub fn evaluate_queue_admission(
+    request: &QueueAdmissionRequest,
+    scheduler: &QueueSchedulerState,
+) -> QueueAdmissionDecision {
+    let current_tick = request.current_tick;
+    let lane = request.lane;
+    let envelope_hash = request
+        .envelope
+        .as_ref()
+        .map_or(ZERO_HASH, |e| e.content_hash);
+    let boundary_id = &request.eval_window.boundary_id;
+
+    // Evaluate all three temporal predicates
+    let (tp001_passed, tp002_passed, tp003_passed) =
+        match evaluate_temporal_predicates(request, lane, current_tick, envelope_hash, boundary_id)
+        {
+            Ok(tp) => tp,
+            Err(decision) => return decision,
+        };
+
+    // Check structural constraints (tick-floors, capacity)
+    if let Err(decision) = check_structural_constraints(
+        scheduler,
+        lane,
+        current_tick,
+        envelope_hash,
+        boundary_id,
+        tp001_passed,
+        tp002_passed,
+        tp003_passed,
+    ) {
+        return decision;
+    }
+
+    // All checks passed
+    let trace = QueueAdmissionTrace {
+        lane: Some(lane),
+        verdict: QueueAdmissionVerdict::Allow,
+        defect: None,
+        tp001_passed,
+        tp002_passed,
+        tp003_passed,
+        evaluated_at_tick: current_tick,
+    };
+
+    QueueAdmissionDecision {
+        verdict: QueueAdmissionVerdict::Allow,
+        defect: None,
+        trace,
+    }
+}
+
+/// Evaluates TP-EIO29-001/002/003 for queue admission. Returns
+/// `(tp001, tp002, tp003)` on success or a deny decision on failure.
+#[allow(clippy::result_large_err)]
+fn evaluate_temporal_predicates(
+    request: &QueueAdmissionRequest,
+    lane: QueueLane,
+    current_tick: u64,
+    envelope_hash: Hash,
+    boundary_id: &str,
+) -> Result<(bool, bool, bool), QueueAdmissionDecision> {
+    // TP-EIO29-001: Time authority envelope validity
+    let tp001_result = validate_envelope_tp001(request.envelope.as_ref(), &request.eval_window);
+    let tp001_passed = tp001_result.is_ok();
+    // For stop_revoke lane, allow local monotonic emergency time if full
+    // envelope fails (fail-open to authority reduction only).
+    let tp001_stop_revoke_emergency = !tp001_passed && lane == QueueLane::StopRevoke;
+
+    if !tp001_passed && !tp001_stop_revoke_emergency {
+        let reason = tp001_result.unwrap_err();
+        return Err(deny_queue(&DenyContext {
+            lane: Some(lane),
+            reason,
+            predicate_id: Some(TemporalPredicateId::TpEio29001),
+            current_tick,
+            envelope_hash,
+            boundary_id,
+            tp001_passed,
+            tp002_passed: false,
+            tp003_passed: false,
+        }));
+    }
+
+    // TP-EIO29-002: Freshness horizon
+    let tp002_result = validate_freshness_horizon_tp002(
+        request.freshness_horizon.as_ref(),
+        request.revocation_frontier.as_ref(),
+        &request.eval_window,
+    );
+    let tp002_passed = tp002_result.is_ok();
+    if !tp002_passed {
+        let reason = tp002_result.unwrap_err();
+        return Err(deny_queue(&DenyContext {
+            lane: Some(lane),
+            reason,
+            predicate_id: Some(TemporalPredicateId::TpEio29002),
+            current_tick,
+            envelope_hash,
+            boundary_id,
+            tp001_passed,
+            tp002_passed,
+            tp003_passed: false,
+        }));
+    }
+
+    // TP-EIO29-003: Anti-entropy convergence horizon
+    let tp003_result = validate_convergence_horizon_tp003(
+        request.convergence_horizon.as_ref(),
+        &request.convergence_receipts,
+        &request.required_authority_sets,
+    );
+    let tp003_passed = tp003_result.is_ok();
+    if !tp003_passed {
+        let reason = tp003_result.unwrap_err();
+        return Err(deny_queue(&DenyContext {
+            lane: Some(lane),
+            reason,
+            predicate_id: Some(TemporalPredicateId::TpEio29003),
+            current_tick,
+            envelope_hash,
+            boundary_id,
+            tp001_passed,
+            tp002_passed,
+            tp003_passed,
+        }));
+    }
+
+    Ok((tp001_passed, tp002_passed, tp003_passed))
+}
+
+/// Checks tick-floor invariants and capacity constraints. Returns `Ok(())`
+/// on success or a deny decision on failure.
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+fn check_structural_constraints(
+    scheduler: &QueueSchedulerState,
+    lane: QueueLane,
+    current_tick: u64,
+    envelope_hash: Hash,
+    boundary_id: &str,
+    tp001_passed: bool,
+    tp002_passed: bool,
+    tp003_passed: bool,
+) -> Result<(), QueueAdmissionDecision> {
+    let mk_ctx = |reason: &'static str| DenyContext {
+        lane: Some(lane),
+        reason,
+        predicate_id: None,
+        current_tick,
+        envelope_hash,
+        boundary_id,
+        tp001_passed,
+        tp002_passed,
+        tp003_passed,
+    };
+
+    // Tick-floor invariants for guaranteed lanes
+    if let Err(reason) = scheduler.check_tick_floor_invariants() {
+        return Err(deny_queue(&mk_ctx(reason)));
+    }
+
+    // Lane backlog
+    let lane_state = scheduler.lane(lane);
+    if lane_state.backlog >= MAX_LANE_BACKLOG {
+        return Err(deny_queue(&mk_ctx(DENY_LANE_BACKLOG_EXCEEDED)));
+    }
+
+    // Total queue capacity
+    if scheduler.total_items() >= MAX_TOTAL_QUEUE_ITEMS {
+        return Err(deny_queue(&mk_ctx(DENY_TOTAL_QUEUE_EXCEEDED)));
+    }
+
+    Ok(())
+}
+
+/// Evaluates anti-entropy admission against temporal authority predicates
+/// and budget constraints.
+///
+/// Anti-entropy is pull-only and budget-bound. Push requests are denied.
+/// Oversized proof ranges are denied. TP-EIO29-001 and TP-EIO29-003 are
+/// enforced.
+#[must_use]
+pub fn evaluate_anti_entropy_admission(
+    request: &AntiEntropyAdmissionRequest,
+    budget: &AntiEntropyBudget,
+) -> QueueAdmissionDecision {
+    let current_tick = request.current_tick;
+    let envelope_hash = request
+        .envelope
+        .as_ref()
+        .map_or(ZERO_HASH, |e| e.content_hash);
+    let boundary_id = &request.eval_window.boundary_id;
+
+    let mk_deny = |reason: &str, pred: Option<TemporalPredicateId>, tp001: bool, tp003: bool| {
+        deny_queue(&DenyContext {
+            lane: None,
+            reason,
+            predicate_id: pred,
+            current_tick,
+            envelope_hash,
+            boundary_id,
+            tp001_passed: tp001,
+            tp002_passed: false,
+            tp003_passed: tp003,
+        })
+    };
+
+    // Pull-only enforcement
+    if request.direction == AntiEntropyDirection::Push {
+        return mk_deny(DENY_ANTI_ENTROPY_PUSH_REJECTED, None, false, false);
+    }
+
+    // Oversized proof check
+    if request.proof_bytes > request.max_proof_bytes {
+        return mk_deny(DENY_ANTI_ENTROPY_OVERSIZED, None, false, false);
+    }
+
+    // TP-EIO29-001
+    let tp001_result = validate_envelope_tp001(request.envelope.as_ref(), &request.eval_window);
+    let tp001_passed = tp001_result.is_ok();
+    if !tp001_passed {
+        let reason = tp001_result.unwrap_err();
+        return mk_deny(reason, Some(TemporalPredicateId::TpEio29001), false, false);
+    }
+
+    // TP-EIO29-003
+    let tp003_result = validate_convergence_horizon_tp003(
+        request.convergence_horizon.as_ref(),
+        &request.convergence_receipts,
+        &request.required_authority_sets,
+    );
+    let tp003_passed = tp003_result.is_ok();
+    if !tp003_passed {
+        let reason = tp003_result.unwrap_err();
+        return mk_deny(
+            reason,
+            Some(TemporalPredicateId::TpEio29003),
+            tp001_passed,
+            false,
+        );
+    }
+
+    // Budget check
+    if request.cost > budget.remaining() {
+        return mk_deny(
+            DENY_ANTI_ENTROPY_BUDGET_EXHAUSTED,
+            None,
+            tp001_passed,
+            tp003_passed,
+        );
+    }
+
+    // All checks passed
+    let trace = QueueAdmissionTrace {
+        lane: None,
+        verdict: QueueAdmissionVerdict::Allow,
+        defect: None,
+        tp001_passed,
+        tp002_passed: false, // TP-002 not evaluated for anti-entropy
+        tp003_passed,
+        evaluated_at_tick: current_tick,
+    };
+
+    QueueAdmissionDecision {
+        verdict: QueueAdmissionVerdict::Allow,
+        defect: None,
+        trace,
+    }
+}
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+/// Internal context for constructing deny decisions, avoiding excessive
+/// argument lists.
+struct DenyContext<'a> {
+    lane: Option<QueueLane>,
+    reason: &'a str,
+    predicate_id: Option<TemporalPredicateId>,
+    current_tick: u64,
+    envelope_hash: Hash,
+    boundary_id: &'a str,
+    tp001_passed: bool,
+    tp002_passed: bool,
+    tp003_passed: bool,
+}
+
+fn deny_queue(ctx: &DenyContext<'_>) -> QueueAdmissionDecision {
+    let defect = QueueDenyDefect {
+        reason: ctx.reason.to_string(),
+        lane: ctx.lane,
+        predicate_id: ctx.predicate_id,
+        denied_at_tick: ctx.current_tick,
+        envelope_hash: ctx.envelope_hash,
+        boundary_id: ctx.boundary_id.to_string(),
+    };
+
+    let trace = QueueAdmissionTrace {
+        lane: ctx.lane,
+        verdict: QueueAdmissionVerdict::Deny,
+        defect: Some(defect.clone()),
+        tp001_passed: ctx.tp001_passed,
+        tp002_passed: ctx.tp002_passed,
+        tp003_passed: ctx.tp003_passed,
+        evaluated_at_tick: ctx.current_tick,
+    };
+
+    QueueAdmissionDecision {
+        verdict: QueueAdmissionVerdict::Deny,
+        defect: Some(defect),
+        trace,
+    }
+}
+
+fn is_zero_hash(hash: &[u8; 32]) -> bool {
+    hash.ct_eq(&ZERO_HASH).unwrap_u8() == 1
+}
+
+fn hashes_equal(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.ct_eq(right).unwrap_u8() == 1
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // Test helpers
+    // ========================================================================
+
+    fn test_hash(byte: u8) -> Hash {
+        [byte; 32]
+    }
+
+    fn valid_envelope() -> TimeAuthorityEnvelopeV1 {
+        TimeAuthorityEnvelopeV1 {
+            boundary_id: "boundary-main".to_string(),
+            authority_clock: "clock-main".to_string(),
+            tick_start: 1000,
+            tick_end: 2000,
+            ttl_ticks: 1500,
+            deny_on_unknown: true,
+            signature_set: vec![EnvelopeSignature {
+                signer_id: test_hash(0xA1),
+                signature: [0xBB; 64],
+            }],
+            content_hash: test_hash(0xCC),
+        }
+    }
+
+    fn valid_eval_window() -> HtfEvaluationWindow {
+        HtfEvaluationWindow {
+            boundary_id: "boundary-main".to_string(),
+            authority_clock: "clock-main".to_string(),
+            tick_start: 1000,
+            tick_end: 1500,
+        }
+    }
+
+    fn valid_freshness_horizon() -> FreshnessHorizonRef {
+        FreshnessHorizonRef {
+            horizon_hash: test_hash(0xDD),
+            tick_end: 2000,
+            resolved: true,
+        }
+    }
+
+    fn valid_revocation_frontier() -> RevocationFrontierSnapshot {
+        RevocationFrontierSnapshot {
+            frontier_hash: test_hash(0xEE),
+            current: true,
+        }
+    }
+
+    fn valid_convergence_horizon() -> ConvergenceHorizonRef {
+        ConvergenceHorizonRef {
+            horizon_hash: test_hash(0xFF),
+            resolved: true,
+        }
+    }
+
+    fn valid_convergence_receipt(authority_set: Hash) -> ConvergenceReceipt {
+        ConvergenceReceipt {
+            authority_set_hash: authority_set,
+            proof_hash: test_hash(0xAB),
+            converged: true,
+        }
+    }
+
+    fn valid_queue_request(lane: QueueLane) -> QueueAdmissionRequest {
+        let required_set = test_hash(0x01);
+        QueueAdmissionRequest {
+            lane,
+            envelope: Some(valid_envelope()),
+            eval_window: valid_eval_window(),
+            freshness_horizon: Some(valid_freshness_horizon()),
+            revocation_frontier: Some(valid_revocation_frontier()),
+            convergence_horizon: Some(valid_convergence_horizon()),
+            convergence_receipts: vec![valid_convergence_receipt(required_set)],
+            required_authority_sets: vec![required_set],
+            cost: 1,
+            current_tick: 1200,
+        }
+    }
+
+    fn valid_anti_entropy_request() -> AntiEntropyAdmissionRequest {
+        let required_set = test_hash(0x01);
+        AntiEntropyAdmissionRequest {
+            direction: AntiEntropyDirection::Pull,
+            envelope: Some(valid_envelope()),
+            eval_window: valid_eval_window(),
+            cost: 10,
+            convergence_horizon: Some(valid_convergence_horizon()),
+            convergence_receipts: vec![valid_convergence_receipt(required_set)],
+            required_authority_sets: vec![required_set],
+            proof_bytes: 100,
+            max_proof_bytes: 1000,
+            current_tick: 1200,
+        }
+    }
+
+    // ========================================================================
+    // Envelope validation (TP-EIO29-001)
+    // ========================================================================
+
+    #[test]
+    fn tp001_valid_envelope_passes() {
+        let result = validate_envelope_tp001(Some(&valid_envelope()), &valid_eval_window());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn tp001_missing_envelope_denies() {
+        let result = validate_envelope_tp001(None, &valid_eval_window());
+        assert_eq!(result.unwrap_err(), DENY_ENVELOPE_MISSING);
+    }
+
+    #[test]
+    fn tp001_unsigned_envelope_denies() {
+        let mut envelope = valid_envelope();
+        envelope.signature_set.clear();
+        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        assert_eq!(result.unwrap_err(), DENY_ENVELOPE_UNSIGNED);
+    }
+
+    #[test]
+    fn tp001_zero_signer_denies() {
+        let mut envelope = valid_envelope();
+        envelope.signature_set[0].signer_id = [0u8; 32];
+        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        assert_eq!(result.unwrap_err(), DENY_ENVELOPE_UNSIGNED);
+    }
+
+    #[test]
+    fn tp001_zero_signature_denies() {
+        let mut envelope = valid_envelope();
+        envelope.signature_set[0].signature = [0u8; 64];
+        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        assert_eq!(result.unwrap_err(), DENY_ENVELOPE_UNSIGNED);
+    }
+
+    #[test]
+    fn tp001_boundary_mismatch_denies() {
+        let envelope = valid_envelope();
+        let mut window = valid_eval_window();
+        window.boundary_id = "other-boundary".to_string();
+        let result = validate_envelope_tp001(Some(&envelope), &window);
+        assert_eq!(result.unwrap_err(), DENY_ENVELOPE_BOUNDARY_MISMATCH);
+    }
+
+    #[test]
+    fn tp001_clock_mismatch_denies() {
+        let envelope = valid_envelope();
+        let mut window = valid_eval_window();
+        window.authority_clock = "other-clock".to_string();
+        let result = validate_envelope_tp001(Some(&envelope), &window);
+        assert_eq!(result.unwrap_err(), DENY_ENVELOPE_CLOCK_MISMATCH);
+    }
+
+    #[test]
+    fn tp001_window_not_covered_denies() {
+        let mut envelope = valid_envelope();
+        envelope.tick_end = 1499; // Does not cover eval_window.tick_end=1500
+        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        assert_eq!(result.unwrap_err(), DENY_ENVELOPE_WINDOW_UNCOVERED);
+    }
+
+    #[test]
+    fn tp001_stale_envelope_denies() {
+        let mut envelope = valid_envelope();
+        envelope.ttl_ticks = 400; // tick_start(1000) + 400 = 1400 < eval_window.tick_end(1500)
+        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        assert_eq!(result.unwrap_err(), DENY_ENVELOPE_STALE);
+    }
+
+    #[test]
+    fn tp001_deny_on_unknown_false_denies() {
+        let mut envelope = valid_envelope();
+        envelope.deny_on_unknown = false;
+        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        assert_eq!(result.unwrap_err(), DENY_ENVELOPE_DENY_ON_UNKNOWN_FALSE);
+    }
+
+    #[test]
+    fn tp001_zero_content_hash_denies() {
+        let mut envelope = valid_envelope();
+        envelope.content_hash = [0u8; 32];
+        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        assert_eq!(result.unwrap_err(), DENY_ENVELOPE_HASH_ZERO);
+    }
+
+    #[test]
+    fn tp001_empty_boundary_id_denies() {
+        let mut envelope = valid_envelope();
+        envelope.boundary_id = String::new();
+        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        assert_eq!(result.unwrap_err(), DENY_ENVELOPE_BOUNDARY_ID_INVALID);
+    }
+
+    #[test]
+    fn tp001_oversized_boundary_id_denies() {
+        let mut envelope = valid_envelope();
+        envelope.boundary_id = "x".repeat(MAX_BOUNDARY_ID_LENGTH + 1);
+        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        assert_eq!(result.unwrap_err(), DENY_ENVELOPE_BOUNDARY_ID_INVALID);
+    }
+
+    #[test]
+    fn tp001_zero_ttl_denies() {
+        let mut envelope = valid_envelope();
+        envelope.ttl_ticks = 0;
+        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        assert_eq!(result.unwrap_err(), DENY_ENVELOPE_TTL_ZERO);
+    }
+
+    #[test]
+    fn tp001_excessive_ttl_denies() {
+        let mut envelope = valid_envelope();
+        envelope.ttl_ticks = MAX_TTL_TICKS + 1;
+        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        assert_eq!(result.unwrap_err(), DENY_ENVELOPE_TTL_EXCESSIVE);
+    }
+
+    #[test]
+    fn tp001_tick_range_inverted_denies() {
+        let mut envelope = valid_envelope();
+        envelope.tick_start = 2001;
+        envelope.tick_end = 2000;
+        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        assert_eq!(result.unwrap_err(), DENY_ENVELOPE_TICK_RANGE_INVALID);
+    }
+
+    #[test]
+    fn tp001_too_many_signatures_denies() {
+        let mut envelope = valid_envelope();
+        envelope.signature_set = (0..=MAX_ENVELOPE_SIGNATURES)
+            .map(|i| EnvelopeSignature {
+                #[allow(clippy::cast_possible_truncation)]
+                signer_id: test_hash(i as u8),
+                signature: [0xBB; 64],
+            })
+            .collect();
+        let result = validate_envelope_tp001(Some(&envelope), &valid_eval_window());
+        assert_eq!(result.unwrap_err(), DENY_ENVELOPE_TOO_MANY_SIGNATURES);
+    }
+
+    // ========================================================================
+    // Freshness horizon (TP-EIO29-002)
+    // ========================================================================
+
+    #[test]
+    fn tp002_valid_inputs_pass() {
+        let result = validate_freshness_horizon_tp002(
+            Some(&valid_freshness_horizon()),
+            Some(&valid_revocation_frontier()),
+            &valid_eval_window(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn tp002_missing_horizon_denies() {
+        let result = validate_freshness_horizon_tp002(
+            None,
+            Some(&valid_revocation_frontier()),
+            &valid_eval_window(),
+        );
+        assert_eq!(result.unwrap_err(), DENY_FRESHNESS_HORIZON_UNRESOLVED);
+    }
+
+    #[test]
+    fn tp002_unresolved_horizon_denies() {
+        let mut horizon = valid_freshness_horizon();
+        horizon.resolved = false;
+        let result = validate_freshness_horizon_tp002(
+            Some(&horizon),
+            Some(&valid_revocation_frontier()),
+            &valid_eval_window(),
+        );
+        assert_eq!(result.unwrap_err(), DENY_FRESHNESS_HORIZON_UNRESOLVED);
+    }
+
+    #[test]
+    fn tp002_zero_horizon_hash_denies() {
+        let mut horizon = valid_freshness_horizon();
+        horizon.horizon_hash = [0u8; 32];
+        let result = validate_freshness_horizon_tp002(
+            Some(&horizon),
+            Some(&valid_revocation_frontier()),
+            &valid_eval_window(),
+        );
+        assert_eq!(result.unwrap_err(), DENY_FRESHNESS_HORIZON_UNRESOLVED);
+    }
+
+    #[test]
+    fn tp002_window_exceeds_horizon_denies() {
+        let mut horizon = valid_freshness_horizon();
+        horizon.tick_end = 1400; // < eval_window.tick_end(1500)
+        let result = validate_freshness_horizon_tp002(
+            Some(&horizon),
+            Some(&valid_revocation_frontier()),
+            &valid_eval_window(),
+        );
+        assert_eq!(result.unwrap_err(), DENY_FRESHNESS_HORIZON_EXCEEDED);
+    }
+
+    #[test]
+    fn tp002_missing_frontier_denies() {
+        let result = validate_freshness_horizon_tp002(
+            Some(&valid_freshness_horizon()),
+            None,
+            &valid_eval_window(),
+        );
+        assert_eq!(result.unwrap_err(), DENY_REVOCATION_FRONTIER_STALE);
+    }
+
+    #[test]
+    fn tp002_stale_frontier_denies() {
+        let mut frontier = valid_revocation_frontier();
+        frontier.current = false;
+        let result = validate_freshness_horizon_tp002(
+            Some(&valid_freshness_horizon()),
+            Some(&frontier),
+            &valid_eval_window(),
+        );
+        assert_eq!(result.unwrap_err(), DENY_REVOCATION_FRONTIER_STALE);
+    }
+
+    #[test]
+    fn tp002_zero_frontier_hash_denies() {
+        let mut frontier = valid_revocation_frontier();
+        frontier.frontier_hash = [0u8; 32];
+        let result = validate_freshness_horizon_tp002(
+            Some(&valid_freshness_horizon()),
+            Some(&frontier),
+            &valid_eval_window(),
+        );
+        assert_eq!(result.unwrap_err(), DENY_REVOCATION_FRONTIER_STALE);
+    }
+
+    // ========================================================================
+    // Convergence horizon (TP-EIO29-003)
+    // ========================================================================
+
+    #[test]
+    fn tp003_valid_inputs_pass() {
+        let required = test_hash(0x01);
+        let result = validate_convergence_horizon_tp003(
+            Some(&valid_convergence_horizon()),
+            &[valid_convergence_receipt(required)],
+            &[required],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn tp003_missing_horizon_denies() {
+        let result = validate_convergence_horizon_tp003(None, &[], &[]);
+        assert_eq!(result.unwrap_err(), DENY_CONVERGENCE_HORIZON_UNRESOLVED);
+    }
+
+    #[test]
+    fn tp003_unresolved_horizon_denies() {
+        let mut horizon = valid_convergence_horizon();
+        horizon.resolved = false;
+        let result = validate_convergence_horizon_tp003(Some(&horizon), &[], &[]);
+        assert_eq!(result.unwrap_err(), DENY_CONVERGENCE_HORIZON_UNRESOLVED);
+    }
+
+    #[test]
+    fn tp003_zero_horizon_hash_denies() {
+        let mut horizon = valid_convergence_horizon();
+        horizon.horizon_hash = [0u8; 32];
+        let result = validate_convergence_horizon_tp003(Some(&horizon), &[], &[]);
+        assert_eq!(result.unwrap_err(), DENY_CONVERGENCE_HORIZON_UNRESOLVED);
+    }
+
+    #[test]
+    fn tp003_missing_receipt_denies() {
+        let required = test_hash(0x01);
+        let result = validate_convergence_horizon_tp003(
+            Some(&valid_convergence_horizon()),
+            &[], // no receipts
+            &[required],
+        );
+        assert_eq!(result.unwrap_err(), DENY_CONVERGENCE_RECEIPT_MISSING);
+    }
+
+    #[test]
+    fn tp003_not_converged_denies() {
+        let required = test_hash(0x01);
+        let mut receipt = valid_convergence_receipt(required);
+        receipt.converged = false;
+        let result = validate_convergence_horizon_tp003(
+            Some(&valid_convergence_horizon()),
+            &[receipt],
+            &[required],
+        );
+        assert_eq!(result.unwrap_err(), DENY_AUTHORITY_SET_NOT_CONVERGED);
+    }
+
+    #[test]
+    fn tp003_zero_proof_hash_denies() {
+        let required = test_hash(0x01);
+        let mut receipt = valid_convergence_receipt(required);
+        receipt.proof_hash = [0u8; 32];
+        let result = validate_convergence_horizon_tp003(
+            Some(&valid_convergence_horizon()),
+            &[receipt],
+            &[required],
+        );
+        assert_eq!(result.unwrap_err(), DENY_CONVERGENCE_RECEIPT_MISSING);
+    }
+
+    #[test]
+    fn tp003_zero_required_set_denies() {
+        let result = validate_convergence_horizon_tp003(
+            Some(&valid_convergence_horizon()),
+            &[],
+            &[[0u8; 32]],
+        );
+        assert_eq!(result.unwrap_err(), DENY_AUTHORITY_SET_NOT_CONVERGED);
+    }
+
+    #[test]
+    fn tp003_multiple_required_sets_all_must_converge() {
+        let set_a = test_hash(0x01);
+        let set_b = test_hash(0x02);
+        let result = validate_convergence_horizon_tp003(
+            Some(&valid_convergence_horizon()),
+            &[valid_convergence_receipt(set_a)], // missing receipt for set_b
+            &[set_a, set_b],
+        );
+        assert_eq!(result.unwrap_err(), DENY_CONVERGENCE_RECEIPT_MISSING);
+    }
+
+    #[test]
+    fn tp003_empty_required_sets_passes() {
+        let result = validate_convergence_horizon_tp003(
+            Some(&valid_convergence_horizon()),
+            &[],
+            &[], // no required sets
+        );
+        assert!(result.is_ok());
+    }
+
+    // ========================================================================
+    // Queue admission evaluator
+    // ========================================================================
+
+    #[test]
+    fn queue_admit_valid_request_allows() {
+        let request = valid_queue_request(QueueLane::Consume);
+        let scheduler = QueueSchedulerState::new();
+        let decision = evaluate_queue_admission(&request, &scheduler);
+        assert_eq!(decision.verdict, QueueAdmissionVerdict::Allow);
+        assert!(decision.defect.is_none());
+        assert!(decision.trace.tp001_passed);
+        assert!(decision.trace.tp002_passed);
+        assert!(decision.trace.tp003_passed);
+    }
+
+    #[test]
+    fn queue_admit_missing_envelope_denies_non_stop_revoke() {
+        let mut request = valid_queue_request(QueueLane::Consume);
+        request.envelope = None;
+        let scheduler = QueueSchedulerState::new();
+        let decision = evaluate_queue_admission(&request, &scheduler);
+        assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
+        assert_eq!(
+            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            Some(DENY_ENVELOPE_MISSING)
+        );
+    }
+
+    #[test]
+    fn queue_admit_stop_revoke_allows_without_full_envelope() {
+        // Stop/revoke lane has emergency carve-out for authority-reducing ops.
+        // With valid tp002/tp003 state, the request is admitted despite tp001
+        // failure because the stop_revoke lane permits local monotonic
+        // emergency time for authority-reducing operations.
+        let mut request = valid_queue_request(QueueLane::StopRevoke);
+        request.envelope = None;
+        let scheduler = QueueSchedulerState::new();
+        let decision = evaluate_queue_admission(&request, &scheduler);
+        assert_eq!(decision.verdict, QueueAdmissionVerdict::Allow);
+        // tp001 should be flagged as failed
+        assert!(!decision.trace.tp001_passed);
+        assert!(decision.trace.tp002_passed);
+        assert!(decision.trace.tp003_passed);
+    }
+
+    #[test]
+    fn queue_admit_stop_revoke_denies_when_tp002_also_fails() {
+        // Stop/revoke lane emergency carve-out for tp001 does not exempt from
+        // tp002 failures. Missing freshness horizon still denies.
+        let mut request = valid_queue_request(QueueLane::StopRevoke);
+        request.envelope = None;
+        request.freshness_horizon = None;
+        let scheduler = QueueSchedulerState::new();
+        let decision = evaluate_queue_admission(&request, &scheduler);
+        assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
+        let defect = decision.defect.as_ref().expect("should have defect");
+        assert_eq!(defect.predicate_id, Some(TemporalPredicateId::TpEio29002));
+    }
+
+    #[test]
+    fn queue_admit_all_lanes_with_valid_request() {
+        let scheduler = QueueSchedulerState::new();
+        for lane in QueueLane::all() {
+            let request = valid_queue_request(lane);
+            let decision = evaluate_queue_admission(&request, &scheduler);
+            assert_eq!(
+                decision.verdict,
+                QueueAdmissionVerdict::Allow,
+                "lane {lane} should be allowed with valid request"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_lane_backlog_exceeded_denies() {
+        let request = valid_queue_request(QueueLane::Bulk);
+        let mut scheduler = QueueSchedulerState::new();
+        scheduler.lanes[QueueLane::Bulk as usize].backlog = MAX_LANE_BACKLOG;
+        let decision = evaluate_queue_admission(&request, &scheduler);
+        assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
+        assert_eq!(
+            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            Some(DENY_LANE_BACKLOG_EXCEEDED)
+        );
+    }
+
+    #[test]
+    fn queue_total_capacity_exceeded_denies() {
+        let request = valid_queue_request(QueueLane::Consume);
+        let mut scheduler = QueueSchedulerState::new();
+        scheduler.total_items = MAX_TOTAL_QUEUE_ITEMS;
+        let decision = evaluate_queue_admission(&request, &scheduler);
+        assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
+        assert_eq!(
+            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            Some(DENY_TOTAL_QUEUE_EXCEEDED)
+        );
+    }
+
+    #[test]
+    fn queue_tick_floor_violation_stop_revoke_denies() {
+        let request = valid_queue_request(QueueLane::Consume);
+        let mut scheduler = QueueSchedulerState::new();
+        scheduler.lanes[QueueLane::StopRevoke as usize].backlog = 1;
+        scheduler.lanes[QueueLane::StopRevoke as usize].max_wait_ticks =
+            MAX_STOP_REVOKE_WAIT_TICKS + 1;
+        let decision = evaluate_queue_admission(&request, &scheduler);
+        assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
+        assert_eq!(
+            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            Some(DENY_TICK_FLOOR_STOP_REVOKE)
+        );
+    }
+
+    #[test]
+    fn queue_tick_floor_violation_control_denies() {
+        let request = valid_queue_request(QueueLane::Bulk);
+        let mut scheduler = QueueSchedulerState::new();
+        scheduler.lanes[QueueLane::Control as usize].backlog = 1;
+        scheduler.lanes[QueueLane::Control as usize].max_wait_ticks = MAX_CONTROL_WAIT_TICKS + 1;
+        let decision = evaluate_queue_admission(&request, &scheduler);
+        assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
+        assert_eq!(
+            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            Some(DENY_TICK_FLOOR_CONTROL)
+        );
+    }
+
+    // ========================================================================
+    // Anti-entropy admission
+    // ========================================================================
+
+    #[test]
+    fn anti_entropy_valid_pull_allows() {
+        let request = valid_anti_entropy_request();
+        let budget = AntiEntropyBudget::default_budget();
+        let decision = evaluate_anti_entropy_admission(&request, &budget);
+        assert_eq!(decision.verdict, QueueAdmissionVerdict::Allow);
+    }
+
+    #[test]
+    fn anti_entropy_push_denies() {
+        let mut request = valid_anti_entropy_request();
+        request.direction = AntiEntropyDirection::Push;
+        let budget = AntiEntropyBudget::default_budget();
+        let decision = evaluate_anti_entropy_admission(&request, &budget);
+        assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
+        assert_eq!(
+            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            Some(DENY_ANTI_ENTROPY_PUSH_REJECTED)
+        );
+    }
+
+    #[test]
+    fn anti_entropy_oversized_proof_denies() {
+        let mut request = valid_anti_entropy_request();
+        request.proof_bytes = 1001;
+        request.max_proof_bytes = 1000;
+        let budget = AntiEntropyBudget::default_budget();
+        let decision = evaluate_anti_entropy_admission(&request, &budget);
+        assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
+        assert_eq!(
+            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            Some(DENY_ANTI_ENTROPY_OVERSIZED)
+        );
+    }
+
+    #[test]
+    fn anti_entropy_budget_exhausted_denies() {
+        let request = valid_anti_entropy_request();
+        let budget = AntiEntropyBudget::new(5); // cost is 10, budget is 5
+        let decision = evaluate_anti_entropy_admission(&request, &budget);
+        assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
+        assert_eq!(
+            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            Some(DENY_ANTI_ENTROPY_BUDGET_EXHAUSTED)
+        );
+    }
+
+    #[test]
+    fn anti_entropy_missing_envelope_denies() {
+        let mut request = valid_anti_entropy_request();
+        request.envelope = None;
+        let budget = AntiEntropyBudget::default_budget();
+        let decision = evaluate_anti_entropy_admission(&request, &budget);
+        assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
+        assert_eq!(
+            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            Some(DENY_ENVELOPE_MISSING)
+        );
+    }
+
+    #[test]
+    fn anti_entropy_missing_convergence_denies() {
+        let mut request = valid_anti_entropy_request();
+        request.convergence_horizon = None;
+        let budget = AntiEntropyBudget::default_budget();
+        let decision = evaluate_anti_entropy_admission(&request, &budget);
+        assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
+        assert_eq!(
+            decision.defect.as_ref().map(|d| d.reason.as_str()),
+            Some(DENY_CONVERGENCE_HORIZON_UNRESOLVED)
+        );
+    }
+
+    // ========================================================================
+    // Scheduler state
+    // ========================================================================
+
+    #[test]
+    fn scheduler_record_admission_and_completion() {
+        let mut scheduler = QueueSchedulerState::new();
+        assert_eq!(scheduler.total_items(), 0);
+
+        scheduler
+            .record_admission(QueueLane::Consume)
+            .expect("should admit");
+        assert_eq!(scheduler.total_items(), 1);
+        assert_eq!(scheduler.lane(QueueLane::Consume).backlog, 1);
+
+        scheduler.record_completion(QueueLane::Consume);
+        assert_eq!(scheduler.total_items(), 0);
+        assert_eq!(scheduler.lane(QueueLane::Consume).backlog, 0);
+    }
+
+    #[test]
+    fn scheduler_lane_backlog_cap_enforced() {
+        let mut scheduler = QueueSchedulerState::new();
+        scheduler.lanes[QueueLane::Bulk as usize].backlog = MAX_LANE_BACKLOG;
+        let result = scheduler.record_admission(QueueLane::Bulk);
+        assert_eq!(result.unwrap_err(), DENY_LANE_BACKLOG_EXCEEDED);
+    }
+
+    #[test]
+    fn scheduler_total_items_cap_enforced() {
+        let mut scheduler = QueueSchedulerState::new();
+        scheduler.total_items = MAX_TOTAL_QUEUE_ITEMS;
+        let result = scheduler.record_admission(QueueLane::Consume);
+        assert_eq!(result.unwrap_err(), DENY_TOTAL_QUEUE_EXCEEDED);
+    }
+
+    #[test]
+    fn scheduler_reserved_capacity_correct() {
+        let stop_reserved = QueueSchedulerState::reserved_capacity(QueueLane::StopRevoke);
+        assert_eq!(
+            stop_reserved,
+            (MAX_TOTAL_QUEUE_ITEMS * STOP_REVOKE_RESERVATION_PERMILLE as usize) / 1000
+        );
+
+        let control_reserved = QueueSchedulerState::reserved_capacity(QueueLane::Control);
+        assert_eq!(
+            control_reserved,
+            (MAX_TOTAL_QUEUE_ITEMS * CONTROL_RESERVATION_PERMILLE as usize) / 1000
+        );
+
+        let bulk_reserved = QueueSchedulerState::reserved_capacity(QueueLane::Bulk);
+        assert_eq!(bulk_reserved, 0);
+    }
+
+    #[test]
+    fn scheduler_tick_floor_ok_when_empty() {
+        let scheduler = QueueSchedulerState::new();
+        assert!(scheduler.check_tick_floor_invariants().is_ok());
+    }
+
+    #[test]
+    fn scheduler_tick_floor_ok_when_within_limits() {
+        let mut scheduler = QueueSchedulerState::new();
+        scheduler.lanes[QueueLane::StopRevoke as usize].backlog = 1;
+        scheduler.lanes[QueueLane::StopRevoke as usize].max_wait_ticks = MAX_STOP_REVOKE_WAIT_TICKS;
+        assert!(scheduler.check_tick_floor_invariants().is_ok());
+    }
+
+    // ========================================================================
+    // Budget tracker
+    // ========================================================================
+
+    #[test]
+    fn budget_consume_and_remaining() {
+        let mut budget = AntiEntropyBudget::new(100);
+        assert_eq!(budget.remaining(), 100);
+
+        budget.try_consume(30).expect("should consume");
+        assert_eq!(budget.remaining(), 70);
+
+        budget.try_consume(70).expect("should consume");
+        assert_eq!(budget.remaining(), 0);
+
+        let err = budget.try_consume(1).unwrap_err();
+        assert_eq!(err, DENY_ANTI_ENTROPY_BUDGET_EXHAUSTED);
+    }
+
+    #[test]
+    fn budget_reset_restores_full_budget() {
+        let mut budget = AntiEntropyBudget::new(100);
+        budget.try_consume(100).expect("should consume");
+        assert_eq!(budget.remaining(), 0);
+
+        budget.reset();
+        assert_eq!(budget.remaining(), 100);
+    }
+
+    // ========================================================================
+    // Lane properties
+    // ========================================================================
+
+    #[test]
+    fn lane_priority_ordering() {
+        assert!(QueueLane::StopRevoke < QueueLane::Control);
+        assert!(QueueLane::Control < QueueLane::Consume);
+        assert!(QueueLane::Consume < QueueLane::Replay);
+        assert!(QueueLane::Replay < QueueLane::ProjectionReplay);
+        assert!(QueueLane::ProjectionReplay < QueueLane::Bulk);
+    }
+
+    #[test]
+    fn lane_tick_floor_guarantees() {
+        assert!(QueueLane::StopRevoke.has_tick_floor_guarantee());
+        assert!(QueueLane::Control.has_tick_floor_guarantee());
+        assert!(!QueueLane::Consume.has_tick_floor_guarantee());
+        assert!(!QueueLane::Replay.has_tick_floor_guarantee());
+        assert!(!QueueLane::ProjectionReplay.has_tick_floor_guarantee());
+        assert!(!QueueLane::Bulk.has_tick_floor_guarantee());
+    }
+
+    #[test]
+    fn lane_max_wait_ticks_correct() {
+        assert_eq!(
+            QueueLane::StopRevoke.max_wait_ticks(),
+            Some(MAX_STOP_REVOKE_WAIT_TICKS)
+        );
+        assert_eq!(
+            QueueLane::Control.max_wait_ticks(),
+            Some(MAX_CONTROL_WAIT_TICKS)
+        );
+        assert_eq!(QueueLane::Consume.max_wait_ticks(), None);
+    }
+
+    // ========================================================================
+    // Trace canonical bytes
+    // ========================================================================
+
+    #[test]
+    fn trace_canonical_bytes_deterministic() {
+        let request = valid_queue_request(QueueLane::Consume);
+        let scheduler = QueueSchedulerState::new();
+        let d1 = evaluate_queue_admission(&request, &scheduler);
+        let d2 = evaluate_queue_admission(&request, &scheduler);
+
+        let bytes1 = d1.trace.canonical_bytes().expect("should serialize");
+        let bytes2 = d2.trace.canonical_bytes().expect("should serialize");
+        assert_eq!(bytes1, bytes2);
+        assert!(!bytes1.is_empty());
+    }
+
+    // ========================================================================
+    // Adversarial drill: replay flood
+    // ========================================================================
+
+    #[test]
+    fn adversarial_replay_flood_bounded_by_lane_backlog() {
+        let scheduler = QueueSchedulerState::new();
+        let mut admitted = 0usize;
+        let mut denied = 0usize;
+
+        for i in 0..MAX_LANE_BACKLOG + 100 {
+            let mut request = valid_queue_request(QueueLane::Replay);
+            request.current_tick = 1200 + i as u64;
+            let mut sched = scheduler.clone();
+            sched.lanes[QueueLane::Replay as usize].backlog = i.min(MAX_LANE_BACKLOG);
+            sched.total_items = i.min(MAX_TOTAL_QUEUE_ITEMS);
+            let decision = evaluate_queue_admission(&request, &sched);
+            match decision.verdict {
+                QueueAdmissionVerdict::Allow => admitted += 1,
+                QueueAdmissionVerdict::Deny => denied += 1,
+                QueueAdmissionVerdict::Freeze => {},
+            }
+        }
+
+        assert!(admitted > 0, "some replay requests should be admitted");
+        assert!(denied > 0, "overflow replay requests must be denied");
+        assert!(
+            admitted <= MAX_LANE_BACKLOG,
+            "admitted replay count must not exceed lane backlog cap"
+        );
+    }
+
+    // ========================================================================
+    // Adversarial drill: mixed control/replay bursts
+    // ========================================================================
+
+    #[test]
+    fn adversarial_mixed_bursts_control_lane_preserved() {
+        let mut scheduler = QueueSchedulerState::new();
+
+        // Fill replay lane to capacity
+        for _ in 0..MAX_LANE_BACKLOG {
+            let _ = scheduler.record_admission(QueueLane::Replay);
+        }
+
+        // Control lane should still admit
+        let request = valid_queue_request(QueueLane::Control);
+        let decision = evaluate_queue_admission(&request, &scheduler);
+        assert_eq!(
+            decision.verdict,
+            QueueAdmissionVerdict::Allow,
+            "control lane must be preserved even when replay is saturated"
+        );
+
+        // Stop/revoke should still admit
+        let request = valid_queue_request(QueueLane::StopRevoke);
+        let decision = evaluate_queue_admission(&request, &scheduler);
+        assert_eq!(
+            decision.verdict,
+            QueueAdmissionVerdict::Allow,
+            "stop_revoke lane must be preserved even when replay is saturated"
+        );
+    }
+
+    // ========================================================================
+    // Adversarial drill: low-rate exhaustion
+    // ========================================================================
+
+    #[test]
+    fn adversarial_low_rate_anti_entropy_exhaustion() {
+        let mut budget = AntiEntropyBudget::default_budget();
+        let mut admitted = 0u64;
+        let mut denied = 0u64;
+
+        // Send many small requests to exhaust budget
+        for _ in 0..MAX_ANTI_ENTROPY_BUDGET + 100 {
+            let mut request = valid_anti_entropy_request();
+            request.cost = 1;
+            let decision = evaluate_anti_entropy_admission(&request, &budget);
+            match decision.verdict {
+                QueueAdmissionVerdict::Allow => {
+                    let _ = budget.try_consume(request.cost);
+                    admitted += 1;
+                },
+                QueueAdmissionVerdict::Deny => denied += 1,
+                QueueAdmissionVerdict::Freeze => {},
+            }
+        }
+
+        assert_eq!(admitted, MAX_ANTI_ENTROPY_BUDGET);
+        assert!(denied > 0, "budget exhaustion must cause denials");
+    }
+
+    // ========================================================================
+    // Adversarial drill: unknown/invalid temporal state
+    // ========================================================================
+
+    #[test]
+    fn unknown_temporal_state_denies_all_lanes() {
+        let scheduler = QueueSchedulerState::new();
+
+        for lane in QueueLane::all() {
+            let mut request = valid_queue_request(lane);
+            request.envelope = None;
+            request.freshness_horizon = None;
+            request.revocation_frontier = None;
+            request.convergence_horizon = None;
+            let decision = evaluate_queue_admission(&request, &scheduler);
+
+            if lane == QueueLane::StopRevoke {
+                // Stop/revoke has emergency carve-out but still fails on tp002
+                assert_eq!(decision.verdict, QueueAdmissionVerdict::Deny);
+            } else {
+                assert_eq!(
+                    decision.verdict,
+                    QueueAdmissionVerdict::Deny,
+                    "lane {lane} must deny with unknown temporal state"
+                );
+            }
+        }
+    }
+
+    // ========================================================================
+    // Envelope structural tests
+    // ========================================================================
+
+    #[test]
+    fn envelope_validate_valid() {
+        let envelope = valid_envelope();
+        assert!(envelope.validate().is_ok());
+    }
+
+    #[test]
+    fn envelope_serde_roundtrip() {
+        let envelope = valid_envelope();
+        let json = serde_json::to_string(&envelope).expect("should serialize");
+        let parsed: TimeAuthorityEnvelopeV1 =
+            serde_json::from_str(&json).expect("should deserialize");
+        assert_eq!(envelope, parsed);
+    }
+
+    // ========================================================================
+    // QueueLane Display
+    // ========================================================================
+
+    #[test]
+    fn queue_lane_display() {
+        assert_eq!(QueueLane::StopRevoke.to_string(), "stop_revoke");
+        assert_eq!(QueueLane::Control.to_string(), "control");
+        assert_eq!(QueueLane::Consume.to_string(), "consume");
+        assert_eq!(QueueLane::Replay.to_string(), "replay");
+        assert_eq!(QueueLane::ProjectionReplay.to_string(), "projection_replay");
+        assert_eq!(QueueLane::Bulk.to_string(), "bulk");
+    }
+}
