@@ -184,6 +184,13 @@ pub enum BrokerError {
     /// Policy digest cannot be zero.
     #[error("policy digest cannot be zero")]
     ZeroPolicyDigest,
+
+    /// Convergence receipt hash cannot be zero.
+    #[error("convergence receipt contains zero hash: {field}")]
+    ZeroConvergenceReceiptHash {
+        /// Which field was zero.
+        field: &'static str,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -606,12 +613,12 @@ impl FacBroker {
 
     /// Issues a `TimeAuthorityEnvelopeV1` with default TTL.
     ///
-    /// Convenience wrapper around [`issue_time_authority_envelope`] using
+    /// Convenience wrapper around [`Self::issue_time_authority_envelope`] using
     /// `DEFAULT_ENVELOPE_TTL_TICKS`.
     ///
     /// # Errors
     ///
-    /// Same as [`issue_time_authority_envelope`].
+    /// Same as [`Self::issue_time_authority_envelope`].
     pub fn issue_time_authority_envelope_default_ttl(
         &mut self,
         boundary_id: &str,
@@ -713,6 +720,16 @@ impl FacBroker {
         authority_set_hash: Hash,
         proof_hash: Hash,
     ) -> Result<(), BrokerError> {
+        if is_zero_hash(&authority_set_hash) {
+            return Err(BrokerError::ZeroConvergenceReceiptHash {
+                field: "authority_set_hash",
+            });
+        }
+        if is_zero_hash(&proof_hash) {
+            return Err(BrokerError::ZeroConvergenceReceiptHash {
+                field: "proof_hash",
+            });
+        }
         if self.state.convergence_receipts.len() >= MAX_CONVERGENCE_RECEIPTS {
             return Err(BrokerError::ConvergenceReceiptStoreAtCapacity {
                 max: MAX_CONVERGENCE_RECEIPTS,
@@ -749,10 +766,14 @@ impl FacBroker {
         if is_zero_hash(&digest) {
             return Err(BrokerError::ZeroPolicyDigest);
         }
+        // Constant-time duplicate scan: examine ALL entries regardless of match
+        // position to preserve INV-PC-001 timing invariant.
+        let mut found = 0u8;
         for existing in &self.state.admitted_policy_digests {
-            if bool::from(existing.ct_eq(&digest)) {
-                return Ok(());
-            }
+            found |= u8::from(bool::from(existing.ct_eq(&digest)));
+        }
+        if found != 0 {
+            return Ok(());
         }
         if self.state.admitted_policy_digests.len() >= MAX_ADMITTED_POLICY_DIGESTS {
             return Err(BrokerError::PolicyDigestStoreAtCapacity {
@@ -774,14 +795,15 @@ impl FacBroker {
         found != 0
     }
 
-    /// Finds the exact admitted policy digest.
+    /// Finds the exact admitted policy digest using constant-time scan
+    /// (INV-PC-001: no short-circuit on match position).
     #[must_use]
     fn find_admitted_policy_digest(&self, digest: &Hash) -> Option<Hash> {
-        self.state
-            .admitted_policy_digests
-            .iter()
-            .find(|existing| bool::from(existing.ct_eq(digest)))
-            .copied()
+        let mut found = 0u8;
+        for existing in &self.state.admitted_policy_digests {
+            found |= u8::from(bool::from(existing.ct_eq(digest)));
+        }
+        if found != 0 { Some(*digest) } else { None }
     }
 
     // -----------------------------------------------------------------------
@@ -1354,7 +1376,7 @@ mod tests {
     #[allow(clippy::cast_possible_truncation)]
     fn convergence_receipt_store_cap_enforced() {
         let mut broker = FacBroker::new();
-        for i in 0..MAX_CONVERGENCE_RECEIPTS {
+        for i in 1..=MAX_CONVERGENCE_RECEIPTS {
             broker
                 .add_convergence_receipt([i as u8; 32], [i as u8; 32])
                 .expect("receipt should be added");
@@ -1369,6 +1391,32 @@ mod tests {
             broker.convergence_receipts().len(),
             MAX_CONVERGENCE_RECEIPTS
         );
+    }
+
+    #[test]
+    fn add_convergence_receipt_rejects_zero_authority_set_hash() {
+        let mut broker = FacBroker::new();
+        let result = broker.add_convergence_receipt([0u8; 32], [0x11; 32]);
+        assert!(matches!(
+            result,
+            Err(BrokerError::ZeroConvergenceReceiptHash {
+                field: "authority_set_hash"
+            })
+        ));
+        assert!(broker.convergence_receipts().is_empty());
+    }
+
+    #[test]
+    fn add_convergence_receipt_rejects_zero_proof_hash() {
+        let mut broker = FacBroker::new();
+        let result = broker.add_convergence_receipt([0x11; 32], [0u8; 32]);
+        assert!(matches!(
+            result,
+            Err(BrokerError::ZeroConvergenceReceiptHash {
+                field: "proof_hash"
+            })
+        ));
+        assert!(broker.convergence_receipts().is_empty());
     }
 
     // -----------------------------------------------------------------------
