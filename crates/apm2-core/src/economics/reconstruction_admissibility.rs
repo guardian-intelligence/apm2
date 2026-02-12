@@ -208,6 +208,16 @@ pub const DENY_RECONSTRUCTION_RECEIPT_WINDOW_MISMATCH: &str =
 pub const DENY_RECONSTRUCTION_RECEIPT_NOT_ADMITTED: &str = "reconstruction_receipt_not_admitted";
 /// Deny: reconstruction receipt duplicate ID detected.
 pub const DENY_RECONSTRUCTION_RECEIPT_DUPLICATE_ID: &str = "reconstruction_receipt_duplicate_id";
+/// Deny: erasure decode result is missing.
+pub const DENY_ERASURE_DECODE_RESULT_MISSING: &str = "reconstruction_erasure_decode_result_missing";
+/// Deny: BFT quorum `total_nodes` does not match trusted membership context.
+pub const DENY_QUORUM_TOTAL_NODES_MISMATCH: &str = "reconstruction_quorum_total_nodes_mismatch";
+/// Deny: reconstruction receipt digest proof reference mismatch.
+pub const DENY_RECONSTRUCTION_RECEIPT_DIGEST_PROOF_MISMATCH: &str =
+    "reconstruction_receipt_digest_proof_ref_mismatch";
+/// Deny: reconstruction receipt quorum cert reference mismatch.
+pub const DENY_RECONSTRUCTION_RECEIPT_QUORUM_CERT_MISMATCH: &str =
+    "reconstruction_receipt_quorum_cert_ref_mismatch";
 /// Deny: unknown reconstruction state.
 pub const DENY_UNKNOWN_RECONSTRUCTION_STATE: &str = "reconstruction_unknown_state";
 
@@ -866,7 +876,7 @@ pub fn validate_erasure_decode(
     }
 
     // Validate decode result if present.
-    let decode = decode_result.ok_or(DENY_ERASURE_PROFILE_MISSING)?;
+    let decode = decode_result.ok_or(DENY_ERASURE_DECODE_RESULT_MISSING)?;
 
     if !decode.decode_valid {
         return Err(DENY_ERASURE_INSUFFICIENT_SHARDS);
@@ -898,15 +908,26 @@ pub fn validate_erasure_decode(
 /// Checks:
 /// 1. Quorum certificate is present (fail-closed).
 /// 2. Total nodes count is non-zero.
-/// 3. Signer count is within bounds.
-/// 4. Signer count meets the 2f+1 BFT threshold (ceil(2n/3)).
-/// 5. All signer keys are non-zero.
-/// 6. All signer keys are unique (no duplicate signers).
-/// 7. All signers are in the trusted signer set (constant-time).
-/// 8. All signatures are valid Ed25519 signatures over the certified digest.
-/// 9. Certified digest is non-zero.
-/// 10. Certificate content hash is non-zero.
-/// 11. Certified digest matches the recovered digest (constant-time).
+/// 3. Certificate `total_nodes` matches the authoritative `trusted_total_nodes`
+///    from the caller's membership context (prevents `total_nodes` downgrade).
+/// 4. Signer count is within bounds.
+/// 5. Signer count meets the 2f+1 BFT threshold (ceil(2n/3)) computed from the
+///    **trusted** `total_nodes`, not the certificate's declared value.
+/// 6. All signer keys are non-zero.
+/// 7. All signer keys are unique (no duplicate signers).
+/// 8. All signers are in the trusted signer set (constant-time).
+/// 9. All signatures are valid Ed25519 signatures over the certified digest.
+/// 10. Certified digest is non-zero.
+/// 11. Certificate content hash is non-zero.
+/// 12. Certified digest matches the recovered digest (constant-time).
+///
+/// # Security
+///
+/// The quorum threshold is derived from `trusted_total_nodes` (an
+/// authoritative membership parameter from the caller), **not** from the
+/// untrusted `cert.total_nodes` field. The certificate's `total_nodes` is
+/// cross-checked against the trusted value, so an attacker cannot lower the
+/// threshold by rewriting the certificate metadata.
 ///
 /// # Errors
 ///
@@ -915,6 +936,7 @@ pub fn validate_bft_quorum_certification(
     cert: Option<&BftQuorumCertificate>,
     recovered_digest: &Hash,
     trusted_quorum_keys: &[[u8; 32]],
+    trusted_total_nodes: u32,
 ) -> Result<(), &'static str> {
     // Fail-closed: missing quorum certificate.
     let cert = cert.ok_or(DENY_QUORUM_CERT_MISSING)?;
@@ -928,12 +950,23 @@ pub fn validate_bft_quorum_certification(
     if cert.total_nodes == 0 {
         return Err(DENY_QUORUM_TOTAL_NODES_ZERO);
     }
+    if trusted_total_nodes == 0 {
+        return Err(DENY_QUORUM_TOTAL_NODES_ZERO);
+    }
+
+    // Cross-check: certificate's declared total_nodes MUST match the
+    // authoritative membership context. This prevents an attacker from
+    // rewriting total_nodes to 1 while reusing valid signatures.
+    if cert.total_nodes != trusted_total_nodes {
+        return Err(DENY_QUORUM_TOTAL_NODES_MISMATCH);
+    }
+
     if cert.signers.len() > MAX_QUORUM_SIGNERS {
         return Err(DENY_QUORUM_SIGNERS_EXCEEDED);
     }
 
-    // BFT quorum threshold: ceil(2n/3).
-    let total = cert.total_nodes as usize;
+    // BFT quorum threshold: ceil(2n/3) computed from TRUSTED total_nodes.
+    let total = trusted_total_nodes as usize;
     let required = (MIN_QUORUM_NUMERATOR * total).div_ceil(MIN_QUORUM_DENOMINATOR);
     if cert.signers.len() < required {
         return Err(DENY_QUORUM_INSUFFICIENT);
@@ -1119,10 +1152,26 @@ pub struct ReconstructionCheckInput {
     pub trusted_receipt_signers: Vec<[u8; 32]>,
     /// Trusted quorum node public keys for quorum certification.
     pub trusted_quorum_keys: Vec<[u8; 32]>,
+    /// Authoritative total node count from trusted membership context.
+    ///
+    /// Used to compute the BFT quorum threshold instead of the untrusted
+    /// `total_nodes` field in the certificate. The certificate's
+    /// `total_nodes` is cross-checked against this value.
+    pub trusted_total_nodes: u32,
     /// Expected time authority reference hash.
     pub expected_time_authority_ref: Hash,
     /// Expected window reference hash.
     pub expected_window_ref: Hash,
+    /// Expected digest proof reference hash for receipt cross-checking.
+    ///
+    /// Receipts' `digest_proof_ref` must match this value (constant-time)
+    /// to prove lineage to the digest proof validated in gate 1.
+    pub expected_digest_proof_ref: Hash,
+    /// Expected quorum cert reference hash for receipt cross-checking.
+    ///
+    /// Receipts' `quorum_cert_ref` must match this value (constant-time)
+    /// to prove lineage to the quorum certificate validated in gate 2.
+    pub expected_quorum_cert_ref: Hash,
 }
 
 /// Typed mode for reconstruction admissibility evaluation.
@@ -1217,6 +1266,7 @@ pub fn evaluate_reconstruction_admissibility(
         input.quorum_cert.as_ref(),
         recovered_digest,
         &input.trusted_quorum_keys,
+        input.trusted_total_nodes,
     );
     // Record quorum result as part of TP-EIO29-004 (same predicate, sub-gate).
     if let Err(reason) = quorum_result {
@@ -1262,6 +1312,8 @@ pub fn evaluate_reconstruction_admissibility(
         &input.trusted_receipt_signers,
         &input.expected_time_authority_ref,
         &input.expected_window_ref,
+        &input.expected_digest_proof_ref,
+        &input.expected_quorum_cert_ref,
     );
     let tp001_passed = receipt_result.is_ok();
     predicate_results.push((TemporalPredicateId::TpEio29001, tp001_passed));
@@ -1292,18 +1344,25 @@ pub fn evaluate_reconstruction_admissibility(
 /// 5. Each receipt passes Ed25519 signature verification.
 /// 6. Each receipt signer is in the trusted set (constant-time).
 /// 7. Receipt context binds to expected time authority and window refs.
-/// 8. Receipt boundary matches the evaluation boundary.
-/// 9. At least one receipt has `admitted == true`.
+/// 8. Receipt `digest_proof_ref` matches the expected digest proof from gate 1
+///    (constant-time).
+/// 9. Receipt `quorum_cert_ref` matches the expected quorum cert from gate 2
+///    (constant-time).
+/// 10. Receipt boundary matches the evaluation boundary.
+/// 11. At least one receipt has `admitted == true`.
 ///
 /// # Errors
 ///
 /// Returns a stable deny reason string for any violation.
+#[allow(clippy::too_many_arguments)]
 pub fn validate_reconstruction_receipts(
     receipts: &[ReconstructionAdmissibilityReceiptV1],
     eval_boundary_id: &str,
     trusted_signers: &[[u8; 32]],
     expected_time_authority_ref: &Hash,
     expected_window_ref: &Hash,
+    expected_digest_proof_ref: &Hash,
+    expected_quorum_cert_ref: &Hash,
 ) -> Result<(), &'static str> {
     if receipts.is_empty() {
         return Err(DENY_RECONSTRUCTION_RECEIPT_MISSING);
@@ -1356,6 +1415,28 @@ pub fn validate_reconstruction_receipts(
         // Context binding: window reference must match (constant-time).
         if receipt.window_ref.ct_eq(expected_window_ref).unwrap_u8() == 0 {
             return Err(DENY_RECONSTRUCTION_RECEIPT_WINDOW_MISMATCH);
+        }
+
+        // Context binding: digest proof reference must match the artifact
+        // validated in gate 1 (constant-time).
+        if receipt
+            .digest_proof_ref
+            .ct_eq(expected_digest_proof_ref)
+            .unwrap_u8()
+            == 0
+        {
+            return Err(DENY_RECONSTRUCTION_RECEIPT_DIGEST_PROOF_MISMATCH);
+        }
+
+        // Context binding: quorum cert reference must match the certificate
+        // validated in gate 2 (constant-time).
+        if receipt
+            .quorum_cert_ref
+            .ct_eq(expected_quorum_cert_ref)
+            .unwrap_u8()
+            == 0
+        {
+            return Err(DENY_RECONSTRUCTION_RECEIPT_QUORUM_CERT_MISMATCH);
         }
 
         if receipt.admitted {
@@ -1527,6 +1608,9 @@ mod tests {
             .map(|s| s.public_key_bytes())
             .collect();
 
+        #[allow(clippy::cast_possible_truncation)]
+        let trusted_total_nodes = quorum_signers.len() as u32;
+
         ReconstructionCheckInput {
             erasure_profile: Some(valid_erasure_profile()),
             decode_result: Some(valid_decode_result()),
@@ -1535,8 +1619,12 @@ mod tests {
             receipts: vec![valid_reconstruction_receipt(receipt_signer)],
             trusted_receipt_signers: trusted_signers_for(receipt_signer),
             trusted_quorum_keys,
+            trusted_total_nodes,
             expected_time_authority_ref: expected_time_authority_ref(),
             expected_window_ref: expected_window_ref(),
+            // Receipt is created with digest_proof_ref=0xAA, quorum_cert_ref=0xEE.
+            expected_digest_proof_ref: test_hash(0xAA),
+            expected_quorum_cert_ref: test_hash(0xEE),
         }
     }
 
@@ -1808,7 +1896,7 @@ mod tests {
     #[test]
     fn erasure_missing_decode_result_denies() {
         let result = validate_erasure_decode(Some(&valid_erasure_profile()), None);
-        assert_eq!(result.unwrap_err(), DENY_ERASURE_PROFILE_MISSING);
+        assert_eq!(result.unwrap_err(), DENY_ERASURE_DECODE_RESULT_MISSING);
     }
 
     #[test]
@@ -1917,14 +2005,15 @@ mod tests {
         let cert = valid_quorum_cert(&signers);
         let trusted: Vec<[u8; 32]> = signers.iter().map(|s| s.public_key_bytes()).collect();
         let recovered = test_hash(0xFF);
-        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted);
+        // trusted_total_nodes matches cert.total_nodes (3).
+        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 3);
         assert!(result.is_ok());
     }
 
     #[test]
     fn quorum_missing_cert_denies() {
         let recovered = test_hash(0xFF);
-        let result = validate_bft_quorum_certification(None, &recovered, &[]);
+        let result = validate_bft_quorum_certification(None, &recovered, &[], 3);
         assert_eq!(result.unwrap_err(), DENY_QUORUM_CERT_MISSING);
     }
 
@@ -1935,7 +2024,8 @@ mod tests {
         cert.total_nodes = 0;
         let trusted = vec![s1.public_key_bytes()];
         let recovered = test_hash(0xFF);
-        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted);
+        // trusted_total_nodes also 0 to match cert — triggers zero check.
+        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 0);
         assert_eq!(result.unwrap_err(), DENY_QUORUM_TOTAL_NODES_ZERO);
     }
 
@@ -1955,7 +2045,7 @@ mod tests {
         };
         let trusted = vec![s1.public_key_bytes(), s2.public_key_bytes()];
         let recovered = test_hash(0xFF);
-        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted);
+        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 3);
         assert_eq!(result.unwrap_err(), DENY_QUORUM_INSUFFICIENT);
     }
 
@@ -1972,7 +2062,7 @@ mod tests {
             s3.public_key_bytes(),
         ];
         let recovered = test_hash(0xFF);
-        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted);
+        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 3);
         assert_eq!(result.unwrap_err(), DENY_QUORUM_SIGNER_KEY_ZERO);
     }
 
@@ -1996,7 +2086,7 @@ mod tests {
         };
         let trusted = vec![s1.public_key_bytes()];
         let recovered = test_hash(0xFF);
-        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted);
+        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 3);
         assert_eq!(result.unwrap_err(), DENY_QUORUM_DUPLICATE_SIGNER);
     }
 
@@ -2009,7 +2099,7 @@ mod tests {
         // Only trust s1 and s2, not s_untrusted.
         let trusted = vec![s1.public_key_bytes(), s2.public_key_bytes()];
         let recovered = test_hash(0xFF);
-        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted);
+        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 3);
         assert_eq!(result.unwrap_err(), DENY_QUORUM_SIGNER_UNTRUSTED);
     }
 
@@ -2027,7 +2117,7 @@ mod tests {
             s3.public_key_bytes(),
         ];
         let recovered = test_hash(0xFF);
-        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted);
+        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 3);
         assert_eq!(result.unwrap_err(), DENY_QUORUM_SIGNATURE_INVALID);
     }
 
@@ -2044,7 +2134,7 @@ mod tests {
         ];
         // Recovered digest does not match certified digest.
         let recovered = test_hash(0x01);
-        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted);
+        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 3);
         assert_eq!(result.unwrap_err(), DENY_QUORUM_DIGEST_MISMATCH);
     }
 
@@ -2056,7 +2146,7 @@ mod tests {
         cert.certified_digest = [0u8; 32];
         let trusted = vec![s1.public_key_bytes()];
         let recovered = test_hash(0xFF);
-        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted);
+        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 1);
         assert_eq!(result.unwrap_err(), DENY_QUORUM_CERT_DIGEST_ZERO);
     }
 
@@ -2068,7 +2158,7 @@ mod tests {
         cert.cert_digest = [0u8; 32];
         let trusted = vec![s1.public_key_bytes()];
         let recovered = test_hash(0xFF);
-        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted);
+        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 1);
         assert_eq!(result.unwrap_err(), DENY_QUORUM_CERT_DIGEST_ZERO);
     }
 
@@ -2077,8 +2167,9 @@ mod tests {
         let signers: Vec<Signer> = (0..=MAX_QUORUM_SIGNERS).map(|_| valid_signer()).collect();
         let signer_refs: Vec<&Signer> = signers.iter().collect();
         #[allow(clippy::cast_possible_truncation)]
+        let total_nodes = signer_refs.len() as u32;
         let cert = BftQuorumCertificate {
-            total_nodes: signer_refs.len() as u32,
+            total_nodes,
             signers: signer_refs
                 .iter()
                 .map(|s| QuorumSigner {
@@ -2091,8 +2182,61 @@ mod tests {
         };
         let trusted: Vec<[u8; 32]> = signer_refs.iter().map(|s| s.public_key_bytes()).collect();
         let recovered = test_hash(0xFF);
-        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted);
+        let result =
+            validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, total_nodes);
         assert_eq!(result.unwrap_err(), DENY_QUORUM_SIGNERS_EXCEEDED);
+    }
+
+    #[test]
+    fn quorum_total_nodes_downgrade_tampering_denied() {
+        // BLOCKER 1 negative test: attacker rewrites total_nodes to 1 in
+        // the certificate while keeping valid signatures. The trusted
+        // membership context says 3 nodes, so the mismatch is detected.
+        let s1 = valid_signer();
+        let s2 = valid_signer();
+        let s3 = valid_signer();
+        let mut cert = valid_quorum_cert(&[&s1, &s2, &s3]);
+        // Attacker tampers: sets total_nodes to 1 to lower threshold.
+        cert.total_nodes = 1;
+        let trusted = vec![
+            s1.public_key_bytes(),
+            s2.public_key_bytes(),
+            s3.public_key_bytes(),
+        ];
+        let recovered = test_hash(0xFF);
+        // Trusted context knows total_nodes is actually 3.
+        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 3);
+        assert_eq!(result.unwrap_err(), DENY_QUORUM_TOTAL_NODES_MISMATCH);
+    }
+
+    #[test]
+    fn quorum_total_nodes_upgrade_tampering_denied() {
+        // Attacker inflates total_nodes above trusted context.
+        let s1 = valid_signer();
+        let s2 = valid_signer();
+        let s3 = valid_signer();
+        let mut cert = valid_quorum_cert(&[&s1, &s2, &s3]);
+        cert.total_nodes = 100;
+        let trusted = vec![
+            s1.public_key_bytes(),
+            s2.public_key_bytes(),
+            s3.public_key_bytes(),
+        ];
+        let recovered = test_hash(0xFF);
+        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 3);
+        assert_eq!(result.unwrap_err(), DENY_QUORUM_TOTAL_NODES_MISMATCH);
+    }
+
+    #[test]
+    fn quorum_trusted_total_nodes_zero_denied() {
+        // Even if cert.total_nodes is valid, a zero trusted_total_nodes
+        // fails closed.
+        let s1 = valid_signer();
+        let cert = valid_quorum_cert(&[&s1]);
+        let trusted = vec![s1.public_key_bytes()];
+        let recovered = test_hash(0xFF);
+        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 0);
+        assert_eq!(result.unwrap_err(), DENY_QUORUM_TOTAL_NODES_ZERO);
     }
 
     // ========================================================================
@@ -2189,6 +2333,18 @@ mod tests {
     // Reconstruction receipt validation
     // ========================================================================
 
+    /// Expected digest proof reference for receipt tests (matches
+    /// `valid_reconstruction_receipt` which uses `test_hash(0xAA)`).
+    fn expected_digest_proof_ref() -> Hash {
+        test_hash(0xAA)
+    }
+
+    /// Expected quorum cert reference for receipt tests (matches
+    /// `valid_reconstruction_receipt` which uses `test_hash(0xEE)`).
+    fn expected_quorum_cert_ref() -> Hash {
+        test_hash(0xEE)
+    }
+
     #[test]
     fn reconstruction_receipts_valid_passes() {
         let signer = valid_signer();
@@ -2200,6 +2356,8 @@ mod tests {
             &trusted,
             &expected_time_authority_ref(),
             &expected_window_ref(),
+            &expected_digest_proof_ref(),
+            &expected_quorum_cert_ref(),
         );
         assert!(result.is_ok());
     }
@@ -2212,6 +2370,8 @@ mod tests {
             &[],
             &expected_time_authority_ref(),
             &expected_window_ref(),
+            &expected_digest_proof_ref(),
+            &expected_quorum_cert_ref(),
         );
         assert_eq!(result.unwrap_err(), DENY_RECONSTRUCTION_RECEIPT_MISSING);
     }
@@ -2228,6 +2388,8 @@ mod tests {
             &trusted,
             &expected_time_authority_ref(),
             &expected_window_ref(),
+            &expected_digest_proof_ref(),
+            &expected_quorum_cert_ref(),
         );
         assert_eq!(
             result.unwrap_err(),
@@ -2247,6 +2409,8 @@ mod tests {
             &trusted,
             &expected_time_authority_ref(),
             &expected_window_ref(),
+            &expected_digest_proof_ref(),
+            &expected_quorum_cert_ref(),
         );
         assert_eq!(
             result.unwrap_err(),
@@ -2265,6 +2429,8 @@ mod tests {
             &trusted,
             &expected_time_authority_ref(),
             &expected_window_ref(),
+            &expected_digest_proof_ref(),
+            &expected_quorum_cert_ref(),
         );
         assert_eq!(
             result.unwrap_err(),
@@ -2283,6 +2449,8 @@ mod tests {
             &trusted,
             &test_hash(0x11), // Wrong time auth.
             &expected_window_ref(),
+            &expected_digest_proof_ref(),
+            &expected_quorum_cert_ref(),
         );
         assert_eq!(
             result.unwrap_err(),
@@ -2301,10 +2469,54 @@ mod tests {
             &trusted,
             &expected_time_authority_ref(),
             &test_hash(0x22), // Wrong window ref.
+            &expected_digest_proof_ref(),
+            &expected_quorum_cert_ref(),
         );
         assert_eq!(
             result.unwrap_err(),
             DENY_RECONSTRUCTION_RECEIPT_WINDOW_MISMATCH
+        );
+    }
+
+    #[test]
+    fn reconstruction_receipts_digest_proof_ref_mismatch_denies() {
+        let signer = valid_signer();
+        let receipt = valid_reconstruction_receipt(&signer);
+        let trusted = trusted_signers_for(&signer);
+        // Pass a wrong expected_digest_proof_ref — receipt has 0xAA.
+        let result = validate_reconstruction_receipts(
+            &[receipt],
+            "boundary-1",
+            &trusted,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
+            &test_hash(0x99), // Mismatched digest proof ref.
+            &expected_quorum_cert_ref(),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            DENY_RECONSTRUCTION_RECEIPT_DIGEST_PROOF_MISMATCH
+        );
+    }
+
+    #[test]
+    fn reconstruction_receipts_quorum_cert_ref_mismatch_denies() {
+        let signer = valid_signer();
+        let receipt = valid_reconstruction_receipt(&signer);
+        let trusted = trusted_signers_for(&signer);
+        // Pass a wrong expected_quorum_cert_ref — receipt has 0xEE.
+        let result = validate_reconstruction_receipts(
+            &[receipt],
+            "boundary-1",
+            &trusted,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
+            &expected_digest_proof_ref(),
+            &test_hash(0x99), // Mismatched quorum cert ref.
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            DENY_RECONSTRUCTION_RECEIPT_QUORUM_CERT_MISMATCH
         );
     }
 
@@ -2332,6 +2544,8 @@ mod tests {
             &trusted,
             &expected_time_authority_ref(),
             &expected_window_ref(),
+            &expected_digest_proof_ref(),
+            &expected_quorum_cert_ref(),
         );
         assert_eq!(
             result.unwrap_err(),
@@ -2352,6 +2566,8 @@ mod tests {
             &trusted,
             &expected_time_authority_ref(),
             &expected_window_ref(),
+            &expected_digest_proof_ref(),
+            &expected_quorum_cert_ref(),
         );
         assert_eq!(
             result.unwrap_err(),
@@ -2387,6 +2603,8 @@ mod tests {
             &trusted,
             &expected_time_authority_ref(),
             &expected_window_ref(),
+            &expected_digest_proof_ref(),
+            &expected_quorum_cert_ref(),
         );
         assert_eq!(result.unwrap_err(), DENY_RECONSTRUCTION_RECEIPTS_EXCEEDED);
     }
@@ -2598,6 +2816,7 @@ mod tests {
         if let Some(ref mut cert) = input.quorum_cert {
             cert.total_nodes = 3;
         }
+        input.trusted_total_nodes = 3;
         let decision = evaluate_reconstruction_admissibility(
             &input,
             "boundary-1",
@@ -2677,7 +2896,7 @@ mod tests {
         };
         let trusted = vec![s1.public_key_bytes(), s2.public_key_bytes()];
         let recovered = test_hash(0xFF);
-        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted);
+        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 3);
         assert!(result.is_ok());
     }
 
@@ -2704,7 +2923,7 @@ mod tests {
         let trusted = vec![s1.public_key_bytes(), s2.public_key_bytes()];
         let recovered = test_hash(0xFF);
         // Should deny: 2 < 3 required.
-        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted);
+        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 4);
         assert_eq!(result.unwrap_err(), DENY_QUORUM_INSUFFICIENT);
     }
 
@@ -2723,7 +2942,7 @@ mod tests {
         };
         let trusted = vec![s1.public_key_bytes()];
         let recovered = test_hash(0xFF);
-        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted);
+        let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 1);
         assert!(result.is_ok());
     }
 }
