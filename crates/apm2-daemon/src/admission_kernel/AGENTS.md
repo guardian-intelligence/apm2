@@ -252,9 +252,10 @@ plan():    validate -> prerequisite resolution -> witness seed creation ->
 execute(): single-use check -> prerequisite re-check (fail-closed) ->
            fresh revalidate (verifier anchor) -> quarantine reserve ->
            durable consume -> bundle construction + validation (TCK-00493) ->
-           effect journal record_started (TCK-00501, after validation) ->
+           journal binding build (TCK-00501, deferred to caller) ->
            bundle seal -> idempotency key derivation (TCK-00501) ->
            capability mint (tier-gated) -> boundary span -> result
+           [caller: record_started at true pre-dispatch boundary]
 
 POST-EFFECT FINALIZATION (caller responsibility, TCK-00502):
 finalize_anti_rollback(): anti-rollback anchor commit (fail-closed tiers only)

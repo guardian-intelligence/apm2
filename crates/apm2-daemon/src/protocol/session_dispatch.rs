@@ -8653,33 +8653,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             matches!(&decision, Ok(ToolDecision::Allow { .. }));
 
         // ================================================================
-        // TCK-00501 SEC-MAJOR-1 FIX: Record effect journal Started only
-        // for broker-allow requests, at the true daemon-side dispatch
-        // boundary immediately before `handle_broker_decision` executes.
-        //
-        // Broker deny/cache-hit outcomes must not allocate `Started`
-        // entries. This prevents deny storms from saturating journal
-        // capacity with orphaned in-flight entries.
+        // TCK-00501 SEC-BLOCKER FIX: record_started is now called INSIDE
+        // handle_broker_decision, immediately before actual tool execution
+        // (execute_tool_with_verified_content). This ensures Started entries
+        // are only created when ALL pre-dispatch checks have passed.
+        // Previously, record_started was called HERE, before
+        // handle_broker_decision, which created orphaned Started entries
+        // when pre-dispatch deny paths returned early.
         // ================================================================
-        if broker_decision_allows_effect_dispatch {
-            if let Some(ref result) = admission_result {
-                if let (Some(journal), Some(binding)) =
-                    (&result.effect_journal, &result.journal_binding)
-                {
-                    if let Err(e) = journal.record_started(binding) {
-                        warn!(
-                            session_id = %token.session_id,
-                            error = %e,
-                            "effect journal record_started failed at allow-dispatch boundary (fail-closed)"
-                        );
-                        return Ok(SessionResponse::error(
-                            SessionErrorCode::SessionErrorToolNotAllowed,
-                            format!("effect journal record_started failed: {e}"),
-                        ));
-                    }
-                }
-            }
-        }
+        let journal_ref = admission_result
+            .as_ref()
+            .and_then(|r| r.effect_journal.as_ref());
+        let binding_ref = admission_result
+            .as_ref()
+            .and_then(|r| r.journal_binding.as_ref());
 
         let mut response = self.handle_broker_decision(
             decision,
@@ -8696,6 +8683,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             pending_pcac,
             channel_context_token,
             boundary_flow_state_for_package.as_ref(),
+            journal_ref,
+            binding_ref,
         );
 
         // ================================================================
@@ -9299,6 +9288,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         pending_pcac: Option<PendingPcacAuthority>,
         channel_context_token: Option<String>,
         boundary_flow_state_for_package: Option<&BoundaryFlowRuntimeState>,
+        effect_journal: Option<
+            &std::sync::Arc<dyn crate::admission_kernel::effect_journal::EffectJournal>,
+        >,
+        journal_binding: Option<&crate::admission_kernel::effect_journal::EffectJournalBindingV1>,
     ) -> ProtocolResult<SessionResponse> {
         let timestamp_ns = actuation_timestamp.wall_ns;
         match decision {
@@ -9823,6 +9816,33 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                 ));
                             },
                         };
+
+                    // ============================================================
+                    // TCK-00501 SEC-BLOCKER FIX: Record effect journal Started
+                    // at the TRUE pre-dispatch boundary — immediately before
+                    // tool execution, AFTER all pre-dispatch deny gates have
+                    // passed (replay ordering, PCAC revalidate, PCAC consume,
+                    // intent digest, redundancy receipt, acceptance evidence).
+                    //
+                    // This ensures Started entries are only created when the
+                    // effect WILL actually execute. Pre-dispatch deny paths
+                    // never orphan Started entries, preventing false in-doubt
+                    // classification on restart that would exhaust journal
+                    // capacity.
+                    // ============================================================
+                    if let (Some(journal), Some(binding)) = (effect_journal, journal_binding) {
+                        if let Err(e) = journal.record_started(binding) {
+                            warn!(
+                                session_id = %session_id,
+                                error = %e,
+                                "effect journal record_started failed at true pre-dispatch boundary (fail-closed)"
+                            );
+                            return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorToolNotAllowed,
+                                format!("effect journal record_started failed: {e}"),
+                            ));
+                        }
+                    }
 
                     // Execute tool
                     // We use the timestamp from the start of the request for consistency.
@@ -19235,6 +19255,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
+                    None,
                 )
                 .expect("dispatch should return application-level error response");
 
@@ -19929,6 +19951,8 @@ mod tests {
                     Some(pending_pcac),
                     None,
                     None,
+                    None,
+                    None,
                 )
                 .expect("handle_broker_decision should return application-level response");
 
@@ -20101,6 +20125,8 @@ mod tests {
                     Some(pending_pcac),
                     None,
                     None,
+                    None,
+                    None,
                 )
                 .expect("handle_broker_decision should return application-level response");
 
@@ -20271,6 +20297,8 @@ mod tests {
                     Some(pending_pcac),
                     None,
                     None,
+                    None,
+                    None,
                 )
                 .expect("handle_broker_decision should return application-level response");
 
@@ -20407,6 +20435,8 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
+                    None,
                     None,
                     None,
                 )
@@ -20557,6 +20587,8 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
+                    None,
                     None,
                     None,
                 )

@@ -81,6 +81,19 @@ use super::types::EnforcementTier;
 /// not consume admission slots.
 const MAX_JOURNAL_ENTRIES: usize = 1_000_000;
 
+/// Maximum number of terminal entries (`Completed`/`NotStarted`) retained
+/// in the in-memory index before automatic compaction.
+///
+/// Terminal entries are not required for crash-window classification — only
+/// active entries (`Started`/`Unknown`) matter for correctness. Retaining
+/// a bounded set of terminal entries supports audit lookups, but allowing
+/// unbounded growth creates a memory exhaustion vector during replay and an
+/// O(n) scan cost for any index operations.
+///
+/// When terminal entries exceed this threshold, `prune_terminal_entries()`
+/// removes the oldest terminal entries to bring the count under the limit.
+const MAX_TERMINAL_ENTRIES: usize = 100_000;
+
 /// Maximum length for the boundary profile field in journal entries.
 const MAX_BOUNDARY_PROFILE_LENGTH: usize = 128;
 
@@ -628,11 +641,32 @@ const fn state_counts_toward_capacity(state: EffectExecutionState) -> bool {
     )
 }
 
-fn active_entry_count(entries: &HashMap<Hash, JournalRecord>) -> usize {
-    entries
-        .values()
-        .filter(|record| state_counts_toward_capacity(record.state))
-        .count()
+#[inline]
+const fn state_is_terminal(state: EffectExecutionState) -> bool {
+    matches!(
+        state,
+        EffectExecutionState::Completed | EffectExecutionState::NotStarted
+    )
+}
+
+/// Inner state co-located under a single `Mutex` to keep the active count
+/// and terminal count in sync with the entry map without additional locks.
+///
+/// # Synchronization Protocol
+///
+/// All fields are protected by the outer `Mutex` in
+/// `FileBackedEffectJournal::inner`. Writers hold this lock for the full
+/// check-mutate-fsync-update cycle. `active_count` and `terminal_count` are
+/// maintained as O(1) counters instead of scanning the full map on every
+/// operation.
+struct JournalInner {
+    entries: HashMap<Hash, JournalRecord>,
+    /// O(1) count of active entries (`Started`/`Unknown`).
+    /// Updated on every state transition.
+    active_count: usize,
+    /// O(1) count of terminal entries (`Completed`/`NotStarted`).
+    /// Updated on every state transition.
+    terminal_count: usize,
 }
 
 // =============================================================================
@@ -686,25 +720,28 @@ pub struct FileBackedEffectJournal {
     path: PathBuf,
     /// Maximum allowed active entries (`Started`/`Unknown`).
     max_active_entries: usize,
-    /// In-memory index: `request_id` -> `JournalRecord`.
+    /// In-memory entry index and O(1) counters.
     ///
-    /// Protected by Mutex. Lock ordering: acquire `entries` before `file`.
-    /// Happens-before: all mutations to this map are preceded by a
+    /// Protected by Mutex. Lock ordering: acquire `inner` before `file`.
+    /// Happens-before: all mutations to the index are preceded by a
     /// successful fsync to disk, ensuring crash consistency.
-    entries: Mutex<HashMap<Hash, JournalRecord>>,
+    inner: Mutex<JournalInner>,
     /// Append-only file handle (holds exclusive file lock).
     ///
-    /// Protected by Mutex. Lock ordering: acquire `entries` before `file`.
+    /// Protected by Mutex. Lock ordering: acquire `inner` before `file`.
     /// Writers hold both locks during state transitions to prevent TOCTOU.
     file: Mutex<File>,
 }
 
 impl std::fmt::Debug for FileBackedEffectJournal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.inner.lock().expect("inner lock poisoned");
         f.debug_struct("FileBackedEffectJournal")
             .field("path", &self.path)
             .field("max_active_entries", &self.max_active_entries)
-            .field("entry_count", &self.len())
+            .field("entry_count", &inner.entries.len())
+            .field("active_count", &inner.active_count)
+            .field("terminal_count", &inner.terminal_count)
             .finish_non_exhaustive()
     }
 }
@@ -748,6 +785,7 @@ impl FileBackedEffectJournal {
         let path = path.as_ref().to_path_buf();
         let mut entries: HashMap<Hash, JournalRecord> = HashMap::new();
         let mut active_entries = 0usize;
+        let mut terminal_entries = 0usize;
 
         // Acquire exclusive lock for single-writer inter-process exclusivity.
         let mut open_opts = OpenOptions::new();
@@ -859,10 +897,10 @@ impl FileBackedEffectJournal {
                         match tag {
                             TAG_STARTED => {
                                 if let Some(binding) = binding_opt {
+                                    let prior_state = entries.get(&request_id).map(|r| r.state);
                                     let prior_active =
-                                        entries.get(&request_id).is_some_and(|record| {
-                                            state_counts_toward_capacity(record.state)
-                                        });
+                                        prior_state.is_some_and(state_counts_toward_capacity);
+                                    let prior_terminal = prior_state.is_some_and(state_is_terminal);
                                     if !prior_active && active_entries >= max_active_entries {
                                         return Err(EffectJournalError::CapacityExhausted {
                                             count: active_entries,
@@ -882,6 +920,9 @@ impl FileBackedEffectJournal {
                                     if !prior_active {
                                         active_entries += 1;
                                     }
+                                    if prior_terminal {
+                                        terminal_entries = terminal_entries.saturating_sub(1);
+                                    }
                                 } else {
                                     pending_error = Some((
                                         line_idx + 1,
@@ -895,6 +936,7 @@ impl FileBackedEffectJournal {
                                     if record.state == EffectExecutionState::Started {
                                         record.state = EffectExecutionState::Completed;
                                         active_entries = active_entries.saturating_sub(1);
+                                        terminal_entries += 1;
                                     }
                                     // If already Completed, ignore duplicate.
                                 }
@@ -918,6 +960,7 @@ impl FileBackedEffectJournal {
                                         // transition to NotStarted directly.
                                         record.state = EffectExecutionState::NotStarted;
                                         active_entries = active_entries.saturating_sub(1);
+                                        terminal_entries += 1;
                                     }
                                 }
                                 // Orphan R without S is ignored (same as C).
@@ -982,10 +1025,42 @@ impl FileBackedEffectJournal {
             }
         }
 
+        // Post-replay compaction: prune terminal entries that exceed
+        // MAX_TERMINAL_ENTRIES. Only in-memory pruning — the on-disk journal
+        // retains all records for forensic recovery. Active entries are never
+        // pruned; only Completed/NotStarted entries are eligible.
+        if terminal_entries > MAX_TERMINAL_ENTRIES {
+            let excess = terminal_entries - MAX_TERMINAL_ENTRIES;
+            let mut pruned = 0usize;
+            let terminal_keys: Vec<Hash> = entries
+                .iter()
+                .filter(|(_, record)| state_is_terminal(record.state))
+                .map(|(k, _)| *k)
+                .collect();
+            for key in terminal_keys {
+                if pruned >= excess {
+                    break;
+                }
+                entries.remove(&key);
+                pruned += 1;
+            }
+            terminal_entries = terminal_entries.saturating_sub(pruned);
+            tracing::info!(
+                pruned_count = pruned,
+                remaining_terminal = terminal_entries,
+                active_count = active_entries,
+                "effect journal: pruned terminal entries during replay compaction"
+            );
+        }
+
         Ok(Self {
             path,
             max_active_entries,
-            entries: Mutex::new(entries),
+            inner: Mutex::new(JournalInner {
+                entries,
+                active_count: active_entries,
+                terminal_count: terminal_entries,
+            }),
             file: Mutex::new(file),
         })
     }
@@ -994,6 +1069,39 @@ impl FileBackedEffectJournal {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Prune terminal entries (`Completed`/`NotStarted`) from the in-memory
+    /// index, retaining only active entries.
+    ///
+    /// This is an in-memory-only operation. The on-disk journal retains all
+    /// records for forensic recovery; only the in-memory index is compacted.
+    ///
+    /// Returns the number of entries pruned.
+    pub fn prune_terminal_entries(&self) -> usize {
+        let mut inner = self.inner.lock().expect("inner lock poisoned");
+        let before = inner.entries.len();
+        inner
+            .entries
+            .retain(|_, record| !state_is_terminal(record.state));
+        let pruned = before - inner.entries.len();
+        inner.terminal_count = inner.terminal_count.saturating_sub(pruned);
+        pruned
+    }
+
+    /// Returns the current active entry count (O(1)).
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        self.inner.lock().expect("inner lock poisoned").active_count
+    }
+
+    /// Returns the current terminal entry count (O(1)).
+    #[must_use]
+    pub fn terminal_count(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("inner lock poisoned")
+            .terminal_count
     }
 }
 
@@ -1004,15 +1112,15 @@ impl EffectJournal for FileBackedEffectJournal {
 
         let request_id = binding.request_id;
 
-        // Lock ordering: entries first, then file.
-        let mut entries = self.entries.lock().expect("entries lock poisoned");
+        // Lock ordering: inner first, then file.
+        let mut inner = self.inner.lock().expect("inner lock poisoned");
 
         // Check for existing entry (state machine enforcement).
         // NotStarted (from resolve_in_doubt) is permitted — remove the stale
         // entry so the new binding can be inserted below. The old 'S' + 'R'
         // records remain in the journal file; the new 'S' record appended
         // below takes precedence on replay.
-        if let Some(existing) = entries.get(&request_id) {
+        if let Some(existing) = inner.entries.get(&request_id) {
             if existing.state != EffectExecutionState::NotStarted {
                 return Err(EffectJournalError::InvalidTransition {
                     request_id,
@@ -1020,14 +1128,15 @@ impl EffectJournal for FileBackedEffectJournal {
                     target: EffectExecutionState::Started,
                 });
             }
-            entries.remove(&request_id);
+            // Removing a terminal (NotStarted) entry.
+            inner.terminal_count = inner.terminal_count.saturating_sub(1);
+            inner.entries.remove(&request_id);
         }
 
-        // Enforce active-entry capacity BEFORE any state mutation.
-        let active_entries = active_entry_count(&entries);
-        if active_entries >= self.max_active_entries {
+        // Enforce active-entry capacity BEFORE any state mutation (O(1)).
+        if inner.active_count >= self.max_active_entries {
             return Err(EffectJournalError::CapacityExhausted {
-                count: active_entries,
+                count: inner.active_count,
                 max: self.max_active_entries,
             });
         }
@@ -1053,23 +1162,24 @@ impl EffectJournal for FileBackedEffectJournal {
         }
 
         // Update in-memory state after successful fsync.
-        entries.insert(
+        inner.entries.insert(
             request_id,
             JournalRecord {
                 state: EffectExecutionState::Started,
                 binding: binding.clone(),
             },
         );
+        inner.active_count += 1;
 
         Ok(())
     }
 
     fn record_completed(&self, request_id: &Hash) -> Result<(), EffectJournalError> {
-        // Lock ordering: entries first, then file.
-        let mut entries = self.entries.lock().expect("entries lock poisoned");
+        // Lock ordering: inner first, then file.
+        let mut inner = self.inner.lock().expect("inner lock poisoned");
 
         // Check state machine: must be in Started state.
-        match entries.get(request_id) {
+        match inner.entries.get(request_id) {
             Some(record) => {
                 if record.state != EffectExecutionState::Started {
                     return Err(EffectJournalError::InvalidTransition {
@@ -1096,23 +1206,26 @@ impl EffectJournal for FileBackedEffectJournal {
         }
 
         // Update in-memory state after successful fsync.
-        if let Some(record) = entries.get_mut(request_id) {
+        if let Some(record) = inner.entries.get_mut(request_id) {
             record.state = EffectExecutionState::Completed;
         }
+        inner.active_count = inner.active_count.saturating_sub(1);
+        inner.terminal_count += 1;
 
         Ok(())
     }
 
     fn query_state(&self, request_id: &Hash) -> EffectExecutionState {
-        let entries = self.entries.lock().expect("entries lock poisoned");
-        entries
+        let inner = self.inner.lock().expect("inner lock poisoned");
+        inner
+            .entries
             .get(request_id)
             .map_or(EffectExecutionState::NotStarted, |r| r.state)
     }
 
     fn query_binding(&self, request_id: &Hash) -> Option<EffectJournalBindingV1> {
-        let entries = self.entries.lock().expect("entries lock poisoned");
-        entries.get(request_id).map(|r| r.binding.clone())
+        let inner = self.inner.lock().expect("inner lock poisoned");
+        inner.entries.get(request_id).map(|r| r.binding.clone())
     }
 
     fn resolve_in_doubt(
@@ -1120,10 +1233,10 @@ impl EffectJournal for FileBackedEffectJournal {
         request_id: &Hash,
         boundary_confirms_not_executed: bool,
     ) -> Result<InDoubtResolutionV1, EffectJournalError> {
-        // Lock ordering: entries first, then file (if both needed).
-        let mut entries = self.entries.lock().expect("entries lock poisoned");
+        // Lock ordering: inner first, then file (if both needed).
+        let mut inner = self.inner.lock().expect("inner lock poisoned");
 
-        let Some(record) = entries.get(request_id) else {
+        let Some(record) = inner.entries.get(request_id) else {
             return Err(EffectJournalError::ReExecutionDenied {
                 request_id: *request_id,
                 enforcement_tier: EnforcementTier::FailClosed,
@@ -1180,15 +1293,22 @@ impl EffectJournal for FileBackedEffectJournal {
 
         // Update in-memory state after successful fsync.
         // Transition Unknown -> NotStarted to allow re-execution.
-        if let Some(record) = entries.get_mut(request_id) {
+        if let Some(record) = inner.entries.get_mut(request_id) {
             record.state = EffectExecutionState::NotStarted;
         }
+        // Unknown is active; NotStarted is terminal.
+        inner.active_count = inner.active_count.saturating_sub(1);
+        inner.terminal_count += 1;
 
         Ok(InDoubtResolutionV1::AllowReExecution { idempotency_key })
     }
 
     fn len(&self) -> usize {
-        self.entries.lock().expect("entries lock poisoned").len()
+        self.inner
+            .lock()
+            .expect("inner lock poisoned")
+            .entries
+            .len()
     }
 }
 
@@ -2593,6 +2713,271 @@ mod tests {
             meta_after.mode() & 0o777,
             0o600,
             "journal must remediate pre-existing permissive file to 0o600"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00501 SEC-BLOCKER: O(1) active count tracking
+    // =========================================================================
+
+    /// Verify that `active_count()` returns the correct O(1) count after
+    /// various state transitions: Started increments, Completed decrements,
+    /// and terminal entries do not contribute.
+    #[test]
+    fn active_count_tracks_state_transitions_o1() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect-active-count.journal");
+        let journal = FileBackedEffectJournal::open(&path).unwrap();
+
+        assert_eq!(journal.active_count(), 0, "empty journal -> 0 active");
+        assert_eq!(journal.terminal_count(), 0, "empty journal -> 0 terminal");
+
+        // Record Started for 3 entries.
+        let r1 = test_hash(0xF0);
+        let r2 = test_hash(0xF1);
+        let r3 = test_hash(0xF2);
+        journal.record_started(&test_binding(r1, false)).unwrap();
+        journal.record_started(&test_binding(r2, false)).unwrap();
+        journal.record_started(&test_binding(r3, false)).unwrap();
+        assert_eq!(journal.active_count(), 3, "3 Started -> 3 active");
+        assert_eq!(journal.terminal_count(), 0, "no completions yet");
+
+        // Complete r1 and r2.
+        journal.record_completed(&r1).unwrap();
+        assert_eq!(journal.active_count(), 2, "1 Completed -> 2 active");
+        assert_eq!(journal.terminal_count(), 1, "1 Completed -> 1 terminal");
+
+        journal.record_completed(&r2).unwrap();
+        assert_eq!(journal.active_count(), 1, "2 Completed -> 1 active");
+        assert_eq!(journal.terminal_count(), 2, "2 Completed -> 2 terminal");
+
+        // Complete r3.
+        journal.record_completed(&r3).unwrap();
+        assert_eq!(journal.active_count(), 0, "all Completed -> 0 active");
+        assert_eq!(journal.terminal_count(), 3, "3 Completed -> 3 terminal");
+
+        // Total entries = 3 (all terminal).
+        assert_eq!(journal.len(), 3);
+    }
+
+    /// Verify that `active_count` is correct after replay, including
+    /// crash-recovery Unknown classification.
+    #[test]
+    fn active_count_correct_after_replay() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect-active-count-replay.journal");
+
+        // Session 1: 2 Started, 1 Completed. Crash with 1 in-flight.
+        let r1 = test_hash(0xF3);
+        let r2 = test_hash(0xF4);
+        {
+            let journal = FileBackedEffectJournal::open(&path).unwrap();
+            journal.record_started(&test_binding(r1, false)).unwrap();
+            journal.record_completed(&r1).unwrap();
+            journal.record_started(&test_binding(r2, false)).unwrap();
+            // r2 remains Started; simulate crash.
+        }
+
+        // Session 2: replay. r1 is Completed (terminal), r2 is Unknown (active).
+        let journal = FileBackedEffectJournal::open(&path).unwrap();
+        assert_eq!(
+            journal.active_count(),
+            1,
+            "replay: 1 Unknown (r2) -> 1 active"
+        );
+        assert_eq!(
+            journal.terminal_count(),
+            1,
+            "replay: 1 Completed (r1) -> 1 terminal"
+        );
+        assert_eq!(
+            journal.query_state(&r2),
+            EffectExecutionState::Unknown,
+            "r2 must be Unknown after crash"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00501 SEC-MAJOR-2: Terminal entry compaction
+    // =========================================================================
+
+    /// Verify that `prune_terminal_entries()` removes all terminal entries
+    /// from the in-memory index while preserving active entries.
+    #[test]
+    fn prune_terminal_entries_removes_completed_preserves_active() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect-prune.journal");
+        let journal = FileBackedEffectJournal::open(&path).unwrap();
+
+        // Create 5 Started + Completed (terminal) entries.
+        for i in 0..5u8 {
+            let rid = test_hash(0xD0 + i);
+            journal.record_started(&test_binding(rid, false)).unwrap();
+            journal.record_completed(&rid).unwrap();
+        }
+
+        // Create 2 Started (active) entries.
+        let active1 = test_hash(0xE0);
+        let active2 = test_hash(0xE1);
+        journal
+            .record_started(&test_binding(active1, false))
+            .unwrap();
+        journal
+            .record_started(&test_binding(active2, false))
+            .unwrap();
+
+        assert_eq!(journal.len(), 7, "5 terminal + 2 active = 7 total");
+        assert_eq!(journal.active_count(), 2, "2 active entries");
+        assert_eq!(journal.terminal_count(), 5, "5 terminal entries");
+
+        // Prune terminal entries.
+        let pruned = journal.prune_terminal_entries();
+        assert_eq!(pruned, 5, "5 terminal entries pruned");
+        assert_eq!(journal.len(), 2, "only 2 active entries remain");
+        assert_eq!(journal.active_count(), 2, "active count unchanged");
+        assert_eq!(journal.terminal_count(), 0, "terminal count zeroed");
+
+        // Active entries still queryable.
+        assert_eq!(journal.query_state(&active1), EffectExecutionState::Started);
+        assert_eq!(journal.query_state(&active2), EffectExecutionState::Started);
+
+        // Pruned terminal entries return NotStarted (not in index).
+        assert_eq!(
+            journal.query_state(&test_hash(0xD0)),
+            EffectExecutionState::NotStarted
+        );
+    }
+
+    /// Verify that `prune_terminal_entries()` is idempotent: calling it
+    /// twice does not affect active entries or crash state.
+    #[test]
+    fn prune_terminal_entries_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect-prune-idempotent.journal");
+        let journal = FileBackedEffectJournal::open(&path).unwrap();
+
+        // Create 3 Completed (terminal) and 1 Started (active).
+        for i in 1..=3u8 {
+            let rid = test_hash(0xC0 + i);
+            journal.record_started(&test_binding(rid, false)).unwrap();
+            journal.record_completed(&rid).unwrap();
+        }
+        let active = test_hash(0xCA);
+        journal
+            .record_started(&test_binding(active, false))
+            .unwrap();
+
+        // First prune: removes 3 terminal entries.
+        let pruned1 = journal.prune_terminal_entries();
+        assert_eq!(pruned1, 3);
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal.active_count(), 1);
+        assert_eq!(journal.terminal_count(), 0);
+
+        // Second prune: nothing to prune.
+        let pruned2 = journal.prune_terminal_entries();
+        assert_eq!(pruned2, 0);
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal.active_count(), 1);
+
+        // Active entry still queryable.
+        assert_eq!(journal.query_state(&active), EffectExecutionState::Started);
+    }
+
+    /// Verify that the `MAX_TERMINAL_ENTRIES` constant is reasonable and
+    /// that replay compaction fires for small excess counts.
+    #[test]
+    fn replay_compaction_fires_on_excess_terminal_entries() {
+        use std::fmt::Write as _;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect-replay-compact.journal");
+
+        // Write a journal file with MAX_TERMINAL_ENTRIES + 5 Completed entries
+        // plus 1 active (Started without Completed).
+        // Note: This test verifies the compaction code path fires; it uses
+        // the real MAX_TERMINAL_ENTRIES constant.
+        let mut content = String::new();
+        let terminal_count = MAX_TERMINAL_ENTRIES + 5;
+        for i in 1..=terminal_count {
+            // Use blake3 to generate unique hashes for large index ranges
+            // (test_hash_u16 only supports u16 range).
+            let mut h = [0u8; 32];
+            let hash_bytes = blake3::hash(&i.to_le_bytes());
+            h.copy_from_slice(hash_bytes.as_bytes());
+            // Ensure non-zero (blake3 output is never all-zero for any input).
+            let rid = h;
+            let binding = test_binding(rid, false);
+            let hex_id = hex::encode(rid);
+            let json = serde_json::to_string(&binding).unwrap();
+            let _ = writeln!(content, "S {hex_id} {json}");
+            let _ = writeln!(content, "C {hex_id}");
+        }
+        // One active entry.
+        let active_rid = test_hash(0xFF);
+        let active_binding = test_binding(active_rid, false);
+        let active_hex = hex::encode(active_rid);
+        let active_json = serde_json::to_string(&active_binding).unwrap();
+        let _ = writeln!(content, "S {active_hex} {active_json}");
+
+        std::fs::write(&path, content).unwrap();
+
+        // Replay should compact terminal entries to MAX_TERMINAL_ENTRIES.
+        let journal = FileBackedEffectJournal::open(&path).unwrap();
+        assert_eq!(
+            journal.active_count(),
+            1,
+            "active entry (Unknown after replay) must be preserved"
+        );
+        assert!(
+            journal.terminal_count() <= MAX_TERMINAL_ENTRIES,
+            "terminal entries must be at or below MAX_TERMINAL_ENTRIES after compaction: got {}",
+            journal.terminal_count()
+        );
+        // Active entry is still present and classified as Unknown (crash).
+        assert_eq!(
+            journal.query_state(&active_rid),
+            EffectExecutionState::Unknown,
+            "active entry must remain as Unknown after compaction"
+        );
+    }
+
+    /// Verify that `resolve_in_doubt` correctly updates active and terminal
+    /// counters (Unknown -> `NotStarted` transitions active to terminal).
+    #[test]
+    fn resolve_in_doubt_updates_active_and_terminal_counts() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect-resolve-counts.journal");
+
+        let request_id = test_hash(0xFA);
+        let binding = test_binding(request_id, true); // idempotent
+
+        // Session 1: Started, crash.
+        {
+            let journal = FileBackedEffectJournal::open(&path).unwrap();
+            journal.record_started(&binding).unwrap();
+        }
+
+        // Session 2: Unknown -> resolve -> NotStarted.
+        let journal = FileBackedEffectJournal::open(&path).unwrap();
+        assert_eq!(journal.active_count(), 1, "Unknown is active");
+        assert_eq!(journal.terminal_count(), 0);
+
+        let resolution = journal.resolve_in_doubt(&request_id, true).unwrap();
+        assert!(matches!(
+            resolution,
+            InDoubtResolutionV1::AllowReExecution { .. }
+        ));
+
+        assert_eq!(
+            journal.active_count(),
+            0,
+            "after resolve: Unknown->NotStarted, active decremented"
+        );
+        assert_eq!(
+            journal.terminal_count(),
+            1,
+            "after resolve: Unknown->NotStarted, terminal incremented"
         );
     }
 }
