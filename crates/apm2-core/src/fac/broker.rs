@@ -37,6 +37,7 @@ use crate::crypto::{Signer, VerifyingKey};
 use crate::economics::queue_admission::{
     ConvergenceHorizonRef, ConvergenceReceipt, EnvelopeSignature, FreshnessHorizonRef,
     HtfEvaluationWindow, RevocationFrontierSnapshot, TimeAuthorityEnvelopeV1,
+    envelope_signature_canonical_bytes,
 };
 
 // ---------------------------------------------------------------------------
@@ -125,6 +126,10 @@ pub enum BrokerError {
         tick_end: u64,
     },
 
+    /// The requested TTL must be greater than zero.
+    #[error("ttl_ticks must be greater than zero")]
+    TtlMustBeNonZero,
+
     /// Channel context token issuance failed.
     #[error("channel token error: {0}")]
     ChannelToken(#[from] ChannelContextTokenError),
@@ -168,6 +173,17 @@ pub enum BrokerError {
     /// Request ID is empty.
     #[error("request_id is empty")]
     EmptyRequestId,
+
+    /// Requested policy digest is not admitted in broker state.
+    #[error("policy digest is not admitted: {detail}")]
+    UnadmittedPolicyDigest {
+        /// Detail about the admission failure.
+        detail: String,
+    },
+
+    /// Policy digest cannot be zero.
+    #[error("policy digest cannot be zero")]
+    ZeroPolicyDigest,
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +200,8 @@ pub struct BrokerState {
     pub schema_version: String,
     /// Monotonic tick counter used for envelope issuance.
     pub current_tick: u64,
+    /// Tick end used for the active freshness horizon.
+    pub freshness_horizon_tick_end: u64,
     /// Currently admitted policy digest set (bounded).
     pub admitted_policy_digests: Vec<Hash>,
     /// Freshness horizon hash for TP-EIO29-002.
@@ -202,6 +220,7 @@ impl Default for BrokerState {
             schema_id: BROKER_STATE_SCHEMA_ID.to_string(),
             schema_version: BROKER_STATE_SCHEMA_VERSION.to_string(),
             current_tick: 1,
+            freshness_horizon_tick_end: 1,
             admitted_policy_digests: Vec::new(),
             freshness_horizon_hash: compute_initial_horizon_hash(),
             revocation_frontier_hash: compute_initial_frontier_hash(),
@@ -222,6 +241,24 @@ impl BrokerState {
                 ),
             });
         }
+        if self.schema_version != BROKER_STATE_SCHEMA_VERSION {
+            return Err(BrokerError::Deserialization {
+                detail: format!(
+                    "schema_version mismatch: expected {BROKER_STATE_SCHEMA_VERSION}, got {}",
+                    self.schema_version
+                ),
+            });
+        }
+        if self.current_tick == 0 {
+            return Err(BrokerError::Deserialization {
+                detail: "current_tick must be non-zero".to_string(),
+            });
+        }
+        if self.freshness_horizon_tick_end == 0 {
+            return Err(BrokerError::Deserialization {
+                detail: "freshness_horizon_tick_end must be non-zero".to_string(),
+            });
+        }
         if self.admitted_policy_digests.len() > MAX_ADMITTED_POLICY_DIGESTS {
             return Err(BrokerError::Deserialization {
                 detail: format!(
@@ -229,6 +266,38 @@ impl BrokerState {
                     self.admitted_policy_digests.len()
                 ),
             });
+        }
+        if is_zero_hash(&self.freshness_horizon_hash) {
+            return Err(BrokerError::Deserialization {
+                detail: "freshness_horizon_hash must be non-zero".to_string(),
+            });
+        }
+        if is_zero_hash(&self.revocation_frontier_hash) {
+            return Err(BrokerError::Deserialization {
+                detail: "revocation_frontier_hash must be non-zero".to_string(),
+            });
+        }
+        if is_zero_hash(&self.convergence_horizon_hash) {
+            return Err(BrokerError::Deserialization {
+                detail: "convergence_horizon_hash must be non-zero".to_string(),
+            });
+        }
+        if self.admitted_policy_digests.iter().any(is_zero_hash) {
+            return Err(BrokerError::Deserialization {
+                detail: "admitted_policy_digests cannot include zero digests".to_string(),
+            });
+        }
+        for receipt in &self.convergence_receipts {
+            if is_zero_hash(&receipt.authority_set_hash) {
+                return Err(BrokerError::Deserialization {
+                    detail: "convergence_receipts includes zero authority_set_hash".to_string(),
+                });
+            }
+            if is_zero_hash(&receipt.proof_hash) {
+                return Err(BrokerError::Deserialization {
+                    detail: "convergence_receipts includes zero proof_hash".to_string(),
+                });
+            }
         }
         if self.convergence_receipts.len() > MAX_CONVERGENCE_RECEIPTS {
             return Err(BrokerError::Deserialization {
@@ -371,7 +440,6 @@ impl FacBroker {
         job_spec_digest: &Hash,
         lease_id: &str,
         request_id: &str,
-        issued_at_secs: u64,
     ) -> Result<String, BrokerError> {
         // Validate inputs (fail-closed)
         if bool::from(job_spec_digest.ct_eq(&[0u8; 32])) {
@@ -383,6 +451,15 @@ impl FacBroker {
         if request_id.is_empty() {
             return Err(BrokerError::EmptyRequestId);
         }
+        let Some(policy_root_digest) = self.find_admitted_policy_digest(job_spec_digest) else {
+            return Err(BrokerError::UnadmittedPolicyDigest {
+                detail: "requested job_spec_digest has not been admitted".to_string(),
+            });
+        };
+
+        let policy_ledger_verified = true;
+        let canonicalizer_tuple_digest = compute_canonicalizer_tuple_digest(&policy_root_digest);
+        let disclosure_policy_digest = compute_disclosure_policy_digest(&policy_root_digest);
 
         // Build a fully-verified boundary check (broker is the authority).
         // The job_spec_digest is embedded in the policy binding to bind
@@ -395,7 +472,7 @@ impl FacBroker {
             broker_verified: true,
             capability_verified: true,
             context_firewall_verified: true,
-            policy_ledger_verified: true,
+            policy_ledger_verified,
             taint_allow: true,
             classification_allow: true,
             declass_receipt_valid: true,
@@ -403,11 +480,9 @@ impl FacBroker {
             redundancy_declassification_receipt: None,
             boundary_flow_policy_binding: Some(crate::channel::BoundaryFlowPolicyBinding {
                 policy_digest: *job_spec_digest,
-                admitted_policy_root_digest: *job_spec_digest,
-                canonicalizer_tuple_digest: compute_canonicalizer_tuple_digest(job_spec_digest),
-                admitted_canonicalizer_tuple_digest: compute_canonicalizer_tuple_digest(
-                    job_spec_digest,
-                ),
+                admitted_policy_root_digest: policy_root_digest,
+                canonicalizer_tuple_digest,
+                admitted_canonicalizer_tuple_digest: canonicalizer_tuple_digest,
             }),
             leakage_budget_receipt: Some(crate::channel::LeakageBudgetReceipt {
                 leakage_bits: 0,
@@ -424,15 +499,15 @@ impl FacBroker {
             }),
             disclosure_policy_binding: Some(crate::channel::DisclosurePolicyBinding {
                 required_for_effect: true,
-                state_valid: true,
+                state_valid: policy_ledger_verified,
                 active_mode: crate::disclosure::DisclosurePolicyMode::TradeSecretOnly,
                 expected_mode: crate::disclosure::DisclosurePolicyMode::TradeSecretOnly,
                 attempted_channel: crate::disclosure::DisclosureChannelClass::Internal,
-                policy_snapshot_digest: *job_spec_digest,
-                admitted_policy_epoch_root_digest: *job_spec_digest,
+                policy_snapshot_digest: disclosure_policy_digest,
+                admitted_policy_epoch_root_digest: disclosure_policy_digest,
                 policy_epoch: 1,
                 phase_id: "broker_default".to_string(),
-                state_reason: "broker_issued".to_string(),
+                state_reason: "policy_root_admitted".to_string(),
             }),
             leakage_budget_policy_max_bits: Some(8),
             declared_leakage_budget_bits: None,
@@ -444,7 +519,7 @@ impl FacBroker {
             &check,
             lease_id,
             request_id,
-            issued_at_secs,
+            current_time_secs(),
             &self.signer,
         )?)
     }
@@ -490,6 +565,9 @@ impl FacBroker {
                 max: MAX_ENVELOPE_TTL_TICKS,
             });
         }
+        if ttl_ticks == 0 {
+            return Err(BrokerError::TtlMustBeNonZero);
+        }
 
         // Compute content hash (domain-separated)
         let content_hash = compute_envelope_content_hash(
@@ -501,8 +579,19 @@ impl FacBroker {
             self.state.current_tick,
         );
 
-        // Sign the content hash
-        let signature_bytes = self.signer.sign(&content_hash);
+        // Sign the canonical bytes consumed by TP-EIO29 envelope validation.
+        let mut envelope = TimeAuthorityEnvelopeV1 {
+            boundary_id: boundary_id.to_string(),
+            authority_clock: authority_clock.to_string(),
+            tick_start,
+            tick_end,
+            ttl_ticks,
+            deny_on_unknown: true,
+            signature_set: Vec::new(),
+            content_hash,
+        };
+        let canonical_bytes = envelope_signature_canonical_bytes(&envelope);
+        let signature_bytes = self.signer.sign(&canonical_bytes);
         let envelope_signature = EnvelopeSignature {
             signer_id: self.signer.verifying_key().to_bytes(),
             signature: signature_bytes.to_bytes(),
@@ -511,16 +600,8 @@ impl FacBroker {
         // Advance tick for monotonicity
         let _ = self.advance_tick();
 
-        Ok(TimeAuthorityEnvelopeV1 {
-            boundary_id: boundary_id.to_string(),
-            authority_clock: authority_clock.to_string(),
-            tick_start,
-            tick_end,
-            ttl_ticks,
-            deny_on_unknown: true,
-            signature_set: vec![envelope_signature],
-            content_hash,
-        })
+        envelope.signature_set.push(envelope_signature);
+        Ok(envelope)
     }
 
     /// Issues a `TimeAuthorityEnvelopeV1` with default TTL.
@@ -558,7 +639,7 @@ impl FacBroker {
     pub const fn freshness_horizon(&self) -> FreshnessHorizonRef {
         FreshnessHorizonRef {
             horizon_hash: self.state.freshness_horizon_hash,
-            tick_end: self.state.current_tick,
+            tick_end: self.state.freshness_horizon_tick_end,
             resolved: true,
         }
     }
@@ -576,10 +657,16 @@ impl FacBroker {
 
     /// Advances the freshness horizon to a new tick, recomputing the hash.
     pub fn advance_freshness_horizon(&mut self, new_tick_end: u64) {
+        let new_tick_end = new_tick_end.max(1);
+        if new_tick_end <= self.state.freshness_horizon_tick_end {
+            return;
+        }
+
         let mut hasher = blake3::Hasher::new();
         hasher.update(BROKER_HORIZON_HASH_DOMAIN);
         hasher.update(&new_tick_end.to_le_bytes());
         hasher.update(&self.state.freshness_horizon_hash);
+        self.state.freshness_horizon_tick_end = new_tick_end;
         self.state.freshness_horizon_hash = *hasher.finalize().as_bytes();
     }
 
@@ -659,16 +746,18 @@ impl FacBroker {
     ///
     /// Returns an error if the digest store is at capacity.
     pub fn admit_policy_digest(&mut self, digest: Hash) -> Result<(), BrokerError> {
-        if self.state.admitted_policy_digests.len() >= MAX_ADMITTED_POLICY_DIGESTS {
-            return Err(BrokerError::PolicyDigestStoreAtCapacity {
-                max: MAX_ADMITTED_POLICY_DIGESTS,
-            });
+        if is_zero_hash(&digest) {
+            return Err(BrokerError::ZeroPolicyDigest);
         }
-        // Deduplicate (constant-time scan for each existing entry)
         for existing in &self.state.admitted_policy_digests {
             if bool::from(existing.ct_eq(&digest)) {
                 return Ok(());
             }
+        }
+        if self.state.admitted_policy_digests.len() >= MAX_ADMITTED_POLICY_DIGESTS {
+            return Err(BrokerError::PolicyDigestStoreAtCapacity {
+                max: MAX_ADMITTED_POLICY_DIGESTS,
+            });
         }
         self.state.admitted_policy_digests.push(digest);
         Ok(())
@@ -683,6 +772,16 @@ impl FacBroker {
             found |= u8::from(bool::from(existing.ct_eq(digest)));
         }
         found != 0
+    }
+
+    /// Finds the exact admitted policy digest.
+    #[must_use]
+    fn find_admitted_policy_digest(&self, digest: &Hash) -> Option<Hash> {
+        self.state
+            .admitted_policy_digests
+            .iter()
+            .find(|existing| bool::from(existing.ct_eq(digest)))
+            .copied()
     }
 
     // -----------------------------------------------------------------------
@@ -771,16 +870,16 @@ impl BrokerSignatureVerifier {
     /// Verifies a broker-signed envelope signature.
     ///
     /// Convenience method that checks the signer matches the broker key
-    /// and the Ed25519 signature is valid over the content hash.
+    /// and the Ed25519 signature is valid over the provided message bytes.
     #[must_use]
     pub fn verify_broker_signature(
         &self,
-        content_hash: &Hash,
+        message: &[u8],
         signer_id: &Hash,
         signature: &[u8; 64],
     ) -> bool {
         use crate::economics::queue_admission::SignatureVerifier;
-        self.verify(signer_id, content_hash, signature).is_ok()
+        self.verify(signer_id, message, signature).is_ok()
     }
 }
 
@@ -870,9 +969,31 @@ fn compute_envelope_content_hash(
     *hasher.finalize().as_bytes()
 }
 
+#[allow(clippy::disallowed_methods)]
+fn current_time_secs() -> u64 {
+    // FAC token minting and expiry policy are anchored to trusted process wall
+    // time. This avoids adding an HTF dependency in broker-local issuance
+    // logic.
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn is_zero_hash(hash: &Hash) -> bool {
+    bool::from(hash.ct_eq(&[0u8; 32]))
+}
+
 fn compute_canonicalizer_tuple_digest(job_spec_digest: &Hash) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"apm2.fac_broker.canonicalizer.v1");
+    hasher.update(job_spec_digest);
+    *hasher.finalize().as_bytes()
+}
+
+fn compute_disclosure_policy_digest(job_spec_digest: &Hash) -> Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"apm2.fac_broker.disclosure_policy_digest.v1");
     hasher.update(job_spec_digest);
     *hasher.finalize().as_bytes()
 }
@@ -922,22 +1043,25 @@ mod tests {
 
     #[test]
     fn issue_and_decode_channel_context_token_roundtrip() {
-        let broker = FacBroker::new();
+        let mut broker = FacBroker::new();
         let job_digest = [0x42; 32];
         let lease_id = "lease-broker-001";
         let request_id = "REQ-001";
-        let now = now_secs();
+        broker
+            .admit_policy_digest(job_digest)
+            .expect("job digest should admit");
 
         let token = broker
-            .issue_channel_context_token(&job_digest, lease_id, request_id, now)
+            .issue_channel_context_token(&job_digest, lease_id, request_id)
             .expect("token issuance should succeed");
 
         // Decode with broker's verifying key
+        let decode_now = now_secs();
         let decoded = decode_channel_context_token(
             &token,
             &broker.verifying_key(),
             lease_id,
-            now,
+            decode_now,
             request_id,
         )
         .expect("token decode should succeed");
@@ -953,40 +1077,62 @@ mod tests {
     #[test]
     fn issue_channel_context_token_rejects_zero_job_digest() {
         let broker = FacBroker::new();
-        let result = broker.issue_channel_context_token(&[0u8; 32], "lease-1", "REQ-1", now_secs());
+        let result = broker.issue_channel_context_token(&[0u8; 32], "lease-1", "REQ-1");
         assert_eq!(result, Err(BrokerError::ZeroJobSpecDigest));
     }
 
     #[test]
     fn issue_channel_context_token_rejects_empty_lease_id() {
-        let broker = FacBroker::new();
-        let result = broker.issue_channel_context_token(&[0x11; 32], "", "REQ-1", now_secs());
+        let mut broker = FacBroker::new();
+        broker
+            .admit_policy_digest([0x11; 32])
+            .expect("job digest should admit");
+        let result = broker.issue_channel_context_token(&[0x11; 32], "", "REQ-1");
         assert_eq!(result, Err(BrokerError::EmptyLeaseId));
     }
 
     #[test]
     fn issue_channel_context_token_rejects_empty_request_id() {
-        let broker = FacBroker::new();
-        let result = broker.issue_channel_context_token(&[0x11; 32], "lease-1", "", now_secs());
+        let mut broker = FacBroker::new();
+        broker
+            .admit_policy_digest([0x11; 32])
+            .expect("job digest should admit");
+        let result = broker.issue_channel_context_token(&[0x11; 32], "lease-1", "");
         assert_eq!(result, Err(BrokerError::EmptyRequestId));
     }
 
     #[test]
-    fn forged_token_rejected_by_different_key() {
+    fn issue_channel_context_token_rejects_unadmitted_job_digest() {
         let broker = FacBroker::new();
-        let attacker = FacBroker::new();
+        let result = broker.issue_channel_context_token(&[0x11; 32], "lease-1", "REQ-1");
+        assert!(matches!(
+            result,
+            Err(BrokerError::UnadmittedPolicyDigest { .. })
+        ));
+    }
+
+    #[test]
+    fn forged_token_rejected_by_different_key() {
+        let mut broker = FacBroker::new();
+        let mut attacker = FacBroker::new();
         let job_digest = [0x42; 32];
-        let now = now_secs();
+        broker
+            .admit_policy_digest(job_digest)
+            .expect("job digest should admit on verifier broker");
+        attacker
+            .admit_policy_digest(job_digest)
+            .expect("job digest should admit on attacker broker");
 
         let forged_token = attacker
-            .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", now)
+            .issue_channel_context_token(&job_digest, "lease-1", "REQ-1")
             .expect("attacker token should encode");
+        let decode_now = now_secs();
 
         let result = decode_channel_context_token(
             &forged_token,
             &broker.verifying_key(),
             "lease-1",
-            now,
+            decode_now,
             "REQ-1",
         );
         assert!(
@@ -1018,13 +1164,36 @@ mod tests {
         // Verify signature using BrokerSignatureVerifier
         let verifier = BrokerSignatureVerifier::new(broker.verifying_key());
         let sig = &envelope.signature_set[0];
+        let canonical = envelope_signature_canonical_bytes(&envelope);
         assert!(
-            verifier.verify_broker_signature(
-                &envelope.content_hash,
-                &sig.signer_id,
-                &sig.signature,
-            ),
+            verifier.verify_broker_signature(&canonical, &sig.signer_id, &sig.signature,),
             "broker-signed envelope must verify"
+        );
+    }
+
+    #[test]
+    fn issue_time_authority_envelope_verifies_with_tp001() {
+        let mut broker = FacBroker::new();
+        let boundary_id = "boundary-1";
+        let authority_clock = "clock-1";
+        let envelope = broker
+            .issue_time_authority_envelope(boundary_id, authority_clock, 100, 200, 500)
+            .expect("envelope issuance should succeed");
+
+        let eval_window = HtfEvaluationWindow {
+            boundary_id: boundary_id.to_string(),
+            authority_clock: authority_clock.to_string(),
+            tick_start: 100,
+            tick_end: 200,
+        };
+        let verifier = BrokerSignatureVerifier::new(broker.verifying_key());
+        assert!(
+            crate::economics::queue_admission::validate_envelope_tp001(
+                Some(&envelope),
+                &eval_window,
+                Some(&verifier),
+            )
+            .is_ok()
         );
     }
 
@@ -1074,6 +1243,13 @@ mod tests {
     }
 
     #[test]
+    fn issue_time_authority_envelope_rejects_zero_ttl() {
+        let mut broker = FacBroker::new();
+        let result = broker.issue_time_authority_envelope("boundary-1", "clock-1", 100, 200, 0);
+        assert!(matches!(result, Err(BrokerError::TtlMustBeNonZero)));
+    }
+
+    #[test]
     fn envelope_tick_advances_after_issuance() {
         let mut broker = FacBroker::new();
         let tick_before = broker.current_tick();
@@ -1097,7 +1273,7 @@ mod tests {
         let sig = &forged_envelope.signature_set[0];
         assert!(
             !verifier.verify_broker_signature(
-                &forged_envelope.content_hash,
+                &envelope_signature_canonical_bytes(&forged_envelope),
                 &sig.signer_id,
                 &sig.signature,
             ),
@@ -1115,7 +1291,8 @@ mod tests {
         let horizon = broker.freshness_horizon();
         assert!(horizon.resolved);
         assert_ne!(horizon.horizon_hash, [0u8; 32]);
-        assert_eq!(horizon.tick_end, broker.current_tick());
+        assert_eq!(horizon.tick_end, broker.state.freshness_horizon_tick_end);
+        assert_eq!(horizon.tick_end, 1);
     }
 
     #[test]
@@ -1133,6 +1310,8 @@ mod tests {
         broker.advance_freshness_horizon(100);
         let h2 = broker.freshness_horizon();
         assert_ne!(h1.horizon_hash, h2.horizon_hash);
+        assert_eq!(h2.tick_end, 100);
+        assert!(h2.tick_end > h1.tick_end);
     }
 
     #[test]
@@ -1296,6 +1475,81 @@ mod tests {
         assert!(matches!(result, Err(BrokerError::Deserialization { .. })));
     }
 
+    #[test]
+    fn deserialization_rejects_wrong_schema_version() {
+        let state = BrokerState {
+            schema_version: "0.0.0".to_string(),
+            ..BrokerState::default()
+        };
+
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let result = FacBroker::deserialize_state(&bytes);
+        assert!(matches!(result, Err(BrokerError::Deserialization { .. })));
+    }
+
+    #[test]
+    fn deserialization_rejects_zeroed_horizon_hashes() {
+        let state = BrokerState {
+            freshness_horizon_hash: [0u8; 32],
+            ..BrokerState::default()
+        };
+
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let result = FacBroker::deserialize_state(&bytes);
+        assert!(matches!(result, Err(BrokerError::Deserialization { .. })));
+    }
+
+    #[test]
+    fn deserialization_rejects_zero_current_tick() {
+        let state = BrokerState {
+            current_tick: 0,
+            ..BrokerState::default()
+        };
+
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let result = FacBroker::deserialize_state(&bytes);
+        assert!(matches!(result, Err(BrokerError::Deserialization { .. })));
+    }
+
+    #[test]
+    fn deserialization_rejects_zero_freshness_horizon_tick_end() {
+        let state = BrokerState {
+            freshness_horizon_tick_end: 0,
+            ..BrokerState::default()
+        };
+
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let result = FacBroker::deserialize_state(&bytes);
+        assert!(matches!(result, Err(BrokerError::Deserialization { .. })));
+    }
+
+    #[test]
+    fn admit_policy_digest_rejects_zero_digest() {
+        let mut broker = FacBroker::new();
+        let result = broker.admit_policy_digest([0u8; 32]);
+        assert!(matches!(result, Err(BrokerError::ZeroPolicyDigest)));
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn admit_policy_digest_duplicate_is_idempotent_with_capacity_at_max() {
+        let mut broker = FacBroker::new();
+        for i in 0..MAX_ADMITTED_POLICY_DIGESTS {
+            let mut digest = [0u8; 32];
+            digest[0] = (i & 0xFF) as u8;
+            digest[1] = ((i >> 8) & 0xFF) as u8;
+            broker.admit_policy_digest(digest).expect("should admit");
+        }
+
+        let mut duplicate = [0u8; 32];
+        duplicate[0] = (MAX_ADMITTED_POLICY_DIGESTS - 1) as u8;
+        let result = broker.admit_policy_digest(duplicate);
+        assert!(
+            result.is_ok(),
+            "duplicate admission must not fail at capacity"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // BrokerSignatureVerifier
     // -----------------------------------------------------------------------
@@ -1313,7 +1567,7 @@ mod tests {
         let sig = &envelope.signature_set[0];
         assert!(
             !verifier.verify_broker_signature(
-                &envelope.content_hash,
+                &envelope_signature_canonical_bytes(&envelope),
                 &sig.signer_id,
                 &sig.signature,
             ),
@@ -1330,9 +1584,14 @@ mod tests {
 
         let verifier = BrokerSignatureVerifier::new(broker.verifying_key());
         let sig = &envelope.signature_set[0];
-        let tampered_hash = [0xFF; 32];
+        let mut tampered_signature_message = envelope_signature_canonical_bytes(&envelope);
+        tampered_signature_message[0] ^= 0xFF;
         assert!(
-            !verifier.verify_broker_signature(&tampered_hash, &sig.signer_id, &sig.signature,),
+            !verifier.verify_broker_signature(
+                &tampered_signature_message,
+                &sig.signer_id,
+                &sig.signature,
+            ),
             "must reject tampered content hash"
         );
     }
@@ -1347,19 +1606,22 @@ mod tests {
         let job_digest = [0x42; 32];
         let lease_id = "lease-e2e-001";
         let request_id = "REQ-E2E-001";
-        let now = now_secs();
+        broker
+            .admit_policy_digest(job_digest)
+            .expect("job digest should admit");
 
         // 1. Issue channel token
         let token = broker
-            .issue_channel_context_token(&job_digest, lease_id, request_id, now)
+            .issue_channel_context_token(&job_digest, lease_id, request_id)
             .expect("token should issue");
+        let decode_now = now_secs();
 
         // 2. Decode and validate
         let decoded = decode_channel_context_token(
             &token,
             &broker.verifying_key(),
             lease_id,
-            now,
+            decode_now,
             request_id,
         )
         .expect("token should decode");
@@ -1374,11 +1636,8 @@ mod tests {
         // 4. Verify signature
         let verifier = BrokerSignatureVerifier::new(broker.verifying_key());
         let sig = &envelope.signature_set[0];
-        assert!(verifier.verify_broker_signature(
-            &envelope.content_hash,
-            &sig.signer_id,
-            &sig.signature,
-        ));
+        let canonical = envelope_signature_canonical_bytes(&envelope);
+        assert!(verifier.verify_broker_signature(&canonical, &sig.signer_id, &sig.signature,));
 
         // 5. Check horizons are non-zero and resolved
         let fh = broker.freshness_horizon();
