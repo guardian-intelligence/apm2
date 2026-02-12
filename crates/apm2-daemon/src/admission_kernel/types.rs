@@ -177,6 +177,11 @@ mod bounded_deser {
         apm2_core::crypto::Hash,
         super::MAX_BUNDLE_POST_EFFECT_WITNESS_HASHES
     );
+    bounded_vec_deser!(
+        deser_measured_values,
+        apm2_core::crypto::Hash,
+        super::MAX_WITNESS_EVIDENCE_MEASURED_VALUES
+    );
 }
 
 // =============================================================================
@@ -615,6 +620,9 @@ pub struct WitnessEvidenceV1 {
     /// Daemon-measured values. Bounded by
     /// [`MAX_WITNESS_EVIDENCE_MEASURED_VALUES`]. Each entry is a
     /// domain-separated hash of a (key, value) measurement.
+    /// Deserialization enforces the limit via visitor-based counting
+    /// (no oversized pre-allocation from malicious size hints).
+    #[serde(deserialize_with = "bounded_deser::deser_measured_values")]
     pub measured_values: Vec<Hash>,
     /// Witness provider identifier (must match the seed's `provider_id`).
     #[serde(deserialize_with = "bounded_deser::deser_witness_provider_id")]
@@ -749,12 +757,19 @@ impl MonitorWaiverV1 {
         *hasher.finalize().as_bytes()
     }
 
-    /// Validate boundary constraints on this waiver.
+    /// Validate boundary constraints on this waiver, including expiry
+    /// enforcement against the current tick.
+    ///
+    /// # Arguments
+    ///
+    /// * `current_tick` - The current holonic time tick. If `expires_at_tick`
+    ///   is non-zero and less than `current_tick`, the waiver is considered
+    ///   expired and validation fails.
     ///
     /// # Errors
     ///
     /// Returns the first violation found (fail-closed).
-    pub fn validate(&self) -> Result<(), AdmitError> {
+    pub fn validate(&self, current_tick: u64) -> Result<(), AdmitError> {
         const ZERO: Hash = [0u8; 32];
 
         if self.waiver_id == ZERO {
@@ -775,6 +790,19 @@ impl MonitorWaiverV1 {
         if self.enforcement_tier != EnforcementTier::Monitor {
             return Err(AdmitError::WitnessWaiverInvalid {
                 reason: "waiver is only valid for Monitor tier, not FailClosed".into(),
+            });
+        }
+        // SECURITY MAJOR 2 (TCK-00497): Enforce waiver expiry.
+        // A non-zero expires_at_tick that is less than the current tick
+        // means the waiver has expired. Expired waivers MUST NOT bypass
+        // witness enforcement — otherwise a stale waiver could be reused
+        // indefinitely.
+        if self.expires_at_tick != 0 && self.expires_at_tick < current_tick {
+            return Err(AdmitError::WitnessWaiverInvalid {
+                reason: format!(
+                    "waiver expired: expires_at_tick ({}) < current_tick ({})",
+                    self.expires_at_tick, current_tick
+                ),
             });
         }
         Ok(())

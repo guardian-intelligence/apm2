@@ -177,7 +177,11 @@ pub struct AdmissionKernelV1 {
     /// Quarantine capacity guard (fail-closed on error for fail-closed tiers).
     quarantine_guard: Option<Arc<dyn QuarantineGuard>>,
     /// Witness provider configuration.
-    witness_provider: WitnessProviderConfig,
+    ///
+    /// `pub(crate)` to allow the post-effect witness evidence
+    /// construction path in `SessionDispatcher::handle_request_tool`
+    /// to access provider identity and build digest (TCK-00497).
+    pub(crate) witness_provider: WitnessProviderConfig,
 }
 
 impl std::fmt::Debug for AdmissionKernelV1 {
@@ -309,6 +313,27 @@ impl AdmissionKernelV1 {
             provider_id: self.witness_provider.provider_id.clone(),
             provider_build_digest: self.witness_provider.provider_build_digest,
         };
+
+        // Phase E.1: Validate witness seeds at join (TCK-00497 QUALITY BLOCKER 1).
+        //
+        // For fail-closed tiers: deny if seeds are zero, unbound, or have
+        // reused nonces. This is the critical gate that prevents requests
+        // from proceeding without valid witness instrumentation.
+        //
+        // For monitor tiers: seed structural validation is still performed
+        // (same checks) but waiver enforcement is deferred to the
+        // post-effect path (`finalize_post_effect_witness`) where the
+        // caller supplies the governance waiver. At plan time, monitor
+        // tiers validate seed integrity without requiring a waiver.
+        if enforcement_tier == EnforcementTier::FailClosed {
+            self.validate_witness_seeds_at_join(
+                enforcement_tier,
+                &leakage_seed,
+                &timing_seed,
+                None,
+                request.freshness_witness_tick,
+            )?;
+        }
 
         // Phase F: Compute canonical request digest for spine extension.
         let canonical_request_digest = compute_canonical_request_digest(request);
@@ -615,6 +640,7 @@ impl AdmissionKernelV1 {
         leakage_seed: &WitnessSeedV1,
         timing_seed: &WitnessSeedV1,
         monitor_waiver: Option<&MonitorWaiverV1>,
+        current_tick: u64,
     ) -> Result<Option<Hash>, AdmitError> {
         const ZERO: Hash = [0u8; 32];
 
@@ -667,7 +693,7 @@ impl AdmissionKernelV1 {
                 // Monitor tier: explicit waiver required. No silent bypass.
                 match monitor_waiver {
                     Some(waiver) => {
-                        waiver.validate()?;
+                        waiver.validate(current_tick)?;
                         // Return the waiver hash for audit binding.
                         Ok(Some(waiver.content_hash()))
                     },
@@ -716,6 +742,7 @@ impl AdmissionKernelV1 {
         leakage_evidence: Option<&WitnessEvidenceV1>,
         timing_evidence: Option<&WitnessEvidenceV1>,
         monitor_waiver: Option<&MonitorWaiverV1>,
+        current_tick: u64,
     ) -> Result<Vec<Hash>, AdmitError> {
         match enforcement_tier {
             EnforcementTier::FailClosed => {
@@ -750,16 +777,24 @@ impl AdmissionKernelV1 {
                 // Monitor tier: explicit waiver required.
                 match monitor_waiver {
                     Some(waiver) => {
-                        waiver.validate()?;
+                        waiver.validate(current_tick)?;
                         // If evidence is provided for monitor tier, validate
-                        // but don't deny on absence.
+                        // including seed and provider binding checks
+                        // (QUALITY MINOR 1: ensure caller-supplied evidence
+                        // is actually bound to the correct plan seeds and
+                        // provider, preventing evidence substitution even
+                        // under monitor-tier waivers).
                         let mut hashes = Vec::new();
                         if let Some(ev) = leakage_evidence {
                             ev.validate()?;
+                            validate_evidence_seed_binding(ev, leakage_seed)?;
+                            validate_evidence_provider_binding(ev, leakage_seed)?;
                             hashes.push(ev.content_hash());
                         }
                         if let Some(ev) = timing_evidence {
                             ev.validate()?;
+                            validate_evidence_seed_binding(ev, timing_seed)?;
+                            validate_evidence_provider_binding(ev, timing_seed)?;
                             hashes.push(ev.content_hash());
                         }
                         // Include waiver hash in evidence hashes for audit.
