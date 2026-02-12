@@ -41,9 +41,12 @@ Single entry point for all admission decisions. Uses builder pattern for optiona
 **Contracts:**
 
 - [CTR-AK01] `plan()` validates request, resolves prerequisites, creates witness seeds, executes PCAC join + initial revalidate.
-- [CTR-AK02] `execute()` performs fresh revalidation, quarantine reservation, durable consume, capability minting, and boundary span initialization.
-- [CTR-AK03] Monitor tiers may proceed without optional prerequisites.
+- [CTR-AK02] `execute()` re-resolves all prerequisites for fail-closed tiers (TOCTOU closure), performs fresh revalidation with the verifier-selected anchor, quarantine reservation, durable consume, capability minting, and boundary span initialization.
+- [CTR-AK03] Monitor tiers may proceed without optional prerequisites and without prerequisite re-checks in `execute()`.
 - [CTR-AK04] Enforcement tier is derived from `RiskTier`: `Tier2Plus` -> `FailClosed`, all others -> `Monitor`.
+- [CTR-AK05] `LedgerWriteCapability` is only minted for fail-closed tiers (CTR-2617). Monitor tiers receive `None`.
+- [CTR-AK06] `build_pcac_join_input()` uses the verifier-selected ledger anchor, NOT the client-supplied `directory_head_hash`, for the AJC's `as_of_ledger_anchor` field.
+- [CTR-AK07] Identity evidence level and pointer-only waiver hash are passed through from `KernelRequestV1` to `AuthorityJoinInputV1` (not hardcoded).
 
 ### `KernelRequestV1` (types.rs)
 
@@ -87,15 +90,17 @@ Policy-derived enforcement tier: `FailClosed` or `Monitor`.
 
 ### `AdmitError` (types.rs)
 
-Error type with 12 deterministic denial variants. No "unknown -> allow" path.
+Error type with 13 deterministic denial variants. No "unknown -> allow" path. Includes `ExecutePrerequisiteDrift` for TOCTOU detection between plan and execute.
 
 ## Phase Ordering
 
 ```text
 plan():    validate -> prerequisite resolution -> witness seed creation ->
            spine join extension -> PCAC join -> PCAC revalidate
-execute(): single-use check -> fresh revalidate -> quarantine reserve ->
-           durable consume -> capability mint -> boundary span -> result
+execute(): single-use check -> prerequisite re-check (fail-closed) ->
+           fresh revalidate (verifier anchor) -> quarantine reserve ->
+           durable consume -> capability mint (tier-gated) -> boundary span ->
+           result
 ```
 
 ## Public API

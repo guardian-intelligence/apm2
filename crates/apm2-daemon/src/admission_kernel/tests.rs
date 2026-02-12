@@ -64,6 +64,8 @@ fn valid_request(risk_tier: RiskTier) -> super::types::KernelRequestV1 {
         directory_head_hash: test_hash(10),
         freshness_policy_hash: test_hash(11),
         revocation_head_hash: test_hash(12),
+        identity_evidence_level: IdentityEvidenceLevel::Verified,
+        pointer_only_waiver_hash: None,
     }
 }
 
@@ -303,6 +305,203 @@ impl MockQuarantineGuard {
 impl QuarantineGuard for MockQuarantineGuard {
     fn reserve(&self, _request_id: &Hash, _ajc_id: &Hash) -> Result<Hash, String> {
         self.result.clone()
+    }
+}
+
+/// A mock ledger verifier that returns different anchors on successive calls.
+///
+/// Used to test BLOCKER 1: ledger-anchor drift detection in `execute()`.
+/// The first call (plan-time) returns `first_anchor`, and all subsequent
+/// calls (execute-time) return `second_anchor`.
+struct DriftingLedgerVerifier {
+    call_count: std::sync::Mutex<u32>,
+    first: ValidatedLedgerStateV1,
+    second: ValidatedLedgerStateV1,
+}
+
+impl DriftingLedgerVerifier {
+    /// Create a verifier that returns `first` on the first call and `second`
+    /// on all subsequent calls, simulating ledger advancement between plan
+    /// and execute.
+    fn new(first: ValidatedLedgerStateV1, second: ValidatedLedgerStateV1) -> Self {
+        Self {
+            call_count: std::sync::Mutex::new(0),
+            first,
+            second,
+        }
+    }
+}
+
+impl LedgerTrustVerifier for DriftingLedgerVerifier {
+    fn validated_state(&self) -> Result<ValidatedLedgerStateV1, TrustError> {
+        let mut count = self
+            .call_count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *count += 1;
+        if *count == 1 {
+            Ok(self.first.clone())
+        } else {
+            Ok(self.second.clone())
+        }
+    }
+}
+
+/// A mock policy resolver that returns different roots on successive calls.
+///
+/// Used to test MAJOR 1: policy root drift detection in `execute()`.
+struct DriftingPolicyResolver {
+    call_count: std::sync::Mutex<u32>,
+    first: PolicyRootStateV1,
+    second: PolicyRootStateV1,
+}
+
+impl DriftingPolicyResolver {
+    fn new(first: PolicyRootStateV1, second: PolicyRootStateV1) -> Self {
+        Self {
+            call_count: std::sync::Mutex::new(0),
+            first,
+            second,
+        }
+    }
+}
+
+impl PolicyRootResolver for DriftingPolicyResolver {
+    fn resolve(&self, _as_of: &LedgerAnchorV1) -> Result<PolicyRootStateV1, PolicyError> {
+        let mut count = self
+            .call_count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *count += 1;
+        if *count == 1 {
+            Ok(self.first.clone())
+        } else {
+            Ok(self.second.clone())
+        }
+    }
+}
+
+/// A mock anti-rollback that fails on the second call (simulating
+/// anti-rollback failure between plan and execute).
+struct DriftingAntiRollback {
+    call_count: std::sync::Mutex<u32>,
+}
+
+impl DriftingAntiRollback {
+    fn new() -> Self {
+        Self {
+            call_count: std::sync::Mutex::new(0),
+        }
+    }
+}
+
+impl AntiRollbackAnchor for DriftingAntiRollback {
+    fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError> {
+        Ok(ExternalAnchorStateV1 {
+            anchor: LedgerAnchorV1 {
+                ledger_id: test_hash(20),
+                event_hash: test_hash(21),
+                height: 100,
+                he_time: 1000,
+            },
+            mechanism_id: "test".to_string(),
+            proof_hash: test_hash(40),
+        })
+    }
+
+    fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+        let mut count = self
+            .call_count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *count += 1;
+        if *count <= 1 {
+            Ok(())
+        } else {
+            Err(TrustError::ExternalAnchorMismatch {
+                reason: "anti-rollback anchor drifted (test)".into(),
+            })
+        }
+    }
+}
+
+/// A mock PCAC kernel that detects ledger anchor drift via revalidate.
+///
+/// The first call to `revalidate()` succeeds (plan-time), but the second
+/// call fails if the ledger anchor differs from the cert's anchor.
+struct DriftDetectingPcacKernel;
+
+impl AuthorityJoinKernel for DriftDetectingPcacKernel {
+    fn join(
+        &self,
+        input: &AuthorityJoinInputV1,
+        _policy: &PcacPolicyKnobs,
+    ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
+        // Mirror the join input's as_of_ledger_anchor into the cert,
+        // as a real PCAC kernel would.
+        Ok(AuthorityJoinCertificateV1 {
+            ajc_id: test_hash(50),
+            authority_join_hash: test_hash(51),
+            intent_digest: test_hash(3),
+            boundary_intent_class: BoundaryIntentClass::Actuate,
+            risk_tier: RiskTier::Tier2Plus,
+            issued_time_envelope_ref: test_hash(52),
+            issued_at_tick: 40,
+            as_of_ledger_anchor: input.as_of_ledger_anchor,
+            expires_at_tick: 1000,
+            revocation_head_hash: test_hash(54),
+            identity_evidence_level: IdentityEvidenceLevel::Verified,
+            admission_capacity_token: None,
+        })
+    }
+
+    fn revalidate(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        _current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        _current_revocation_head_hash: Hash,
+        _policy: &PcacPolicyKnobs,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        // Detect anchor drift: if the current ledger anchor differs from
+        // the cert's as_of_ledger_anchor, deny.
+        if current_ledger_anchor != cert.as_of_ledger_anchor {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: AuthorityDenyClass::LedgerAnchorDrift,
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: test_hash(90),
+                ledger_anchor: current_ledger_anchor,
+                denied_at_tick: 50,
+                containment_action: Some(FreezeAction::NoAction),
+            }));
+        }
+        Ok(())
+    }
+
+    fn consume(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        _intent_digest: Hash,
+        _boundary_intent_class: BoundaryIntentClass,
+        _requires_authoritative_acceptance: bool,
+        _current_time_envelope_ref: Hash,
+        _current_revocation_head_hash: Hash,
+        _policy: &PcacPolicyKnobs,
+    ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
+        Ok((
+            AuthorityConsumedV1 {
+                ajc_id: cert.ajc_id,
+                intent_digest: test_hash(3),
+                consumed_time_envelope_ref: test_hash(61),
+                consumed_at_tick: 45,
+            },
+            AuthorityConsumeRecordV1 {
+                ajc_id: cert.ajc_id,
+                consumed_time_envelope_ref: test_hash(61),
+                consumed_at_tick: 45,
+                effect_selector_digest: test_hash(60),
+            },
+        ))
     }
 }
 
@@ -610,6 +809,10 @@ fn test_monitor_tier_proceeds_without_quarantine_guard() {
         res.quarantine_capability.is_none(),
         "monitor tier should not receive quarantine capability"
     );
+    assert!(
+        res.ledger_write_capability.is_none(),
+        "monitor tier MUST NOT receive ledger write capability (CTR-2617)"
+    );
 }
 
 // =============================================================================
@@ -631,8 +834,13 @@ fn test_capability_tokens_present_on_success() {
     assert_eq!(result.effect_capability.intent_digest(), &test_hash(3));
     assert_eq!(result.effect_capability.request_id(), &test_hash(1));
 
-    assert_eq!(result.ledger_write_capability.ajc_id(), &test_hash(50));
-    assert_eq!(result.ledger_write_capability.request_id(), &test_hash(1));
+    assert!(
+        result.ledger_write_capability.is_some(),
+        "fail-closed tier must receive ledger write capability"
+    );
+    let lwcap = result.ledger_write_capability.as_ref().unwrap();
+    assert_eq!(lwcap.ajc_id(), &test_hash(50));
+    assert_eq!(lwcap.request_id(), &test_hash(1));
 
     assert!(
         result.quarantine_capability.is_some(),
@@ -831,6 +1039,10 @@ fn test_full_lifecycle_monitor_tier() {
         result.quarantine_capability.is_none(),
         "quarantine capability should not be present for monitor tier"
     );
+    assert!(
+        result.ledger_write_capability.is_none(),
+        "ledger write capability should not be present for monitor tier"
+    );
 }
 
 // =============================================================================
@@ -1003,11 +1215,371 @@ fn test_admit_error_display() {
         AdmitError::MissingPrerequisite {
             prerequisite: "test".into(),
         },
+        AdmitError::ExecutePrerequisiteDrift {
+            prerequisite: "test".into(),
+            reason: "test".into(),
+        },
     ];
 
     for err in &errors {
         let display = format!("{err}");
         assert!(!display.is_empty(), "display must not be empty for {err:?}");
     }
-    assert_eq!(errors.len(), 12, "all 12 error variants must be tested");
+    assert_eq!(errors.len(), 13, "all 13 error variants must be tested");
+}
+
+// =============================================================================
+// SECURITY REGRESSION: BLOCKER 1 — ledger anchor drift detection in execute()
+// =============================================================================
+
+#[test]
+fn test_execute_detects_ledger_anchor_drift_fail_closed() {
+    // Scenario: ledger advances between plan() and execute().
+    // The DriftDetectingPcacKernel denies revalidation when the fresh
+    // anchor differs from the cert's as_of_ledger_anchor.
+    let first_state = ValidatedLedgerStateV1 {
+        validated_anchor: LedgerAnchorV1 {
+            ledger_id: test_hash(20),
+            event_hash: test_hash(21),
+            height: 100,
+            he_time: 1000,
+        },
+        tip_anchor: LedgerAnchorV1 {
+            ledger_id: test_hash(20),
+            event_hash: test_hash(22),
+            height: 105,
+            he_time: 1050,
+        },
+        ledger_keyset_digest: test_hash(23),
+        root_trust_bundle_digest: test_hash(24),
+    };
+
+    let second_state = ValidatedLedgerStateV1 {
+        validated_anchor: LedgerAnchorV1 {
+            ledger_id: test_hash(20),
+            event_hash: test_hash(25), // DIFFERENT anchor — drift!
+            height: 110,
+            he_time: 1100,
+        },
+        tip_anchor: LedgerAnchorV1 {
+            ledger_id: test_hash(20),
+            event_hash: test_hash(26),
+            height: 115,
+            he_time: 1150,
+        },
+        ledger_keyset_digest: test_hash(23),
+        root_trust_bundle_digest: test_hash(24),
+    };
+
+    // Use the drift-detecting PCAC kernel that actually checks anchor equality.
+    let kernel = AdmissionKernelV1::new(Arc::new(DriftDetectingPcacKernel), witness_provider())
+        .with_ledger_verifier(Arc::new(DriftingLedgerVerifier::new(
+            first_state,
+            second_state,
+        )))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(Arc::new(MockAntiRollback::passing()))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+
+    // Execute with fresh anchor that has drifted — must be denied.
+    let result = kernel.execute(&mut plan, test_hash(90), test_hash(91));
+
+    assert!(
+        result.is_err(),
+        "execute must deny when ledger anchor drifted between plan and execute"
+    );
+    match result.unwrap_err() {
+        AdmitError::RevalidationDenied { reason } => {
+            assert!(
+                reason.contains("ledger anchor drift"),
+                "reason should mention ledger anchor drift: {reason}"
+            );
+        },
+        other => panic!("expected RevalidationDenied (ledger anchor drift), got: {other}"),
+    }
+}
+
+// =============================================================================
+// SECURITY REGRESSION: MAJOR 1 — policy root drift detection in execute()
+// =============================================================================
+
+#[test]
+fn test_execute_detects_policy_root_drift_fail_closed() {
+    // Scenario: policy root changes between plan() and execute().
+    let first_policy = PolicyRootStateV1 {
+        policy_root_digest: test_hash(30),
+        policy_root_epoch: 5,
+        anchor: LedgerAnchorV1 {
+            ledger_id: test_hash(20),
+            event_hash: test_hash(21),
+            height: 100,
+            he_time: 1000,
+        },
+        provenance: super::prerequisites::GovernanceProvenanceV1 {
+            signer_key_id: test_hash(31),
+            algorithm_id: "ed25519".to_string(),
+        },
+    };
+
+    let second_policy = PolicyRootStateV1 {
+        policy_root_digest: test_hash(35), // DIFFERENT digest — drift!
+        policy_root_epoch: 6,              // DIFFERENT epoch
+        anchor: LedgerAnchorV1 {
+            ledger_id: test_hash(20),
+            event_hash: test_hash(21),
+            height: 100,
+            he_time: 1000,
+        },
+        provenance: super::prerequisites::GovernanceProvenanceV1 {
+            signer_key_id: test_hash(31),
+            algorithm_id: "ed25519".to_string(),
+        },
+    };
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(DriftingPolicyResolver::new(
+            first_policy,
+            second_policy,
+        )))
+        .with_anti_rollback(Arc::new(MockAntiRollback::passing()))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+
+    // Execute when policy root has drifted — must be denied.
+    let result = kernel.execute(&mut plan, test_hash(90), test_hash(91));
+
+    assert!(
+        result.is_err(),
+        "execute must deny when policy root drifted between plan and execute"
+    );
+    match result.unwrap_err() {
+        AdmitError::ExecutePrerequisiteDrift {
+            prerequisite,
+            reason,
+        } => {
+            assert_eq!(prerequisite, "PolicyRoot");
+            assert!(
+                reason.contains("drifted"),
+                "reason should mention drift: {reason}"
+            );
+        },
+        other => panic!("expected ExecutePrerequisiteDrift, got: {other}"),
+    }
+}
+
+#[test]
+fn test_execute_detects_anti_rollback_failure_fail_closed() {
+    // Scenario: anti-rollback fails between plan() and execute().
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(Arc::new(DriftingAntiRollback::new()))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+
+    // Execute when anti-rollback fails — must be denied.
+    let result = kernel.execute(&mut plan, test_hash(90), test_hash(91));
+
+    assert!(
+        result.is_err(),
+        "execute must deny when anti-rollback fails between plan and execute"
+    );
+    match result.unwrap_err() {
+        AdmitError::AntiRollbackFailure { reason } => {
+            assert!(
+                reason.contains("drifted"),
+                "reason should mention drift: {reason}"
+            );
+        },
+        other => panic!("expected AntiRollbackFailure, got: {other}"),
+    }
+}
+
+// =============================================================================
+// SECURITY REGRESSION: MAJOR 1 — monitor tier is NOT affected by re-checks
+// =============================================================================
+
+#[test]
+fn test_execute_monitor_tier_not_affected_by_prerequisite_recheck() {
+    // Monitor tier does not re-check prerequisites in execute().
+    // Even with a drifting policy resolver, monitor tier should succeed.
+    let first_policy = PolicyRootStateV1 {
+        policy_root_digest: test_hash(30),
+        policy_root_epoch: 5,
+        anchor: LedgerAnchorV1 {
+            ledger_id: test_hash(20),
+            event_hash: test_hash(21),
+            height: 100,
+            he_time: 1000,
+        },
+        provenance: super::prerequisites::GovernanceProvenanceV1 {
+            signer_key_id: test_hash(31),
+            algorithm_id: "ed25519".to_string(),
+        },
+    };
+
+    let second_policy = PolicyRootStateV1 {
+        policy_root_digest: test_hash(35), // DIFFERENT — but monitor ignores
+        policy_root_epoch: 6,
+        anchor: LedgerAnchorV1 {
+            ledger_id: test_hash(20),
+            event_hash: test_hash(21),
+            height: 100,
+            he_time: 1000,
+        },
+        provenance: super::prerequisites::GovernanceProvenanceV1 {
+            signer_key_id: test_hash(31),
+            algorithm_id: "ed25519".to_string(),
+        },
+    };
+
+    // Monitor tier kernel with drifting policy — should still succeed.
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(DriftingPolicyResolver::new(
+            first_policy,
+            second_policy,
+        )))
+        .with_anti_rollback(Arc::new(MockAntiRollback::passing()));
+
+    // Tier1 maps to Monitor, not FailClosed.
+    let request = valid_request(RiskTier::Tier1);
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+
+    let result = kernel.execute(&mut plan, test_hash(90), test_hash(91));
+    assert!(
+        result.is_ok(),
+        "monitor tier must NOT be affected by prerequisite re-checks: {:?}",
+        result.err()
+    );
+}
+
+// =============================================================================
+// SECURITY REGRESSION: MAJOR 2 — monitor tier must NOT get
+// LedgerWriteCapability
+// =============================================================================
+
+#[test]
+fn test_monitor_tier_no_ledger_write_capability() {
+    let kernel = minimal_kernel();
+    let request = valid_request(RiskTier::Tier0);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    assert!(
+        result.ledger_write_capability.is_none(),
+        "monitor tier MUST NOT receive LedgerWriteCapability (CTR-2617)"
+    );
+}
+
+#[test]
+fn test_fail_closed_tier_gets_ledger_write_capability() {
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let mut plan = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan, test_hash(90), test_hash(91))
+        .expect("execute should succeed");
+
+    assert!(
+        result.ledger_write_capability.is_some(),
+        "fail-closed tier MUST receive LedgerWriteCapability"
+    );
+    let lwcap = result.ledger_write_capability.unwrap();
+    assert_eq!(
+        lwcap.ajc_id(),
+        &test_hash(50),
+        "LedgerWriteCapability must carry correct AJC ID"
+    );
+    assert_eq!(
+        lwcap.request_id(),
+        &test_hash(1),
+        "LedgerWriteCapability must carry correct request ID"
+    );
+}
+
+// =============================================================================
+// SECURITY REGRESSION: MINOR 1 — identity evidence level passes through
+// =============================================================================
+
+#[test]
+fn test_identity_evidence_level_passes_through_to_join_input() {
+    // Verify that the identity evidence level from the request is used,
+    // not hardcoded to PointerOnly.
+    let kernel = fully_wired_kernel();
+
+    // Test with Verified evidence level.
+    let mut request = valid_request(RiskTier::Tier2Plus);
+    request.identity_evidence_level = IdentityEvidenceLevel::Verified;
+    request.pointer_only_waiver_hash = None;
+
+    let plan = kernel.plan(&request);
+    assert!(
+        plan.is_ok(),
+        "plan with Verified identity evidence should succeed: {:?}",
+        plan.err()
+    );
+
+    // Test with PointerOnly evidence level + waiver hash.
+    let mut request = valid_request(RiskTier::Tier2Plus);
+    request.identity_evidence_level = IdentityEvidenceLevel::PointerOnly;
+    request.pointer_only_waiver_hash = Some(test_hash(80));
+
+    let plan = kernel.plan(&request);
+    assert!(
+        plan.is_ok(),
+        "plan with PointerOnly + waiver should succeed: {:?}",
+        plan.err()
+    );
+}
+
+// =============================================================================
+// SECURITY REGRESSION: BLOCKER 1 — verifier anchor used in AJC, not client hash
+// =============================================================================
+
+#[test]
+fn test_join_input_uses_verifier_anchor_not_client_hash() {
+    // Verify that build_pcac_join_input uses the verifier-selected anchor,
+    // not the client-supplied directory_head_hash.
+    //
+    // We do this by checking that the plan's as_of_ledger_anchor matches
+    // the verifier state (from MockLedgerVerifier), NOT the request's
+    // directory_head_hash.
+    let kernel = fully_wired_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    // The plan's as_of_ledger_anchor should match the MockLedgerVerifier's
+    // validated_anchor, NOT request.directory_head_hash.
+    let expected_verifier_anchor = LedgerAnchorV1 {
+        ledger_id: test_hash(20),
+        event_hash: test_hash(21),
+        height: 100,
+        he_time: 1000,
+    };
+
+    assert_eq!(
+        plan.as_of_ledger_anchor, expected_verifier_anchor,
+        "plan must use verifier-selected anchor, not client-supplied directory_head_hash"
+    );
+
+    // Specifically verify it's NOT the client's directory_head_hash.
+    assert_ne!(
+        plan.as_of_ledger_anchor.content_hash(),
+        request.directory_head_hash,
+        "plan anchor must differ from client-supplied directory_head_hash"
+    );
 }

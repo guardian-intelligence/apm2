@@ -16,8 +16,8 @@
 
 use apm2_core::crypto::Hash;
 use apm2_core::pcac::{
-    AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityJoinCertificateV1, PcacPolicyKnobs,
-    RiskTier,
+    AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityJoinCertificateV1,
+    IdentityEvidenceLevel, PcacPolicyKnobs, RiskTier,
 };
 use serde::{Deserialize, Serialize};
 
@@ -133,6 +133,18 @@ pub struct KernelRequestV1 {
     pub freshness_policy_hash: Hash,
     /// Current revocation head hash.
     pub revocation_head_hash: Hash,
+    /// Identity evidence level for this request (`Verified` or `PointerOnly`).
+    ///
+    /// For Tier2+ (fail-closed) paths, this is expected to be `Verified`.
+    /// `PointerOnly` at Tier2+ requires a non-`None`
+    /// `pointer_only_waiver_hash`.
+    pub identity_evidence_level: IdentityEvidenceLevel,
+    /// Optional pointer-only waiver hash.
+    ///
+    /// Required when `identity_evidence_level` is `PointerOnly` at Tier2+.
+    /// The waiver hash references a governance policy waiver allowing
+    /// pointer-only identity evidence for the given request context.
+    pub pointer_only_waiver_hash: Option<Hash>,
 }
 
 impl KernelRequestV1 {
@@ -499,7 +511,12 @@ pub struct AdmissionResultV1 {
     /// Capability token for effect execution.
     pub effect_capability: EffectCapability,
     /// Capability token for authoritative ledger writes.
-    pub ledger_write_capability: LedgerWriteCapability,
+    ///
+    /// `Some` only for fail-closed tiers that have passed all prerequisite
+    /// checks. `None` for monitor tiers — monitor-tier requests MUST NOT
+    /// perform authoritative ledger writes (CTR-2617: fail-closed
+    /// capabilities).
+    pub ledger_write_capability: Option<LedgerWriteCapability>,
     /// Capability token for quarantine insertion (if applicable).
     pub quarantine_capability: Option<QuarantineCapability>,
     /// The consumed authority witness.
@@ -593,6 +610,17 @@ pub enum AdmitError {
         /// Name of the missing prerequisite.
         prerequisite: String,
     },
+    /// A prerequisite drifted between plan and execute (TOCTOU protection).
+    ///
+    /// This error is raised when a fail-closed tier detects that a
+    /// prerequisite (ledger anchor, policy root, anti-rollback) changed
+    /// between `plan()` and `execute()`.
+    ExecutePrerequisiteDrift {
+        /// Which prerequisite drifted.
+        prerequisite: String,
+        /// Bounded reason string.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for AdmitError {
@@ -625,6 +653,12 @@ impl std::fmt::Display for AdmitError {
             },
             Self::MissingPrerequisite { prerequisite } => {
                 write!(f, "missing prerequisite: {prerequisite}")
+            },
+            Self::ExecutePrerequisiteDrift {
+                prerequisite,
+                reason,
+            } => {
+                write!(f, "execute prerequisite drift: {prerequisite}: {reason}")
             },
         }
     }

@@ -28,8 +28,9 @@
 //! ```text
 //! plan():    validate -> prerequisite resolution -> witness seed creation ->
 //!            spine join extension -> PCAC join -> PCAC revalidate
-//! execute(): PCAC revalidate (fresh) -> durable consume -> capability mint ->
-//!            boundary span init -> result assembly
+//! execute(): prerequisite re-check (fail-closed) -> PCAC revalidate (fresh) ->
+//!            durable consume -> capability mint -> boundary span init ->
+//!            result assembly
 //! ```
 
 pub mod capabilities;
@@ -327,7 +328,10 @@ impl AdmissionKernelV1 {
         let spine_ext_hash = spine_ext.content_hash();
 
         // Phase I: Build PCAC join input via canonical builder pattern.
-        let join_input = build_pcac_join_input(request, &spine_ext_hash);
+        // Pass the verifier-selected anchor (NOT the client-supplied
+        // directory_head_hash) so the AJC binds to the authoritative
+        // ledger state resolved in Phase D.
+        let join_input = build_pcac_join_input(request, &spine_ext_hash, &ledger_state.anchor);
 
         // Phase J: Execute PCAC join.
         let certificate = self
@@ -405,12 +409,56 @@ impl AdmissionKernelV1 {
         // create a new plan.
         plan.state = PlanState::Consumed;
 
-        // Phase N: Fresh revalidation (execution-time freshness check).
+        // Phase N: Prerequisite re-check and fresh revalidation.
+        //
+        // For fail-closed tiers, we freshly resolve all prerequisites to
+        // close the TOCTOU window between plan() and execute(). If any
+        // prerequisite drifted, the operation is denied. The fresh ledger
+        // anchor is then used for PCAC revalidation so drift detection
+        // compares the plan-time anchor (in the AJC cert) against the
+        // current authoritative anchor.
+        //
+        // For monitor tiers, we use the plan-time anchor (no re-check
+        // required since monitor tiers do not gate authoritative effects).
+        let revalidation_ledger_anchor = if plan.enforcement_tier == EnforcementTier::FailClosed {
+            // Re-resolve ledger trust to get the current authoritative anchor.
+            let fresh_ledger = self.resolve_ledger_trust(plan.enforcement_tier)?;
+
+            // Re-resolve policy root against the fresh anchor.
+            let fresh_policy =
+                self.resolve_policy_root(plan.enforcement_tier, &fresh_ledger.anchor)?;
+
+            // Re-verify anti-rollback against the fresh anchor.
+            self.verify_anti_rollback(plan.enforcement_tier, &fresh_ledger.anchor)?;
+
+            // Detect policy root drift between plan and execute.
+            if fresh_policy.digest != plan.policy_root_digest {
+                return Err(AdmitError::ExecutePrerequisiteDrift {
+                    prerequisite: "PolicyRoot".into(),
+                    reason: "policy root digest drifted between plan and execute".into(),
+                });
+            }
+            if fresh_policy.epoch != plan.policy_root_epoch {
+                return Err(AdmitError::ExecutePrerequisiteDrift {
+                    prerequisite: "PolicyRoot".into(),
+                    reason: "policy root epoch drifted between plan and execute".into(),
+                });
+            }
+
+            // Use the fresh anchor for PCAC revalidation so the lifecycle
+            // gate can compare the cert's as_of_ledger_anchor (plan-time)
+            // against the current authoritative anchor (execute-time).
+            fresh_ledger.anchor.content_hash()
+        } else {
+            // Monitor tier: no prerequisite re-check; use plan-time anchor.
+            plan.as_of_ledger_anchor.content_hash()
+        };
+
         self.pcac_kernel
             .revalidate(
                 &plan.certificate,
                 current_time_envelope_ref,
-                plan.as_of_ledger_anchor.content_hash(),
+                revalidation_ledger_anchor,
                 current_revocation_head_hash,
                 &plan.request.pcac_policy,
             )
@@ -444,7 +492,16 @@ impl AdmissionKernelV1 {
         let intent_digest = plan.request.intent_digest;
 
         let effect_capability = EffectCapability::new(ajc_id, intent_digest, request_id);
-        let ledger_write_capability = LedgerWriteCapability::new(ajc_id, request_id);
+
+        // Gate LedgerWriteCapability to fail-closed tiers only (CTR-2617).
+        // Monitor-tier requests MUST NOT receive authoritative ledger
+        // write capabilities — they do not satisfy the prerequisite
+        // checks that authorize ledger mutations.
+        let ledger_write_capability = if plan.enforcement_tier == EnforcementTier::FailClosed {
+            Some(LedgerWriteCapability::new(ajc_id, request_id))
+        } else {
+            None
+        };
 
         let quarantine_capability = quarantine_reservation_hash.map(|reservation_hash| {
             QuarantineCapability::new(ajc_id, request_id, reservation_hash)
@@ -680,13 +737,43 @@ fn compute_canonical_request_digest(request: &KernelRequestV1) -> Hash {
     hasher.update(&request.directory_head_hash);
     hasher.update(&request.freshness_policy_hash);
     hasher.update(&request.revocation_head_hash);
+    // Identity evidence fields (MINOR 1: no longer hardcoded).
+    // The enum is #[non_exhaustive], so we include a fallback tag for
+    // unknown future variants to maintain digest determinism.
+    hasher.update(match request.identity_evidence_level {
+        IdentityEvidenceLevel::Verified => &[0x01],
+        IdentityEvidenceLevel::PointerOnly => &[0x02],
+        _ => &[0xFF], // Unknown variant — deterministic fallback tag.
+    });
+    match &request.pointer_only_waiver_hash {
+        Some(waiver) => {
+            hasher.update(&[0x01]); // presence tag
+            hasher.update(waiver);
+        },
+        None => {
+            hasher.update(&[0x00]); // absence tag
+        },
+    }
     *hasher.finalize().as_bytes()
 }
 
 /// Build the PCAC `AuthorityJoinInputV1` from kernel request bindings.
 ///
 /// Uses the canonical builder pattern per RFC-0019 §5.3 and RS-42.
-fn build_pcac_join_input(request: &KernelRequestV1, spine_ext_hash: &Hash) -> AuthorityJoinInputV1 {
+///
+/// # Arguments
+///
+/// * `request` — The kernel request.
+/// * `spine_ext_hash` — Hash of the spine join extension.
+/// * `verifier_anchor` — The verifier-selected ledger anchor (from
+///   `resolve_ledger_trust()`), NOT the client-supplied `directory_head_hash`.
+///   This ensures the AJC `as_of_ledger_anchor` reflects the authoritative
+///   ledger state, enabling drift detection in `execute()`.
+fn build_pcac_join_input(
+    request: &KernelRequestV1,
+    spine_ext_hash: &Hash,
+    verifier_anchor: &LedgerAnchorV1,
+) -> AuthorityJoinInputV1 {
     // Compute leakage and timing witness hashes following the canonical
     // pattern from PrivilegedPcacInputBuilder.
     let tick_bytes = request.freshness_witness_tick.to_le_bytes();
@@ -719,8 +806,8 @@ fn build_pcac_join_input(request: &KernelRequestV1, spine_ext_hash: &Hash) -> Au
         lease_id: request.lease_id.clone(),
         permeability_receipt_hash: None,
         identity_proof_hash: request.identity_proof_hash,
-        identity_evidence_level: IdentityEvidenceLevel::PointerOnly,
-        pointer_only_waiver_hash: None,
+        identity_evidence_level: request.identity_evidence_level,
+        pointer_only_waiver_hash: request.pointer_only_waiver_hash,
         directory_head_hash: request.directory_head_hash,
         freshness_policy_hash: request.freshness_policy_hash,
         freshness_witness_tick: request.freshness_witness_tick,
@@ -731,7 +818,7 @@ fn build_pcac_join_input(request: &KernelRequestV1, spine_ext_hash: &Hash) -> Au
         risk_tier: request.risk_tier,
         determinism_class: DeterminismClass::Deterministic,
         time_envelope_ref: request.time_envelope_ref,
-        as_of_ledger_anchor: request.directory_head_hash,
+        as_of_ledger_anchor: verifier_anchor.content_hash(),
     }
 }
 
