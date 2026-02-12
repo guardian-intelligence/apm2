@@ -23,6 +23,7 @@ use super::types::{
     TERMINAL_SHA_DRIFT_SUPERSEDED, TERMINAL_STALE_HEAD_AMBIGUITY, TERMINATE_TIMEOUT, apm2_home_dir,
     ensure_parent_dir, now_iso8601,
 };
+use super::worktree::resolve_worktree_for_sha;
 
 // ── Path helpers ────────────────────────────────────────────────────────────
 
@@ -462,8 +463,10 @@ fn drift_lineage_from_state(state: &ReviewRunState, key: &DispatchIdempotencyKey
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resume_dispatch_after_head_drift_for_home<F>(
     home: &Path,
+    workspace_root: &Path,
     pr_url: &str,
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
@@ -472,7 +475,7 @@ fn resume_dispatch_after_head_drift_for_home<F>(
     spawn_review: &F,
 ) -> Result<DispatchReviewResult, String>
 where
-    F: Fn(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+    F: Fn(&Path, &str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
 {
     let mut superseded = state.clone();
     superseded.status = ReviewRunStatus::Failed;
@@ -485,6 +488,7 @@ where
     let mut seeded =
         seed_pending_run_state_for_dispatch_for_home(home, pr_url, key, Some(&lineage))?;
     let started = match spawn_review(
+        workspace_root,
         pr_url,
         key.pr_number,
         review_kind,
@@ -561,8 +565,10 @@ fn next_sequence_hint_from_state(load: &ReviewRunStateLoad) -> Option<u32> {
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_single_review_locked_for_home<F>(
     home: &Path,
+    workspace_root: &Path,
     pr_url: &str,
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
@@ -571,7 +577,7 @@ fn dispatch_single_review_locked_for_home<F>(
     spawn_review: &F,
 ) -> Result<DispatchReviewResult, String>
 where
-    F: Fn(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+    F: Fn(&Path, &str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
 {
     let run_state_load = load_review_run_state_for_home(home, key.pr_number, &key.review_type)?;
     let sequence_hint = next_sequence_hint_from_state(&run_state_load);
@@ -696,6 +702,7 @@ where
                         }
                         return resume_dispatch_after_head_drift_for_home(
                             home,
+                            workspace_root,
                             pr_url,
                             key,
                             review_kind,
@@ -742,6 +749,7 @@ where
                             }
                             return resume_dispatch_after_head_drift_for_home(
                                 home,
+                                workspace_root,
                                 pr_url,
                                 key,
                                 review_kind,
@@ -795,6 +803,7 @@ where
 
     let mut seeded = seed_pending_run_state_for_dispatch_for_home(home, pr_url, key, None)?;
     let started = match spawn_review(
+        workspace_root,
         pr_url,
         key.pr_number,
         review_kind,
@@ -813,31 +822,10 @@ where
     attach_run_state_contract_for_home(home, key, started)
 }
 
-#[cfg(test)]
-fn dispatch_single_review_for_home_with_spawn<F>(
+#[allow(clippy::too_many_arguments)]
+fn dispatch_single_review_for_home_with_spawn_force_workspace<F>(
     home: &Path,
-    pr_url: &str,
-    key: &DispatchIdempotencyKey,
-    review_kind: ReviewKind,
-    dispatch_epoch: u64,
-    spawn_review: &F,
-) -> Result<DispatchReviewResult, String>
-where
-    F: Fn(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
-{
-    dispatch_single_review_for_home_with_spawn_force(
-        home,
-        pr_url,
-        key,
-        review_kind,
-        dispatch_epoch,
-        false,
-        spawn_review,
-    )
-}
-
-fn dispatch_single_review_for_home_with_spawn_force<F>(
-    home: &Path,
+    workspace_root: &Path,
     pr_url: &str,
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
@@ -846,7 +834,7 @@ fn dispatch_single_review_for_home_with_spawn_force<F>(
     spawn_review: &F,
 ) -> Result<DispatchReviewResult, String>
 where
-    F: Fn(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+    F: Fn(&Path, &str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
 {
     key.validate()?;
     if !key.review_type.eq_ignore_ascii_case(review_kind.as_str()) {
@@ -887,6 +875,7 @@ where
 
     dispatch_single_review_locked_for_home(
         home,
+        workspace_root,
         pr_url,
         key,
         review_kind,
@@ -896,16 +885,85 @@ where
     )
 }
 
-fn dispatch_single_review_for_home(
+#[cfg(test)]
+fn dispatch_single_review_for_home_with_spawn<F>(
+    home: &Path,
+    pr_url: &str,
+    key: &DispatchIdempotencyKey,
+    review_kind: ReviewKind,
+    dispatch_epoch: u64,
+    spawn_review: &F,
+) -> Result<DispatchReviewResult, String>
+where
+    F: Fn(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+{
+    let adapter = |_: &Path,
+                   url: &str,
+                   pr_number: u32,
+                   kind: ReviewKind,
+                   expected_head_sha: &str,
+                   epoch: u64|
+     -> Result<DispatchReviewResult, String> {
+        spawn_review(url, pr_number, kind, expected_head_sha, epoch)
+    };
+    dispatch_single_review_for_home_with_spawn_force_workspace(
+        home,
+        Path::new("."),
+        pr_url,
+        key,
+        review_kind,
+        dispatch_epoch,
+        false,
+        &adapter,
+    )
+}
+
+#[cfg(test)]
+fn dispatch_single_review_for_home_with_spawn_force<F>(
     home: &Path,
     pr_url: &str,
     key: &DispatchIdempotencyKey,
     review_kind: ReviewKind,
     dispatch_epoch: u64,
     force_same_sha_retry: bool,
-) -> Result<DispatchReviewResult, String> {
-    dispatch_single_review_for_home_with_spawn_force(
+    spawn_review: &F,
+) -> Result<DispatchReviewResult, String>
+where
+    F: Fn(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+{
+    let adapter = |_: &Path,
+                   url: &str,
+                   pr_number: u32,
+                   kind: ReviewKind,
+                   expected_head_sha: &str,
+                   epoch: u64|
+     -> Result<DispatchReviewResult, String> {
+        spawn_review(url, pr_number, kind, expected_head_sha, epoch)
+    };
+    dispatch_single_review_for_home_with_spawn_force_workspace(
         home,
+        Path::new("."),
+        pr_url,
+        key,
+        review_kind,
+        dispatch_epoch,
+        force_same_sha_retry,
+        &adapter,
+    )
+}
+
+fn dispatch_single_review_for_home(
+    home: &Path,
+    workspace_root: &Path,
+    pr_url: &str,
+    key: &DispatchIdempotencyKey,
+    review_kind: ReviewKind,
+    dispatch_epoch: u64,
+    force_same_sha_retry: bool,
+) -> Result<DispatchReviewResult, String> {
+    dispatch_single_review_for_home_with_spawn_force_workspace(
+        home,
+        workspace_root,
         pr_url,
         key,
         review_kind,
@@ -947,8 +1005,7 @@ pub fn dispatch_single_review_with_force(
 ) -> Result<DispatchReviewResult, String> {
     let key = DispatchIdempotencyKey::new(owner_repo, pr_number, review_kind.as_str(), head_sha);
     key.validate()?;
-    let workspace_root =
-        std::env::current_dir().map_err(|err| format!("failed to resolve cwd: {err}"))?;
+    let workspace_root = resolve_worktree_for_sha(head_sha)?;
     let merge_report = check_merge_conflicts_against_main(&workspace_root, head_sha)?;
     if merge_report.has_conflicts() {
         return Err(format!(
@@ -959,6 +1016,7 @@ pub fn dispatch_single_review_with_force(
     let home = apm2_home_dir()?;
     dispatch_single_review_for_home(
         &home,
+        &workspace_root,
         pr_url,
         &key,
         review_kind,
@@ -968,6 +1026,7 @@ pub fn dispatch_single_review_with_force(
 }
 
 fn spawn_detached_review(
+    workspace_root: &Path,
     pr_url: &str,
     pr_number: u32,
     review_kind: ReviewKind,
@@ -976,7 +1035,6 @@ fn spawn_detached_review(
 ) -> Result<DispatchReviewResult, String> {
     let exe_path = std::env::current_exe()
         .map_err(|err| format!("failed to resolve current executable: {err}"))?;
-    let cwd = std::env::current_dir().map_err(|err| format!("failed to resolve cwd: {err}"))?;
     let head_short = &expected_head_sha[..expected_head_sha.len().min(8)];
     let ts = Utc::now().format("%Y%m%dT%H%M%SZ");
 
@@ -994,7 +1052,7 @@ fn spawn_detached_review(
             .arg("--unit")
             .arg(&unit)
             .arg("--property")
-            .arg(format!("WorkingDirectory={}", cwd.display()));
+            .arg(format!("WorkingDirectory={}", workspace_root.display()));
 
         for key in ["PATH", "HOME", "CARGO_HOME"] {
             if let Ok(value) = std::env::var(key) {
@@ -1062,7 +1120,7 @@ fn spawn_detached_review(
         .arg(review_kind.as_str())
         .arg("--expected-head-sha")
         .arg(expected_head_sha)
-        .current_dir(cwd)
+        .current_dir(workspace_root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(stdout))
         .stderr(std::process::Stdio::from(stderr))

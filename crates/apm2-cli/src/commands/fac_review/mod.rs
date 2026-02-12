@@ -12,6 +12,7 @@
 mod backend;
 mod barrier;
 mod ci_status;
+mod comment;
 mod decision;
 mod detection;
 mod dispatch;
@@ -21,14 +22,17 @@ mod findings;
 mod gate_attestation;
 mod gate_cache;
 mod gates;
+mod github_projection;
 mod liveness;
 mod logs;
 mod merge_conflicts;
 mod model_pool;
 mod orchestrator;
 mod pipeline;
+mod pr_body;
 mod prepare;
 mod projection;
+mod projection_store;
 mod publish;
 mod push;
 mod restart;
@@ -36,6 +40,7 @@ mod selector;
 mod state;
 mod target;
 mod types;
+mod worktree;
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -44,23 +49,19 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use apm2_daemon::telemetry::reviewer::{ProjectionSummary, ProjectionSummaryEmitter};
-use barrier::{
-    emit_barrier_decision_event, enforce_barrier, ensure_gh_cli_ready, resolve_fac_event_context,
-};
 // Re-export public API for use by `fac.rs`
+pub use comment::{ReviewCommentSeverityArg, ReviewCommentTypeArg};
 pub use decision::DecisionValueArg;
 use dispatch::dispatch_single_review_with_force;
 use events::{read_last_event_values, review_events_path};
-use projection::{projection_state_done, projection_state_failed, run_project_inner};
+use projection::run_project_inner;
 pub use publish::ReviewPublishTypeArg;
 use state::{
     list_review_pr_numbers, load_review_run_state, read_pulse_file, review_run_state_path,
 };
 pub use types::ReviewRunType;
 use types::{
-    BarrierSummary, DispatchSummary, KickoffSummary, ReviewKind, TERMINATE_TIMEOUT, parse_pr_url,
-    validate_expected_head_sha,
+    DispatchSummary, ReviewKind, TERMINATE_TIMEOUT, parse_pr_url, validate_expected_head_sha,
 };
 
 use crate::exit_codes::codes as exit_codes;
@@ -451,6 +452,47 @@ pub fn run_publish(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn run_comment(
+    repo: &str,
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    sha: Option<&str>,
+    severity: ReviewCommentSeverityArg,
+    review_type: ReviewCommentTypeArg,
+    body: Option<&str>,
+    json_output: bool,
+) -> u8 {
+    match comment::run_comment(
+        repo,
+        pr_number,
+        pr_url,
+        sha,
+        severity,
+        review_type,
+        body,
+        json_output,
+    ) {
+        Ok(code) => code,
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_comment_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_decision_set(
     repo: &str,
     pr_number: Option<u32>,
@@ -514,163 +556,6 @@ pub fn run_decision_show(
                         .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
                 );
             } else {
-                eprintln!("ERROR: {err}");
-            }
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
-pub fn run_barrier(repo: &str, event_path: &Path, event_name: &str, json_output: bool) -> u8 {
-    match resolve_fac_event_context(repo, event_path, event_name) {
-        Ok(ctx) => {
-            if let Err(err) = enforce_barrier(&ctx) {
-                let _ = emit_barrier_decision_event(
-                    "barrier",
-                    repo,
-                    event_name,
-                    Some(&ctx),
-                    false,
-                    Some(&err),
-                );
-                if json_output {
-                    let payload = serde_json::json!({
-                        "error": "fac_barrier_failed",
-                        "message": err,
-                    });
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-                    );
-                } else {
-                    eprintln!("ERROR: {err}");
-                }
-                return exit_codes::GENERIC_ERROR;
-            }
-            let _ =
-                emit_barrier_decision_event("barrier", repo, event_name, Some(&ctx), true, None);
-
-            let summary = BarrierSummary {
-                repo: ctx.repo,
-                event_name: ctx.event_name,
-                pr_number: ctx.pr_number,
-                pr_url: ctx.pr_url,
-                head_sha: ctx.head_sha,
-                base_ref: ctx.base_ref,
-                default_branch: ctx.default_branch,
-                author_login: ctx.author_login,
-                author_association: ctx.author_association,
-                actor_login: ctx.actor_login,
-                actor_permission: ctx.actor_permission,
-            };
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else {
-                println!("FAC Barrier");
-                println!("  Repo:              {}", summary.repo);
-                println!("  Event:             {}", summary.event_name);
-                println!("  PR Number:         {}", summary.pr_number);
-                println!("  Head SHA:          {}", summary.head_sha);
-                println!("  Base Ref:          {}", summary.base_ref);
-                println!(
-                    "  Author:            {} ({})",
-                    summary.author_login, summary.author_association
-                );
-                if let Some(permission) = &summary.actor_permission {
-                    println!(
-                        "  Actor:             {} ({permission})",
-                        summary.actor_login
-                    );
-                } else {
-                    println!("  Actor:             {}", summary.actor_login);
-                }
-                println!("  Barrier:           PASS");
-            }
-            exit_codes::SUCCESS
-        },
-        Err(err) => {
-            let _ =
-                emit_barrier_decision_event("barrier", repo, event_name, None, false, Some(&err));
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_barrier_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
-pub fn run_kickoff(
-    repo: &str,
-    event_path: &Path,
-    event_name: &str,
-    max_wait_seconds: u64,
-    public_projection_only: bool,
-    json_output: bool,
-) -> u8 {
-    // SECURITY BOUNDARY: GitHub Action logs are publicly visible.
-    // `public_projection_only` is intentionally fail-closed and must never emit
-    // sensitive diagnostics on stdout/stderr. Rich details stay on runner-local
-    // files under ~/.apm2.
-    if public_projection_only && json_output {
-        return exit_codes::GENERIC_ERROR;
-    }
-    if !json_output && !public_projection_only {
-        println!(
-            "details=~/.apm2/review_events.ndjson state=~/.apm2/reviews/ dispatch_logs=~/.apm2/review_dispatch/"
-        );
-    }
-    match run_kickoff_inner(
-        repo,
-        event_path,
-        event_name,
-        max_wait_seconds,
-        public_projection_only,
-    ) {
-        Ok(summary) => {
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else if !public_projection_only {
-                println!("FAC Kickoff");
-                println!("  Repo:              {}", summary.repo);
-                println!("  Event:             {}", summary.event_name);
-                println!("  PR Number:         {}", summary.pr_number);
-                println!("  Head SHA:          {}", summary.head_sha);
-                println!("  Dispatch Epoch:    {}", summary.dispatch_epoch);
-                println!("  Total Seconds:     {}", summary.total_secs);
-                println!("  Terminal State:    {}", summary.terminal_state);
-            }
-            if summary.terminal_state == "success" {
-                exit_codes::SUCCESS
-            } else {
-                exit_codes::GENERIC_ERROR
-            }
-        },
-        Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_kickoff_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else if !public_projection_only {
                 eprintln!("ERROR: {err}");
             }
             exit_codes::GENERIC_ERROR
@@ -806,7 +691,31 @@ fn run_dispatch_inner(
     force: bool,
 ) -> Result<DispatchSummary, String> {
     let (owner_repo, pr_number) = parse_pr_url(pr_url)?;
-    let current_head_sha = barrier::fetch_pr_head_sha(&owner_repo, pr_number)?;
+    let current_head_sha =
+        if let Some(identity) = projection_store::load_pr_identity(&owner_repo, pr_number)? {
+            validate_expected_head_sha(&identity.head_sha)?;
+            identity.head_sha.to_ascii_lowercase()
+        } else if projection_store::gh_read_fallback_enabled() {
+            let value = barrier::fetch_pr_head_sha(&owner_repo, pr_number)?;
+            validate_expected_head_sha(&value)?;
+            let value = value.to_ascii_lowercase();
+            let _ = projection_store::record_fallback_read(
+                &owner_repo,
+                pr_number,
+                "dispatch.resolve_head_sha",
+            );
+            let _ = projection_store::save_identity_with_context(
+                &owner_repo,
+                pr_number,
+                &value,
+                "gh-fallback:dispatch.resolve_head_sha",
+            );
+            value
+        } else {
+            return Err(projection_store::gh_read_fallback_disabled_error(
+                "dispatch.resolve_head_sha",
+            ));
+        };
     if let Some(expected) = expected_head_sha {
         validate_expected_head_sha(expected)?;
         if !expected.eq_ignore_ascii_case(&current_head_sha) {
@@ -846,109 +755,6 @@ fn run_dispatch_inner(
         head_sha: current_head_sha,
         dispatch_epoch,
         results,
-    })
-}
-
-// ── Kickoff ─────────────────────────────────────────────────────────────────
-
-fn run_kickoff_inner(
-    repo: &str,
-    event_path: &Path,
-    event_name: &str,
-    max_wait_seconds: u64,
-    public_projection_only: bool,
-) -> Result<KickoffSummary, String> {
-    if max_wait_seconds == 0 {
-        return Err("max_wait_seconds must be greater than zero".to_string());
-    }
-
-    let ctx = match resolve_fac_event_context(repo, event_path, event_name) {
-        Ok(ctx) => ctx,
-        Err(err) => {
-            let _ =
-                emit_barrier_decision_event("kickoff", repo, event_name, None, false, Some(&err));
-            return Err(err);
-        },
-    };
-    if let Err(err) = enforce_barrier(&ctx) {
-        let _ =
-            emit_barrier_decision_event("kickoff", repo, event_name, Some(&ctx), false, Some(&err));
-        return Err(err);
-    }
-    let _ = emit_barrier_decision_event("kickoff", repo, event_name, Some(&ctx), true, None);
-    ensure_gh_cli_ready()?;
-
-    let started = Instant::now();
-    let dispatch = run_dispatch_inner(&ctx.pr_url, ReviewRunType::All, Some(&ctx.head_sha), false)?;
-    let mut after_seq = 0_u64;
-    let deadline = Instant::now() + Duration::from_secs(max_wait_seconds);
-    let mut terminal_state = "failure:timeout".to_string();
-    let mut summary_emitter = ProjectionSummaryEmitter::default();
-
-    loop {
-        let projection = run_project_inner(
-            ctx.pr_number,
-            Some(&ctx.head_sha),
-            Some(dispatch.dispatch_epoch),
-            after_seq,
-        )?;
-        let summary = ProjectionSummary::from_projection(
-            projection.sha.clone(),
-            projection.current_head_sha.clone(),
-            projection.security.clone(),
-            projection.quality.clone(),
-            projection.recent_events.clone(),
-        );
-        if let Some(line) = summary_emitter.emit_if_due(Instant::now(), &summary) {
-            println!("{line}");
-        }
-        for error in &projection.errors {
-            if public_projection_only {
-                eprintln!(
-                    "ERROR ts={} event={} review={} seq={} detail={}",
-                    error.ts, error.event, error.review_type, error.seq, error.detail
-                );
-            } else {
-                println!(
-                    "ERROR ts={} event={} review={} seq={} detail={}",
-                    error.ts, error.event, error.review_type, error.seq, error.detail
-                );
-            }
-        }
-        after_seq = projection.last_seq;
-
-        if projection.terminal_failure {
-            terminal_state = "failure:terminal_failure".to_string();
-            break;
-        }
-        if projection_state_failed(&projection.security) {
-            terminal_state = "failure:security".to_string();
-            break;
-        }
-        if projection_state_failed(&projection.quality) {
-            terminal_state = "failure:quality".to_string();
-            break;
-        }
-        if projection_state_done(&projection.security) && projection_state_done(&projection.quality)
-        {
-            terminal_state = "success".to_string();
-            break;
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-
-    Ok(KickoffSummary {
-        repo: ctx.repo,
-        event_name: ctx.event_name,
-        pr_number: ctx.pr_number,
-        pr_url: ctx.pr_url,
-        head_sha: ctx.head_sha,
-        dispatch_epoch: dispatch.dispatch_epoch,
-        total_secs: started.elapsed().as_secs(),
-        terminal_state,
     })
 }
 

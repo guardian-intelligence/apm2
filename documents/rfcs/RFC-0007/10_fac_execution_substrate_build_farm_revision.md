@@ -1,18 +1,25 @@
-# RFC-0007 Amendment A2: FAC Execution Substrate / Local Build Farm Kernel (Execution Lanes, Queue, Hygiene, Attestation)
+# RFC-0019 Amendment A1: FAC Local Execution Substrate (FESv1)
+#
+# Why RFC-0019 (not RFC-0007):
+# - This spec defines host-safety, provenance, attestation, and receipt semantics for FAC execution.
+# - RFC-0007 is build-tooling optimization (mold/sccache/nextest recommendations), not FAC kernel semantics.
+# - RFC-0007 is still referenced for build-tooling constraints (e.g., .cargo/config.toml, nextest profile),
+#   but authority/receipt semantics must compose with RFC-0019 (FAC v0) invariants.
 
-* **Document:** `documents/rfcs/RFC-0007/10_fac_execution_substrate_build_farm_revision.md`
-* **Amends:** RFC-0007 (DRAFT)
+* **Document:** `documents/rfcs/RFC-0019/19_fac_execution_substrate_local_kernel.md`
+* **Amends:** RFC-0019 (APPROVED) — operational substrate addendum (no PCAC/crypto changes)
+* **Informs:** RFC-0007 — build-tooling decisions are constrained by this substrate (cache safety, isolation)
 * **Date:** 2026-02-12
 * **Primary surfaces touched by this amendment:**
 
   * `crates/apm2-cli/src/commands/fac.rs`
-  * `crates/apm2-cli/src/commands/fac_review/{gates,evidence,gate_attestation}.rs`
+  * `crates/apm2-cli/src/commands/fac_review/{gates,evidence,gate_attestation,gate_cache}.rs`
   * `scripts/ci/run_bounded_tests.sh`
   * `flake.nix`
   * `documents/skills/implementor-default/SKILL.md`
-  * (NEW) `crates/apm2-cli/src/commands/fac_review/{lane,queue,executor,fac_resources,target_pool}.rs` (exact module layout is flexible; semantics are not)
-  * (NEW) `crates/apm2-core/src/fac/{receipt_stream,hlc}.rs` (design seam; implementation may start in apm2-cli and migrate)
-* **Motivating operational constraints (explicit):**
+  * (NEW) `crates/apm2-cli/src/commands/fac_review/{fac_resources,target_pool,repo_mirror,io_safety}.rs` (layout flexible; semantics are not)
+  * (OPTIONAL, Phase ≥2) `crates/apm2-daemon/src/htf/HolonicClock` integration for authoritative time-stamping
+* **Motivating operational constraints (explicit, measured on current host class):**
 
   * Ubuntu 24.04
   * 96 GB RAM
@@ -41,7 +48,9 @@ This amendment is a build-farm "kernel" spec. The following are MUSTs:
 
 * **Lane**: A bounded, cullable execution context with deterministic identity, dedicated workspace+target namespace, and a fixed resource profile.
 * **Job**: An immutable spec (what to run, against which inputs) that is queued, leased to a lane, executed, and yields receipts.
-* **Receipt stream**: An append-only, mergeable (CRDT-compatible) set/log of receipts; receipts are the ground truth, not runtime state.
+* **Receipt stream**: An append-only, mergeable set of immutable receipts; receipts are the ground truth, not runtime state.
+  Ordering for presentation MUST be derived from HTF stamps when available, otherwise from a deterministic fallback tuple
+  `(monotonic_time_ns, node_fingerprint, receipt_digest)`.
 * **Execution profile**: The attested environment+policy facts (including lane profile hash + toolchain fingerprint) that gate-cache keys depend on.
 
 ## 1. Repo-grounded baseline: what actually runs today
@@ -78,6 +87,31 @@ Clarification (missing in the draft): **there are two "fallback" paths today**:
 
 If we "mandate nextest", we must fix **both** call paths (pipeline + local), not just the pipeline builder.
 
+### 1.1.1 Repo-grounded correction: local full-mode already enforces "clean tree"
+
+The **local** `apm2 fac gates` path already fail-closes on dirty state in **full mode**:
+* `--quick` explicitly accepts dirty and skips gate-cache read/write.
+* full mode requires a clean working tree before any cacheable gate execution.
+
+This means "dirty tree cache reuse" is **not** the dominant correctness risk for local full-mode runs.
+
+### 1.1.2 The actual correctness hole: pipeline-mode may execute against a drifting or dirty workspace
+
+The **pipeline** mode (`apm2 fac pipeline`) receives a `sha` argument and executes gates in `cwd`
+without proving:
+1) `git rev-parse HEAD == sha`, and
+2) the working tree is clean.
+
+Worse: the current attestation `input_digest()` uses `HEAD^{tree}` and `git rev-parse HEAD:<path>`
+for tracked inputs, which **does not reflect uncommitted working-tree modifications**. Therefore:
+* A dirty workspace can run gates against dirty content,
+* while producing an attestation digest that still corresponds to the *clean HEAD tree*,
+* enabling false-positive reuse (fail-open) for the `sha` directory in gate cache.
+
+**This amendment treats "pipeline SHA drift" and "dirty-but-attests-clean" as correctness-critical.**
+The substrate MUST either (a) hard-reset to the target SHA in an isolated checkout, or
+(b) incorporate a dirty-diff digest that is *actually* bound into attestation inputs.
+
 ### 1.2 Bounded test environment today
 
 The bounded runner:
@@ -97,9 +131,12 @@ Operational footgun (needs to be treated as a *substrate requirement*, not a "ma
 
 Correctness footgun (missing in the draft, and currently **fail-open**):
 
-* Gate cache keys are derived from `git rev-parse HEAD` (a commit SHA). **If the working tree has uncommitted changes, the SHA does not change**, so cache reuse can become incorrect. This substrate MUST either:
-  * require a clean worktree to use gate cache (fail-closed), OR
-  * incorporate a "dirty diff digest" (or patch artifact hash) into the attested inputs.
+* The substrate's correctness risk is specifically **(pipeline)** "execution workspace != intended SHA" and
+  **(attestation)** "tracked file inputs hashed via `HEAD:<path>` ignore dirty content."
+  The substrate MUST:
+  * prove `HEAD==sha` + clean tree for any cacheable pipeline run, OR
+  * execute from an isolated checkout at `sha` (preferred), OR
+  * incorporate a dirty-diff digest into attestation input material and disable cache reuse when unknown.
 
 ### 1.3 Gate cache and attestation today
 
@@ -164,6 +201,33 @@ Your stated goal is not to "relax the box"; it is to **make cold-start rare** an
 
 The current "compute slots + target pool" proposal is necessary but insufficient: it addresses concurrency and caching, but it does not define the **unit of containment** (lane), **job semantics**, **queueing**, **leases**, or **receipts as ground truth**.
 
+### 2.3 Threat model (normative)
+
+This substrate is a **host-safety kernel**. We therefore model both accidental overload and adversarial behavior.
+
+#### 2.3.1 Adversaries
+* **A0: Accidental overload** — multiple agents trigger overlapping builds/tests/logging.
+* **A1: Malicious repo content** — PR introduces tests/build scripts that attempt to exhaust resources, escape containment, or sabotage cleanup.
+* **A2: Local hostile process** — another process on the host attempts symlink/TOCTOU attacks against GC/reset, or races queue/lease files.
+
+#### 2.3.2 In-scope attacks and required mitigations
+1) **Unbounded stdout/stderr capture → RAM blow-up**
+   * Current evidence execution captures entire stdout/stderr into memory before writing logs.
+   * FESv1 MUST stream output to files with hard byte caps (see §6.3) and avoid unbounded in-memory buffering.
+
+2) **Log file bloat → disk exhaustion**
+   * FESv1 MUST enforce per-gate log caps and per-lane log quotas; GC MUST be able to reclaim space deterministically.
+
+3) **Symlink/TOCTOU deletion attack → catastrophic data loss**
+   * FESv1 MUST use a single symlink-safe deletion primitive with an allowlisted root set (see §4.7 and §6.2).
+
+4) **Containment bypass via helper daemons (e.g., compiler wrappers)**
+   * Any helper that can spawn compilers/tests outside the bounded cgroup is treated as an integrity regression.
+   * Default posture: helpers are disabled unless proven to preserve cgroup membership (see §15.2).
+
+5) **Queue/lease corruption and double execution**
+   * Queue claim MUST be atomic; lease ownership MUST be exclusive; crash recovery MUST be defined by receipts (see §4.5–§4.6).
+
 ---
 
 ## 3. What this amendment changes in RFC-0007 (and why it still belongs in RFC-0007)
@@ -206,7 +270,8 @@ FESv1 is the "local build farm kernel" for APM2 agents.
 
 Each lane is:
 
-* a git worktree rooted at: `$APM2_HOME/private/fac/lanes/<lane_id>/workspace`
+* a **clean checkout** rooted at: `$APM2_HOME/private/fac/lanes/<lane_id>/workspace`
+  produced from a node-local **bare mirror** (see §4.2.1)
 * a long-lived, **cullable** execution context (resettable without touching other lanes)
 * a fixed resource profile (enforced via systemd/cgroups)
 * a dedicated target namespace: `$APM2_HOME/private/fac/lanes/<lane_id>/target/<toolchain_fingerprint>`
@@ -219,6 +284,21 @@ Lane lifecycle (persisted via receipts + lease records; runtime is not authorita
 Exceptional:
 
 `* → CORRUPT → RESET → IDLE`
+
+#### 4.2.1 Repository substrate (mandatory): node-local bare mirror + lane checkouts
+
+FESv1 introduces a repository substrate layer to eliminate ambient worktree contamination and to create
+clean seams for later multi-node transport.
+
+* Mirror root: `$APM2_HOME/private/fac/repo_mirror/<repo_id_sanitized>.git/` (bare)
+* Lane checkout source: the mirror, not the developer's worktree.
+* Default execution source is a **clean commit** (`head_sha`).
+* Dirty trees are handled only by explicit **patch injection** (see §5.3.3).
+
+Minimum required invariants:
+* If `job.source.kind == "mirror_commit"`, the lane workspace MUST be reset to the attested commit SHA before execution.
+* If `job.source.kind == "patch_injection"`, the injected patch digest MUST be included in attestation material and cache keys.
+* If neither invariant can be met, gate-cache reuse MUST be disabled (fail-closed).
 
 ### 4.3 Backpressure is lane-count + lane profiles (not "worktrees")
 
@@ -310,6 +390,15 @@ Each job MUST end in a cleanup step before the lane returns to IDLE:
 * enforce log retention/quota per lane (size and TTL)
 
 If cleanup fails, the lane MUST be marked CORRUPT and refused for further leases until reset.
+
+## 4.9 Output handling (normative): bounded streaming, never unbounded buffering
+
+Evidence gate execution MUST NOT capture unbounded stdout/stderr into memory.
+Implementations MUST:
+* stream stdout/stderr to per-gate log files,
+* enforce `max_gate_log_bytes` (truncate with an explicit sentinel),
+* enforce `max_gate_capture_bytes` for any in-memory summaries (e.g., last N KB),
+* record truncation in receipts/metadata so debugging remains possible without risking host stability.
 
 ---
 
@@ -406,7 +495,8 @@ All schemas MUST:
 * be bounded in size on read (reuse apm2-core FAC bounded deserialization primitives)
 
 Canonical hashing rules:
-* Hash input is canonical JSON bytes (stable key ordering, no insignificant whitespace).
+* Hash input is canonical JSON bytes. Implementations MUST reuse the repo's canonicalization primitive
+  (`apm2_core::determinism::canonicalize_json`) rather than ad-hoc "sorted keys" serializers.
 * Hash algorithm for lane/job receipts is **BLAKE3** with domain separation:
   * `hash = blake3("apm2:fac:<schema_id>:v1\0" || canonical_json_bytes)`
 * Hashes are encoded as lowercase hex and prefixed: `blake3:<hex>`
@@ -448,6 +538,19 @@ Lane profile storage:
 Lane profile hash:
 * `LaneProfileHash = blake3(canonical(LaneProfileV1))`
 
+#### 5.3.1.1 `FacPolicyV1` (mandatory hashed policy object)
+
+`FacPolicyV1` is the single authoritative knob surface that cache reuse depends on.
+It MUST include (at minimum):
+* resource caps (cpu/mem/pids/timeouts)
+* disk preflight thresholds and GC escalation order
+* env allowlist/denylist and explicit `CARGO_HOME` / `CARGO_TARGET_DIR` policy
+* log/output caps: `max_gate_log_bytes`, `max_gate_capture_bytes`
+* safe deletion root allowlist (GC and resets)
+* provenance policy (mirror_commit vs patch_injection admission rules)
+
+Any change to `FacPolicyV1` MUST change `FacPolicyHash` (fail-closed).
+
 #### 5.3.2 `LaneLeaseV1`
 
 ```jsonc
@@ -475,11 +578,11 @@ Storage:
   "kind": "gates",
   "priority": 50,
   "enqueue_time": "2026-02-12T03:15:00Z",
-  "repo_root": "/abs/path/to/apm2",
-  "git": {
+  "source": {
+    "kind": "mirror_commit", // mirror_commit | patch_injection
+    "repo_id": "guardian-intelligence/apm2", // stable logical id, not a filesystem path
     "head_sha": "012345…",
-    "dirty": false,
-    "dirty_diff_hash": null
+    "patch": null // if kind=patch_injection: { "format":"git_diff_v1", "digest":"blake3:…", "bytes_cas":"blake3:…" }
   },
   "lane_requirements": {
     "lane_profile_hash": null
@@ -492,8 +595,9 @@ Storage:
 }
 ```
 
-Dirty-tree rule:
-* if `dirty=true`, either `dirty_diff_hash` MUST be present and included in attestation OR cache reuse MUST be disabled (fail-closed).
+Dirty-tree rule (reframed to match FESv1 provenance):
+* `patch_injection` is the **only** way to run dirty content while preserving fail-closed cache semantics.
+* Any run executed from an ambient caller worktree is permitted only in explicitly-uncacheable modes (e.g., `--quick`).
 
 #### 5.3.4 `FacJobReceiptV1`
 
@@ -722,7 +826,9 @@ No networking code is defined here; only the object contract.
 Receipt streams MUST be mergeable by set union:
 
 * receipts are immutable content-addressed objects
-* stream merge = union of receipt hashes + deterministic ordering for presentation using HLC-with-node-id (see apm2-core consensus CRDT primitives)
+* stream merge = union of receipt digests + deterministic presentation ordering:
+  1) primary: HTF time envelope stamp (RFC-0016) if present
+  2) fallback: monotonic timestamp + node_fingerprint + receipt digest
 
 ### 8.5 Authentication boundary (future PCAC/AJC seam)
 
@@ -1441,7 +1547,7 @@ ticket_meta:
   scope:
     in_scope:
       - "Add `apm2 fac warm` subcommand routed via crates/apm2-cli/src/commands/fac.rs."
-      - "Acquire a FAC compute slot for warm (reuse compute-slot leasing from TCK-00488)."
+      - "Acquire a FAC compute slot for warm (reuse compute-slot leasing from TCK-00506)."
       - "Enable target pool by default (CARGO_TARGET_DIR derived from slot + toolchain fingerprint)."
       - "Implement warm phases (selectable): cargo fetch --locked; cargo build --workspace --all-targets --all-features --locked; cargo nextest run ... --no-run; optional clippy/doc phases."
       - "Set CARGO_BUILD_JOBS and NEXTEST_TEST_THREADS from compute-slot policy unless explicitly overridden."

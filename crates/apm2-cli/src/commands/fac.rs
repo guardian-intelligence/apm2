@@ -19,16 +19,13 @@
 //!   context
 //! - `apm2 fac resume <work_id>` - Show crash-only resume helpers from ledger
 //!   anchor
-//! - `apm2 fac barrier --repo <OWNER/REPO> --event <EVENT_JSON>` - Validate
-//!   trigger trust boundary before any FAC execution
-//! - `apm2 fac kickoff --repo <OWNER/REPO> --event <EVENT_JSON>` - Dispatch and
-//!   observe FAC review lifecycle for GitHub projection
 //! - `apm2 fac review run <PR_URL>` - Run FAC review orchestration (parallel,
 //!   multi-model)
 //! - `apm2 fac review dispatch <PR_URL>` - Dispatch detached FAC review runs
 //! - `apm2 fac review status` - Show FAC review state and recent events
 //! - `apm2 fac review findings` - Retrieve SHA-bound review findings in a
 //!   structured FAC-native format
+//! - `apm2 fac review comment` - Publish one SHA-bound finding comment
 //! - `apm2 fac review decision` - Show/set SHA-bound approve/deny decisions per
 //!   review dimension
 //! - `apm2 fac restart --pr <PR_NUMBER>` - Intelligent pipeline restart from
@@ -160,17 +157,6 @@ pub enum FacSubcommand {
     /// Analyzes ledger to determine restart point for interrupted work.
     /// Returns the last committed anchor and pending operations.
     Resume(ResumeArgs),
-
-    /// Validate FAC trigger trust boundary for GitHub projection execution.
-    ///
-    /// Fails closed unless the trigger context is authorized.
-    Barrier(BarrierArgs),
-
-    /// Dispatch and observe FAC review lifecycle for GitHub projection.
-    ///
-    /// Runs idempotent detached review dispatch and emits 1Hz health/status
-    /// lines until a terminal outcome is reached.
-    Kickoff(KickoffArgs),
 
     /// Push code and create/update PR (lean push).
     ///
@@ -366,51 +352,6 @@ pub struct ResumeArgs {
     pub limit: u64,
 }
 
-/// Arguments for `apm2 fac barrier`.
-#[derive(Debug, Args)]
-pub struct BarrierArgs {
-    /// Repository in owner/repo format.
-    #[arg(long)]
-    pub repo: String,
-
-    /// Path to GitHub event payload JSON.
-    #[arg(long)]
-    pub event: PathBuf,
-
-    /// Event name (`pull_request_target` or `workflow_dispatch`).
-    #[arg(long)]
-    pub event_name: String,
-}
-
-/// Arguments for `apm2 fac kickoff`.
-#[derive(Debug, Args)]
-pub struct KickoffArgs {
-    /// Repository in owner/repo format.
-    #[arg(long)]
-    pub repo: String,
-
-    /// Path to GitHub event payload JSON.
-    #[arg(long)]
-    pub event: PathBuf,
-
-    /// Event name (`pull_request_target` or `workflow_dispatch`).
-    #[arg(long)]
-    pub event_name: String,
-
-    /// Maximum seconds to wait for FAC terminal state.
-    #[arg(long, default_value_t = 3600)]
-    pub max_wait_seconds: u64,
-
-    /// SECURITY-CRITICAL: limit stdout to one projection health line per
-    /// second.
-    ///
-    /// Use this mode for public log surfaces (for example GitHub Actions logs).
-    /// Any rich diagnostics must stay on private runner-local storage.
-    /// Non-health diagnostics are emitted to stderr for private runner logs.
-    #[arg(long, default_value_t = false)]
-    pub public_projection_only: bool,
-}
-
 /// Arguments for `apm2 fac push`.
 #[derive(Debug, Args)]
 pub struct PushArgs {
@@ -514,6 +455,8 @@ pub enum ReviewSubcommand {
     Publish(ReviewPublishArgs),
     /// Retrieve structured review findings for a PR head SHA.
     Findings(ReviewFindingsArgs),
+    /// Publish one SHA-bound finding comment with machine-readable metadata.
+    Comment(ReviewCommentArgs),
     /// Show or set explicit decision state per review dimension.
     Decision(ReviewDecisionArgs),
     /// Render one condensed projection line for GitHub log surfaces.
@@ -663,6 +606,42 @@ pub struct ReviewPublishArgs {
     /// Path to markdown findings body.
     #[arg(long)]
     pub body_file: PathBuf,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac review comment`.
+#[derive(Debug, Args)]
+pub struct ReviewCommentArgs {
+    /// Repository in owner/repo format (used when --pr is provided).
+    #[arg(long, default_value = "guardian-intelligence/apm2")]
+    pub repo: String,
+
+    /// Pull request number.
+    #[arg(long)]
+    pub pr: Option<u32>,
+
+    /// Pull request URL (alternative to --pr).
+    #[arg(long)]
+    pub pr_url: Option<String>,
+
+    /// Optional head SHA override (defaults to `git rev-parse HEAD`).
+    #[arg(long)]
+    pub sha: Option<String>,
+
+    /// Finding severity (`blocker`, `major`, `minor`, or `nit`).
+    #[arg(long, value_enum)]
+    pub severity: fac_review::ReviewCommentSeverityArg,
+
+    /// Finding type (`security` or `code-quality`).
+    #[arg(long = "type", value_enum)]
+    pub review_type: fac_review::ReviewCommentTypeArg,
+
+    /// Finding body text. If omitted, body is read from stdin.
+    #[arg(long)]
+    pub body: Option<String>,
 
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
@@ -996,17 +975,6 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
             },
         },
         FacSubcommand::Resume(args) => run_resume(args, &ledger_path, json_output),
-        FacSubcommand::Barrier(args) => {
-            fac_review::run_barrier(&args.repo, &args.event, &args.event_name, json_output)
-        },
-        FacSubcommand::Kickoff(args) => fac_review::run_kickoff(
-            &args.repo,
-            &args.event,
-            &args.event_name,
-            args.max_wait_seconds,
-            args.public_projection_only,
-            json_output,
-        ),
         FacSubcommand::Push(args) => fac_review::run_push(
             &args.repo,
             &args.remote,
@@ -1070,6 +1038,16 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
                 findings_args.pr_url.as_deref(),
                 findings_args.sha.as_deref(),
                 json_output || findings_args.json,
+            ),
+            ReviewSubcommand::Comment(comment_args) => fac_review::run_comment(
+                &comment_args.repo,
+                comment_args.pr,
+                comment_args.pr_url.as_deref(),
+                comment_args.sha.as_deref(),
+                comment_args.severity,
+                comment_args.review_type,
+                comment_args.body.as_deref(),
+                json_output || comment_args.json,
             ),
             ReviewSubcommand::Decision(decision_args) => match &decision_args.subcommand {
                 ReviewDecisionSubcommand::Show(show_args) => fac_review::run_decision_show(
