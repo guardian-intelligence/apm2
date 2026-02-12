@@ -49,6 +49,9 @@ Single entry point for all admission decisions. Uses builder pattern for optiona
 - [CTR-AK07] Identity evidence level and pointer-only waiver hash are passed through from `KernelRequestV1` to `AuthorityJoinInputV1` (not hardcoded).
 - [CTR-AK08] `execute()` constructs and seals `AdmissionBundleV1` BEFORE capability minting and receipt emission. Bundle digest becomes the `AdmissionBindingHash` (TCK-00493).
 - [CTR-AK09] `AdmissionResultV1` includes both the sealed `bundle` and `bundle_digest`. The digest is recomputable from the bundle via `content_hash()`.
+- [CTR-AK10] `validate_witness_seeds_at_join()` denies fail-closed tiers when seeds have zero provider digests or reused nonces. Monitor tiers require an explicit `MonitorWaiverV1` (TCK-00497).
+- [CTR-AK11] `finalize_post_effect_witness()` validates post-effect evidence objects against their seeds (seed hash, provider provenance, temporal ordering). Fail-closed tiers deny on missing evidence. Monitor tiers require explicit waiver (TCK-00497).
+- [CTR-AK12] `release_boundary_output()` denies output release for fail-closed tiers when evidence hashes are empty. Marks `BoundarySpanV1` as released exactly once (TCK-00497).
 
 ### `KernelRequestV1` (types.rs)
 
@@ -69,6 +72,28 @@ Spine join extension committed into PCAC join. Domain-separated BLAKE3 content h
 ### `WitnessSeedV1` (types.rs)
 
 Witness seed created at join time with provider provenance binding and domain-separated content hash.
+
+### `WitnessEvidenceV1` (types.rs)
+
+Post-effect witness evidence object (TCK-00497). Materialized AFTER the effect executes. Binds daemon-measured values (leakage metrics, timing measurements) to the witness seed committed at join time. For fail-closed tiers, output release is denied unless valid witness evidence is present. Domain-separated BLAKE3 content hash.
+
+**Invariants:**
+
+- [INV-AK30] Evidence `seed_hash` must match the seed's `content_hash()` (constant-time comparison).
+- [INV-AK31] Evidence `witness_class`, `request_id`, `session_id` must match the seed's fields.
+- [INV-AK32] Evidence `provider_id` and `provider_build_digest` must match the seed (anti-substitution).
+- [INV-AK33] Evidence `ht_end` must be >= seed `ht_start` (temporal ordering).
+- [INV-AK34] `measured_values` bounded by `MAX_WITNESS_EVIDENCE_MEASURED_VALUES` (16).
+
+### `MonitorWaiverV1` (types.rs)
+
+Explicit waiver for monitor-tier witness bypass (TCK-00497). Monitor tiers may skip witness enforcement ONLY via explicit waiver. Silent permissive defaults are forbidden. Domain-separated BLAKE3 content hash.
+
+**Invariants:**
+
+- [INV-AK35] Waiver `enforcement_tier` must be `Monitor`, never `FailClosed`.
+- [INV-AK36] Waiver `reason` must be non-empty and bounded by `MAX_WAIVER_REASON_LENGTH`.
+- [INV-AK37] Waiver hash is included in audit binding (outcome index evidence hashes).
 
 ### `EffectCapability`, `LedgerWriteCapability`, `QuarantineCapability` (capabilities.rs)
 
@@ -114,7 +139,7 @@ Individual quarantine action record within `AdmissionBundleV1`. Contains `reserv
 
 ### `AdmitError` (types.rs)
 
-Error type with 14 deterministic denial variants. No "unknown -> allow" path. Includes `ExecutePrerequisiteDrift` for TOCTOU detection between plan and execute and `BundleSealFailure` for bundle validation/serialization failures (TCK-00493).
+Error type with 17 deterministic denial variants. No "unknown -> allow" path. Includes `ExecutePrerequisiteDrift` for TOCTOU detection between plan and execute, `BundleSealFailure` for bundle validation/serialization failures (TCK-00493), and `WitnessEvidenceFailure`/`OutputReleaseDenied`/`WitnessWaiverInvalid` for witness enforcement (TCK-00497).
 
 ## Phase Ordering
 
@@ -132,7 +157,7 @@ execute(): single-use check -> prerequisite re-check (fail-closed) ->
 - `AdmissionKernelV1`, `WitnessProviderConfig`, `QuarantineGuard`
 - `AdmissionPlanV1`, `AdmissionResultV1`, `AdmissionSpineJoinExtV1`
 - `AdmissionBundleV1`, `AdmissionOutcomeIndexV1`, `QuarantineActionV1`
-- `KernelRequestV1`, `WitnessSeedV1`, `BoundarySpanV1`
+- `KernelRequestV1`, `WitnessSeedV1`, `WitnessEvidenceV1`, `MonitorWaiverV1`, `BoundarySpanV1`
 - `EnforcementTier`, `AdmitError`
 - `EffectCapability`, `LedgerWriteCapability`, `QuarantineCapability`
 - `LedgerTrustVerifier`, `PolicyRootResolver`, `AntiRollbackAnchor`
@@ -178,3 +203,4 @@ The kernel is wired in production via `DispatcherState::with_persistence_and_ada
 - TCK-00492: Implementation ticket (kernel plan/execute API)
 - TCK-00493: Implementation ticket (bundle + outcome index)
 - TCK-00494: Implementation ticket (handler refactoring + kernel wiring)
+- TCK-00497: Implementation ticket (witness closure -- post-effect evidence, monitor waivers, boundary output gating)

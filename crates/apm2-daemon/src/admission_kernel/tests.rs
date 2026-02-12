@@ -2706,3 +2706,891 @@ fn test_bounded_vec_deser_accepts_valid_sized_collections() {
         "witness evidence hashes must survive round-trip"
     );
 }
+
+// =============================================================================
+// TCK-00497: Authoritative witness closure tests
+// =============================================================================
+
+/// Helper: build a valid monitor waiver for testing.
+fn valid_monitor_waiver(request_id: Hash) -> super::types::MonitorWaiverV1 {
+    super::types::MonitorWaiverV1 {
+        waiver_id: test_hash(200),
+        reason: "test monitor waiver for non-authoritative tier".to_string(),
+        expires_at_tick: 10000,
+        request_id,
+        enforcement_tier: EnforcementTier::Monitor,
+    }
+}
+
+/// Helper: build a kernel with all prerequisites for fail-closed testing.
+fn fail_closed_kernel() -> AdmissionKernelV1 {
+    let pcac = Arc::new(MockPcacKernel::passing()) as Arc<dyn AuthorityJoinKernel>;
+    AdmissionKernelV1::new(pcac, witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(Arc::new(MockAntiRollback::passing()))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+}
+
+/// Helper: build witness evidence from a seed (valid binding).
+fn evidence_from_seed(
+    seed: &super::types::WitnessSeedV1,
+    ht_end: u64,
+) -> super::types::WitnessEvidenceV1 {
+    super::types::WitnessEvidenceV1 {
+        witness_class: seed.witness_class.clone(),
+        seed_hash: seed.content_hash(),
+        request_id: seed.request_id,
+        session_id: seed.session_id.clone(),
+        ht_end,
+        measured_values: vec![test_hash(180), test_hash(181)],
+        provider_id: seed.provider_id.clone(),
+        provider_build_digest: seed.provider_build_digest,
+    }
+}
+
+// ---- Fail-closed seed validation at join ----
+
+#[test]
+fn test_tck_00497_fail_closed_seed_validation_succeeds_with_valid_seeds() {
+    let kernel = fail_closed_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    let result = kernel.validate_witness_seeds_at_join(
+        EnforcementTier::FailClosed,
+        &plan.leakage_witness_seed,
+        &plan.timing_witness_seed,
+        None,
+    );
+    assert!(
+        result.is_ok(),
+        "valid seeds at fail-closed tier should succeed"
+    );
+    assert!(
+        result.unwrap().is_none(),
+        "fail-closed path returns None (no waiver hash)"
+    );
+}
+
+#[test]
+fn test_tck_00497_fail_closed_denies_zero_leakage_seed() {
+    let kernel = fail_closed_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    // Create a zero-hash seed (simulating a stubbed/None seed).
+    let mut bad_leakage = plan.leakage_witness_seed.clone();
+    bad_leakage.witness_class = String::new(); // will make content_hash produce a non-meaningful hash
+    // Actually, we need a seed whose content_hash is zero. Since that's
+    // cryptographically infeasible, we test the provider_build_digest=zero path
+    // instead.
+    let mut bad_leakage2 = plan.leakage_witness_seed.clone();
+    bad_leakage2.provider_build_digest = [0u8; 32];
+
+    let result = kernel.validate_witness_seeds_at_join(
+        EnforcementTier::FailClosed,
+        &bad_leakage2,
+        &plan.timing_witness_seed,
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "zero provider_build_digest must deny at fail-closed tier"
+    );
+    match result.unwrap_err() {
+        AdmitError::WitnessSeedFailure { reason } => {
+            assert!(
+                reason.contains("provider_build_digest is zero"),
+                "reason should mention provider_build_digest: {reason}"
+            );
+        },
+        other => panic!("expected WitnessSeedFailure, got: {other}"),
+    }
+}
+
+#[test]
+fn test_tck_00497_fail_closed_denies_zero_timing_seed_provider() {
+    let kernel = fail_closed_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    let mut bad_timing = plan.timing_witness_seed.clone();
+    bad_timing.provider_build_digest = [0u8; 32];
+
+    let result = kernel.validate_witness_seeds_at_join(
+        EnforcementTier::FailClosed,
+        &plan.leakage_witness_seed,
+        &bad_timing,
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "zero provider_build_digest on timing seed must deny"
+    );
+    match result.unwrap_err() {
+        AdmitError::WitnessSeedFailure { reason } => {
+            assert!(
+                reason.contains("timing witness seed provider_build_digest"),
+                "reason should identify timing seed: {reason}"
+            );
+        },
+        other => panic!("expected WitnessSeedFailure, got: {other}"),
+    }
+}
+
+#[test]
+fn test_tck_00497_fail_closed_denies_nonce_reuse() {
+    let kernel = fail_closed_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    let mut bad_timing = plan.timing_witness_seed.clone();
+    bad_timing.nonce = plan.leakage_witness_seed.nonce; // duplicate nonce
+
+    let result = kernel.validate_witness_seeds_at_join(
+        EnforcementTier::FailClosed,
+        &plan.leakage_witness_seed,
+        &bad_timing,
+        None,
+    );
+    assert!(result.is_err(), "nonce reuse must deny");
+    match result.unwrap_err() {
+        AdmitError::WitnessSeedFailure { reason } => {
+            assert!(
+                reason.contains("nonce reuse"),
+                "reason should mention nonce reuse: {reason}"
+            );
+        },
+        other => panic!("expected WitnessSeedFailure, got: {other}"),
+    }
+}
+
+// ---- Monitor tier requires explicit waiver ----
+
+#[test]
+fn test_tck_00497_monitor_tier_denies_without_waiver() {
+    let kernel = fail_closed_kernel();
+    let request = valid_request(RiskTier::Tier0);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    let result = kernel.validate_witness_seeds_at_join(
+        EnforcementTier::Monitor,
+        &plan.leakage_witness_seed,
+        &plan.timing_witness_seed,
+        None, // no waiver
+    );
+    assert!(result.is_err(), "monitor tier without waiver must deny");
+    match result.unwrap_err() {
+        AdmitError::WitnessWaiverInvalid { reason } => {
+            assert!(
+                reason.contains("explicit waiver"),
+                "reason should mention explicit waiver: {reason}"
+            );
+        },
+        other => panic!("expected WitnessWaiverInvalid, got: {other}"),
+    }
+}
+
+#[test]
+fn test_tck_00497_monitor_tier_succeeds_with_waiver() {
+    let kernel = fail_closed_kernel();
+    let request = valid_request(RiskTier::Tier0);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    let waiver = valid_monitor_waiver(request.request_id);
+    let result = kernel.validate_witness_seeds_at_join(
+        EnforcementTier::Monitor,
+        &plan.leakage_witness_seed,
+        &plan.timing_witness_seed,
+        Some(&waiver),
+    );
+    assert!(
+        result.is_ok(),
+        "monitor tier with valid waiver should succeed"
+    );
+    let waiver_hash = result.unwrap();
+    assert!(
+        waiver_hash.is_some(),
+        "monitor path should return waiver hash for audit"
+    );
+    assert_ne!(
+        waiver_hash.unwrap(),
+        [0u8; 32],
+        "waiver hash must be non-zero"
+    );
+}
+
+#[test]
+fn test_tck_00497_monitor_waiver_denies_fail_closed_tier() {
+    let waiver = super::types::MonitorWaiverV1 {
+        waiver_id: test_hash(200),
+        reason: "test".to_string(),
+        expires_at_tick: 10000,
+        request_id: test_hash(1),
+        enforcement_tier: EnforcementTier::FailClosed, // wrong tier
+    };
+    let result = waiver.validate();
+    assert!(
+        result.is_err(),
+        "waiver with FailClosed tier must be invalid"
+    );
+    match result.unwrap_err() {
+        AdmitError::WitnessWaiverInvalid { reason } => {
+            assert!(
+                reason.contains("not FailClosed"),
+                "reason should explain tier mismatch: {reason}"
+            );
+        },
+        other => panic!("expected WitnessWaiverInvalid, got: {other}"),
+    }
+}
+
+// ---- Post-effect witness evidence ----
+
+#[test]
+fn test_tck_00497_fail_closed_post_effect_denies_missing_leakage_evidence() {
+    let kernel = fail_closed_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    let timing_ev = evidence_from_seed(&plan.timing_witness_seed, 100);
+
+    let result = kernel.finalize_post_effect_witness(
+        EnforcementTier::FailClosed,
+        &plan.leakage_witness_seed,
+        &plan.timing_witness_seed,
+        None, // missing leakage evidence
+        Some(&timing_ev),
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "missing leakage evidence must deny at fail-closed tier"
+    );
+    match result.unwrap_err() {
+        AdmitError::OutputReleaseDenied { reason } => {
+            assert!(
+                reason.contains("leakage"),
+                "reason should mention leakage: {reason}"
+            );
+        },
+        other => panic!("expected OutputReleaseDenied, got: {other}"),
+    }
+}
+
+#[test]
+fn test_tck_00497_fail_closed_post_effect_denies_missing_timing_evidence() {
+    let kernel = fail_closed_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    let leakage_ev = evidence_from_seed(&plan.leakage_witness_seed, 100);
+
+    let result = kernel.finalize_post_effect_witness(
+        EnforcementTier::FailClosed,
+        &plan.leakage_witness_seed,
+        &plan.timing_witness_seed,
+        Some(&leakage_ev),
+        None, // missing timing evidence
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "missing timing evidence must deny at fail-closed tier"
+    );
+    match result.unwrap_err() {
+        AdmitError::OutputReleaseDenied { reason } => {
+            assert!(
+                reason.contains("timing"),
+                "reason should mention timing: {reason}"
+            );
+        },
+        other => panic!("expected OutputReleaseDenied, got: {other}"),
+    }
+}
+
+#[test]
+fn test_tck_00497_fail_closed_post_effect_succeeds_with_valid_evidence() {
+    let kernel = fail_closed_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    let leakage_ev = evidence_from_seed(&plan.leakage_witness_seed, 100);
+    let timing_ev = evidence_from_seed(&plan.timing_witness_seed, 100);
+
+    let result = kernel.finalize_post_effect_witness(
+        EnforcementTier::FailClosed,
+        &plan.leakage_witness_seed,
+        &plan.timing_witness_seed,
+        Some(&leakage_ev),
+        Some(&timing_ev),
+        None,
+    );
+    assert!(
+        result.is_ok(),
+        "valid evidence at fail-closed tier should succeed"
+    );
+    let hashes = result.unwrap();
+    assert_eq!(
+        hashes.len(),
+        2,
+        "must have exactly 2 evidence hashes (leakage + timing)"
+    );
+    assert_ne!(
+        hashes[0], [0u8; 32],
+        "leakage evidence hash must be non-zero"
+    );
+    assert_ne!(
+        hashes[1], [0u8; 32],
+        "timing evidence hash must be non-zero"
+    );
+    assert_ne!(hashes[0], hashes[1], "evidence hashes must be unique");
+}
+
+#[test]
+fn test_tck_00497_fail_closed_post_effect_denies_wrong_seed_binding() {
+    let kernel = fail_closed_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    // Create evidence bound to the wrong seed (swap leakage/timing).
+    let leakage_ev = evidence_from_seed(&plan.timing_witness_seed, 100);
+    let timing_ev = evidence_from_seed(&plan.leakage_witness_seed, 100);
+
+    let result = kernel.finalize_post_effect_witness(
+        EnforcementTier::FailClosed,
+        &plan.leakage_witness_seed,
+        &plan.timing_witness_seed,
+        Some(&leakage_ev), // bound to timing seed
+        Some(&timing_ev),  // bound to leakage seed
+        None,
+    );
+    assert!(result.is_err(), "wrong seed binding must deny");
+    match result.unwrap_err() {
+        AdmitError::WitnessEvidenceFailure { reason } => {
+            assert!(
+                reason.contains("seed_hash") || reason.contains("witness_class"),
+                "reason should explain binding mismatch: {reason}"
+            );
+        },
+        other => panic!("expected WitnessEvidenceFailure, got: {other}"),
+    }
+}
+
+#[test]
+fn test_tck_00497_fail_closed_post_effect_denies_wrong_provider() {
+    let kernel = fail_closed_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    let mut leakage_ev = evidence_from_seed(&plan.leakage_witness_seed, 100);
+    leakage_ev.provider_id = "attacker-module".to_string();
+
+    let timing_ev = evidence_from_seed(&plan.timing_witness_seed, 100);
+
+    let result = kernel.finalize_post_effect_witness(
+        EnforcementTier::FailClosed,
+        &plan.leakage_witness_seed,
+        &plan.timing_witness_seed,
+        Some(&leakage_ev),
+        Some(&timing_ev),
+        None,
+    );
+    assert!(result.is_err(), "wrong provider must deny");
+    match result.unwrap_err() {
+        AdmitError::WitnessEvidenceFailure { reason } => {
+            assert!(
+                reason.contains("provider_id"),
+                "reason should mention provider: {reason}"
+            );
+        },
+        other => panic!("expected WitnessEvidenceFailure, got: {other}"),
+    }
+}
+
+#[test]
+fn test_tck_00497_evidence_denies_when_ht_end_before_ht_start() {
+    let kernel = fail_closed_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    let mut leakage_ev = evidence_from_seed(&plan.leakage_witness_seed, 100);
+    // Set ht_end before ht_start (seed.ht_start is request.freshness_witness_tick =
+    // 42)
+    leakage_ev.ht_end = 1; // before 42
+
+    let timing_ev = evidence_from_seed(&plan.timing_witness_seed, 100);
+
+    let result = kernel.finalize_post_effect_witness(
+        EnforcementTier::FailClosed,
+        &plan.leakage_witness_seed,
+        &plan.timing_witness_seed,
+        Some(&leakage_ev),
+        Some(&timing_ev),
+        None,
+    );
+    assert!(result.is_err(), "ht_end before ht_start must deny");
+    match result.unwrap_err() {
+        AdmitError::WitnessEvidenceFailure { reason } => {
+            assert!(
+                reason.contains("before seed ht_start"),
+                "reason should explain temporal order: {reason}"
+            );
+        },
+        other => panic!("expected WitnessEvidenceFailure, got: {other}"),
+    }
+}
+
+// ---- Monitor post-effect waiver ----
+
+#[test]
+fn test_tck_00497_monitor_post_effect_denies_without_waiver() {
+    let kernel = fail_closed_kernel();
+    let request = valid_request(RiskTier::Tier0);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    let result = kernel.finalize_post_effect_witness(
+        EnforcementTier::Monitor,
+        &plan.leakage_witness_seed,
+        &plan.timing_witness_seed,
+        None,
+        None,
+        None, // no waiver
+    );
+    assert!(result.is_err(), "monitor tier without waiver must deny");
+    match result.unwrap_err() {
+        AdmitError::WitnessWaiverInvalid { reason } => {
+            assert!(
+                reason.contains("explicit waiver"),
+                "reason should mention explicit waiver: {reason}"
+            );
+        },
+        other => panic!("expected WitnessWaiverInvalid, got: {other}"),
+    }
+}
+
+#[test]
+fn test_tck_00497_monitor_post_effect_succeeds_with_waiver() {
+    let kernel = fail_closed_kernel();
+    let request = valid_request(RiskTier::Tier0);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    let waiver = valid_monitor_waiver(request.request_id);
+    let result = kernel.finalize_post_effect_witness(
+        EnforcementTier::Monitor,
+        &plan.leakage_witness_seed,
+        &plan.timing_witness_seed,
+        None, // no evidence (waived)
+        None,
+        Some(&waiver),
+    );
+    assert!(result.is_ok(), "monitor tier with waiver should succeed");
+    let hashes = result.unwrap();
+    assert_eq!(
+        hashes.len(),
+        1,
+        "must have exactly 1 hash (the waiver hash for audit)"
+    );
+    assert_ne!(hashes[0], [0u8; 32], "waiver hash must be non-zero");
+}
+
+// ---- Boundary output release ----
+
+#[test]
+fn test_tck_00497_boundary_output_release_succeeds_with_evidence() {
+    let kernel = fail_closed_kernel();
+    let mut span = super::types::BoundarySpanV1 {
+        request_id: test_hash(1),
+        output_held: true,
+        enforcement_tier: EnforcementTier::FailClosed,
+    };
+
+    let evidence_hashes = vec![test_hash(180), test_hash(181)];
+    let result = kernel.release_boundary_output(&mut span, &evidence_hashes);
+    assert!(
+        result.is_ok(),
+        "release with evidence hashes should succeed"
+    );
+    assert!(!span.output_held, "output must be released after success");
+}
+
+#[test]
+fn test_tck_00497_boundary_output_release_denies_empty_evidence_fail_closed() {
+    let kernel = fail_closed_kernel();
+    let mut span = super::types::BoundarySpanV1 {
+        request_id: test_hash(1),
+        output_held: true,
+        enforcement_tier: EnforcementTier::FailClosed,
+    };
+
+    let result = kernel.release_boundary_output(&mut span, &[]);
+    assert!(
+        result.is_err(),
+        "empty evidence at fail-closed must deny release"
+    );
+    assert!(span.output_held, "output must remain held on denial");
+    match result.unwrap_err() {
+        AdmitError::OutputReleaseDenied { reason } => {
+            assert!(
+                reason.contains("no witness evidence"),
+                "reason should explain missing evidence: {reason}"
+            );
+        },
+        other => panic!("expected OutputReleaseDenied, got: {other}"),
+    }
+}
+
+#[test]
+fn test_tck_00497_boundary_output_double_release_denies() {
+    let kernel = fail_closed_kernel();
+    let mut span = super::types::BoundarySpanV1 {
+        request_id: test_hash(1),
+        output_held: false, // already released
+        enforcement_tier: EnforcementTier::FailClosed,
+    };
+
+    let evidence_hashes = vec![test_hash(180)];
+    let result = kernel.release_boundary_output(&mut span, &evidence_hashes);
+    assert!(result.is_err(), "double release must deny");
+    match result.unwrap_err() {
+        AdmitError::BoundaryMediationFailure { reason } => {
+            assert!(
+                reason.contains("double-release"),
+                "reason should mention double-release: {reason}"
+            );
+        },
+        other => panic!("expected BoundaryMediationFailure, got: {other}"),
+    }
+}
+
+#[test]
+fn test_tck_00497_boundary_output_monitor_release_always_succeeds() {
+    let kernel = fail_closed_kernel();
+    let mut span = super::types::BoundarySpanV1 {
+        request_id: test_hash(1),
+        output_held: false,
+        enforcement_tier: EnforcementTier::Monitor,
+    };
+
+    // Monitor tier: release succeeds even with empty evidence.
+    let result = kernel.release_boundary_output(&mut span, &[]);
+    assert!(
+        result.is_ok(),
+        "monitor tier release should succeed even without evidence"
+    );
+}
+
+// ---- WitnessEvidenceV1 validation ----
+
+#[test]
+fn test_tck_00497_witness_evidence_validate_rejects_zero_seed_hash() {
+    let ev = super::types::WitnessEvidenceV1 {
+        witness_class: "leakage".to_string(),
+        seed_hash: [0u8; 32], // zero
+        request_id: test_hash(1),
+        session_id: "test-session".to_string(),
+        ht_end: 100,
+        measured_values: vec![],
+        provider_id: "test-provider".to_string(),
+        provider_build_digest: test_hash(99),
+    };
+    let result = ev.validate();
+    assert!(result.is_err(), "zero seed_hash must be rejected");
+    match result.unwrap_err() {
+        AdmitError::WitnessEvidenceFailure { reason } => {
+            assert!(reason.contains("seed_hash"), "reason: {reason}");
+        },
+        other => panic!("expected WitnessEvidenceFailure, got: {other}"),
+    }
+}
+
+#[test]
+fn test_tck_00497_witness_evidence_validate_rejects_zero_ht_end() {
+    let ev = super::types::WitnessEvidenceV1 {
+        witness_class: "leakage".to_string(),
+        seed_hash: test_hash(50),
+        request_id: test_hash(1),
+        session_id: "test-session".to_string(),
+        ht_end: 0, // zero
+        measured_values: vec![],
+        provider_id: "test-provider".to_string(),
+        provider_build_digest: test_hash(99),
+    };
+    let result = ev.validate();
+    assert!(result.is_err(), "zero ht_end must be rejected");
+    match result.unwrap_err() {
+        AdmitError::WitnessEvidenceFailure { reason } => {
+            assert!(reason.contains("ht_end"), "reason: {reason}");
+        },
+        other => panic!("expected WitnessEvidenceFailure, got: {other}"),
+    }
+}
+
+#[test]
+fn test_tck_00497_witness_evidence_validate_rejects_oversized_measured_values() {
+    let too_many: Vec<Hash> = (0..=super::types::MAX_WITNESS_EVIDENCE_MEASURED_VALUES)
+        .map(|i| {
+            #[allow(clippy::cast_possible_truncation)]
+            test_hash(i as u8)
+        })
+        .collect();
+
+    let ev = super::types::WitnessEvidenceV1 {
+        witness_class: "leakage".to_string(),
+        seed_hash: test_hash(50),
+        request_id: test_hash(1),
+        session_id: "test-session".to_string(),
+        ht_end: 100,
+        measured_values: too_many,
+        provider_id: "test-provider".to_string(),
+        provider_build_digest: test_hash(99),
+    };
+    let result = ev.validate();
+    assert!(
+        result.is_err(),
+        "oversized measured_values must be rejected"
+    );
+    match result.unwrap_err() {
+        AdmitError::WitnessEvidenceFailure { reason } => {
+            assert!(
+                reason.contains("measured_values"),
+                "reason should mention measured_values: {reason}"
+            );
+        },
+        other => panic!("expected WitnessEvidenceFailure, got: {other}"),
+    }
+}
+
+// ---- WitnessEvidenceV1 content hash ----
+
+#[test]
+fn test_tck_00497_witness_evidence_content_hash_deterministic() {
+    let ev = super::types::WitnessEvidenceV1 {
+        witness_class: "leakage".to_string(),
+        seed_hash: test_hash(50),
+        request_id: test_hash(1),
+        session_id: "test-session".to_string(),
+        ht_end: 100,
+        measured_values: vec![test_hash(180)],
+        provider_id: "test-provider".to_string(),
+        provider_build_digest: test_hash(99),
+    };
+    let hash1 = ev.content_hash();
+    let hash2 = ev.content_hash();
+    assert_eq!(hash1, hash2, "content hash must be deterministic");
+    assert_ne!(hash1, [0u8; 32], "content hash must be non-zero");
+}
+
+#[test]
+fn test_tck_00497_witness_evidence_content_hash_changes_with_measured_values() {
+    let ev1 = super::types::WitnessEvidenceV1 {
+        witness_class: "timing".to_string(),
+        seed_hash: test_hash(50),
+        request_id: test_hash(1),
+        session_id: "test-session".to_string(),
+        ht_end: 100,
+        measured_values: vec![test_hash(180)],
+        provider_id: "test-provider".to_string(),
+        provider_build_digest: test_hash(99),
+    };
+    let ev2 = super::types::WitnessEvidenceV1 {
+        measured_values: vec![test_hash(180), test_hash(181)],
+        ..ev1.clone()
+    };
+    assert_ne!(
+        ev1.content_hash(),
+        ev2.content_hash(),
+        "different measured_values must produce different hashes"
+    );
+}
+
+// ---- MonitorWaiverV1 validation ----
+
+#[test]
+fn test_tck_00497_monitor_waiver_validate_rejects_zero_waiver_id() {
+    let waiver = super::types::MonitorWaiverV1 {
+        waiver_id: [0u8; 32],
+        reason: "test".to_string(),
+        expires_at_tick: 10000,
+        request_id: test_hash(1),
+        enforcement_tier: EnforcementTier::Monitor,
+    };
+    let result = waiver.validate();
+    assert!(result.is_err(), "zero waiver_id must be rejected");
+}
+
+#[test]
+fn test_tck_00497_monitor_waiver_validate_rejects_empty_reason() {
+    let waiver = super::types::MonitorWaiverV1 {
+        waiver_id: test_hash(200),
+        reason: String::new(),
+        expires_at_tick: 10000,
+        request_id: test_hash(1),
+        enforcement_tier: EnforcementTier::Monitor,
+    };
+    let result = waiver.validate();
+    assert!(result.is_err(), "empty reason must be rejected");
+}
+
+// ---- Integration: seed hashes in spine join extension + bundle ----
+
+#[test]
+fn test_tck_00497_seed_hashes_bound_into_spine_ext_and_bundle() {
+    let kernel = fail_closed_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+    let plan = kernel.plan(&request).expect("plan should succeed");
+
+    // Verify seed hashes are in the spine join extension.
+    let leakage_hash = plan.leakage_witness_seed.content_hash();
+    let timing_hash = plan.timing_witness_seed.content_hash();
+
+    assert_eq!(
+        plan.spine_ext.leakage_witness_seed_hash, leakage_hash,
+        "spine ext must contain leakage seed hash"
+    );
+    assert_eq!(
+        plan.spine_ext.timing_witness_seed_hash, timing_hash,
+        "spine ext must contain timing seed hash"
+    );
+
+    // Execute and verify seed hashes in bundle.
+    let mut plan_exec = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan_exec, test_hash(9), test_hash(12))
+        .expect("execute should succeed");
+
+    assert_eq!(
+        result.bundle.leakage_witness_seed_hash,
+        plan_exec.leakage_witness_seed.content_hash(),
+        "bundle must contain leakage seed hash"
+    );
+    assert_eq!(
+        result.bundle.timing_witness_seed_hash,
+        plan_exec.timing_witness_seed.content_hash(),
+        "bundle must contain timing seed hash"
+    );
+    assert_ne!(
+        result.bundle.leakage_witness_seed_hash, result.bundle.timing_witness_seed_hash,
+        "seed hashes in bundle must be unique"
+    );
+}
+
+// ---- End-to-end positive path: fail-closed tier with witnesses within budget
+// ----
+
+#[test]
+fn test_tck_00497_e2e_fail_closed_positive_path() {
+    let kernel = fail_closed_kernel();
+    let request = valid_request(RiskTier::Tier2Plus);
+
+    // Plan and validate seeds.
+    let plan = kernel.plan(&request).expect("plan should succeed");
+    let seed_result = kernel.validate_witness_seeds_at_join(
+        plan.enforcement_tier,
+        &plan.leakage_witness_seed,
+        &plan.timing_witness_seed,
+        None,
+    );
+    assert!(seed_result.is_ok(), "seed validation should succeed");
+
+    // Execute.
+    let mut plan2 = kernel.plan(&request).expect("plan should succeed");
+    let result = kernel
+        .execute(&mut plan2, test_hash(9), test_hash(12))
+        .expect("execute should succeed");
+
+    assert!(
+        result.boundary_span.output_held,
+        "output must be held for fail-closed tier"
+    );
+
+    // Finalize post-effect evidence.
+    let leakage_ev = evidence_from_seed(&plan2.leakage_witness_seed, 100);
+    let timing_ev = evidence_from_seed(&plan2.timing_witness_seed, 100);
+
+    let evidence_hashes = kernel
+        .finalize_post_effect_witness(
+            plan2.enforcement_tier,
+            &plan2.leakage_witness_seed,
+            &plan2.timing_witness_seed,
+            Some(&leakage_ev),
+            Some(&timing_ev),
+            None,
+        )
+        .expect("evidence finalization should succeed");
+
+    assert_eq!(evidence_hashes.len(), 2, "must have 2 evidence hashes");
+
+    // Release boundary output.
+    let mut span = result.boundary_span;
+    let release_result = kernel.release_boundary_output(&mut span, &evidence_hashes);
+    assert!(
+        release_result.is_ok(),
+        "output release should succeed with evidence"
+    );
+    assert!(!span.output_held, "output must be released");
+
+    // Verify evidence hashes can be bound into outcome index.
+    let outcome_index = super::types::AdmissionOutcomeIndexV1 {
+        schema_version: super::types::ADMISSION_OUTCOME_INDEX_SCHEMA_VERSION,
+        bundle_digest: result.bundle_digest,
+        request_id: result.bundle.request_id,
+        ajc_id: result.bundle.ajc_id,
+        post_effect_witness_evidence_hashes: evidence_hashes,
+        receipt_digests: vec![],
+    };
+    assert!(
+        outcome_index.validate().is_ok(),
+        "outcome index with evidence hashes must validate"
+    );
+    assert_ne!(
+        outcome_index.content_hash(),
+        [0u8; 32],
+        "outcome index hash must be non-zero"
+    );
+}
+
+// ---- WitnessEvidenceV1 JSON round-trip ----
+
+#[test]
+fn test_tck_00497_witness_evidence_json_round_trip() {
+    let ev = super::types::WitnessEvidenceV1 {
+        witness_class: "leakage".to_string(),
+        seed_hash: test_hash(50),
+        request_id: test_hash(1),
+        session_id: "test-session".to_string(),
+        ht_end: 100,
+        measured_values: vec![test_hash(180), test_hash(181)],
+        provider_id: "apm2-daemon/admission_kernel/test".to_string(),
+        provider_build_digest: test_hash(99),
+    };
+    let json = serde_json::to_string(&ev).expect("serialize must succeed");
+    let deser: super::types::WitnessEvidenceV1 =
+        serde_json::from_str(&json).expect("deserialize must succeed");
+    assert_eq!(
+        ev.content_hash(),
+        deser.content_hash(),
+        "round-trip must preserve content hash"
+    );
+    assert_eq!(
+        deser.measured_values.len(),
+        2,
+        "measured_values must survive round-trip"
+    );
+}
+
+// ---- MonitorWaiverV1 JSON round-trip ----
+
+#[test]
+fn test_tck_00497_monitor_waiver_json_round_trip() {
+    let waiver = valid_monitor_waiver(test_hash(1));
+    let json = serde_json::to_string(&waiver).expect("serialize must succeed");
+    let deser: super::types::MonitorWaiverV1 =
+        serde_json::from_str(&json).expect("deserialize must succeed");
+    assert_eq!(
+        waiver.content_hash(),
+        deser.content_hash(),
+        "round-trip must preserve content hash"
+    );
+}
