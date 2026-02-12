@@ -607,7 +607,7 @@ Ensures reconstruction of mandatory artifact tiers (source snapshots, policy roo
 - [INV-RA07] Trusted signer enforcement uses non-short-circuiting constant-time fold to prevent timing side-channels.
 - [INV-RA08] Domain-separated signatures prevent cross-receipt-type replay.
 - [INV-RA09] Collections are hard-capped: MAX_ERASURE_SHARDS=256, MAX_QUORUM_SIGNERS=128, MAX_RECONSTRUCTION_RECEIPTS=256, MAX_POLICY_SIGNATURES=64.
-- [INV-RA10] All protocol-boundary `String` fields use bounded serde deserializers (Check-Before-Allocate pattern).
+- [INV-RA10] All protocol-boundary `String` and `Vec` fields use bounded serde deserializers (Check-Before-Allocate pattern).
 - [INV-RA11] `create_signed` methods validate string field lengths BEFORE allocation to prevent DoS via oversized input.
 - [INV-RA12] Duplicate receipt IDs are rejected to prevent signature amplification attacks.
 - [INV-RA13] `ReconstructionMode` forces callers to explicitly declare reconstruction intent; `Option`-based bypass is eliminated.

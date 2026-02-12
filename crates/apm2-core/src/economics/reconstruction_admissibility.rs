@@ -36,7 +36,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
-use crate::crypto::{Hash, Signer, SignerError, parse_signature, parse_verifying_key};
+use crate::crypto::{EventHasher, Hash, Signer, SignerError, parse_signature, parse_verifying_key};
 use crate::fac::{sign_with_domain, verify_with_domain};
 use crate::pcac::MAX_REASON_LENGTH;
 use crate::pcac::temporal_arbitration::TemporalPredicateId;
@@ -77,6 +77,12 @@ pub const MAX_PROFILE_ID_LENGTH: usize = 256;
 /// Re-uses the canonical [`MAX_REASON_LENGTH`] from PCAC types to ensure
 /// consistent bounds across the codebase.
 pub const MAX_DENY_REASON_LENGTH: usize = MAX_REASON_LENGTH;
+
+/// Maximum number of predicate results in a reconstruction decision.
+///
+/// Each evaluation produces at most one result per gate (4 gates), so 16
+/// provides generous headroom while still bounding deserialization.
+pub const MAX_PREDICATE_RESULTS: usize = 16;
 
 /// Minimum quorum fraction numerator (2/3 BFT threshold).
 /// The quorum threshold is `MIN_QUORUM_NUMERATOR / MIN_QUORUM_DENOMINATOR`.
@@ -170,9 +176,12 @@ pub const DENY_RECONSTRUCTION_RECEIPT_MISSING: &str = "reconstruction_receipt_mi
 pub const DENY_RECONSTRUCTION_RECEIPTS_EXCEEDED: &str = "reconstruction_receipts_exceeded";
 /// Deny: reconstruction receipt ID is empty or oversized.
 pub const DENY_RECONSTRUCTION_RECEIPT_ID_INVALID: &str = "reconstruction_receipt_id_invalid";
-/// Deny: reconstruction receipt boundary ID is empty or oversized.
+/// Deny: reconstruction receipt boundary ID is empty.
 pub const DENY_RECONSTRUCTION_RECEIPT_BOUNDARY_ID_INVALID: &str =
     "reconstruction_receipt_boundary_id_invalid";
+/// Deny: reconstruction receipt boundary ID exceeds maximum length.
+pub const DENY_RECONSTRUCTION_RECEIPT_BOUNDARY_ID_LENGTH_EXCEEDED: &str =
+    "reconstruction_receipt_boundary_id_length_exceeded";
 /// Deny: reconstruction receipt time authority reference is zero.
 pub const DENY_RECONSTRUCTION_RECEIPT_TIME_AUTH_ZERO: &str =
     "reconstruction_receipt_time_authority_ref_zero";
@@ -342,6 +351,104 @@ where
 }
 
 // ============================================================================
+// Bounded Vec deserialization (OOM-safe)
+// ============================================================================
+
+/// Deserializes a `Vec<T>` with a hard item-count bound to prevent OOM
+/// during deserialization from untrusted input.
+///
+/// The visitor checks the element count during streaming, rejecting
+/// payloads that exceed `max_items` BEFORE allocating memory for
+/// additional elements.
+fn deserialize_bounded_vec<'de, D, T>(
+    deserializer: D,
+    max_items: usize,
+    field_name: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T> {
+        max_items: usize,
+        field_name: &'static str,
+        _marker: std::marker::PhantomData<T>,
+    }
+
+    impl<'de, T> Visitor<'de> for BoundedVecVisitor<T>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a sequence with at most {} items for field '{}'",
+                self.max_items, self.field_name
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut vec = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(self.max_items));
+
+            while let Some(item) = seq.next_element()? {
+                if vec.len() >= self.max_items {
+                    return Err(de::Error::custom(format!(
+                        "collection '{}' exceeds maximum size of {}",
+                        self.field_name, self.max_items
+                    )));
+                }
+                vec.push(item);
+            }
+
+            Ok(vec)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor {
+        max_items,
+        field_name,
+        _marker: std::marker::PhantomData,
+    })
+}
+
+// Field-specific Vec deserializers for `#[serde(deserialize_with = "...")]`.
+
+fn deser_available_shard_digests<'de, D>(deserializer: D) -> Result<Vec<Hash>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_ERASURE_SHARDS, "available_shard_digests")
+}
+
+fn deser_quorum_signers<'de, D>(deserializer: D) -> Result<Vec<QuorumSigner>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_QUORUM_SIGNERS, "signers")
+}
+
+fn deser_policy_signatures<'de, D>(deserializer: D) -> Result<Vec<Hash>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_POLICY_SIGNATURES, "policy_signatures")
+}
+
+fn deser_predicate_results<'de, D>(
+    deserializer: D,
+) -> Result<Vec<(TemporalPredicateId, bool)>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_PREDICATE_RESULTS, "predicate_results")
+}
+
+// ============================================================================
 // Error types
 // ============================================================================
 
@@ -427,6 +534,7 @@ pub struct ErasureProfile {
     /// Minimum number of shards required for reconstruction.
     pub required_shards: u32,
     /// Digests of available (recovered) shards.
+    #[serde(deserialize_with = "deser_available_shard_digests")]
     pub available_shard_digests: Vec<Hash>,
     /// Content-addressed digest of the erasure profile declaration.
     pub profile_digest: Hash,
@@ -471,6 +579,7 @@ pub struct BftQuorumCertificate {
     /// Total number of nodes in the BFT quorum.
     pub total_nodes: u32,
     /// Signers who have certified the recovered digest.
+    #[serde(deserialize_with = "deser_quorum_signers")]
     pub signers: Vec<QuorumSigner>,
     /// The digest that has been quorum-certified.
     pub certified_digest: Hash,
@@ -517,6 +626,7 @@ pub struct SourceTrustSnapshot {
     /// Combined digest of policy signatures.
     pub policy_digest: Hash,
     /// Individual policy signature entries (each a hash binding).
+    #[serde(deserialize_with = "deser_policy_signatures")]
     pub policy_signatures: Vec<Hash>,
     /// Content-addressed hash of the snapshot.
     pub content_hash: Hash,
@@ -733,8 +843,11 @@ impl ReconstructionAdmissibilityReceiptV1 {
         if self.receipt_id.is_empty() || self.receipt_id.len() > MAX_RECEIPT_ID_LENGTH {
             return Err(DENY_RECONSTRUCTION_RECEIPT_ID_INVALID);
         }
-        if self.boundary_id.is_empty() || self.boundary_id.len() > MAX_BOUNDARY_ID_LENGTH {
+        if self.boundary_id.is_empty() {
             return Err(DENY_RECONSTRUCTION_RECEIPT_BOUNDARY_ID_INVALID);
+        }
+        if self.boundary_id.len() > MAX_BOUNDARY_ID_LENGTH {
+            return Err(DENY_RECONSTRUCTION_RECEIPT_BOUNDARY_ID_LENGTH_EXCEEDED);
         }
         if is_zero_hash(&self.time_authority_ref) {
             return Err(DENY_RECONSTRUCTION_RECEIPT_TIME_AUTH_ZERO);
@@ -1092,6 +1205,7 @@ pub struct ReconstructionDecision {
     /// Deny defect (present when verdict is `Deny`).
     pub defect: Option<ReconstructionDenyDefect>,
     /// Temporal predicate results: (`predicate_id`, passed).
+    #[serde(deserialize_with = "deser_predicate_results")]
     pub predicate_results: Vec<(TemporalPredicateId, bool)>,
 }
 
@@ -1397,8 +1511,10 @@ pub fn validate_reconstruction_receipts(
             return Err(DENY_RECONSTRUCTION_RECEIPT_SIGNER_UNTRUSTED);
         }
 
-        // Context binding: boundary must match evaluation.
-        if receipt.boundary_id != eval_boundary_id {
+        // Context binding: boundary must match evaluation (constant-time
+        // comparison to prevent timing side-channel leaking boundary_id
+        // prefix-match length).
+        if !ct_eq_str(&receipt.boundary_id, eval_boundary_id) {
             return Err(DENY_RECONSTRUCTION_RECEIPT_BOUNDARY_MISMATCH);
         }
 
@@ -1458,6 +1574,18 @@ pub fn validate_reconstruction_receipts(
 
 fn is_zero_hash(hash: &[u8; 32]) -> bool {
     hash.ct_eq(&ZERO_HASH).unwrap_u8() == 1
+}
+
+/// Constant-time string comparison via Blake3 hash equality (INV-RA10).
+///
+/// Hashes both operands to fixed-size digests and compares via
+/// `ConstantTimeEq`, preventing timing side-channel leaks on
+/// variable-length boundary identifiers. This avoids the early-exit
+/// behaviour of standard `!=` which leaks prefix-match length.
+fn ct_eq_str(a: &str, b: &str) -> bool {
+    let hash_a = EventHasher::hash_content(a.as_bytes());
+    let hash_b = EventHasher::hash_content(b.as_bytes());
+    hash_a.ct_eq(&hash_b).unwrap_u8() == 1
 }
 
 fn validate_required_string(
@@ -2944,5 +3072,250 @@ mod tests {
         let recovered = test_hash(0xFF);
         let result = validate_bft_quorum_certification(Some(&cert), &recovered, &trusted, 1);
         assert!(result.is_ok());
+    }
+
+    // ========================================================================
+    // Constant-time string comparison
+    // ========================================================================
+
+    #[test]
+    fn ct_eq_str_equal_strings_match() {
+        assert!(ct_eq_str("boundary-1", "boundary-1"));
+    }
+
+    #[test]
+    fn ct_eq_str_different_strings_no_match() {
+        assert!(!ct_eq_str("boundary-1", "boundary-2"));
+    }
+
+    #[test]
+    fn ct_eq_str_empty_vs_nonempty_no_match() {
+        assert!(!ct_eq_str("", "boundary-1"));
+    }
+
+    #[test]
+    fn ct_eq_str_both_empty_match() {
+        assert!(ct_eq_str("", ""));
+    }
+
+    // ========================================================================
+    // Boundary ID length-exceeded separate deny code
+    // ========================================================================
+
+    #[test]
+    fn reconstruction_receipt_validate_empty_boundary_id_denied() {
+        let signer = valid_signer();
+        let mut receipt = valid_reconstruction_receipt(&signer);
+        receipt.boundary_id = String::new();
+        assert_eq!(
+            receipt.validate().unwrap_err(),
+            DENY_RECONSTRUCTION_RECEIPT_BOUNDARY_ID_INVALID
+        );
+    }
+
+    #[test]
+    fn reconstruction_receipt_validate_oversized_boundary_id_denied() {
+        let signer = valid_signer();
+        let mut receipt = valid_reconstruction_receipt(&signer);
+        receipt.boundary_id = "x".repeat(MAX_BOUNDARY_ID_LENGTH + 1);
+        assert_eq!(
+            receipt.validate().unwrap_err(),
+            DENY_RECONSTRUCTION_RECEIPT_BOUNDARY_ID_LENGTH_EXCEEDED
+        );
+    }
+
+    // ========================================================================
+    // Bounded Vec deserialization (OOM-DoS prevention)
+    // ========================================================================
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn bounded_vec_deser_erasure_shards_rejects_overflow() {
+        // Build a JSON payload where available_shard_digests has more than
+        // MAX_ERASURE_SHARDS elements. Deserialization must fail before
+        // allocating all of them.
+        let shard_json: Vec<String> = (0..=MAX_ERASURE_SHARDS)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (i & 0xFF) as u8;
+                h[31] = 0xFF;
+                serde_json::to_string(&h).unwrap()
+            })
+            .collect();
+        let json = format!(
+            r#"{{"tier_id":"t","profile_id":"p","total_shards":300,"required_shards":1,"available_shard_digests":[{}],"profile_digest":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],"expected_artifact_digest":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]}}"#,
+            shard_json.join(",")
+        );
+        let result: Result<ErasureProfile, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "should reject Vec exceeding MAX_ERASURE_SHARDS"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("exceeds maximum size"),
+            "error should mention exceeds maximum size: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn bounded_vec_deser_quorum_signers_rejects_overflow() {
+        // Build a JSON payload with more than MAX_QUORUM_SIGNERS entries.
+        let signer_json: Vec<String> = (0..=MAX_QUORUM_SIGNERS)
+            .map(|_| {
+                let mut key = [0u8; 32];
+                key[0] = 0xFF;
+                let sig = [0u8; 64];
+                format!(
+                    r#"{{"signer_key":{},"signature":{}}}"#,
+                    serde_json::to_string(&key[..]).unwrap(),
+                    serde_json::to_string(&sig[..]).unwrap()
+                )
+            })
+            .collect();
+        let json = format!(
+            r#"{{"total_nodes":200,"signers":[{}],"certified_digest":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],"cert_digest":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]}}"#,
+            signer_json.join(",")
+        );
+        let result: Result<BftQuorumCertificate, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "should reject Vec exceeding MAX_QUORUM_SIGNERS"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn bounded_vec_deser_policy_signatures_rejects_overflow() {
+        // Build a JSON payload with more than MAX_POLICY_SIGNATURES entries.
+        let sig_json: Vec<String> = (0..=MAX_POLICY_SIGNATURES)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (i & 0xFF) as u8;
+                h[31] = 0xFF;
+                serde_json::to_string(&h).unwrap()
+            })
+            .collect();
+        let json = format!(
+            r#"{{"cas_root":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],"ledger_head":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],"policy_digest":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],"policy_signatures":[{}],"content_hash":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]}}"#,
+            sig_json.join(",")
+        );
+        let result: Result<SourceTrustSnapshot, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "should reject Vec exceeding MAX_POLICY_SIGNATURES"
+        );
+    }
+
+    #[test]
+    fn bounded_vec_deser_within_limit_succeeds() {
+        // Verify that a Vec within limits deserializes successfully.
+        let profile = valid_erasure_profile();
+        let json = serde_json::to_string(&profile).unwrap();
+        let decoded: ErasureProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, profile);
+    }
+
+    // ========================================================================
+    // End-to-end evaluate_reconstruction_admissibility integration tests
+    // ========================================================================
+
+    #[test]
+    fn e2e_evaluate_reconstruction_admissibility_happy_path() {
+        // Full gate composition (gates 1-4) with valid input produces ALLOW.
+        let receipt_signer = valid_signer();
+        let s1 = valid_signer();
+        let s2 = valid_signer();
+        let s3 = valid_signer();
+        let input = valid_reconstruction_input(&receipt_signer, &[&s1, &s2, &s3]);
+        let decision = evaluate_reconstruction_admissibility(
+            &input,
+            "boundary-1",
+            1000,
+            test_hash(0xBB),
+            test_hash(0xCC),
+        );
+        assert_eq!(decision.verdict, ReconstructionVerdict::Allow);
+        assert!(decision.defect.is_none());
+        // Must have predicate results for both TP-EIO29-004 and TP-EIO29-001.
+        assert!(decision.predicate_results.len() >= 2);
+        let tp004 = decision
+            .predicate_results
+            .iter()
+            .find(|(pid, _)| *pid == TemporalPredicateId::TpEio29004);
+        let tp001 = decision
+            .predicate_results
+            .iter()
+            .find(|(pid, _)| *pid == TemporalPredicateId::TpEio29001);
+        assert!(tp004.is_some(), "must include TP-EIO29-004 result");
+        assert!(tp001.is_some(), "must include TP-EIO29-001 result");
+        assert!(tp004.unwrap().1, "TP-EIO29-004 must pass");
+        assert!(tp001.unwrap().1, "TP-EIO29-001 must pass");
+    }
+
+    #[test]
+    fn e2e_evaluate_reconstruction_admissibility_deny_receipt_boundary_mismatch() {
+        // Full gate composition through gates 1-3, denied at gate 4 by
+        // receipt boundary mismatch.
+        let receipt_signer = valid_signer();
+        let s1 = valid_signer();
+        let s2 = valid_signer();
+        let s3 = valid_signer();
+        let input = valid_reconstruction_input(&receipt_signer, &[&s1, &s2, &s3]);
+        // Receipt has boundary_id="boundary-1" but we evaluate with
+        // "mismatched-boundary", causing a gate 4 deny.
+        let decision = evaluate_reconstruction_admissibility(
+            &input,
+            "mismatched-boundary",
+            1000,
+            test_hash(0xBB),
+            test_hash(0xCC),
+        );
+        assert_eq!(decision.verdict, ReconstructionVerdict::Deny);
+        let defect = decision.defect.as_ref().unwrap();
+        assert_eq!(defect.reason, DENY_RECONSTRUCTION_RECEIPT_BOUNDARY_MISMATCH);
+        assert_eq!(defect.predicate_id, TemporalPredicateId::TpEio29001);
+        assert_eq!(
+            defect.failure_mode,
+            ReconstructionFailureMode::ReceiptValidationFailed
+        );
+        assert_eq!(defect.boundary_id, "mismatched-boundary");
+        assert_eq!(defect.denied_at_tick, 1000);
+    }
+
+    #[test]
+    fn e2e_evaluate_reconstruction_admissibility_deny_not_admitted() {
+        // All gates pass structurally, but receipt has admitted=false.
+        let receipt_signer = valid_signer();
+        let s1 = valid_signer();
+        let s2 = valid_signer();
+        let s3 = valid_signer();
+        let mut input = valid_reconstruction_input(&receipt_signer, &[&s1, &s2, &s3]);
+        // Replace with a non-admitted receipt.
+        let not_admitted = ReconstructionAdmissibilityReceiptV1::create_signed(
+            "recon-rcpt-deny",
+            "boundary-1",
+            "source_snapshots",
+            false, // NOT admitted
+            test_hash(0xBB),
+            test_hash(0xCC),
+            test_hash(0xAA),
+            test_hash(0xEE),
+            test_hash(0xDD),
+            "actor-1",
+            &receipt_signer,
+        )
+        .unwrap();
+        input.receipts = vec![not_admitted];
+        let decision = evaluate_reconstruction_admissibility(
+            &input,
+            "boundary-1",
+            2000,
+            test_hash(0xBB),
+            test_hash(0xCC),
+        );
+        assert_eq!(decision.verdict, ReconstructionVerdict::Deny);
+        let defect = decision.defect.as_ref().unwrap();
+        assert_eq!(defect.reason, DENY_RECONSTRUCTION_RECEIPT_NOT_ADMITTED);
     }
 }
