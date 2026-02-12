@@ -8389,34 +8389,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 broker_request.with_idempotency_key(Some(result.idempotency_key.as_hex()));
         }
 
-        // ================================================================
-        // TCK-00501 SEC-MAJOR-1 FIX: Record effect journal Started at the
-        // TRUE pre-dispatch boundary — immediately before broker.execute().
-        //
-        // All fallible pre-dispatch steps (ToolActuation evidence
-        // persistence, EpisodeId construction, risk tier resolution,
-        // BrokerToolRequest assembly) have completed. If record_started
-        // fails, deny the request (fail-closed). This prevents false
-        // in-doubt classification from orphaned Started entries.
-        // ================================================================
-        if let Some(ref result) = admission_result {
-            if let (Some(journal), Some(binding)) =
-                (&result.effect_journal, &result.journal_binding)
-            {
-                if let Err(e) = journal.record_started(binding) {
-                    warn!(
-                        session_id = %token.session_id,
-                        error = %e,
-                        "effect journal record_started failed at pre-dispatch boundary (fail-closed)"
-                    );
-                    return Ok(SessionResponse::error(
-                        SessionErrorCode::SessionErrorToolNotAllowed,
-                        format!("effect journal record_started failed: {e}"),
-                    ));
-                }
-            }
-        }
-
         // Call broker.request() asynchronously using tokio runtime
         let tool_actuation_started = Instant::now();
         let broker_response = tokio::task::block_in_place(|| {
@@ -8675,6 +8647,38 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 token_len = channel_context_token.len(),
                 "channel context token issued for actuation request"
             );
+        }
+
+        let broker_decision_allows_effect_dispatch =
+            matches!(&decision, Ok(ToolDecision::Allow { .. }));
+
+        // ================================================================
+        // TCK-00501 SEC-MAJOR-1 FIX: Record effect journal Started only
+        // for broker-allow requests, at the true daemon-side dispatch
+        // boundary immediately before `handle_broker_decision` executes.
+        //
+        // Broker deny/cache-hit outcomes must not allocate `Started`
+        // entries. This prevents deny storms from saturating journal
+        // capacity with orphaned in-flight entries.
+        // ================================================================
+        if broker_decision_allows_effect_dispatch {
+            if let Some(ref result) = admission_result {
+                if let (Some(journal), Some(binding)) =
+                    (&result.effect_journal, &result.journal_binding)
+                {
+                    if let Err(e) = journal.record_started(binding) {
+                        warn!(
+                            session_id = %token.session_id,
+                            error = %e,
+                            "effect journal record_started failed at allow-dispatch boundary (fail-closed)"
+                        );
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorToolNotAllowed,
+                            format!("effect journal record_started failed: {e}"),
+                        ));
+                    }
+                }
+            }
         }
 
         let mut response = self.handle_broker_decision(
@@ -9137,7 +9141,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // ================================================================
         if let Some(ref admission_res) = admission_result {
             if let Ok(SessionResponse::RequestTool(ref resp)) = response {
-                if resp.decision == i32::from(DecisionType::Allow) {
+                if broker_decision_allows_effect_dispatch
+                    && resp.decision == i32::from(DecisionType::Allow)
+                {
                     if let Some(ref journal) = admission_res.effect_journal {
                         if let Err(e) = journal.record_completed(&admission_res.bundle.request_id) {
                             warn!(
@@ -14739,7 +14745,7 @@ mod tests {
         use crate::episode::preactuation::{PreActuationGate, StopAuthority};
         use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
         use crate::htf::{ClockConfig, HolonicClock};
-        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+        use crate::session::{SessionRegistry, SessionState};
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -14781,7 +14787,7 @@ mod tests {
                 .expect("session registration should succeed");
             let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let telemetry = Arc::new(crate::session::SessionTelemetryStore::new());
             let started_at_ns = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|duration| {
@@ -14901,7 +14907,7 @@ mod tests {
             RiskTier as CapabilityRiskTier, ToolBroker, ToolBrokerConfig, ToolClass,
         };
         use crate::htf::{ClockConfig, HolonicClock};
-        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+        use crate::session::{SessionRegistry, SessionState};
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -14959,7 +14965,7 @@ mod tests {
                 .expect("session registration should succeed");
             let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let telemetry = Arc::new(crate::session::SessionTelemetryStore::new());
             let started_at_ns = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|duration| {
@@ -16787,7 +16793,7 @@ mod tests {
         use crate::episode::preactuation::{PreActuationGate, StopAuthority};
         use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
         use crate::htf::{ClockConfig, HolonicClock};
-        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+        use crate::session::{SessionRegistry, SessionState};
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -16829,7 +16835,7 @@ mod tests {
                 .expect("session registration should succeed");
             let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let telemetry = Arc::new(crate::session::SessionTelemetryStore::new());
             let started_at_ns = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|duration| {
@@ -16967,7 +16973,7 @@ mod tests {
         use crate::episode::preactuation::{PreActuationGate, StopAuthority};
         use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
         use crate::htf::{ClockConfig, HolonicClock};
-        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+        use crate::session::{SessionRegistry, SessionState};
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -17009,7 +17015,7 @@ mod tests {
                 .expect("session registration should succeed");
             let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let telemetry = Arc::new(crate::session::SessionTelemetryStore::new());
             let started_at_ns = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|duration| {
@@ -17142,7 +17148,7 @@ mod tests {
         use crate::episode::preactuation::{PreActuationGate, StopAuthority};
         use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
         use crate::htf::{ClockConfig, HolonicClock};
-        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+        use crate::session::{SessionRegistry, SessionState};
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -17188,7 +17194,7 @@ mod tests {
                 .expect("session registration should succeed");
             let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let telemetry = Arc::new(crate::session::SessionTelemetryStore::new());
             let started_at_ns = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|duration| {
@@ -17324,7 +17330,7 @@ mod tests {
         use crate::protocol::dispatch::{
             LedgerEventEmitter, LedgerEventError, SignedLedgerEvent, StubLedgerEventEmitter,
         };
-        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+        use crate::session::{SessionRegistry, SessionState};
 
         #[derive(Debug)]
         struct MockInferenceHandler {
@@ -17712,7 +17718,7 @@ mod tests {
                 .expect("session registration should succeed");
             let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let telemetry = Arc::new(crate::session::SessionTelemetryStore::new());
             let started_at_ns = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|duration| {
@@ -19078,7 +19084,7 @@ mod tests {
         use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
         use crate::htf::{ClockConfig, HolonicClock};
         use crate::protocol::dispatch::{LedgerEventEmitter, StubLedgerEventEmitter};
-        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+        use crate::session::{SessionRegistry, SessionState};
 
         /// TCK-00316: Verify fail-closed behavior when broker is configured but
         /// holonic clock is missing.
@@ -19409,7 +19415,7 @@ mod tests {
                     .expect("session registration");
                 let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-                let telemetry_store = Arc::new(SessionTelemetryStore::new());
+                let telemetry_store = Arc::new(crate::session::SessionTelemetryStore::new());
                 let started_at_ns = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                     .map(|duration| {
@@ -19546,7 +19552,7 @@ mod tests {
                     .expect("session registration");
                 let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-                let telemetry_store = Arc::new(SessionTelemetryStore::new());
+                let telemetry_store = Arc::new(crate::session::SessionTelemetryStore::new());
                 let started_at_ns = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                     .map(|duration| {
@@ -19700,7 +19706,7 @@ mod tests {
                     .expect("session registration");
                 let registry_dyn: Arc<dyn SessionRegistry> = registry;
 
-                let telemetry_store = Arc::new(SessionTelemetryStore::new());
+                let telemetry_store = Arc::new(crate::session::SessionTelemetryStore::new());
                 let started_at_ns = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                     .map(|duration| {
@@ -22201,7 +22207,7 @@ mod tests {
                     .expect("register session");
 
                 // Telemetry store - register with real start time
-                let telemetry_store = Arc::new(SessionTelemetryStore::new());
+                let telemetry_store = Arc::new(crate::session::SessionTelemetryStore::new());
                 let started_at_ns = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                     .map(|d| {
@@ -24398,7 +24404,7 @@ mod tests {
 
         /// Creates a capability manifest where the given tool class is at Tier3
         /// (fail-closed enforcement).
-        fn make_tier3_manifest(tool: ToolClass) -> crate::episode::CapabilityManifest {
+        pub(super) fn make_tier3_manifest(tool: ToolClass) -> crate::episode::CapabilityManifest {
             let capability = Capability {
                 capability_id: format!("cap-{tool}-tier3"),
                 tool_class: tool,
@@ -26824,6 +26830,135 @@ mod tests {
                     1_000_000_001,
                 )
                 .expect("governance event emission should succeed");
+        }
+
+        /// **SEC-MAJOR-1 regression**: repeated broker-denied `RequestTool`
+        /// calls must not create stale `Started` journal entries.
+        ///
+        /// This test drives the real `handle_request_tool` path through
+        /// kernel plan/execute with a broker manifest mismatch (dispatch
+        /// allows `read`, broker allows only `search`) and repeats deny
+        /// outcomes. Journal cardinality must remain bounded at zero.
+        #[test]
+        fn request_tool_broker_deny_does_not_accumulate_started_entries() {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+
+            rt.block_on(async {
+                let minter = test_minter();
+                let mock_journal = Arc::new(MockEffectJournal::new());
+                let kernel = build_kernel(Arc::clone(&mock_journal));
+
+                let dispatch_manifest = super::tck_00494_admission_kernel_guard::make_tier3_manifest(
+                    crate::episode::ToolClass::Read,
+                );
+                let broker_manifest = super::tck_00494_admission_kernel_guard::make_tier3_manifest(
+                    crate::episode::ToolClass::Search,
+                );
+
+                let manifest_store = Arc::new(InMemoryManifestStore::new());
+                manifest_store.register("session-001", dispatch_manifest);
+
+                let broker = Arc::new(crate::episode::ToolBroker::new(
+                    crate::episode::ToolBrokerConfig::default().without_policy_check(),
+                ));
+                broker
+                    .initialize_with_manifest(broker_manifest)
+                    .await
+                    .expect("broker manifest initialization");
+
+                let ledger = StubLedgerEventEmitter::new();
+                seed_governance_event(&ledger);
+                let ledger_dyn: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
+                    Arc::new(ledger);
+
+                let session_registry = Arc::new(InMemorySessionRegistry::new());
+                let session_registry_dyn = register_session(&session_registry, "session-001");
+                let telemetry_store = Arc::new(crate::session::SessionTelemetryStore::new());
+                let started_at_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|duration| {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let value = duration.as_nanos() as u64;
+                        value
+                    })
+                    .unwrap_or(1);
+                telemetry_store
+                    .register("session-001", started_at_ns)
+                    .expect("telemetry registration should succeed");
+
+                let clock = Arc::new(
+                    crate::htf::HolonicClock::new(crate::htf::ClockConfig::default(), None)
+                        .expect("test clock should initialize"),
+                );
+                let stop_authority =
+                    Arc::new(crate::episode::preactuation::StopAuthority::new());
+                let preactuation_gate = Arc::new(
+                    crate::episode::preactuation::PreActuationGate::production_gate(
+                        Arc::clone(&stop_authority),
+                        None,
+                    ),
+                );
+
+                let dispatcher =
+                    SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                        .with_broker(broker)
+                        .with_ledger(ledger_dyn)
+                        .with_session_registry(session_registry_dyn)
+                        .with_admission_kernel(kernel)
+                        .with_clock(clock)
+                        .with_telemetry_store(telemetry_store)
+                        .with_preactuation_gate(preactuation_gate)
+                        .with_stop_authority(stop_authority);
+
+                let token = test_token(&minter);
+                let ctx = make_session_ctx();
+
+                for i in 0..32usize {
+                    let request = RequestToolRequest {
+                        session_token: serde_json::to_string(&token).unwrap(),
+                        tool_id: "read".to_string(),
+                        arguments: serde_json::to_vec(&serde_json::json!({
+                            "path": format!("/tmp/deny-storm-{i}.txt")
+                        }))
+                        .unwrap(),
+                        dedupe_key: format!("deny-storm-{i}"),
+                        epoch_seal: None,
+                    };
+                    let frame = encode_request_tool_request(&request);
+                    let response = dispatcher
+                        .dispatch(&frame, &ctx)
+                        .expect("dispatch should return application response");
+                    match response {
+                        SessionResponse::RequestTool(resp) => {
+                            assert_eq!(
+                                resp.decision,
+                                i32::from(DecisionType::Deny),
+                                "broker deny expected for read request against search-only broker manifest"
+                            );
+                        },
+                        other => panic!("expected RequestTool deny response, got: {other:?}"),
+                    }
+                }
+
+                assert_eq!(
+                    mock_journal.started_count(),
+                    0,
+                    "broker-denied requests must not leave Started entries"
+                );
+                assert_eq!(
+                    mock_journal.completed_count(),
+                    0,
+                    "broker-denied requests must not create Completed entries"
+                );
+                assert_eq!(
+                    mock_journal.started_count() + mock_journal.completed_count(),
+                    0,
+                    "journal cardinality must remain bounded for repeated deny outcomes"
+                );
+            });
         }
 
         // ----------------------------------------------------------------

@@ -74,10 +74,11 @@ use super::types::EnforcementTier;
 // Resource limits
 // =============================================================================
 
-/// Maximum number of journal entries held in the in-memory index.
+/// Maximum number of active in-flight entries held in the in-memory index.
 ///
-/// When the index exceeds this limit, new entries are denied (fail-closed).
-/// This prevents unbounded memory growth from adversarial request churn.
+/// Active entries are requests in `Started` or `Unknown` state. Terminal
+/// entries (`Completed`/`NotStarted`) are retained for replay/audit but do
+/// not consume admission slots.
 const MAX_JOURNAL_ENTRIES: usize = 1_000_000;
 
 /// Maximum length for the boundary profile field in journal entries.
@@ -176,9 +177,9 @@ pub enum EffectJournalError {
 
     /// Journal capacity exhausted (fail-closed).
     CapacityExhausted {
-        /// Current number of entries.
+        /// Current number of active entries (`Started`/`Unknown`).
         count: usize,
-        /// Maximum allowed entries.
+        /// Maximum allowed active entries.
         max: usize,
     },
 
@@ -554,7 +555,7 @@ pub trait EffectJournal: Send + Sync {
     /// - `InvalidTransition` if the request already has a `Started`,
     ///   `Completed`, or `Unknown` entry (but NOT `NotStarted`, which permits
     ///   re-execution after `resolve_in_doubt`).
-    /// - `CapacityExhausted` if the journal is full.
+    /// - `CapacityExhausted` if active in-flight entries are at capacity.
     /// - `IoError` if the durable write fails.
     fn record_started(&self, binding: &EffectJournalBindingV1) -> Result<(), EffectJournalError>;
 
@@ -619,6 +620,21 @@ struct JournalRecord {
     binding: EffectJournalBindingV1,
 }
 
+#[inline]
+const fn state_counts_toward_capacity(state: EffectExecutionState) -> bool {
+    matches!(
+        state,
+        EffectExecutionState::Started | EffectExecutionState::Unknown
+    )
+}
+
+fn active_entry_count(entries: &HashMap<Hash, JournalRecord>) -> usize {
+    entries
+        .values()
+        .filter(|record| state_counts_toward_capacity(record.state))
+        .count()
+}
+
 // =============================================================================
 // Journal line format
 // =============================================================================
@@ -668,6 +684,8 @@ const TAG_RESOLVED: char = 'R';
 pub struct FileBackedEffectJournal {
     /// Path to the append-only journal file.
     path: PathBuf,
+    /// Maximum allowed active entries (`Started`/`Unknown`).
+    max_active_entries: usize,
     /// In-memory index: `request_id` -> `JournalRecord`.
     ///
     /// Protected by Mutex. Lock ordering: acquire `entries` before `file`.
@@ -685,6 +703,7 @@ impl std::fmt::Debug for FileBackedEffectJournal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileBackedEffectJournal")
             .field("path", &self.path)
+            .field("max_active_entries", &self.max_active_entries)
             .field("entry_count", &self.len())
             .finish_non_exhaustive()
     }
@@ -704,10 +723,31 @@ impl FileBackedEffectJournal {
     ///
     /// - `IoError` if the file cannot be opened or locked.
     /// - `CorruptEntry` if mid-file corruption is detected.
-    /// - `CapacityExhausted` if replayed entries exceed the limit.
+    /// - `CapacityExhausted` if replayed active entries exceed the limit.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, EffectJournalError> {
+        Self::open_with_capacity(path, MAX_JOURNAL_ENTRIES)
+    }
+
+    #[cfg(test)]
+    fn open_with_max_active_entries(
+        path: impl AsRef<Path>,
+        max_active_entries: usize,
+    ) -> Result<Self, EffectJournalError> {
+        Self::open_with_capacity(path, max_active_entries)
+    }
+
+    fn open_with_capacity(
+        path: impl AsRef<Path>,
+        max_active_entries: usize,
+    ) -> Result<Self, EffectJournalError> {
+        if max_active_entries == 0 {
+            return Err(EffectJournalError::ValidationError {
+                reason: "max_active_entries must be > 0".to_string(),
+            });
+        }
         let path = path.as_ref().to_path_buf();
         let mut entries: HashMap<Hash, JournalRecord> = HashMap::new();
+        let mut active_entries = 0usize;
 
         // Acquire exclusive lock for single-writer inter-process exclusivity.
         let mut open_opts = OpenOptions::new();
@@ -816,19 +856,20 @@ impl FileBackedEffectJournal {
 
                 match parse_journal_line(trimmed) {
                     Ok((tag, request_id, binding_opt)) => {
-                        // Enforce capacity during replay.
-                        if entries.len() >= MAX_JOURNAL_ENTRIES
-                            && !entries.contains_key(&request_id)
-                        {
-                            return Err(EffectJournalError::CapacityExhausted {
-                                count: entries.len(),
-                                max: MAX_JOURNAL_ENTRIES,
-                            });
-                        }
-
                         match tag {
                             TAG_STARTED => {
                                 if let Some(binding) = binding_opt {
+                                    let prior_active =
+                                        entries.get(&request_id).is_some_and(|record| {
+                                            state_counts_toward_capacity(record.state)
+                                        });
+                                    if !prior_active && active_entries >= max_active_entries {
+                                        return Err(EffectJournalError::CapacityExhausted {
+                                            count: active_entries,
+                                            max: max_active_entries,
+                                        });
+                                    }
+
                                     // On replay, Started without Completed
                                     // will become Unknown after replay finishes.
                                     entries.insert(
@@ -838,6 +879,9 @@ impl FileBackedEffectJournal {
                                             binding,
                                         },
                                     );
+                                    if !prior_active {
+                                        active_entries += 1;
+                                    }
                                 } else {
                                     pending_error = Some((
                                         line_idx + 1,
@@ -850,6 +894,7 @@ impl FileBackedEffectJournal {
                                 if let Some(record) = entries.get_mut(&request_id) {
                                     if record.state == EffectExecutionState::Started {
                                         record.state = EffectExecutionState::Completed;
+                                        active_entries = active_entries.saturating_sub(1);
                                     }
                                     // If already Completed, ignore duplicate.
                                 }
@@ -872,6 +917,7 @@ impl FileBackedEffectJournal {
                                         // no C or R follows. Since we see R,
                                         // transition to NotStarted directly.
                                         record.state = EffectExecutionState::NotStarted;
+                                        active_entries = active_entries.saturating_sub(1);
                                     }
                                 }
                                 // Orphan R without S is ignored (same as C).
@@ -938,6 +984,7 @@ impl FileBackedEffectJournal {
 
         Ok(Self {
             path,
+            max_active_entries,
             entries: Mutex::new(entries),
             file: Mutex::new(file),
         })
@@ -976,11 +1023,12 @@ impl EffectJournal for FileBackedEffectJournal {
             entries.remove(&request_id);
         }
 
-        // Enforce capacity limit BEFORE any state mutation.
-        if entries.len() >= MAX_JOURNAL_ENTRIES {
+        // Enforce active-entry capacity BEFORE any state mutation.
+        let active_entries = active_entry_count(&entries);
+        if active_entries >= self.max_active_entries {
             return Err(EffectJournalError::CapacityExhausted {
-                count: entries.len(),
-                max: MAX_JOURNAL_ENTRIES,
+                count: active_entries,
+                max: self.max_active_entries,
             });
         }
 
@@ -1319,6 +1367,13 @@ mod tests {
         let mut h = [0u8; 32];
         h[0] = byte;
         h[31] = byte;
+        h
+    }
+
+    fn test_hash_u16(value: u16) -> Hash {
+        let mut h = [0u8; 32];
+        h[0..2].copy_from_slice(&value.to_le_bytes());
+        h[30..32].copy_from_slice(&value.to_be_bytes());
         h
     }
 
@@ -1944,6 +1999,83 @@ mod tests {
         let journal = FileBackedEffectJournal::open(&path).unwrap();
         assert!(journal.is_empty());
         assert_eq!(journal.len(), 0);
+    }
+
+    // =========================================================================
+    // Active-entry capacity accounting tests (SECURITY MAJOR-2 fix)
+    // =========================================================================
+
+    #[test]
+    fn completed_entries_do_not_consume_active_capacity_slots() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect-capacity.journal");
+        let journal = FileBackedEffectJournal::open_with_max_active_entries(&path, 1).unwrap();
+
+        let first_request = test_hash(0x90);
+        journal
+            .record_started(&test_binding(first_request, false))
+            .expect("first active request should be admitted");
+        journal
+            .record_completed(&first_request)
+            .expect("first request should complete");
+
+        let second_request = test_hash(0x91);
+        journal
+            .record_started(&test_binding(second_request, false))
+            .expect("completed entries must not block new active admission");
+    }
+
+    #[test]
+    fn many_completed_entries_still_allow_new_admission() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect-many-completed.journal");
+        let journal = FileBackedEffectJournal::open_with_max_active_entries(&path, 2).unwrap();
+
+        for i in 0..128u16 {
+            let request_id = test_hash_u16(0xA000u16 + i);
+            let binding = test_binding(request_id, false);
+            journal
+                .record_started(&binding)
+                .expect("admission should succeed");
+            journal
+                .record_completed(&request_id)
+                .expect("completion should succeed");
+        }
+
+        let fresh_request = test_hash_u16(0xB001);
+        journal
+            .record_started(&test_binding(fresh_request, false))
+            .expect("new request must still be admitted after many completions");
+    }
+
+    #[test]
+    fn replay_capacity_limits_active_entries_not_completed_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect-replay-capacity.journal");
+
+        // Build replay state: one fully completed request + one in-flight
+        // request. With max_active_entries=1, replay must succeed because only
+        // one request is active after replay.
+        let completed_id = test_hash(0x92);
+        let active_id = test_hash(0x93);
+        let completed_binding = test_binding(completed_id, false);
+        let active_binding = test_binding(active_id, false);
+        let completed_json = serde_json::to_string(&completed_binding).unwrap();
+        let active_json = serde_json::to_string(&active_binding).unwrap();
+        let completed_hex = hex::encode(completed_id);
+        let active_hex = hex::encode(active_id);
+        let content = format!(
+            "S {completed_hex} {completed_json}\nC {completed_hex}\nS {active_hex} {active_json}\n"
+        );
+        std::fs::write(&path, content).unwrap();
+
+        let journal = FileBackedEffectJournal::open_with_max_active_entries(&path, 1)
+            .expect("replay should count only active entries toward capacity");
+        assert_eq!(
+            journal.query_state(&active_id),
+            EffectExecutionState::Unknown,
+            "in-flight replayed entry should classify as Unknown"
+        );
     }
 
     // =========================================================================
