@@ -1,8 +1,8 @@
-# RFC-0007 Amendment A1: FAC Execution Substrate (Target Pool), Nextest Policy, and Resource Hygiene
+# RFC-0007 Amendment A2: FAC Execution Substrate / Local Build Farm Kernel (Execution Lanes, Queue, Hygiene, Attestation)
 
-* **Document:** `documents/rfcs/RFC-0007/10_fac_build_cache_substrate_amendment.md`
+* **Document:** `documents/rfcs/RFC-0007/10_fac_execution_substrate_build_farm_revision.md`
 * **Amends:** RFC-0007 (DRAFT)
-* **Date:** 2026-02-11
+* **Date:** 2026-02-12
 * **Primary surfaces touched by this amendment:**
 
   * `crates/apm2-cli/src/commands/fac.rs`
@@ -10,18 +10,39 @@
   * `scripts/ci/run_bounded_tests.sh`
   * `flake.nix`
   * `documents/skills/implementor-default/SKILL.md`
-  * (NEW) `crates/apm2-cli/src/commands/fac_review/{fac_resources,target_pool}.rs` (or equivalent module placement)
+  * (NEW) `crates/apm2-cli/src/commands/fac_review/{lane,queue,executor,fac_resources,target_pool}.rs` (exact module layout is flexible; semantics are not)
+  * (NEW) `crates/apm2-core/src/fac/{receipt_stream,hlc}.rs` (design seam; implementation may start in apm2-cli and migrate)
 * **Motivating operational constraints (explicit):**
 
   * Ubuntu 24.04
-  * 96 GB RAM
+  * 96 GB RAM
   * Frequently **≤ 3 simultaneous** `gate` executions across **3 worktrees**
   * Often **~13 worktrees exist concurrently** (not all active)
   * Near-term: heavy bash → Rust migration (security + perf)
   * Long-term: assimilate to **NixOS substrate** across the holonic network
   * Primary goal: **maximize FAC loop throughput** while guaranteeing **no catastrophic host failure** (disk/mem/CPU exhaustion), with **automatic/enforced cleanup**
+  * Networking is **not available yet**; all semantics MUST be local-first with clean seams for later distribution.
 
 ---
+
+## 0. Non-negotiable requirements (normative)
+
+This amendment is a build-farm "kernel" spec. The following are MUSTs:
+
+1. **Safety > speed.** The substrate MUST prevent catastrophic host failure (disk/mem/CPU/PIDs/IO exhaustion) even with multiple autonomous agents.
+2. **Incremental deployability.** Every phase MUST be useful on a single VPS, MUST have rollback, and MUST NOT require a distributed system.
+3. **Networkless semantics.** Job/lane semantics MUST NOT assume networking. Networking is a bolt-on transport layer later.
+4. **Declarative substrate target.** The design MUST map cleanly to flakes now and future NixOS modules later.
+5. **Fail-closed attestation semantics.** If anything that can affect correctness changes, gate-cache reuse MUST NOT silently continue.
+6. **No ambient user state reliance.** FAC MUST NOT depend on aliases/dotfiles/`~/.cargo/config.toml`; FAC MUST set policy explicitly.
+7. **No new long-lived bash daemons.** Control plane MUST be Rust and/or systemd-managed units. Bash scripts may exist only as transitional leaf executors.
+
+## 0.1 Terminology (local build-farm primitives)
+
+* **Lane**: A bounded, cullable execution context with deterministic identity, dedicated workspace+target namespace, and a fixed resource profile.
+* **Job**: An immutable spec (what to run, against which inputs) that is queued, leased to a lane, executed, and yields receipts.
+* **Receipt stream**: An append-only, mergeable (CRDT-compatible) set/log of receipts; receipts are the ground truth, not runtime state.
+* **Execution profile**: The attested environment+policy facts (including lane profile hash + toolchain fingerprint) that gate-cache keys depend on.
 
 ## 1. Repo-grounded baseline: what actually runs today
 
@@ -44,10 +65,11 @@ Evidence gates include:
 * `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 * `cargo doc --workspace --no-deps`
 * `scripts/ci/test_safety_guard.sh`
+* `scripts/ci/workspace_integrity_guard.sh`
 * `scripts/ci/review_artifact_lint.sh`
 * **test gate**: uses `cargo nextest run ...` inside `scripts/ci/run_bounded_tests.sh` when cgroup v2 is available.
 
-Key fact: **nextest is already the default execution for the test gate** on modern Linux via `run_bounded_tests.sh` (the command constructed in `evidence.rs::build_pipeline_test_command` is explicitly `cargo nextest run ...`). The old "cargo test" path exists only as a fallback when the bounded runner is unavailable.
+Key fact: **nextest is already the default execution for the test gate** when the bounded runner path is active (the pipeline builder constructs `cargo nextest run ...`). **However, both the pipeline and local gates paths still fall back to `cargo test`** when bounded execution is unavailable or when `EvidenceGateOptions.test_command` is unset.
 
 Clarification (missing in the draft): **there are two "fallback" paths today**:
 
@@ -69,9 +91,15 @@ The bounded runner:
   * CPU quota
 * Uses an **explicit allowlist** to propagate selected env vars into the unit (`run_bounded_tests.sh` has `SETENV_ARGS` built from a for-loop allowlist).
 
-Operational footgun not called out in the draft:
+Operational footgun (needs to be treated as a *substrate requirement*, not a "maybe"):
 
 * `systemd-run --user` requires a functioning user bus. On headless/VPS setups this frequently fails unless the user session is correctly configured (and CI uses a documented workaround). This amendment therefore treats "bounded runner availability" as a **first-class availability constraint**, not a "maybe".
+
+Correctness footgun (missing in the draft, and currently **fail-open**):
+
+* Gate cache keys are derived from `git rev-parse HEAD` (a commit SHA). **If the working tree has uncommitted changes, the SHA does not change**, so cache reuse can become incorrect. This substrate MUST either:
+  * require a clean worktree to use gate cache (fail-closed), OR
+  * incorporate a "dirty diff digest" (or patch artifact hash) into the attested inputs.
 
 ### 1.3 Gate cache and attestation today
 
@@ -89,28 +117,29 @@ Important details:
 * `gate_input_digest()` hashes selected paths (e.g., `.config/nextest.toml`, `scripts/ci/run_bounded_tests.sh`), but **does not currently include `.cargo/config.toml`**.
 * `environment_digest()` includes versions for: kernel, rustc, cargo, rustfmt, clippy, nextest, systemd-run. **No sccache version** is captured today.
 
-Correction (repo-grounded): `environment_digest()` currently captures:
+Correction (repo-grounded): `environment_digest()` currently captures **string outputs** from:
 
-* kernel (`uname -r`)
-* rustc (`rustc -Vv`)
-* cargo (`cargo -Vv`)
+* kernel (`uname -sr`)
+* rustc (`rustc --version`)
+* cargo (`cargo --version`)
 * clippy (`cargo clippy --version`)
 * nextest (`cargo nextest --version`)
 * systemd-run (`systemd-run --version`)
 
-It does **not** currently capture `rustfmt --version` (this is a latent fail-open in gate-cache semantics for the fmt gate).
+It does **not** capture `rustfmt --version` today (latent fail-open for fmt-gate correctness across toolchain changes).
 
 This matters: any "build cache substrate" change must be surfaced into attestation in a way that remains **fail-closed** (no unsafe reuse).
 
-Also repo-grounded and missing from the draft threat discussion:
+Repo-grounded missing pieces that matter to fail-closed semantics:
 
 * `.cargo/config.toml` already exists in-repo and materially changes builds (e.g., linker + rustflags). It is currently **not** included in attestation input digests.
+* `~/.cargo/config.toml` (ambient) can also change builds. The substrate MUST NOT depend on it; the safe approach is to set `CARGO_HOME` under `$APM2_HOME` for FAC executions and treat the FAC-managed cargo config as authoritative policy input.
 
 ---
 
-## 2. Problem re-statement (with hard constraints)
+## 2. Problem statement (what must become true)
 
-### 2.1 Why you’re hitting the 240s / 24G wall
+### 2.1 The real bottleneck is not "tests are slow"; it's uncontrolled shared-host resource collapse
 
 Observed operational pattern:
 
@@ -122,112 +151,593 @@ Observed operational pattern:
   * **Wall-time 240s** (by policy; should not be increased)
   * **MemoryMax 24G** (policy default)
 
-Your stated goal is not to “relax the box”; it is to **make cold-start rare** and **keep the host stable** under parallel agents.
+Your stated goal is not to "relax the box"; it is to **make cold-start rare** and **keep the host stable** under parallel agents.
 
-### 2.2 Second-order failure modes you must treat as first-class
+### 2.2 Failure modes to treat as first-class (explicitly in substrate semantics)
 
-The initial planning doc does not cover these adequately:
+1. **Disk exhaustion** (targets/logs/evidence artifacts) is the dominant catastrophic failure mode.
+2. **CPU/IO thrash** from unbounded parallel cargo/clippy/doc/test invocations is the second.
+3. **PID exhaustion** and **runaway processes** are the third (especially with nextest default concurrency).
+4. **Containment bypass** is a security and correctness risk if any helper (e.g., sccache) can execute compilers outside the bounded unit.
+5. **Incorrect cache reuse** (dirty tree, missing inputs, missing tool versions) is correctness failure, not just "cache isn't perfect".
+6. **Symlink/rmtree disasters** during cleanup/reset are catastrophic and must be engineered out.
 
-1. **Disk exhaustion is the dominant catastrophic failure mode** in multi-worktree Rust development (targets balloon fast).
-2. **Parallelism without a global governor** can still destroy a host even if one gate is bounded (because:
-
-   * only the test gate is bounded today
-   * unbounded clippy/doc builds can thrash CPU, IO, and memory
-3. Build caching tools (sccache) can introduce **containment bypass risks** if they daemonize or spawn compiler processes outside your intended cgroup containment strategy (details in §6.4).
-4. "cargo test aliased to nextest" is an *ambient state dependency* that fights your stated requirement: **instant environment reproducibility across new VPS nodes**.
-
-5. **CPU oversubscription is currently guaranteed** under 3 concurrent gate runs unless you explicitly cap nextest runtime concurrency:
-   * nextest defaults its test scheduling to machine parallelism; with 3 simultaneous runs, you can easily spawn "3× full CPU" worth of test processes. CPUQuota helps, but without aligning nextest's own concurrency knobs, you get unnecessary context switching and tail latency.
-
-6. **Disk-full failure is "fast and dumb"**: it usually happens mid-build, leaving half-written artifacts that make subsequent runs slower and more failure-prone. Therefore, "GC exists" is insufficient; we need **enforced preflight**.
+The current "compute slots + target pool" proposal is necessary but insufficient: it addresses concurrency and caching, but it does not define the **unit of containment** (lane), **job semantics**, **queueing**, **leases**, or **receipts as ground truth**.
 
 ---
 
-## 3. Amendment scope: what this document changes in RFC-0007
+## 3. What this amendment changes in RFC-0007 (and why it still belongs in RFC-0007)
 
 RFC-0007 (currently DRAFT) is about build optimizations; it already contains:
 
 * `TB-002: Compilation Cache` (sccache) in `03_trust_boundaries.yaml`
 * Optional nextest decisions (`DD-002`, `DD-003`) in `02_design_decisions.yaml`
 
-This amendment modifies RFC-0007 in two ways:
+This amendment modifies RFC-0007 in four ways (execution substrate is a build optimization when done correctly):
 
-1. It upgrades "optional nextest" to a **mandatory FAC policy** (for the FAC gate execution substrate), without requiring every developer shell alias behavior.
-2. It turns "cross-worktree build reuse" from an RFC-0007 "nice-to-have" into an **implemented and governed FAC substrate**, with the following ordering:
+1. It upgrades "optional nextest" to a **mandatory FAC test runner policy** (explicit invocation; no alias reliance).
+2. It replaces "worktree is the execution unit" with a **finite execution lane pool** (lane = blast radius).
+3. It turns "cross-worktree build reuse" into a **lane-scoped target namespace** (target pool per lane, per toolchain fingerprint).
+4. It makes **resource hygiene and enforced preflight** part of the FAC substrate contract, not a human ritual.
+
+Ordering of accelerators remains:
 
    **Primary accelerator (new):** slot-scoped `CARGO_TARGET_DIR` pool ("target pool").
 
    **Secondary accelerator (optional, gated):** sccache, only after containment + benefit verification.
 
-   This ordering is deliberate: the target pool attacks the dominant observed cost (duplicated `target/` trees across worktrees) without introducing a daemon boundary.
-
-3. It adds an "enforced resource hygiene" control plane (GC + disk preflight) as a FAC primitive, not an optional human ritual.
-
-4. It adds a "global concurrency governor" as a FAC primitive, reusing patterns already present in-repo (e.g., provider slot leasing).
-
-   * cache warm interfaces (optional but useful)
-   * strict resource hygiene / GC policy (enforced)
-   * explicit attestation surfacing (fail-closed)
-   * staged migration path from bash → Rust and to NixOS
-
 This amendment explicitly **does not** attempt to redesign FAC protocol cryptography; it is about the **local execution substrate** and safety of running many agents.
 
 ---
 
-## 4. Goals, non-goals, and invariants
+## 4. FAC Execution Substrate v1 (FESv1): execution lanes + local scheduler (networkless)
 
-### 4.1 Goals
+FESv1 is the "local build farm kernel" for APM2 agents.
 
-G1. **Bounded test gate reliability:** after a one-time warm (per worktree lifecycle), running `apm2 fac gates` (full mode) must reliably complete the test gate within **240s/24G** on this node class, without “raise the timeout” pressure.
+### 4.1 Entities (stable semantics; distribution later)
 
-G2. **Parallel agent safety:** enable up to **3 simultaneous gate executions** (your current reality) without:
+* **Node**: a single host instance (today: one Ubuntu VPS). Future: many nodes under headscale.
+* **Lane**: a bounded execution context on a node with deterministic identity and a fixed resource profile.
+* **Job**: an immutable spec that produces receipts and evidence artifacts.
+* **Scheduler**: local-only dispatcher that leases jobs to lanes with backpressure.
+* **Receipt**: an append-only record; the ground truth (ledger-first).
 
-* disk filling
-* system-wide swap thrash
-* wedging the shell environment
-* requiring manual cleanup “heroics”
+### 4.2 Execution lanes (required model)
 
-G3. **Automatic, enforced cleanup:** implement guardrails that prevent unbounded growth of:
+Each lane is:
 
-* worktree `target/` artifacts
-* FAC evidence / cache artifacts
-* compilation caches
+* a git worktree rooted at: `$APM2_HOME/private/fac/lanes/<lane_id>/workspace`
+* a long-lived, **cullable** execution context (resettable without touching other lanes)
+* a fixed resource profile (enforced via systemd/cgroups)
+* a dedicated target namespace: `$APM2_HOME/private/fac/lanes/<lane_id>/target/<toolchain_fingerprint>`
+* a dedicated log namespace: `$APM2_HOME/private/fac/lanes/<lane_id>/logs`
 
-G4. **Reproducibility across nodes:** remove hidden reliance on user shell aliases; encode toolchain + policy in:
+Lane lifecycle (persisted via receipts + lease records; runtime is not authoritative):
 
-* repo (Nix flake + configs)
-* `apm2` commands (explicit nextest usage, explicit cache policy)
-* receipts / attestation (fail-closed)
+`IDLE → LEASED → RUNNING → CLEANUP → IDLE`
 
-G5. **Incremental path to Rust + NixOS:** every new control plane surface introduced here must be representable as:
+Exceptional:
 
-* Rust code (no new long-lived bash daemons)
-* Nix (flake now; NixOS module later)
+`* → CORRUPT → RESET → IDLE`
 
-### 4.2 Non-goals (for this amendment)
+### 4.3 Backpressure is lane-count + lane profiles (not "worktrees")
 
-NG1. Remote/distributed compilation cache across untrusted nodes (TB-002 explicitly warns; keep local-only for now).
-NG2. Replacing `scripts/ci/run_bounded_tests.sh` entirely today (we will reduce its responsibilities and migrate later).
-NG3. Solving “1 worktree = 1 ticket” globally immediately; we will provide an execution pool path that can **replace** that model when ready.
+The substrate MUST enforce a finite number of concurrent heavy jobs by construction:
 
-### 4.3 Hard invariants
+* `lane_count` is finite (default derived from memory policy; on the current box: 3).
+* each lane runs **at most one job at a time** (exclusive lease).
+* each job executes under lane resource limits (CPU/memory/PIDs/IO + timeouts).
 
-I1. **Do not increase bounded test timeout** beyond 240s. This must be enforced in code (reject >240 unless an explicit unsafe override is present).
-I2. **Fail-closed on attestation ambiguity.** If policy/tooling/env changes in ways that *might* affect correctness, gate cache reuse must not occur.
-I3. **Host survivability > speed.** If any speed optimization risks host instability, it must be gated behind explicit opt-in and measured.
+### 4.4 Leasing (mechanism, not vibes)
 
-I4. **Disk preflight is mandatory.** No heavy FAC operation may start if the relevant filesystem(s) are below `min-free` after an attempt to GC.
+Leasing is a file-lock + durable lease record:
 
-I5. **No ambient build-policy inheritance.** FAC must ignore user ambient state for the following knobs unless explicitly set via FAC flags:
-* `CARGO_TARGET_DIR` (must be set by FAC target pool)
-* nextest runtime concurrency knobs (must be set by FAC policy)
-* (if later enabled) `RUSTC_WRAPPER` / sccache knobs (must be set by FAC policy)
+* Lock file: `$APM2_HOME/private/fac/locks/lanes/<lane_id>.lock`
+* Lease record: `$APM2_HOME/private/fac/lanes/<lane_id>/lease.v1.json`
+
+Rules:
+
+* lease acquisition MUST be atomic and exclusive (reuse the existing file-lock leasing pattern used by `fac_review/model_pool.rs`).
+* lease record MUST include: `job_id`, `pid`, `started_at`, `lane_profile_hash`, `toolchain_fingerprint`.
+* stale lease handling MUST be fail-closed:
+  * if lock is free but lease record claims RUNNING and the pid is alive → treat as CORRUPT and require reset
+  * if lock is free and pid is dead → scheduler may transition to CLEANUP and then IDLE (writing receipts)
+
+### 4.5 Job queue (local-first; distribution later)
+
+Queue is a filesystem-backed ordered set of job specs under `$APM2_HOME/private/fac/queue`.
+
+Required properties:
+
+* FIFO within a priority band
+* explicit priority levels (small integer; higher wins)
+* cancellation by job id
+* atomic claiming (no double-execution)
+* crash tolerance (claimed jobs must requeue or be marked failed with receipt)
+
+Minimal viable layout:
+
+* `queue/pending/`
+* `queue/claimed/`
+* `queue/done/`
+* `queue/cancelled/`
+
+Claim algorithm (local-only):
+
+1. Workers (either CLI or daemonized `apm2-daemon` later) scan `pending/` for highest priority then oldest `enqueued_at`.
+2. Claim uses atomic `rename()` from `pending/<job_id>.json` → `claimed/<job_id>.json`.
+3. The claiming worker then acquires a lane lease and executes the job.
+
+This is the networkless seam: a future distributed scheduler can transport `FacJobSpecV1` objects and still use the same lane/job semantics.
+
+### 4.6 Containment: all compilers/tests MUST run inside bounded units
+
+Baseline requirement: cargo, rustc, nextest, and any helper processes spawned by the job MUST remain inside the intended cgroup boundary for the lane/job.
+
+Mechanism (Phase 1, user-mode):
+
+* execute each job via `systemd-run --user` transient units with explicit properties derived from `LaneProfileV1`.
+
+Mechanism (Phase 3, stronger brokered mode; optional but recommended for hostile workloads):
+
+* a systemd **system** unit executes jobs as a dedicated service user (no user-bus), preventing "spawn new user units" escape hatches.
+
+If bounded execution cannot be proven available, FAC MUST fail closed with actionable remediation (enable linger / run via systemd-managed apm2-daemon).
+
+### 4.7 Cleanup/reset MUST be symlink-safe (rmtree disasters are catastrophic)
+
+GC and lane reset MUST NOT use naive recursive deletion (e.g., `rm -rf` or `std::fs::remove_dir_all`) on paths influenced by lane/job state.
+
+Required deletion primitive: `safe_rmtree_v1(root, allowed_parent)`:
+
+* canonicalize `allowed_parent` and `root`
+* verify `root.starts_with(allowed_parent)` after canonicalization
+* refuse to operate if **any path component** between `allowed_parent` and `root` is a symlink
+* delete by walking directory entries using `symlink_metadata()` and:
+  * unlink symlinks as files (do not follow)
+  * recurse into directories only after verifying they are not symlinks
+* on any ambiguity or TOCTOU suspicion → fail closed and mark lane CORRUPT (requires manual reset)
+
+This is non-negotiable: one symlink bug can delete the host.
+
+### 4.8 Cross-job contamination controls (lane reset protocol)
+
+Each job MUST end in a cleanup step before the lane returns to IDLE:
+
+* hard reset the git worktree to the job's attested revision
+* `git clean -ffdx` (or equivalent) inside the lane workspace
+* remove lane-local temp dirs (`target/tmp`, nextest temp, etc.)
+* enforce log retention/quota per lane (size and TTL)
+
+If cleanup fails, the lane MUST be marked CORRUPT and refused for further leases until reset.
 
 ---
 
-## 5. Nextest policy: stop relying on ambient aliasing
+## 5. Interfaces (precise; implementable)
 
-### 5.1 Explicit recommendation
+This section is normative. If an interface is not specified here, it is not part of the substrate contract.
+
+### 5.1 Directory layout under `$APM2_HOME` (authoritative)
+
+All FAC lane execution state MUST live under `$APM2_HOME/private/fac` so that:
+* GC can be enforced coherently
+* backup/restore is well-defined
+* ambient `$HOME/.cache` sprawl is avoided
+
+Required layout:
+
+* `private/fac/lanes/<lane_id>/workspace/`
+* `private/fac/lanes/<lane_id>/target/<toolchain_fingerprint>/`
+* `private/fac/lanes/<lane_id>/logs/`
+* `private/fac/queue/{pending,claimed,done,cancelled}/`
+* `private/fac/receipts/` (content-addressed receipt objects; see §5.3)
+* `private/fac/locks/` (lane locks, queue locks, optional global locks)
+
+Legacy compatibility:
+* `private/fac/gate_cache_v2/` remains during migration; new receipts MUST record enough to migrate away from it later.
+
+### 5.2 CLI (required commands)
+
+All commands MUST support `--json` for machine output and MUST fail with non-zero exit codes on invariant violations.
+
+#### 5.2.1 `apm2 fac lane status`
+
+Shows all lane states derived from (a) lock state, (b) lease record, (c) last receipt.
+
+* human output: table (lane_id, state, job_id, started_at, toolchain_fingerprint, last_exit)
+* json output: array of `LaneStatusV1` objects (schema may be embedded; not required in this amendment)
+
+#### 5.2.2 `apm2 fac lane reset <lane_id>`
+
+Resets a lane to a known-good state.
+
+Rules:
+* MUST refuse to reset if lane is RUNNING unless `--force` is provided.
+* `--force` MUST stop/kill the lane's active unit (KillMode=control-group) before deletion.
+* MUST use `safe_rmtree_v1` for deletion (see §4.7).
+* MUST write a `FacJobReceiptV1`-style receipt with `kind="lane_reset"` (or a dedicated `LaneResetReceiptV1`; either is acceptable if schema-id is stable).
+
+#### 5.2.3 `apm2 fac enqueue <job_spec>`
+
+Enqueues a job without executing it immediately.
+
+* `<job_spec>` is a path to a JSON file containing `FacJobSpecV1` OR `-` (stdin).
+* on success: prints `job_id` (human) or a JSON object with `{ job_id, queued_path }`
+
+Cancellation (mandatory for queue semantics):
+* `apm2 fac enqueue --cancel <job_id>` MUST move the job to `queue/cancelled/` if pending, or mark it cancelled if claimed/running (best-effort signal).
+
+#### 5.2.4 `apm2 fac warm`
+
+Lane-scoped cache warm.
+
+* default: warm **all lanes** to reduce cold-start probability
+* `--lane <lane_id>`: warm only one lane
+* MUST acquire lane lease(s) internally
+* MUST write `WarmReceiptV1`
+
+#### 5.2.5 `apm2 fac gc`
+
+Global and lane-scoped enforced GC.
+
+* default: global GC across all FAC-controlled roots
+* `--lane <lane_id>`: only prune that lane's logs/targets
+* MUST write `GcReceiptV1`
+* MUST be callable automatically from disk preflight (see §6.2)
+
+#### 5.2.6 `apm2 fac gates`
+
+Runs evidence gates using the lane substrate.
+
+Rules:
+* MUST acquire a lane lease internally (no "run directly in caller worktree" once Phase 1 is complete)
+* MUST use nextest explicitly (no cargo-test fallback)
+* MUST fail closed if nextest is missing
+* MUST enforce the 240s/24G test policy (no override without explicit unsafe flag)
+
+Queueing:
+* `apm2 fac gates --queued` MUST translate into `FacJobSpecV1(kind="gates")` and enqueue, then optionally wait for completion (`--wait` default true).
+
+### 5.3 JSON schemas (required; with hashing rules + storage locations)
+
+All schemas MUST:
+* include `schema` (stable ID with version suffix)
+* use `#[serde(deny_unknown_fields)]` in implementation
+* be bounded in size on read (reuse apm2-core FAC bounded deserialization primitives)
+
+Canonical hashing rules:
+* Hash input is canonical JSON bytes (stable key ordering, no insignificant whitespace).
+* Hash algorithm for lane/job receipts is **BLAKE3** with domain separation:
+  * `hash = blake3("apm2:fac:<schema_id>:v1\0" || canonical_json_bytes)`
+* Hashes are encoded as lowercase hex and prefixed: `blake3:<hex>`
+
+Storage rules:
+* Each receipt is stored content-addressed:
+  * `$APM2_HOME/private/fac/receipts/<hash>.json`
+* Queue objects are stored by job_id:
+  * `$APM2_HOME/private/fac/queue/pending/<job_id>.json`
+
+#### 5.3.1 `LaneProfileV1`
+
+```jsonc
+{
+  "schema": "apm2.fac.lane_profile.v1",
+  "lane_id": "lane-00",
+  "node_fingerprint": "blake3:…",
+  "resource_profile": {
+    "cpu_quota_percent": 200,
+    "memory_max_bytes": 25769803776,
+    "pids_max": 1536,
+    "io_weight": 100
+  },
+  "timeouts": {
+    "test_timeout_seconds": 240,
+    "job_runtime_max_seconds": 1800
+  },
+  "policy": {
+    "fac_policy_hash": "sha256:…",
+    "nextest_profile": "ci",
+    "deny_ambient_cargo_home": true
+  }
+}
+```
+
+Lane profile storage:
+* `$APM2_HOME/private/fac/lanes/<lane_id>/profile.v1.json`
+
+Lane profile hash:
+* `LaneProfileHash = blake3(canonical(LaneProfileV1))`
+
+#### 5.3.2 `LaneLeaseV1`
+
+```jsonc
+{
+  "schema": "apm2.fac.lane_lease.v1",
+  "lane_id": "lane-00",
+  "job_id": "job_20260212T031500Z_…",
+  "pid": 12345,
+  "state": "RUNNING",
+  "started_at": "2026-02-12T03:15:00Z",
+  "lane_profile_hash": "blake3:…",
+  "toolchain_fingerprint": "blake3:…"
+}
+```
+
+Storage:
+* `$APM2_HOME/private/fac/lanes/<lane_id>/lease.v1.json`
+
+#### 5.3.3 `FacJobSpecV1`
+
+```jsonc
+{
+  "schema": "apm2.fac.job_spec.v1",
+  "job_id": "job_20260212T031500Z_…",
+  "kind": "gates",
+  "priority": 50,
+  "enqueue_time": "2026-02-12T03:15:00Z",
+  "repo_root": "/abs/path/to/apm2",
+  "git": {
+    "head_sha": "012345…",
+    "dirty": false,
+    "dirty_diff_hash": null
+  },
+  "lane_requirements": {
+    "lane_profile_hash": null
+  },
+  "constraints": {
+    "require_nextest": true,
+    "test_timeout_seconds": 240,
+    "memory_max_bytes": 25769803776
+  }
+}
+```
+
+Dirty-tree rule:
+* if `dirty=true`, either `dirty_diff_hash` MUST be present and included in attestation OR cache reuse MUST be disabled (fail-closed).
+
+#### 5.3.4 `FacJobReceiptV1`
+
+```jsonc
+{
+  "schema": "apm2.fac.job_receipt.v1",
+  "job_id": "job_…",
+  "kind": "gates",
+  "lane_id": "lane-00",
+  "lane_profile_hash": "blake3:…",
+  "toolchain_fingerprint": "blake3:…",
+  "fac_policy_hash": "sha256:…",
+  "started_at": "…",
+  "finished_at": "…",
+  "status": "SUCCESS",
+  "exit_code": 0,
+  "artifacts": {
+    "log_bundle_hash": "blake3:…",
+    "gate_cache_keys": ["sha256:…"]
+  }
+}
+```
+
+#### 5.3.5 `WarmReceiptV1`
+
+```jsonc
+{
+  "schema": "apm2.fac.warm_receipt.v1",
+  "lane_id": "lane-00",
+  "lane_profile_hash": "blake3:…",
+  "toolchain_fingerprint": "blake3:…",
+  "started_at": "…",
+  "finished_at": "…",
+  "steps": [
+    { "name": "cargo_fetch", "exit_code": 0, "duration_ms": 1234 },
+    { "name": "cargo_build", "exit_code": 0, "duration_ms": 5678 }
+  ]
+}
+```
+
+#### 5.3.6 `GcReceiptV1`
+
+```jsonc
+{
+  "schema": "apm2.fac.gc_receipt.v1",
+  "started_at": "…",
+  "finished_at": "…",
+  "policy": { "min_free_bytes": 21474836480, "min_free_percent": 10 },
+  "before": { "free_bytes": 123, "free_percent": 1.2 },
+  "after": { "free_bytes": 456, "free_percent": 12.3 },
+  "freed_bytes": 333,
+  "actions": [
+    { "kind": "prune_lane_targets", "lane_id": "lane-01", "freed_bytes": 123 }
+  ]
+}
+```
+
+### 5.4 Attestation integration (fail-closed)
+
+The following MUST be present in gate-cache key material (directly or via digests):
+
+* `LaneProfileHash`
+* `ToolchainFingerprint`
+* `FacPolicyHash` (authoritative policy version)
+
+Minimum required changes to the current attestation:
+
+* include `.cargo/config.toml` in gate input digests for cargo-based gates
+* include `rustfmt --version` in environment facts
+* extend command/environment allowlist to include:
+  * `CARGO_HOME`, `CARGO_TARGET_DIR`, `CARGO_BUILD_JOBS`, `NEXTEST_TEST_THREADS`
+  * `RUSTC_WRAPPER` and `SCCACHE_*` (future-proof; no effect when unset)
+
+Policy hashing:
+
+* define a single authoritative `FacPolicyV1` in Rust (and optionally emitted to `$APM2_HOME/private/fac/policy/fac_policy.v1.json` for inspection)
+* `FacPolicyHash = sha256(canonical_json(FacPolicyV1))`
+* any change to timeouts, resource caps, allowlists, or tool requirements MUST change `FacPolicyHash`
+
+---
+
+## 6. Enforced hygiene: disk preflight + GC (cannot be optional)
+
+### 6.1 Disk preflight (mandatory gate before heavy jobs)
+
+Before a job enters RUNNING, the scheduler MUST:
+
+1. compute free space for:
+   * filesystem containing the lane workspace
+   * filesystem containing `$APM2_HOME`
+2. compare against policy (`min_free_bytes` AND `min_free_percent`)
+3. if below threshold:
+   * run `apm2 fac gc` in enforcement mode
+   * re-check
+4. if still below threshold:
+   * FAIL CLOSED (do not start the job; host is at risk)
+
+Default policy for the current node class:
+* `min_free_bytes = 20 GiB`
+* `min_free_percent = 10%`
+
+### 6.2 What GC is allowed to delete (explicit allowlist)
+
+GC MAY delete only:
+* lane targets under `private/fac/lanes/*/target/*` (excluding leased/running lanes)
+* lane logs under `private/fac/lanes/*/logs` beyond retention/quota
+* FAC evidence logs under `private/fac/evidence` beyond retention/quota
+* (optional) gate cache entries beyond TTL (legacy)
+* (future) sccache dirs under FAC-controlled roots, if enabled
+
+GC MUST NOT delete:
+* identity/keys under `$APM2_HOME/private` that are not explicitly marked as FAC cache
+* git worktrees themselves outside FAC lane roots
+
+All deletions MUST use `safe_rmtree_v1`.
+
+---
+
+## 7. Migration plan (staged, rollbackable)
+
+This is the incremental deployment plan required by the prompt.
+
+### Phase 0 — Instrumentation + invariants (no behavior change)
+
+Deliverables:
+* add missing fail-closed attestation inputs (`.cargo/config.toml`, `rustfmt --version`)
+* remove cargo-test fallback for FAC tests; nextest required (fail fast if missing)
+* add dirty-tree protection (disable cache or incorporate diff digest)
+* add disk preflight checks (warn-only at first; no GC yet)
+
+Acceptance criteria:
+* no regressions to existing `apm2 fac gates` UX on a healthy machine
+* cache keys change when `.cargo/config.toml` changes
+
+Rollback:
+* single PR revert (no persistent state changes required)
+
+### Phase 1 — Local lanes + lane leases + target namespaces (single VPS)
+
+Deliverables:
+* implement `LaneProfileV1`, deterministic `lane_id` set (default 3 lanes on this box)
+* implement lane lease locks + lease records
+* implement per-lane `CARGO_TARGET_DIR` under lane target namespace
+* implement `apm2 fac lane status`
+* implement `apm2 fac gates` acquiring a lane lease internally
+
+Acceptance criteria:
+* three concurrent `apm2 fac gates` invocations never exceed lane count
+* target reuse collapses disk usage vs many worktrees (qualitative)
+
+Rollback:
+* `APM2_FAC_LANES=0` (or `--legacy`) runs old path; lane directories remain but are inert
+
+### Phase 2 — Queueing + priority + cancellation + lane reset + enforced GC
+
+Deliverables:
+* implement filesystem job queue (`pending/claimed/done/cancelled`)
+* implement `apm2 fac enqueue` and `apm2 fac gates --queued`
+* implement `apm2 fac lane reset` with symlink-safe deletion
+* turn disk preflight from warn-only to enforced (auto GC, fail closed if still low)
+* implement `apm2 fac gc` + `GcReceiptV1`
+
+Acceptance criteria:
+* enqueue + cancellation works correctly under concurrent clients
+* disk preflight demonstrably prevents "disk full mid-build" failures in normal operation
+
+Rollback:
+* disable queue consumption; run direct lane acquisition mode
+
+### Phase 3 — Assimilate second VPS (Nix + flakes) with minimal interop seam
+
+Deliverables:
+* "assimilate node" playbook:
+  * clone repo at pinned commit
+  * `nix develop`
+  * restore minimal `$APM2_HOME` state (receipts, configs, keys; not bulky caches)
+  * run `apm2 fac warm` to rehydrate caches
+* local scheduler per host; no distributed routing required
+* define a transport-agnostic evidence bundle export/import contract (see §8)
+
+Acceptance criteria:
+* catastrophic failure recovery on primary host is reproducible within a single playbook run
+* developer shell/toolchain parity achieved via flakes
+
+Rollback:
+* none; this is additive documentation + optional tooling
+
+### Phase 4 — 100+ nodes (design only): distributed routing + receipt stream merge
+
+Deliverables:
+* stable job spec + receipt schemas sufficient for routing without semantic refactor
+* define trust boundaries + authentication using PCAC/AJC (no implementation)
+
+---
+
+## 8. Evidence bundle streaming seam (contract; no networking implementation)
+
+### 8.1 Evidence bundle contents (build success / failure)
+
+An evidence bundle is a content-addressed set with a manifest:
+
+* `FacJobReceiptV1`
+* gate attestation objects referenced by hash
+* logs (possibly compressed) referenced by hash
+* optional artifacts (binary size summaries, nextest junit, etc.) referenced by hash
+
+### 8.2 Hashing + addressing
+
+* each blob is addressed by `blake3:<hex>`
+* manifest schema (proposed): `apm2.fac.evidence_bundle_manifest.v1`
+* bundle id = blake3(canonical(manifest))
+
+### 8.3 Transport-agnostic envelope
+
+Define an envelope format that can be shipped later over any transport:
+
+* `schema: apm2.fac.evidence_bundle_envelope.v1`
+* `bundle_id`
+* `compression` (none|zstd)
+* `chunks[]` (each chunk references a blob hash)
+
+No networking code is defined here; only the object contract.
+
+### 8.4 Receipt stream merge (CRDT-ish)
+
+Receipt streams MUST be mergeable by set union:
+
+* receipts are immutable content-addressed objects
+* stream merge = union of receipt hashes + deterministic ordering for presentation using HLC-with-node-id (see apm2-core consensus CRDT primitives)
+
+### 8.5 Authentication boundary (future PCAC/AJC seam)
+
+Future distributed mode MUST authenticate:
+
+* which node produced the bundle (node identity)
+* which capabilities authorized job execution (PCAC/AJC chain)
+
+In v1 (local-only), these fields may be present but unsigned; v2 adds signatures without changing schema semantics.
+
+---
+
+## 9. Nextest policy: stop relying on ambient aliasing
+
+### 9.1 Explicit recommendation
 
 **Do not alias `cargo test` → nextest** as part of the canonical FAC substrate.
 
@@ -235,9 +745,9 @@ Reasons (practical, not ideological):
 
 * It is an **ambient global mutation** of tooling semantics that your attestation cannot reliably see (unless you treat `~/.cargo/config.toml` as a formal input, which you should not).
 * It can break commands that expect `cargo test` semantics (including compile-only patterns like `cargo test --no-run`, or third-party scripts that assume cargo behavior).
-* It undermines the “instantly reproduce environment across VPSs” objective; you will forget one node or one systemd unit will not pick up shell alias state.
+* It undermines the "instantly reproduce environment across VPSs" objective; you will forget one node or one systemd unit will not pick up shell alias state.
 
-### 5.2 What we do instead (mandatory, encoded)
+### 9.2 What we do instead (mandatory, encoded)
 
 **FAC test execution uses nextest explicitly** in the code path.
 
@@ -256,7 +766,7 @@ Missing-but-required detail: align nextest's own concurrency knobs with the glob
 
 * `NEXTEST_TEST_THREADS` must be set (or `--test-threads`) to match the per-slot CPU budget, otherwise you still get oversubscription even with CPUQuota.
 
-### 5.3 Optional dev convenience (safe)
+### 9.3 Optional dev convenience (safe)
 
 If you want a shortcut, add a **non-overriding** cargo alias (repo-local, not user-global):
 
@@ -271,9 +781,9 @@ Key: **do not override `test`**. Provide a new alias.
 
 ---
 
-## 6. Build cache substrate: target pool (primary), sccache (optional)
+## 10. Build cache substrate: target pool (primary), sccache (optional)
 
-### 6.1 Primary accelerator: slot-scoped `CARGO_TARGET_DIR` ("target pool")
+### 10.1 Primary accelerator: slot-scoped `CARGO_TARGET_DIR` ("target pool")
 
 Why this exists:
 
@@ -299,7 +809,7 @@ Result:
 * Disk usage collapses from "~13 targets" to "≤ slot_count targets".
 * No new daemon boundary, so containment is straightforward.
 
-### 6.2 Security boundary alignment (TB-002)
+### 10.2 Security boundary alignment (TB-002)
 
 RFC-0007 TB-002 already establishes:
 
@@ -312,7 +822,7 @@ This amendment enforces:
 * they are subject to GC policy
 * optional sccache use is local-only and explicitly controlled (if/when enabled)
 
-### 6.3 Optional secondary accelerator: sccache (only if it actually helps)
+### 10.3 Optional secondary accelerator: sccache (only if it actually helps)
 
 We choose the **explicit-activation model** for sccache (if/when implemented):
 
@@ -325,11 +835,11 @@ Rationale:
 * More importantly, FAC runs under bounded systemd units; implicit wrappers are harder to reason about and attest.
 * Explicit activation makes it possible to:
 
-  * run “safe mode” (no sccache) if needed for debugging
+  * run "safe mode" (no sccache) if needed for debugging
   * record activation in receipts and attestation
   * migrate to NixOS without hidden assumptions
 
-### 6.4 Standard cache locations
+### 10.4 Standard cache locations
 
 We standardize:
 
@@ -344,13 +854,13 @@ Why under APM2_HOME?
 
 * makes GC and backup policy coherent
 * avoids scattered caches across `$HOME/.cache`
-* makes “restore environment on new VPS” more predictable
+* makes "restore environment on new VPS" more predictable
 
 Implementation note:
 
 * `apm2_home_dir()` already exists in `fac_review/types.rs`; use it to derive the path.
 
-### 6.4 Critical containment caveat: sccache + cgroups
+### 10.5 Critical containment caveat: sccache + cgroups
 
 This is where the original planning doc was dangerously under-specified.
 
@@ -358,7 +868,7 @@ Because the test gate is executed under a bounded `systemd-run` unit, we must as
 
 * any compilation or compilation-adjacent process must remain inside the bounded cgroup to preserve the 24G/240s guarantees.
 
-**Risk:** If sccache uses a long-lived daemon that spawns compiler processes outside the transient unit cgroup, your “bounded tests” aren’t actually bounded. That is an unacceptable integrity regression.
+**Risk:** If sccache uses a long-lived daemon that spawns compiler processes outside the transient unit cgroup, your "bounded tests" aren't actually bounded. That is an unacceptable integrity regression.
 
 **Mitigation policy in this amendment:**
 
@@ -372,9 +882,9 @@ If/when you try to enable it:
 
 Otherwise, keep sccache off for bounded units and rely on:
 
-* target pool reuse + warm/prebuild (see §7)
+* target pool reuse + warm/prebuild (see §11)
 
-Because sccache behavior may differ by version, this amendment requires a **verification check** (see §11) that confirms rustc processes remain inside the bounded cgroup when sccache is enabled.
+Because sccache behavior may differ by version, this amendment requires a **verification check** (see §15) that confirms rustc processes remain inside the bounded cgroup when sccache is enabled.
 
 If verification fails, the "safe fallback" is:
 
@@ -383,7 +893,7 @@ If verification fails, the "safe fallback" is:
 
 This is not optional hand-waving; it is the containment guarantee.
 
-### 6.5 Attestation surfacing
+### 10.6 Attestation surfacing
 
 We must make cache substrate visible to the gate attestation so cache reuse is fail-closed.
 
@@ -413,11 +923,11 @@ Changes:
 
 ---
 
-## 7. `apm2 fac warm`: pre-warming as a first-class, attested maintenance action
+## 11. `apm2 fac warm`: pre-warming as a first-class, attested maintenance action
 
-### 7.1 Why warm is required (and where it belongs)
+### 11.1 Why warm is required (and where it belongs)
 
-Given the “240s/24G bounded test SLA,” we treat warm as:
+Given the "240s/24G bounded test SLA," we treat warm as:
 
 * a **worktree lifecycle step**, not a per-run step
 * required:
@@ -426,9 +936,9 @@ Given the “240s/24G bounded test SLA,” we treat warm as:
   * after toolchain upgrades (rustc/cargo changes)
   * after aggressive GC/cargo clean
 
-Warm is how we turn bounded tests into “run-only” rather than “build + run.”
+Warm is how we turn bounded tests into "run-only" rather than "build + run."
 
-### 7.2 CLI interface
+### 11.2 CLI interface
 
 Add to `crates/apm2-cli/src/commands/fac.rs`:
 
@@ -448,7 +958,7 @@ Proposed args (minimum viable + future-proof):
   * (future) `--sccache` / `--no-sccache` only if/when sccache is implemented
   * `--bounded` (optional: run warm under a resource governor scope; default true on multi-agent boxes)
 
-### 7.3 Execution plan
+### 11.3 Execution plan
 
 Warm runs these phases (with timing):
 
@@ -465,7 +975,7 @@ All commands run with:
 * `NEXTEST_TEST_THREADS = computed_or_override`
 * (future) sccache env only if enabled
 
-### 7.4 Warm locking and concurrency
+### 11.4 Warm locking and concurrency
 
 Warm must not stampede, but **do not serialize warm globally**: global warm locks reduce throughput and create single-point deadlocks.
 
@@ -479,7 +989,7 @@ Behavior:
 * If no compute slots are available:
   * default: wait (bounded by a reasonable max, or with `--no-wait` to fail fast)
 
-### 7.5 Warm receipts
+### 11.5 Warm receipts
 
 Warm must write a durable receipt:
 
@@ -519,16 +1029,16 @@ This receipt is intentionally similar in spirit to FAC receipts: structured, aud
 
 ---
 
-## 8. Resource hygiene: `apm2 fac gc` as an enforced safety valve
+## 12. Resource hygiene: `apm2 fac gc` as an enforced safety valve
 
-### 8.1 Why GC must exist as a FAC primitive
+### 12.1 Why GC must exist as a FAC primitive
 
 You have:
 
 * many worktrees
 * large `target/` dirs
 * parallel agents
-* a strict “host must remain functional” requirement
+* a strict "host must remain functional" requirement
 
 Therefore GC cannot remain an informal human action.
 
@@ -538,7 +1048,7 @@ This amendment therefore requires:
 * enforced disk preflight in `gates`, `warm`, and pipeline evidence
 * GC auto-invocation when below `min-free`
 
-### 8.2 CLI interface
+### 12.2 CLI interface
 
 Add:
 
@@ -550,12 +1060,12 @@ Args:
 * `--dry-run`
 * `--min-free <SIZE|PERCENT>` (default policy: see below)
 * `--keep-hot-worktrees <N>` (default: derived from concurrency)
-* `--ttl-days <D>` for “cold worktree targets”
+* `--ttl-days <D>` for "cold worktree targets"
 * `--sccache-trim` (default true)
 * `--gate-cache-ttl-days <D>` (default: 30)
 * `--aggressive` (enables deeper deletions)
 
-### 8.3 What GC is allowed to delete (safe set)
+### 12.3 What GC is allowed to delete (safe set)
 
 GC is allowed to delete:
 
@@ -567,15 +1077,15 @@ GC is allowed to delete:
 
 GC must **not** delete:
 
-* keys / identity material under `$APM2_HOME/private/*` unless explicitly in a separate “nuke” command
+* keys / identity material under `$APM2_HOME/private/*` unless explicitly in a separate "nuke" command
 * git worktrees themselves (only their build artifacts)
 
-### 8.4 “Active worktree” definition
+### 12.4 "Active worktree" definition
 
 A worktree is **active** if any of the following are true:
 
 * It is the current working directory of the invoking process (obviously)
-* It has a live FAC lock lease file (see §9)
+* It has a live FAC lock lease file (see §13)
 * It has a running `systemd-run` unit associated with it (optional detection)
 * It has been used recently (mtime heuristic):
 
@@ -586,10 +1096,10 @@ Everything else is eligible for target pruning.
 
 Required amendment: "active" must be defined in terms of the actual global governor, not heuristics.
 
-* A worktree is active iff it is referenced by an active compute-slot lease record (see §9.2.3).
+* A worktree is active iff it is referenced by an active compute-slot lease record (see §13.2.3).
 * Heuristics (mtime) may be used as a fallback only when lease metadata is missing.
 
-### 8.5 Default policy for your current box
+### 12.5 Default policy for your current box
 
 Given 96GB RAM and up to 3 simultaneous gate executions:
 
@@ -613,7 +1123,7 @@ Missing detail: enforce on both relevant mounts.
 * Evaluate `min-free` for the filesystem containing `$APM2_HOME`.
 * The preflight passes only if both pass, because disk-full on either breaks FAC.
 
-### 8.6 GC receipts
+### 12.6 GC receipts
 
 GC writes:
 
@@ -629,17 +1139,17 @@ Include:
 
 ---
 
-## 9. Global resource governor: stop pretending per-command limits are sufficient
+## 13. Global resource governor: stop pretending per-command limits are sufficient
 
-### 9.1 The missing control plane
+### 13.1 The missing control plane
 
-Today, only the test gate is bounded by `systemd-run`. That does not provide “host survivability” under multiple agents.
+Today, only the test gate is bounded by `systemd-run`. That does not provide "host survivability" under multiple agents.
 
 This amendment introduces a minimal, incremental control plane:
 
 * A local **compute lease** system (file-lock-based) that limits concurrent heavy operations.
 
-### 9.2 Compute lease model (Phase 1)
+### 13.2 Compute lease model (Phase 1)
 
 Implement a token semaphore under:
 
@@ -666,7 +1176,7 @@ Any heavy operation must acquire a slot:
 
 Lease is held for the duration; released on exit (Drop guard).
 
-### 9.2.3 Lease metadata (required for GC safety + debugging)
+### 13.2.3 Lease metadata (required for GC safety + debugging)
 
 On acquisition, write a sidecar JSON (not locked, but best-effort, overwrite-safe):
 
@@ -678,7 +1188,7 @@ Fields:
 * command (gates/warm/pipeline/gc)
 * workspace_root
 * started_at
-* toolchain_fingerprint (see §6.1)
+* toolchain_fingerprint (see §10.1)
 
 This single mechanism prevents:
 
@@ -686,7 +1196,7 @@ This single mechanism prevents:
 * warm stampedes
 * silent death-by-IO
 
-### 9.3 Compute-aware `CARGO_BUILD_JOBS` (Phase 1)
+### 13.3 Compute-aware `CARGO_BUILD_JOBS` (Phase 1)
 
 When a process acquires a compute slot, it computes a default `CARGO_BUILD_JOBS`:
 
@@ -709,9 +1219,9 @@ Missing-but-required: nextest runtime concurrency alignment:
 
 Optional: if bounded tests keep CPUQuota, compute CPUQuota from CPU count and N instead of hardcoding `200%`.
 
-### 9.4 Phase 2: long-lived “FAC Execution Pool” (the thing you’re gesturing at)
+### 13.4 Phase 2: long-lived "FAC Execution Pool" (the thing you're gesturing at)
 
-You asked whether “1 worktree = 1 ticket” is the right primitive. For exabyte/100B-agent scale, it isn’t.
+You asked whether "1 worktree = 1 ticket" is the right primitive. For exabyte/100B-agent scale, it isn't.
 
 This amendment defines the target architecture:
 
@@ -734,15 +1244,15 @@ Why this matters:
   * systemd slice budgets
   * per-slot and global disk quotas
   * sccache containment rules
-  * fast “reset slot” on corruption
+  * fast "reset slot" on corruption
 
-This is the correct “control surface” for scaling to many nodes and many agents. Phase 1 leases are the minimal stepping stone.
+This is the correct "control surface" for scaling to many nodes and many agents. Phase 1 leases are the minimal stepping stone.
 
 ---
 
-## 10. Nix integration: environment must be declarative
+## 14. Nix integration: environment must be declarative
 
-### 10.1 flake.nix updates
+### 14.1 flake.nix updates
 
 `flake.nix` already includes `cargo-nextest`. This amendment requires adding:
 
@@ -754,7 +1264,7 @@ This amendment does require:
 
 so the dev shell is a complete reproduction unit for FAC warm/gates.
 
-### 10.2 Backup/restore implications
+### 14.2 Backup/restore implications
 
 Because you have a backup node on the same headscale network:
 
@@ -772,7 +1282,7 @@ Because you have a backup node on the same headscale network:
   * sccache dir (large, but can accelerate restore)
   * cargo registry cache (also large)
 
-The “instant reproduction” story should be:
+The "instant reproduction" story should be:
 
 1. clone repo at known commit
 2. `nix develop` (tools pinned)
@@ -781,11 +1291,11 @@ The “instant reproduction” story should be:
 
 ---
 
-## 11. Verification and hard checks
+## 15. Verification and hard checks
 
 This amendment is only acceptable if these checks pass.
 
-### 11.1 Functional checks
+### 15.1 Functional checks
 
 1. `nix develop` provides:
 
@@ -809,7 +1319,7 @@ This amendment is only acceptable if these checks pass.
    * changing rustfmt version changes environment digest (fmt gate)
    * (if enabled) changing `RUSTC_WRAPPER` changes attestation digest
 
-### 11.2 Containment check (mandatory)
+### 15.2 Containment check (mandatory)
 
 If we enable sccache inside bounded units, we must verify:
 
@@ -827,9 +1337,9 @@ This check can be implemented as:
 
 ---
 
-## 12. Concrete file-level deltas (amendment plan)
+## 16. Concrete file-level deltas (amendment plan)
 
-### 12.1 Code changes
+### 16.1 Code changes
 
 * `crates/apm2-cli/src/commands/fac.rs`
 
@@ -877,11 +1387,11 @@ This check can be implemented as:
 
   * add CACHE_WARM (or equivalent) node as a lifecycle step after worktree prep and before editing
 
-### 12.2 RFC-0007 doc changes
+### 16.2 RFC-0007 doc changes
 
 Update `documents/rfcs/RFC-0007/02_design_decisions.yaml`:
 
-* Replace “optional nextest” decisions with:
+* Replace "optional nextest" decisions with:
 
   * **FAC substrate mandates nextest** (explicit invocation)
   * cargo test aliasing is not relied upon
@@ -899,7 +1409,7 @@ Add a new section (or amendment file) describing:
 
 ---
 
-## 13. Ticket YAMLs (drop-in proposals)
+## 17. Ticket YAMLs (drop-in proposals)
 
 Below are proposed new tickets using the current ticket schema (`schema_version: "2026-01-29"`). IDs start from `TCK-00503` (next available after existing tickets).
 
@@ -1150,20 +1660,3 @@ ticket_meta:
       This ticket is policy enforcement. The goal is to eliminate ambient-state ambiguity and
       prevent accidental host-destabilizing overrides.
 ```
-
----
-
-## 14. Summary of "what you should revert" from your current practice
-
-* **Revert**: “`cargo test` aliases to nextest” as part of the canonical environment.
-* **Keep/encode**: nextest as the **explicit** FAC test runner (already true on the bounded path; we make it true on the fallback path too).
-* **Stop**: "one worktree = one target dir = one disk bomb". Move FAC to slot-scoped target pool.
-* **Encode reproducibility** via:
-
-  * `flake.nix` including `cargo-nextest` and `sccache`
-  * repo-local cargo alias `cargo nt` (optional)
-  * FAC commands that explicitly run nextest and explicitly manage cache policy
-
-If you do only one thing from this amendment, do the target pool + enforced disk preflight. sccache is not the first lever.
-
-That is the cleanest route to "scale out to more VPS nodes and instantly reproduce."
