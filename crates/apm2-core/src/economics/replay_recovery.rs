@@ -95,11 +95,24 @@ pub const DENY_REPLAY_RECEIPT_TIME_AUTH_ZERO: &str =
     "replay_convergence_receipt_time_authority_ref_zero";
 /// Deny: replay receipt signer key is zero.
 pub const DENY_REPLAY_RECEIPT_SIGNER_ZERO: &str = "replay_convergence_receipt_signer_key_zero";
+/// Deny: replay receipt signer is not in the trusted set.
+pub const DENY_REPLAY_RECEIPT_SIGNER_UNTRUSTED: &str =
+    "replay_convergence_receipt_signer_untrusted";
 /// Deny: replay receipt ID is empty or oversized.
 pub const DENY_REPLAY_RECEIPT_ID_INVALID: &str = "replay_convergence_receipt_id_invalid";
 /// Deny: replay receipt boundary mismatch.
 pub const DENY_REPLAY_RECEIPT_BOUNDARY_MISMATCH: &str =
     "replay_convergence_receipt_boundary_mismatch";
+/// Deny: replay receipt time authority reference does not match evaluation
+/// context.
+pub const DENY_REPLAY_RECEIPT_TIME_AUTH_MISMATCH: &str =
+    "replay_convergence_receipt_time_authority_ref_mismatch";
+/// Deny: replay receipt window reference does not match evaluation context.
+pub const DENY_REPLAY_RECEIPT_WINDOW_MISMATCH: &str =
+    "replay_convergence_receipt_window_ref_mismatch";
+/// Deny: replay receipt backlog digest does not match evaluation context.
+pub const DENY_REPLAY_RECEIPT_BACKLOG_MISMATCH: &str =
+    "replay_convergence_receipt_backlog_digest_mismatch";
 /// Deny: recovery admissibility receipt is missing.
 pub const DENY_RECOVERY_RECEIPT_MISSING: &str = "recovery_admissibility_receipt_missing";
 /// Deny: recovery admissibility receipt hash is zero.
@@ -248,44 +261,44 @@ pub struct ReplayConvergenceReceiptV1 {
 impl ReplayConvergenceReceiptV1 {
     /// Creates and signs a replay convergence receipt.
     ///
+    /// String fields are validated for length BEFORE allocation to prevent
+    /// unbounded memory allocation from oversized inputs.
+    ///
     /// # Errors
     ///
     /// Returns an error if any field fails validation or signing fails.
     #[allow(clippy::too_many_arguments)]
     pub fn create_signed(
-        receipt_id: impl Into<String>,
-        boundary_id: impl Into<String>,
+        receipt_id: &str,
+        boundary_id: &str,
         backlog_digest: Hash,
         replay_horizon_tick: u64,
         converged: bool,
         time_authority_ref: Hash,
         window_ref: Hash,
         content_hash: Hash,
-        signer_actor_id: impl Into<String>,
+        signer_actor_id: &str,
         signer: &Signer,
     ) -> Result<Self, ReplayRecoveryError> {
-        let receipt_id = receipt_id.into();
-        let boundary_id = boundary_id.into();
-        let signer_actor_id = signer_actor_id.into();
-
-        validate_required_string("receipt_id", &receipt_id, MAX_RECEIPT_ID_LENGTH)?;
-        validate_required_string("boundary_id", &boundary_id, MAX_BOUNDARY_ID_LENGTH)?;
-        validate_required_string("signer_actor_id", &signer_actor_id, MAX_ACTOR_ID_LENGTH)?;
+        // Validate length BEFORE allocating to prevent DoS via oversized input.
+        validate_required_string("receipt_id", receipt_id, MAX_RECEIPT_ID_LENGTH)?;
+        validate_required_string("boundary_id", boundary_id, MAX_BOUNDARY_ID_LENGTH)?;
+        validate_required_string("signer_actor_id", signer_actor_id, MAX_ACTOR_ID_LENGTH)?;
         validate_non_zero_hash("backlog_digest", &backlog_digest)?;
         validate_non_zero_hash("time_authority_ref", &time_authority_ref)?;
         validate_non_zero_hash("window_ref", &window_ref)?;
         validate_non_zero_hash("content_hash", &content_hash)?;
 
         let mut receipt = Self {
-            receipt_id,
-            boundary_id,
+            receipt_id: receipt_id.to_string(),
+            boundary_id: boundary_id.to_string(),
             backlog_digest,
             replay_horizon_tick,
             converged,
             time_authority_ref,
             window_ref,
             content_hash,
-            signer_actor_id,
+            signer_actor_id: signer_actor_id.to_string(),
             signer_key: signer.public_key_bytes(),
             signature: [0u8; 64],
         };
@@ -446,42 +459,42 @@ pub struct RecoveryAdmissibilityReceiptV1 {
 impl RecoveryAdmissibilityReceiptV1 {
     /// Creates and signs a recovery admissibility receipt.
     ///
+    /// String fields are validated for length BEFORE allocation to prevent
+    /// unbounded memory allocation from oversized inputs.
+    ///
     /// # Errors
     ///
     /// Returns an error if any field fails validation or signing fails.
     #[allow(clippy::too_many_arguments)]
     pub fn create_signed(
-        receipt_id: impl Into<String>,
-        boundary_id: impl Into<String>,
+        receipt_id: &str,
+        boundary_id: &str,
         recovery_scope_digest: Hash,
         admitted: bool,
         time_authority_ref: Hash,
         window_ref: Hash,
         content_hash: Hash,
-        signer_actor_id: impl Into<String>,
+        signer_actor_id: &str,
         signer: &Signer,
     ) -> Result<Self, ReplayRecoveryError> {
-        let receipt_id = receipt_id.into();
-        let boundary_id = boundary_id.into();
-        let signer_actor_id = signer_actor_id.into();
-
-        validate_required_string("receipt_id", &receipt_id, MAX_RECEIPT_ID_LENGTH)?;
-        validate_required_string("boundary_id", &boundary_id, MAX_BOUNDARY_ID_LENGTH)?;
-        validate_required_string("signer_actor_id", &signer_actor_id, MAX_ACTOR_ID_LENGTH)?;
+        // Validate length BEFORE allocating to prevent DoS via oversized input.
+        validate_required_string("receipt_id", receipt_id, MAX_RECEIPT_ID_LENGTH)?;
+        validate_required_string("boundary_id", boundary_id, MAX_BOUNDARY_ID_LENGTH)?;
+        validate_required_string("signer_actor_id", signer_actor_id, MAX_ACTOR_ID_LENGTH)?;
         validate_non_zero_hash("recovery_scope_digest", &recovery_scope_digest)?;
         validate_non_zero_hash("time_authority_ref", &time_authority_ref)?;
         validate_non_zero_hash("window_ref", &window_ref)?;
         validate_non_zero_hash("content_hash", &content_hash)?;
 
         let mut receipt = Self {
-            receipt_id,
-            boundary_id,
+            receipt_id: receipt_id.to_string(),
+            boundary_id: boundary_id.to_string(),
             recovery_scope_digest,
             admitted,
             time_authority_ref,
             window_ref,
             content_hash,
-            signer_actor_id,
+            signer_actor_id: signer_actor_id.to_string(),
             signer_key: signer.public_key_bytes(),
             signature: [0u8; 64],
         };
@@ -639,18 +652,26 @@ pub struct ReplayRecoveryDenyDefect {
 /// 2. Replay receipts are present and within bounds.
 /// 3. The backlog state is resolved.
 /// 4. All receipts have valid structural form.
-/// 5. All receipts match the evaluation boundary.
-/// 6. The backlog converged idempotently within the horizon.
+/// 5. All receipts pass Ed25519 signature verification.
+/// 6. All receipt signers are in the trusted signer set (constant-time).
+/// 7. All receipts match the evaluation boundary.
+/// 8. All receipts bind to the expected time authority, window, and backlog
+///    context (constant-time comparison to prevent cross-context replay).
+/// 9. The backlog converged idempotently within the horizon.
 ///
 /// # Errors
 ///
 /// Returns a stable deny reason string for any violation. All unknown
 /// or missing states fail closed.
+#[allow(clippy::too_many_arguments)]
 pub fn validate_replay_convergence_tp004(
     horizon: Option<&ReplayConvergenceHorizonRef>,
     backlog: Option<&BacklogState>,
     receipts: &[ReplayConvergenceReceiptV1],
     eval_boundary_id: &str,
+    trusted_signers: &[[u8; 32]],
+    expected_time_authority_ref: &Hash,
+    expected_window_ref: &Hash,
 ) -> Result<(), &'static str> {
     // Fail-closed: missing horizon reference.
     let horizon = horizon.ok_or(DENY_REPLAY_HORIZON_UNRESOLVED)?;
@@ -684,12 +705,52 @@ pub fn validate_replay_convergence_tp004(
         return Err(DENY_REPLAY_RECEIPT_MISSING);
     }
 
-    // Validate each receipt structurally and check boundary match.
+    // Validate each receipt structurally, verify signature, check trusted
+    // signer, and bind to evaluation context.
     for receipt in receipts {
         receipt.validate()?;
 
+        // BLOCKER fix: verify Ed25519 signature (not just structural form).
+        receipt
+            .verify_signature()
+            .map_err(|_| DENY_REPLAY_RECEIPT_SIGNATURE_INVALID)?;
+
+        // BLOCKER fix: verify signer is in trusted set (constant-time).
+        if !trusted_signers
+            .iter()
+            .any(|ts| ts.ct_eq(&receipt.signer_key).unwrap_u8() == 1)
+        {
+            return Err(DENY_REPLAY_RECEIPT_SIGNER_UNTRUSTED);
+        }
+
         if receipt.boundary_id != eval_boundary_id {
             return Err(DENY_REPLAY_RECEIPT_BOUNDARY_MISMATCH);
+        }
+
+        // Context binding: receipt time_authority_ref must match expected
+        // (constant-time to prevent cross-context replay).
+        if receipt
+            .time_authority_ref
+            .ct_eq(expected_time_authority_ref)
+            .unwrap_u8()
+            == 0
+        {
+            return Err(DENY_REPLAY_RECEIPT_TIME_AUTH_MISMATCH);
+        }
+
+        // Context binding: receipt window_ref must match expected.
+        if receipt.window_ref.ct_eq(expected_window_ref).unwrap_u8() == 0 {
+            return Err(DENY_REPLAY_RECEIPT_WINDOW_MISMATCH);
+        }
+
+        // Context binding: receipt backlog_digest must match backlog state.
+        if receipt
+            .backlog_digest
+            .ct_eq(&backlog.backlog_digest)
+            .unwrap_u8()
+            == 0
+        {
+            return Err(DENY_REPLAY_RECEIPT_BACKLOG_MISMATCH);
         }
 
         // Receipt must be within the replay horizon.
@@ -879,8 +940,8 @@ impl ReplayRecoveryDecision {
 /// Evaluates replay-recovery admission for a given evaluation context.
 ///
 /// This is the top-level evaluator that checks TP-EIO29-004 (replay
-/// convergence) and optionally TP-EIO29-007 (idempotency monotone) if
-/// adjacent-window data is provided.
+/// convergence) and TP-EIO29-007 (idempotency monotone) when the caller
+/// declares adjacent windows via [`IdempotencyMode::Adjacent`].
 ///
 /// # Arguments
 ///
@@ -891,7 +952,8 @@ impl ReplayRecoveryDecision {
 /// - `eval_tick`: current tick for deny defect reporting.
 /// - `envelope_hash`: time authority envelope hash for defect reporting.
 /// - `window_ref_hash`: window reference hash for defect reporting.
-/// - `idempotency`: optional adjacent-window idempotency check data.
+/// - `trusted_signers`: trusted signer public keys for receipt verification.
+/// - `idempotency`: typed mode indicating whether TP-EIO29-007 applies.
 ///
 /// # Returns
 ///
@@ -906,13 +968,21 @@ pub fn evaluate_replay_recovery(
     eval_tick: u64,
     envelope_hash: Hash,
     window_ref_hash: Hash,
-    idempotency: Option<&IdempotencyCheckInput>,
+    trusted_signers: &[[u8; 32]],
+    idempotency: IdempotencyMode<'_>,
 ) -> ReplayRecoveryDecision {
     let mut predicate_results = Vec::new();
 
     // TP-EIO29-004: replay convergence horizon satisfied.
-    let tp004_result =
-        validate_replay_convergence_tp004(horizon, backlog, receipts, eval_boundary_id);
+    let tp004_result = validate_replay_convergence_tp004(
+        horizon,
+        backlog,
+        receipts,
+        eval_boundary_id,
+        trusted_signers,
+        &envelope_hash,
+        &window_ref_hash,
+    );
     let tp004_passed = tp004_result.is_ok();
     predicate_results.push((TemporalPredicateId::TpEio29004, tp004_passed));
 
@@ -928,28 +998,36 @@ pub fn evaluate_replay_recovery(
         );
     }
 
-    // TP-EIO29-007: replay idempotency monotone (only if provided).
-    if let Some(idem) = idempotency {
-        let tp007_result = validate_replay_idempotency_tp007(
-            &idem.windows,
-            &idem.effects_t,
-            &idem.effects_t1,
-            &idem.revoked_t1,
-        );
-        let tp007_passed = tp007_result.is_ok();
-        predicate_results.push((TemporalPredicateId::TpEio29007, tp007_passed));
-
-        if let Err(reason) = tp007_result {
-            return ReplayRecoveryDecision::deny(
-                reason,
-                TemporalPredicateId::TpEio29007,
-                eval_boundary_id,
-                eval_tick,
-                envelope_hash,
-                window_ref_hash,
-                predicate_results,
+    // TP-EIO29-007: replay idempotency monotone.
+    // Only checked when the caller explicitly declares adjacent windows.
+    // `IdempotencyMode::NotAdjacent` means the caller attests non-adjacency;
+    // `IdempotencyMode::Adjacent(input)` requires the full check.
+    match idempotency {
+        IdempotencyMode::NotAdjacent => {
+            // Caller explicitly declared non-adjacency; TP007 does not apply.
+        },
+        IdempotencyMode::Adjacent(idem) => {
+            let tp007_result = validate_replay_idempotency_tp007(
+                &idem.windows,
+                &idem.effects_t,
+                &idem.effects_t1,
+                &idem.revoked_t1,
             );
-        }
+            let tp007_passed = tp007_result.is_ok();
+            predicate_results.push((TemporalPredicateId::TpEio29007, tp007_passed));
+
+            if let Err(reason) = tp007_result {
+                return ReplayRecoveryDecision::deny(
+                    reason,
+                    TemporalPredicateId::TpEio29007,
+                    eval_boundary_id,
+                    eval_tick,
+                    envelope_hash,
+                    window_ref_hash,
+                    predicate_results,
+                );
+            }
+        },
     }
 
     ReplayRecoveryDecision::allow(predicate_results)
@@ -966,6 +1044,23 @@ pub struct IdempotencyCheckInput {
     pub effects_t1: Vec<Hash>,
     /// Revoked effect digests in the later window.
     pub revoked_t1: Vec<Hash>,
+}
+
+/// Typed mode for TP-EIO29-007 idempotency evaluation.
+///
+/// Replaces `Option<&IdempotencyCheckInput>` to prevent fail-open bypass.
+/// Callers must explicitly declare whether windows are adjacent (requiring
+/// the full idempotency check) or not adjacent (TP-EIO29-007 does not apply).
+///
+/// This design follows CTR-2623 (no boolean blindness) and CTR-2617
+/// (fail-closed distributed capabilities): ambiguous optional parameters on
+/// security paths must resolve to deny, not allow.
+#[derive(Debug, Clone, Copy)]
+pub enum IdempotencyMode<'a> {
+    /// Windows are not adjacent; TP-EIO29-007 does not apply.
+    NotAdjacent,
+    /// Windows are adjacent; idempotency check is required.
+    Adjacent(&'a IdempotencyCheckInput),
 }
 
 // ============================================================================
@@ -1025,11 +1120,28 @@ mod tests {
         Signer::generate()
     }
 
+    /// Standard trusted signer set containing the given signer's public key.
+    fn trusted_signers_for(signer: &Signer) -> [[u8; 32]; 1] {
+        [signer.public_key_bytes()]
+    }
+
+    /// Expected time authority ref used in valid receipts.
+    fn expected_time_authority_ref() -> Hash {
+        test_hash(0xBB)
+    }
+
+    /// Expected window ref used in valid receipts.
+    fn expected_window_ref() -> Hash {
+        test_hash(0xCC)
+    }
+
     fn valid_replay_receipt(signer: &Signer) -> ReplayConvergenceReceiptV1 {
         ReplayConvergenceReceiptV1::create_signed(
             "rcpt-001",
             "boundary-1",
-            test_hash(0xAA),
+            // backlog_digest must match valid_backlog().backlog_digest for
+            // context binding checks.
+            test_hash(0xFF),
             1000,
             true,
             test_hash(0xBB),
@@ -1073,7 +1185,7 @@ mod tests {
     }
 
     // ========================================================================
-    // ReplayConvergenceReceiptV1 — creation and signing
+    // ReplayConvergenceReceiptV1 -- creation and signing
     // ========================================================================
 
     #[test]
@@ -1143,7 +1255,7 @@ mod tests {
         let result = ReplayConvergenceReceiptV1::create_signed(
             "",
             "boundary-1",
-            test_hash(0xAA),
+            test_hash(0xFF),
             1000,
             true,
             test_hash(0xBB),
@@ -1160,9 +1272,9 @@ mod tests {
         let signer = valid_signer();
         let big_id = "x".repeat(MAX_RECEIPT_ID_LENGTH + 1);
         let result = ReplayConvergenceReceiptV1::create_signed(
-            big_id,
+            &big_id,
             "boundary-1",
-            test_hash(0xAA),
+            test_hash(0xFF),
             1000,
             true,
             test_hash(0xBB),
@@ -1180,7 +1292,7 @@ mod tests {
         let result = ReplayConvergenceReceiptV1::create_signed(
             "rcpt-001",
             "boundary-1",
-            test_hash(0xAA),
+            test_hash(0xFF),
             1000,
             true,
             [0u8; 32], // zero time_authority_ref
@@ -1198,7 +1310,7 @@ mod tests {
         let result = ReplayConvergenceReceiptV1::create_signed(
             "rcpt-001",
             "boundary-1",
-            test_hash(0xAA),
+            test_hash(0xFF),
             1000,
             true,
             test_hash(0xBB),
@@ -1216,7 +1328,7 @@ mod tests {
         let result = ReplayConvergenceReceiptV1::create_signed(
             "rcpt-001",
             "boundary-1",
-            test_hash(0xAA),
+            test_hash(0xFF),
             1000,
             true,
             test_hash(0xBB),
@@ -1261,7 +1373,7 @@ mod tests {
         let signer = valid_signer();
         let replay_receipt = valid_replay_receipt(&signer);
 
-        // Try to verify with recovery receipt domain — should fail.
+        // Try to verify with recovery receipt domain -- should fail.
         let key = parse_verifying_key(&replay_receipt.signer_key).unwrap();
         let sig = parse_signature(&replay_receipt.signature).unwrap();
         let result = verify_with_domain(
@@ -1274,7 +1386,7 @@ mod tests {
     }
 
     // ========================================================================
-    // RecoveryAdmissibilityReceiptV1 — creation and signing
+    // RecoveryAdmissibilityReceiptV1 -- creation and signing
     // ========================================================================
 
     #[test]
@@ -1351,7 +1463,7 @@ mod tests {
         let signer = valid_signer();
         let recovery_receipt = valid_recovery_receipt(&signer);
 
-        // Try to verify with replay receipt domain — should fail.
+        // Try to verify with replay receipt domain -- should fail.
         let key = parse_verifying_key(&recovery_receipt.signer_key).unwrap();
         let sig = parse_signature(&recovery_receipt.signature).unwrap();
         let result = verify_with_domain(
@@ -1405,11 +1517,15 @@ mod tests {
     fn tp004_valid_inputs_pass() {
         let signer = valid_signer();
         let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
         let result = validate_replay_convergence_tp004(
             Some(&valid_horizon()),
             Some(&valid_backlog()),
             &[receipt],
             "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
         );
         assert!(result.is_ok());
     }
@@ -1418,11 +1534,15 @@ mod tests {
     fn tp004_missing_horizon_denies() {
         let signer = valid_signer();
         let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
         let result = validate_replay_convergence_tp004(
             None,
             Some(&valid_backlog()),
             &[receipt],
             "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
         );
         assert_eq!(result.unwrap_err(), DENY_REPLAY_HORIZON_UNRESOLVED);
     }
@@ -1431,6 +1551,7 @@ mod tests {
     fn tp004_unresolved_horizon_denies() {
         let signer = valid_signer();
         let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
         let mut horizon = valid_horizon();
         horizon.resolved = false;
         let result = validate_replay_convergence_tp004(
@@ -1438,6 +1559,9 @@ mod tests {
             Some(&valid_backlog()),
             &[receipt],
             "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
         );
         assert_eq!(result.unwrap_err(), DENY_REPLAY_HORIZON_UNRESOLVED);
     }
@@ -1446,6 +1570,7 @@ mod tests {
     fn tp004_zero_horizon_digest_denies() {
         let signer = valid_signer();
         let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
         let mut horizon = valid_horizon();
         horizon.horizon_digest = [0u8; 32];
         let result = validate_replay_convergence_tp004(
@@ -1453,6 +1578,9 @@ mod tests {
             Some(&valid_backlog()),
             &[receipt],
             "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
         );
         assert_eq!(result.unwrap_err(), DENY_REPLAY_HORIZON_UNRESOLVED);
     }
@@ -1461,11 +1589,15 @@ mod tests {
     fn tp004_missing_backlog_denies() {
         let signer = valid_signer();
         let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
         let result = validate_replay_convergence_tp004(
             Some(&valid_horizon()),
             None,
             &[receipt],
             "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
         );
         assert_eq!(result.unwrap_err(), DENY_BACKLOG_UNRESOLVED);
     }
@@ -1474,6 +1606,7 @@ mod tests {
     fn tp004_unresolved_backlog_denies() {
         let signer = valid_signer();
         let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
         let mut backlog = valid_backlog();
         backlog.resolved = false;
         let result = validate_replay_convergence_tp004(
@@ -1481,6 +1614,9 @@ mod tests {
             Some(&backlog),
             &[receipt],
             "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
         );
         assert_eq!(result.unwrap_err(), DENY_BACKLOG_UNRESOLVED);
     }
@@ -1489,6 +1625,7 @@ mod tests {
     fn tp004_zero_backlog_digest_denies() {
         let signer = valid_signer();
         let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
         let mut backlog = valid_backlog();
         backlog.backlog_digest = [0u8; 32];
         let result = validate_replay_convergence_tp004(
@@ -1496,17 +1633,25 @@ mod tests {
             Some(&backlog),
             &[receipt],
             "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
         );
         assert_eq!(result.unwrap_err(), DENY_BACKLOG_UNRESOLVED);
     }
 
     #[test]
     fn tp004_empty_receipts_denies() {
+        let signer = valid_signer();
+        let ts = trusted_signers_for(&signer);
         let result = validate_replay_convergence_tp004(
             Some(&valid_horizon()),
             Some(&valid_backlog()),
             &[],
             "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
         );
         assert_eq!(result.unwrap_err(), DENY_REPLAY_RECEIPT_MISSING);
     }
@@ -1515,11 +1660,15 @@ mod tests {
     fn tp004_receipt_boundary_mismatch_denies() {
         let signer = valid_signer();
         let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
         let result = validate_replay_convergence_tp004(
             Some(&valid_horizon()),
             Some(&valid_backlog()),
             &[receipt],
             "wrong-boundary",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
         );
         assert_eq!(result.unwrap_err(), DENY_REPLAY_RECEIPT_BOUNDARY_MISMATCH);
     }
@@ -1527,10 +1676,11 @@ mod tests {
     #[test]
     fn tp004_receipt_beyond_horizon_denies() {
         let signer = valid_signer();
+        let ts = trusted_signers_for(&signer);
         let receipt = ReplayConvergenceReceiptV1::create_signed(
             "rcpt-stale",
             "boundary-1",
-            test_hash(0xAA),
+            test_hash(0xFF),
             3000, // beyond horizon_end_tick=2000
             true,
             test_hash(0xBB),
@@ -1545,6 +1695,9 @@ mod tests {
             Some(&valid_backlog()),
             &[receipt],
             "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
         );
         assert_eq!(result.unwrap_err(), DENY_STALE_REPLAY_RECEIPT);
     }
@@ -1552,10 +1705,11 @@ mod tests {
     #[test]
     fn tp004_non_converged_receipt_denies() {
         let signer = valid_signer();
+        let ts = trusted_signers_for(&signer);
         let receipt = ReplayConvergenceReceiptV1::create_signed(
             "rcpt-nc",
             "boundary-1",
-            test_hash(0xAA),
+            test_hash(0xFF),
             1000,
             false, // not converged
             test_hash(0xBB),
@@ -1570,6 +1724,9 @@ mod tests {
             Some(&valid_backlog()),
             &[receipt],
             "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
         );
         assert_eq!(result.unwrap_err(), DENY_BACKLOG_UNRESOLVED);
     }
@@ -1577,12 +1734,13 @@ mod tests {
     #[test]
     fn tp004_exceeds_max_receipts_denies() {
         let signer = valid_signer();
+        let ts = trusted_signers_for(&signer);
         let receipts: Vec<_> = (0..=MAX_REPLAY_RECEIPTS)
             .map(|i| {
                 ReplayConvergenceReceiptV1::create_signed(
-                    format!("rcpt-{i}"),
+                    &format!("rcpt-{i}"),
                     "boundary-1",
-                    test_hash(0xAA),
+                    test_hash(0xFF),
                     1000,
                     true,
                     test_hash(0xBB),
@@ -1599,8 +1757,161 @@ mod tests {
             Some(&valid_backlog()),
             &receipts,
             "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
         );
         assert_eq!(result.unwrap_err(), DENY_REPLAY_RECEIPTS_EXCEEDED);
+    }
+
+    // ========================================================================
+    // TP004 BLOCKER fix: signature verification and trusted signer enforcement
+    // ========================================================================
+
+    #[test]
+    fn tp004_forged_signature_denies() {
+        let signer = valid_signer();
+        let ts = trusted_signers_for(&signer);
+        let mut receipt = valid_replay_receipt(&signer);
+        // Tamper with a field to invalidate the signature.
+        receipt.boundary_id = "tampered-boundary".to_string();
+        let result = validate_replay_convergence_tp004(
+            Some(&valid_horizon()),
+            Some(&valid_backlog()),
+            &[receipt],
+            "tampered-boundary",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
+        );
+        assert_eq!(result.unwrap_err(), DENY_REPLAY_RECEIPT_SIGNATURE_INVALID);
+    }
+
+    #[test]
+    fn tp004_untrusted_signer_denies() {
+        let signer_a = valid_signer();
+        let signer_b = valid_signer();
+        let receipt = valid_replay_receipt(&signer_a);
+        // Trust only signer_b, not signer_a.
+        let ts = trusted_signers_for(&signer_b);
+        let result = validate_replay_convergence_tp004(
+            Some(&valid_horizon()),
+            Some(&valid_backlog()),
+            &[receipt],
+            "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
+        );
+        assert_eq!(result.unwrap_err(), DENY_REPLAY_RECEIPT_SIGNER_UNTRUSTED);
+    }
+
+    #[test]
+    fn tp004_trusted_signer_passes() {
+        let signer = valid_signer();
+        let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
+        let result = validate_replay_convergence_tp004(
+            Some(&valid_horizon()),
+            Some(&valid_backlog()),
+            &[receipt],
+            "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
+        );
+        assert!(result.is_ok());
+    }
+
+    // ========================================================================
+    // TP004 MAJOR-1 fix: context binding (cross-context replay prevention)
+    // ========================================================================
+
+    #[test]
+    fn tp004_receipt_time_authority_mismatch_denies() {
+        let signer = valid_signer();
+        let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
+        // Expected time authority does not match receipt's.
+        let wrong_time_auth = test_hash(0x11);
+        let result = validate_replay_convergence_tp004(
+            Some(&valid_horizon()),
+            Some(&valid_backlog()),
+            &[receipt],
+            "boundary-1",
+            &ts,
+            &wrong_time_auth,
+            &expected_window_ref(),
+        );
+        assert_eq!(result.unwrap_err(), DENY_REPLAY_RECEIPT_TIME_AUTH_MISMATCH);
+    }
+
+    #[test]
+    fn tp004_receipt_window_ref_mismatch_denies() {
+        let signer = valid_signer();
+        let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
+        // Expected window ref does not match receipt's.
+        let wrong_window_ref = test_hash(0x22);
+        let result = validate_replay_convergence_tp004(
+            Some(&valid_horizon()),
+            Some(&valid_backlog()),
+            &[receipt],
+            "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &wrong_window_ref,
+        );
+        assert_eq!(result.unwrap_err(), DENY_REPLAY_RECEIPT_WINDOW_MISMATCH);
+    }
+
+    #[test]
+    fn tp004_receipt_backlog_digest_mismatch_denies() {
+        let signer = valid_signer();
+        let ts = trusted_signers_for(&signer);
+        // Create receipt with a backlog_digest that does NOT match
+        // valid_backlog().backlog_digest.
+        let receipt = ReplayConvergenceReceiptV1::create_signed(
+            "rcpt-mismatch",
+            "boundary-1",
+            test_hash(0xAA), // != valid_backlog().backlog_digest (0xFF)
+            1000,
+            true,
+            test_hash(0xBB),
+            test_hash(0xCC),
+            test_hash(0xDD),
+            "actor-1",
+            &signer,
+        )
+        .unwrap();
+        let result = validate_replay_convergence_tp004(
+            Some(&valid_horizon()),
+            Some(&valid_backlog()),
+            &[receipt],
+            "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
+        );
+        assert_eq!(result.unwrap_err(), DENY_REPLAY_RECEIPT_BACKLOG_MISMATCH);
+    }
+
+    #[test]
+    fn tp004_receipt_context_binding_all_match_passes() {
+        let signer = valid_signer();
+        let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
+        // All context fields match: time_authority_ref, window_ref, backlog_digest.
+        let result = validate_replay_convergence_tp004(
+            Some(&valid_horizon()),
+            Some(&valid_backlog()),
+            &[receipt],
+            "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
+        );
+        assert!(result.is_ok());
     }
 
     // ========================================================================
@@ -1825,13 +2136,14 @@ mod tests {
     }
 
     // ========================================================================
-    // Combined evaluation
+    // Combined evaluation (with IdempotencyMode)
     // ========================================================================
 
     #[test]
-    fn evaluate_replay_recovery_tp004_only_allows() {
+    fn evaluate_replay_recovery_not_adjacent_skips_tp007() {
         let signer = valid_signer();
         let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
         let decision = evaluate_replay_recovery(
             Some(&valid_horizon()),
             Some(&valid_backlog()),
@@ -1840,7 +2152,8 @@ mod tests {
             500,
             test_hash(0xBB),
             test_hash(0xCC),
-            None, // no idempotency check
+            &ts,
+            IdempotencyMode::NotAdjacent,
         );
         assert_eq!(decision.verdict, ReplayRecoveryVerdict::Allow);
         assert!(decision.defect.is_none());
@@ -1853,6 +2166,8 @@ mod tests {
 
     #[test]
     fn evaluate_replay_recovery_tp004_denies_produces_defect() {
+        let signer = valid_signer();
+        let ts = trusted_signers_for(&signer);
         let decision = evaluate_replay_recovery(
             None, // missing horizon -> deny
             Some(&valid_backlog()),
@@ -1861,7 +2176,8 @@ mod tests {
             500,
             test_hash(0xBB),
             test_hash(0xCC),
-            None,
+            &ts,
+            IdempotencyMode::NotAdjacent,
         );
         assert_eq!(decision.verdict, ReplayRecoveryVerdict::Deny);
         let defect = decision.defect.as_ref().unwrap();
@@ -1875,6 +2191,7 @@ mod tests {
     fn evaluate_replay_recovery_tp007_denies_duplicate_effect() {
         let signer = valid_signer();
         let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
         let shared = test_hash(0x01);
         let idem = IdempotencyCheckInput {
             windows: adjacent_windows(),
@@ -1890,7 +2207,8 @@ mod tests {
             500,
             test_hash(0xBB),
             test_hash(0xCC),
-            Some(&idem),
+            &ts,
+            IdempotencyMode::Adjacent(&idem),
         );
         assert_eq!(decision.verdict, ReplayRecoveryVerdict::Deny);
         let defect = decision.defect.as_ref().unwrap();
@@ -1902,6 +2220,7 @@ mod tests {
     fn evaluate_replay_recovery_tp004_and_tp007_both_pass() {
         let signer = valid_signer();
         let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
         let idem = IdempotencyCheckInput {
             windows: adjacent_windows(),
             effects_t: vec![test_hash(0x01)],
@@ -1916,7 +2235,8 @@ mod tests {
             500,
             test_hash(0xBB),
             test_hash(0xCC),
-            Some(&idem),
+            &ts,
+            IdempotencyMode::Adjacent(&idem),
         );
         assert_eq!(decision.verdict, ReplayRecoveryVerdict::Allow);
         assert_eq!(decision.predicate_results.len(), 2);
@@ -1934,6 +2254,7 @@ mod tests {
     fn evaluate_replay_recovery_tp007_revoked_effect_denies() {
         let signer = valid_signer();
         let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
         let revoked = test_hash(0x05);
         let idem = IdempotencyCheckInput {
             windows: adjacent_windows(),
@@ -1949,12 +2270,44 @@ mod tests {
             500,
             test_hash(0xBB),
             test_hash(0xCC),
-            Some(&idem),
+            &ts,
+            IdempotencyMode::Adjacent(&idem),
         );
         assert_eq!(decision.verdict, ReplayRecoveryVerdict::Deny);
         let defect = decision.defect.as_ref().unwrap();
         assert_eq!(defect.reason, DENY_REVOKED_EFFECT_IN_LATER_WINDOW);
         assert_eq!(defect.predicate_id, TemporalPredicateId::TpEio29007);
+    }
+
+    #[test]
+    fn evaluate_replay_recovery_adjacent_runs_tp007() {
+        let signer = valid_signer();
+        let receipt = valid_replay_receipt(&signer);
+        let ts = trusted_signers_for(&signer);
+        let idem = IdempotencyCheckInput {
+            windows: adjacent_windows(),
+            effects_t: vec![test_hash(0x01)],
+            effects_t1: vec![test_hash(0x02)],
+            revoked_t1: vec![],
+        };
+        let decision = evaluate_replay_recovery(
+            Some(&valid_horizon()),
+            Some(&valid_backlog()),
+            &[receipt],
+            "boundary-1",
+            500,
+            test_hash(0xBB),
+            test_hash(0xCC),
+            &ts,
+            IdempotencyMode::Adjacent(&idem),
+        );
+        assert_eq!(decision.verdict, ReplayRecoveryVerdict::Allow);
+        // Both predicates must appear in results.
+        assert_eq!(decision.predicate_results.len(), 2);
+        assert_eq!(
+            decision.predicate_results[1],
+            (TemporalPredicateId::TpEio29007, true)
+        );
     }
 
     // ========================================================================
@@ -2010,14 +2363,35 @@ mod tests {
 
     #[test]
     fn unknown_temporal_state_fails_closed_missing_horizon() {
-        let result = validate_replay_convergence_tp004(None, None, &[], "boundary-1");
+        let signer = valid_signer();
+        let ts = trusted_signers_for(&signer);
+        let result = validate_replay_convergence_tp004(
+            None,
+            None,
+            &[],
+            "boundary-1",
+            &ts,
+            &expected_time_authority_ref(),
+            &expected_window_ref(),
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn unknown_temporal_state_fails_closed_missing_everything() {
-        let decision =
-            evaluate_replay_recovery(None, None, &[], "boundary-1", 0, [0u8; 32], [0u8; 32], None);
+        let signer = valid_signer();
+        let ts = trusted_signers_for(&signer);
+        let decision = evaluate_replay_recovery(
+            None,
+            None,
+            &[],
+            "boundary-1",
+            0,
+            [0u8; 32],
+            [0u8; 32],
+            &ts,
+            IdempotencyMode::NotAdjacent,
+        );
         assert_eq!(decision.verdict, ReplayRecoveryVerdict::Deny);
     }
 }

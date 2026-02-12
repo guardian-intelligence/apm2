@@ -33,8 +33,8 @@ pub use queue_admission::{
     validate_convergence_horizon_tp003, validate_envelope_tp001, validate_freshness_horizon_tp002,
 };
 pub use replay_recovery::{
-    AdjacentWindowPair, BacklogState, IdempotencyCheckInput, RecoveryAdmissibilityReceiptV1,
-    ReplayConvergenceHorizonRef, ReplayConvergenceReceiptV1, ReplayRecoveryDecision,
-    ReplayRecoveryDenyDefect, ReplayRecoveryError, ReplayRecoveryVerdict, evaluate_replay_recovery,
-    validate_replay_convergence_tp004, validate_replay_idempotency_tp007,
+    AdjacentWindowPair, BacklogState, IdempotencyCheckInput, IdempotencyMode,
+    RecoveryAdmissibilityReceiptV1, ReplayConvergenceHorizonRef, ReplayConvergenceReceiptV1,
+    ReplayRecoveryDecision, ReplayRecoveryDenyDefect, ReplayRecoveryError, ReplayRecoveryVerdict,
+    evaluate_replay_recovery, validate_replay_convergence_tp004, validate_replay_idempotency_tp007,
 };

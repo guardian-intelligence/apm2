@@ -361,6 +361,7 @@ Both receipt types use domain-separated Ed25519 signatures (`REPLAY_CONVERGENCE_
 - `BacklogState` -- Backlog state snapshot for TP-EIO29-004
 - `AdjacentWindowPair` -- Adjacent-window pair for TP-EIO29-007
 - `IdempotencyCheckInput` -- Complete input for TP-EIO29-007 evaluation
+- `IdempotencyMode` -- Typed enum (`NotAdjacent` / `Adjacent(&IdempotencyCheckInput)`) replacing `Option<&IdempotencyCheckInput>` to prevent fail-open bypass of TP-EIO29-007
 - `ReplayRecoveryDecision` -- Combined verdict with structured deny defect
 - `ReplayRecoveryDenyDefect` -- Auditable deny defect with reason, predicate ID, boundary, tick, and envelope/window hashes
 
@@ -372,25 +373,31 @@ Both receipt types use domain-separated Ed25519 signatures (`REPLAY_CONVERGENCE_
 - [INV-RR04] Zero effect identity digests deny fail-closed.
 - [INV-RR05] Receipt and effect collections are hard-capped (MAX_REPLAY_RECEIPTS=256, MAX_EFFECT_IDENTITIES=4096, MAX_REVOKED_EFFECTS=4096).
 - [INV-RR06] Domain-separated signatures prevent cross-receipt-type replay.
+- [INV-RR07] TP-EIO29-004 verifies Ed25519 signatures on all receipts (not just structural form).
+- [INV-RR08] TP-EIO29-004 enforces trusted signer set via constant-time comparison; untrusted signers deny.
+- [INV-RR09] TP-EIO29-004 binds receipt `time_authority_ref`, `window_ref`, and `backlog_digest` to evaluation context via constant-time comparison to prevent cross-context replay.
+- [INV-RR10] `IdempotencyMode` forces callers to explicitly declare adjacency intent; `Option`-based bypass is eliminated.
+- [INV-RR11] Receipt `create_signed` methods accept `&str` and validate length BEFORE allocation to prevent DoS via oversized input.
 
 ### Contracts
 
-- [CTR-RR01] `validate_replay_convergence_tp004()` enforces horizon resolution, backlog resolution, receipt structural validity, boundary match, horizon bounds, and convergence.
+- [CTR-RR01] `validate_replay_convergence_tp004()` enforces horizon resolution, backlog resolution, receipt structural validity, Ed25519 signature verification, trusted signer enforcement, boundary match, context binding (time_authority_ref, window_ref, backlog_digest), horizon bounds, and convergence.
 - [CTR-RR02] `validate_replay_idempotency_tp007()` enforces window adjacency, revoked-effect exclusion, authoritative-effect dedup, and zero-digest rejection.
-- [CTR-RR03] `evaluate_replay_recovery()` combines TP-EIO29-004 and optional TP-EIO29-007 into a single admission decision with structured deny defects.
+- [CTR-RR03] `evaluate_replay_recovery()` combines TP-EIO29-004 and TP-EIO29-007 (via `IdempotencyMode`) into a single admission decision with structured deny defects.
 - [CTR-RR04] All deny decisions produce a `ReplayRecoveryDenyDefect` with stable reason code, predicate ID, boundary, tick, and hash bindings.
+- [CTR-RR05] `create_signed` methods validate string field lengths BEFORE allocating to prevent unbounded memory allocation.
 
 ### Public API
 
-- `ReplayConvergenceReceiptV1::create_signed(...)` -- Create and sign a replay convergence receipt
+- `ReplayConvergenceReceiptV1::create_signed(receipt_id: &str, ...)` -- Create and sign a replay convergence receipt (validates before allocating)
 - `ReplayConvergenceReceiptV1::verify_signature()` -- Verify receipt Ed25519 signature
 - `ReplayConvergenceReceiptV1::validate()` -- Structural validation (no signature check)
-- `RecoveryAdmissibilityReceiptV1::create_signed(...)` -- Create and sign a recovery admissibility receipt
+- `RecoveryAdmissibilityReceiptV1::create_signed(receipt_id: &str, ...)` -- Create and sign a recovery admissibility receipt (validates before allocating)
 - `RecoveryAdmissibilityReceiptV1::verify_signature()` -- Verify receipt Ed25519 signature
 - `RecoveryAdmissibilityReceiptV1::validate()` -- Structural validation
-- `validate_replay_convergence_tp004(horizon, backlog, receipts, boundary_id)` -- TP-EIO29-004 validation
+- `validate_replay_convergence_tp004(horizon, backlog, receipts, boundary_id, trusted_signers, expected_time_authority_ref, expected_window_ref)` -- TP-EIO29-004 validation (with signature verification, trusted signer enforcement, and context binding)
 - `validate_replay_idempotency_tp007(windows, effects_t, effects_t1, revoked_t1)` -- TP-EIO29-007 validation
-- `evaluate_replay_recovery(...)` -- Combined TP-EIO29-004 + TP-EIO29-007 evaluation
+- `evaluate_replay_recovery(..., trusted_signers, idempotency: IdempotencyMode)` -- Combined TP-EIO29-004 + TP-EIO29-007 evaluation
 
 ## Related Modules
 
