@@ -7589,6 +7589,247 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             None
         };
 
+        // ================================================================
+        // TCK-00494 BLOCKER FIX: AdmissionKernel plan/execute invocation.
+        //
+        // When the AdmissionKernel is wired and the PCAC LifecycleGate is
+        // NOT (kernel is sole authority gate), we MUST invoke the kernel's
+        // plan() and execute() lifecycle before broker dispatch.
+        //
+        // This closes the authority bypass where admission_kernel.is_some()
+        // passed the no-bypass guard but the handler never actually called
+        // plan()/execute(), allowing fail-closed tier requests to reach the
+        // effect-capable broker path ungated.
+        //
+        // For fail-closed tiers: kernel plan+execute is MANDATORY.
+        // For monitor tiers: kernel plan+execute runs if wired (defense in
+        // depth) but is not gating.
+        //
+        // The EffectCapability token from execute() proves admission was
+        // granted. Without it, broker dispatch MUST NOT proceed for
+        // fail-closed tiers.
+        // ================================================================
+        let _admission_result = if self.pcac_lifecycle_gate.is_none()
+            && self.is_authoritative_mode()
+        {
+            if let Some(ref kernel) = self.admission_kernel {
+                // Resolve the PCAC risk tier for this tool class.
+                let pcac_risk_tier = self
+                    .derive_pcac_risk_tier_from_policy(&token.session_id, tool_class)
+                    .unwrap_or(apm2_core::pcac::RiskTier::Tier2Plus);
+
+                // Resolve dependencies needed for KernelRequestV1.
+                let Some(clock) = self.clock.as_ref() else {
+                    warn!(
+                        session_id = %token.session_id,
+                        "AdmissionKernel denied: clock unavailable (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        "admission kernel denied: clock unavailable (fail-closed)",
+                    ));
+                };
+                let hlc = match clock.now_hlc() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            session_id = %token.session_id,
+                            error = %e,
+                            "AdmissionKernel denied: clock read failed (fail-closed)"
+                        );
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorToolNotAllowed,
+                            format!("admission kernel denied: clock read failed: {e}"),
+                        ));
+                    },
+                };
+                let Some(session_registry) = self.session_registry.as_ref() else {
+                    warn!(
+                        session_id = %token.session_id,
+                        "AdmissionKernel denied: session registry unavailable (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        "admission kernel denied: session registry unavailable (fail-closed)",
+                    ));
+                };
+                let Some(session_state) = session_registry.get_session(&token.session_id) else {
+                    warn!(
+                        session_id = %token.session_id,
+                        "AdmissionKernel denied: session state unavailable (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        "admission kernel denied: session state unavailable (fail-closed)",
+                    ));
+                };
+
+                let freshness_witness_tick = hlc.wall_ns / 1_000_000_000;
+                if freshness_witness_tick == 0 {
+                    warn!(
+                        session_id = %token.session_id,
+                        "AdmissionKernel denied: freshness witness tick is zero"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        "admission kernel denied: freshness witness tick is zero (fail-closed)",
+                    ));
+                }
+
+                let time_envelope_ref = *blake3::hash(&hlc.wall_ns.to_le_bytes()).as_bytes();
+                let directory_head_hash =
+                    *blake3::hash(session_state.policy_resolved_ref.as_bytes()).as_bytes();
+                let identity_proof_hash = *blake3::hash(token.session_id.as_bytes()).as_bytes();
+                let capability_manifest_hash: Hash = if let Ok(hash) =
+                    session_state.capability_manifest_hash.as_slice().try_into()
+                {
+                    hash
+                } else {
+                    warn!(
+                        session_id = %token.session_id,
+                        "AdmissionKernel denied: capability_manifest_hash malformed"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        "admission kernel denied: malformed capability manifest hash \
+                             (fail-closed)",
+                    ));
+                };
+                let freshness_policy_hash = {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(b"pcac-freshness-policy-v1");
+                    hasher.update(session_state.policy_resolved_ref.as_bytes());
+                    *hasher.finalize().as_bytes()
+                };
+                let revocation_head_hash =
+                    *blake3::hash(session_state.policy_resolved_ref.as_bytes()).as_bytes();
+
+                let stop_budget_digest = {
+                    let stop_authority = self.stop_authority.as_ref();
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(b"pcac-stop-budget-profile-v1");
+                    let (emergency, governance) = stop_authority.map_or((false, false), |a| {
+                        (a.emergency_stop_active(), a.governance_stop_active())
+                    });
+                    hasher.update(&[u8::from(emergency)]);
+                    hasher.update(&[u8::from(governance)]);
+                    let tool_class_name = tool_class.to_string();
+                    hasher.update(tool_class_name.as_bytes());
+                    *hasher.finalize().as_bytes()
+                };
+
+                let effect_descriptor_digest = argument_content_digest;
+                let hsi_contract_manifest_digest =
+                    *blake3::hash(b"apm2-hsi-contract-manifest-v1").as_bytes();
+                let hsi_envelope_binding_digest =
+                    *blake3::hash(session_state.capability_manifest_hash.as_slice()).as_bytes();
+
+                let request_id_hash = *blake3::hash(request_id.as_bytes()).as_bytes();
+
+                let pcac_policy = session_state.pcac_policy.unwrap_or_default();
+
+                let kernel_request = crate::admission_kernel::types::KernelRequestV1 {
+                    request_id: request_id_hash,
+                    session_id: token.session_id.clone(),
+                    tool_class: tool_class.to_string(),
+                    boundary_profile_id: format!("session-{}", token.session_id),
+                    risk_tier: pcac_risk_tier,
+                    effect_descriptor_digest,
+                    intent_digest: request_scope_intent_digest,
+                    hsi_contract_manifest_digest,
+                    hsi_envelope_binding_digest,
+                    stop_budget_digest,
+                    pcac_policy,
+                    declared_idempotent: false,
+                    lease_id: token.lease_id.clone(),
+                    identity_proof_hash,
+                    capability_manifest_hash,
+                    time_envelope_ref,
+                    freshness_witness_tick,
+                    directory_head_hash,
+                    freshness_policy_hash,
+                    revocation_head_hash,
+                    identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
+                    pointer_only_waiver_hash: None,
+                };
+
+                // Phase 1: plan() -- validate, resolve prerequisites, join,
+                // revalidate.
+                let mut plan = match kernel.plan(&kernel_request) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(
+                            session_id = %token.session_id,
+                            tool_class = %tool_class,
+                            error = %e,
+                            "AdmissionKernel plan() denied (fail-closed)"
+                        );
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorToolNotAllowed,
+                            format!("admission kernel plan denied: {e}"),
+                        ));
+                    },
+                };
+
+                // Derive fresh revalidation inputs for execute() phase.
+                let (exec_time_envelope_ref, _exec_ledger_anchor, exec_revocation_head) =
+                    match self.derive_fresh_pcac_revalidation_inputs(&token.session_id) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(
+                                session_id = %token.session_id,
+                                error = %e,
+                                "AdmissionKernel denied: revalidation inputs unavailable"
+                            );
+                            return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorToolNotAllowed,
+                                format!(
+                                    "admission kernel denied: revalidation inputs \
+                                         unavailable: {e}"
+                                ),
+                            ));
+                        },
+                    };
+
+                // Phase 2: execute() -- fresh revalidation, consume,
+                // capability minting.
+                let result =
+                    match kernel.execute(&mut plan, exec_time_envelope_ref, exec_revocation_head) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(
+                                session_id = %token.session_id,
+                                tool_class = %tool_class,
+                                error = %e,
+                                "AdmissionKernel execute() denied (fail-closed)"
+                            );
+                            return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorToolNotAllowed,
+                                format!("admission kernel execute denied: {e}"),
+                            ));
+                        },
+                    };
+
+                info!(
+                    session_id = %token.session_id,
+                    tool_class = %tool_class,
+                    bundle_digest = %hex::encode(result.bundle_digest),
+                    ajc_id = %hex::encode(result.bundle.ajc_id),
+                    enforcement_tier = %result.boundary_span.enforcement_tier,
+                    "AdmissionKernel plan+execute completed: admission granted"
+                );
+
+                Some(result)
+            } else {
+                // No kernel wired in authoritative mode without PCAC gate.
+                // The no-bypass guard at the top already handles fail-closed
+                // tier denial; monitor tiers proceed without kernel.
+                None
+            }
+        } else {
+            None
+        };
+
         // TCK-00290: Use ToolBroker for request validation and execution
         // Per DOD: "RequestTool executes via ToolBroker and returns ToolResult or Deny"
         let Some(broker) = broker else {
@@ -21729,11 +21970,14 @@ mod tests {
         /// The `AdmissionKernel` satisfies the "at least one authority gate"
         /// requirement specified by the TCK-00494 contract.
         ///
-        /// The request will likely fail for other reasons (broker missing,
-        /// clock missing, etc.) but MUST NOT hit the "no authority lifecycle
-        /// gate wired" or "PCAC authority gate not wired" denial.
+        /// TCK-00494 BLOCKER FIX: The kernel is now ACTUALLY INVOKED
+        /// (`plan()`/`execute()`). With minimal wiring (no clock, etc.), the
+        /// kernel invocation path will fail at a kernel-specific denial
+        /// (e.g., "admission kernel denied: clock unavailable") rather
+        /// than the generic "no authority lifecycle gate" guard. This
+        /// proves the handler dispatches to the kernel.
         #[test]
-        fn kernel_present_pcac_missing_allows_fail_closed_tiers() {
+        fn kernel_present_pcac_missing_invokes_kernel_for_fail_closed_tiers() {
             for risk_tier in [RiskTier::Tier2, RiskTier::Tier3, RiskTier::Tier4] {
                 let minter = test_minter();
                 let manifest_store = Arc::new(InMemoryManifestStore::new());
@@ -21758,10 +22002,10 @@ mod tests {
                 let session_registry = Arc::new(InMemorySessionRegistry::new());
                 let session_registry_dyn = register_session(&session_registry, "session-001");
 
-                // Build a minimal AdmissionKernelV1 (the test only needs the
-                // dispatcher to see it as `Some(...)` — the kernel itself is
-                // not invoked because the handler hits other missing-dependency
-                // denials first).
+                // Build a minimal AdmissionKernelV1. The kernel IS invoked
+                // by the handler now, but will fail at a kernel-specific
+                // prerequisite check (clock unavailable) since we don't wire
+                // a clock. This proves the kernel path is entered.
                 let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> = Arc::new(
                     crate::pcac::InProcessKernel::new(1).with_verifier_economics(
                         apm2_core::pcac::VerifierEconomicsProfile::default(),
@@ -21783,6 +22027,8 @@ mod tests {
                         .with_admission_kernel(kernel);
                 // NOTE: No .with_pcac_lifecycle_gate() — this is the test
                 // scenario where AdmissionKernel is the sole authority gate.
+                // No .with_clock() — forces kernel path to fail at clock
+                // check, proving the kernel invocation path is entered.
 
                 let token = test_token(&minter);
                 let ctx = make_session_ctx();
@@ -21797,27 +22043,155 @@ mod tests {
                 let frame = encode_request_tool_request(&request);
                 let response = dispatcher.dispatch(&frame, &ctx).unwrap();
 
-                // The response MUST NOT be the kernel-guard denial or the
-                // old PCAC-missing hard deny. Any other error (broker
-                // missing, clock missing, etc.) is acceptable — we are only
-                // verifying that the authority gate contract is satisfied by
-                // the AdmissionKernel alone.
-                if let SessionResponse::Error(ref err) = response {
-                    assert!(
-                        !err.message
-                            .contains("no authority lifecycle gate wired for fail-closed tier"),
-                        "{risk_tier:?}: kernel-present must not trigger authority gate \
-                         denial. Got: {}",
-                        err.message
-                    );
-                    assert!(
-                        !err.message
-                            .contains("PCAC authority gate not wired in authoritative mode"),
-                        "{risk_tier:?}: kernel-present must not trigger old PCAC-missing \
-                         hard deny. Got: {}",
-                        err.message
-                    );
+                // The response MUST NOT be the generic authority-gate denial.
+                // It MUST be a kernel-specific denial (e.g., clock unavailable)
+                // proving the handler dispatched to the kernel.
+                match response {
+                    SessionResponse::Error(ref err) => {
+                        assert!(
+                            !err.message
+                                .contains("no authority lifecycle gate wired for fail-closed tier"),
+                            "{risk_tier:?}: kernel-present must not trigger authority gate \
+                             denial. Got: {}",
+                            err.message
+                        );
+                        assert!(
+                            !err.message
+                                .contains("PCAC authority gate not wired in authoritative mode"),
+                            "{risk_tier:?}: kernel-present must not trigger old PCAC-missing \
+                             hard deny. Got: {}",
+                            err.message
+                        );
+                        // Verify the error is from the kernel invocation path
+                        // (not the generic guard). The kernel path fails at
+                        // clock/registry/plan/execute checks.
+                        assert!(
+                            err.message.contains("admission kernel denied")
+                                || err.message.contains("admission kernel plan denied")
+                                || err.message.contains("admission kernel execute denied"),
+                            "{risk_tier:?}: error must be from kernel invocation path, \
+                             got: {}",
+                            err.message
+                        );
+                    },
+                    other => {
+                        panic!("{risk_tier:?}: expected kernel invocation denial, got: {other:?}")
+                    },
                 }
+            }
+        }
+
+        /// **Kernel plan+execute is MANDATORY for fail-closed effect path
+        /// (BLOCKER 1 + SECURITY BLOCKER 1 fix, REQ-0025, EVID-0020)**:
+        ///
+        /// Proves that Tier2/3/4 requests CANNOT reach broker/effect
+        /// dispatch unless the `AdmissionKernel`'s `plan()`+`execute()`
+        /// actually runs. The kernel is wired but will fail at `plan()`
+        /// because prerequisites are intentionally missing. The handler
+        /// MUST deny the request at the kernel invocation step — NOT
+        /// fall through to broker dispatch.
+        ///
+        /// This test directly addresses the review finding:
+        /// "`handle_request_tool` NEVER invokes
+        /// `AdmissionKernel::plan()`/`execute()`"
+        #[test]
+        fn fail_closed_tier_must_invoke_kernel_plan_execute_before_broker() {
+            let minter = test_minter();
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+            let manifest = make_tier3_manifest(ToolClass::Execute);
+            manifest_store.register("session-001", manifest);
+
+            let ledger: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
+                Arc::new(StubLedgerEventEmitter::new());
+
+            let session_registry = Arc::new(InMemorySessionRegistry::new());
+            let session_registry_dyn = register_session(&session_registry, "session-001");
+
+            // Wire a minimal AdmissionKernel. It will be invoked by the
+            // handler. plan() will fail because there is no LedgerTrustVerifier
+            // or PolicyRootResolver wired, which means for fail-closed tiers
+            // the kernel returns AdmitError::MissingPrerequisite.
+            // The CRITICAL assertion: the handler hits this kernel denial
+            // path (not the broker or effect path).
+            let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> = Arc::new(
+                crate::pcac::InProcessKernel::new(1)
+                    .with_verifier_economics(apm2_core::pcac::VerifierEconomicsProfile::default()),
+            );
+            let witness_cfg = crate::admission_kernel::WitnessProviderConfig {
+                provider_id: "test-provider/plan-execute-required".to_string(),
+                provider_build_digest: *blake3::hash(b"test-build-digest-v2").as_bytes(),
+            };
+            let kernel = Arc::new(crate::admission_kernel::AdmissionKernelV1::new(
+                pcac_kernel,
+                witness_cfg,
+            ));
+
+            // Wire clock so the handler reaches the kernel.plan() call
+            // (without a clock, it would fail earlier at clock-unavailable).
+            let clock = Arc::new(
+                crate::htf::HolonicClock::new(crate::htf::ClockConfig::default(), None)
+                    .expect("default clock config should build"),
+            );
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                .with_ledger(ledger)
+                .with_session_registry(session_registry_dyn)
+                .with_admission_kernel(kernel)
+                .with_clock(clock);
+            // No broker wired — if the kernel fails, we MUST NOT reach
+            // broker dispatch. If the kernel somehow passes and broker
+            // is missing, we'd get "tool broker unavailable" — which is
+            // a DIFFERENT failure mode than kernel denial.
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "execute".to_string(),
+                arguments: serde_json::to_vec(&serde_json::json!({
+                    "command": "echo hello"
+                }))
+                .unwrap(),
+                dedupe_key: "kernel-plan-execute-required-001".to_string(),
+                epoch_seal: None,
+            };
+            let frame = encode_request_tool_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    // The error MUST be from the kernel invocation path, NOT
+                    // from broker dispatch or any other downstream path.
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Fail-closed tier must be denied by kernel (not broker)"
+                    );
+                    // Must NOT have reached broker dispatch
+                    assert!(
+                        !err.message.contains("tool broker unavailable"),
+                        "SECURITY VIOLATION: fail-closed tier bypassed kernel and \
+                         reached broker dispatch. Got: {}",
+                        err.message
+                    );
+                    // Must be a kernel denial (plan or execute or prerequisite)
+                    assert!(
+                        err.message.contains("admission kernel")
+                            || err.message.contains("AdmissionKernel"),
+                        "Error must originate from AdmissionKernel invocation path. \
+                         Got: {}",
+                        err.message
+                    );
+                },
+                SessionResponse::RequestTool(_) => {
+                    panic!(
+                        "SECURITY VIOLATION: fail-closed tier produced tool output \
+                         without kernel plan+execute succeeding. The authority \
+                         lifecycle bypass (BLOCKER 1) is still present."
+                    );
+                },
+                other => panic!("Unexpected response for fail-closed tier with kernel: {other:?}"),
             }
         }
     }

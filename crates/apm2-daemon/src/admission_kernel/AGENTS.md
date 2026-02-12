@@ -142,9 +142,10 @@ execute(): single-use check -> prerequisite re-check (fail-closed) ->
 
 ## Handler Integration (TCK-00494)
 
-The `AdmissionKernel` is wired into `SessionDispatcher` via `with_admission_kernel()`. In authoritative mode (ledger or CAS configured), the `RequestTool` handler enforces a kernel guard:
+The `AdmissionKernel` is wired into `SessionDispatcher` via `with_admission_kernel()`. In authoritative mode (ledger or CAS configured), the `RequestTool` handler enforces a kernel guard and invokes the kernel lifecycle:
 
 - **Fail-closed tiers** (Tier2/3/4 -> `FailClosed` enforcement): requests are denied with `SessionErrorToolNotAllowed` if neither the kernel nor the PCAC `LifecycleGate` is wired. No silent fallback to ungated effect-capable path.
+- **Kernel invocation path** (kernel wired, no `LifecycleGate`): `handle_request_tool` invokes `kernel.plan()` with a `KernelRequestV1` built from session state, then `kernel.execute()` with fresh clock/revalidation inputs. Both must succeed; any error produces an immediate deny before broker dispatch.
 - **Monitor tiers** (Tier0/1): requests pass the kernel guard without kernel wiring.
 - **Non-authoritative mode**: the kernel guard does not fire regardless of tier.
 

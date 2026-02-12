@@ -1130,24 +1130,32 @@ impl DispatcherState {
                     // kernel.
                     {
                         // Derive admission consume log as a sibling of the
-                        // PCAC consume log with a clear `_admission_consume`
-                        // suffix. We replace the `pcac_consume` stem portion
-                        // with `pcac_admission_consume` so that the resulting
-                        // filename is unambiguous (e.g.
-                        // `<db>.pcac_admission_consume.log` instead of the
-                        // confusing `.admission_consume.log` double-extension
-                        // produced by `with_extension`).
+                        // PCAC consume log with an `_admission` suffix appended
+                        // to the stem. This is robust against input paths that
+                        // do not contain the literal "pcac_consume" substring:
+                        // the resulting filename is ALWAYS distinct because we
+                        // unconditionally append `_admission` to the stem
+                        // rather than relying on string replacement.
+                        //
+                        // SECURITY MAJOR 1 FIX (TCK-00494): The previous
+                        // `name.replace("pcac_consume", "pcac_admission_consume")`
+                        // derivation was fragile — if the path did not contain
+                        // "pcac_consume", both log paths pointed to the same
+                        // file, causing lock contention / DoS.
                         let admission_consume_log_path = {
-                            let name = consume_log_path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("pcac_consume.log");
-                            let admission_name =
-                                name.replace("pcac_consume", "pcac_admission_consume");
-                            consume_log_path
+                            let parent = consume_log_path
                                 .parent()
-                                .unwrap_or(consume_log_path.as_path())
-                                .join(admission_name)
+                                .unwrap_or(consume_log_path.as_path());
+                            let stem = consume_log_path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("pcac_consume");
+                            let ext = consume_log_path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("log");
+                            let admission_name = format!("{stem}_admission.{ext}");
+                            parent.join(admission_name)
                         };
                         let admission_durable_index = crate::pcac::FileBackedConsumeIndex::open(
                             &admission_consume_log_path,
