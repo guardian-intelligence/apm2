@@ -65,7 +65,11 @@ Single-use admission plan containing join-time bindings. Not `Clone`, `Copy`, `S
 
 ### `AdmissionResultV1` (types.rs)
 
-Result of successful execution containing capability tokens, consume receipts, and boundary span.
+Result of successful execution containing capability tokens, consume receipts, boundary span, and witness seeds. The `leakage_witness_seed` and `timing_witness_seed` fields are carried through from the consumed plan so the runtime post-effect path can invoke `finalize_post_effect_witness` with actual seeds rather than ad-hoc hash-only checks (TCK-00497 QUALITY MAJOR 1).
+
+- [CTR-AK15] Seeds in `AdmissionResultV1` match the plan-time seeds (same content hash).
+- [CTR-AK16] Runtime post-effect path MUST use `kernel.finalize_post_effect_witness()` with the result's seeds as the single source of truth for seed/provider/temporal binding validation. Ad-hoc validation is forbidden.
+- [CTR-AK17] Monitor tiers MUST construct a `MonitorWaiverV1` and pass it to `finalize_post_effect_witness()`. Silent log-and-continue bypass is forbidden (QUALITY MAJOR 2).
 
 ### `AdmissionSpineJoinExtV1` (types.rs)
 

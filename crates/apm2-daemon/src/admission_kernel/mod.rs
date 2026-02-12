@@ -602,6 +602,15 @@ impl AdmissionKernelV1 {
         // Seal: compute the deterministic content hash.
         let bundle_digest = bundle.content_hash();
 
+        // Clone the witness seeds from the plan BEFORE returning.
+        // The plan is already consumed (state = Consumed) but its fields
+        // are still accessible. The runtime post-effect path needs the
+        // actual seeds (not just hashes) to call
+        // `finalize_post_effect_witness` with full seed/provider binding
+        // validation (TCK-00497 QUALITY MAJOR 1).
+        let leakage_witness_seed = plan.leakage_witness_seed.clone();
+        let timing_witness_seed = plan.timing_witness_seed.clone();
+
         Ok(AdmissionResultV1 {
             bundle_digest,
             bundle,
@@ -611,6 +620,8 @@ impl AdmissionKernelV1 {
             consumed_witness,
             consume_record,
             boundary_span,
+            leakage_witness_seed,
+            timing_witness_seed,
         })
     }
 

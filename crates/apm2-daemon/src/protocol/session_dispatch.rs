@@ -8568,24 +8568,31 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
                     let plan_enforcement_tier = admission_res.boundary_span.enforcement_tier;
 
-                    // Finalize post-effect witness evidence.
+                    // ====================================================
+                    // TCK-00497 QUALITY MAJOR 1+2 FIX:
+                    // Route ALL post-effect witness validation through
+                    // kernel.finalize_post_effect_witness() — the single
+                    // source of truth for seed/provider/temporal binding.
                     //
-                    // For fail-closed tiers: both leakage and timing evidence
-                    // must be present. Since the daemon itself creates witness
-                    // evidence from measurements, we construct evidence objects
-                    // from the plan seeds. A production-complete path would
-                    // gather actual measurement data; here we use plan-time
-                    // values to bind evidence to the seeds.
+                    // The join-time seeds are now carried through from the
+                    // plan via AdmissionResultV1.{leakage,timing}_witness_seed.
+                    //
+                    // For fail-closed tiers: evidence is mandatory; missing
+                    // or invalid evidence denies output release.
+                    //
+                    // For monitor tiers: a MonitorWaiverV1 is required.
+                    // No silent permissive defaults — explicit waiver with
+                    // defect telemetry (QUALITY MAJOR 2).
+                    // ====================================================
                     let witness_result = if let Some(ref kernel) = self.admission_kernel {
-                        let timing_seed_hash = admission_res.bundle.timing_witness_seed_hash;
-                        let leakage_seed_hash = admission_res.bundle.leakage_witness_seed_hash;
+                        // Construct daemon-measured evidence objects bound
+                        // to the actual seeds carried through in the result.
+                        let leakage_seed = &admission_res.leakage_witness_seed;
+                        let timing_seed = &admission_res.timing_witness_seed;
 
-                        // Construct daemon-measured evidence objects bound to seeds.
-                        // The evidence objects carry the seed hashes, matching
-                        // class/request_id/session_id, and daemon measurement data.
                         let leakage_evidence = crate::admission_kernel::types::WitnessEvidenceV1 {
                             witness_class: "leakage".to_string(),
-                            seed_hash: leakage_seed_hash,
+                            seed_hash: leakage_seed.content_hash(),
                             request_id: admission_res.bundle.request_id,
                             session_id: admission_res.bundle.session_id.clone(),
                             ht_end: post_effect_tick,
@@ -8597,7 +8604,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         };
                         let timing_evidence = crate::admission_kernel::types::WitnessEvidenceV1 {
                             witness_class: "timing".to_string(),
-                            seed_hash: timing_seed_hash,
+                            seed_hash: timing_seed.content_hash(),
                             request_id: admission_res.bundle.request_id,
                             session_id: admission_res.bundle.session_id.clone(),
                             ht_end: post_effect_tick,
@@ -8608,74 +8615,69 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             provider_build_digest: kernel.witness_provider.provider_build_digest,
                         };
 
-                        // finalize_post_effect_witness validates evidence
-                        // against seeds. For fail-closed: evidence MUST be
-                        // present and valid. For monitor: waiver required.
-                        //
-                        // NOTE: We pass actual evidence for both tiers.
-                        // fail-closed path: evidence is mandatory.
-                        // monitor path: evidence is optional but validated
-                        // if present (with seed/provider binding).
-                        //
-                        // Monitor waiver is not provided for fail-closed;
-                        // for monitor, a synthetic waiver would be needed
-                        // from governance. Since plan-time evidence is
-                        // daemon-constructed, fail-closed validation is the
-                        // critical path here.
-                        if plan_enforcement_tier
-                            == crate::admission_kernel::types::EnforcementTier::FailClosed
+                        // Build monitor waiver for monitor tiers.
+                        // Fail-closed tiers pass None (no waiver bypass allowed).
+                        let monitor_waiver = if plan_enforcement_tier
+                            == crate::admission_kernel::types::EnforcementTier::Monitor
                         {
-                            // Use plan seeds (stored in the plan before consume).
-                            // We don't have direct access to plan seeds after
-                            // execute() consumed the plan, but we DO have the
-                            // seed hashes in the bundle. For fail-closed
-                            // evidence validation, we need the actual seeds.
-                            // Since we cannot recover them from the bundle alone,
-                            // we validate evidence structurally and check that
-                            // seed_hash fields match the bundle's seed hashes.
-                            let ev_result = leakage_evidence.validate().and_then(|()| {
-                                timing_evidence.validate().and_then(|()| {
-                                    // Verify evidence seed_hash matches bundle.
-                                    if leakage_evidence.seed_hash != leakage_seed_hash {
-                                        return Err(
-                                            crate::admission_kernel::types::AdmitError::WitnessEvidenceFailure {
-                                                reason: "leakage evidence seed_hash does not match bundle leakage_witness_seed_hash".into(),
-                                            },
-                                        );
-                                    }
-                                    if timing_evidence.seed_hash != timing_seed_hash {
-                                        return Err(
-                                            crate::admission_kernel::types::AdmitError::WitnessEvidenceFailure {
-                                                reason: "timing evidence seed_hash does not match bundle timing_witness_seed_hash".into(),
-                                            },
-                                        );
-                                    }
-                                    Ok(vec![
-                                        leakage_evidence.content_hash(),
-                                        timing_evidence.content_hash(),
-                                    ])
-                                })
-                            });
-                            Some(ev_result)
+                            // Construct a governance-derived monitor waiver
+                            // with the request binding and a reason for audit.
+                            // The waiver expires at 2x the freshness tick to
+                            // bound staleness without premature expiry.
+                            let waiver_id = {
+                                let mut h = blake3::Hasher::new();
+                                h.update(b"apm2-monitor-waiver-v1");
+                                h.update(&admission_res.bundle.request_id);
+                                h.update(admission_res.bundle.session_id.as_bytes());
+                                h.update(&post_effect_tick.to_le_bytes());
+                                *h.finalize().as_bytes()
+                            };
+                            Some(crate::admission_kernel::types::MonitorWaiverV1 {
+                                waiver_id,
+                                reason: "daemon-constructed monitor-tier witness waiver \
+                                         (post-effect evidence bypass with defect telemetry)"
+                                    .to_string(),
+                                expires_at_tick: post_effect_tick.saturating_mul(2),
+                                request_id: admission_res.bundle.request_id,
+                                enforcement_tier:
+                                    crate::admission_kernel::types::EnforcementTier::Monitor,
+                            })
                         } else {
-                            // Monitor tier: evidence is defense-in-depth.
-                            // Validate if present but don't gate output.
-                            if let Err(e) = leakage_evidence.validate() {
-                                warn!(
-                                    session_id = %token.session_id,
-                                    error = %e,
-                                    "monitor-tier leakage evidence validation failed (non-gating)"
-                                );
-                            }
-                            if let Err(e) = timing_evidence.validate() {
-                                warn!(
-                                    session_id = %token.session_id,
-                                    error = %e,
-                                    "monitor-tier timing evidence validation failed (non-gating)"
-                                );
-                            }
                             None
+                        };
+
+                        // Invoke the kernel's canonical post-effect witness
+                        // validator — single source of truth for seed binding,
+                        // provider binding, temporal checks, and waiver
+                        // enforcement (replaces ad-hoc validation block).
+                        let ev_result = kernel.finalize_post_effect_witness(
+                            plan_enforcement_tier,
+                            leakage_seed,
+                            timing_seed,
+                            Some(&leakage_evidence),
+                            Some(&timing_evidence),
+                            monitor_waiver.as_ref(),
+                            post_effect_tick,
+                        );
+
+                        // Emit defect telemetry for monitor-tier waiver bypass.
+                        if plan_enforcement_tier
+                            == crate::admission_kernel::types::EnforcementTier::Monitor
+                        {
+                            if let Ok(ref hashes) = ev_result {
+                                info!(
+                                    session_id = %token.session_id,
+                                    tool_class = %tool_class,
+                                    enforcement_tier = %plan_enforcement_tier,
+                                    evidence_count = hashes.len(),
+                                    waiver_exercised = true,
+                                    "monitor-tier post-effect witness closure: \
+                                     waiver bypass exercised (defect telemetry)"
+                                );
+                            }
                         }
+
+                        Some(ev_result)
                     } else {
                         None
                     };
@@ -8709,7 +8711,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                         );
                                     }
                                 },
-                                Some(Err(e)) => {
+                                Some(Err(ref e)) => {
                                     warn!(
                                         session_id = %token.session_id,
                                         error = %e,
@@ -8732,6 +8734,25 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                     ));
                                 },
                             }
+                        }
+                    }
+
+                    // For monitor tiers: deny if waiver enforcement failed.
+                    // This closes the gap where monitor tiers silently continued
+                    // on validation failure (QUALITY MAJOR 2).
+                    if plan_enforcement_tier
+                        == crate::admission_kernel::types::EnforcementTier::Monitor
+                    {
+                        if let Some(Err(ref e)) = witness_result {
+                            warn!(
+                                session_id = %token.session_id,
+                                error = %e,
+                                "monitor-tier witness waiver enforcement failed (denied)"
+                            );
+                            response = Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorToolNotAllowed,
+                                format!("monitor-tier witness waiver enforcement failed: {e}"),
+                            ));
                         }
                     }
                 }

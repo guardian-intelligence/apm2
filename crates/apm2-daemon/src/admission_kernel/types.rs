@@ -1367,6 +1367,12 @@ pub struct BoundarySpanV1 {
 ///
 /// Contains the sealed admission bundle, its digest, capability tokens
 /// for effect execution, and lifecycle receipts.
+///
+/// Witness seeds are carried through from the plan so the runtime
+/// post-effect path can invoke `finalize_post_effect_witness` with the
+/// actual seeds (not just their hashes). This closes the gap where the
+/// runtime path previously did ad-hoc hash-only validation instead of
+/// calling the kernel's canonical validator (QUALITY MAJOR 1, TCK-00497).
 pub struct AdmissionResultV1 {
     /// Digest of the sealed `AdmissionBundleV1` CAS object
     /// (v1.1 `AdmissionBindingHash`).
@@ -1391,6 +1397,18 @@ pub struct AdmissionResultV1 {
     pub consume_record: AuthorityConsumeRecordV1,
     /// Boundary span for output mediation.
     pub boundary_span: BoundarySpanV1,
+    /// Leakage witness seed from plan time (TCK-00497 QUALITY MAJOR 1).
+    ///
+    /// Carried through from the consumed plan so the runtime post-effect
+    /// path can pass the actual seed (not just its hash) to
+    /// `AdmissionKernelV1::finalize_post_effect_witness`. This enables
+    /// full seed/provider binding validation instead of ad-hoc hash-only
+    /// checks.
+    pub leakage_witness_seed: WitnessSeedV1,
+    /// Timing witness seed from plan time (TCK-00497 QUALITY MAJOR 1).
+    ///
+    /// See `leakage_witness_seed` for rationale.
+    pub timing_witness_seed: WitnessSeedV1,
 }
 
 // Intentionally no Clone or Serialize — capability tokens are non-cloneable.
@@ -1406,6 +1424,14 @@ impl std::fmt::Debug for AdmissionResultV1 {
             .field("consumed_witness", &self.consumed_witness)
             .field("consume_record", &self.consume_record)
             .field("boundary_span", &self.boundary_span)
+            .field(
+                "leakage_seed_hash",
+                &hex::encode(self.leakage_witness_seed.content_hash()),
+            )
+            .field(
+                "timing_seed_hash",
+                &hex::encode(self.timing_witness_seed.content_hash()),
+            )
             .finish()
     }
 }
