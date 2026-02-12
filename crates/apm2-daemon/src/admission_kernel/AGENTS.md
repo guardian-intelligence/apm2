@@ -140,8 +140,10 @@ Crash-safe effect execution journal (TCK-00501). Tracks effect execution state p
 - [INV-AK47] `record_started()` rejects duplicate `request_id` entries UNLESS state is `NotStarted` (from `resolve_in_doubt`), which permits re-execution by removing the stale entry before inserting the new binding.
 - [INV-AK48] `resolve_in_doubt()` persists resolution atomically (fsync 'R' tag) BEFORE updating in-memory state; prevents infinite resolution loops on crash (TCK-00501 fix).
 - [INV-AK49] Fail-closed tiers MUST have an effect journal wired; `execute()` denies with `MissingPrerequisite` if journal is absent for `FailClosed` tier (TCK-00501 fix).
-- [INV-AK50] Journal file is created with mode `0o600` (owner-only read/write) to prevent world-readable exposure of request IDs, session IDs, and policy root digests (TCK-00501 fix).
+- [INV-AK50] Journal file is created with mode `0o600` (owner-only read/write) to prevent world-readable exposure of request IDs, session IDs, and policy root digests (TCK-00501 fix). Pre-existing files with broader permissions are remediated to `0o600` on open (MINOR-1 fix).
 - [INV-AK51] Post-effect path MUST call `record_completed()` after successful effect execution to transition journal state from `Started` to `Completed`; wired in `session_dispatch.rs` (TCK-00501 fix).
+- [INV-AK52] C and R journal records enforce exact 64 hex char length (not minimum). Trailing garbage after the hex is rejected as `CorruptEntry` during replay (MAJOR-1 fix, TCK-00501 round 6).
+- [INV-AK53] S journal records verify line-key `request_id` matches `binding.request_id`. A mismatch is rejected as `CorruptEntry` during replay to prevent identity confusion between lookup key and authoritative binding (MAJOR-2 fix, TCK-00501 round 6).
 
 ### `EffectCapability`, `LedgerWriteCapability`, `QuarantineCapability` (capabilities.rs)
 

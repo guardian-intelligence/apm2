@@ -722,6 +722,18 @@ impl FileBackedEffectJournal {
             )
         })?;
 
+        // MINOR-1 fix: Remediate permissions on pre-existing files.
+        // OpenOptions::mode(0o600) only applies on file creation; a
+        // pre-existing file with broader permissions (e.g., 0o644 from
+        // a previous version or manual creation) would remain world-readable.
+        // Enforce 0o600 unconditionally after open+lock to close this gap.
+        #[cfg(unix)]
+        {
+            use std::fs::Permissions;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, Permissions::from_mode(0o600))?;
+        }
+
         // Replay existing entries in streaming fashion.
         // SECURITY: Use bounded read_line instead of unbounded
         // reader.lines() to prevent memory exhaustion from a
@@ -882,6 +894,14 @@ impl FileBackedEffectJournal {
             #[cfg(unix)]
             truncate_opts.mode(0o600);
             let truncate_file = truncate_opts.open(&path)?;
+            // MINOR-1 fix: Remediate permissions on truncation reopen
+            // (same rationale as the primary open path above).
+            #[cfg(unix)]
+            {
+                use std::fs::Permissions;
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, Permissions::from_mode(0o600))?;
+            }
             truncate_file.set_len(truncate_pos)?;
             truncate_file.sync_all()?;
         }
@@ -1200,30 +1220,44 @@ fn parse_journal_line(line: &str) -> Result<(char, Hash, Option<EffectJournalBin
                 .validate()
                 .map_err(|e| format!("binding validation failed: {e}"))?;
 
+            // MAJOR-2 fix: Verify line-key request_id matches the binding's
+            // request_id. A mismatch indicates corruption or tampering — the
+            // line key determines lookup but the binding carries the
+            // authoritative identity, so they must agree.
+            if request_id != binding.request_id {
+                return Err(format!(
+                    "S record key/binding mismatch: line key={}, binding.request_id={}",
+                    hex::encode(request_id),
+                    hex::encode(binding.request_id),
+                ));
+            }
+
             Ok((TAG_STARTED, request_id, Some(binding)))
         },
         TAG_COMPLETED => {
             // Format: C <64-char hex>
-            if rest.len() < 64 {
+            // Exact-length enforcement: reject trailing garbage that could
+            // mask corruption or adversarial tampering (MAJOR-1 fix).
+            if rest.len() != 64 {
                 return Err(format!(
-                    "Completed entry too short: expected 64 hex chars, got {} chars",
+                    "Completed entry has wrong length: expected exactly 64 hex chars, got {} chars",
                     rest.len()
                 ));
             }
-            let hex_part = rest[..64].trim();
-            let request_id = hex_to_hash(hex_part)?;
+            let request_id = hex_to_hash(rest)?;
             Ok((TAG_COMPLETED, request_id, None))
         },
         TAG_RESOLVED => {
             // Format: R <64-char hex>
-            if rest.len() < 64 {
+            // Exact-length enforcement: reject trailing garbage that could
+            // mask corruption or adversarial tampering (MAJOR-1 fix).
+            if rest.len() != 64 {
                 return Err(format!(
-                    "Resolved entry too short: expected 64 hex chars, got {} chars",
+                    "Resolved entry has wrong length: expected exactly 64 hex chars, got {} chars",
                     rest.len()
                 ));
             }
-            let hex_part = rest[..64].trim();
-            let request_id = hex_to_hash(hex_part)?;
+            let request_id = hex_to_hash(rest)?;
             Ok((TAG_RESOLVED, request_id, None))
         },
         other => Err(format!("unknown journal tag: {other}")),
@@ -2224,5 +2258,179 @@ mod tests {
             },
             other => panic!("expected ValidationError, got: {other:?}"),
         }
+    }
+
+    // =========================================================================
+    // MAJOR-1: Trailing garbage in C/R records rejected
+    // =========================================================================
+
+    /// A Completed record with trailing garbage after the 64 hex chars
+    /// must be rejected with `CorruptEntry` during replay (MAJOR-1 fix).
+    ///
+    /// The journal format for C records is exactly `C <64-hex>\n`.
+    /// Any extra bytes after the 64 hex characters indicate corruption
+    /// or adversarial tampering and must not be silently discarded.
+    #[test]
+    fn replay_rejects_completed_with_trailing_garbage() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect.journal");
+
+        let request_id = test_hash(0xE0);
+        let binding = test_binding(request_id, false);
+        let hex_id = hex::encode(request_id);
+        let json = serde_json::to_string(&binding).unwrap();
+
+        // Write a valid Started line, then a Completed line with trailing
+        // garbage, then a second valid Started to trigger mid-file
+        // corruption detection (single trailing errors are treated as
+        // torn tail).
+        let valid_id2 = test_hash(0xE1);
+        let binding2 = test_binding(valid_id2, false);
+        let hex_id2 = hex::encode(valid_id2);
+        let json2 = serde_json::to_string(&binding2).unwrap();
+
+        let content = format!("S {hex_id} {json}\nC {hex_id}EXTRA\nS {hex_id2} {json2}\n");
+        std::fs::write(&path, content).unwrap();
+
+        let err = FileBackedEffectJournal::open(&path).unwrap_err();
+        match err {
+            EffectJournalError::CorruptEntry { reason, .. } => {
+                assert!(
+                    reason.contains("wrong length")
+                        || reason.contains("expected exactly 64 hex chars"),
+                    "error must indicate wrong length: {reason}"
+                );
+            },
+            other => {
+                panic!("expected CorruptEntry for Completed with trailing garbage, got: {other:?}")
+            },
+        }
+    }
+
+    /// A Resolved record with trailing garbage after the 64 hex chars
+    /// must be rejected with `CorruptEntry` during replay (MAJOR-1 fix).
+    #[test]
+    fn replay_rejects_resolved_with_trailing_garbage() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect.journal");
+
+        let request_id = test_hash(0xE2);
+        let binding = test_binding(request_id, false);
+        let hex_id = hex::encode(request_id);
+        let json = serde_json::to_string(&binding).unwrap();
+
+        // Write S, then R with trailing garbage, then a second valid S
+        // to trigger mid-file corruption detection.
+        let valid_id2 = test_hash(0xE3);
+        let binding2 = test_binding(valid_id2, false);
+        let hex_id2 = hex::encode(valid_id2);
+        let json2 = serde_json::to_string(&binding2).unwrap();
+
+        let content = format!("S {hex_id} {json}\nR {hex_id}EXTRA\nS {hex_id2} {json2}\n");
+        std::fs::write(&path, content).unwrap();
+
+        let err = FileBackedEffectJournal::open(&path).unwrap_err();
+        match err {
+            EffectJournalError::CorruptEntry { reason, .. } => {
+                assert!(
+                    reason.contains("wrong length")
+                        || reason.contains("expected exactly 64 hex chars"),
+                    "error must indicate wrong length: {reason}"
+                );
+            },
+            other => {
+                panic!("expected CorruptEntry for Resolved with trailing garbage, got: {other:?}")
+            },
+        }
+    }
+
+    // =========================================================================
+    // MAJOR-2: S record key/binding request_id mismatch rejected
+    // =========================================================================
+
+    /// A Started record where the line-key hex differs from the binding's
+    /// `request_id` must be rejected with `CorruptEntry` during replay
+    /// (MAJOR-2 fix).
+    ///
+    /// The line-key determines in-memory lookup, but the binding carries
+    /// the authoritative identity. A mismatch means the journal was
+    /// tampered with or suffered bit-level corruption.
+    #[test]
+    fn replay_rejects_started_with_mismatched_request_id() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect.journal");
+
+        // Create a binding for request_id A, but write the hex key as B.
+        let real_id = test_hash(0xE4);
+        let fake_key = test_hash(0xE5);
+        let binding = test_binding(real_id, false);
+        let fake_hex = hex::encode(fake_key);
+        let json = serde_json::to_string(&binding).unwrap();
+
+        // Write mismatched S line + a second valid S to trigger mid-file
+        // corruption detection.
+        let valid_id = test_hash(0xE6);
+        let valid_binding = test_binding(valid_id, false);
+        let valid_hex = hex::encode(valid_id);
+        let valid_json = serde_json::to_string(&valid_binding).unwrap();
+
+        let content = format!("S {fake_hex} {json}\nS {valid_hex} {valid_json}\n");
+        std::fs::write(&path, content).unwrap();
+
+        let err = FileBackedEffectJournal::open(&path).unwrap_err();
+        match err {
+            EffectJournalError::CorruptEntry { reason, .. } => {
+                assert!(
+                    reason.contains("key/binding mismatch"),
+                    "error must mention key/binding mismatch: {reason}"
+                );
+            },
+            other => panic!("expected CorruptEntry for mismatched request_id, got: {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // MINOR-1: Permission remediation for pre-existing files
+    // =========================================================================
+
+    /// A pre-existing journal file with permissive permissions (e.g.,
+    /// 0o644) must be remediated to 0o600 when opened (MINOR-1 fix).
+    ///
+    /// `OpenOptions::mode` only applies on file creation. This test verifies
+    /// that the unconditional `set_permissions` call in the open path
+    /// closes the gap for files created by older versions or manual
+    /// operations.
+    #[cfg(unix)]
+    #[test]
+    fn journal_remediates_permissive_existing_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect.journal");
+
+        // Create the file with overly permissive mode 0o644.
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_permissions(std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+
+        // Verify the file actually has 0o644 before the open.
+        let meta_before = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            meta_before.mode() & 0o777,
+            0o644,
+            "pre-condition: file must start with mode 0o644"
+        );
+
+        // Open via FileBackedEffectJournal — this should remediate.
+        let _journal = FileBackedEffectJournal::open(&path).unwrap();
+
+        let meta_after = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            meta_after.mode() & 0o777,
+            0o600,
+            "journal must remediate pre-existing permissive file to 0o600"
+        );
     }
 }
