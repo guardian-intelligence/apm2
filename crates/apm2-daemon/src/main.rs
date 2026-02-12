@@ -1423,9 +1423,13 @@ async fn async_main(args: Args) -> Result<()> {
                 // 3. Gate signer for constructing signed window/profile artifacts
                 //
                 // All three must be present for has_economics_gate() to return true.
-                // If any fails to initialize, the worker starts without the gate
-                // (fail-closed: projection proceeds without economics checking only
-                // if the gate was never wired -- once wired, missing inputs DENY).
+                // If any fails to initialize, the worker starts without the gate.
+                //
+                // SECURITY (MAJOR-1 fix): When the gate is NOT wired, events
+                // that carry economics selectors are DENIED (fail-closed). The
+                // worker can still project legacy events without economics
+                // selectors. This prevents init failure from silently bypassing
+                // economics enforcement.
                 {
                     use apm2_daemon::projection::{ConfigBackedResolver, IntentBuffer};
 
@@ -1519,9 +1523,10 @@ async fn async_main(args: Args) -> Result<()> {
                              economics-gated with idempotent-insert replay prevention"
                         );
                     } else {
-                        info!(
-                            "Economics admission gate INACTIVE: projections will \
-                             proceed without economics checking"
+                        warn!(
+                            "Economics admission gate INACTIVE: events with economics \
+                             selectors will be DENIED (fail-closed). Legacy events \
+                             without selectors will project normally."
                         );
                     }
                 }

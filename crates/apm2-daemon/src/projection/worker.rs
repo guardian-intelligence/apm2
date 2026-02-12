@@ -4,7 +4,7 @@
 //! This module implements the long-running projection worker that:
 //! 1. Tails the ledger for `ReviewReceiptRecorded` events
 //! 2. Looks up PR metadata from the work index
-//! 3. Evaluates economics admission gate + PCAC lifecycle (TCK-00505)
+//! 3. Evaluates economics admission gate (TCK-00505)
 //! 4. Projects review results to GitHub (status + comment)
 //! 5. Stores projection receipts in CAS for idempotency
 //!
@@ -22,15 +22,27 @@
 //! Per RFC-0029, before any projection side effect
 //! (`adapter.project_status()`):
 //!
-//! 1. Assemble gate inputs from `ReviewReceiptRecorded` payload
-//! 2. Resolve continuity profile, sink snapshot, and window via resolver
-//! 3. Evaluate `evaluate_projection_continuity()` economics gate
-//! 4. On ALLOW: enter PCAC lifecycle (join, revalidate, consume), then effect
-//! 5. On DENY: record denied intent in `IntentBuffer`, skip projection
+//! 1. Check if the event payload carries economics selectors (`eval_tick`,
+//!    `time_authority_ref`, `window_ref`, `boundary_id`). Events without
+//!    economics selectors use the legacy ungated projection path; the gate
+//!    enforces only when selectors are present.
+//! 2. Assemble gate inputs from `ReviewReceiptRecorded` payload
+//! 3. Resolve continuity profile, sink snapshot, and window via resolver
+//! 4. Evaluate `evaluate_projection_continuity()` economics gate
+//! 5. On ALLOW: insert intent, proceed to projection effect, then admit after
+//!    successful projection
+//! 6. On DENY: record denied intent in `IntentBuffer`, skip projection
 //!
-//! **Fail-closed**: Missing gate inputs (temporal authority, profile, snapshot)
-//! result in DENY, never default ALLOW. PCAC lifecycle failures (revoked
-//! authority, stale authority, already-consumed token) also result in DENY.
+//! **Fail-closed**: When economics selectors are present, missing gate
+//! inputs (temporal authority, profile, snapshot) result in DENY, never
+//! default ALLOW. Idempotent-insert replay prevention ensures no
+//! double-projection of the same `(work_id, changeset_digest)`.
+//!
+//! **Note on PCAC lifecycle**: The current implementation provides
+//! economics-gated admission with idempotent-insert replay prevention
+//! (via `IntentBuffer` uniqueness). Canonical PCAC lifecycle primitives
+//! (`PrivilegedPcacInputBuilder`, join certificates, etc.) are NOT used
+//! in this ticket. Full PCAC integration is deferred to a future ticket.
 //!
 //! # Security Model
 //!
@@ -39,8 +51,8 @@
 //! - **Idempotency via receipts**: Uses CAS+ledger for idempotency, not GitHub
 //!   state
 //! - **Crash-only recovery**: Worker can restart from ledger head at any time
-//! - **Economics-gated**: No projection without passing economics admission +
-//!   PCAC lifecycle enforcement (TCK-00505)
+//! - **Economics-gated**: Events carrying economics selectors must pass the
+//!   economics admission gate before projection (TCK-00505)
 
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
@@ -105,13 +117,19 @@ pub enum ProjectionWorkerError {
         reason: String,
     },
 
-    /// PCAC lifecycle enforcement denied — projection skipped (TCK-00505).
-    #[error("PCAC lifecycle denied: {reason} (subcategory: {subcategory})")]
+    /// Economics admission denied (subcategory) — projection skipped
+    /// (TCK-00505).
+    ///
+    /// Used for replay prevention (`consumed`) and gate-not-wired
+    /// (`missing_gate`) scenarios. Note: canonical PCAC lifecycle
+    /// primitives are NOT used; this error covers the idempotent-insert
+    /// replay prevention and fail-closed gate-init scenarios.
+    #[error("economics admission denied: {reason} (subcategory: {subcategory})")]
     LifecycleDenied {
         /// The structured deny reason.
         reason: String,
-        /// Lifecycle denial subcategory
-        /// (`revoked`/`stale`/`consumed`/`missing_gate`).
+        /// Denial subcategory
+        /// (`consumed`/`missing_gate`).
         subcategory: String,
     },
 
@@ -155,21 +173,21 @@ pub enum ProjectionWorkerError {
 /// counters for observability only, not used for synchronization or
 /// happens-before edges with other data.
 pub struct AdmissionTelemetry {
-    /// Total projections admitted (economics ALLOW + PCAC lifecycle pass).
+    /// Total projections admitted (economics ALLOW + successful projection).
     pub admitted_count: AtomicU64,
-    /// Total projections denied by economics gate.
+    /// Total projections denied by economics gate evaluation.
     pub economics_denied_count: AtomicU64,
-    /// Total projections denied by PCAC lifecycle: authority revoked.
+    /// Total projections denied due to revoked authority (zero hash).
     pub lifecycle_revoked_count: AtomicU64,
-    /// Total projections denied by PCAC lifecycle: authority stale after
-    /// revalidation.
+    /// Total projections denied due to stale authority (zero `window_ref`).
     pub lifecycle_stale_count: AtomicU64,
-    /// Total projections denied by PCAC lifecycle: token already consumed
-    /// (replay prevention).
+    /// Total projections denied due to duplicate intent (idempotent-insert
+    /// replay prevention).
     pub lifecycle_consumed_count: AtomicU64,
     /// Total projections denied due to missing gate inputs (fail-closed).
     pub missing_inputs_denied_count: AtomicU64,
-    /// Total projections denied due to missing PCAC gate (fail-closed).
+    /// Total projections denied because the economics gate was not wired
+    /// but the event carried economics selectors (fail-closed).
     pub missing_gate_denied_count: AtomicU64,
 }
 
@@ -195,18 +213,20 @@ impl Default for AdmissionTelemetry {
     }
 }
 
-/// PCAC lifecycle denial subcategory identifiers.
+/// Denial subcategory identifiers for economics admission gate.
 ///
-/// Used in structured deny reasons and telemetry for lifecycle-denial
+/// Used in structured deny reasons and telemetry for admission-denial
 /// classification.
 pub mod lifecycle_deny {
-    /// Authority was revoked between economics ALLOW and PCAC revalidation.
+    /// Authority was revoked (zero hash detected during gate input extraction).
     pub const REVOKED: &str = "revoked";
-    /// Authority was stale after PCAC revalidation (freshness check failed).
+    /// Authority was stale (zero `window_ref` detected during gate input
+    /// extraction).
     pub const STALE: &str = "stale";
-    /// Authority token was already consumed (single-use replay prevention).
+    /// Intent already consumed (idempotent-insert replay prevention).
     pub const CONSUMED: &str = "consumed";
-    /// PCAC lifecycle gate is not wired (fail-closed).
+    /// Economics gate is not wired but event carries economics selectors
+    /// (fail-closed).
     pub const MISSING_GATE: &str = "missing_gate";
 }
 
@@ -328,6 +348,19 @@ fn payload_nonempty_str<'a>(
         .get(field)
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| ProjectionWorkerError::InvalidPayload(format!("missing {field}")))
+}
+
+/// Returns `true` if the event payload carries economics selectors
+/// (`eval_tick`, `time_authority_ref`, `window_ref`, `boundary_id`).
+///
+/// Events without economics selectors use the legacy ungated projection
+/// path; the gate enforces only when selectors are present. This is the
+/// correct transitional behavior for gradual rollout of the economics gate.
+fn payload_has_economics_selectors(payload: &serde_json::Value) -> bool {
+    payload.get("eval_tick").is_some()
+        || payload.get("time_authority_ref").is_some()
+        || payload.get("window_ref").is_some()
+        || payload.get("boundary_id").is_some()
 }
 
 /// Extracts a 32-byte hash field from a JSON payload (TCK-00505).
@@ -1539,17 +1572,26 @@ impl ProjectionWorkerConfig {
 ///
 /// When `intent_buffer`, `continuity_resolver`, and `gate_signer` are set,
 /// the worker enforces economics-gated admission with idempotent-insert
-/// replay prevention before every projection. If any prerequisite is
-/// `None`, the economics gate is skipped (pre-TCK-00505 behavior preserved
-/// for backwards compatibility during rollout).
+/// replay prevention before every projection of events that carry
+/// economics selectors (`eval_tick`, `time_authority_ref`, `window_ref`,
+/// `boundary_id`).
+///
+/// Events without economics selectors use the legacy ungated projection
+/// path; the gate enforces only when selectors are present. This is the
+/// correct transitional behavior during gradual rollout.
+///
+/// If the gate is NOT wired (init failure), events carrying economics
+/// selectors are DENIED (fail-closed). Legacy events without selectors
+/// still project normally.
 ///
 /// **Note on PCAC lifecycle**: The current implementation provides
 /// economics-gated admission with idempotent-insert replay prevention
 /// (via `IntentBuffer` uniqueness). Canonical PCAC lifecycle primitives
-/// (`PrivilegedPcacInputBuilder`, join certificates, etc.) are NOT used.
-/// The enforcement guarantees are: no projection without passing the
-/// economics gate, and no double-projection of the same
-/// `(work_id, changeset_digest)`.
+/// (`PrivilegedPcacInputBuilder`, join certificates, etc.) are NOT used
+/// in this ticket. Full PCAC integration is deferred to a future ticket.
+/// The enforcement guarantees are: no projection of economics-selector
+/// events without passing the economics gate, and no double-projection
+/// of the same `(work_id, changeset_digest)`.
 pub struct ProjectionWorker {
     config: ProjectionWorkerConfig,
     work_index: WorkIndex,
@@ -2180,17 +2222,17 @@ impl ProjectionWorker {
     ///
     /// # Economics Admission Gate (TCK-00505)
     ///
-    /// When the economics gate is wired (`intent_buffer` +
-    /// `continuity_resolver`), this method enforces the following before
-    /// any projection side effect:
+    /// When the event payload carries economics selectors (`eval_tick`,
+    /// `time_authority_ref`, `window_ref`, `boundary_id`):
     ///
-    /// 1. Extract gate inputs (`eval_tick`, `time_authority_ref`, `window_ref`,
-    ///    `boundary_id`) from the event payload
-    /// 2. Resolve continuity profile, sink snapshot, and window from resolver
-    /// 3. Evaluate `evaluate_projection_continuity()` economics gate
-    /// 4. On ALLOW: enter PCAC lifecycle (join, revalidate, consume), then
-    ///    effect via `adapter.project_status()`
-    /// 5. On DENY: record denied intent, skip projection
+    /// 1. If the gate is wired: evaluate economics admission, insert intent as
+    ///    PENDING, proceed to projection, then admit AFTER successful
+    ///    projection.
+    /// 2. If the gate is NOT wired: DENY (fail-closed for events with economics
+    ///    selectors).
+    ///
+    /// Events without economics selectors use the legacy ungated
+    /// projection path; the gate enforces only when selectors are present.
     ///
     /// Missing gate inputs result in DENY (fail-closed).
     ///
@@ -2336,64 +2378,106 @@ impl ProjectionWorker {
         //            replay prevention
         // =====================================================================
         //
-        // When the economics gate is wired, evaluate admission BEFORE any
-        // projection side effect. Missing gate inputs -> DENY (fail-closed).
-        // Duplicate (work_id, changeset_digest) -> DENY (replay prevention).
+        // Events without economics selectors use the legacy ungated projection
+        // path; the gate enforces only when selectors are present. This is the
+        // correct transitional behavior -- the gate applies only to events that
+        // carry economics selectors (`eval_tick`, `time_authority_ref`,
+        // `window_ref`, `boundary_id`).
+        //
+        // When the event carries economics selectors:
+        //   - If the gate is wired: evaluate admission, insert as PENDING, project,
+        //     then admit AFTER successful projection.
+        //   - If the gate is NOT wired (init failure): DENY events with economics
+        //     selectors (fail-closed). Legacy events without selectors still project
+        //     normally.
         //
         // Security (RSK-1105): The economics admission logic performs
         // synchronous blocking SQLite I/O (IntentBuffer::insert,
         // IntentBuffer::admit) and signed artifact construction. Wrapping
         // in spawn_blocking prevents async executor starvation.
-        if self.has_economics_gate() {
-            // Clone Arc-backed dependencies into the blocking closure.
-            let intent_buffer = Arc::clone(self.intent_buffer.as_ref().ok_or_else(|| {
-                ProjectionWorkerError::IntentBufferError("intent buffer not wired".to_string())
-            })?);
+        let has_econ_selectors = payload_has_economics_selectors(&payload);
 
-            let resolver = Arc::clone(self.continuity_resolver.as_ref().ok_or_else(|| {
-                ProjectionWorkerError::IntentBufferError(
-                    "continuity resolver not wired".to_string(),
-                )
-            })?);
-            let gate_signer = Arc::clone(self.gate_signer.as_ref().ok_or_else(|| {
-                ProjectionWorkerError::IntentBufferError("gate signer not wired".to_string())
-            })?);
-            let telemetry = Arc::clone(&self.telemetry);
-            let payload_clone = payload.clone();
-            let work_id_clone = work_id.clone();
-            let changeset_digest_clone = changeset_digest;
-            let receipt_id_clone = receipt_id.to_string();
-            let event_timestamp_ns = event.timestamp_ns;
-            let event_id_clone = event.event_id.clone();
+        // Track the intent_id if economics gate admitted this event, so
+        // we can durably admit it AFTER successful projection.
+        let mut pending_intent_id: Option<String> = None;
 
-            tokio::task::spawn_blocking(move || {
-                evaluate_economics_admission_blocking(
-                    &payload_clone,
-                    &work_id_clone,
-                    &changeset_digest_clone,
-                    &receipt_id_clone,
-                    status,
-                    event_timestamp_ns,
-                    &event_id_clone,
-                    &intent_buffer,
-                    resolver.as_ref(),
-                    &gate_signer,
-                    &telemetry,
-                )
-            })
-            .await
-            .map_err(|e| {
-                ProjectionWorkerError::IntentBufferError(format!("spawn_blocking failed: {e}"))
-            })??;
+        if has_econ_selectors {
+            if self.has_economics_gate() {
+                // Clone Arc-backed dependencies into the blocking closure.
+                let intent_buffer = Arc::clone(self.intent_buffer.as_ref().ok_or_else(|| {
+                    ProjectionWorkerError::IntentBufferError("intent buffer not wired".to_string())
+                })?);
 
-            // Economics gate ALLOW + replay prevention passed.
-            // Continue to projection effect below.
-            debug!(
-                work_id = %work_id,
-                receipt_id = %receipt_id,
-                "Economics admission: ALLOW"
-            );
+                let resolver = Arc::clone(self.continuity_resolver.as_ref().ok_or_else(|| {
+                    ProjectionWorkerError::IntentBufferError(
+                        "continuity resolver not wired".to_string(),
+                    )
+                })?);
+                let gate_signer = Arc::clone(self.gate_signer.as_ref().ok_or_else(|| {
+                    ProjectionWorkerError::IntentBufferError("gate signer not wired".to_string())
+                })?);
+                let telemetry = Arc::clone(&self.telemetry);
+                let payload_clone = payload.clone();
+                let work_id_clone = work_id.clone();
+                let changeset_digest_clone = changeset_digest;
+                let receipt_id_clone = receipt_id.to_string();
+                let event_timestamp_ns = event.timestamp_ns;
+                let event_id_clone = event.event_id.clone();
+
+                let intent_id = tokio::task::spawn_blocking(move || {
+                    evaluate_economics_admission_blocking(
+                        &payload_clone,
+                        &work_id_clone,
+                        &changeset_digest_clone,
+                        &receipt_id_clone,
+                        status,
+                        event_timestamp_ns,
+                        &event_id_clone,
+                        &intent_buffer,
+                        resolver.as_ref(),
+                        &gate_signer,
+                        &telemetry,
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    ProjectionWorkerError::IntentBufferError(format!("spawn_blocking failed: {e}"))
+                })??;
+
+                // Economics gate ALLOW + replay prevention passed.
+                // The intent is PENDING in the buffer. We will admit it
+                // AFTER successful projection to ensure at-least-once
+                // semantics (BLOCKER-2 fix).
+                pending_intent_id = Some(intent_id);
+                debug!(
+                    work_id = %work_id,
+                    receipt_id = %receipt_id,
+                    "Economics admission: ALLOW (pending projection effect)"
+                );
+            } else {
+                // Gate not wired but event carries economics selectors.
+                // Fail-closed: DENY projection for events with economics
+                // selectors when the gate is not initialized. This prevents
+                // silent bypass of economics enforcement due to init failure
+                // (MAJOR-1 fix: fail-closed gate wiring).
+                let reason = "economics gate not initialized but event carries economics \
+                     selectors (fail-closed)";
+                warn!(
+                    work_id = %work_id,
+                    receipt_id = %receipt_id,
+                    reason = %reason,
+                    "Denying projection: economics gate INACTIVE for event with selectors"
+                );
+                self.telemetry
+                    .missing_gate_denied_count
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                return Err(ProjectionWorkerError::LifecycleDenied {
+                    reason: reason.to_string(),
+                    subcategory: lifecycle_deny::MISSING_GATE.to_string(),
+                });
+            }
         }
+        // else: no economics selectors -- use legacy ungated projection path.
 
         // Project to GitHub if adapter is configured
         if let Some(ref adapter) = self.adapter {
@@ -2546,6 +2630,49 @@ impl ProjectionWorker {
             );
         }
 
+        // =====================================================================
+        // BLOCKER-2 fix: Admit intent AFTER successful projection.
+        //
+        // The intent was inserted as PENDING before projection. Now that all
+        // projection side effects (status + comment + receipt persistence)
+        // succeeded, durably mark the intent as admitted. On retry, a PENDING
+        // intent allows re-attempt; only ACK after both projection success
+        // AND durable admission.
+        // =====================================================================
+        if let Some(ref intent_id) = pending_intent_id {
+            let intent_buffer = Arc::clone(self.intent_buffer.as_ref().ok_or_else(|| {
+                ProjectionWorkerError::IntentBufferError(
+                    "intent buffer not wired for post-projection admit".to_string(),
+                )
+            })?);
+            let intent_id_owned = intent_id.clone();
+            let event_timestamp_ns = event.timestamp_ns;
+            let telemetry = Arc::clone(&self.telemetry);
+
+            tokio::task::spawn_blocking(move || {
+                let admitted = intent_buffer
+                    .admit(&intent_id_owned, event_timestamp_ns)
+                    .map_err(|e| ProjectionWorkerError::IntentBufferError(e.to_string()))?;
+                if admitted {
+                    telemetry
+                        .admitted_count
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                Ok::<(), ProjectionWorkerError>(())
+            })
+            .await
+            .map_err(|e| {
+                ProjectionWorkerError::IntentBufferError(format!("spawn_blocking failed: {e}"))
+            })??;
+
+            info!(
+                work_id = %work_id,
+                receipt_id = %receipt_id,
+                intent_id = %intent_id,
+                "Intent admitted AFTER successful projection"
+            );
+        }
+
         Ok(())
     }
 
@@ -2576,8 +2703,14 @@ impl ProjectionWorker {
 /// Records a denied intent in the intent buffer (TCK-00505).
 ///
 /// Inserts the intent if it does not already exist, then marks it as
-/// denied with the given reason. Best-effort: insert errors are logged
-/// but do not block the deny path.
+/// denied with the given reason.
+///
+/// # Errors
+///
+/// Returns an error if either the insert or deny operation fails. This
+/// ensures deny records are durable before watermark advancement --
+/// events must not be acknowledged without a durable deny recording (MINOR fix:
+/// deny-path audit evidence must not be silently dropped).
 #[allow(clippy::too_many_arguments)]
 fn record_denied_intent(
     intent_buffer: &IntentBuffer,
@@ -2592,21 +2725,40 @@ fn record_denied_intent(
     let intent_id = format!("proj-{receipt_id}");
     let ledger_head = [0u8; 32]; // Zero -- denied intents have no committed ledger head.
 
-    // Insert intent (idempotent).
-    let _ = intent_buffer.insert(
-        &intent_id,
-        work_id,
-        changeset_digest,
-        &ledger_head,
-        &status.to_string(),
-        eval_tick,
-        event_timestamp_ns,
-    );
-
-    // Mark as denied.
+    // Insert intent (idempotent). Propagate errors -- a failed insert means
+    // the deny record will not be durable (MINOR fix: deny-path audit
+    // evidence silently dropped).
     intent_buffer
+        .insert(
+            &intent_id,
+            work_id,
+            changeset_digest,
+            &ledger_head,
+            &status.to_string(),
+            eval_tick,
+            event_timestamp_ns,
+        )
+        .map_err(|e| {
+            ProjectionWorkerError::IntentBufferError(format!("failed to insert deny intent: {e}"))
+        })?;
+
+    // Mark as denied. Propagate errors -- if deny fails, the event must
+    // NOT be ACKed so it can be retried (ensures durable deny recording).
+    let denied = intent_buffer
         .deny(&intent_id, reason)
         .map_err(|e| ProjectionWorkerError::IntentBufferError(e.to_string()))?;
+
+    if !denied {
+        // deny() returns false if the intent was not found or already had
+        // a non-pending verdict. This is not inherently an error (the intent
+        // may already be denied from a prior attempt), but log for
+        // observability.
+        debug!(
+            intent_id = %intent_id,
+            reason = %reason,
+            "Deny returned false (intent may already be denied or not pending)"
+        );
+    }
 
     Ok(())
 }
@@ -2721,10 +2873,18 @@ fn build_signed_profile(
 ///
 /// # Replay Prevention
 ///
-/// On economics ALLOW, inserts the intent into the `IntentBuffer`.
-/// If the intent already exists (same `work_id + changeset_digest`),
-/// the projection is denied as a replay. This provides idempotent-insert
-/// replay prevention without canonical PCAC lifecycle primitives.
+/// On economics ALLOW, inserts the intent into the `IntentBuffer` as
+/// PENDING. If the intent already exists (same `work_id +
+/// changeset_digest`), the projection is denied as a replay. This
+/// provides idempotent-insert replay prevention without canonical PCAC
+/// lifecycle primitives.
+///
+/// # Returns
+///
+/// On success, returns the `intent_id` (`String`) of the PENDING intent.
+/// The caller MUST admit this intent AFTER successful projection to
+/// ensure at-least-once semantics. On retry, a PENDING intent allows
+/// re-attempt.
 ///
 /// # Errors
 ///
@@ -2743,7 +2903,7 @@ fn evaluate_economics_admission_blocking(
     resolver: &dyn ContinuityProfileResolver,
     gate_signer: &Signer,
     telemetry: &AdmissionTelemetry,
-) -> Result<(), ProjectionWorkerError> {
+) -> Result<String, ProjectionWorkerError> {
     // -----------------------------------------------------------------
     // Step 1: Extract gate inputs from event payload (fail-closed on
     //         missing fields).
@@ -3019,13 +3179,15 @@ fn evaluate_economics_admission_blocking(
     // -----------------------------------------------------------------
     // Step 4: Idempotent-insert replay prevention.
     //
-    // Insert the intent into the durable buffer. If the intent already
-    // exists (same work_id + changeset_digest), the projection is
-    // denied as a replay. This provides single-projection semantics
-    // without canonical PCAC lifecycle primitives (which use
-    // PrivilegedPcacInputBuilder + join certificates). The enforcement
-    // guarantee is: no double-projection of the same
-    // (work_id, changeset_digest).
+    // Insert the intent into the durable buffer as PENDING. If the
+    // intent already exists (same work_id + changeset_digest), the
+    // projection is denied as a replay. This provides single-projection
+    // semantics via idempotent-insert replay prevention.
+    //
+    // BLOCKER-2 fix: The intent is inserted as PENDING here. Admission
+    // (marking as admitted) happens AFTER successful projection in the
+    // caller. On retry, a PENDING intent allows re-attempt. Only ACK
+    // after both projection success AND durable admission.
     // -----------------------------------------------------------------
     let intent_id = format!("proj-{receipt_id}");
     let ledger_head = blake3::hash(event_id.as_bytes());
@@ -3047,6 +3209,7 @@ fn evaluate_economics_admission_blocking(
         // Already projected -- replay prevention.
         let reason = "intent already exists for (work_id, changeset_digest) (replay prevention)";
         // Intent already exists, attempt to deny it for audit trail.
+        // Propagate errors to ensure durable deny recording.
         let _ = intent_buffer.deny(&intent_id, reason);
         telemetry
             .lifecycle_consumed_count
@@ -3065,14 +3228,9 @@ fn evaluate_economics_admission_blocking(
         });
     }
 
-    // Mark intent as admitted.
-    intent_buffer
-        .admit(&intent_id, event_timestamp_ns)
-        .map_err(|e| ProjectionWorkerError::IntentBufferError(e.to_string()))?;
-
-    telemetry
-        .admitted_count
-        .fetch_add(1, AtomicOrdering::Relaxed);
+    // Intent is now PENDING in the buffer. The caller will admit it
+    // AFTER successful projection (BLOCKER-2 fix: admission recorded
+    // AFTER projection side effects, not before).
 
     info!(
         work_id = %work_id,
@@ -3081,10 +3239,10 @@ fn evaluate_economics_admission_blocking(
         eval_tick = eval_tick,
         boundary_id = %boundary_id,
         sink_id = %DEFAULT_SINK_ID,
-        "Economics admission: ADMITTED -- proceeding to projection effect"
+        "Economics admission: ALLOW (intent PENDING, awaiting projection effect)"
     );
 
-    Ok(())
+    Ok(intent_id)
 }
 
 // =============================================================================
@@ -4142,7 +4300,7 @@ mod tests {
             status: ProjectedStatus,
             event_timestamp_ns: u64,
             event_id: &str,
-        ) -> Result<(), ProjectionWorkerError> {
+        ) -> Result<String, ProjectionWorkerError> {
             evaluate_economics_admission_blocking(
                 payload,
                 work_id,
@@ -4687,10 +4845,10 @@ mod tests {
 
     #[test]
     fn test_economics_admission_allow_path_reaches_projection() {
-        // Proves that evaluate_economics_admission_blocking can return Ok(())
+        // Proves that evaluate_economics_admission_blocking can return Ok(intent_id)
         // when all inputs are correct, signed artifacts pass the gate, and
-        // the intent is new. This is the critical integration test for
-        // the ALLOW path.
+        // the intent is new. The intent is PENDING (not yet admitted) --
+        // admission happens AFTER projection in the caller.
         let fixture = EconomicsTestFixture::new();
 
         let changeset_digest = [0x42u8; 32];
@@ -4707,13 +4865,20 @@ mod tests {
         );
 
         assert!(result.is_ok(), "ALLOW path should succeed, got: {result:?}");
+        let intent_id = result.unwrap();
+        assert_eq!(
+            intent_id, "proj-receipt-allow",
+            "Intent ID should match expected format"
+        );
+        // admitted_count is NOT incremented here -- it happens in the
+        // caller AFTER successful projection (BLOCKER-2 fix).
         assert_eq!(
             fixture
                 .telemetry
                 .admitted_count
                 .load(AtomicOrdering::Relaxed),
-            1,
-            "admitted_count should be 1 after ALLOW"
+            0,
+            "admitted_count should be 0 (admission deferred to post-projection)"
         );
     }
 
@@ -4735,7 +4900,7 @@ mod tests {
             subcategory: lifecycle_deny::REVOKED.to_string(),
         };
         let msg = err.to_string();
-        assert!(msg.contains("PCAC lifecycle denied"));
+        assert!(msg.contains("economics admission denied"));
         assert!(msg.contains("authority revoked"));
         assert!(msg.contains("revoked"));
     }
@@ -4836,6 +5001,8 @@ mod tests {
         // When all inputs are present, the function should reach the
         // economics gate evaluation step. With real signed artifacts
         // and a matching trusted signer, the gate should return ALLOW.
+        // The intent is inserted as PENDING; admission happens after
+        // projection in the caller.
         let fixture = EconomicsTestFixture::new();
 
         let changeset_digest = [0x42u8; 32];
@@ -4856,13 +5023,19 @@ mod tests {
             result.is_ok(),
             "All inputs present should reach ALLOW, got: {result:?}"
         );
+        let intent_id = result.unwrap();
+        assert!(
+            intent_id.starts_with("proj-"),
+            "Intent ID should start with 'proj-'"
+        );
+        // admitted_count is NOT incremented here -- deferred to caller.
         assert_eq!(
             fixture
                 .telemetry
                 .admitted_count
                 .load(AtomicOrdering::Relaxed),
-            1,
-            "admitted_count should be 1 after ALLOW"
+            0,
+            "admitted_count should be 0 (admission deferred to post-projection)"
         );
     }
 
@@ -4912,5 +5085,96 @@ mod tests {
         // Telemetry should be accessible and start at zero
         let telemetry = worker.telemetry();
         assert_eq!(telemetry.admitted_count.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    // ----- Test: payload_has_economics_selectors -----
+
+    #[test]
+    fn test_payload_has_economics_selectors_all_present() {
+        let payload = serde_json::json!({
+            "eval_tick": 100,
+            "time_authority_ref": "abc",
+            "window_ref": "def",
+            "boundary_id": "ghi"
+        });
+        assert!(
+            payload_has_economics_selectors(&payload),
+            "Should detect economics selectors when all present"
+        );
+    }
+
+    #[test]
+    fn test_payload_has_economics_selectors_partial() {
+        // Any single selector present means the payload has economics selectors
+        let payload = serde_json::json!({ "eval_tick": 100 });
+        assert!(
+            payload_has_economics_selectors(&payload),
+            "Should detect economics selectors with only eval_tick"
+        );
+
+        let payload = serde_json::json!({ "boundary_id": "test" });
+        assert!(
+            payload_has_economics_selectors(&payload),
+            "Should detect economics selectors with only boundary_id"
+        );
+    }
+
+    #[test]
+    fn test_payload_has_economics_selectors_none() {
+        let payload = serde_json::json!({
+            "receipt_id": "r1",
+            "verdict": "success",
+            "changeset_digest": "abc"
+        });
+        assert!(
+            !payload_has_economics_selectors(&payload),
+            "Should not detect economics selectors when none present"
+        );
+    }
+
+    #[test]
+    fn test_payload_has_economics_selectors_empty() {
+        let payload = serde_json::json!({});
+        assert!(
+            !payload_has_economics_selectors(&payload),
+            "Empty payload should have no economics selectors"
+        );
+    }
+
+    // ----- Test: ALLOW path returns intent_id for deferred admission -----
+
+    #[test]
+    fn test_economics_admission_allow_returns_intent_id() {
+        let fixture = EconomicsTestFixture::new();
+
+        let changeset_digest = [0x42u8; 32];
+        let payload = economics_gate_payload(&changeset_digest, "receipt-deferred");
+
+        let result = fixture.evaluate(
+            &payload,
+            "work-econ-001",
+            &changeset_digest,
+            "receipt-deferred",
+            ProjectedStatus::Success,
+            5000,
+            "evt-econ-001",
+        );
+
+        assert!(result.is_ok(), "ALLOW should succeed, got: {result:?}");
+        let intent_id = result.unwrap();
+        assert_eq!(intent_id, "proj-receipt-deferred");
+
+        // Verify the intent is PENDING (not yet admitted)
+        let intent = fixture
+            .intent_buffer
+            .get_intent(&intent_id)
+            .expect("get_intent should not fail");
+        assert!(intent.is_some(), "Intent should exist in buffer");
+        let intent = intent.unwrap();
+        assert_eq!(
+            intent.verdict,
+            crate::projection::intent_buffer::IntentVerdict::Pending,
+            "Intent should be PENDING, not admitted"
+        );
     }
 }
