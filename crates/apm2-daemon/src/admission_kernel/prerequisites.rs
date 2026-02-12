@@ -54,6 +54,11 @@ pub enum TrustError {
         /// Bounded reason string.
         reason: String,
     },
+    /// External anti-rollback anchor has not been initialized yet.
+    ///
+    /// This represents the bootstrap condition on fresh install before the
+    /// first successful external anchor commit.
+    ExternalAnchorNotInitialized,
     /// External anchor does not match local ledger state.
     ExternalAnchorMismatch {
         /// Bounded reason string.
@@ -80,6 +85,9 @@ impl fmt::Display for TrustError {
             },
             Self::ExternalAnchorUnavailable { reason } => {
                 write!(f, "external anti-rollback anchor unavailable: {reason}")
+            },
+            Self::ExternalAnchorNotInitialized => {
+                write!(f, "external anti-rollback anchor not initialized")
             },
             Self::ExternalAnchorMismatch { reason } => {
                 write!(f, "external anchor mismatch: {reason}")
@@ -324,6 +332,8 @@ pub trait PolicyRootResolver: Send + Sync {
 ///
 /// Fail-closed tiers MUST require verified anti-rollback anchoring.
 /// If the anchor is unavailable or does not match, admission MUST deny.
+/// The only tolerated bootstrap exception is
+/// [`TrustError::ExternalAnchorNotInitialized`].
 ///
 /// # Commit Contract
 ///
@@ -338,6 +348,8 @@ pub trait AntiRollbackAnchor: Send + Sync {
     /// # Errors
     ///
     /// Returns [`TrustError`] if the external anchor is unavailable.
+    /// Returns [`TrustError::ExternalAnchorNotInitialized`] when no anchor has
+    /// ever been committed yet (fresh install bootstrap).
     fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError>;
 
     /// Verifies that `anchor` is committed externally.
@@ -345,7 +357,9 @@ pub trait AntiRollbackAnchor: Send + Sync {
     /// # Errors
     ///
     /// Returns [`TrustError`] if the anchor is not committed externally
-    /// or the external state does not match.
+    /// or the external state does not match. Returns
+    /// [`TrustError::ExternalAnchorNotInitialized`] when no committed anchor
+    /// exists yet.
     fn verify_committed(&self, anchor: &LedgerAnchorV1) -> Result<(), TrustError>;
 
     /// Commit a new anchor to the external anchor state, advancing

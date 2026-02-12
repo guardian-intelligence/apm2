@@ -61,7 +61,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
@@ -1276,6 +1276,12 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// **mandatory** for fail-closed tiers. Missing kernel wiring causes
     /// a hard deny — no silent fallback to the legacy effect-capable path.
     admission_kernel: Option<Arc<AdmissionKernelV1>>,
+    /// Circuit-break latch for fail-closed anti-rollback finalization.
+    ///
+    /// Set to `true` when post-effect `finalize_anti_rollback()` fails for a
+    /// fail-closed request. While open, fail-closed effects are denied until
+    /// a pre-effect health probe confirms anchor commit health has recovered.
+    fail_closed_anchor_circuit_open: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -1462,6 +1468,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
                 BoundaryChannelQuarantineState::default(),
             )),
             admission_kernel: None,
+            fail_closed_anchor_circuit_open: AtomicBool::new(false),
         }
     }
 
@@ -1498,6 +1505,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
                 BoundaryChannelQuarantineState::default(),
             )),
             admission_kernel: None,
+            fail_closed_anchor_circuit_open: AtomicBool::new(false),
         }
     }
 }
@@ -1539,6 +1547,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 BoundaryChannelQuarantineState::default(),
             )),
             admission_kernel: None,
+            fail_closed_anchor_circuit_open: AtomicBool::new(false),
         }
     }
 
@@ -1580,6 +1589,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 BoundaryChannelQuarantineState::default(),
             )),
             admission_kernel: None,
+            fail_closed_anchor_circuit_open: AtomicBool::new(false),
         }
     }
 
@@ -1637,6 +1647,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 BoundaryChannelQuarantineState::default(),
             )),
             admission_kernel: None,
+            fail_closed_anchor_circuit_open: AtomicBool::new(false),
         }
     }
 
@@ -1890,6 +1901,91 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     pub fn with_admission_kernel(mut self, kernel: Arc<AdmissionKernelV1>) -> Self {
         self.admission_kernel = Some(kernel);
         self
+    }
+
+    fn open_fail_closed_anchor_circuit(&self, endpoint_class: &str, session_id: &str, error: &str) {
+        self.fail_closed_anchor_circuit_open
+            .store(true, Ordering::SeqCst);
+        warn!(
+            session_id = %session_id,
+            endpoint = %endpoint_class,
+            error = %error,
+            "fail-closed anti-rollback admission circuit opened"
+        );
+    }
+
+    fn close_fail_closed_anchor_circuit_if_open(&self, endpoint_class: &str, session_id: &str) {
+        if self
+            .fail_closed_anchor_circuit_open
+            .swap(false, Ordering::SeqCst)
+        {
+            info!(
+                session_id = %session_id,
+                endpoint = %endpoint_class,
+                "fail-closed anti-rollback admission circuit closed after health recovery"
+            );
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn enforce_fail_closed_anchor_circuit_before_effect(
+        &self,
+        endpoint_class: &str,
+        token: &SessionToken,
+        result: &crate::admission_kernel::types::AdmissionResultV1,
+    ) -> Result<(), SessionResponse> {
+        if result.boundary_span.enforcement_tier
+            != crate::admission_kernel::types::EnforcementTier::FailClosed
+        {
+            return Ok(());
+        }
+
+        if !self.fail_closed_anchor_circuit_open.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let Some(kernel) = self.admission_kernel.as_ref() else {
+            self.open_fail_closed_anchor_circuit(
+                endpoint_class,
+                &token.session_id,
+                "admission kernel unavailable while anti-rollback circuit is open",
+            );
+            return Err(SessionResponse::error(
+                SessionErrorCode::SessionErrorInternal,
+                format!(
+                    "anti-rollback anchor degraded for {endpoint_class}: fail-closed effects \
+                     suspended (kernel unavailable)"
+                ),
+            ));
+        };
+
+        warn!(
+            session_id = %token.session_id,
+            endpoint = %endpoint_class,
+            "fail-closed anti-rollback admission circuit is open; probing anchor \
+             commit health before effect"
+        );
+
+        match kernel.finalize_anti_rollback(
+            crate::admission_kernel::types::EnforcementTier::FailClosed,
+            &result.bundle.ledger_anchor,
+        ) {
+            Ok(()) => {
+                self.close_fail_closed_anchor_circuit_if_open(endpoint_class, &token.session_id);
+                Ok(())
+            },
+            Err(e) => {
+                let reason = format!("{e}");
+                self.open_fail_closed_anchor_circuit(endpoint_class, &token.session_id, &reason);
+                Err(SessionResponse::error(
+                    SessionErrorCode::SessionErrorInternal,
+                    format!(
+                        "anti-rollback anchor degraded for {endpoint_class}: fail-closed \
+                         effects suspended until anchor health is restored: {e}"
+                    ),
+                ))
+            },
+        }
     }
 
     fn emit_htf_regression_defect(&self, current: u64, previous: u64) {
@@ -7836,6 +7932,16 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             None
         };
 
+        if let Some(ref result) = admission_result {
+            if let Err(deny_response) = self.enforce_fail_closed_anchor_circuit_before_effect(
+                "request_tool",
+                &token,
+                result,
+            ) {
+                return Ok(deny_response);
+            }
+        }
+
         // ================================================================
         // TCK-00494 SECURITY MAJOR 1 FIX: Persist AdmissionBundleV1
         // evidence to the ledger BEFORE broker dispatch.
@@ -8572,20 +8678,44 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     // ====================================================
                     if let Some(ref kernel) = self.admission_kernel {
                         let plan_tier = admission_res.boundary_span.enforcement_tier;
-                        if let Err(e) = kernel
+                        match kernel
                             .finalize_anti_rollback(plan_tier, &admission_res.bundle.ledger_anchor)
                         {
-                            warn!(
-                                session_id = %token.session_id,
-                                error = %e,
-                                "anti-rollback anchor finalization failed \
-                                 (effect succeeded but anchor not committed)"
-                            );
-                            // The effect already succeeded; anti-rollback
-                            // finalization failure is logged but does not
-                            // retroactively revoke the allow decision. The
-                            // next admission will detect the stale anchor
-                            // via verify_anti_rollback and deny if needed.
+                            Ok(()) => {
+                                if plan_tier
+                                    == crate::admission_kernel::types::EnforcementTier::FailClosed
+                                {
+                                    self.close_fail_closed_anchor_circuit_if_open(
+                                        "request_tool",
+                                        &token.session_id,
+                                    );
+                                }
+                            },
+                            Err(e) => {
+                                warn!(
+                                    session_id = %token.session_id,
+                                    error = %e,
+                                    "anti-rollback anchor finalization failed \
+                                     (effect succeeded but anchor not committed)"
+                                );
+                                if plan_tier
+                                    == crate::admission_kernel::types::EnforcementTier::FailClosed
+                                {
+                                    let reason = e.to_string();
+                                    self.open_fail_closed_anchor_circuit(
+                                        "request_tool",
+                                        &token.session_id,
+                                        &reason,
+                                    );
+                                    return Ok(SessionResponse::error(
+                                        SessionErrorCode::SessionErrorInternal,
+                                        format!(
+                                            "anti-rollback anchor finalization failed for \
+                                             request_tool (fail-closed): {e}"
+                                        ),
+                                    ));
+                                }
+                            },
                         }
                     }
 
@@ -11404,6 +11534,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             Err(deny_response) => return Ok(deny_response),
         };
 
+        if let Some(ref result) = admission_result {
+            if let Err(deny_response) =
+                self.enforce_fail_closed_anchor_circuit_before_effect("emit_event", &token, result)
+            {
+                return Ok(deny_response);
+            }
+        }
+
         // Persist admission evidence BEFORE the effect (ledger write).
         if let Some(ref result) = admission_result {
             if let Err(deny_response) =
@@ -11450,20 +11588,43 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 if let Some(ref result) = admission_result {
                     if let Some(ref kernel) = self.admission_kernel {
                         let plan_tier = result.boundary_span.enforcement_tier;
-                        if let Err(e) =
-                            kernel.finalize_anti_rollback(plan_tier, &result.bundle.ledger_anchor)
+                        match kernel.finalize_anti_rollback(plan_tier, &result.bundle.ledger_anchor)
                         {
-                            warn!(
-                                session_id = %token.session_id,
-                                error = %e,
-                                "EmitEvent anti-rollback anchor finalization failed \
-                                 (effect succeeded but anchor not committed)"
-                            );
-                            // The effect already succeeded; anti-rollback
-                            // finalization failure is logged but does not
-                            // retroactively revoke the allow decision. The
-                            // next admission will detect the stale anchor
-                            // via verify_anti_rollback and deny if needed.
+                            Ok(()) => {
+                                if plan_tier
+                                    == crate::admission_kernel::types::EnforcementTier::FailClosed
+                                {
+                                    self.close_fail_closed_anchor_circuit_if_open(
+                                        "emit_event",
+                                        &token.session_id,
+                                    );
+                                }
+                            },
+                            Err(e) => {
+                                warn!(
+                                    session_id = %token.session_id,
+                                    error = %e,
+                                    "EmitEvent anti-rollback anchor finalization failed \
+                                     (effect succeeded but anchor not committed)"
+                                );
+                                if plan_tier
+                                    == crate::admission_kernel::types::EnforcementTier::FailClosed
+                                {
+                                    let reason = e.to_string();
+                                    self.open_fail_closed_anchor_circuit(
+                                        "emit_event",
+                                        &token.session_id,
+                                        &reason,
+                                    );
+                                    return Ok(SessionResponse::error(
+                                        SessionErrorCode::SessionErrorInternal,
+                                        format!(
+                                            "anti-rollback anchor finalization failed for \
+                                             emit_event (fail-closed): {e}"
+                                        ),
+                                    ));
+                                }
+                            },
                         }
                     }
                 }
@@ -11608,6 +11769,16 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             Err(deny_response) => return Ok(deny_response),
         };
 
+        if let Some(ref result) = admission_result {
+            if let Err(deny_response) = self.enforce_fail_closed_anchor_circuit_before_effect(
+                "publish_evidence",
+                &token,
+                result,
+            ) {
+                return Ok(deny_response);
+            }
+        }
+
         // Persist admission evidence BEFORE the effect (CAS write).
         if let Some(ref result) = admission_result {
             if let Err(deny_response) =
@@ -11686,20 +11857,40 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         if let Some(ref result) = admission_result {
             if let Some(ref kernel) = self.admission_kernel {
                 let plan_tier = result.boundary_span.enforcement_tier;
-                if let Err(e) =
-                    kernel.finalize_anti_rollback(plan_tier, &result.bundle.ledger_anchor)
-                {
-                    warn!(
-                        session_id = %token.session_id,
-                        error = %e,
-                        "PublishEvidence anti-rollback anchor finalization failed \
-                         (effect succeeded but anchor not committed)"
-                    );
-                    // The effect already succeeded; anti-rollback
-                    // finalization failure is logged but does not
-                    // retroactively revoke the allow decision. The
-                    // next admission will detect the stale anchor
-                    // via verify_anti_rollback and deny if needed.
+                match kernel.finalize_anti_rollback(plan_tier, &result.bundle.ledger_anchor) {
+                    Ok(()) => {
+                        if plan_tier == crate::admission_kernel::types::EnforcementTier::FailClosed
+                        {
+                            self.close_fail_closed_anchor_circuit_if_open(
+                                "publish_evidence",
+                                &token.session_id,
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        warn!(
+                            session_id = %token.session_id,
+                            error = %e,
+                            "PublishEvidence anti-rollback anchor finalization failed \
+                             (effect succeeded but anchor not committed)"
+                        );
+                        if plan_tier == crate::admission_kernel::types::EnforcementTier::FailClosed
+                        {
+                            let reason = e.to_string();
+                            self.open_fail_closed_anchor_circuit(
+                                "publish_evidence",
+                                &token.session_id,
+                                &reason,
+                            );
+                            return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorInternal,
+                                format!(
+                                    "anti-rollback anchor finalization failed for \
+                                     publish_evidence (fail-closed): {e}"
+                                ),
+                            ));
+                        }
+                    },
                 }
             }
         }
@@ -23942,6 +24133,210 @@ mod tests {
             Arc::clone(registry) as Arc<dyn SessionRegistry>
         }
 
+        pub(super) fn test_hash(byte: u8) -> Hash {
+            let mut h = [0u8; 32];
+            h[0] = byte;
+            h[31] = byte;
+            h
+        }
+
+        pub(super) fn emit_signed_policy_root_event(
+            ledger: &StubLedgerEventEmitter,
+            policy_hash: Hash,
+        ) {
+            let payload = serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
+                work_id: "work-emit".to_string(),
+                policy_hash,
+                timestamp_ms: 1,
+            })
+            .expect("policy event payload must serialize");
+            ledger
+                .emit_session_event(
+                    "session-001",
+                    "gate.policy_resolved",
+                    &payload,
+                    "orchestrator:gate-lifecycle",
+                    1_000_000_001,
+                )
+                .expect("policy event emit must succeed");
+        }
+
+        pub(super) fn build_kernel_with_failing_finalize()
+        -> Arc<crate::admission_kernel::AdmissionKernelV1> {
+            use apm2_core::pcac::{
+                AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyV1,
+                AuthorityJoinCertificateV1, AuthorityJoinInputV1, AuthorityJoinKernel,
+                BoundaryIntentClass, IdentityEvidenceLevel as CoreIdentityEvidenceLevel,
+                PcacPolicyKnobs,
+            };
+
+            use crate::admission_kernel::QuarantineGuard;
+            use crate::admission_kernel::prerequisites::{
+                AntiRollbackAnchor, ExternalAnchorStateV1, LedgerAnchorV1, LedgerTrustVerifier,
+                PolicyError, PolicyRootResolver, PolicyRootStateV1, TrustError,
+                ValidatedLedgerStateV1,
+            };
+
+            struct PassingPcacKernel;
+            impl AuthorityJoinKernel for PassingPcacKernel {
+                fn join(
+                    &self,
+                    _input: &AuthorityJoinInputV1,
+                    _policy: &PcacPolicyKnobs,
+                ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
+                    Ok(AuthorityJoinCertificateV1 {
+                        ajc_id: test_hash(0x50),
+                        authority_join_hash: test_hash(0x51),
+                        intent_digest: test_hash(0x52),
+                        boundary_intent_class: BoundaryIntentClass::Actuate,
+                        risk_tier: apm2_core::pcac::RiskTier::Tier2Plus,
+                        issued_time_envelope_ref: test_hash(0x53),
+                        issued_at_tick: 40,
+                        as_of_ledger_anchor: test_hash(0x54),
+                        expires_at_tick: 1000,
+                        revocation_head_hash: test_hash(0x55),
+                        identity_evidence_level: CoreIdentityEvidenceLevel::Verified,
+                        admission_capacity_token: None,
+                    })
+                }
+
+                fn revalidate(
+                    &self,
+                    _cert: &AuthorityJoinCertificateV1,
+                    _time: Hash,
+                    _ledger: Hash,
+                    _revocation: Hash,
+                    _policy: &PcacPolicyKnobs,
+                ) -> Result<(), Box<AuthorityDenyV1>> {
+                    Ok(())
+                }
+
+                fn consume(
+                    &self,
+                    cert: &AuthorityJoinCertificateV1,
+                    _intent: Hash,
+                    _class: BoundaryIntentClass,
+                    _requires_authoritative_acceptance: bool,
+                    _time: Hash,
+                    _revocation: Hash,
+                    _policy: &PcacPolicyKnobs,
+                ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>
+                {
+                    Ok((
+                        AuthorityConsumedV1 {
+                            ajc_id: cert.ajc_id,
+                            intent_digest: test_hash(0x56),
+                            consumed_time_envelope_ref: test_hash(0x57),
+                            consumed_at_tick: 45,
+                        },
+                        AuthorityConsumeRecordV1 {
+                            ajc_id: cert.ajc_id,
+                            consumed_time_envelope_ref: test_hash(0x57),
+                            consumed_at_tick: 45,
+                            effect_selector_digest: test_hash(0x58),
+                        },
+                    ))
+                }
+            }
+
+            struct PassingLedgerVerifier;
+            impl LedgerTrustVerifier for PassingLedgerVerifier {
+                fn validated_state(&self) -> Result<ValidatedLedgerStateV1, TrustError> {
+                    Ok(ValidatedLedgerStateV1 {
+                        validated_anchor: LedgerAnchorV1 {
+                            ledger_id: test_hash(0x20),
+                            event_hash: test_hash(0x21),
+                            height: 100,
+                            he_time: 1000,
+                        },
+                        tip_anchor: LedgerAnchorV1 {
+                            ledger_id: test_hash(0x20),
+                            event_hash: test_hash(0x22),
+                            height: 105,
+                            he_time: 1050,
+                        },
+                        ledger_keyset_digest: test_hash(0x23),
+                        root_trust_bundle_digest: test_hash(0x24),
+                    })
+                }
+            }
+
+            struct PassingPolicyResolver;
+            impl PolicyRootResolver for PassingPolicyResolver {
+                fn resolve(
+                    &self,
+                    _as_of: &LedgerAnchorV1,
+                ) -> Result<PolicyRootStateV1, PolicyError> {
+                    Ok(PolicyRootStateV1 {
+                        policy_root_digest: test_hash(0x30),
+                        policy_root_epoch: 5,
+                        anchor: LedgerAnchorV1 {
+                            ledger_id: test_hash(0x20),
+                            event_hash: test_hash(0x21),
+                            height: 100,
+                            he_time: 1000,
+                        },
+                        provenance:
+                            crate::admission_kernel::prerequisites::GovernanceProvenanceV1 {
+                                signer_key_id: test_hash(0x31),
+                                algorithm_id: "ed25519".to_string(),
+                            },
+                    })
+                }
+            }
+
+            struct FailingCommitAntiRollback;
+            impl AntiRollbackAnchor for FailingCommitAntiRollback {
+                fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError> {
+                    Ok(ExternalAnchorStateV1 {
+                        anchor: LedgerAnchorV1 {
+                            ledger_id: test_hash(0x20),
+                            event_hash: test_hash(0x21),
+                            height: 100,
+                            he_time: 1000,
+                        },
+                        mechanism_id: "test".to_string(),
+                        proof_hash: test_hash(0x40),
+                    })
+                }
+
+                fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+                    Ok(())
+                }
+
+                fn commit(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+                    Err(TrustError::ExternalAnchorUnavailable {
+                        reason: "simulated external anchor finalize outage".to_string(),
+                    })
+                }
+            }
+
+            struct PassingQuarantineGuard;
+            impl QuarantineGuard for PassingQuarantineGuard {
+                fn reserve(
+                    &self,
+                    _session_id: &str,
+                    _request_id: &Hash,
+                    _ajc_id: &Hash,
+                ) -> Result<Hash, String> {
+                    Ok(test_hash(0x70))
+                }
+            }
+
+            let pcac_kernel: Arc<dyn AuthorityJoinKernel> = Arc::new(PassingPcacKernel);
+            let witness_cfg = crate::admission_kernel::WitnessProviderConfig {
+                provider_id: "test-provider/finalize-failure".to_string(),
+                provider_build_digest: *blake3::hash(b"finalize-failure-build").as_bytes(),
+            };
+            Arc::new(
+                crate::admission_kernel::AdmissionKernelV1::new(pcac_kernel, witness_cfg)
+                    .with_ledger_verifier(Arc::new(PassingLedgerVerifier))
+                    .with_policy_resolver(Arc::new(PassingPolicyResolver))
+                    .with_anti_rollback(Arc::new(FailingCommitAntiRollback))
+                    .with_quarantine_guard(Arc::new(PassingQuarantineGuard)),
+            )
+        }
+
         /// **No-bypass test (REQ-0025, EVID-0020)**:
         ///
         /// In authoritative mode (ledger configured), when the
@@ -25018,6 +25413,178 @@ mod tests {
                 other => panic!(
                     "Expected SessionErrorToolNotAllowed for PublishEvidence without kernel, got: {other:?}"
                 ),
+            }
+        }
+
+        /// **TCK-00502 MAJOR-1**: `EmitEvent` must fail-safe when post-effect
+        /// anti-rollback finalization fails for fail-closed tiers.
+        #[test]
+        fn emit_event_fail_closed_finalize_failure_returns_error_and_opens_circuit() {
+            use crate::htf::{ClockConfig, HolonicClock};
+
+            let minter = test_minter();
+            let ledger = Arc::new(StubLedgerEventEmitter::new());
+            super::tck_00494_admission_kernel_guard::emit_signed_policy_root_event(
+                &ledger,
+                super::tck_00494_admission_kernel_guard::test_hash(0xA1),
+            );
+            let ledger_dyn: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
+                Arc::clone(&ledger) as _;
+
+            let session_registry = Arc::new(InMemorySessionRegistry::new());
+            let session_registry_dyn = register_session(&session_registry, "session-001");
+            let kernel =
+                super::tck_00494_admission_kernel_guard::build_kernel_with_failing_finalize();
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None)
+                    .expect("test clock should initialize"),
+            );
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_ledger(ledger_dyn)
+                .with_session_registry(session_registry_dyn)
+                .with_admission_kernel(kernel)
+                .with_clock(clock);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = EmitEventRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                event_type: "user.test_event".to_string(),
+                payload: b"test-payload".to_vec(),
+                correlation_id: "corr-finalize-fail-emit-1".to_string(),
+            };
+            let frame = encode_emit_event_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(err.code, SessionErrorCode::SessionErrorInternal as i32);
+                    assert!(
+                        err.message
+                            .contains("anti-rollback anchor finalization failed for emit_event"),
+                        "expected finalize failure error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected fail-safe error response, got: {other:?}"),
+            }
+
+            let events = ledger.get_events_by_work_id("session-001");
+            assert!(
+                events
+                    .iter()
+                    .all(|e| e.event_type != "post_effect_outcome_index_emit_event"),
+                "outcome index must not persist when finalize fails in fail-closed mode"
+            );
+
+            let second_request = EmitEventRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                event_type: "user.test_event".to_string(),
+                payload: b"test-payload-2".to_vec(),
+                correlation_id: "corr-finalize-fail-emit-2".to_string(),
+            };
+            let second_response = dispatcher
+                .dispatch(&encode_emit_event_request(&second_request), &ctx)
+                .unwrap();
+            match second_response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(err.code, SessionErrorCode::SessionErrorInternal as i32);
+                    assert!(
+                        err.message.contains("fail-closed effects suspended"),
+                        "circuit-break response should report suspended fail-closed effects: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected circuit-break error response, got: {other:?}"),
+            }
+        }
+
+        /// **TCK-00502 MAJOR-1**: `PublishEvidence` must fail-safe when
+        /// post-effect anti-rollback finalization fails for fail-closed tiers.
+        #[test]
+        fn publish_evidence_fail_closed_finalize_failure_returns_error_and_opens_circuit() {
+            use crate::htf::{ClockConfig, HolonicClock};
+
+            let minter = test_minter();
+            let ledger = Arc::new(StubLedgerEventEmitter::new());
+            super::tck_00494_admission_kernel_guard::emit_signed_policy_root_event(
+                &ledger,
+                super::tck_00494_admission_kernel_guard::test_hash(0xA2),
+            );
+            let ledger_dyn: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
+                Arc::clone(&ledger) as _;
+            let cas: Arc<dyn crate::episode::executor::ContentAddressedStore> =
+                Arc::new(StubContentAddressedStore::new());
+
+            let session_registry = Arc::new(InMemorySessionRegistry::new());
+            let session_registry_dyn = register_session(&session_registry, "session-001");
+            let kernel =
+                super::tck_00494_admission_kernel_guard::build_kernel_with_failing_finalize();
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None)
+                    .expect("test clock should initialize"),
+            );
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_ledger(ledger_dyn)
+                .with_cas(cas)
+                .with_session_registry(session_registry_dyn)
+                .with_admission_kernel(kernel)
+                .with_clock(clock);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = PublishEvidenceRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                artifact: b"test-artifact-data".to_vec(),
+                kind: 0,
+                retention_hint: 0,
+            };
+            let frame = encode_publish_evidence_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(err.code, SessionErrorCode::SessionErrorInternal as i32);
+                    assert!(
+                        err.message.contains(
+                            "anti-rollback anchor finalization failed for publish_evidence"
+                        ),
+                        "expected finalize failure error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected fail-safe error response, got: {other:?}"),
+            }
+
+            let events = ledger.get_events_by_work_id("session-001");
+            assert!(
+                events
+                    .iter()
+                    .all(|e| e.event_type != "post_effect_outcome_index_publish_evidence"),
+                "outcome index must not persist when finalize fails in fail-closed mode"
+            );
+
+            let second_request = PublishEvidenceRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                artifact: b"test-artifact-data-2".to_vec(),
+                kind: 0,
+                retention_hint: 0,
+            };
+            let second_response = dispatcher
+                .dispatch(&encode_publish_evidence_request(&second_request), &ctx)
+                .unwrap();
+            match second_response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(err.code, SessionErrorCode::SessionErrorInternal as i32);
+                    assert!(
+                        err.message.contains("fail-closed effects suspended"),
+                        "circuit-break response should report suspended fail-closed effects: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected circuit-break error response, got: {other:?}"),
             }
         }
 

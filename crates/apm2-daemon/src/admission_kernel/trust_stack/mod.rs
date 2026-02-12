@@ -1363,6 +1363,9 @@ struct PersistedAnchorStateV1 {
 /// - If the persisted state cannot be read (file missing, corrupt, schema
 ///   mismatch), `latest()` and `verify_committed()` return
 ///   `TrustError::ExternalAnchorUnavailable`.
+/// - If no anchor has ever been committed (fresh-install bootstrap), `latest()`
+///   and `verify_committed()` return
+///   `TrustError::ExternalAnchorNotInitialized`.
 /// - If the requested anchor regresses relative to persisted state,
 ///   `verify_committed()` returns `TrustError::ExternalAnchorMismatch`.
 /// - If the anchor height matches but the event hash differs (fork),
@@ -1657,6 +1660,23 @@ impl DurableAntiRollbackAnchor {
                 )),
             })?;
 
+        // Durability: fsync parent directory so the rename itself is durable.
+        if let Some(parent_dir) = path.parent() {
+            let dir =
+                std::fs::File::open(parent_dir).map_err(|e| TrustError::IntegrityFailure {
+                    reason: truncate_reason(&format!(
+                        "failed to open parent directory {} for fsync: {e}",
+                        parent_dir.display()
+                    )),
+                })?;
+            dir.sync_all().map_err(|e| TrustError::IntegrityFailure {
+                reason: truncate_reason(&format!(
+                    "failed to fsync parent directory {}: {e}",
+                    parent_dir.display()
+                )),
+            })?;
+        }
+
         Ok(())
     }
 
@@ -1722,11 +1742,7 @@ impl super::prerequisites::AntiRollbackAnchor for DurableAntiRollbackAnchor {
             })?;
 
         guard.as_ref().map_or_else(
-            || {
-                Err(TrustError::ExternalAnchorUnavailable {
-                    reason: "no external anchor has been committed yet".into(),
-                })
-            },
+            || Err(TrustError::ExternalAnchorNotInitialized),
             |state| {
                 Ok(super::prerequisites::ExternalAnchorStateV1 {
                     anchor: state.anchor.clone(),
@@ -1747,9 +1763,7 @@ impl super::prerequisites::AntiRollbackAnchor for DurableAntiRollbackAnchor {
 
         let current = guard
             .as_ref()
-            .ok_or_else(|| TrustError::ExternalAnchorUnavailable {
-                reason: "no external anchor committed; cannot verify".into(),
-            })?;
+            .ok_or(TrustError::ExternalAnchorNotInitialized)?;
 
         // Verify the requested anchor is consistent with (not regressed from)
         // the externally committed state. The committed anchor represents the
@@ -1888,9 +1902,7 @@ impl super::prerequisites::AntiRollbackAnchor for InMemoryAntiRollbackAnchor {
                     proof_hash: *proof_hash,
                 })
             },
-            None => Err(TrustError::ExternalAnchorUnavailable {
-                reason: "no external anchor committed (in-memory provider)".into(),
-            }),
+            None => Err(TrustError::ExternalAnchorNotInitialized),
         }
     }
 
@@ -1902,13 +1914,9 @@ impl super::prerequisites::AntiRollbackAnchor for InMemoryAntiRollbackAnchor {
                 reason: "anti-rollback state lock poisoned".into(),
             })?;
 
-        let (current_anchor, _, _) =
-            guard
-                .as_ref()
-                .ok_or_else(|| TrustError::ExternalAnchorUnavailable {
-                    reason: "no external anchor committed; cannot verify (in-memory provider)"
-                        .into(),
-                })?;
+        let (current_anchor, _, _) = guard
+            .as_ref()
+            .ok_or(TrustError::ExternalAnchorNotInitialized)?;
 
         if anchor.height < current_anchor.height {
             return Err(TrustError::ExternalAnchorMismatch {

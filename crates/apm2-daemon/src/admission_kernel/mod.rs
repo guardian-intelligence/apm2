@@ -986,7 +986,7 @@ impl AdmissionKernelV1 {
     /// Verify anti-rollback anchor.
     ///
     /// For fail-closed tiers: missing or errored anchor produces denial,
-    /// except for `ExternalAnchorUnavailable` which is tolerated as the
+    /// except for `ExternalAnchorNotInitialized` which is tolerated as the
     /// bootstrap path (no prior anchor exists on fresh install).
     ///
     /// For monitor tiers: missing anchor is allowed (warning only).
@@ -1000,7 +1000,7 @@ impl AdmissionKernelV1 {
             Some(ar) => {
                 match ar.verify_committed(anchor) {
                     Ok(()) => Ok(()),
-                    Err(TrustError::ExternalAnchorUnavailable { .. }) => {
+                    Err(TrustError::ExternalAnchorNotInitialized) => {
                         // Bootstrap path: on fresh install, no anchor has been
                         // committed yet. The first execute() will establish the
                         // initial anchor state via finalize_anti_rollback().

@@ -4178,8 +4178,8 @@ fn test_tck_00502_in_memory_anchor_latest_before_commit() {
         "latest() before any commit must return error"
     );
     match result.unwrap_err() {
-        TrustError::ExternalAnchorUnavailable { .. } => {},
-        other => panic!("expected ExternalAnchorUnavailable, got {other:?}"),
+        TrustError::ExternalAnchorNotInitialized => {},
+        other => panic!("expected ExternalAnchorNotInitialized, got {other:?}"),
     }
 }
 
@@ -4676,20 +4676,11 @@ fn test_tck_00502_fail_closed_denies_on_anchor_mismatch() {
     }
 }
 
-/// Verifies that `ExternalAnchorUnavailable` from `verify_committed()` is
-/// tolerated during `plan()` (bootstrap path), but the failure surfaces later
-/// when `finalize_anti_rollback()` attempts to commit and the anchor
-/// provider reports an error.
-///
-/// With the BLOCKER-1 fix, `ExternalAnchorUnavailable` is no longer a
-/// plan-time denial — it represents the bootstrap case where no prior
-/// state exists to protect. The anti-rollback invariant is enforced
-/// at finalize time via `commit()`.
+/// Verifies that operational external-anchor unavailability denies fail-closed
+/// `plan()` attempts.
 #[test]
 fn test_tck_00502_fail_closed_denies_on_anchor_unavailable() {
-    // Anti-rollback anchor that is unavailable: verify_committed returns
-    // ExternalAnchorUnavailable (tolerated by bootstrap path), but commit()
-    // also fails (simulating persistent external service failure).
+    // Anti-rollback anchor that is unavailable due to service outage.
     struct UnavailableAntiRollback;
 
     impl AntiRollbackAnchor for UnavailableAntiRollback {
@@ -4719,35 +4710,54 @@ fn test_tck_00502_fail_closed_denies_on_anchor_unavailable() {
         .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
 
     let request = valid_request(RiskTier::Tier2Plus);
-
-    // plan() now succeeds (bootstrap path: ExternalAnchorUnavailable tolerated).
-    let mut plan = kernel
-        .plan(&request)
-        .expect("plan must succeed (bootstrap path tolerates unavailable)");
-
-    // execute() succeeds (no anchor commit inside execute).
-    let result = kernel
-        .execute(&mut plan, test_hash(0xE0), test_hash(0xE1))
-        .expect("execute must succeed");
-
-    // finalize_anti_rollback() fails because commit() returns error.
-    let finalize_result = kernel.finalize_anti_rollback(
-        result.boundary_span.enforcement_tier,
-        &result.bundle.ledger_anchor,
-    );
+    let result = kernel.plan(&request);
     assert!(
-        finalize_result.is_err(),
-        "finalize_anti_rollback must fail when external service is down"
+        result.is_err(),
+        "fail-closed tier must deny when external anchor is unavailable"
     );
-    match finalize_result.unwrap_err() {
+    match result.unwrap_err() {
         AdmitError::AntiRollbackFailure { reason } => {
             assert!(
                 reason.contains("unavailable") || reason.contains("down"),
-                "error should describe unavailability: {reason}"
+                "error should describe unavailability: {reason}",
             );
         },
         other => panic!("expected AntiRollbackFailure, got {other:?}"),
     }
+}
+
+/// Verifies that the explicit bootstrap signal
+/// `ExternalAnchorNotInitialized` is tolerated for fail-closed `plan()`.
+#[test]
+fn test_tck_00502_fail_closed_bootstrap_tolerates_not_initialized_anchor() {
+    struct NotInitializedAntiRollback;
+
+    impl AntiRollbackAnchor for NotInitializedAntiRollback {
+        fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError> {
+            Err(TrustError::ExternalAnchorNotInitialized)
+        }
+
+        fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            Err(TrustError::ExternalAnchorNotInitialized)
+        }
+
+        fn commit(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+            Ok(())
+        }
+    }
+
+    let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
+        .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
+        .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
+        .with_anti_rollback(Arc::new(NotInitializedAntiRollback))
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+
+    let request = valid_request(RiskTier::Tier2Plus);
+    let result = kernel.plan(&request);
+    assert!(
+        result.is_ok(),
+        "fail-closed bootstrap path must tolerate ExternalAnchorNotInitialized",
+    );
 }
 
 #[test]
@@ -5009,13 +5019,13 @@ fn test_tck_00502_execute_does_not_commit_anchor_for_monitor_tier() {
 }
 
 /// Verifies the fresh-install bootstrap path: `plan()` succeeds even when no
-/// anchor has been committed yet (`ExternalAnchorUnavailable` is tolerated),
+/// anchor has been committed yet (`ExternalAnchorNotInitialized` is tolerated),
 /// then `execute()` + `finalize_anti_rollback()` establishes the initial state.
 /// A subsequent `plan()` call also succeeds (anchor now bootstrapped).
 ///
 /// This is the BLOCKER-1 fix test: the circular dependency between `plan()`
 /// requiring a committed anchor and `execute()` being the first to commit
-/// is broken by tolerating `ExternalAnchorUnavailable` during `plan()`.
+/// is broken by tolerating `ExternalAnchorNotInitialized` during `plan()`.
 #[test]
 fn test_tck_00502_fresh_install_bootstrap_without_preseeding() {
     use super::prerequisites::AntiRollbackAnchor;
@@ -5025,11 +5035,11 @@ fn test_tck_00502_fresh_install_bootstrap_without_preseeding() {
         "test_mechanism".to_string(),
     ));
 
-    // Confirm anchor is initially unavailable.
-    assert!(
-        anti_rollback.latest().is_err(),
-        "anchor must be unavailable before first commit (fresh install)"
-    );
+    // Confirm anchor is initially not initialized.
+    match anti_rollback.latest() {
+        Err(TrustError::ExternalAnchorNotInitialized) => {},
+        other => panic!("expected ExternalAnchorNotInitialized, got {other:?}"),
+    }
 
     let kernel = AdmissionKernelV1::new(Arc::new(MockPcacKernel::passing()), witness_provider())
         .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
@@ -5049,10 +5059,10 @@ fn test_tck_00502_fresh_install_bootstrap_without_preseeding() {
         .expect("execute must succeed on fresh install");
 
     // Anchor is still NOT committed after execute() (BLOCKER-2 fix).
-    assert!(
-        anti_rollback.latest().is_err(),
-        "anchor must NOT be committed by execute() (pre-commit hazard guard)"
-    );
+    match anti_rollback.latest() {
+        Err(TrustError::ExternalAnchorNotInitialized) => {},
+        other => panic!("expected ExternalAnchorNotInitialized before finalize, got {other:?}"),
+    }
 
     // Finalize: simulate post-effect success.
     kernel
@@ -5273,9 +5283,7 @@ fn test_tck_00502_finalize_noop_for_monitor_tier_all_handler_paths() {
     impl AntiRollbackAnchor for CommitCountingAnchor {
         fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
             // Allow verification to pass (bootstrap tolerance).
-            Err(TrustError::ExternalAnchorUnavailable {
-                reason: "no external anchor committed (test counting anchor)".into(),
-            })
+            Err(TrustError::ExternalAnchorNotInitialized)
         }
 
         fn commit(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
@@ -5284,9 +5292,7 @@ fn test_tck_00502_finalize_noop_for_monitor_tier_all_handler_paths() {
         }
 
         fn latest(&self) -> Result<ExternalAnchorStateV1, TrustError> {
-            Err(TrustError::ExternalAnchorUnavailable {
-                reason: "no external anchor committed (test counting anchor)".into(),
-            })
+            Err(TrustError::ExternalAnchorNotInitialized)
         }
     }
 
