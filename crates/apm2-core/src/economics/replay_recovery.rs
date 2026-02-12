@@ -793,6 +793,7 @@ pub struct BacklogState {
 ///
 /// Provides auditable structured evidence for why an admission was denied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayRecoveryDenyDefect {
     /// Stable deny reason code.
     #[serde(deserialize_with = "deser_deny_reason")]
@@ -887,11 +888,12 @@ pub fn validate_replay_convergence_tp004(
             .verify_signature()
             .map_err(|_| DENY_REPLAY_RECEIPT_SIGNATURE_INVALID)?;
 
-        // Verify signer is in trusted set (constant-time).
-        if !trusted_signers
-            .iter()
-            .any(|ts| ts.ct_eq(&receipt.signer_key).unwrap_u8() == 1)
-        {
+        // Verify signer is in trusted set (non-short-circuiting constant-time
+        // fold to prevent timing side-channel leaking signer position).
+        let signer_trusted = trusted_signers.iter().fold(0u8, |acc, ts| {
+            acc | ts.ct_eq(&receipt.signer_key).unwrap_u8()
+        });
+        if signer_trusted == 0 {
             return Err(DENY_REPLAY_RECEIPT_SIGNER_UNTRUSTED);
         }
 
@@ -1064,6 +1066,7 @@ pub enum ReplayRecoveryVerdict {
 
 /// Decision from a replay-recovery admission evaluation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayRecoveryDecision {
     /// Verdict of the admission evaluation.
     pub verdict: ReplayRecoveryVerdict,
@@ -1336,12 +1339,12 @@ pub fn validate_recovery_admissibility(
             .verify_signature()
             .map_err(|_| DENY_RECOVERY_RECEIPT_SIGNATURE_INVALID)?;
 
-        // Verify signer is in trusted set (constant-time).
-        if !input
-            .trusted_signers
-            .iter()
-            .any(|ts| ts.ct_eq(&receipt.signer_key).unwrap_u8() == 1)
-        {
+        // Verify signer is in trusted set (non-short-circuiting constant-time
+        // fold to prevent timing side-channel leaking signer position).
+        let signer_trusted = input.trusted_signers.iter().fold(0u8, |acc, ts| {
+            acc | ts.ct_eq(&receipt.signer_key).unwrap_u8()
+        });
+        if signer_trusted == 0 {
             return Err(DENY_RECOVERY_RECEIPT_SIGNER_UNTRUSTED);
         }
 
@@ -3095,5 +3098,71 @@ mod tests {
         assert_eq!(decision.verdict, ReplayRecoveryVerdict::Deny);
         let defect = decision.defect.as_ref().unwrap();
         assert_eq!(defect.predicate_id, TemporalPredicateId::TpEio29009);
+    }
+
+    // ========================================================================
+    // deny_unknown_fields tests
+    // ========================================================================
+
+    #[test]
+    fn deny_defect_rejects_unknown_field() {
+        let json = r#"{
+            "reason": "test_deny_reason",
+            "predicate_id": "TP-EIO29-004",
+            "boundary_id": "boundary-1",
+            "denied_at_tick": 100,
+            "envelope_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "window_ref": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "injected_field": "malicious"
+        }"#;
+        let result = serde_json::from_str::<ReplayRecoveryDenyDefect>(json);
+        assert!(result.is_err(), "must reject unknown field in deny defect");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field"),
+            "error should mention unknown field: {err}",
+        );
+    }
+
+    #[test]
+    fn deny_defect_accepts_known_fields() {
+        let json = r#"{
+            "reason": "test_deny_reason",
+            "predicate_id": "TP-EIO29-004",
+            "boundary_id": "boundary-1",
+            "denied_at_tick": 100,
+            "envelope_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "window_ref": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+        }"#;
+        let result = serde_json::from_str::<ReplayRecoveryDenyDefect>(json);
+        assert!(result.is_ok(), "must accept valid deny defect: {result:?}");
+    }
+
+    #[test]
+    fn decision_rejects_unknown_field() {
+        let json = r#"{
+            "verdict": "allow",
+            "defect": null,
+            "predicate_results": [],
+            "injected_field": "malicious"
+        }"#;
+        let result = serde_json::from_str::<ReplayRecoveryDecision>(json);
+        assert!(result.is_err(), "must reject unknown field in decision");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field"),
+            "error should mention unknown field: {err}",
+        );
+    }
+
+    #[test]
+    fn decision_accepts_known_fields() {
+        let json = r#"{
+            "verdict": "allow",
+            "defect": null,
+            "predicate_results": []
+        }"#;
+        let result = serde_json::from_str::<ReplayRecoveryDecision>(json);
+        assert!(result.is_ok(), "must accept valid decision: {result:?}");
     }
 }
