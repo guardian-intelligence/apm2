@@ -226,7 +226,7 @@ pub fn run_decision_set(
             eprintln!("WARNING: failed to clean prepared review inputs: {err}");
         }
     }
-    terminate_review_agent(resolved_pr, normalized_dimension);
+    let _ = terminate_review_agent(resolved_pr, normalized_dimension, &head_sha);
     Ok(exit_codes::SUCCESS)
 }
 
@@ -716,22 +716,43 @@ fn dimension_to_state_review_type(dimension: &str) -> &str {
     }
 }
 
-fn terminate_review_agent(pr_number: u32, dimension: &str) {
+fn terminate_review_agent(pr_number: u32, dimension: &str, reviewed_sha: &str) -> Option<String> {
     let review_type = dimension_to_state_review_type(dimension);
     let Ok(Some(state)) = super::state::load_review_run_state_strict(pr_number, review_type) else {
-        return;
+        return None;
     };
-    let Some(pid) = state.pid else { return };
+    if !state.head_sha.eq_ignore_ascii_case(reviewed_sha) {
+        let warning = format!(
+            "WARNING: skipping agent termination: reviewed sha {reviewed_sha} does not match state sha {}",
+            state.head_sha
+        );
+        eprintln!("{warning}");
+        return Some(warning);
+    }
+    let Some(pid) = state.pid else {
+        let warning = format!(
+            "WARNING: skipping agent termination: no pid on active state for PR #{pr_number}"
+        );
+        eprintln!("{warning}");
+        return Some(warning);
+    };
+    let Some(recorded_proc_start) = state.proc_start_time else {
+        let warning =
+            format!("WARNING: skipping agent termination: missing proc_start_time for pid {pid}");
+        eprintln!("{warning}");
+        return Some(warning);
+    };
     if !super::state::is_process_alive(pid) {
-        return;
+        return None;
     }
     // Verify process identity to avoid killing a reused PID.
-    if let Some(recorded) = state.proc_start_time {
-        let observed = super::state::get_process_start_time(pid);
-        if observed != Some(recorded) {
-            eprintln!("WARNING: skipping agent termination: pid {pid} identity mismatch");
-            return;
-        }
+    let observed_start = super::state::get_process_start_time(pid);
+    if observed_start != Some(recorded_proc_start) {
+        let warning = format!(
+            "WARNING: skipping agent termination: pid {pid} identity mismatch observed={observed_start:?} expected={recorded_proc_start}"
+        );
+        eprintln!("{warning}");
+        return Some(warning);
     }
     // SIGTERM → wait → SIGKILL
     let _ = std::process::Command::new("kill")
@@ -741,7 +762,7 @@ fn terminate_review_agent(pr_number: u32, dimension: &str) {
     while std::time::Instant::now() < deadline {
         if !super::state::is_process_alive(pid) {
             eprintln!("INFO: terminated review agent pid={pid} after decision set");
-            return;
+            return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -749,11 +770,14 @@ fn terminate_review_agent(pr_number: u32, dimension: &str) {
         .args(["-KILL", &pid.to_string()])
         .status();
     eprintln!("WARNING: sent SIGKILL to review agent pid={pid}");
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{
         CODE_QUALITY_DIMENSION, DECISION_SCHEMA, DecisionComment, DecisionEntry,
@@ -761,6 +785,41 @@ mod tests {
         normalize_decision_value, normalize_dimension, parse_decision_comments_for_author,
         render_decision_comment_body, signature_for_payload,
     };
+    use crate::commands::fac_review::state;
+    use crate::commands::fac_review::types::{ReviewRunState, ReviewRunStatus, apm2_home_dir};
+
+    static TEST_PR_COUNTER: AtomicU32 = AtomicU32::new(441_000);
+
+    fn next_test_pr() -> u32 {
+        TEST_PR_COUNTER.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn sample_run_state(
+        pr_number: u32,
+        pid: u32,
+        head_sha: &str,
+        proc_start_time: Option<u64>,
+    ) -> ReviewRunState {
+        ReviewRunState {
+            run_id: "pr441-security-s1-01234567".to_string(),
+            pr_url: "https://github.com/example/repo/pull/441".to_string(),
+            pr_number,
+            head_sha: head_sha.to_string(),
+            review_type: "security".to_string(),
+            reviewer_role: "fac_reviewer".to_string(),
+            started_at: "2026-02-10T00:00:00Z".to_string(),
+            status: ReviewRunStatus::Alive,
+            terminal_reason: None,
+            model_id: Some("gpt-5.3-codex".to_string()),
+            backend_id: Some("codex".to_string()),
+            restart_count: 0,
+            sequence_number: 1,
+            previous_run_id: None,
+            previous_head_sha: None,
+            pid: Some(pid),
+            proc_start_time,
+        }
+    }
 
     #[test]
     fn test_normalize_dimension_aliases() {
@@ -894,5 +953,95 @@ dimensions:
         let parsed = parse_decision_comments_for_author(&[trusted, spoofed], Some("fac-bot"));
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].comment.id, 1);
+    }
+
+    #[test]
+    fn test_terminate_review_agent_skips_when_sha_mismatch() {
+        let pr_number = next_test_pr();
+        let home = apm2_home_dir().expect("apm2 home");
+        let state_path = state::review_run_state_path_for_home(&home, pr_number, "security");
+
+        let mut child = Command::new("sleep")
+            .arg("1000")
+            .spawn()
+            .expect("spawn review process");
+        let pid = child.id();
+        let proc_start_time =
+            state::get_process_start_time(pid).expect("start time should be available");
+        let state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
+        state::write_review_run_state_for_home(&home, &state).expect("write run state");
+
+        let warning = super::terminate_review_agent(pr_number, "security", "1234567890abcdef")
+            .expect("warning expected");
+        assert!(
+            warning.contains("does not match"),
+            "unexpected warning: {warning}"
+        );
+        assert!(state::is_process_alive(pid));
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_terminate_review_agent_skips_when_proc_start_time_missing() {
+        let pr_number = next_test_pr();
+        let home = apm2_home_dir().expect("apm2 home");
+        let state_path = state::review_run_state_path_for_home(&home, pr_number, "security");
+
+        let mut child = Command::new("sleep")
+            .arg("1000")
+            .spawn()
+            .expect("spawn review process");
+        let pid = child.id();
+        let state = sample_run_state(pr_number, pid, "abcdef1234567890", None);
+        state::write_review_run_state_for_home(&home, &state).expect("write run state");
+
+        let warning = super::terminate_review_agent(pr_number, "security", "abcdef1234567890")
+            .expect("warning expected");
+        assert!(
+            warning.contains("missing proc_start_time"),
+            "unexpected warning: {warning}"
+        );
+        assert!(state::is_process_alive(pid));
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_terminate_review_agent_skips_when_proc_start_time_mismatched() {
+        let pr_number = next_test_pr();
+        let home = apm2_home_dir().expect("apm2 home");
+        let state_path = state::review_run_state_path_for_home(&home, pr_number, "security");
+
+        let mut child = Command::new("sleep")
+            .arg("1000")
+            .spawn()
+            .expect("spawn review process");
+        let pid = child.id();
+        let proc_start_time =
+            state::get_process_start_time(pid).expect("start time should be available");
+        let state = sample_run_state(
+            pr_number,
+            pid,
+            "abcdef1234567890",
+            Some(proc_start_time + 1),
+        );
+        state::write_review_run_state_for_home(&home, &state).expect("write run state");
+
+        let warning = super::terminate_review_agent(pr_number, "security", "abcdef1234567890")
+            .expect("warning expected");
+        assert!(
+            warning.contains("identity mismatch"),
+            "unexpected warning: {warning}"
+        );
+        assert!(state::is_process_alive(pid));
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(state_path);
     }
 }

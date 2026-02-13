@@ -961,14 +961,25 @@ fn run_terminate_inner(
     if let Some(pid) = run_state.pid {
         if state::is_process_alive(pid) {
             // Verify process identity to avoid killing a reused PID.
-            if let Some(recorded) = run_state.proc_start_time {
-                let observed = state::get_process_start_time(pid);
-                if observed != Some(recorded) {
-                    return Err(format!(
-                        "pid {pid} identity mismatch: recorded start_time={recorded}, \
-                         observed={observed:?} — refusing to terminate"
-                    ));
-                }
+            let recorded = run_state.proc_start_time.ok_or_else(|| {
+                let message =
+                    format!("WARNING: skipping termination: missing proc_start_time for pid={pid}");
+                eprintln!("{message}");
+                message
+            })?;
+            let observed = state::get_process_start_time(pid).ok_or_else(|| {
+                let message = format!(
+                    "WARNING: skipping termination: unable to read /proc/{pid} process start_time"
+                );
+                eprintln!("{message}");
+                message
+            })?;
+            if observed != recorded {
+                let message = format!(
+                    "WARNING: skipping termination: pid {pid} identity mismatch: recorded={recorded}, observed={observed}"
+                );
+                eprintln!("{message}");
+                return Err(message);
             }
             // SIGTERM → wait → SIGKILL
             let _ = std::process::Command::new("kill")
@@ -1456,6 +1467,8 @@ fn run_tail_inner(lines: usize, follow: bool) -> Result<(), String> {
 mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use chrono::Utc;
 
@@ -1477,12 +1490,58 @@ mod tests {
     use super::state::{read_last_lines, read_pulse_file_from_path, write_pulse_file_to_path};
     use super::types::{
         EVENT_ROTATE_BYTES, FacEventContext, ProjectionStatus, ReviewBackend, ReviewKind,
-        ReviewRunStatus, ReviewStateEntry, ReviewStateFile, default_model, default_review_type,
-        now_iso8601_millis,
+        ReviewRunState, ReviewRunStatus, ReviewStateEntry, ReviewStateFile, default_model,
+        default_review_type, now_iso8601_millis,
     };
     use super::{
         review_types_all_terminal, review_types_terminal_done, review_types_terminal_failed,
     };
+    use crate::commands::fac_review::types::apm2_home_dir;
+
+    static TEST_PR_COUNTER: AtomicU32 = AtomicU32::new(441_000);
+
+    fn next_test_pr() -> u32 {
+        TEST_PR_COUNTER.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn sample_run_state(
+        pr_number: u32,
+        pid: u32,
+        head_sha: &str,
+        proc_start_time: Option<u64>,
+    ) -> ReviewRunState {
+        ReviewRunState {
+            run_id: "pr441-security-s1-01234567".to_string(),
+            pr_url: "https://github.com/example/repo/pull/441".to_string(),
+            pr_number,
+            head_sha: head_sha.to_string(),
+            review_type: "security".to_string(),
+            reviewer_role: "fac_reviewer".to_string(),
+            started_at: "2026-02-10T00:00:00Z".to_string(),
+            status: ReviewRunStatus::Alive,
+            terminal_reason: None,
+            model_id: Some("gpt-5.3-codex".to_string()),
+            backend_id: Some("codex".to_string()),
+            restart_count: 0,
+            sequence_number: 1,
+            previous_run_id: None,
+            previous_head_sha: None,
+            pid: Some(pid),
+            proc_start_time,
+        }
+    }
+
+    fn spawn_persistent_process() -> std::process::Child {
+        Command::new("sleep")
+            .arg("1000")
+            .spawn()
+            .expect("spawn persistent process")
+    }
+
+    fn kill_child(mut child: std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     fn dead_pid_for_test() -> u32 {
         let mut child = std::process::Command::new("sh")
@@ -1761,6 +1820,51 @@ mod tests {
         .to_string();
         std::fs::write(&path, line).expect("write source-dump denied marker log");
         assert!(!detect_comment_permission_denied(&path));
+    }
+
+    #[test]
+    fn test_run_terminate_inner_skips_when_proc_start_time_missing() {
+        let pr_number = next_test_pr();
+        let home = apm2_home_dir().expect("apm2 home");
+        let state_path = super::state::review_run_state_path_for_home(&home, pr_number, "security");
+
+        let child = spawn_persistent_process();
+        let pid = child.id();
+        let state = sample_run_state(pr_number, pid, "abcdef1234567890", None);
+        super::state::write_review_run_state_for_home(&home, &state).expect("write run state");
+
+        let result =
+            super::run_terminate_inner("owner/repo", Some(pr_number), None, "security", false);
+        assert!(result.is_err());
+        let error = result.expect_err("terminate should fail-closed");
+        assert!(error.contains("missing proc_start_time"));
+        assert!(super::state::is_process_alive(pid));
+
+        kill_child(child);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_run_terminate_inner_skips_when_proc_start_time_mismatched() {
+        let pr_number = next_test_pr();
+        let home = apm2_home_dir().expect("apm2 home");
+        let state_path = super::state::review_run_state_path_for_home(&home, pr_number, "security");
+
+        let child = spawn_persistent_process();
+        let pid = child.id();
+        let observed_start = super::state::get_process_start_time(pid).expect("read start time");
+        let state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(observed_start + 1));
+        super::state::write_review_run_state_for_home(&home, &state).expect("write run state");
+
+        let result =
+            super::run_terminate_inner("owner/repo", Some(pr_number), None, "security", false);
+        assert!(result.is_err());
+        let error = result.expect_err("terminate should fail-closed");
+        assert!(error.contains("identity mismatch"));
+        assert!(super::state::is_process_alive(pid));
+
+        kill_child(child);
+        let _ = std::fs::remove_file(state_path);
     }
 
     #[test]
