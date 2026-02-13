@@ -868,7 +868,7 @@ impl DeferredReplayWorker {
 
         let intent_digest = EventHasher::hash_content(&intent.changeset_digest);
         let ledger_anchor = EventHasher::hash_content(intent.intent_id.as_bytes());
-        let freshness_tick = eval_tick.max(1);
+        let issued_at_tick = intent.eval_tick.max(1);
 
         // Preserve original bindings from the buffered intent:
         // - capability_manifest_hash: derived by hashing the changeset_digest. The
@@ -908,15 +908,15 @@ impl DeferredReplayWorker {
                 .stop_budget_profile_digest(stop_budget_profile_digest)
                 .effect_intent_digest(intent_digest)
                 .build(
-                    freshness_tick,
+                    issued_at_tick,
                     time_authority_ref,
                     ledger_anchor,
-                    current_revocation_head,
+                    intent.ledger_head,
                 );
 
         let policy = PcacPolicyKnobs::default();
 
-        self.lifecycle_gate.advance_tick(eval_tick);
+        self.lifecycle_gate.advance_tick(issued_at_tick);
 
         // Join + revalidate: the current_revocation_head is the authoritative
         // system revocation frontier. The lifecycle gate will deny if the

@@ -1,5 +1,6 @@
 //! TCK-00509: End-to-end projection replay economics and lifecycle tests.
 
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use apm2_core::crypto::{EventHasher, Hash, Signer};
@@ -15,8 +16,9 @@ use apm2_daemon::projection::intent_buffer::{IntentBuffer, IntentLifecycleArtifa
 use apm2_daemon::projection::worker::AdmissionTelemetry;
 use apm2_daemon::projection::{
     ContinuityProfileResolver, DENY_REPLAY_ECONOMICS_GATE, DENY_REPLAY_HORIZON_OUT_OF_WINDOW,
-    DENY_REPLAY_LIFECYCLE_GATE, DeferredReplayWorker, DeferredReplayWorkerConfig, IntentVerdict,
-    ProjectionIntent, ReplayCycleResult, ReplayProjectionEffect,
+    DENY_REPLAY_LIFECYCLE_GATE, DENY_REPLAY_PROJECTION_EFFECT, DeferredReplayWorker,
+    DeferredReplayWorkerConfig, IntentVerdict, ProjectionIntent, ReplayCycleResult,
+    ReplayProjectionEffect,
 };
 use rusqlite::Connection;
 
@@ -35,6 +37,14 @@ fn domain_tagged_hash(handler_prefix: &str, hash_type: &str, data: &[&[u8]]) -> 
     hasher.update(tag.as_bytes());
     for chunk in data {
         hasher.update(chunk);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn backlog_digest_from_digests(digests: &[&[u8; 32]]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for digest in digests {
+        hasher.update(*digest);
     }
     *hasher.finalize().as_bytes()
 }
@@ -98,6 +108,7 @@ fn build_authority_join_input(
 enum ResolverMode {
     Allow,
     MissingProfile,
+    MissingSnapshot,
 }
 
 struct TestContinuityResolver {
@@ -150,15 +161,27 @@ impl TestContinuityResolver {
         resolver.mode = ResolverMode::MissingProfile;
         resolver
     }
+
+    fn with_missing_snapshot(signer: &Signer) -> Self {
+        let mut resolver = Self::new(signer);
+        resolver.mode = ResolverMode::MissingSnapshot;
+        resolver
+    }
 }
 
 impl ContinuityProfileResolver for TestContinuityResolver {
     fn resolve_continuity_profile(&self, _sink_id: &str) -> Option<ResolvedContinuityProfile> {
-        (self.mode == ResolverMode::Allow).then_some(self.profile.clone())
+        match self.mode {
+            ResolverMode::Allow => Some(self.profile.clone()),
+            _ => None,
+        }
     }
 
     fn resolve_sink_snapshot(&self, _sink_id: &str) -> Option<MultiSinkIdentitySnapshotV1> {
-        Some(self.snapshot.clone())
+        match self.mode {
+            ResolverMode::Allow => Some(self.snapshot.clone()),
+            ResolverMode::MissingProfile | ResolverMode::MissingSnapshot => None,
+        }
     }
 
     fn resolve_continuity_window(&self, _boundary_id: &str) -> Option<ResolvedContinuityWindow> {
@@ -193,6 +216,14 @@ impl SpyReplayProjectionEffect {
             .len()
     }
 
+    fn set_fail_reason(&self, reason: Option<&str>) {
+        let mut lock = self
+            .fail_reason
+            .lock()
+            .expect("projection fail reason lock should be available");
+        *lock = reason.map(str::to_string);
+    }
+
     fn never_called(&self) -> bool {
         self.calls().is_empty()
     }
@@ -206,6 +237,11 @@ impl ReplayProjectionEffect for SpyReplayProjectionEffect {
         _ledger_head: [u8; 32],
         _status: apm2_daemon::projection::ProjectedStatus,
     ) -> Result<(), String> {
+        self.calls
+            .lock()
+            .expect("projection call log lock should be available")
+            .push(work_id.to_string());
+
         let fail_reason = self
             .fail_reason
             .lock()
@@ -216,11 +252,6 @@ impl ReplayProjectionEffect for SpyReplayProjectionEffect {
             return Err(reason);
         }
 
-        self.calls
-            .lock()
-            .expect("projection call log lock should be available")
-            .push(work_id.to_string());
-
         Ok(())
     }
 }
@@ -228,9 +259,12 @@ impl ReplayProjectionEffect for SpyReplayProjectionEffect {
 struct Harness {
     intent_conn: Arc<Mutex<Connection>>,
     intent_buffer: Arc<IntentBuffer>,
+    resolver: Arc<dyn ContinuityProfileResolver>,
+    gate_signer: Arc<Signer>,
     lifecycle_gate: Arc<LifecycleGate>,
     worker: DeferredReplayWorker,
     effect: Arc<SpyReplayProjectionEffect>,
+    telemetry: Arc<AdmissionTelemetry>,
 }
 
 impl Harness {
@@ -251,6 +285,7 @@ impl Harness {
         let lifecycle_gate = Arc::new(LifecycleGate::with_tick_kernel(kernel, tick_kernel));
         let telemetry = Arc::new(AdmissionTelemetry::new());
         let effect = Arc::new(SpyReplayProjectionEffect::new());
+        let effect_trait: Arc<dyn ReplayProjectionEffect> = effect.clone();
         let config =
             DeferredReplayWorkerConfig::new("test-boundary".to_string(), "test-actor".to_string())
                 .with_batch_size(REPLAY_BATCH_SIZE);
@@ -258,21 +293,41 @@ impl Harness {
         let worker = DeferredReplayWorker::new(
             config,
             Arc::clone(&intent_buffer),
-            resolver,
-            gate_signer,
+            Arc::clone(&resolver),
+            Arc::clone(&gate_signer),
             lifecycle_gate.clone(),
-            telemetry,
-            effect.clone(),
+            telemetry.clone(),
+            effect_trait,
         )
         .expect("deferred replay worker should initialize");
 
         Self {
             intent_conn,
             intent_buffer,
+            resolver,
+            gate_signer,
             lifecycle_gate,
             worker,
             effect,
+            telemetry,
         }
+    }
+
+    fn reset_lifecycle_gate_for_replay(&mut self, kernel_start_tick: u64) {
+        let tick_kernel = Arc::new(InProcessKernel::new(kernel_start_tick));
+        let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> = tick_kernel.clone();
+        self.lifecycle_gate = Arc::new(LifecycleGate::with_tick_kernel(kernel, tick_kernel));
+        let effect: Arc<dyn ReplayProjectionEffect> = self.effect.clone();
+        self.worker = DeferredReplayWorker::new(
+            self.worker.config().clone(),
+            Arc::clone(&self.intent_buffer),
+            Arc::clone(&self.resolver),
+            Arc::clone(&self.gate_signer),
+            Arc::clone(&self.lifecycle_gate),
+            Arc::clone(&self.telemetry),
+            effect,
+        )
+        .expect("replay worker should reinitialize for retry");
     }
 
     fn insert_intent(
@@ -348,6 +403,48 @@ impl Harness {
 
     fn effect_calls(&self) -> Vec<String> {
         self.effect.calls()
+    }
+
+    fn set_effect_fail_reason(&self, reason: Option<&str>) {
+        self.effect.set_fail_reason(reason);
+    }
+
+    fn reset_pending_for_replay(&self, intent_id: &str) {
+        let conn = self
+            .intent_conn
+            .lock()
+            .expect("intent DB lock should be available for state reset");
+        conn.execute(
+            "UPDATE projection_intents
+             SET verdict = 'pending', deny_reason = ''
+             WHERE intent_id = ?1",
+            [intent_id],
+        )
+        .expect("intent should be moved back to pending state");
+
+        conn.execute(
+            "UPDATE deferred_replay_backlog
+             SET converged = 0
+             WHERE intent_id = ?1",
+            [intent_id],
+        )
+        .expect("backlog should be re-armed for retry");
+    }
+
+    fn lifecycle_revoked_count(&self) -> u64 {
+        self.telemetry
+            .lifecycle_revoked_count
+            .load(Ordering::Relaxed)
+    }
+
+    fn lifecycle_stale_count(&self) -> u64 {
+        self.telemetry.lifecycle_stale_count.load(Ordering::Relaxed)
+    }
+
+    fn lifecycle_consumed_count(&self) -> u64 {
+        self.telemetry
+            .lifecycle_consumed_count
+            .load(Ordering::Relaxed)
     }
 
     fn lifecycle_artifacts_direct(&self, intent_id: &str) -> Option<IntentLifecycleArtifacts> {
@@ -478,6 +575,20 @@ impl Harness {
 
         let _ = (consumed_witness, consume_record);
     }
+
+    fn set_backlog_pending(&self, intent_id: &str) {
+        let conn = self
+            .intent_conn
+            .lock()
+            .expect("intent DB lock should be available for backlog mutation");
+        conn.execute(
+            "UPDATE deferred_replay_backlog
+             SET converged = 0
+             WHERE intent_id = ?1",
+            [intent_id],
+        )
+        .expect("backlog entry should be made non-converged for replay attempt");
+    }
 }
 
 fn intent_digest_for_join(intent: &ProjectionIntent) -> Hash {
@@ -498,19 +609,47 @@ fn assert_deny_with_reason(
     harness: &Harness,
     intent_id: &str,
     reason_prefix: &str,
+    reason_substring: Option<&str>,
     result: &ReplayCycleResult,
 ) {
-    harness.assert_no_projection_call();
-    assert!(result.denied_count > 0 || result.expired_count > 0);
     let intent = harness
         .intent(intent_id)
         .expect("intent should still exist after deny path");
+    assert!(
+        result.denied_count > 0 || result.expired_count > 0,
+        "expected at least one denied/expired intent: replayed={replayed}, skipped={skipped}, denied={denied}, expired={expired}, verdict={verdict}, reason={reason}",
+        replayed = result.replayed_count,
+        skipped = result.skipped_count,
+        denied = result.denied_count,
+        expired = result.expired_count,
+        verdict = intent.verdict,
+        reason = intent.deny_reason,
+    );
     assert_eq!(intent.verdict, IntentVerdict::Denied);
     assert!(
         intent.deny_reason.contains(reason_prefix),
         "unexpected deny reason: {}",
         intent.deny_reason
     );
+
+    if let Some(reason_substring) = reason_substring {
+        let reason_lower = intent.deny_reason.to_lowercase();
+        let has_substring = match reason_substring {
+            "revoked" => reason_lower.contains("revoked") || reason_lower.contains("revocation"),
+            "stale" => {
+                reason_lower.contains("stale")
+                    || reason_lower.contains("freshness")
+                    || reason_lower.contains("expired")
+            },
+            "consumed" => reason_lower.contains("consumed"),
+            other => reason_lower.contains(other),
+        };
+        assert!(
+            has_substring,
+            "deny reason must contain `{reason_substring}`: {}",
+            intent.deny_reason
+        );
+    }
 }
 
 #[test]
@@ -518,6 +657,7 @@ fn test_happy_path_economics_allow_lifecycle_allow_projects() {
     let signer = Arc::new(Signer::generate());
     let resolver = Arc::new(TestContinuityResolver::new(&signer));
     let harness = Harness::new(resolver, 0, Arc::clone(&signer));
+    let revocation_head = digest(0x55);
 
     let inserted = harness.insert_intent_with_backlog(
         "intent-happy-001",
@@ -529,12 +669,7 @@ fn test_happy_path_economics_allow_lifecycle_allow_projects() {
     );
     assert!(inserted);
 
-    let result = harness.drain(
-        100,
-        digest(0xAA),
-        digest(0xBB),
-        ledger_anchor("intent-happy-001"),
-    );
+    let result = harness.drain(100, digest(0xAA), digest(0xBB), revocation_head);
 
     assert!(result.replayed_count > 0);
     let calls = harness.effect_calls();
@@ -556,38 +691,38 @@ fn test_happy_path_economics_allow_lifecycle_allow_projects() {
 fn test_deny_stale_temporal_authority() {
     let signer = Arc::new(Signer::generate());
     let resolver = Arc::new(TestContinuityResolver::new(&signer));
-    let harness = Harness::new(resolver, 1_000, Arc::clone(&signer));
-
+    let harness = Harness::new(resolver, 0, Arc::clone(&signer));
+    let stale_before = harness.lifecycle_stale_count();
+    let stale_eval_tick = 10u64;
+    let revocation_head = digest(0x56);
     let inserted = harness.insert_intent_with_backlog(
         "intent-stale-temporal-001",
         "work-stale-temporal-001",
         digest(0x11),
-        digest(0x56),
-        10,
-        10,
+        revocation_head,
+        stale_eval_tick,
+        stale_eval_tick,
     );
     assert!(inserted);
 
-    harness.preconsume_intent_token(
-        "intent-stale-temporal-001",
-        10,
-        digest(0xAA),
-        ledger_anchor("intent-stale-temporal-001"),
-    );
+    let stale_replay_tick =
+        stale_eval_tick + PcacPolicyKnobs::default().freshness_max_age_ticks + 1;
 
     let result = harness.drain(
-        10,
+        stale_replay_tick,
         digest(0xAA),
         digest(0xBB),
-        ledger_anchor("intent-stale-temporal-001"),
+        revocation_head,
     );
 
     assert_deny_with_reason(
         &harness,
         "intent-stale-temporal-001",
         DENY_REPLAY_LIFECYCLE_GATE,
+        Some("stale"),
         &result,
     );
+    assert_eq!(harness.lifecycle_stale_count(), stale_before + 1);
 }
 
 #[test]
@@ -595,30 +730,57 @@ fn test_deny_missing_continuity_profile() {
     let signer = Arc::new(Signer::generate());
     let resolver = Arc::new(TestContinuityResolver::with_missing_profile(&signer));
     let harness = Harness::new(resolver, 0, Arc::clone(&signer));
+    let revocation_head = digest(0x57);
 
     let inserted = harness.insert_intent_with_backlog(
         "intent-missing-profile-001",
         "work-missing-profile-001",
         digest(0x12),
-        digest(0x57),
+        revocation_head,
         100,
         100,
     );
     assert!(inserted);
 
-    let result = harness.drain(
-        100,
-        digest(0xAA),
-        digest(0xBB),
-        ledger_anchor("intent-missing-profile-001"),
-    );
+    let result = harness.drain(100, digest(0xAA), digest(0xBB), revocation_head);
 
     assert_deny_with_reason(
         &harness,
         "intent-missing-profile-001",
         DENY_REPLAY_ECONOMICS_GATE,
+        None,
         &result,
     );
+    harness.assert_no_projection_call();
+}
+
+#[test]
+fn test_deny_missing_snapshot() {
+    let signer = Arc::new(Signer::generate());
+    let resolver = Arc::new(TestContinuityResolver::with_missing_snapshot(&signer));
+    let harness = Harness::new(resolver, 0, Arc::clone(&signer));
+    let revocation_head = digest(0x67);
+
+    let inserted = harness.insert_intent_with_backlog(
+        "intent-missing-snapshot-001",
+        "work-missing-snapshot-001",
+        digest(0x1C),
+        revocation_head,
+        100,
+        100,
+    );
+    assert!(inserted);
+
+    let result = harness.drain(100, digest(0xAA), digest(0xBB), revocation_head);
+
+    assert_deny_with_reason(
+        &harness,
+        "intent-missing-snapshot-001",
+        DENY_REPLAY_ECONOMICS_GATE,
+        Some("continuity profile"),
+        &result,
+    );
+    harness.assert_no_projection_call();
 }
 
 #[test]
@@ -626,27 +788,41 @@ fn test_lifecycle_deny_revoked_authority() {
     let signer = Arc::new(Signer::generate());
     let resolver = Arc::new(TestContinuityResolver::new(&signer));
     let harness = Harness::new(resolver, 0, Arc::clone(&signer));
+    let revoked_before = harness.lifecycle_revoked_count();
+    let revoked_ledger_head = digest(0x58);
+
+    let issued_revocation_head = revoked_ledger_head;
+    let current_revocation_head = ledger_anchor("intent-revoked-001-current");
 
     let inserted = harness.insert_intent_with_backlog(
         "intent-revoked-001",
         "work-revoked-001",
         digest(0x13),
-        digest(0x58),
+        revoked_ledger_head,
         100,
         100,
     );
     assert!(inserted);
 
-    let revoked_revocation = ledger_anchor("intent-revoked-001");
-    harness.preconsume_intent_token("intent-revoked-001", 100, digest(0xAA), revoked_revocation);
-    let result = harness.drain(100, digest(0xAA), digest(0xBB), revoked_revocation);
+    harness.preconsume_intent_token(
+        "intent-revoked-001",
+        100,
+        digest(0xAA),
+        issued_revocation_head,
+    );
+
+    let result = harness.drain(100, digest(0xAA), digest(0xBB), current_revocation_head);
 
     assert_deny_with_reason(
         &harness,
         "intent-revoked-001",
         DENY_REPLAY_LIFECYCLE_GATE,
+        Some("revoked"),
         &result,
     );
+    assert_eq!(harness.lifecycle_revoked_count(), revoked_before + 1);
+    assert_eq!(harness.lifecycle_stale_count(), 0);
+    assert_eq!(harness.lifecycle_consumed_count(), 0);
 }
 
 #[test]
@@ -654,12 +830,13 @@ fn test_lifecycle_deny_consumed_token() {
     let signer = Arc::new(Signer::generate());
     let resolver = Arc::new(TestContinuityResolver::new(&signer));
     let harness = Harness::new(resolver, 0, Arc::clone(&signer));
+    let revocation_head = digest(0x59);
 
     let inserted = harness.insert_intent_with_backlog(
         "intent-consumed-001",
         "work-consumed-001",
         digest(0x14),
-        digest(0x59),
+        revocation_head,
         200,
         200,
     );
@@ -667,7 +844,6 @@ fn test_lifecycle_deny_consumed_token() {
 
     let preconsume_tick = 200;
     let time_authority_ref = digest(0xAA);
-    let revocation_head = ledger_anchor("intent-consumed-001");
 
     // Pre-consume the lifecycle token in the same gate before replay.
     harness.preconsume_intent_token(
@@ -688,83 +864,165 @@ fn test_lifecycle_deny_consumed_token() {
         &harness,
         "intent-consumed-001",
         DENY_REPLAY_LIFECYCLE_GATE,
+        Some("consumed"),
         &result,
     );
+    assert_eq!(harness.lifecycle_consumed_count(), 1);
 }
 
 #[test]
 fn test_lifecycle_deny_stale_authority_freshness() {
     let signer = Arc::new(Signer::generate());
     let resolver = Arc::new(TestContinuityResolver::new(&signer));
-    let harness = Harness::new(resolver, 2_000, Arc::clone(&signer));
+    let harness = Harness::new(resolver, 0, Arc::clone(&signer));
+    let stale_before = harness.lifecycle_stale_count();
+    let eval_tick = 150u64;
+    let revocation_head = digest(0x5A);
 
     let inserted = harness.insert_intent_with_backlog(
         "intent-stale-freshness-001",
         "work-stale-freshness-001",
         digest(0x15),
-        digest(0x5A),
-        150,
-        150,
+        revocation_head,
+        eval_tick,
+        eval_tick,
     );
     assert!(inserted);
 
-    harness.preconsume_intent_token(
-        "intent-stale-freshness-001",
-        150,
-        digest(0xAA),
-        ledger_anchor("intent-stale-freshness-001"),
-    );
+    let stale_replay_tick = eval_tick + PcacPolicyKnobs::default().freshness_max_age_ticks + 1;
 
     let result = harness.drain(
-        150,
+        stale_replay_tick,
         digest(0xAA),
         digest(0xBB),
-        ledger_anchor("intent-stale-freshness-001"),
+        revocation_head,
     );
 
     assert_deny_with_reason(
         &harness,
         "intent-stale-freshness-001",
         DENY_REPLAY_LIFECYCLE_GATE,
+        Some("stale"),
         &result,
     );
+    assert_eq!(harness.lifecycle_stale_count(), stale_before + 1);
 }
 
 #[test]
 fn test_outage_recovery_replay_in_order() {
     let signer = Arc::new(Signer::generate());
     let resolver = Arc::new(TestContinuityResolver::new(&signer));
-    let harness = Harness::new(resolver, 0, Arc::clone(&signer));
+    let mut harness = Harness::new(resolver, 0, Arc::clone(&signer));
+    let replay_tick = 300u64;
+    let current_revocation_head = digest(0x60);
+    let authority_ref = digest(0xAA);
+    let window_ref = digest(0xBB);
 
-    assert!(harness.insert_intent_with_backlog(
-        "intent-order-001",
-        "work-order-001",
-        digest(0x16),
-        digest(0x61),
-        300,
-        300,
-    ));
-    assert!(harness.insert_intent_with_backlog(
-        "intent-order-002",
-        "work-order-002",
-        digest(0x17),
-        digest(0x62),
-        300,
-        300,
-    ));
-    assert!(harness.insert_intent_with_backlog(
-        "intent-order-003",
-        "work-order-003",
-        digest(0x18),
-        digest(0x63),
-        300,
-        300,
-    ));
+    let intents = [
+        (
+            "intent-order-001",
+            "work-order-001",
+            digest(0x16),
+            current_revocation_head,
+        ),
+        (
+            "intent-order-002",
+            "work-order-002",
+            digest(0x17),
+            current_revocation_head,
+        ),
+        (
+            "intent-order-003",
+            "work-order-003",
+            digest(0x18),
+            current_revocation_head,
+        ),
+    ];
 
-    let result = harness.drain(300, digest(0xAA), digest(0xBB), digest(0xCC));
+    let replay_horizon_tick = replay_tick - 1;
+    for (intent_id, work_id, digest, ledger_head) in intents {
+        assert!(harness.insert_intent_with_backlog(
+            intent_id,
+            work_id,
+            digest,
+            ledger_head,
+            replay_tick,
+            replay_horizon_tick,
+        ));
+    }
 
-    assert_eq!(result.replayed_count, 3);
-    assert!(result.converged);
+    harness.set_effect_fail_reason(Some("outage: sink unavailable"));
+
+    let first = harness.drain(
+        replay_tick,
+        authority_ref,
+        window_ref,
+        current_revocation_head,
+    );
+
+    assert_eq!(first.denied_count, 3);
+    assert_eq!(first.replayed_count, 0);
+    assert!(first.converged);
+    assert!(first.convergence_receipt.is_some());
+    let first_receipt = first
+        .convergence_receipt
+        .expect("failed outage drain should still emit receipt");
+    assert_eq!(first_receipt.boundary_id, "test-boundary");
+    assert_eq!(first_receipt.backlog_digest, first.backlog_digest);
+    assert_eq!(first_receipt.replayed_item_count, 0);
+    assert!(first_receipt.converged);
+
+    let outage_calls = harness.effect_calls();
+    assert_eq!(
+        outage_calls,
+        vec![
+            "work-order-001".to_string(),
+            "work-order-002".to_string(),
+            "work-order-003".to_string(),
+        ]
+    );
+
+    let pending_after_outage = harness
+        .intent_buffer
+        .query_pending_backlog(10)
+        .expect("pending backlog query should succeed");
+    assert!(pending_after_outage.is_empty());
+
+    for intent_id in ["intent-order-001", "intent-order-002", "intent-order-003"] {
+        let intent = harness.intent(intent_id).expect("intent should exist");
+        assert_eq!(intent.verdict, IntentVerdict::Denied);
+        assert!(intent.deny_reason.contains(DENY_REPLAY_PROJECTION_EFFECT));
+    }
+
+    let denied_calls = harness.effect_calls();
+    assert_eq!(denied_calls.len(), 3);
+
+    harness.set_effect_fail_reason(None);
+
+    for intent_id in ["intent-order-001", "intent-order-002", "intent-order-003"] {
+        harness.reset_pending_for_replay(intent_id);
+    }
+    harness.reset_lifecycle_gate_for_replay(replay_tick);
+
+    let pending_after_reset = harness
+        .intent_buffer
+        .query_pending_backlog(10)
+        .expect("pending backlog query should show replay-ready intents");
+    assert_eq!(pending_after_reset.len(), 3);
+
+    let second = harness.drain(
+        replay_tick,
+        authority_ref,
+        window_ref,
+        current_revocation_head,
+    );
+
+    assert_eq!(second.replayed_count, 3);
+    assert!(second.converged);
+    assert_eq!(
+        second.denied_count, 0,
+        "recovery pass should not deny replayed intents"
+    );
 
     let calls = harness.effect_calls();
     assert_eq!(
@@ -773,8 +1031,25 @@ fn test_outage_recovery_replay_in_order() {
             "work-order-001".to_string(),
             "work-order-002".to_string(),
             "work-order-003".to_string(),
+            "work-order-001".to_string(),
+            "work-order-002".to_string(),
+            "work-order-003".to_string(),
         ]
     );
+
+    assert_eq!(
+        second.backlog_digest,
+        backlog_digest_from_digests(&[&digest(0x16), &digest(0x17), &digest(0x18),])
+    );
+
+    let receipt = second
+        .convergence_receipt
+        .expect("recovery cycle should emit receipt");
+    assert_eq!(receipt.replayed_item_count, 3);
+    assert!(receipt.converged);
+    assert_eq!(receipt.backlog_digest, second.backlog_digest);
+    assert_eq!(receipt.boundary_id, "test-boundary");
+    assert_eq!(second.denied_count, 0);
 }
 
 #[test]
@@ -782,32 +1057,39 @@ fn test_outage_revoked_authority_replay_deny() {
     let signer = Arc::new(Signer::generate());
     let resolver = Arc::new(TestContinuityResolver::new(&signer));
     let harness = Harness::new(resolver, 0, Arc::clone(&signer));
+    let revoked_before = harness.lifecycle_revoked_count();
+    let revoked_ledger_head = digest(0x64);
 
     let inserted = harness.insert_intent_with_backlog(
         "intent-outage-revoked-001",
         "work-outage-revoked-001",
         digest(0x19),
-        digest(0x64),
+        revoked_ledger_head,
         400,
         400,
     );
     assert!(inserted);
 
-    let revoked_frontier = ledger_anchor("intent-outage-revoked-001");
+    let issued_revocation_head = revoked_ledger_head;
+    let current_revocation_head = ledger_anchor("intent-outage-revoked-001-current");
+
     harness.preconsume_intent_token(
         "intent-outage-revoked-001",
         400,
         digest(0xAA),
-        ledger_anchor("intent-outage-revoked-001"),
+        issued_revocation_head,
     );
-    let result = harness.drain(400, digest(0xAA), digest(0xBB), revoked_frontier);
+
+    let result = harness.drain(400, digest(0xAA), digest(0xBB), current_revocation_head);
 
     assert_deny_with_reason(
         &harness,
         "intent-outage-revoked-001",
         DENY_REPLAY_LIFECYCLE_GATE,
+        Some("revoked"),
         &result,
     );
+    assert_eq!(harness.lifecycle_revoked_count(), revoked_before + 1);
 }
 
 #[test]
@@ -815,12 +1097,13 @@ fn test_window_expiration() {
     let signer = Arc::new(Signer::generate());
     let resolver = Arc::new(TestContinuityResolver::new(&signer));
     let harness = Harness::new(resolver, 0, Arc::clone(&signer));
+    let revocation_head = digest(0x65);
 
     let inserted = harness.insert_intent_with_backlog(
         "intent-expired-001",
         "work-expired-001",
         digest(0x1A),
-        digest(0x65),
+        revocation_head,
         5,
         5,
     );
@@ -828,12 +1111,7 @@ fn test_window_expiration() {
 
     // Resolver replay window is 1_000 ticks, so this is far beyond window
     // and should expire as DENY_REPLAY_HORIZON_OUT_OF_WINDOW.
-    let result = harness.drain(
-        5_000,
-        digest(0xAA),
-        digest(0xBB),
-        ledger_anchor("intent-expired-001"),
-    );
+    let result = harness.drain(5_000, digest(0xAA), digest(0xBB), revocation_head);
 
     let intent = harness
         .intent("intent-expired-001")
@@ -853,12 +1131,13 @@ fn test_idempotency_same_work_changeset() {
     let signer = Arc::new(Signer::generate());
     let resolver = Arc::new(TestContinuityResolver::new(&signer));
     let harness = Harness::new(resolver, 0, Arc::clone(&signer));
+    let revocation_head = digest(0x66);
 
     assert!(harness.insert_intent_with_backlog(
         "intent-idempotent-001",
         "work-idempotent",
         digest(0x1B),
-        digest(0x66),
+        revocation_head,
         600,
         600,
     ));
@@ -867,19 +1146,35 @@ fn test_idempotency_same_work_changeset() {
         "intent-idempotent-002",
         "work-idempotent",
         digest(0x1B),
-        digest(0x66),
+        revocation_head,
         600,
     );
     assert!(!second, "same (work_id, changeset) must be rejected");
 
-    let result = harness.drain(
-        600,
-        digest(0xAA),
-        digest(0xBB),
-        ledger_anchor("intent-idempotent-001"),
-    );
+    let first = harness.drain(600, digest(0xAA), digest(0xBB), revocation_head);
 
-    assert!(result.replayed_count > 0);
+    assert_eq!(first.replayed_count, 1);
+    assert_eq!(harness.effect.call_count(), 1);
+    assert!(first.convergence_receipt.is_some());
+    let first_receipt = first
+        .convergence_receipt
+        .expect("initial run should emit convergence receipt");
+    assert_eq!(first_receipt.replayed_item_count, 1);
+    assert!(first_receipt.converged);
+
+    harness.set_backlog_pending("intent-idempotent-001");
+
+    let second = harness.drain(600, digest(0xAA), digest(0xBB), revocation_head);
+
+    assert_eq!(second.skipped_count, 1);
+    assert_eq!(second.replayed_count, 0);
+    assert_eq!(second.denied_count, 0);
+    assert!(second.convergence_receipt.is_some());
+    let second_receipt = second
+        .convergence_receipt
+        .expect("second run should emit convergence receipt");
+    assert_eq!(second_receipt.replayed_item_count, 0);
+    assert!(second_receipt.converged);
     assert_eq!(harness.effect.call_count(), 1);
 
     let intent = harness
