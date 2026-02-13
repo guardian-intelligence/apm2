@@ -963,18 +963,6 @@ fn run_terminate_inner(
             run_state.pr_url
         );
         eprintln!("WARNING: {msg}");
-        if json_output {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "repo_mismatch",
-                    "pr_number": resolved_pr,
-                    "review_type": review_type,
-                    "message": msg,
-                }))
-                .unwrap_or_default()
-            );
-        }
         return Err(msg);
     };
     if !state_repo.eq_ignore_ascii_case(owner_repo.as_str()) {
@@ -982,20 +970,6 @@ fn run_terminate_inner(
             "repo mismatch guard skipped termination for PR #{resolved_pr} type={review_type}: run-state repo={state_repo} requested repo={owner_repo}"
         );
         eprintln!("WARNING: {msg}");
-        if json_output {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "repo_mismatch",
-                    "pr_number": resolved_pr,
-                    "review_type": review_type,
-                    "run_state_repo": state_repo,
-                    "requested_repo": owner_repo,
-                    "message": msg,
-                }))
-                .unwrap_or_default()
-            );
-        }
         return Err(msg);
     }
 

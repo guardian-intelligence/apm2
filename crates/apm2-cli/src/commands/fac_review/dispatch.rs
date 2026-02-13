@@ -1114,10 +1114,9 @@ fn spawn_detached_review(
     let exe_path = resolve_dispatch_executable_path(workspace_root)?;
     let head_short = &expected_head_sha[..expected_head_sha.len().min(8)];
     let ts = Utc::now().format("%Y%m%dT%H%M%SZ");
+    let use_systemd_run = command_available("systemd-run");
 
-    let has_sensitive_token_env =
-        std::env::var_os("GH_TOKEN").is_some() || std::env::var_os("GITHUB_TOKEN").is_some();
-    if command_available("systemd-run") && !has_sensitive_token_env {
+    if use_systemd_run {
         let unit = format!(
             "apm2-review-pr{pr_number}-{}-{head_short}-{ts}",
             review_kind.as_str()
@@ -1171,6 +1170,10 @@ fn spawn_detached_review(
         });
     }
 
+    if !use_systemd_run {
+        eprintln!("WARNING: systemd-run unavailable; read-only confinement not applied");
+    }
+
     let dispatch_dir = apm2_home_dir()?.join("review_dispatch");
     fs::create_dir_all(&dispatch_dir).map_err(|err| {
         format!(
@@ -1178,11 +1181,6 @@ fn spawn_detached_review(
             dispatch_dir.display()
         )
     })?;
-    if has_sensitive_token_env {
-        eprintln!(
-            "WARNING: systemd-run unavailable with token env; read-only confinement not applied"
-        );
-    }
     let log_path = dispatch_dir.join(format!(
         "pr{pr_number}-{}-{head_short}-{dispatch_epoch}.log",
         review_kind.as_str()

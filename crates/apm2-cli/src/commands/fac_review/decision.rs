@@ -229,17 +229,27 @@ pub fn run_decision_set(
         }
     }
 
+    let review_state_type = dimension_to_state_review_type(normalized_dimension);
+    let termination_state_non_terminal_alive =
+        super::state::load_review_run_state_strict(resolved_pr, review_state_type)?
+            .is_some_and(|state| state.status == ReviewRunStatus::Alive);
+
     let exit_code = match terminate_review_agent(
         &owner_repo,
         resolved_pr,
         normalized_dimension,
         &head_sha,
     ) {
-        Ok(
-            TerminationOutcome::Killed
-            | TerminationOutcome::AlreadyDead
-            | TerminationOutcome::SkippedMismatch,
-        ) => exit_codes::SUCCESS,
+        Ok(TerminationOutcome::Killed | TerminationOutcome::AlreadyDead) => exit_codes::SUCCESS,
+        Ok(TerminationOutcome::SkippedMismatch) => {
+            if termination_state_non_terminal_alive {
+                // Known limitation for TCK-00602: AJC lifecycle enforcement for terminate
+                // handlers is intentionally out of scope.
+                exit_codes::GENERIC_ERROR
+            } else {
+                exit_codes::SUCCESS
+            }
+        },
         Ok(TerminationOutcome::IdentityFailure(reason)) => {
             eprintln!(
                 "ERROR: review termination failed for PR #{resolved_pr} type={normalized_dimension}: {reason}"
