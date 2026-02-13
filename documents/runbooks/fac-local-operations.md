@@ -400,12 +400,12 @@ Symptom: Builds fail with "No space left on device"
 | `apm2 fac resume` | Show crash-only resume helpers from ledger anchor |
 | `apm2 fac role-launch` | Launch a FAC role with hash-bound admission checks |
 | `apm2 fac pr` | GitHub App credential management and PR operations |
-| `apm2 fac doctor` | Check daemon health and prerequisites |
 
 ### PLANNED -- not yet implemented (FESv1 queue/worker/lane surface)
 
 | Command | Purpose |
 |---------|---------|
+| `apm2 fac doctor` | Check daemon health and prerequisites |
 | `apm2 fac lane status` | Show all lane states |
 | `apm2 fac lane reset <id>` | Reset a lane to known-good state |
 | `apm2 fac lane reset <id> --force` | Force-reset a running lane |
