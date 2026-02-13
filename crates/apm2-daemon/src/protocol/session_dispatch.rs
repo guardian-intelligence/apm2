@@ -8671,19 +8671,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     // commit was moved out of execute() to prevent the
                     // pre-commit hazard where a failed effect would leave
                     // the anchor watermark ahead of the actual ledger head.
-                    //
-                    // TODO(SEC): finalize_anti_rollback performs blocking
-                    // file I/O (write+fsync+rename) on a synchronous
-                    // dispatch path called from an async Tokio task.
-                    // Consider wrapping in spawn_blocking or refactoring
-                    // dispatch to async. Tracked separately from TCK-00502.
                     // ====================================================
-                    if let Some(ref kernel) = self.admission_kernel {
+                    if let Some(kernel) = self.admission_kernel.clone() {
                         let plan_tier = admission_res.boundary_span.enforcement_tier;
-                        match kernel
-                            .finalize_anti_rollback(plan_tier, &admission_res.bundle.ledger_anchor)
-                        {
-                            Ok(()) => {
+                        let anchor = admission_res.bundle.ledger_anchor.clone();
+                        let anti_rollback_result =
+                            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                                handle.block_on(tokio::task::spawn_blocking(move || {
+                                    kernel.finalize_anti_rollback(plan_tier, &anchor)
+                                }))
+                            } else {
+                                Ok(kernel.finalize_anti_rollback(plan_tier, &anchor))
+                            };
+                        match anti_rollback_result {
+                            Ok(Ok(())) => {
                                 if plan_tier
                                     == crate::admission_kernel::types::EnforcementTier::FailClosed
                                 {
@@ -8693,7 +8694,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                     );
                                 }
                             },
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 warn!(
                                     session_id = %token.session_id,
                                     error = %e,
@@ -8715,6 +8716,29 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                             "anti-rollback anchor finalization failed for \
                                              request_tool (fail-closed): {e}"
                                         ),
+                                    ));
+                                }
+                            },
+                            Err(join_err) => {
+                                tracing::error!(
+                                    session_id = %token.session_id,
+                                    error = %join_err,
+                                    "anti-rollback finalize task failed for request_tool"
+                                );
+                                if plan_tier
+                                    == crate::admission_kernel::types::EnforcementTier::FailClosed
+                                {
+                                    let reason = join_err.to_string();
+                                    self.open_fail_closed_anchor_circuit(
+                                        "request_tool",
+                                        &token.session_id,
+                                        &reason,
+                                    );
+                                    return Ok(SessionResponse::error(
+                                        SessionErrorCode::SessionErrorInternal,
+                                        "anti-rollback anchor finalize task failed for \
+                                         request_tool (fail-closed)"
+                                            .to_string(),
                                     ));
                                 }
                             },
@@ -11592,12 +11616,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 // pre-effect anchor if the verifier is unavailable.
                 // ====================================================
                 if let Some(ref result) = admission_result {
-                    if let Some(ref kernel) = self.admission_kernel {
+                    if let Some(kernel) = self.admission_kernel.clone() {
                         let plan_tier = result.boundary_span.enforcement_tier;
                         let post_effect_anchor =
                             kernel.resolve_post_effect_anchor(&result.bundle.ledger_anchor);
-                        match kernel.finalize_anti_rollback(plan_tier, &post_effect_anchor) {
-                            Ok(()) => {
+                        let anti_rollback_result =
+                            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                                handle.block_on(tokio::task::spawn_blocking(move || {
+                                    kernel.finalize_anti_rollback(plan_tier, &post_effect_anchor)
+                                }))
+                            } else {
+                                Ok(kernel.finalize_anti_rollback(plan_tier, &post_effect_anchor))
+                            };
+                        match anti_rollback_result {
+                            Ok(Ok(())) => {
                                 if plan_tier
                                     == crate::admission_kernel::types::EnforcementTier::FailClosed
                                 {
@@ -11607,7 +11639,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                     );
                                 }
                             },
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 warn!(
                                     session_id = %token.session_id,
                                     error = %e,
@@ -11629,6 +11661,29 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                             "anti-rollback anchor finalization failed for \
                                              emit_event (fail-closed): {e}"
                                         ),
+                                    ));
+                                }
+                            },
+                            Err(join_err) => {
+                                tracing::error!(
+                                    session_id = %token.session_id,
+                                    error = %join_err,
+                                    "anti-rollback finalize task failed for emit_event"
+                                );
+                                if plan_tier
+                                    == crate::admission_kernel::types::EnforcementTier::FailClosed
+                                {
+                                    let reason = join_err.to_string();
+                                    self.open_fail_closed_anchor_circuit(
+                                        "emit_event",
+                                        &token.session_id,
+                                        &reason,
+                                    );
+                                    return Ok(SessionResponse::error(
+                                        SessionErrorCode::SessionErrorInternal,
+                                        "anti-rollback anchor finalize task failed for \
+                                         emit_event (fail-closed)"
+                                            .to_string(),
                                     ));
                                 }
                             },
@@ -11862,10 +11917,19 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // the anchor watermark ahead of the actual ledger head.
         // ====================================================
         if let Some(ref result) = admission_result {
-            if let Some(ref kernel) = self.admission_kernel {
+            if let Some(kernel) = self.admission_kernel.clone() {
                 let plan_tier = result.boundary_span.enforcement_tier;
-                match kernel.finalize_anti_rollback(plan_tier, &result.bundle.ledger_anchor) {
-                    Ok(()) => {
+                let anchor = result.bundle.ledger_anchor.clone();
+                let anti_rollback_result = if let Ok(handle) = tokio::runtime::Handle::try_current()
+                {
+                    handle.block_on(tokio::task::spawn_blocking(move || {
+                        kernel.finalize_anti_rollback(plan_tier, &anchor)
+                    }))
+                } else {
+                    Ok(kernel.finalize_anti_rollback(plan_tier, &anchor))
+                };
+                match anti_rollback_result {
+                    Ok(Ok(())) => {
                         if plan_tier == crate::admission_kernel::types::EnforcementTier::FailClosed
                         {
                             self.close_fail_closed_anchor_circuit_if_open(
@@ -11874,7 +11938,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             );
                         }
                     },
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         warn!(
                             session_id = %token.session_id,
                             error = %e,
@@ -11895,6 +11959,28 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                     "anti-rollback anchor finalization failed for \
                                      publish_evidence (fail-closed): {e}"
                                 ),
+                            ));
+                        }
+                    },
+                    Err(join_err) => {
+                        tracing::error!(
+                            session_id = %token.session_id,
+                            error = %join_err,
+                            "anti-rollback finalize task failed for publish_evidence"
+                        );
+                        if plan_tier == crate::admission_kernel::types::EnforcementTier::FailClosed
+                        {
+                            let reason = join_err.to_string();
+                            self.open_fail_closed_anchor_circuit(
+                                "publish_evidence",
+                                &token.session_id,
+                                &reason,
+                            );
+                            return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorInternal,
+                                "anti-rollback anchor finalize task failed for \
+                                 publish_evidence (fail-closed)"
+                                    .to_string(),
                             ));
                         }
                     },
