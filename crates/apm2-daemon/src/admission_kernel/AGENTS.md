@@ -134,7 +134,8 @@ Crash-safe effect execution journal (TCK-00501). Tracks effect execution state p
 - [INV-AK41] `Started` without `Completed` on replay produces `Unknown`, never silent re-execution.
 - [INV-AK42] `Unknown` state denies output release unless explicit `AllowReExecution` resolution with matching `request_id` and `idempotency_key` is provided.
 - [INV-AK43] Journal replay tolerates torn tail entries (partial writes from crash) by skipping unparseable trailing lines.
-- [INV-AK44] In-memory entry count bounded by `MAX_JOURNAL_ENTRIES` (1,000,000). Overflow returns `EffectJournalError::JournalFull`.
+- [INV-AK44] In-memory **active** entry count (`Started`/`Unknown`) bounded by `MAX_JOURNAL_ENTRIES` (1,000,000). Overflow returns `EffectJournalError::CapacityExhausted`. Terminal entries (`Completed`/`NotStarted`) do not consume active capacity slots.
+- [INV-AK59] In-memory **terminal** entry count (`Completed`/`NotStarted`) bounded by `MAX_TERMINAL_ENTRIES` (100,000). Pruning is triggered automatically: (a) inline during journal replay when terminal entries exceed the threshold (prevents OOM from replaying millions of completed entries), (b) at runtime after `record_completed()` and `resolve_in_doubt()` via `JournalInner::prune_terminal_entries_if_needed()`, and (c) as a post-replay safety-net pass. Only in-memory pruning; the on-disk journal retains all records for forensic recovery.
 - [INV-AK45] Exclusive file lock (`flock LOCK_EX`) prevents concurrent journal access from multiple daemon instances.
 - [INV-AK46] Binding data is validated (`validate()`) before persistence; zero hashes and empty fields are rejected.
 - [INV-AK47] `record_started()` rejects duplicate `request_id` entries UNLESS state is `NotStarted` (from `resolve_in_doubt`), which permits re-execution by removing the stale entry before inserting the new binding.

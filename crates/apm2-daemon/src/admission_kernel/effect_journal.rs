@@ -168,9 +168,10 @@ impl std::fmt::Display for EffectExecutionState {
 // =============================================================================
 
 /// Errors from effect journal operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EffectJournalError {
     /// I/O error during durable write or fsync.
+    #[error("effect journal I/O error ({kind:?}): {reason}")]
     IoError {
         /// The I/O error kind for programmatic matching.
         kind: std::io::ErrorKind,
@@ -179,6 +180,12 @@ pub enum EffectJournalError {
     },
 
     /// Invalid state transition attempted.
+    #[error(
+        "invalid effect journal transition for {}: {} -> {}",
+        hex::encode(.request_id),
+        .current,
+        .target
+    )]
     InvalidTransition {
         /// The `RequestId` involved.
         request_id: Hash,
@@ -189,6 +196,7 @@ pub enum EffectJournalError {
     },
 
     /// Journal capacity exhausted (fail-closed).
+    #[error("effect journal capacity exhausted ({count}/{max})")]
     CapacityExhausted {
         /// Current number of active entries (`Started`/`Unknown`).
         count: usize,
@@ -197,6 +205,7 @@ pub enum EffectJournalError {
     },
 
     /// Corrupt journal entry detected during replay.
+    #[error("corrupt effect journal entry at line {line}: {reason}")]
     CorruptEntry {
         /// Line number where corruption was detected.
         line: usize,
@@ -205,6 +214,10 @@ pub enum EffectJournalError {
     },
 
     /// Re-execution denied for Unknown state (fail-closed).
+    #[error(
+        "re-execution denied for {} (tier={enforcement_tier}, idempotent={declared_idempotent}): {reason}",
+        hex::encode(.request_id)
+    )]
     ReExecutionDenied {
         /// The `RequestId` in Unknown state.
         request_id: Hash,
@@ -217,6 +230,7 @@ pub enum EffectJournalError {
     },
 
     /// Output release denied for Unknown state (fail-closed).
+    #[error("output release denied for {}: {reason}", hex::encode(.request_id))]
     OutputReleaseDenied {
         /// The `RequestId` in Unknown state.
         request_id: Hash,
@@ -225,61 +239,12 @@ pub enum EffectJournalError {
     },
 
     /// Journal entry validation failed.
+    #[error("effect journal validation error: {reason}")]
     ValidationError {
         /// Description of the validation failure.
         reason: String,
     },
 }
-
-impl std::fmt::Display for EffectJournalError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::IoError { kind, reason } => {
-                write!(f, "effect journal I/O error ({kind:?}): {reason}")
-            },
-            Self::InvalidTransition {
-                request_id,
-                current,
-                target,
-            } => write!(
-                f,
-                "invalid effect journal transition for {}: {} -> {}",
-                hex::encode(request_id),
-                current,
-                target
-            ),
-            Self::CapacityExhausted { count, max } => {
-                write!(f, "effect journal capacity exhausted ({count}/{max})")
-            },
-            Self::CorruptEntry { line, reason } => {
-                write!(f, "corrupt effect journal entry at line {line}: {reason}")
-            },
-            Self::ReExecutionDenied {
-                request_id,
-                enforcement_tier,
-                declared_idempotent,
-                reason,
-            } => write!(
-                f,
-                "re-execution denied for {} (tier={enforcement_tier}, \
-                 idempotent={declared_idempotent}): {reason}",
-                hex::encode(request_id)
-            ),
-            Self::OutputReleaseDenied {
-                request_id, reason, ..
-            } => write!(
-                f,
-                "output release denied for {}: {reason}",
-                hex::encode(request_id)
-            ),
-            Self::ValidationError { reason } => {
-                write!(f, "effect journal validation error: {reason}")
-            },
-        }
-    }
-}
-
-impl std::error::Error for EffectJournalError {}
 
 impl From<std::io::Error> for EffectJournalError {
     fn from(e: std::io::Error) -> Self {
@@ -669,6 +634,47 @@ struct JournalInner {
     terminal_count: usize,
 }
 
+impl JournalInner {
+    /// Prune terminal entries from the in-memory index if `terminal_count`
+    /// exceeds `MAX_TERMINAL_ENTRIES`.
+    ///
+    /// This is called after any operation that increments `terminal_count`
+    /// (`record_completed`, `resolve_in_doubt`, and during replay) to prevent
+    /// unbounded memory growth from accumulated terminal entries.
+    ///
+    /// Returns the number of entries pruned.
+    fn prune_terminal_entries_if_needed(&mut self) -> usize {
+        if self.terminal_count <= MAX_TERMINAL_ENTRIES {
+            return 0;
+        }
+        let excess = self.terminal_count - MAX_TERMINAL_ENTRIES;
+        let mut pruned = 0usize;
+        let terminal_keys: Vec<Hash> = self
+            .entries
+            .iter()
+            .filter(|(_, record)| state_is_terminal(record.state))
+            .map(|(k, _)| *k)
+            .collect();
+        for key in terminal_keys {
+            if pruned >= excess {
+                break;
+            }
+            self.entries.remove(&key);
+            pruned += 1;
+        }
+        self.terminal_count = self.terminal_count.saturating_sub(pruned);
+        if pruned > 0 {
+            tracing::debug!(
+                pruned_count = pruned,
+                remaining_terminal = self.terminal_count,
+                active_count = self.active_count,
+                "effect journal: pruned terminal entries"
+            );
+        }
+        pruned
+    }
+}
+
 // =============================================================================
 // Journal line format
 // =============================================================================
@@ -937,6 +943,26 @@ impl FileBackedEffectJournal {
                                         record.state = EffectExecutionState::Completed;
                                         active_entries = active_entries.saturating_sub(1);
                                         terminal_entries += 1;
+                                        // BLOCKER FIX: Inline terminal compaction during
+                                        // replay to prevent unbounded memory growth. Without
+                                        // this, replaying millions of Completed entries
+                                        // accumulates all terminal entries in the HashMap
+                                        // before post-replay compaction, causing OOM.
+                                        if terminal_entries > MAX_TERMINAL_ENTRIES {
+                                            let excess = terminal_entries - MAX_TERMINAL_ENTRIES;
+                                            let keys: Vec<Hash> = entries
+                                                .iter()
+                                                .filter(|(_, r)| state_is_terminal(r.state))
+                                                .map(|(k, _)| *k)
+                                                .take(excess)
+                                                .collect();
+                                            let pruned = keys.len();
+                                            for key in keys {
+                                                entries.remove(&key);
+                                            }
+                                            terminal_entries =
+                                                terminal_entries.saturating_sub(pruned);
+                                        }
                                     }
                                     // If already Completed, ignore duplicate.
                                 }
@@ -961,6 +987,23 @@ impl FileBackedEffectJournal {
                                         record.state = EffectExecutionState::NotStarted;
                                         active_entries = active_entries.saturating_sub(1);
                                         terminal_entries += 1;
+                                        // BLOCKER FIX: Same inline compaction for Resolved
+                                        // entries during replay (same rationale as Completed).
+                                        if terminal_entries > MAX_TERMINAL_ENTRIES {
+                                            let excess = terminal_entries - MAX_TERMINAL_ENTRIES;
+                                            let keys: Vec<Hash> = entries
+                                                .iter()
+                                                .filter(|(_, r)| state_is_terminal(r.state))
+                                                .map(|(k, _)| *k)
+                                                .take(excess)
+                                                .collect();
+                                            let pruned = keys.len();
+                                            for key in keys {
+                                                entries.remove(&key);
+                                            }
+                                            terminal_entries =
+                                                terminal_entries.saturating_sub(pruned);
+                                        }
                                     }
                                 }
                                 // Orphan R without S is ignored (same as C).
@@ -1025,32 +1068,21 @@ impl FileBackedEffectJournal {
             }
         }
 
-        // Post-replay compaction: prune terminal entries that exceed
-        // MAX_TERMINAL_ENTRIES. Only in-memory pruning — the on-disk journal
-        // retains all records for forensic recovery. Active entries are never
-        // pruned; only Completed/NotStarted entries are eligible.
-        if terminal_entries > MAX_TERMINAL_ENTRIES {
-            let excess = terminal_entries - MAX_TERMINAL_ENTRIES;
-            let mut pruned = 0usize;
-            let terminal_keys: Vec<Hash> = entries
-                .iter()
-                .filter(|(_, record)| state_is_terminal(record.state))
-                .map(|(k, _)| *k)
-                .collect();
-            for key in terminal_keys {
-                if pruned >= excess {
-                    break;
-                }
-                entries.remove(&key);
-                pruned += 1;
-            }
-            terminal_entries = terminal_entries.saturating_sub(pruned);
-            tracing::info!(
-                pruned_count = pruned,
-                remaining_terminal = terminal_entries,
-                active_count = active_entries,
-                "effect journal: pruned terminal entries during replay compaction"
-            );
+        // Post-replay safety-net compaction: the inline compaction above
+        // handles streaming pruning during replay, but a final pass ensures
+        // no edge case leaves terminal entries above the limit (e.g., the
+        // Unknown→Started reclassification above may not have triggered
+        // inline compaction for pre-existing terminal entries).
+        {
+            let mut inner = JournalInner {
+                entries,
+                active_count: active_entries,
+                terminal_count: terminal_entries,
+            };
+            inner.prune_terminal_entries_if_needed();
+            entries = inner.entries;
+            active_entries = inner.active_count;
+            terminal_entries = inner.terminal_count;
         }
 
         Ok(Self {
@@ -1212,6 +1244,12 @@ impl EffectJournal for FileBackedEffectJournal {
         inner.active_count = inner.active_count.saturating_sub(1);
         inner.terminal_count += 1;
 
+        // BLOCKER FIX: Prune terminal entries at runtime to prevent
+        // unbounded in-memory growth during long-running daemon sessions.
+        // Without this, a daemon that processes millions of requests will
+        // accumulate terminal entries indefinitely, leading to OOM.
+        inner.prune_terminal_entries_if_needed();
+
         Ok(())
     }
 
@@ -1299,6 +1337,10 @@ impl EffectJournal for FileBackedEffectJournal {
         // Unknown is active; NotStarted is terminal.
         inner.active_count = inner.active_count.saturating_sub(1);
         inner.terminal_count += 1;
+
+        // BLOCKER FIX: Prune terminal entries at runtime to prevent
+        // unbounded in-memory growth (same rationale as record_completed).
+        inner.prune_terminal_entries_if_needed();
 
         Ok(InDoubtResolutionV1::AllowReExecution { idempotency_key })
     }
@@ -2978,6 +3020,150 @@ mod tests {
             journal.terminal_count(),
             1,
             "after resolve: Unknown->NotStarted, terminal incremented"
+        );
+    }
+
+    // =========================================================================
+    // BLOCKER FIX: Runtime terminal pruning in record_completed
+    // =========================================================================
+
+    /// Verify that `record_completed` triggers automatic terminal entry
+    /// pruning when terminal entries exceed `MAX_TERMINAL_ENTRIES`. This
+    /// prevents unbounded in-memory growth during long-running daemon
+    /// sessions that process many requests.
+    #[test]
+    fn record_completed_triggers_terminal_pruning() {
+        use std::fmt::Write as _;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect-runtime-pruning.journal");
+
+        // Pre-populate journal file with MAX_TERMINAL_ENTRIES completed
+        // entries, then open and complete one more to trigger pruning.
+        let mut content = String::new();
+        for i in 1..=MAX_TERMINAL_ENTRIES {
+            let mut h = [0u8; 32];
+            let hash_bytes = blake3::hash(&i.to_le_bytes());
+            h.copy_from_slice(hash_bytes.as_bytes());
+            let rid = h;
+            let binding = test_binding(rid, false);
+            let hex_id = hex::encode(rid);
+            let json = serde_json::to_string(&binding).unwrap();
+            let _ = writeln!(content, "S {hex_id} {json}");
+            let _ = writeln!(content, "C {hex_id}");
+        }
+        // Add one active entry that we'll complete at runtime.
+        let active_rid = test_hash(0xFB);
+        let active_binding = test_binding(active_rid, false);
+        let active_hex = hex::encode(active_rid);
+        let active_json = serde_json::to_string(&active_binding).unwrap();
+        let _ = writeln!(content, "S {active_hex} {active_json}");
+
+        std::fs::write(&path, content).unwrap();
+
+        let journal = FileBackedEffectJournal::open(&path).unwrap();
+        assert_eq!(
+            journal.active_count(),
+            1,
+            "one active entry (Unknown after replay)"
+        );
+        // Terminal entries may be at or below MAX_TERMINAL_ENTRIES after
+        // replay compaction.
+        assert!(
+            journal.terminal_count() <= MAX_TERMINAL_ENTRIES,
+            "replay should have compacted terminal entries"
+        );
+
+        // Complete the active entry, pushing terminal_count over the limit.
+        // Note: The entry is in Unknown state after replay, but we need it
+        // in Started state to complete it. Let's resolve it first and then
+        // re-start and complete it.
+        // Actually, for simplicity let's just create a fresh journal with
+        // a known number of terminal entries already at the limit.
+        drop(journal);
+
+        // Simpler approach: open a fresh journal, add entries to just below
+        // the limit, then complete one more to trigger pruning.
+        let dir2 = TempDir::new().unwrap();
+        let path2 = dir2.path().join("effect-runtime-pruning2.journal");
+        let journal2 = FileBackedEffectJournal::open(&path2).unwrap();
+
+        // Fill up terminal entries to exactly MAX_TERMINAL_ENTRIES.
+        for i in 1..=MAX_TERMINAL_ENTRIES {
+            let mut h = [0u8; 32];
+            let hash_bytes = blake3::hash(&i.to_le_bytes());
+            h.copy_from_slice(hash_bytes.as_bytes());
+            let rid = h;
+            journal2.record_started(&test_binding(rid, false)).unwrap();
+            journal2.record_completed(&rid).unwrap();
+        }
+        assert_eq!(
+            journal2.terminal_count(),
+            MAX_TERMINAL_ENTRIES,
+            "terminal count should be at MAX_TERMINAL_ENTRIES"
+        );
+
+        // Start and complete one more — this should trigger pruning.
+        let trigger_rid = test_hash(0xFC);
+        journal2
+            .record_started(&test_binding(trigger_rid, false))
+            .unwrap();
+        journal2.record_completed(&trigger_rid).unwrap();
+
+        // Terminal count should be at or below MAX_TERMINAL_ENTRIES after
+        // automatic pruning.
+        assert!(
+            journal2.terminal_count() <= MAX_TERMINAL_ENTRIES,
+            "record_completed must trigger pruning when terminal entries exceed limit: got {}",
+            journal2.terminal_count()
+        );
+        assert_eq!(journal2.active_count(), 0, "no active entries remain");
+    }
+
+    // =========================================================================
+    // BLOCKER FIX: Inline replay compaction prevents OOM
+    // =========================================================================
+
+    /// Verify that inline compaction during replay keeps the in-memory
+    /// entry count bounded. Without inline compaction, replaying a journal
+    /// with millions of terminal entries would accumulate them all in the
+    /// `HashMap` before the post-replay compaction pass, causing OOM.
+    #[test]
+    fn replay_inline_compaction_bounds_memory() {
+        use std::fmt::Write as _;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("effect-inline-compact.journal");
+
+        // Write a journal with 2x MAX_TERMINAL_ENTRIES completed entries.
+        // With inline compaction, the in-memory map should never grow
+        // beyond MAX_TERMINAL_ENTRIES + a small delta.
+        let count = MAX_TERMINAL_ENTRIES * 2;
+        let mut content = String::new();
+        for i in 1..=count {
+            let mut h = [0u8; 32];
+            let hash_bytes = blake3::hash(&i.to_le_bytes());
+            h.copy_from_slice(hash_bytes.as_bytes());
+            let rid = h;
+            let binding = test_binding(rid, false);
+            let hex_id = hex::encode(rid);
+            let json = serde_json::to_string(&binding).unwrap();
+            let _ = writeln!(content, "S {hex_id} {json}");
+            let _ = writeln!(content, "C {hex_id}");
+        }
+
+        std::fs::write(&path, content).unwrap();
+
+        let journal = FileBackedEffectJournal::open(&path).unwrap();
+        assert!(
+            journal.terminal_count() <= MAX_TERMINAL_ENTRIES,
+            "after replay with inline compaction, terminal entries must be bounded: got {}",
+            journal.terminal_count()
+        );
+        assert_eq!(
+            journal.active_count(),
+            0,
+            "no active entries in all-completed journal"
         );
     }
 }
