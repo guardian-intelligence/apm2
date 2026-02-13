@@ -57,7 +57,19 @@ pub fn install() -> Result<()> {
         .join("apm2-daemon.service");
 
     if let Some(parent) = unit_path.parent() {
-        std::fs::create_dir_all(parent).context("failed to create systemd unit directory")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o755)
+                .create(parent)
+                .context("failed to create systemd unit directory")?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(parent).context("failed to create systemd unit directory")?;
+        }
     }
 
     let unit_content = format!(
@@ -106,7 +118,7 @@ WantedBy=default.target
 
     if let Ok(user) = std::env::var("USER") {
         match Command::new("loginctl")
-            .args(["enable-linger", &user])
+            .args(["enable-linger", "--", &user])
             .status()
         {
             Ok(status) if !status.success() => {
@@ -403,7 +415,19 @@ fn check_socket_reachable(rt: &tokio::runtime::Runtime, path: &Path) -> Result<(
 
 fn available_space_bytes(path: &std::path::Path) -> Result<u64> {
     if !path.exists() {
-        std::fs::create_dir_all(path).context("failed to create data directory")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(path)
+                .context("failed to create data directory")?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(path).context("failed to create data directory")?;
+        }
     }
     fs2::available_space(path).context("failed to read available space")
 }
