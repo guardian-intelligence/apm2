@@ -677,21 +677,26 @@ where
             );
         },
         ReviewRunStateLoad::Present(state) => {
-            if state.head_sha.eq_ignore_ascii_case(&key.head_sha)
-                && state.status.is_terminal()
-                && !force_same_sha_retry
-            {
-                return Ok(DispatchReviewResult {
-                    review_type: key.review_type.clone(),
-                    mode: "joined".to_string(),
-                    run_state: state.status.as_str().to_string(),
-                    run_id: Some(state.run_id),
-                    sequence_number: Some(state.sequence_number),
-                    terminal_reason: state.terminal_reason,
-                    pid: state.pid,
-                    unit: None,
-                    log_file: None,
-                });
+            if state.head_sha.eq_ignore_ascii_case(&key.head_sha) && state.status.is_terminal() {
+                if !force_same_sha_retry && state.pid.is_some() {
+                    return Ok(DispatchReviewResult {
+                        review_type: key.review_type.clone(),
+                        mode: "joined".to_string(),
+                        run_state: state.status.as_str().to_string(),
+                        run_id: Some(state.run_id),
+                        sequence_number: Some(state.sequence_number),
+                        terminal_reason: state.terminal_reason,
+                        pid: state.pid,
+                        unit: None,
+                        log_file: None,
+                    });
+                }
+                if !force_same_sha_retry && state.pid.is_none() {
+                    eprintln!(
+                        "WARNING: terminal run-state missing pid for PR #{} type={} sha={}; dispatching new review",
+                        key.pr_number, key.review_type, key.head_sha
+                    );
+                }
             }
 
             if !state.status.is_terminal() && state.head_sha.eq_ignore_ascii_case(&key.head_sha) {
@@ -1301,7 +1306,7 @@ mod tests {
             previous_run_id: None,
             previous_head_sha: None,
             pid,
-            proc_start_time: pid.and_then(get_process_start_time),
+            proc_start_time: pid.map(|process_id| get_process_start_time(process_id).unwrap_or(1)),
             integrity_hmac: None,
         }
     }
@@ -1545,6 +1550,56 @@ mod tests {
         assert_eq!(result.mode, "joined");
         assert_eq!(result.run_state, "done");
         assert_eq!(result.run_id.as_deref(), Some("pr441-security-s4-01234567"));
+    }
+
+    #[test]
+    fn test_same_sha_terminal_state_missing_pid_dispatches_new_review() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+
+        let mut terminal = sample_run_state(None);
+        terminal.status = ReviewRunStatus::Done;
+        terminal.sequence_number = 4;
+        terminal.run_id = "pr441-security-s4-01234567".to_string();
+        write_review_run_state_for_home(home, &terminal).expect("seed terminal state");
+
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let spawn_count_ref = Arc::clone(&spawn_count);
+        let spawn = move |_: &str,
+                          _: u32,
+                          _: ReviewKind,
+                          _: &str,
+                          _: u64|
+              -> Result<DispatchReviewResult, String> {
+            spawn_count_ref.fetch_add(1, Ordering::SeqCst);
+            Ok(DispatchReviewResult {
+                review_type: "security".to_string(),
+                mode: "started".to_string(),
+                run_state: "pending".to_string(),
+                run_id: None,
+                sequence_number: None,
+                terminal_reason: None,
+                pid: Some(dead_pid_for_test()),
+                unit: None,
+                log_file: None,
+            })
+        };
+
+        let key = dispatch_key_with_owner(
+            "Example/Repo-TerminalMissingPid",
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        let result = dispatch_single_review_for_home_with_spawn(
+            home,
+            pr_url(),
+            &key,
+            ReviewKind::Security,
+            100,
+            &spawn,
+        )
+        .expect("same-sha terminal without pid should dispatch");
+        assert_eq!(result.mode, "started");
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

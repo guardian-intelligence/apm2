@@ -20,10 +20,6 @@ path = "src/lib.rs"
 name = "apm2-daemon"
 path = "src/main.rs"
 
-[features]
-default = []
-e2e-agent-tests = []
-
 [dependencies]
 # Internal crates
 apm2-core.workspace = true

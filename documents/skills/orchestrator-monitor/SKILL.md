@@ -110,8 +110,6 @@ decision_tree:
             Read all required references in order:
             (1) @documents/theory/unified-theory-v2.json (REQUIRED: APM2 terminology and ontology)
             (2) @documents/skills/implementor-default/SKILL.md (default implementor skill for all fix-agent dispatches)
-            (3) @documents/reviews/SECURITY_REVIEW_PROMPT.md (security review prompt contract)
-            (4) @documents/reviews/CODE_QUALITY_PROMPT.md (code-quality review prompt contract)
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables; replace <...> placeholders with concrete values."
         - id: DISCOVER_RELEVANT_FAC_HELP
@@ -129,7 +127,6 @@ decision_tree:
             (10) `apm2 fac push --help`
             (11) `apm2 fac restart --help`
             (12) `apm2 fac review terminate --help`
-            Help output is authoritative for names/flags.
         - id: VERIFY_REPO_AUTH
           action: "Run `apm2 fac pr auth-check`."
         - id: RESOLVE_PR_SCOPE
@@ -255,7 +252,6 @@ decision_tree:
             (2) synchronize branch ancestry with current mainline policy,
             (3) reduce merge-conflict count to zero,
             (4) proceed only when worktree is conflict-free.
-            Do NOT prescribe raw git/gh commands in orchestrator prompts.
         - id: REQUIRE_CONFLICT_EVIDENCE
           action: |
             Require branch hygiene facts to be verifiable from FAC artifacts:

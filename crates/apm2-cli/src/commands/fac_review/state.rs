@@ -127,18 +127,39 @@ fn open_secret_for_read(path: &Path) -> Result<File, String> {
     })
 }
 
-fn open_secret_for_write(path: &Path) -> Result<File, String> {
-    let mut options = OpenOptions::new();
-    options.create(true).write(true).truncate(true);
+fn sync_parent_dir(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("path has no parent: {}", path.display()))?;
+    let dir = File::open(parent)
+        .map_err(|err| format!("failed to open parent dir {}: {err}", parent.display()))?;
+    dir.sync_all()
+        .map_err(|err| format!("failed to sync parent dir {}: {err}", parent.display()))
+}
+
+fn write_secret_atomic(path: &Path, encoded_secret: &str) -> Result<(), String> {
+    ensure_parent_dir(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("run secret path has no parent: {}", path.display()))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|err| format!("failed to create run secret temp file: {err}"))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-        options.custom_flags(libc::O_NOFOLLOW);
+        use std::os::unix::fs::PermissionsExt as _;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        temp.as_file()
+            .set_permissions(permissions)
+            .map_err(|err| format!("failed to set run secret temp file mode: {err}"))?;
     }
-    options
-        .open(path)
-        .map_err(|err| format!("failed to write run secret {}: {err}", path.display()))
+    temp.write_all(encoded_secret.as_bytes())
+        .map_err(|err| format!("failed to write run secret temp file: {err}"))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|err| format!("failed to sync run secret temp file: {err}"))?;
+    temp.persist(path)
+        .map_err(|err| format!("failed to persist run secret {}: {err}", path.display()))?;
+    sync_parent_dir(path)
 }
 
 pub fn rotate_run_secret_for_home(
@@ -149,15 +170,8 @@ pub fn rotate_run_secret_for_home(
     let mut secret = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut secret);
     let path = review_run_secret_path_for_home(home, pr_number, review_type);
-    ensure_parent_dir(&path)?;
-    let mut secret_file = open_secret_for_write(&path)?;
     let encoded = hex::encode(secret);
-    secret_file
-        .write_all(encoded.as_bytes())
-        .map_err(|err| format!("failed to write run secret {}: {err}", path.display()))?;
-    secret_file
-        .sync_all()
-        .map_err(|err| format!("failed to sync run secret {}: {err}", path.display()))?;
+    write_secret_atomic(&path, &encoded)?;
     Ok(secret.to_vec())
 }
 
@@ -414,8 +428,8 @@ pub fn load_review_run_state_for_home(
     Ok(ReviewRunStateLoad::Present(parsed))
 }
 
-/// Loads review run state and verifies integrity binding when a live identity
-/// is present.
+/// Loads review run state and verifies integrity binding for any state that
+/// carries a process identity (`pid`).
 ///
 /// Use this path only for security-sensitive callers. Non-security paths
 /// (status display, telemetry reads, etc.) should continue to use
@@ -430,9 +444,6 @@ pub fn load_review_run_state_verified_for_home(
     match run_state_load {
         ReviewRunStateLoad::Present(mut state) => {
             if state.pid.is_none() {
-                return Ok(ReviewRunStateLoad::Present(state));
-            }
-            if !is_process_alive(state.pid.unwrap()) {
                 return Ok(ReviewRunStateLoad::Present(state));
             }
             if let Err(err) = verify_review_run_state_integrity_binding(home, &mut state) {
@@ -982,11 +993,12 @@ mod tests {
     use super::{
         ReviewRunStateLoad, bind_review_run_state_integrity, build_review_run_id,
         extract_repo_from_pr_url, get_process_start_time, load_review_run_state_for_home,
-        load_review_run_state_strict_for_home, next_review_sequence_number_for_home,
-        parse_process_start_time, read_run_secret_for_home, review_lock_path_for_home,
-        review_run_secret_path_for_home, review_run_state_path_for_home,
+        load_review_run_state_strict_for_home, load_review_run_state_verified_for_home,
+        next_review_sequence_number_for_home, parse_process_start_time, read_run_secret_for_home,
+        review_lock_path_for_home, review_run_secret_path_for_home, review_run_state_path_for_home,
         rotate_run_secret_for_home, try_acquire_review_lease_for_home,
-        verify_review_run_state_integrity, write_review_run_state_to_path,
+        verify_review_run_state_integrity, write_review_run_state_for_home,
+        write_review_run_state_to_path,
     };
     use crate::commands::fac_review::types::{ReviewRunState, ReviewRunStatus};
 
@@ -1016,6 +1028,16 @@ mod tests {
             proc_start_time: Some(987_654_321),
             integrity_hmac: None,
         }
+    }
+
+    fn dead_pid_for_test() -> u32 {
+        let mut child = std::process::Command::new("sh")
+            .args(["-lc", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        let _ = child.wait();
+        pid
     }
 
     #[test]
@@ -1243,5 +1265,53 @@ mod tests {
             error.contains("corrupt-state"),
             "unexpected error detail: {error}"
         );
+    }
+
+    #[test]
+    fn test_load_review_run_state_verified_rejects_dead_pid_without_integrity_hmac() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let mut state = sample_state();
+        state.pid = Some(dead_pid_for_test());
+        state.proc_start_time = Some(987_654_321);
+        state.integrity_hmac = None;
+        let path = review_run_state_path_for_home(home, 441, "security");
+        write_review_run_state_to_path(&path, &state).expect("write run-state without integrity");
+
+        let loaded =
+            load_review_run_state_verified_for_home(home, 441, "security").expect("load verified");
+        match loaded {
+            ReviewRunStateLoad::Corrupt { error, .. } => {
+                assert!(
+                    error.contains("integrity"),
+                    "expected integrity verification failure, got: {error}"
+                );
+            },
+            other => panic!("expected corrupt state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_load_review_run_state_verified_accepts_dead_pid_with_integrity_hmac() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let mut state = sample_state();
+        state.pid = Some(dead_pid_for_test());
+        state.proc_start_time = Some(987_654_321);
+        write_review_run_state_for_home(home, &state).expect("write integrity-bound run-state");
+
+        let loaded =
+            load_review_run_state_verified_for_home(home, 441, "security").expect("load verified");
+        match loaded {
+            ReviewRunStateLoad::Present(found) => {
+                assert!(
+                    found.integrity_hmac.is_some(),
+                    "integrity binding must be present"
+                );
+                assert_eq!(found.pid, state.pid);
+                assert_eq!(found.proc_start_time, state.proc_start_time);
+            },
+            other => panic!("expected present state, got {other:?}"),
+        }
     }
 }
