@@ -1064,6 +1064,13 @@ fn run_terminate_inner_for_home(
         );
     }
 
+    if run_state.pid.is_some() && run_state.proc_start_time.is_none() {
+        return Err(format!(
+            "integrity check failed for PR #{resolved_pr} type={review_type}: \
+             pid is present but proc_start_time is missing — refusing to terminate"
+        ));
+    }
+
     if run_state.pid.is_some() && run_state.proc_start_time.is_some() {
         if let Err(integrity_err) =
             state::verify_review_run_state_integrity_binding(home, &run_state)

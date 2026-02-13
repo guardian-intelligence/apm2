@@ -179,13 +179,13 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
         return Ok(value.to_ascii_lowercase());
     }
 
-    if let Some(value) = resolve_local_review_head_sha(pr_number) {
-        return Ok(value);
-    }
-
     if let Some(identity) = projection_store::load_pr_identity(owner_repo, pr_number)? {
         validate_expected_head_sha(&identity.head_sha)?;
         return Ok(identity.head_sha.to_ascii_lowercase());
+    }
+
+    if let Some(value) = resolve_local_review_head_sha(pr_number) {
+        return Ok(value);
     }
 
     Err(format!(

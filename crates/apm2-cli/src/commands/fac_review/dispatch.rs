@@ -11,6 +11,7 @@ use chrono::Utc;
 use fs2::FileExt;
 
 use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
+use super::projection_store;
 use super::state::{
     ReviewRunStateLoad, build_review_run_id, get_process_start_time,
     load_review_run_state_for_home, load_review_run_state_verified_for_home,
@@ -560,6 +561,13 @@ where
     superseded.pid = None;
     superseded.proc_start_time = None;
     write_review_run_state_for_home(home, &superseded)?;
+
+    let _ = projection_store::save_identity_with_context(
+        &key.owner_repo,
+        key.pr_number,
+        &key.head_sha,
+        "dispatch_drift",
+    );
 
     let lineage = drift_lineage_from_state(state, key);
     let mut seeded = seed_pending_run_state_for_dispatch_for_home(home, key, Some(&lineage))?;

@@ -983,6 +983,9 @@ pub fn write_review_run_state(state: &ReviewRunState) -> Result<PathBuf, String>
     state.integrity_hmac = None; // force re-bind on every write
     bind_review_run_state_integrity_for_home(&home, &mut state)?;
     write_review_run_state_to_path(&path, &state)?;
+    if state.status.is_terminal() {
+        let _ = remove_pulse_file(state.pr_number, &state.review_type);
+    }
     Ok(path)
 }
 
@@ -995,6 +998,9 @@ pub fn write_review_run_state_for_home(
     state.integrity_hmac = None; // force re-bind on every write
     bind_review_run_state_integrity_for_home(home, &mut state)?;
     write_review_run_state_to_path(&path, &state)?;
+    if state.status.is_terminal() {
+        let _ = remove_pulse_file(state.pr_number, &state.review_type);
+    }
     Ok(path)
 }
 
@@ -1545,17 +1551,9 @@ pub fn resolve_local_review_head_sha(pr_number: u32) -> Option<String> {
             continue;
         };
         if let ReviewRunStateLoad::Present(entry) = state {
-            if validate_expected_head_sha(&entry.head_sha).is_ok() {
-                return Some(entry.head_sha.to_ascii_lowercase());
+            if entry.status.is_terminal() {
+                continue;
             }
-        }
-    }
-
-    for review_type in ["security", "quality"] {
-        let Ok(pulse) = read_pulse_file(pr_number, review_type) else {
-            continue;
-        };
-        if let Some(entry) = pulse {
             if validate_expected_head_sha(&entry.head_sha).is_ok() {
                 return Some(entry.head_sha.to_ascii_lowercase());
             }
@@ -1563,6 +1561,18 @@ pub fn resolve_local_review_head_sha(pr_number: u32) -> Option<String> {
     }
 
     None
+}
+
+pub fn remove_pulse_file(pr_number: u32, review_type: &str) -> Result<(), String> {
+    let path = pulse_file_path(pr_number, review_type)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "failed to remove pulse file {}: {err}",
+            path.display()
+        )),
+    }
 }
 
 pub fn read_last_lines(path: &Path, max_lines: usize) -> Result<Vec<String>, String> {

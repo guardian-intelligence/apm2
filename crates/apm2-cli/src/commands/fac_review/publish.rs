@@ -145,12 +145,8 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
         return Ok(identity.head_sha.to_ascii_lowercase());
     }
 
-    for review_type in ["security", "quality"] {
-        let state = super::state::load_review_run_state(pr_number, review_type)?;
-        if let super::state::ReviewRunStateLoad::Present(state) = state {
-            validate_expected_head_sha(&state.head_sha)?;
-            return Ok(state.head_sha.to_ascii_lowercase());
-        }
+    if let Some(value) = super::state::resolve_local_review_head_sha(pr_number) {
+        return Ok(value);
     }
 
     Err(format!(
