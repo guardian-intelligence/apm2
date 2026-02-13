@@ -999,6 +999,13 @@ fn run_terminate_inner(
         return Ok(());
     }
 
+    if run_state.status == types::ReviewRunStatus::Alive && run_state.pid.is_none() {
+        return Err(
+            "cannot terminate: run state is Alive but PID is missing - operator must investigate."
+                .to_string(),
+        );
+    }
+
     let mut killed = false;
     if let Some(pid) = run_state.pid {
         if state::is_process_alive(pid) {
@@ -1870,6 +1877,34 @@ mod tests {
         assert!(super::state::is_process_alive(pid));
 
         kill_child(child);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_run_terminate_inner_fails_when_pid_missing_for_alive_state() {
+        let pr_number = next_test_pr();
+        let home = apm2_home_dir().expect("apm2 home");
+        let state_path = super::state::review_run_state_path_for_home(&home, pr_number, "security");
+
+        let mut state = sample_run_state(pr_number, 0, "abcdef1234567890", Some(123_456_789));
+        state.pid = None;
+        super::state::write_review_run_state_for_home(&home, &state).expect("write run state");
+
+        let result =
+            super::run_terminate_inner("example/repo", Some(pr_number), None, "security", false);
+        assert!(result.is_err());
+        let error = result.expect_err("terminate should fail-closed");
+        assert!(error.contains("PID is missing"));
+
+        let loaded = super::state::load_review_run_state_for_home(&home, pr_number, "security")
+            .expect("load run-state");
+        let state = match loaded {
+            super::state::ReviewRunStateLoad::Present(state) => state,
+            other => panic!("expected present state, got {other:?}"),
+        };
+        assert_eq!(state.status, ReviewRunStatus::Alive);
+        assert!(state.pid.is_none());
+
         let _ = std::fs::remove_file(state_path);
     }
 

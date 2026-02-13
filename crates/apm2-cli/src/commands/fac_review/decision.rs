@@ -228,14 +228,35 @@ pub fn run_decision_set(
             eprintln!("WARNING: failed to clean prepared review inputs: {err}");
         }
     }
-    let exit_code =
-        match terminate_review_agent(&owner_repo, resolved_pr, normalized_dimension, &head_sha) {
-            Ok(_terminated) => exit_codes::SUCCESS,
-            Err(err) => {
-                eprintln!("WARNING: review termination step failed: {err}");
-                exit_codes::GENERIC_ERROR
+    let review_type = dimension_to_state_review_type(normalized_dimension);
+    let force_fail_on_noop_termination =
+        super::state::load_review_run_state_strict(resolved_pr, review_type)?.is_some_and(
+            |state| {
+                state.status == ReviewRunStatus::Alive
+                    && state.head_sha.eq_ignore_ascii_case(&head_sha)
+                    && super::state::extract_repo_from_pr_url(&state.pr_url)
+                        .is_some_and(|state_repo| state_repo.eq_ignore_ascii_case(&owner_repo))
             },
-        };
+        );
+
+    let exit_code = match terminate_review_agent(
+        &owner_repo,
+        resolved_pr,
+        normalized_dimension,
+        &head_sha,
+    ) {
+        Ok(false) if force_fail_on_noop_termination => {
+            eprintln!(
+                "ERROR: review termination failed for PR #{resolved_pr} type={normalized_dimension} while state is alive for the same SHA"
+            );
+            exit_codes::GENERIC_ERROR
+        },
+        Ok(true | false) => exit_codes::SUCCESS,
+        Err(err) => {
+            eprintln!("WARNING: review termination step failed: {err}");
+            exit_codes::GENERIC_ERROR
+        },
+    };
     Ok(exit_code)
 }
 
