@@ -1003,7 +1003,16 @@ pub struct ErrorResponse {
 // =============================================================================
 
 /// Runs the FAC command, returning an appropriate exit code.
-pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) -> u8 {
+///
+/// TCK-00595 MAJOR-2 FIX: `config_path` is threaded through so the
+/// `ensure_daemon_running` fallback spawn uses the same config the caller
+/// specified via `--config`.
+pub fn run_fac(
+    cmd: &FacCommand,
+    operator_socket: &Path,
+    session_socket: &Path,
+    config_path: &Path,
+) -> u8 {
     let json_output = cmd.json;
     let ledger_path = resolve_ledger_path(cmd.ledger_path.as_deref());
     let cas_path = resolve_cas_path(cmd.cas_path.as_deref());
@@ -1012,7 +1021,8 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
         cmd.subcommand,
         FacSubcommand::Gates(_) | FacSubcommand::Doctor(_)
     ) {
-        if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket) {
+        if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
+        {
             eprintln!("WARNING: Could not auto-start daemon: {e}");
         }
     }
@@ -1036,7 +1046,11 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
             },
         },
         FacSubcommand::Doctor(args) => {
-            match crate::commands::daemon::doctor(operator_socket, json_output || args.json) {
+            match crate::commands::daemon::doctor(
+                operator_socket,
+                config_path,
+                json_output || args.json,
+            ) {
                 Ok(()) => exit_codes::SUCCESS,
                 Err(_) => exit_codes::GENERIC_ERROR,
             }

@@ -864,8 +864,17 @@ fn main() -> Result<()> {
     // Parse command-line arguments (synchronous, no threads)
     let args = Args::parse();
 
-    // Detect GitHub owner/repo from git remote before daemonization changes CWD.
-    let detected_github_owner_repo = detect_github_owner_repo_from_remote();
+    // TCK-00595 MAJOR-1 FIX: Do NOT auto-detect GitHub owner/repo from CWD.
+    //
+    // The daemon is a user-singleton (fixed XDG socket path). Binding it to
+    // the CWD at startup causes cross-context pollution: if the user starts
+    // the daemon from repo A's directory, it permanently serves repo A's
+    // projection even when the user switches to repo B.
+    //
+    // The daemon MUST require explicit configuration via ecosystem.toml's
+    // [daemon.projection] section (github_owner + github_repo). Auto-detect
+    // from `git remote` is appropriate only in the short-lived CLI client
+    // layer, not in the long-lived daemon.
 
     // Daemonize if requested - MUST happen before any async runtime!
     //
@@ -892,17 +901,14 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("failed to create Tokio runtime")?;
 
     // Run the async main on the runtime
-    runtime.block_on(async_main(args, detected_github_owner_repo))
+    runtime.block_on(async_main(args))
 }
 
 /// Async entry point - runs after daemonization is complete.
 ///
 /// All async initialization and the main event loop live here.
 /// This is safe because the Tokio runtime was created AFTER any `fork()` calls.
-async fn async_main(
-    args: Args,
-    detected_github_owner_repo: Option<(String, String)>,
-) -> Result<()> {
+async fn async_main(args: Args) -> Result<()> {
     // Initialize logging
     let filter = EnvFilter::try_new(&args.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -1259,33 +1265,19 @@ async fn async_main(
 
         let projection_conn = Arc::clone(conn);
         let projection_config = &daemon_config.config.daemon.projection;
-        let github_owner = if projection_config.github_owner.is_empty() {
-            detected_github_owner_repo
-                .as_ref()
-                .map(|(owner, _)| owner.clone())
-                .unwrap_or_default()
-        } else {
-            projection_config.github_owner.clone()
-        };
-        let github_repo = if projection_config.github_repo.is_empty() {
-            detected_github_owner_repo
-                .as_ref()
-                .map(|(_, repo)| repo.clone())
-                .unwrap_or_default()
-        } else {
-            projection_config.github_repo.clone()
-        };
 
-        if (projection_config.github_owner.is_empty() || projection_config.github_repo.is_empty())
-            && !github_owner.is_empty()
-            && !github_repo.is_empty()
-        {
+        // TCK-00595 MAJOR-1 FIX: The daemon MUST NOT auto-detect owner/repo
+        // from CWD. The daemon is a user-singleton with a fixed socket path;
+        // binding it to the startup CWD's git remote would cause cross-context
+        // pollution if the user switches repositories. Only explicit config
+        // values are used.
+        let github_owner = projection_config.github_owner.clone();
+        let github_repo = projection_config.github_repo.clone();
+
+        if projection_config.enabled && (github_owner.is_empty() || github_repo.is_empty()) {
             tracing::warn!(
-                owner = %github_owner,
-                repo = %github_repo,
-                "projection target auto-detected from git remote; \
-                 set projection.github_owner and projection.github_repo in config \
-                 for explicit binding"
+                "projection.enabled=true but github_owner or github_repo is not set in config; \
+                 set [daemon.projection] github_owner and github_repo in ecosystem.toml"
             );
         }
 
@@ -2095,50 +2087,55 @@ fn sha_to_32_bytes(hex_sha: &str) -> [u8; 32] {
     *blake3::hash(hex_sha.as_bytes()).as_bytes()
 }
 
-fn detect_github_owner_repo_from_remote() -> Option<(String, String)> {
-    let output = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    parse_github_owner_repo(&url)
-}
+// TCK-00595 MAJOR-1: detect_github_owner_repo_from_remote() removed.
+// The daemon must not auto-detect owner/repo from CWD git remote.
+// Use explicit [daemon.projection] config in ecosystem.toml instead.
 
+/// Parse a GitHub remote URL into (owner, repo).
+///
+/// Supports ssh://, git@, https://, and http:// URL formats.
+///
+/// # NIT FIX: Strict regex validation
+///
+/// Owner and repo segments are validated against `[a-zA-Z0-9._-]+` to reject
+/// malformed or injection-prone values.
+#[cfg(test)]
 fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
+    /// Validate that a GitHub owner or repo segment contains only safe
+    /// characters. GitHub allows alphanumeric, hyphens, dots, and
+    /// underscores in owner/repo names.
+    fn is_valid_segment(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= 100
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+    }
+
+    fn extract_owner_repo(path_str: &str) -> Option<(String, String)> {
+        let path = path_str.strip_suffix(".git").unwrap_or(path_str);
+        let parts: Vec<&str> = path.splitn(2, '/').collect();
+        if parts.len() == 2 && is_valid_segment(parts[0]) && is_valid_segment(parts[1]) {
+            Some((parts[0].to_string(), parts[1].to_string()))
+        } else {
+            None
+        }
+    }
+
     // ssh://git@github.com/owner/repo[.git]
     if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
-        let path = rest.strip_suffix(".git").unwrap_or(rest);
-        let parts: Vec<&str> = path.splitn(2, '/').collect();
-        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-            return Some((parts[0].to_string(), parts[1].to_string()));
-        }
+        return extract_owner_repo(rest);
     }
     // git@github.com:owner/repo[.git]
     if let Some(rest) = url.strip_prefix("git@github.com:") {
-        let path = rest.strip_suffix(".git").unwrap_or(rest);
-        let parts: Vec<&str> = path.splitn(2, '/').collect();
-        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-            return Some((parts[0].to_string(), parts[1].to_string()));
-        }
+        return extract_owner_repo(rest);
     }
     // https://github.com/owner/repo[.git]
     if let Some(rest) = url.strip_prefix("https://github.com/") {
-        let path = rest.strip_suffix(".git").unwrap_or(rest);
-        let parts: Vec<&str> = path.splitn(2, '/').collect();
-        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-            return Some((parts[0].to_string(), parts[1].to_string()));
-        }
+        return extract_owner_repo(rest);
     }
     // http://github.com/owner/repo[.git]
     if let Some(rest) = url.strip_prefix("http://github.com/") {
-        let path = rest.strip_suffix(".git").unwrap_or(rest);
-        let parts: Vec<&str> = path.splitn(2, '/').collect();
-        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-            return Some((parts[0].to_string(), parts[1].to_string()));
-        }
+        return extract_owner_repo(rest);
     }
     None
 }

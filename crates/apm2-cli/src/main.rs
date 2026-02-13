@@ -322,7 +322,9 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Daemon { no_daemon, command } => match command {
             Some(DaemonSubcommand::Install) => commands::daemon::install(),
-            Some(DaemonSubcommand::Doctor { json }) => commands::daemon::doctor(&socket_path, json),
+            Some(DaemonSubcommand::Doctor { json }) => {
+                commands::daemon::doctor(&socket_path, &cli.config, json)
+            },
             None => commands::daemon::run(&cli.config, no_daemon),
         },
         Commands::Kill => commands::daemon::kill(&socket_path),
@@ -446,7 +448,10 @@ fn main() -> Result<()> {
             // FAC commands are primarily ledger/CAS-driven; work lifecycle
             // status/list subcommands route through operator IPC.
             // Exit codes per RFC-0018.
-            let exit_code = commands::fac::run_fac(&fac_cmd, &operator_socket, &session_socket);
+            // TCK-00595 MAJOR-2 FIX: Thread config path so ensure_daemon_running
+            // can forward --config when spawning the daemon.
+            let exit_code =
+                commands::fac::run_fac(&fac_cmd, &operator_socket, &session_socket, &cli.config);
             std::process::exit(i32::from(exit_code));
         },
         Commands::Factory(cmd) => match cmd {
