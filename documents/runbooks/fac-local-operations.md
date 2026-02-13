@@ -176,10 +176,10 @@ apm2 fac gates --quick
 
 ```bash
 # Remove old evidence logs
-rm -rf $APM2_HOME/private/fac/evidence/
+rm -rf "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"
 
 # Check disk usage
-du -sh $APM2_HOME/private/fac/evidence/ 2>/dev/null
+du -sh "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/" 2>/dev/null
 ```
 
 Run manual cleanup when:
@@ -223,13 +223,13 @@ When queue-based execution is implemented, a job will be moved to
 
 ```bash
 # List quarantined items
-ls $APM2_HOME/private/fac/queue/quarantine/
+ls "${APM2_HOME:-$HOME/.apm2}/private/fac/queue/quarantine/"
 
 # Inspect a quarantined job (the original spec is preserved)
-cat $APM2_HOME/private/fac/queue/quarantine/<job_id>.json
+cat "${APM2_HOME:-$HOME/.apm2}/private/fac/queue/quarantine/<job_id>.json"
 
 # Check for associated denial receipt
-ls $APM2_HOME/private/fac/receipts/ | grep <job_id>
+ls "${APM2_HOME:-$HOME/.apm2}/private/fac/receipts/" | grep <job_id>
 ```
 
 Common causes and remediation:
@@ -252,10 +252,10 @@ When queue-based execution is implemented, a job will be moved to
 
 ```bash
 # List denied items
-ls $APM2_HOME/private/fac/queue/denied/
+ls "${APM2_HOME:-$HOME/.apm2}/private/fac/queue/denied/"
 
 # Inspect denial reason (sidecar file)
-cat $APM2_HOME/private/fac/queue/denied/<job_id>.reason.json
+cat "${APM2_HOME:-$HOME/.apm2}/private/fac/queue/denied/<job_id>.reason.json"
 ```
 
 ### 4.4 Recovering from quarantine/denial (PLANNED)
@@ -311,8 +311,8 @@ Symptom: apm2 fac gates hangs or returns immediately with no output
 ```
 
 1. Check process health: `systemctl --user status apm2-daemon`
-2. Check evidence logs: `ls $APM2_HOME/private/fac/evidence/` and `apm2 fac --json logs`
-3. Check disk space: `df -h` and `du -sh $APM2_HOME/private/fac/`
+2. Check evidence logs: `ls "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"` and `apm2 fac --json logs`
+3. Check disk space: `df -h` and `du -sh "${APM2_HOME:-$HOME/.apm2}/private/fac/"`
 
 ### 6.2 Cold-start timeout (240s exceeded)
 
@@ -357,7 +357,7 @@ Symptom: Builds fail with "No space left on device"
 ```
 
 1. Free disk space manually (see section 3.3)
-2. Check for orphaned evidence logs: `du -sh $APM2_HOME/private/fac/evidence/`
+2. Check for orphaned evidence logs: `du -sh "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"`
 3. Check build target directories: `du -sh target/`
 4. Target directories are compilation caches (safe to delete): `rm -rf target/`
 
@@ -400,6 +400,7 @@ Symptom: Builds fail with "No space left on device"
 | `apm2 fac resume` | Show crash-only resume helpers from ledger anchor |
 | `apm2 fac role-launch` | Launch a FAC role with hash-bound admission checks |
 | `apm2 fac pr` | GitHub App credential management and PR operations |
+| `apm2 fac doctor` | Check daemon health and prerequisites |
 
 ### PLANNED -- not yet implemented (FESv1 queue/worker/lane surface)
 

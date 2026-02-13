@@ -67,14 +67,14 @@ decision_tree:
           action: "References do not interpolate variables. Replace placeholders like <TICKET_ID>, <PR_NUMBER>, and <WORKTREE_PATH> before running commands."
         - id: DISCOVER_RELEVANT_FAC_HELP
           action: |
-            Discovery what the apm2 CLI can do for you. Run these commands checklist:
+            Discover what the apm2 CLI can do for you. Run these commands checklist:
             (1) `apm2 fac --help`
             (2) `apm2 fac gates --help`
             (3) `apm2 fac logs --help`
             (4) `apm2 fac push --help`
             (5) `apm2 fac review --help`
-            (7) `apm2 fac review status --help`
-            (8) `apm2 fac restart --help`
+            (6) `apm2 fac review status --help`
+            (7) `apm2 fac restart --help`
             Help output is authoritative for names/flags.
         - id: RESOLVE_SCOPE
           action: |
@@ -230,16 +230,16 @@ decision_tree:
           action: "Immediately before push, run `apm2 fac gates`."
         - id: VERIFY_GATE_HEALTH
           action: |
-            If gates fail to start, check: (1) evidence log directory exists: `ls $APM2_HOME/private/fac/evidence/`; (2) process health: `systemctl --user status apm2-daemon`; (3) disk space: `df -h`. If disk is full, reclaim space by removing old evidence logs: `rm -rf $APM2_HOME/private/fac/evidence/`.
+            If gates fail to start, check: (1) evidence log directory exists: `ls "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"`; (2) process health: `systemctl --user status apm2-daemon`; (3) disk space: `df -h`. If disk is full, reclaim space by removing old evidence logs: `rm -rf "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"`.
         - id: WARM_BUILD_IF_COLD
           action: |
             If gate execution hits cold-start timeouts (240s wall-time exceeded during large compilations), pre-warm by running `cargo build --workspace` before retrying gates. This populates compiled dependencies so subsequent gate runs avoid full recompilation.
         - id: READ_FAC_LOGS_ON_FAIL
-          action: "On failure, run `apm2 fac --json logs` and inspect referenced evidence logs under `$APM2_HOME/private/fac/evidence/`."
+          action: "On failure, run `apm2 fac --json logs` and inspect referenced evidence logs under `${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/`."
         - id: HANDLE_RESOURCE_EXHAUSTION
           action: |
             If gate execution fails due to resource exhaustion:
-            - Reclaim disk space: `rm -rf $APM2_HOME/private/fac/evidence/` (old evidence logs, safe to delete) and `rm -rf target/` (compilation cache, safe to delete).
+            - Reclaim disk space: `rm -rf "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"` (old evidence logs, safe to delete) and `rm -rf target/` (compilation cache, safe to delete).
             - Re-run gates after cleanup: `apm2 fac gates`.
             Note: Queue-based quarantine/denial is PLANNED for the FESv1 queue/worker surface and does not apply to current local gate execution.
         - id: FIX_AND_RERUN
@@ -251,7 +251,7 @@ decision_tree:
       steps[3]:
         - id: HANDLE_DISK_PRESSURE
           action: |
-            If gate execution fails due to disk exhaustion, reclaim space by removing old evidence logs: `rm -rf $APM2_HOME/private/fac/evidence/` and build caches: `rm -rf target/`. Check disk usage: `df -h` and `du -sh $APM2_HOME/private/fac/`.
+            If gate execution fails due to disk exhaustion, reclaim space by removing old evidence logs: `rm -rf "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"` and build caches: `rm -rf target/`. Check disk usage: `df -h` and `du -sh "${APM2_HOME:-$HOME/.apm2}/private/fac/"`.
         - id: HANDLE_BUILD_FAILURES
           action: |
             If gates fail due to build errors, check evidence logs (`apm2 fac --json logs`) for detailed output. Common causes: missing dependencies, stale Cargo.lock, compiler version mismatch. Fix the root cause and re-run `apm2 fac gates`.

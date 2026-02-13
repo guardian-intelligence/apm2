@@ -271,11 +271,13 @@ rfc_design_decisions:
     chosen_rationale: |
       Host safety is a non-negotiable FESv1 requirement. The sccache
       daemon process model is incompatible with per-lane cgroup isolation.
-      Lane-scoped target directories plus `apm2 fac warm` provide
-      sufficient build reuse for the current host class without violating
-      containment. sccache MAY be re-evaluated after proving that its
-      processes remain inside the job cgroup (e.g., via --no-daemon mode
-      or systemd slice inheritance).
+      Lane-scoped target directories plus manual pre-warming (currently
+      `cargo build --workspace`; a dedicated `apm2 fac warm` command is
+      PLANNED for the FESv1 lane surface) provide sufficient build reuse
+      for the current host class without violating containment. sccache
+      MAY be re-evaluated after proving that its processes remain inside
+      the job cgroup (e.g., via --no-daemon mode or systemd slice
+      inheritance).
     impacted_requirement_ids:
     - PERF-002
     evidence_ids:
