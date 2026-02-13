@@ -750,13 +750,7 @@ impl LaneManager {
         let lock_path = self.lock_path(lane_id);
         ensure_parent_dir(&lock_path)?;
 
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|e| LaneError::io(format!("opening lock file {}", lock_path.display()), e))?;
+        let lock_file = open_lock_file(&lock_path, true)?;
 
         // Set restrictive permissions on the lock file (CTR-2611)
         #[cfg(unix)]
@@ -818,11 +812,7 @@ impl LaneManager {
         if !lock_path.exists() {
             return Ok(false);
         }
-        let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|e| LaneError::io(format!("opening lock file {}", lock_path.display()), e))?;
+        let lock_file = open_lock_file(&lock_path, false)?;
         match try_flock_exclusive(&lock_file) {
             Ok(true) => {
                 // We acquired it — release immediately by dropping.
@@ -1180,6 +1170,41 @@ fn open_file_no_follow(path: &Path) -> Result<File, LaneError> {
             .open(path)
             .map_err(|e| LaneError::io(format!("opening {}", path.display()), e))
     }
+}
+
+fn open_lock_file(lock_path: &Path, create_if_missing: bool) -> Result<File, LaneError> {
+    let is_symlink = match lock_path.symlink_metadata() {
+        Ok(metadata) => metadata.file_type().is_symlink(),
+        Err(e) if create_if_missing && e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(LaneError::io(
+                format!("validating lock file path {}", lock_path.display()),
+                e,
+            ));
+        },
+    };
+
+    if is_symlink {
+        return Err(LaneError::io(
+            format!("opening lock file {}", lock_path.display()),
+            io::Error::new(io::ErrorKind::InvalidInput, "lock path is a symlink"),
+        ));
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).truncate(false);
+    if create_if_missing {
+        options.create(true);
+    }
+
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+
+    options
+        .open(lock_path)
+        .map_err(|e| LaneError::io(format!("opening lock file {}", lock_path.display()), e))
 }
 
 fn lane_dir_lane_id(lane_dir: &Path) -> Result<&str, LaneError> {
@@ -2052,6 +2077,62 @@ mod tests {
         atomic_write(&path, b"second").expect("write 2");
         let contents = fs::read_to_string(&path).expect("read");
         assert_eq!(contents, "second");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lane_manager_try_lock_rejects_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lock_path = manager.lock_path(lane_id);
+        let target = root.path().join("real_lock_target");
+        fs::write(&target, b"target").expect("write target");
+        symlink(&target, &lock_path).expect("create symlink lock path");
+
+        let err = manager
+            .try_lock(lane_id)
+            .expect_err("try_lock should reject symlinked lock path");
+        match err {
+            LaneError::Io { source, .. } => {
+                assert_eq!(source.kind(), io::ErrorKind::InvalidInput);
+            },
+            other => panic!("expected io error, got {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lane_manager_is_lock_held_rejects_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lock_path = manager.lock_path(lane_id);
+        let target = root.path().join("real_lock_target_for_status");
+        fs::write(&target, b"target").expect("write target");
+        symlink(&target, &lock_path).expect("create symlink lock path");
+
+        let err = manager
+            .is_lock_held(lane_id)
+            .expect_err("is_lock_held should reject symlinked lock path");
+        match err {
+            LaneError::Io { source, .. } => {
+                assert_eq!(source.kind(), io::ErrorKind::InvalidInput);
+            },
+            other => panic!("expected io error, got {other}"),
+        }
     }
 
     // ── Concurrency Test ───────────────────────────────────────────────
