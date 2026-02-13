@@ -455,6 +455,7 @@ fn write_fail_closed_state_for_dispatch(
         previous_head_sha: None,
         pid: None,
         proc_start_time: None,
+        integrity_hmac: None,
     };
     write_review_run_state_for_home(home, &state)?;
     Ok(state)
@@ -601,6 +602,7 @@ fn seed_pending_run_state_for_dispatch_for_home(
         previous_head_sha: lineage.map(|value| value.previous_head_sha.clone()),
         pid: None,
         proc_start_time: None,
+        integrity_hmac: None,
     };
     write_review_run_state_for_home(home, &state)?;
     Ok(state)
@@ -833,33 +835,44 @@ where
 
     // Final dedup gate: if the orchestrator's review lease is already held,
     // a reviewer is actively running — no need to spawn another.
-    if try_acquire_review_lease(&key.owner_repo, key.pr_number, &key.review_type)?.is_none() {
-        // Lease held — enrich the response with current run state so callers
-        // can see which run_id/pid they joined.
-        let (run_state_str, run_id, seq, pid) =
-            match load_review_run_state_for_home(home, key.pr_number, &key.review_type) {
-                Ok(ReviewRunStateLoad::Present(state)) => (
-                    state.status.as_str().to_string(),
-                    Some(state.run_id),
-                    Some(state.sequence_number),
-                    state.pid,
-                ),
-                _ => ("unknown".to_string(), None, None, None),
-            };
-        return Ok(DispatchReviewResult {
-            review_type: key.review_type.clone(),
-            mode: "joined".to_string(),
-            run_state: run_state_str,
-            run_id,
-            sequence_number: seq,
-            terminal_reason: None,
-            pid,
-            unit: None,
-            log_file: None,
-        });
-    }
-    // Lease was free (we acquired it) — drop immediately so the spawned process can
-    // take it.
+    let review_lease =
+        match try_acquire_review_lease(&key.owner_repo, key.pr_number, &key.review_type) {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                // Lease held — enrich the response with current run state so callers
+                // can see which run_id/pid they joined.
+                let (run_state_str, run_id, seq, pid) =
+                    match load_review_run_state_for_home(home, key.pr_number, &key.review_type) {
+                        Ok(ReviewRunStateLoad::Present(state)) => (
+                            state.status.as_str().to_string(),
+                            Some(state.run_id),
+                            Some(state.sequence_number),
+                            state.pid,
+                        ),
+                        _ => ("unknown".to_string(), None, None, None),
+                    };
+                return Ok(DispatchReviewResult {
+                    review_type: key.review_type.clone(),
+                    mode: "joined".to_string(),
+                    run_state: run_state_str,
+                    run_id,
+                    sequence_number: seq,
+                    terminal_reason: None,
+                    pid,
+                    unit: None,
+                    log_file: None,
+                });
+            },
+            Err(err) => {
+                return Err(format!(
+                    "failed to acquire review lease for {}#{} {}: {err}",
+                    key.owner_repo, key.pr_number, key.review_type
+                ));
+            },
+        };
+
+    // Keep the lease open through spawn and state write so duplicate dispatchers
+    // cannot race this decision-critical transition.
 
     if let Some(pending) = read_fresh_pending_dispatch_for_home(home, key)? {
         return attach_run_state_contract_for_home(
@@ -897,6 +910,7 @@ where
         },
     };
     write_pending_dispatch_for_home(home, key, &started)?;
+    let _ = review_lease;
     attach_run_state_contract_for_home(home, key, started)
 }
 
@@ -1265,6 +1279,7 @@ mod tests {
             previous_head_sha: None,
             pid,
             proc_start_time: pid.and_then(get_process_start_time),
+            integrity_hmac: None,
         }
     }
 
@@ -1342,6 +1357,10 @@ mod tests {
         DispatchIdempotencyKey::new("Example/Repo", 441, "security", head_sha)
     }
 
+    fn dispatch_key_with_owner(owner_repo: &str, head_sha: &str) -> DispatchIdempotencyKey {
+        DispatchIdempotencyKey::new(owner_repo, 441, "security", head_sha)
+    }
+
     fn pr_url() -> &'static str {
         "https://github.com/example/repo/pull/441"
     }
@@ -1362,7 +1381,10 @@ mod tests {
     fn test_idempotent_dispatch_dedup() {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
-        let key = dispatch_key("0123456789abcdef0123456789abcdef01234567");
+        let key = dispatch_key_with_owner(
+            "Example/Repo-Idempotent",
+            "0123456789abcdef0123456789abcdef01234567",
+        );
         let spawn_count = Arc::new(AtomicUsize::new(0));
         let spawned_children = Arc::new(Mutex::new(Vec::new()));
 
@@ -1447,7 +1469,10 @@ mod tests {
             })
         };
 
-        let key = dispatch_key("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let key = dispatch_key_with_owner(
+            "Example/Repo-DifferentSha",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
         let result = dispatch_single_review_for_home_with_spawn(
             home,
             pr_url(),
@@ -1472,7 +1497,10 @@ mod tests {
         terminal.run_id = "pr441-security-s4-01234567".to_string();
         write_review_run_state_for_home(home, &terminal).expect("seed terminal state");
 
-        let key = dispatch_key("0123456789abcdef0123456789abcdef01234567");
+        let key = dispatch_key_with_owner(
+            "Example/Repo-Force",
+            "0123456789abcdef0123456789abcdef01234567",
+        );
         let spawn = |_: &str,
                      _: u32,
                      _: ReviewKind,
@@ -1529,7 +1557,10 @@ mod tests {
             })
         };
 
-        let key = dispatch_key("0123456789abcdef0123456789abcdef01234567");
+        let key = dispatch_key_with_owner(
+            "Example/Repo-Force-Spawn",
+            "0123456789abcdef0123456789abcdef01234567",
+        );
         let result = dispatch_single_review_for_home_with_spawn_force(
             home,
             pr_url(),
@@ -2005,7 +2036,10 @@ mod tests {
             })
         };
 
-        let key = dispatch_key("0123456789abcdef0123456789abcdef01234567");
+        let key = dispatch_key_with_owner(
+            "Example/Repo-StalePidNotJoined",
+            "0123456789abcdef0123456789abcdef01234567",
+        );
         let result = dispatch_single_review_for_home_with_spawn(
             home,
             pr_url(),

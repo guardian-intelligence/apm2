@@ -2,17 +2,43 @@
 //! checks.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use chrono::Utc;
 use fs2::FileExt;
+use hmac::{Hmac, Mac};
+use rand::RngCore;
+use serde::Serialize;
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 use super::types::{
-    PulseFile, ReviewRunState, ReviewStateEntry, ReviewStateFile, apm2_home_dir, ensure_parent_dir,
-    entry_pr_number, parse_pr_url, sanitize_for_path,
+    PulseFile, ReviewRunState, ReviewStateEntry, ReviewStateFile, TERMINAL_INTEGRITY_FAILURE,
+    apm2_home_dir, ensure_parent_dir, entry_pr_number, parse_pr_url, sanitize_for_path,
 };
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewRunTerminationReceipt {
+    pub emitted_at: String,
+    pub repo: String,
+    pub pr_number: u32,
+    pub review_type: String,
+    pub run_id: String,
+    pub head_sha: String,
+    pub decision_comment_id: u64,
+    pub decision_author: String,
+    pub decision_signature: String,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome_reason: Option<String>,
+}
+
+type HmacSha256 = Hmac<Sha256>;
 
 // ── Path helpers ────────────────────────────────────────────────────────────
 
@@ -36,6 +62,185 @@ fn review_run_dir_for_home(home: &Path, pr_number: u32, review_type: &str) -> Pa
 
 pub fn review_run_state_path_for_home(home: &Path, pr_number: u32, review_type: &str) -> PathBuf {
     review_run_dir_for_home(home, pr_number, review_type).join("state.json")
+}
+
+fn review_run_secret_path_for_home(home: &Path, pr_number: u32, review_type: &str) -> PathBuf {
+    review_run_dir_for_home(home, pr_number, review_type).join("run_secret")
+}
+
+fn review_run_termination_receipt_path_for_home(
+    home: &Path,
+    pr_number: u32,
+    review_type: &str,
+) -> PathBuf {
+    review_run_dir_for_home(home, pr_number, review_type).join("termination_receipt.json")
+}
+
+fn bind_review_run_state_integrity_for_home(
+    home: &Path,
+    state: &mut ReviewRunState,
+) -> Result<(), String> {
+    if state.pid.is_none() || state.proc_start_time.is_none() {
+        return Ok(());
+    }
+    let secret = match read_run_secret_for_home(home, state.pr_number, &state.review_type)? {
+        Some(secret) => secret,
+        None => rotate_run_secret_for_home(home, state.pr_number, &state.review_type)?,
+    };
+
+    if state.integrity_hmac.is_none() {
+        bind_review_run_state_integrity(state, &secret)?;
+        return Ok(());
+    }
+
+    match verify_review_run_state_integrity(state, &secret) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("run-state integrity check failed".to_string()),
+        Err(err) => Err(format!("run-state integrity check error: {err}")),
+    }
+}
+
+#[derive(Serialize)]
+struct ReviewRunStateIntegrityBinding<'a> {
+    run_id: &'a str,
+    pid: u32,
+    proc_start_time: u64,
+    pr_url: &'a str,
+    head_sha: &'a str,
+    pr_number: u32,
+    review_type: &'a str,
+}
+
+fn open_secret_for_read(path: &Path) -> Result<File, String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            "run secret missing".to_string()
+        } else {
+            format!("failed to open run secret {}: {err}", path.display())
+        }
+    })
+}
+
+fn open_secret_for_write(path: &Path) -> Result<File, String> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .map_err(|err| format!("failed to write run secret {}: {err}", path.display()))
+}
+
+pub fn rotate_run_secret_for_home(
+    home: &Path,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<Vec<u8>, String> {
+    let mut secret = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+    let path = review_run_secret_path_for_home(home, pr_number, review_type);
+    ensure_parent_dir(&path)?;
+    let mut secret_file = open_secret_for_write(&path)?;
+    let encoded = hex::encode(secret);
+    secret_file
+        .write_all(encoded.as_bytes())
+        .map_err(|err| format!("failed to write run secret {}: {err}", path.display()))?;
+    secret_file
+        .sync_all()
+        .map_err(|err| format!("failed to sync run secret {}: {err}", path.display()))?;
+    Ok(secret.to_vec())
+}
+
+pub fn read_run_secret_for_home(
+    home: &Path,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let path = review_run_secret_path_for_home(home, pr_number, review_type);
+    let mut file = match open_secret_for_read(&path) {
+        Ok(file) => file,
+        Err(err) if err == "run secret missing" => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let mut encoded = String::new();
+    file.read_to_string(&mut encoded)
+        .map_err(|err| format!("failed to read run secret {}: {err}", path.display()))?;
+    if encoded.trim().is_empty() {
+        return Ok(None);
+    }
+    let secret = hex::decode(encoded.trim())
+        .map_err(|err| format!("failed to decode run secret {}: {err}", path.display()))?;
+    Ok(Some(secret))
+}
+
+#[allow(dead_code)]
+pub fn review_run_secret_path(pr_number: u32, review_type: &str) -> Result<PathBuf, String> {
+    Ok(review_run_secret_path_for_home(
+        &apm2_home_dir()?,
+        pr_number,
+        review_type,
+    ))
+}
+
+pub fn run_state_integrity_binding_payload(state: &ReviewRunState) -> Result<Vec<u8>, String> {
+    let binding = ReviewRunStateIntegrityBinding {
+        run_id: &state.run_id,
+        pid: state.pid.ok_or_else(|| "state missing pid".to_string())?,
+        proc_start_time: state
+            .proc_start_time
+            .ok_or_else(|| "state missing proc_start_time".to_string())?,
+        pr_url: &state.pr_url,
+        head_sha: &state.head_sha,
+        pr_number: state.pr_number,
+        review_type: &state.review_type,
+    };
+    serde_json::to_vec(&binding).map_err(|err| format!("failed to build integrity payload: {err}"))
+}
+
+pub fn compute_review_run_state_integrity_hmac(
+    state: &ReviewRunState,
+    secret: &[u8],
+) -> Result<String, String> {
+    let mut mac = HmacSha256::new_from_slice(secret)
+        .map_err(|err| format!("invalid integrity secret: {err}"))?;
+    let payload = run_state_integrity_binding_payload(state)?;
+    mac.update(&payload);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+pub fn bind_review_run_state_integrity(
+    state: &mut ReviewRunState,
+    secret: &[u8],
+) -> Result<(), String> {
+    state.integrity_hmac = Some(compute_review_run_state_integrity_hmac(state, secret)?);
+    Ok(())
+}
+
+pub fn verify_review_run_state_integrity(
+    state: &ReviewRunState,
+    secret: &[u8],
+) -> Result<bool, String> {
+    let stored = state
+        .integrity_hmac
+        .as_deref()
+        .ok_or_else(|| "state missing integrity_hmac".to_string())?;
+    let expected =
+        hex::decode(stored).map_err(|err| format!("invalid integrity_hmac encoding: {err}"))?;
+    let actual = hex::decode(compute_review_run_state_integrity_hmac(state, secret)?)
+        .map_err(|err| format!("invalid computed integrity encoding: {err}"))?;
+    if expected.len() != actual.len() {
+        return Ok(false);
+    }
+    Ok(expected.ct_eq(actual.as_slice()).into())
 }
 
 fn review_runs_dir_path() -> Result<PathBuf, String> {
@@ -240,7 +445,10 @@ pub fn extract_repo_from_pr_url(pr_url: &str) -> Option<String> {
 
 pub fn write_review_run_state(state: &ReviewRunState) -> Result<PathBuf, String> {
     let path = review_run_state_path(state.pr_number, &state.review_type)?;
-    write_review_run_state_to_path(&path, state)?;
+    let home = apm2_home_dir()?;
+    let mut state = state.clone();
+    bind_review_run_state_integrity_for_home(&home, &mut state)?;
+    write_review_run_state_to_path(&path, &state)?;
     Ok(path)
 }
 
@@ -249,8 +457,56 @@ pub fn write_review_run_state_for_home(
     state: &ReviewRunState,
 ) -> Result<PathBuf, String> {
     let path = review_run_state_path_for_home(home, state.pr_number, &state.review_type);
-    write_review_run_state_to_path(&path, state)?;
+    let mut state = state.clone();
+    bind_review_run_state_integrity_for_home(home, &mut state)?;
+    write_review_run_state_to_path(&path, &state)?;
     Ok(path)
+}
+
+pub fn write_review_run_state_integrity_receipt_for_home(
+    home: &Path,
+    receipt: &ReviewRunTerminationReceipt,
+) -> Result<PathBuf, String> {
+    let path =
+        review_run_termination_receipt_path_for_home(home, receipt.pr_number, &receipt.review_type);
+    ensure_parent_dir(&path)?;
+    let payload = serde_json::to_vec_pretty(receipt)
+        .map_err(|err| format!("failed to serialize termination receipt: {err}"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("termination receipt path has no parent: {}", path.display()))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|err| format!("failed to create termination receipt temp file: {err}"))?;
+    temp.write_all(&payload)
+        .map_err(|err| format!("failed to write termination receipt temp file: {err}"))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|err| format!("failed to sync termination receipt temp file: {err}"))?;
+    temp.persist(path.clone())
+        .map_err(|err| format!("failed to persist {}: {err}", path.display()))?;
+    Ok(path)
+}
+
+pub fn verify_review_run_state_integrity_binding(
+    home: &Path,
+    state: &ReviewRunState,
+) -> Result<(), String> {
+    let secret = read_run_secret_for_home(home, state.pr_number, &state.review_type)?
+        .ok_or_else(|| "run secret missing".to_string())?;
+    let stored = state
+        .integrity_hmac
+        .as_deref()
+        .ok_or_else(|| TERMINAL_INTEGRITY_FAILURE.to_string())?;
+    let expected =
+        hex::decode(stored).map_err(|err| format!("failed to decode integrity_hmac: {err}"))?;
+    let computed = hex::decode(compute_review_run_state_integrity_hmac(state, &secret)?)
+        .map_err(|err| format!("failed to compute integrity_hmac: {err}"))?;
+    if expected.len() != computed.len()
+        || subtle::ConstantTimeEq::ct_eq(&expected[..], &computed[..]).unwrap_u8() != 1
+    {
+        return Err(TERMINAL_INTEGRITY_FAILURE.to_string());
+    }
+    Ok(())
 }
 
 pub fn write_review_run_state_to_path(path: &Path, state: &ReviewRunState) -> Result<(), String> {
@@ -593,10 +849,12 @@ pub fn read_last_lines(path: &Path, max_lines: usize) -> Result<Vec<String>, Str
 #[cfg(test)]
 mod tests {
     use super::{
-        ReviewRunStateLoad, build_review_run_id, extract_repo_from_pr_url, get_process_start_time,
-        load_review_run_state_for_home, load_review_run_state_strict_for_home,
-        next_review_sequence_number_for_home, parse_process_start_time,
-        review_run_state_path_for_home, write_review_run_state_to_path,
+        ReviewRunStateLoad, bind_review_run_state_integrity, build_review_run_id,
+        extract_repo_from_pr_url, get_process_start_time, load_review_run_state_for_home,
+        load_review_run_state_strict_for_home, next_review_sequence_number_for_home,
+        parse_process_start_time, read_run_secret_for_home, review_run_secret_path_for_home,
+        review_run_state_path_for_home, rotate_run_secret_for_home,
+        verify_review_run_state_integrity, write_review_run_state_to_path,
     };
     use crate::commands::fac_review::types::{ReviewRunState, ReviewRunStatus};
 
@@ -624,7 +882,47 @@ mod tests {
             previous_head_sha: None,
             pid: Some(12345),
             proc_start_time: Some(987_654_321),
+            integrity_hmac: None,
         }
+    }
+
+    #[test]
+    fn test_review_run_state_integrity_tamper_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let mut state = sample_state();
+        let _ = rotate_run_secret_for_home(home, 441, "security").expect("generate secret");
+        let secret = read_run_secret_for_home(home, 441, "security")
+            .expect("read secret")
+            .expect("secret present");
+        bind_review_run_state_integrity(&mut state, &secret).expect("bind integrity");
+        assert!(
+            verify_review_run_state_integrity(&state, &secret).expect("verify integrity"),
+            "tamper check should pass for original state"
+        );
+
+        state.proc_start_time = Some(111_111_111);
+        assert!(
+            !verify_review_run_state_integrity(&state, &secret).expect("verify modified state"),
+            "tampered state must fail integrity check"
+        );
+    }
+
+    #[test]
+    fn test_missing_run_secret_is_none() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        assert_eq!(
+            read_run_secret_for_home(home, 441, "security").expect("read missing secret"),
+            None,
+            "missing secret must be None"
+        );
+        assert_eq!(
+            review_run_secret_path_for_home(home, 441, "security")
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("run_secret")
+        );
     }
 
     #[test]

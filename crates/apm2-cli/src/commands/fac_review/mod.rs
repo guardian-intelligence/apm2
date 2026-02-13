@@ -1515,6 +1515,7 @@ mod tests {
             previous_head_sha: None,
             pid: Some(pid),
             proc_start_time,
+            integrity_hmac: None,
         }
     }
 
