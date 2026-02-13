@@ -115,7 +115,8 @@ health gate to refuse job admission when broker health is degraded.
 - `evaluate_worker_health_gate()` enforces policy-driven admission control:
   verifies receipt existence, payload integrity (content hash recomputation +
   constant-time comparison), signature authenticity (via `BrokerSignatureVerifier`),
-  and health status against worker policy.
+  evaluation window context binding (`expected_eval_window_hash`), receipt
+  recency (`min_broker_tick`), and health status against worker policy.
 - Domain-separated BLAKE3 content hash (`apm2.fac_broker.health_receipt.v1`) over
   schema identity, tick, eval window hash, status, and all per-check results
   with injective u64 length-prefix framing.
@@ -151,6 +152,14 @@ health gate to refuse job admission when broker health is degraded.
   injective framing of variable-length fields.
 - [INV-BH-009] Evaluation window hash is included in the receipt payload for
   boundary context binding.
+- [INV-BH-010] Worker health gate requires `expected_eval_window_hash` and
+  rejects receipts generated for a different evaluation window (context binding,
+  anti-replay). Uses constant-time comparison.
+- [INV-BH-011] Worker health gate requires `min_broker_tick` and rejects
+  receipts with stale broker ticks (recency enforcement, anti-replay).
+- [INV-BH-012] On health check input validation errors, a synthetic FAILED
+  receipt is persisted so downstream gates cannot continue on a stale HEALTHY
+  receipt. The synthetic receipt carries a machine-readable reason.
 
 ## projection_compromise Submodule
 

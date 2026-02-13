@@ -24,6 +24,15 @@
 //!   deserialization to prevent memory exhaustion (RSK-1601).
 //! - [INV-BRK-HEALTH-007] Hash computation uses `u64::to_le_bytes()` length
 //!   prefixes for injective framing of variable-length fields.
+//! - [INV-BRK-HEALTH-010] Worker health gate requires
+//!   `expected_eval_window_hash` and rejects receipts generated for a different
+//!   evaluation window (context binding, anti-replay).
+//! - [INV-BRK-HEALTH-011] Worker health gate requires `min_broker_tick` and
+//!   rejects receipts with stale broker ticks (recency enforcement,
+//!   anti-replay).
+//! - [INV-BRK-HEALTH-012] On health check input validation errors, a synthetic
+//!   `FAILED` receipt is persisted so downstream gates cannot continue on a
+//!   stale `HEALTHY` receipt.
 
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -663,7 +672,15 @@ impl BrokerHealthChecker {
         signer: &Signer,
     ) -> Result<HealthReceiptV1, BrokerHealthError> {
         // INV-BH-005: Enforce input bounds before evaluation (fail-closed).
+        // INV-BH-012: On input validation failure, persist a synthetic FAILED
+        // receipt so downstream gates cannot continue on a stale HEALTHY receipt.
         if input.required_authority_sets.len() > MAX_HEALTH_REQUIRED_AUTHORITY_SETS {
+            let reason = format!(
+                "required_authority_sets exceeds maximum ({} > {})",
+                input.required_authority_sets.len(),
+                MAX_HEALTH_REQUIRED_AUTHORITY_SETS
+            );
+            self.persist_synthetic_failed_receipt(broker_tick, input.eval_window, &reason, signer);
             return Err(BrokerHealthError::TooManyRequiredAuthoritySets {
                 actual: input.required_authority_sets.len(),
                 max: MAX_HEALTH_REQUIRED_AUTHORITY_SETS,
@@ -745,6 +762,53 @@ impl BrokerHealthChecker {
         Ok(receipt)
     }
 
+    /// Persists a synthetic `FAILED` receipt when a health check encounters
+    /// an error before evaluation completes.
+    ///
+    /// This ensures downstream gates cannot rely on a stale `HEALTHY` receipt
+    /// after a failed re-check attempt (INV-BH-012). The synthetic receipt
+    /// carries a machine-readable reason in a single `EVAL_ERROR` check result.
+    fn persist_synthetic_failed_receipt(
+        &mut self,
+        broker_tick: u64,
+        eval_window: &HtfEvaluationWindow,
+        reason: &str,
+        signer: &Signer,
+    ) {
+        let checks = vec![InvariantCheckResult {
+            predicate_id: "EVAL_ERROR".to_string(),
+            passed: false,
+            deny_reason: Some(reason.to_string()),
+        }];
+
+        let eval_window_hash = compute_eval_window_hash(eval_window);
+        let content_hash = compute_health_receipt_hash(
+            broker_tick,
+            eval_window_hash,
+            BrokerHealthStatus::Failed,
+            &checks,
+        );
+        let signature_bytes = signer.sign(&content_hash);
+
+        let receipt = HealthReceiptV1 {
+            schema_id: HEALTH_RECEIPT_SCHEMA_ID.to_string(),
+            schema_version: HEALTH_RECEIPT_SCHEMA_VERSION.to_string(),
+            status: BrokerHealthStatus::Failed,
+            broker_tick,
+            eval_window_hash,
+            checks,
+            content_hash,
+            signature: signature_bytes.to_bytes(),
+            signer_id: signer.verifying_key().to_bytes(),
+        };
+
+        // Append to bounded history (evict oldest when at cap)
+        if self.history.len() >= MAX_HEALTH_HISTORY {
+            self.history.remove(0);
+        }
+        self.history.push(receipt);
+    }
+
     /// Returns the most recent health receipt, if any.
     #[must_use]
     pub fn latest(&self) -> Option<&HealthReceiptV1> {
@@ -802,6 +866,30 @@ pub enum WorkerHealthGateError {
     /// Health receipt verification failed (signature, content hash, or schema).
     #[error("health receipt verification failed: {0}")]
     VerificationFailed(#[from] BrokerHealthError),
+
+    /// Receipt `eval_window_hash` does not match the expected evaluation
+    /// window.
+    ///
+    /// This prevents replay of receipts generated for a different evaluation
+    /// context (INV-BH-010).
+    #[error(
+        "receipt eval_window_hash mismatch: receipt was generated for a different evaluation window"
+    )]
+    EvalWindowMismatch,
+
+    /// Receipt `broker_tick` is below the required minimum (stale receipt).
+    ///
+    /// This prevents replay of old receipts from earlier broker ticks
+    /// (INV-BH-011).
+    #[error(
+        "receipt broker_tick {receipt_tick} is below minimum required tick {min_tick} (stale receipt)"
+    )]
+    StaleReceipt {
+        /// The broker tick on the receipt.
+        receipt_tick: u64,
+        /// The minimum required broker tick.
+        min_tick: u64,
+    },
 }
 
 /// Policy for the worker health admission gate.
@@ -817,13 +905,21 @@ pub enum WorkerHealthPolicy {
     AllowDegraded,
 }
 
-/// Evaluates the worker admission health gate.
+/// Evaluates the worker admission health gate with replay protection.
 ///
-/// The gate checks:
+/// The gate checks (in order, fail-closed):
 /// 1. A health receipt exists (fail-closed if missing).
 /// 2. The receipt payload integrity (content hash recomputed and compared).
 /// 3. The receipt signature is valid.
-/// 4. The health status meets the configured policy.
+/// 4. **Freshness**: The receipt's `eval_window_hash` matches
+///    `expected_eval_window_hash` (context binding, INV-BH-010).
+/// 5. **Recency**: The receipt's `broker_tick` is at or above `min_broker_tick`
+///    (anti-replay staleness check, INV-BH-011).
+/// 6. The health status meets the configured policy.
+///
+/// Steps 4 and 5 prevent replay of previously healthy receipts after broker
+/// state has degraded. An attacker cannot present a stale receipt from an
+/// earlier evaluation window or broker tick.
 ///
 /// # Errors
 ///
@@ -832,12 +928,32 @@ pub fn evaluate_worker_health_gate(
     receipt: Option<&HealthReceiptV1>,
     verifier: &BrokerSignatureVerifier,
     policy: WorkerHealthPolicy,
+    expected_eval_window_hash: Hash,
+    min_broker_tick: u64,
 ) -> Result<(), WorkerHealthGateError> {
     let receipt = receipt.ok_or(WorkerHealthGateError::NoHealthReceipt)?;
 
     // Verify receipt: schema + content hash recompute + signature
     // (INV-BRK-HEALTH-005)
     receipt.verify(verifier)?;
+
+    // INV-BH-010: Verify evaluation window context binding.
+    // Reject receipts generated for a different evaluation window to prevent
+    // cross-context replay attacks.
+    if !bool::from(receipt.eval_window_hash.ct_eq(&expected_eval_window_hash)) {
+        return Err(WorkerHealthGateError::EvalWindowMismatch);
+    }
+
+    // INV-BH-011: Verify receipt recency via broker tick floor.
+    // Reject stale receipts from earlier broker ticks to prevent temporal
+    // replay attacks where an attacker presents an old HEALTHY receipt after
+    // the broker's health has degraded.
+    if receipt.broker_tick < min_broker_tick {
+        return Err(WorkerHealthGateError::StaleReceipt {
+            receipt_tick: receipt.broker_tick,
+            min_tick: min_broker_tick,
+        });
+    }
 
     match receipt.status {
         BrokerHealthStatus::Healthy => Ok(()),
@@ -1356,8 +1472,14 @@ mod tests {
         let receipt = checker.check_health(&input, 42, &signer).unwrap();
         assert_eq!(receipt.status, BrokerHealthStatus::Healthy);
 
-        let result =
-            evaluate_worker_health_gate(Some(&receipt), &verifier, WorkerHealthPolicy::default());
+        let expected_hash = compute_eval_window_hash(&eval_window);
+        let result = evaluate_worker_health_gate(
+            Some(&receipt),
+            &verifier,
+            WorkerHealthPolicy::default(),
+            expected_hash,
+            42, // min_broker_tick matches receipt tick
+        );
         assert!(result.is_ok());
     }
 
@@ -1370,8 +1492,13 @@ mod tests {
         let signer = test_signer();
         let verifier = make_verifier(&signer);
 
-        let result =
-            evaluate_worker_health_gate(None, &verifier, WorkerHealthPolicy::StrictHealthy);
+        let result = evaluate_worker_health_gate(
+            None,
+            &verifier,
+            WorkerHealthPolicy::StrictHealthy,
+            [0u8; 32], // dummy hash, not reached
+            0,         // dummy tick, not reached
+        );
         assert!(matches!(
             result,
             Err(WorkerHealthGateError::NoHealthReceipt)
@@ -1403,10 +1530,13 @@ mod tests {
         let receipt = checker.check_health(&input, 1, &signer).unwrap();
         assert_eq!(receipt.status, BrokerHealthStatus::Failed);
 
+        let expected_hash = compute_eval_window_hash(&eval_window);
         let result = evaluate_worker_health_gate(
             Some(&receipt),
             &verifier,
             WorkerHealthPolicy::StrictHealthy,
+            expected_hash,
+            1, // min_broker_tick matches receipt tick
         );
         assert!(matches!(
             result,
@@ -1444,11 +1574,14 @@ mod tests {
 
         let receipt = checker.check_health(&input, 42, &signer).unwrap();
 
+        let expected_hash = compute_eval_window_hash(&eval_window);
         // Verify with a different key => must reject
         let result = evaluate_worker_health_gate(
             Some(&receipt),
             &other_verifier,
             WorkerHealthPolicy::StrictHealthy,
+            expected_hash,
+            42,
         );
         assert!(matches!(
             result,
@@ -1512,6 +1645,8 @@ mod tests {
             Some(&receipt),
             &verifier,
             WorkerHealthPolicy::AllowDegraded,
+            eval_window_hash,
+            42,
         );
         assert!(result.is_ok());
 
@@ -1520,6 +1655,8 @@ mod tests {
             Some(&receipt),
             &verifier,
             WorkerHealthPolicy::StrictHealthy,
+            eval_window_hash,
+            42,
         );
         assert!(matches!(
             result,
@@ -2133,5 +2270,516 @@ mod tests {
             result.is_err(),
             "should reject oversized schema_version via visitor"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // MAJOR-1: Replay protection — eval_window_hash binding (INV-BH-010)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worker_gate_rejects_receipt_with_wrong_eval_window_hash() {
+        let signer = test_signer();
+        let verifier = make_verifier(&signer);
+        let mut checker = BrokerHealthChecker::new();
+
+        let envelope = valid_envelope(&signer);
+        let eval_window = valid_eval_window();
+        let freshness = valid_freshness_horizon();
+        let frontier = valid_revocation_frontier();
+        let convergence = valid_convergence_horizon();
+
+        let input = HealthCheckInput {
+            envelope: Some(&envelope),
+            eval_window: &eval_window,
+            verifier: Some(&verifier),
+            freshness_horizon: Some(&freshness),
+            revocation_frontier: Some(&frontier),
+            convergence_horizon: Some(&convergence),
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+
+        let receipt = checker.check_health(&input, 42, &signer).unwrap();
+        assert_eq!(receipt.status, BrokerHealthStatus::Healthy);
+
+        // Replay attack: present this healthy receipt with a DIFFERENT
+        // expected eval_window_hash (simulating context change)
+        let different_window = HtfEvaluationWindow {
+            boundary_id: "different-boundary".to_string(),
+            authority_clock: "different-clock".to_string(),
+            tick_start: 500,
+            tick_end: 600,
+        };
+        let wrong_hash = compute_eval_window_hash(&different_window);
+
+        let result = evaluate_worker_health_gate(
+            Some(&receipt),
+            &verifier,
+            WorkerHealthPolicy::StrictHealthy,
+            wrong_hash,
+            42,
+        );
+        assert!(
+            matches!(result, Err(WorkerHealthGateError::EvalWindowMismatch)),
+            "expected EvalWindowMismatch, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn worker_gate_accepts_receipt_with_matching_eval_window_hash() {
+        let signer = test_signer();
+        let verifier = make_verifier(&signer);
+        let mut checker = BrokerHealthChecker::new();
+
+        let envelope = valid_envelope(&signer);
+        let eval_window = valid_eval_window();
+        let freshness = valid_freshness_horizon();
+        let frontier = valid_revocation_frontier();
+        let convergence = valid_convergence_horizon();
+
+        let input = HealthCheckInput {
+            envelope: Some(&envelope),
+            eval_window: &eval_window,
+            verifier: Some(&verifier),
+            freshness_horizon: Some(&freshness),
+            revocation_frontier: Some(&frontier),
+            convergence_horizon: Some(&convergence),
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+
+        let receipt = checker.check_health(&input, 42, &signer).unwrap();
+        assert_eq!(receipt.status, BrokerHealthStatus::Healthy);
+
+        let correct_hash = compute_eval_window_hash(&eval_window);
+        let result = evaluate_worker_health_gate(
+            Some(&receipt),
+            &verifier,
+            WorkerHealthPolicy::StrictHealthy,
+            correct_hash,
+            1, // min_broker_tick well below receipt tick 42
+        );
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // MAJOR-1: Replay protection — stale broker tick (INV-BH-011)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worker_gate_rejects_stale_receipt_below_min_broker_tick() {
+        let signer = test_signer();
+        let verifier = make_verifier(&signer);
+        let mut checker = BrokerHealthChecker::new();
+
+        let envelope = valid_envelope(&signer);
+        let eval_window = valid_eval_window();
+        let freshness = valid_freshness_horizon();
+        let frontier = valid_revocation_frontier();
+        let convergence = valid_convergence_horizon();
+
+        let input = HealthCheckInput {
+            envelope: Some(&envelope),
+            eval_window: &eval_window,
+            verifier: Some(&verifier),
+            freshness_horizon: Some(&freshness),
+            revocation_frontier: Some(&frontier),
+            convergence_horizon: Some(&convergence),
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+
+        // Generate receipt at tick 42
+        let receipt = checker.check_health(&input, 42, &signer).unwrap();
+        assert_eq!(receipt.status, BrokerHealthStatus::Healthy);
+
+        let correct_hash = compute_eval_window_hash(&eval_window);
+
+        // Replay attack: present old tick-42 receipt when system requires
+        // at least tick 100
+        let result = evaluate_worker_health_gate(
+            Some(&receipt),
+            &verifier,
+            WorkerHealthPolicy::StrictHealthy,
+            correct_hash,
+            100, // min_broker_tick above receipt's 42
+        );
+        assert!(
+            matches!(
+                result,
+                Err(WorkerHealthGateError::StaleReceipt {
+                    receipt_tick: 42,
+                    min_tick: 100,
+                })
+            ),
+            "expected StaleReceipt, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn worker_gate_accepts_receipt_at_exact_min_broker_tick() {
+        let signer = test_signer();
+        let verifier = make_verifier(&signer);
+        let mut checker = BrokerHealthChecker::new();
+
+        let envelope = valid_envelope(&signer);
+        let eval_window = valid_eval_window();
+        let freshness = valid_freshness_horizon();
+        let frontier = valid_revocation_frontier();
+        let convergence = valid_convergence_horizon();
+
+        let input = HealthCheckInput {
+            envelope: Some(&envelope),
+            eval_window: &eval_window,
+            verifier: Some(&verifier),
+            freshness_horizon: Some(&freshness),
+            revocation_frontier: Some(&frontier),
+            convergence_horizon: Some(&convergence),
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+
+        let receipt = checker.check_health(&input, 42, &signer).unwrap();
+        assert_eq!(receipt.status, BrokerHealthStatus::Healthy);
+
+        let correct_hash = compute_eval_window_hash(&eval_window);
+
+        // Exact match: broker_tick == min_broker_tick should pass
+        let result = evaluate_worker_health_gate(
+            Some(&receipt),
+            &verifier,
+            WorkerHealthPolicy::StrictHealthy,
+            correct_hash,
+            42, // exactly matches receipt tick
+        );
+        assert!(
+            result.is_ok(),
+            "expected Ok at exact min_broker_tick, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn worker_gate_rejects_stale_receipt_one_below_min() {
+        let signer = test_signer();
+        let verifier = make_verifier(&signer);
+        let mut checker = BrokerHealthChecker::new();
+
+        let envelope = valid_envelope(&signer);
+        let eval_window = valid_eval_window();
+        let freshness = valid_freshness_horizon();
+        let frontier = valid_revocation_frontier();
+        let convergence = valid_convergence_horizon();
+
+        let input = HealthCheckInput {
+            envelope: Some(&envelope),
+            eval_window: &eval_window,
+            verifier: Some(&verifier),
+            freshness_horizon: Some(&freshness),
+            revocation_frontier: Some(&frontier),
+            convergence_horizon: Some(&convergence),
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+
+        let receipt = checker.check_health(&input, 42, &signer).unwrap();
+        let correct_hash = compute_eval_window_hash(&eval_window);
+
+        // min_broker_tick = 43 (one above receipt's 42) => reject
+        let result = evaluate_worker_health_gate(
+            Some(&receipt),
+            &verifier,
+            WorkerHealthPolicy::StrictHealthy,
+            correct_hash,
+            43,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(WorkerHealthGateError::StaleReceipt {
+                    receipt_tick: 42,
+                    min_tick: 43,
+                })
+            ),
+            "expected StaleReceipt, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MAJOR-1: Full replay scenario — healthy receipt replayed after failure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn replay_of_old_healthy_receipt_rejected_after_broker_degradation() {
+        let signer = test_signer();
+        let verifier = make_verifier(&signer);
+        let mut checker = BrokerHealthChecker::new();
+
+        let envelope = valid_envelope(&signer);
+        let eval_window = valid_eval_window();
+        let freshness = valid_freshness_horizon();
+        let frontier = valid_revocation_frontier();
+        let convergence = valid_convergence_horizon();
+
+        // Step 1: Broker is healthy at tick 10
+        let healthy_input = HealthCheckInput {
+            envelope: Some(&envelope),
+            eval_window: &eval_window,
+            verifier: Some(&verifier),
+            freshness_horizon: Some(&freshness),
+            revocation_frontier: Some(&frontier),
+            convergence_horizon: Some(&convergence),
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+        let healthy_receipt = checker.check_health(&healthy_input, 10, &signer).unwrap();
+        assert_eq!(healthy_receipt.status, BrokerHealthStatus::Healthy);
+
+        // Step 2: Broker degrades at tick 20 (TP001 fails — no envelope)
+        let failed_input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: Some(&freshness),
+            revocation_frontier: Some(&frontier),
+            convergence_horizon: Some(&convergence),
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+        let failed_receipt = checker.check_health(&failed_input, 20, &signer).unwrap();
+        assert_eq!(failed_receipt.status, BrokerHealthStatus::Failed);
+
+        let correct_hash = compute_eval_window_hash(&eval_window);
+
+        // Step 3: Attacker replays the old healthy receipt (tick 10)
+        // Worker should require min_broker_tick >= 20 (current tick)
+        let result = evaluate_worker_health_gate(
+            Some(&healthy_receipt),
+            &verifier,
+            WorkerHealthPolicy::StrictHealthy,
+            correct_hash,
+            20, // min_broker_tick = current tick
+        );
+        assert!(
+            matches!(
+                result,
+                Err(WorkerHealthGateError::StaleReceipt {
+                    receipt_tick: 10,
+                    min_tick: 20,
+                })
+            ),
+            "replay of old healthy receipt must be rejected, got {result:?}"
+        );
+
+        // Step 4: Current failed receipt passes freshness but is rejected
+        // on status
+        let result = evaluate_worker_health_gate(
+            Some(&failed_receipt),
+            &verifier,
+            WorkerHealthPolicy::StrictHealthy,
+            correct_hash,
+            20,
+        );
+        assert!(
+            matches!(result, Err(WorkerHealthGateError::HealthFailed { .. })),
+            "current failed receipt must be rejected on status, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MINOR-1: Error path persists synthetic FAILED receipt (INV-BH-012)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn check_health_error_persists_synthetic_failed_receipt() {
+        let signer = test_signer();
+        let verifier = make_verifier(&signer);
+        let mut checker = BrokerHealthChecker::new();
+
+        let envelope = valid_envelope(&signer);
+        let eval_window = valid_eval_window();
+        let freshness = valid_freshness_horizon();
+        let frontier = valid_revocation_frontier();
+        let convergence = valid_convergence_horizon();
+
+        // Step 1: Establish healthy state at tick 5
+        let healthy_input = HealthCheckInput {
+            envelope: Some(&envelope),
+            eval_window: &eval_window,
+            verifier: Some(&verifier),
+            freshness_horizon: Some(&freshness),
+            revocation_frontier: Some(&frontier),
+            convergence_horizon: Some(&convergence),
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+        let healthy_receipt = checker.check_health(&healthy_input, 5, &signer).unwrap();
+        assert_eq!(healthy_receipt.status, BrokerHealthStatus::Healthy);
+        assert_eq!(checker.latest_status(), BrokerHealthStatus::Healthy);
+
+        // Step 2: Trigger input overflow error at tick 10
+        let oversized: Vec<Hash> = (0..=MAX_HEALTH_REQUIRED_AUTHORITY_SETS)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (i & 0xFF) as u8;
+                h[1] = ((i >> 8) & 0xFF) as u8;
+                h
+            })
+            .collect();
+
+        let error_input = HealthCheckInput {
+            envelope: Some(&envelope),
+            eval_window: &eval_window,
+            verifier: Some(&verifier),
+            freshness_horizon: Some(&freshness),
+            revocation_frontier: Some(&frontier),
+            convergence_horizon: Some(&convergence),
+            convergence_receipts: &[],
+            required_authority_sets: &oversized,
+        };
+
+        let result = checker.check_health(&error_input, 10, &signer);
+        assert!(result.is_err(), "should return Err for oversized input");
+
+        // Step 3: Verify synthetic FAILED receipt was persisted
+        assert_eq!(
+            checker.latest_status(),
+            BrokerHealthStatus::Failed,
+            "latest status must be Failed after error, not stale Healthy"
+        );
+
+        let latest = checker.latest().expect("history should not be empty");
+        assert_eq!(latest.status, BrokerHealthStatus::Failed);
+        assert_eq!(latest.broker_tick, 10);
+        assert_eq!(latest.checks.len(), 1);
+        assert_eq!(latest.checks[0].predicate_id, "EVAL_ERROR");
+        assert!(!latest.checks[0].passed);
+        assert!(latest.checks[0].deny_reason.is_some());
+        assert!(
+            latest.checks[0]
+                .deny_reason
+                .as_ref()
+                .unwrap()
+                .contains("exceeds maximum"),
+            "deny_reason should contain machine-readable error"
+        );
+
+        // Step 4: Verify the synthetic receipt is properly signed
+        assert!(
+            latest.verify(&verifier).is_ok(),
+            "synthetic FAILED receipt must be verifiable"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn synthetic_failed_receipt_prevents_stale_healthy_gate_pass() {
+        let signer = test_signer();
+        let verifier = make_verifier(&signer);
+        let mut checker = BrokerHealthChecker::new();
+
+        let envelope = valid_envelope(&signer);
+        let eval_window = valid_eval_window();
+        let freshness = valid_freshness_horizon();
+        let frontier = valid_revocation_frontier();
+        let convergence = valid_convergence_horizon();
+
+        // Step 1: Establish healthy state at tick 5
+        let healthy_input = HealthCheckInput {
+            envelope: Some(&envelope),
+            eval_window: &eval_window,
+            verifier: Some(&verifier),
+            freshness_horizon: Some(&freshness),
+            revocation_frontier: Some(&frontier),
+            convergence_horizon: Some(&convergence),
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+        let _healthy = checker.check_health(&healthy_input, 5, &signer).unwrap();
+
+        // Step 2: Error path at tick 10 — synthetic FAILED persisted
+        let oversized: Vec<Hash> = (0..=MAX_HEALTH_REQUIRED_AUTHORITY_SETS)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (i & 0xFF) as u8;
+                h[1] = ((i >> 8) & 0xFF) as u8;
+                h
+            })
+            .collect();
+
+        let error_input = HealthCheckInput {
+            envelope: Some(&envelope),
+            eval_window: &eval_window,
+            verifier: Some(&verifier),
+            freshness_horizon: Some(&freshness),
+            revocation_frontier: Some(&frontier),
+            convergence_horizon: Some(&convergence),
+            convergence_receipts: &[],
+            required_authority_sets: &oversized,
+        };
+        let _ = checker.check_health(&error_input, 10, &signer);
+
+        // Step 3: Gate evaluation with latest receipt must fail
+        let latest = checker.latest().unwrap();
+        let correct_hash = compute_eval_window_hash(&eval_window);
+        let result = evaluate_worker_health_gate(
+            Some(latest),
+            &verifier,
+            WorkerHealthPolicy::StrictHealthy,
+            correct_hash,
+            10,
+        );
+        assert!(
+            matches!(result, Err(WorkerHealthGateError::HealthFailed { .. })),
+            "gate must reject after error-path receipt invalidation, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MINOR-1: Synthetic FAILED receipt history count
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn synthetic_failed_receipt_increments_history() {
+        let signer = test_signer();
+        let mut checker = BrokerHealthChecker::new();
+
+        let eval_window = valid_eval_window();
+        let oversized: Vec<Hash> = (0..=MAX_HEALTH_REQUIRED_AUTHORITY_SETS)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (i & 0xFF) as u8;
+                h[1] = ((i >> 8) & 0xFF) as u8;
+                h
+            })
+            .collect();
+
+        let error_input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &oversized,
+        };
+
+        // Before: empty history
+        assert_eq!(checker.history_len(), 0);
+
+        // Error triggers synthetic receipt
+        let _ = checker.check_health(&error_input, 1, &signer);
+        assert_eq!(
+            checker.history_len(),
+            1,
+            "synthetic receipt must be in history"
+        );
+
+        // Verify it's a FAILED receipt with EVAL_ERROR
+        let latest = checker.latest().unwrap();
+        assert_eq!(latest.status, BrokerHealthStatus::Failed);
+        assert_eq!(latest.checks[0].predicate_id, "EVAL_ERROR");
     }
 }
