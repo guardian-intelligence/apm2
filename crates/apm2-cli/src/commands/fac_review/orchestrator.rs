@@ -226,20 +226,6 @@ fn load_completion_signal(
     }))
 }
 
-fn terminate_active_reviewer_if_alive(pr_number: u32, review_type: &str) -> Result<(), String> {
-    let Some(state) = load_review_run_state_strict(pr_number, review_type)? else {
-        return Ok(());
-    };
-    let Some(pid) = state.pid else {
-        return Ok(());
-    };
-    if !super::state::is_process_alive(pid) {
-        return Ok(());
-    }
-    let _ = super::dispatch::verify_process_identity(pid, state.proc_start_time);
-    super::dispatch::terminate_process_with_timeout(pid)
-}
-
 // ── run_review_inner ────────────────────────────────────────────────────────
 
 pub fn run_review_inner(
@@ -313,16 +299,13 @@ pub fn run_review_inner(
             quality_summary = Some(result.summary);
         },
         ReviewRunType::All => {
-            let (worker_done_tx, worker_done_rx) = std::sync::mpsc::channel::<(ReviewKind, bool)>();
-
             let sec_pr_url = pr_url.clone();
             let sec_owner_repo = owner_repo.to_string();
             let sec_head = current_head_sha.clone();
             let sec_ctx = event_ctx.clone();
             let sec_model = select_review_model_random();
-            let sec_done_tx = worker_done_tx.clone();
             let sec_handle = thread::spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_single_review(
                         &sec_pr_url,
                         &sec_owner_repo,
@@ -335,9 +318,7 @@ pub fn run_review_inner(
                     )
                 }))
                 .map_err(|_| "security review worker panicked".to_string())
-                .and_then(|value| value);
-                let _ = sec_done_tx.send((ReviewKind::Security, result.is_err()));
-                result
+                .and_then(|value| value)
             });
 
             let qual_pr_url = pr_url.clone();
@@ -345,9 +326,8 @@ pub fn run_review_inner(
             let qual_head = current_head_sha;
             let qual_ctx = event_ctx.clone();
             let qual_model = select_review_model_random();
-            let qual_done_tx = worker_done_tx.clone();
             let qual_handle = thread::spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_single_review(
                         &qual_pr_url,
                         &qual_owner_repo,
@@ -360,24 +340,8 @@ pub fn run_review_inner(
                     )
                 }))
                 .map_err(|_| "quality review worker panicked".to_string())
-                .and_then(|value| value);
-                let _ = qual_done_tx.send((ReviewKind::Quality, result.is_err()));
-                result
+                .and_then(|value| value)
             });
-            drop(worker_done_tx);
-
-            if let Ok((worker, failed)) = worker_done_rx.recv() {
-                if failed {
-                    match worker {
-                        ReviewKind::Security => {
-                            let _ = terminate_active_reviewer_if_alive(pr_number, "quality");
-                        },
-                        ReviewKind::Quality => {
-                            let _ = terminate_active_reviewer_if_alive(pr_number, "security");
-                        },
-                    }
-                }
-            }
 
             let sec_joined = sec_handle
                 .join()
@@ -385,18 +349,34 @@ pub fn run_review_inner(
             let qual_joined = qual_handle
                 .join()
                 .map_err(|_| "quality review worker panicked".to_string())?;
-            if sec_joined.is_err() {
-                let _ = terminate_active_reviewer_if_alive(pr_number, "quality");
+            let security_outcome = match &sec_joined {
+                Ok(result) => format!(
+                    "ok(run_id={},state={},verdict={})",
+                    result.summary.run_id, result.summary.state, result.summary.verdict
+                ),
+                Err(err) => format!("error({err})"),
+            };
+            let quality_outcome = match &qual_joined {
+                Ok(result) => format!(
+                    "ok(run_id={},state={},verdict={})",
+                    result.summary.run_id, result.summary.state, result.summary.verdict
+                ),
+                Err(err) => format!("error({err})"),
+            };
+
+            match (sec_joined, qual_joined) {
+                (Ok(sec_result), Ok(qual_result)) => {
+                    final_heads.push(sec_result.final_head_sha.clone());
+                    final_heads.push(qual_result.final_head_sha.clone());
+                    security_summary = Some(sec_result.summary);
+                    quality_summary = Some(qual_result.summary);
+                },
+                _ => {
+                    return Err(format!(
+                        "parallel review aggregate failure for PR #{pr_number}: security={security_outcome}; quality={quality_outcome}"
+                    ));
+                },
             }
-            if qual_joined.is_err() {
-                let _ = terminate_active_reviewer_if_alive(pr_number, "security");
-            }
-            let sec_result = sec_joined?;
-            let qual_result = qual_joined?;
-            final_heads.push(sec_result.final_head_sha.clone());
-            final_heads.push(qual_result.final_head_sha.clone());
-            security_summary = Some(sec_result.summary);
-            quality_summary = Some(qual_result.summary);
         },
     }
 

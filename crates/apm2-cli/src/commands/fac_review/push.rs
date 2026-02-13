@@ -467,21 +467,21 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         .flatten()
         .map(|identity| identity.pr_number);
 
-    // Step 1: git push (always force-with-lease for projection branches).
+    // Step 1: git push (always force; local branch truth is authoritative).
     let push_output = Command::new("git")
-        .args(["push", "--force-with-lease", remote, &branch])
+        .args(["push", "--force", remote, &branch])
         .output();
     match push_output {
         Ok(o) if o.status.success() => {
-            eprintln!("fac push: git push --force-with-lease succeeded");
+            eprintln!("fac push: git push --force succeeded");
         },
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            eprintln!("ERROR: git push --force-with-lease failed: {stderr}");
+            eprintln!("ERROR: git push --force failed: {stderr}");
             return exit_codes::GENERIC_ERROR;
         },
         Err(e) => {
-            eprintln!("ERROR: failed to execute git push --force-with-lease: {e}");
+            eprintln!("ERROR: failed to execute git push --force: {e}");
             return exit_codes::GENERIC_ERROR;
         },
     }

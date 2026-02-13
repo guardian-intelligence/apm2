@@ -20,10 +20,11 @@ constraints:
     - "All interactions with the repository MUST be read-only."
 
 metadata_contract:
-  invariants[3]:
+  invariants[4]:
     - '"head_sha" MUST equal reviewed_sha.'
     - '"pr_number" MUST match the prepared PR number exactly.'
     - "Set reviewed_sha = headRefOid."
+    - "Deployment invariant: this CLI serves Anveio on the current VPS only; do NOT file compatibility findings that require broad enterprise/custom-remote support or GitHub-as-authority fallback."
 
 references[30]:
   # Core guidance and policy
