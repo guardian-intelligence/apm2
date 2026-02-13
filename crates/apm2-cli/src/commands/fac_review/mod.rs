@@ -875,6 +875,156 @@ pub fn run_tail(lines: usize, follow: bool) -> u8 {
     }
 }
 
+pub fn run_terminate(
+    repo: &str,
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    review_type: &str,
+    json_output: bool,
+) -> u8 {
+    match run_terminate_inner(repo, pr_number, pr_url, review_type, json_output) {
+        Ok(()) => exit_codes::SUCCESS,
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "terminate_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
+fn run_terminate_inner(
+    repo: &str,
+    pr_number: Option<u32>,
+    pr_url: Option<&str>,
+    review_type: &str,
+    json_output: bool,
+) -> Result<(), String> {
+    let (_owner_repo, resolved_pr) = target::resolve_pr_target(repo, pr_number, pr_url)?;
+    let state_opt =
+        state::load_review_run_state_strict(resolved_pr, review_type)?;
+
+    let Some(mut run_state) = state_opt else {
+        let msg = format!(
+            "no active reviewer for PR #{resolved_pr} type={review_type}"
+        );
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "no_active_reviewer",
+                    "pr_number": resolved_pr,
+                    "review_type": review_type,
+                    "message": msg,
+                }))
+                .unwrap_or_default()
+            );
+        } else {
+            eprintln!("{msg}");
+        }
+        return Ok(());
+    };
+
+    if run_state.status.is_terminal() {
+        let msg = format!(
+            "reviewer already terminal for PR #{resolved_pr} type={review_type} status={} reason={}",
+            run_state.status.as_str(),
+            run_state.terminal_reason.as_deref().unwrap_or("none"),
+        );
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "already_terminal",
+                    "pr_number": resolved_pr,
+                    "review_type": review_type,
+                    "run_status": run_state.status.as_str(),
+                    "terminal_reason": run_state.terminal_reason,
+                    "message": msg,
+                }))
+                .unwrap_or_default()
+            );
+        } else {
+            eprintln!("{msg}");
+        }
+        return Ok(());
+    }
+
+    let mut killed = false;
+    if let Some(pid) = run_state.pid {
+        if state::is_process_alive(pid) {
+            // Verify process identity to avoid killing a reused PID.
+            if let Some(recorded) = run_state.proc_start_time {
+                let observed = state::get_process_start_time(pid);
+                if observed != Some(recorded) {
+                    return Err(format!(
+                        "pid {pid} identity mismatch: recorded start_time={recorded}, \
+                         observed={observed:?} — refusing to terminate"
+                    ));
+                }
+            }
+            // SIGTERM → wait → SIGKILL
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+            let deadline = Instant::now() + TERMINATE_TIMEOUT;
+            while Instant::now() < deadline {
+                if !state::is_process_alive(pid) {
+                    killed = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            if !killed {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+                killed = true;
+            }
+        }
+    }
+
+    run_state.status = types::ReviewRunStatus::Failed;
+    run_state.terminal_reason = Some("manual_termination".to_string());
+    state::write_review_run_state(&run_state)?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "terminated",
+                "pr_number": resolved_pr,
+                "review_type": review_type,
+                "run_id": run_state.run_id,
+                "pid": run_state.pid,
+                "process_killed": killed,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        let pid_info = run_state
+            .pid
+            .map_or_else(|| "no-pid".to_string(), |p| p.to_string());
+        eprintln!(
+            "terminated reviewer PR #{resolved_pr} type={review_type} \
+             run_id={} pid={pid_info} killed={killed}",
+            run_state.run_id
+        );
+    }
+
+    Ok(())
+}
+
 pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&Path>) -> u8 {
     push::run_push(repo, remote, branch, ticket)
 }
@@ -1375,6 +1525,10 @@ mod tests {
 
         let next =
             select_fallback_model("gpt-5.3-codex").expect("known model should produce fallback");
+        assert_eq!(next.model, "gpt-5.3-codex-spark");
+
+        let next = select_fallback_model("gpt-5.3-codex-spark")
+            .expect("known model should produce fallback");
         assert_eq!(next.model, "gemini-3-flash-preview");
     }
 

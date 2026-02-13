@@ -58,6 +58,12 @@ review_prompt_required_payload[1]:
 
 push_workflow:
   canonical_command: "apm2 fac push --ticket <TICKET_YAML>"
+  CRITICAL_PREREQUISITE: |
+    ALL changes MUST be committed before running `apm2 fac gates` or `apm2 fac push`.
+    These commands WILL FAIL on a dirty working tree. Build artifacts are attested
+    against the committed HEAD SHA and reused as a source of truth — uncommitted
+    changes produce unattestable results. Ensure implementor agents commit everything
+    (including docs, tickets, and config) before invoking gates or push.
   behavior:
     - "Pushes the current branch to remote."
     - "Creates or updates the PR from ticket YAML metadata (title, body)."
@@ -76,7 +82,7 @@ runtime_review_protocol:
     log_discovery: "apm2 fac logs --pr <PR_NUMBER> --json (canonical per-PR log path inventory for evidence gates, pipeline, and review runs)"
     live_logs: "Use `tail -f` on paths returned by `apm2 fac logs --pr <PR_NUMBER> --json` to monitor live reviewer output."
     liveness_check: "If no review progress appears for ~120s after push, run lane-scoped status for both lanes, then refresh log paths with `apm2 fac logs --pr <PR_NUMBER> --json` and tail the active run logs."
-    liveness_recovery: "If processes are stalled/dead or review state is ambiguous, run `apm2 fac restart --pr <PR_NUMBER>`."
+    liveness_recovery: "If a single reviewer lane is stuck, terminate it with `apm2 fac review terminate --pr <PR_NUMBER> --type <security|quality> --json` then restart with `apm2 fac restart --pr <PR_NUMBER>`. If both lanes or the full pipeline are stuck, run `apm2 fac restart --pr <PR_NUMBER>` directly."
     ci_status_comment: "PR comment with marker `apm2-ci-status:v1` containing YAML gate statuses (rustfmt, clippy, doc, test, security_review, quality_review)"
     findings_source: "`apm2 fac review findings --pr <PR_NUMBER> --json` (structured severity + reviewer type + SHA binding + evidence pointers)."
   observability_surfaces:
@@ -122,6 +128,7 @@ decision_tree:
             (9) `apm2 fac gates --help`
             (10) `apm2 fac push --help`
             (11) `apm2 fac restart --help`
+            (12) `apm2 fac review terminate --help`
             Help output is authoritative for names/flags.
         - id: VERIFY_REPO_AUTH
           action: "Run `apm2 fac pr auth-check`."

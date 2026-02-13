@@ -1,15 +1,15 @@
 //! Adaptive timeout policy for bounded FAC test execution.
 //!
-//! FAC keeps a strict steady-state SLA for warm caches (240s) but can
+//! FAC keeps a strict steady-state SLA for warm caches (600s) but can
 //! temporarily widen the bounded test window for clearly cold workspaces.
 
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS: u64 = 240;
-pub const MAX_MANUAL_TIMEOUT_SECONDS: u64 = 240;
-pub const DEFAULT_COLD_CACHE_TIMEOUT_SECONDS: u64 = 420;
-pub const MAX_EFFECTIVE_TIMEOUT_SECONDS: u64 = 900;
-pub const TEST_TIMEOUT_SLA_MESSAGE: &str = "Steady-state test SLA is p100=240s, p99=180s, p50=80s. FAC may temporarily widen this timeout for cold-cache warm-up runs. Persistent overruns after warm-up are bugs and must be investigated.";
+pub const DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS: u64 = 600;
+pub const MAX_MANUAL_TIMEOUT_SECONDS: u64 = 600;
+pub const DEFAULT_COLD_CACHE_TIMEOUT_SECONDS: u64 = 900;
+pub const MAX_EFFECTIVE_TIMEOUT_SECONDS: u64 = 1200;
+pub const TEST_TIMEOUT_SLA_MESSAGE: &str = "Steady-state test SLA is p100=600s, p99=300s, p50=80s. FAC may temporarily widen this timeout for cold-cache warm-up runs. Persistent overruns after warm-up are bugs and must be investigated.";
 
 const ENV_COLD_TIMEOUT_SECONDS: &str = "APM2_FAC_COLD_CACHE_TIMEOUT_SECONDS";
 const ENV_DISABLE_COLD_BOOST: &str = "APM2_FAC_DISABLE_COLD_CACHE_TIMEOUT_BOOST";

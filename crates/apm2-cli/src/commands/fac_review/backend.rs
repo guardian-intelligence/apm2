@@ -41,6 +41,14 @@ pub fn build_script_command_for_backend(
             build_script_wrapper_command(log_path, &inner, false)
         },
         ReviewBackend::Gemini => build_gemini_script_command(prompt_path, log_path, model),
+        ReviewBackend::ClaudeCode => {
+            let prompt_q = sh_quote(&prompt_path.display().to_string());
+            let model_q = sh_quote(model);
+            let inner = format!(
+                "claude -p \"$(cat {prompt_q})\" --model {model_q} --output-format json --permission-mode plan"
+            );
+            build_script_wrapper_command(log_path, &inner, false)
+        },
     }
 }
 
@@ -51,12 +59,18 @@ pub fn build_resume_command_for_backend(
 ) -> String {
     let msg_q = sh_quote(sha_update_msg);
     match backend {
-        ReviewBackend::Codex => format!(
-            "codex exec resume --last --dangerously-bypass-approvals-and-sandbox --json {msg_q}"
-        ),
+        ReviewBackend::Codex => {
+            format!("codex exec resume --last --dangerously-bypass-approvals-and-sandbox --json {msg_q}")
+        },
         ReviewBackend::Gemini => {
             let model_q = sh_quote(normalize_gemini_model(model));
             format!("gemini -m {model_q} -y --resume latest -p {msg_q}")
+        },
+        ReviewBackend::ClaudeCode => {
+            let model_q = sh_quote(model);
+            format!(
+                "claude -p {msg_q} --model {model_q} --output-format json --permission-mode plan --resume"
+            )
         },
     }
 }

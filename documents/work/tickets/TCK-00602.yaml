@@ -1,0 +1,66 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00602"
+    title: "Revert broken Codex/Gemini permission flags and add agent auto-termination on decision set"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME"]
+  dependencies:
+    tickets: []
+  root_cause_analysis:
+    summary: |
+      Two issues addressed: (1) A prior attempt to restrict Codex/Gemini sandbox permissions
+      broke reviewer dispatch by using incorrect flags (`--sandbox-permissions read` instead of
+      `--dangerously-bypass-approvals-and-sandbox` for Codex, and dropping `-y` from Gemini).
+      (2) After a decision is persisted via `decision set`, the spawning review agent remains
+      alive and can continue performing worktree operations (10+ incidents observed of rogue
+      agents destroying worktrees post-decision).
+    failure_1_primary: |
+      backend.rs Codex commands changed from `--dangerously-bypass-approvals-and-sandbox` to
+      `--sandbox-permissions read` in both initial and resume paths. Gemini initial command
+      lost its `-y` (auto-approve) flag. These changes broke reviewer dispatch entirely since
+      the restricted flags are not yet supported in the review pipeline.
+    failure_2: |
+      No mechanism existed to terminate the review agent process after a decision is persisted.
+      The agent continues running after its decision is set, consuming resources and potentially
+      performing unwanted operations on the worktree.
+  scope:
+    in_scope:
+      - "Revert Codex initial command from `--sandbox-permissions read` to `--dangerously-bypass-approvals-and-sandbox` in backend.rs."
+      - "Revert Codex resume command from `--sandbox-permissions read` to `--dangerously-bypass-approvals-and-sandbox` in backend.rs."
+      - "Restore missing `-y` flag to Gemini initial command in backend.rs."
+      - "Add `terminate_review_agent` function in decision.rs that sends SIGTERM/SIGKILL to the review agent after decision persist, with process identity verification via proc_start_time."
+      - "Call `terminate_review_agent` at the end of `run_decision_set` after cleanup."
+    out_of_scope:
+      - "Sandbox mode migration for Codex/Gemini backends (requires upstream support)."
+      - "RoleSpec ToolAllowlist runtime enforcement (covered by RFC-0028 broker)."
+      - "Prompt-level git prohibitions, ReadOnlyPaths systemd confinement, or other defense-in-depth measures."
+  plan:
+    steps:
+      - "Revert backend.rs line 19: restore `-y` flag to Gemini initial command."
+      - "Revert backend.rs line 39: restore `--dangerously-bypass-approvals-and-sandbox` for Codex initial command."
+      - "Revert backend.rs line 63: restore `--dangerously-bypass-approvals-and-sandbox` for Codex resume command."
+      - "Add `dimension_to_state_review_type` helper mapping 'code-quality' to 'quality' in decision.rs."
+      - "Add `terminate_review_agent` function in decision.rs: load run state, verify PID identity, SIGTERM with 5s timeout, SIGKILL fallback."
+      - "Call `terminate_review_agent` in `run_decision_set` after cleanup block."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "backend.rs Codex commands use `--dangerously-bypass-approvals-and-sandbox` (both initial and resume)."
+      - "backend.rs Gemini initial command includes `-y` flag."
+      - "`run_decision_set` terminates the review agent process after persisting the decision."
+      - "Process identity verification prevents killing unrelated processes on PID reuse."
+      - "`cargo clippy -p apm2-cli -p apm2-core -- -D warnings` passes clean."
+      - "`cargo test -p apm2-cli fac_review` — all tests pass."
+  notes:
+    critical_files:
+      - "crates/apm2-cli/src/commands/fac_review/backend.rs — Codex/Gemini command builders"
+      - "crates/apm2-cli/src/commands/fac_review/decision.rs — terminate_review_agent + call site"

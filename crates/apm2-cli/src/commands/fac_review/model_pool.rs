@@ -17,7 +17,7 @@ use super::types::{
 
 // ── Model pool ──────────────────────────────────────────────────────────────
 
-pub const MODEL_POOL: [ModelPoolEntry; 3] = [
+pub const MODEL_POOL: [ModelPoolEntry; 4] = [
     ModelPoolEntry {
         model: "gemini-3-flash-preview",
         backend: ReviewBackend::Gemini,
@@ -28,6 +28,10 @@ pub const MODEL_POOL: [ModelPoolEntry; 3] = [
     },
     ModelPoolEntry {
         model: "gpt-5.3-codex",
+        backend: ReviewBackend::Codex,
+    },
+    ModelPoolEntry {
+        model: "gpt-5.3-codex-spark",
         backend: ReviewBackend::Codex,
     },
 ];
@@ -59,7 +63,7 @@ fn normalize_review_model_selection(selection: ReviewModelSelection) -> ReviewMo
             model: normalize_gemini_model(&selection.model).to_string(),
             backend: ReviewBackend::Gemini,
         },
-        ReviewBackend::Codex => selection,
+        ReviewBackend::Codex | ReviewBackend::ClaudeCode => selection,
     }
 }
 
@@ -126,7 +130,7 @@ pub fn ensure_model_backend_available(
     }
 
     Err(
-        "no configured review backend tool is available (need codex and/or gemini in PATH)"
+        "no configured review backend tool is available (need codex, gemini, and/or claude in PATH)"
             .to_string(),
     )
 }
@@ -135,6 +139,7 @@ pub fn backend_tool_available(backend: ReviewBackend) -> bool {
     let tool = match backend {
         ReviewBackend::Codex => "codex",
         ReviewBackend::Gemini => "gemini",
+        ReviewBackend::ClaudeCode => "claude",
     };
     Command::new("sh")
         .args(["-lc", &format!("command -v {tool} >/dev/null 2>&1")])
@@ -148,6 +153,7 @@ pub fn provider_slot_count(backend: ReviewBackend) -> usize {
     let key = match backend {
         ReviewBackend::Codex => "APM2_FAC_CODEX_SLOTS",
         ReviewBackend::Gemini => "APM2_FAC_GEMINI_SLOTS",
+        ReviewBackend::ClaudeCode => "APM2_FAC_CLAUDE_CODE_SLOTS",
     };
     std::env::var(key)
         .ok()

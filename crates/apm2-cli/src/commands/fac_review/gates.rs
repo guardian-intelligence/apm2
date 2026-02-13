@@ -406,7 +406,9 @@ fn ensure_clean_working_tree(workspace_root: &Path, quick: bool) -> Result<(), S
         .map_err(|e| format!("failed to run git diff: {e}"))?;
     if !diff_status.status.success() {
         return Err(
-            "working tree has unstaged changes — commit or stash first (or use `apm2 fac gates --quick` for inner-loop development)"
+            "DIRTY TREE: working tree has unstaged changes. ALL changes must be committed before \
+             running full gates — build artifacts are SHA-attested and reused as a source of truth. \
+             Run `git add -A && git commit` first, or use `apm2 fac gates --quick` for inner-loop development."
                 .to_string(),
         );
     }
@@ -418,7 +420,10 @@ fn ensure_clean_working_tree(workspace_root: &Path, quick: bool) -> Result<(), S
         .map_err(|e| format!("failed to run git diff --cached: {e}"))?;
     if !cached_status.status.success() {
         return Err(
-            "working tree has staged changes — commit or stash first (or use `apm2 fac gates --quick` for inner-loop development)"
+            "DIRTY TREE: working tree has staged but uncommitted changes. ALL changes must be \
+             committed before running full gates — build artifacts are SHA-attested and reused \
+             as a source of truth. Run `git commit` first, or use `apm2 fac gates --quick` for \
+             inner-loop development."
                 .to_string(),
         );
     }
@@ -433,7 +438,10 @@ fn ensure_clean_working_tree(workspace_root: &Path, quick: bool) -> Result<(), S
     }
     if !String::from_utf8_lossy(&untracked.stdout).trim().is_empty() {
         return Err(
-            "working tree has untracked files — commit, stash, or remove them first (or use `apm2 fac gates --quick` for inner-loop development)"
+            "DIRTY TREE: working tree has untracked files. ALL files must be committed (or \
+             .gitignored) before running full gates — build artifacts are SHA-attested and \
+             reused as a source of truth. Run `git add -A && git commit` first, or use \
+             `apm2 fac gates --quick` for inner-loop development."
                 .to_string(),
         );
     }

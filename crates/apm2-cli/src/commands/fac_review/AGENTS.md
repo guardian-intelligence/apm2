@@ -55,7 +55,7 @@ apm2 fac review run --pr-url <URL> --type all
 - **Liveness monitoring**: Pulse files track reviewer health; stall threshold is 90 seconds.
 - **Idempotent dispatch**: `DispatchIdempotencyKey` prevents duplicate reviews for the same SHA.
 - **SHA freshness**: Reviews are invalidated if PR head moves during execution.
-- **Adaptive bounded tests**: Test gate keeps a 240s steady-state SLA but can temporarily widen timeout on detected cold build caches.
+- **Adaptive bounded tests**: Test gate keeps a 600s steady-state SLA but can temporarily widen timeout on detected cold build caches.
 - **NDJSON telemetry**: All lifecycle events are appended to `~/.apm2/review_events.ndjson`.
 - **CI-aware restart**: `apm2 fac restart` analyzes CI check-suite state before restarting.
 - **Worktree-aware dispatch**: Detached review dispatch resolves and uses the worktree whose `HEAD` matches target SHA.

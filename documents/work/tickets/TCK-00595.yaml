@@ -1,0 +1,43 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00595"
+    title: "Worker heartbeat + broker liveness API (no-hang waiting semantics)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00510"
+        reason: "Broker must expose status endpoints and store liveness state."
+      - ticket_id: "TCK-00511"
+        reason: "Worker must emit heartbeat signals."
+      - ticket_id: "TCK-00594"
+        reason: "Services status should display liveness."
+  scope:
+    in_scope:
+      - "Define a minimal worker heartbeat model (worker_id, last_seen, active_lane_claims)."
+      - "Worker periodically reports heartbeat to broker over local IPC."
+      - "Broker exposes a `GetStatus`-style API returning worker liveness and queue depth (pending/running counts)."
+      - "`apm2 fac wait` and `apm2 fac gates` waiting paths consult broker liveness and fail fast if no worker is live (bounded wait)."
+    out_of_scope:
+      - "Distributed cluster membership or multi-host leader election."
+  plan:
+    steps:
+      - "Implement worker heartbeat emission (e.g., every N seconds and on claim/complete)."
+      - "Persist liveness in broker state in an atomic, crash-safe manner."
+      - "Expose broker status endpoint for CLI consumption."
+      - "Update waiters to enforce `--wait-timeout` and to surface a clear error when worker is absent."
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "With no worker running, `apm2 fac gates` fails quickly with an error indicating worker absence."
+      - "With a worker running, `apm2 fac gates` waits until completion (or timeout) and reports progress."
+      - "No secret values appear in status output."

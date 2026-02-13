@@ -221,15 +221,20 @@ decision_tree:
 
     - id: VERIFY_WITH_FAC
       purpose: "Run deterministic merge-gate verification via FAC."
+      CRITICAL_PREREQUISITE: |
+        ALL changes MUST be committed before running `apm2 fac gates` (full mode) or `apm2 fac push`.
+        These commands WILL FAIL on a dirty working tree. Build artifacts are attested against
+        the committed HEAD SHA and reused as a source of truth — uncommitted changes produce
+        unattestable results. Commit first, then run gates/push.
       steps[4]:
         - id: RUN_FAC_GATES_QUICK
-          action: "During active edits, run `apm2 fac gates --quick` for short-loop validation."
+          action: "During active edits, run `apm2 fac gates --quick` for short-loop validation (dirty tree OK for --quick only)."
         - id: RUN_FAC_GATES_FULL
-          action: "Immediately before push, run `apm2 fac gates`."
+          action: "COMMIT ALL CHANGES FIRST, then run `apm2 fac gates`. Full gates require a clean working tree — no uncommitted, staged, or untracked files."
         - id: READ_FAC_LOGS_ON_FAIL
           action: "On failure, run `apm2 fac --json logs` and inspect referenced evidence logs."
         - id: FIX_AND_RERUN
-          action: "Fix failures and re-run gates (`--quick` during iteration, full `apm2 fac gates` before push) until PASS or BLOCKED."
+          action: "Fix failures, COMMIT, then re-run gates (`--quick` during iteration, full `apm2 fac gates` after committing before push) until PASS or BLOCKED."
       next: UPDATE_AGENTS_DOCS
 
     - id: UPDATE_AGENTS_DOCS
@@ -244,19 +249,24 @@ decision_tree:
       next: COMMIT
 
     - id: COMMIT
-      purpose: "Stage and commit all work before push — apm2 fac push only pushes existing commits."
+      purpose: |
+        MANDATORY: Stage and commit ALL work before gates or push.
+        `apm2 fac gates` and `apm2 fac push` WILL FAIL on a dirty working tree.
+        Build artifacts are attested against the committed HEAD SHA and reused as
+        a source of truth — uncommitted changes make attestation impossible.
+        There is NO workaround. Commit everything first.
       steps[2]:
         - id: STAGE_ALL_CHANGES
-          action: "Run `git add -A` to stage implementation code, test additions, and AGENTS.md updates."
+          action: "Run `git add -A` to stage ALL changes — implementation code, test additions, AGENTS.md updates, and any other modified files. Do NOT leave files unstaged."
         - id: CREATE_COMMIT
-          action: "Run `git commit` with a concise message summarizing what changed and why."
+          action: "Run `git commit` with a concise message summarizing what changed and why. Verify with `git status` that the tree is clean (no modified, staged, or untracked files remain)."
       next: PUSH
 
     - id: PUSH
-      purpose: "Push through FAC-only surface and handle interstitial branch/worktree failures."
+      purpose: "Push through FAC-only surface and handle interstitial branch/worktree failures. Requires a clean committed tree."
       steps[4]:
         - id: RUN_FAC_PUSH
-          action: "`apm2 fac push` only pushes committed work — it will not stage or commit for you. Run `timeout 180s apm2 fac push --ticket <TICKET_YAML>` (or `--branch <BRANCH>` when ticket metadata is unavailable)."
+          action: "`apm2 fac push` REQUIRES a clean working tree with all changes committed. It will not stage or commit for you. Run `timeout 180s apm2 fac push --ticket <TICKET_YAML>` (or `--branch <BRANCH>` when ticket metadata is unavailable)."
         - id: CAPTURE_PR_CONTEXT
           action: "Capture PR number/URL from `apm2 fac push` output for monitoring and restart."
         - id: HANDLE_PUSH_FAILURE
@@ -278,7 +288,10 @@ decision_tree:
         - id: DONE
           action: "output DONE and nothing else, your task is complete."
 
-invariants[14]:
+invariants[15]:
+  # Clean Tree Invariant (HIGHEST PRIORITY — agents repeatedly violate this)
+  - "NEVER run `apm2 fac gates` (full) or `apm2 fac push` with uncommitted changes. ALL files — code, tests, docs, tickets — MUST be committed first. Build artifacts are SHA-attested and reused as a source of truth; a dirty tree makes attestation impossible and the commands WILL FAIL. `--quick` mode is the ONLY exception."
+
   - "Do not ship fail-open defaults for missing, stale, unknown, or unverifiable authority/security state."
   - "Do not rely on shape-only validation for trust decisions; validate authenticity and binding claims."
   - "Do not mutate durable or single-use state before all deny gates that can reject the operation."

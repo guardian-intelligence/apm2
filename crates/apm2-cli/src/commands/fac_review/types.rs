@@ -49,6 +49,7 @@ pub enum ReviewBackend {
     #[default]
     Codex,
     Gemini,
+    ClaudeCode,
 }
 
 impl ReviewBackend {
@@ -56,6 +57,7 @@ impl ReviewBackend {
         match self {
             Self::Codex => "codex",
             Self::Gemini => "gemini",
+            Self::ClaudeCode => "claude-code",
         }
     }
 }

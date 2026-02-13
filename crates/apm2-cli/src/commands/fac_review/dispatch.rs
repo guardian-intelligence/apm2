@@ -14,7 +14,7 @@ use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_co
 use super::state::{
     ReviewRunStateLoad, build_review_run_id, get_process_start_time,
     load_review_run_state_for_home, next_review_sequence_number_for_home,
-    write_review_run_state_for_home,
+    try_acquire_review_lease, write_review_run_state_for_home,
 };
 use super::types::{
     DISPATCH_LOCK_ACQUIRE_TIMEOUT, DISPATCH_PENDING_TTL, DispatchIdempotencyKey,
@@ -828,6 +828,37 @@ where
         ReviewRunStateLoad::Missing { .. } => {},
     }
 
+    // Final dedup gate: if the orchestrator's review lease is already held,
+    // a reviewer is actively running — no need to spawn another.
+    if try_acquire_review_lease(&key.owner_repo, key.pr_number, &key.review_type)?
+        .is_none()
+    {
+        // Lease held — enrich the response with current run state so callers
+        // can see which run_id/pid they joined.
+        let (run_state_str, run_id, seq, pid) =
+            match load_review_run_state_for_home(home, key.pr_number, &key.review_type) {
+                Ok(ReviewRunStateLoad::Present(state)) => (
+                    state.status.as_str().to_string(),
+                    Some(state.run_id),
+                    Some(state.sequence_number),
+                    state.pid,
+                ),
+                _ => ("unknown".to_string(), None, None, None),
+            };
+        return Ok(DispatchReviewResult {
+            review_type: key.review_type.clone(),
+            mode: "joined".to_string(),
+            run_state: run_state_str,
+            run_id,
+            sequence_number: seq,
+            terminal_reason: None,
+            pid,
+            unit: None,
+            log_file: None,
+        });
+    }
+    // Lease was free (we acquired it) — drop immediately so the spawned process can take it.
+
     if let Some(pending) = read_fresh_pending_dispatch_for_home(home, key)? {
         return attach_run_state_contract_for_home(
             home,
@@ -1096,7 +1127,9 @@ fn spawn_detached_review(
             .arg("--unit")
             .arg(&unit)
             .arg("--property")
-            .arg(format!("WorkingDirectory={}", workspace_root.display()));
+            .arg(format!("WorkingDirectory={}", workspace_root.display()))
+            .arg("--property")
+            .arg(format!("ReadOnlyPaths={}", workspace_root.display()));
 
         for key in ["PATH", "HOME", "CARGO_HOME"] {
             if let Ok(value) = std::env::var(key) {

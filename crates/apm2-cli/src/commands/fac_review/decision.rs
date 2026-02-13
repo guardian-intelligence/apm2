@@ -226,6 +226,7 @@ pub fn run_decision_set(
             eprintln!("WARNING: failed to clean prepared review inputs: {err}");
         }
     }
+    terminate_review_agent(resolved_pr, normalized_dimension);
     Ok(exit_codes::SUCCESS)
 }
 
@@ -706,6 +707,49 @@ fn emit_show_report(report: &DecisionShowReport, json_output: bool) -> Result<()
         }
     }
     Ok(())
+}
+
+fn dimension_to_state_review_type(dimension: &str) -> &str {
+    match dimension {
+        "code-quality" => "quality",
+        other => other,
+    }
+}
+
+fn terminate_review_agent(pr_number: u32, dimension: &str) {
+    let review_type = dimension_to_state_review_type(dimension);
+    let Ok(Some(state)) = super::state::load_review_run_state_strict(pr_number, review_type)
+    else {
+        return;
+    };
+    let Some(pid) = state.pid else { return };
+    if !super::state::is_process_alive(pid) {
+        return;
+    }
+    // Verify process identity to avoid killing a reused PID.
+    if let Some(recorded) = state.proc_start_time {
+        let observed = super::state::get_process_start_time(pid);
+        if observed != Some(recorded) {
+            eprintln!("WARNING: skipping agent termination: pid {pid} identity mismatch");
+            return;
+        }
+    }
+    // SIGTERM → wait → SIGKILL
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status();
+    let deadline = std::time::Instant::now() + super::types::TERMINATE_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if !super::state::is_process_alive(pid) {
+            eprintln!("INFO: terminated review agent pid={pid} after decision set");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status();
+    eprintln!("WARNING: sent SIGKILL to review agent pid={pid}");
 }
 
 #[cfg(test)]
