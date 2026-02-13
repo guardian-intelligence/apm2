@@ -666,11 +666,22 @@ impl DeferredReplayWorker {
         //
         // Fail-closed: if projection fails, the intent is DENIED.
         // -----------------------------------------------------------------
+        // Parse the projected_status stored in the intent record back into
+        // the ProjectedStatus enum. Fail-closed: unknown status string results
+        // in DENY rather than silently defaulting to Success.
+        let parsed_status = ProjectedStatus::from_str_checked(&intent.projected_status)
+            .ok_or_else(|| {
+                DeferredReplayError::IntentBufferError(format!(
+                    "unknown projected_status '{}' for intent {} (fail-closed deny)",
+                    intent.projected_status, entry.intent_id
+                ))
+            })?;
+
         if let Err(proj_err) = self.projection_effect.execute_projection(
             &intent.work_id,
             intent.changeset_digest,
             intent.ledger_head,
-            ProjectedStatus::Success,
+            parsed_status,
         ) {
             info!(
                 intent_id = %entry.intent_id,
@@ -692,7 +703,9 @@ impl DeferredReplayWorker {
         // means the expected row mutation did not occur, which is a hard
         // failure (INV-DR08).
         // -----------------------------------------------------------------
-        let admit_tick_ns = current_tick.saturating_mul(1_000_000); // HTF tick to ns
+        // At 1GHz tick rate (daemon default), 1 tick = 1 nanosecond.
+        // Use current_tick directly as the nanosecond timestamp.
+        let admit_tick_ns = current_tick;
 
         let admitted = self
             .intent_buffer
@@ -858,8 +871,14 @@ impl DeferredReplayWorker {
         let freshness_tick = eval_tick.max(1);
 
         // Preserve original bindings from the buffered intent:
-        // - capability_manifest_hash: derived from changeset_digest (the original
-        //   intent's content binding), not a synthetic constant.
+        // - capability_manifest_hash: derived by hashing the changeset_digest. The
+        //   changeset_digest is itself a content hash of the original changeset, so
+        //   this produces a domain-separated "hash of a hash". This is intentional: the
+        //   deferred replay context does not have access to the original capability
+        //   manifest, so we derive a deterministic stand-in from the closest available
+        //   content binding (the changeset_digest). Hashing again ensures the value
+        //   occupies the correct domain (capability_manifest namespace) and cannot
+        //   collide with a raw changeset_digest used elsewhere.
         // - identity_proof_hash: derived from work_id (the original identity binding).
         // - scope_witness_hash: derived from ledger_head (the original scope context at
         //   buffer time).
