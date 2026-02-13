@@ -143,9 +143,14 @@ where
 
 /// Deserialize a string with a maximum length bound to prevent OOM attacks.
 ///
-/// Per SEC-CTRL-FAC-0016, all string fields deserialized from untrusted input
-/// must enforce length limits during parsing to prevent denial-of-service via
-/// memory exhaustion.
+/// Per SEC-CTRL-FAC-0016 / RSK-1601, all string fields deserialized from
+/// untrusted input must enforce length limits during parsing to prevent
+/// denial-of-service via memory exhaustion.
+///
+/// Uses a Visitor-based implementation so that `visit_str` checks the length
+/// BEFORE allocating (calling `to_owned()`), closing the Check-After-Allocate
+/// OOM-DoS vector present in naive `String::deserialize` + post-check patterns.
+/// Same pattern as `crates/apm2-core/src/economics/queue_admission.rs`.
 fn deserialize_bounded_string<'de, D>(
     deserializer: D,
     max_len: usize,
@@ -154,19 +159,64 @@ fn deserialize_bounded_string<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    if s.len() > max_len {
-        return Err(de::Error::custom(format!(
-            "string field '{}' exceeds maximum length ({} > {})",
-            field_name,
-            s.len(),
-            max_len
-        )));
+    struct BoundedStringVisitor {
+        max_len: usize,
+        field_name: &'static str,
     }
-    Ok(s)
+
+    impl Visitor<'_> for BoundedStringVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a string of at most {} bytes for field '{}'",
+                self.max_len, self.field_name
+            )
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            if value.len() > self.max_len {
+                Err(E::custom(format!(
+                    "string field '{}' exceeds maximum length ({} > {})",
+                    self.field_name,
+                    value.len(),
+                    self.max_len
+                )))
+            } else {
+                // Length validated BEFORE allocation.
+                Ok(value.to_owned())
+            }
+        }
+
+        fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+            if value.len() > self.max_len {
+                Err(E::custom(format!(
+                    "string field '{}' exceeds maximum length ({} > {})",
+                    self.field_name,
+                    value.len(),
+                    self.max_len
+                )))
+            } else {
+                // Already owned — no additional allocation needed.
+                Ok(value)
+            }
+        }
+    }
+
+    deserializer.deserialize_string(BoundedStringVisitor {
+        max_len,
+        field_name,
+    })
 }
 
 /// Deserialize an optional string with a maximum length bound.
+///
+/// Uses a Visitor-based implementation so that `visit_str` / `visit_string`
+/// check the length BEFORE allocating, and `visit_none` / `visit_unit` handle
+/// the `None` / `null` case without any allocation. This closes the
+/// Check-After-Allocate OOM-DoS vector present in naive
+/// `Option::<String>::deserialize` + post-check patterns.
 fn deserialize_bounded_option_string<'de, D>(
     deserializer: D,
     max_len: usize,
@@ -175,18 +225,45 @@ fn deserialize_bounded_option_string<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    let opt: Option<String> = Option::deserialize(deserializer)?;
-    if let Some(ref s) = opt {
-        if s.len() > max_len {
-            return Err(de::Error::custom(format!(
-                "string field '{}' exceeds maximum length ({} > {})",
-                field_name,
-                s.len(),
-                max_len
-            )));
+    struct BoundedOptionStringVisitor<'de> {
+        max_len: usize,
+        field_name: &'static str,
+        _lifetime: std::marker::PhantomData<&'de ()>,
+    }
+
+    impl<'de> Visitor<'de> for BoundedOptionStringVisitor<'de> {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                formatter,
+                "null or a string of at most {} bytes for field '{}'",
+                self.max_len, self.field_name
+            )
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: Deserializer<'de>,
+        {
+            // Delegate to the non-optional bounded string visitor and wrap in Some.
+            deserialize_bounded_string(deserializer, self.max_len, self.field_name).map(Some)
         }
     }
-    Ok(opt)
+
+    deserializer.deserialize_option(BoundedOptionStringVisitor {
+        max_len,
+        field_name,
+        _lifetime: std::marker::PhantomData,
+    })
 }
 
 // Field-specific deserializers
@@ -1933,5 +2010,128 @@ mod tests {
         let mut w2 = valid_eval_window();
         w2.tick_end = 999;
         assert_ne!(compute_eval_window_hash(&w1), compute_eval_window_hash(&w2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Visitor-based bounded string deserialization (RSK-1601 OOM hardening)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn visitor_bounded_string_accepts_at_limit() {
+        // predicate_id at exactly MAX_PREDICATE_ID_LENGTH should succeed
+        let exact_id = "x".repeat(MAX_PREDICATE_ID_LENGTH);
+        let json =
+            format!(r#"{{"predicate_id": "{exact_id}", "passed": true, "deny_reason": null}}"#);
+        let result: Result<InvariantCheckResult, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_ok(),
+            "should accept predicate_id at exactly MAX length"
+        );
+        assert_eq!(result.unwrap().predicate_id.len(), MAX_PREDICATE_ID_LENGTH);
+    }
+
+    #[test]
+    fn visitor_bounded_string_rejects_one_over_limit() {
+        // predicate_id at MAX_PREDICATE_ID_LENGTH + 1 must be rejected
+        let over_id = "x".repeat(MAX_PREDICATE_ID_LENGTH + 1);
+        let json =
+            format!(r#"{{"predicate_id": "{over_id}", "passed": true, "deny_reason": null}}"#);
+        let result: Result<InvariantCheckResult, _> = serde_json::from_str(&json);
+        assert!(result.is_err(), "should reject predicate_id one over MAX");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds maximum length"),
+            "error should mention length violation: {err}"
+        );
+    }
+
+    #[test]
+    fn visitor_bounded_option_string_accepts_null() {
+        // deny_reason = null should deserialize to None
+        let json = r#"{"predicate_id": "TP001", "passed": true, "deny_reason": null}"#;
+        let result: Result<InvariantCheckResult, _> = serde_json::from_str(json);
+        assert!(result.is_ok(), "should accept null deny_reason");
+        assert_eq!(result.unwrap().deny_reason, None);
+    }
+
+    #[test]
+    fn visitor_bounded_option_string_accepts_at_limit() {
+        // deny_reason at exactly MAX_DENY_REASON_LENGTH should succeed
+        let exact_reason = "r".repeat(MAX_DENY_REASON_LENGTH);
+        let json = format!(
+            r#"{{"predicate_id": "TP001", "passed": false, "deny_reason": "{exact_reason}"}}"#
+        );
+        let result: Result<InvariantCheckResult, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_ok(),
+            "should accept deny_reason at exactly MAX length"
+        );
+        assert_eq!(
+            result.unwrap().deny_reason.unwrap().len(),
+            MAX_DENY_REASON_LENGTH
+        );
+    }
+
+    #[test]
+    fn visitor_bounded_option_string_rejects_one_over_limit() {
+        // deny_reason at MAX_DENY_REASON_LENGTH + 1 must be rejected
+        let over_reason = "r".repeat(MAX_DENY_REASON_LENGTH + 1);
+        let json = format!(
+            r#"{{"predicate_id": "TP001", "passed": false, "deny_reason": "{over_reason}"}}"#
+        );
+        let result: Result<InvariantCheckResult, _> = serde_json::from_str(&json);
+        assert!(result.is_err(), "should reject deny_reason one over MAX");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds maximum length"),
+            "error should mention length violation: {err}"
+        );
+    }
+
+    #[test]
+    fn visitor_bounded_schema_id_rejects_oversized() {
+        // Schema ID oversized by a large margin to verify visitor path
+        let huge_schema = "s".repeat(MAX_SCHEMA_ID_LENGTH + 100);
+        let receipt_json = format!(
+            r#"{{
+                "schema_id": "{huge_schema}",
+                "schema_version": "1.0.0",
+                "status": "HEALTHY",
+                "broker_tick": 1,
+                "eval_window_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "checks": [],
+                "content_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "signature": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "signer_id": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+            }}"#
+        );
+        let result: Result<HealthReceiptV1, _> = serde_json::from_str(&receipt_json);
+        assert!(
+            result.is_err(),
+            "should reject oversized schema_id via visitor"
+        );
+    }
+
+    #[test]
+    fn visitor_bounded_schema_version_rejects_oversized() {
+        let huge_version = "v".repeat(MAX_SCHEMA_VERSION_LENGTH + 1);
+        let receipt_json = format!(
+            r#"{{
+                "schema_id": "apm2.fac_broker_health_receipt.v1",
+                "schema_version": "{huge_version}",
+                "status": "HEALTHY",
+                "broker_tick": 1,
+                "eval_window_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "checks": [],
+                "content_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "signature": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "signer_id": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+            }}"#
+        );
+        let result: Result<HealthReceiptV1, _> = serde_json::from_str(&receipt_json);
+        assert!(
+            result.is_err(),
+            "should reject oversized schema_version via visitor"
+        );
     }
 }

@@ -143,7 +143,10 @@ health gate to refuse job admission when broker health is degraded.
   receipt payload fields, preventing post-signing field tampering. Schema ID and
   version are included in the canonical hash.
 - [INV-BH-007] All string fields and Vec collections enforce bounded
-  deserialization to prevent memory exhaustion from malformed JSON (RSK-1601).
+  deserialization via visitor-based implementations that validate length BEFORE
+  ownership allocation, preventing memory exhaustion from malformed JSON
+  (RSK-1601, SEC-CTRL-FAC-0016). The `visit_str` path checks length before
+  `to_owned()`, closing the Check-After-Allocate OOM-DoS vector.
 - [INV-BH-008] Hash computation uses `u64::to_le_bytes()` length prefixes for
   injective framing of variable-length fields.
 - [INV-BH-009] Evaluation window hash is included in the receipt payload for
