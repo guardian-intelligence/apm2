@@ -172,8 +172,8 @@ impl TestContinuityResolver {
 impl ContinuityProfileResolver for TestContinuityResolver {
     fn resolve_continuity_profile(&self, _sink_id: &str) -> Option<ResolvedContinuityProfile> {
         match self.mode {
-            ResolverMode::Allow => Some(self.profile.clone()),
-            _ => None,
+            ResolverMode::Allow | ResolverMode::MissingSnapshot => Some(self.profile.clone()),
+            ResolverMode::MissingProfile => None,
         }
     }
 
@@ -693,6 +693,8 @@ fn test_deny_stale_temporal_authority() {
     let resolver = Arc::new(TestContinuityResolver::new(&signer));
     let harness = Harness::new(resolver, 0, Arc::clone(&signer));
     let stale_before = harness.lifecycle_stale_count();
+    let revoked_before = harness.lifecycle_revoked_count();
+    let consumed_before = harness.lifecycle_consumed_count();
     let stale_eval_tick = 10u64;
     let revocation_head = digest(0x56);
     let inserted = harness.insert_intent_with_backlog(
@@ -723,6 +725,8 @@ fn test_deny_stale_temporal_authority() {
         &result,
     );
     assert_eq!(harness.lifecycle_stale_count(), stale_before + 1);
+    assert_eq!(harness.lifecycle_revoked_count(), revoked_before);
+    assert_eq!(harness.lifecycle_consumed_count(), consumed_before);
 }
 
 #[test]
@@ -777,7 +781,7 @@ fn test_deny_missing_snapshot() {
         &harness,
         "intent-missing-snapshot-001",
         DENY_REPLAY_ECONOMICS_GATE,
-        Some("continuity profile"),
+        Some("snapshot"),
         &result,
     );
     harness.assert_no_projection_call();
@@ -789,6 +793,8 @@ fn test_lifecycle_deny_revoked_authority() {
     let resolver = Arc::new(TestContinuityResolver::new(&signer));
     let harness = Harness::new(resolver, 0, Arc::clone(&signer));
     let revoked_before = harness.lifecycle_revoked_count();
+    let stale_before = harness.lifecycle_stale_count();
+    let consumed_before = harness.lifecycle_consumed_count();
     let revoked_ledger_head = digest(0x58);
 
     let issued_revocation_head = revoked_ledger_head;
@@ -821,8 +827,8 @@ fn test_lifecycle_deny_revoked_authority() {
         &result,
     );
     assert_eq!(harness.lifecycle_revoked_count(), revoked_before + 1);
-    assert_eq!(harness.lifecycle_stale_count(), 0);
-    assert_eq!(harness.lifecycle_consumed_count(), 0);
+    assert_eq!(harness.lifecycle_stale_count(), stale_before);
+    assert_eq!(harness.lifecycle_consumed_count(), consumed_before);
 }
 
 #[test]
@@ -830,6 +836,8 @@ fn test_lifecycle_deny_consumed_token() {
     let signer = Arc::new(Signer::generate());
     let resolver = Arc::new(TestContinuityResolver::new(&signer));
     let harness = Harness::new(resolver, 0, Arc::clone(&signer));
+    let revoked_before = harness.lifecycle_revoked_count();
+    let stale_before = harness.lifecycle_stale_count();
     let revocation_head = digest(0x59);
 
     let inserted = harness.insert_intent_with_backlog(
@@ -868,6 +876,8 @@ fn test_lifecycle_deny_consumed_token() {
         &result,
     );
     assert_eq!(harness.lifecycle_consumed_count(), 1);
+    assert_eq!(harness.lifecycle_revoked_count(), revoked_before);
+    assert_eq!(harness.lifecycle_stale_count(), stale_before);
 }
 
 #[test]
@@ -876,6 +886,8 @@ fn test_lifecycle_deny_stale_authority_freshness() {
     let resolver = Arc::new(TestContinuityResolver::new(&signer));
     let harness = Harness::new(resolver, 0, Arc::clone(&signer));
     let stale_before = harness.lifecycle_stale_count();
+    let revoked_before = harness.lifecycle_revoked_count();
+    let consumed_before = harness.lifecycle_consumed_count();
     let eval_tick = 150u64;
     let revocation_head = digest(0x5A);
 
@@ -906,6 +918,8 @@ fn test_lifecycle_deny_stale_authority_freshness() {
         &result,
     );
     assert_eq!(harness.lifecycle_stale_count(), stale_before + 1);
+    assert_eq!(harness.lifecycle_revoked_count(), revoked_before);
+    assert_eq!(harness.lifecycle_consumed_count(), consumed_before);
 }
 
 #[test]
@@ -952,6 +966,11 @@ fn test_outage_recovery_replay_in_order() {
     }
 
     harness.set_effect_fail_reason(Some("outage: sink unavailable"));
+    let pending_before_first_outage = harness
+        .intent_buffer
+        .query_pending_backlog(10)
+        .expect("pending backlog should be queryable before outage drain");
+    assert_eq!(pending_before_first_outage.len(), 3);
 
     let first = harness.drain(
         replay_tick,
@@ -981,6 +1000,12 @@ fn test_outage_recovery_replay_in_order() {
             "work-order-003".to_string(),
         ]
     );
+
+    let denied_after_outage = harness
+        .intent_buffer
+        .query_by_verdict(IntentVerdict::Denied, 10)
+        .expect("denied intents should be queryable after projection outage");
+    assert_eq!(denied_after_outage.len(), 3);
 
     let pending_after_outage = harness
         .intent_buffer
