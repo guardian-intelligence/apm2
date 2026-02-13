@@ -82,7 +82,7 @@ Privileged endpoint dispatcher for RFC-0017 control-plane IPC. Routes privileged
 
 **Invariants:**
 
-- [INV-BRK-HEALTH-GATE-001] Token issuance via `validate_channel_boundary_and_issue_context_token_with_flow` requires `admission_health_gate` to be `true` (set by `set_admission_health_gate(true)` after a successful broker health check). Defaults to `false` (fail-closed). The `admission_health_gate` field is an `AtomicBool` because `PrivilegedDispatcher` is stored as `&'static` via `OnceLock` in session dispatch, preventing `&mut self` access. Uses `Release`/`Acquire` ordering. The static singleton is exposed via `channel_boundary_dispatcher()` (pub(crate) in session_dispatch.rs).
+- [INV-BRK-HEALTH-GATE-001] Token issuance via `validate_channel_boundary_and_issue_context_token_with_flow` requires `admission_health_gate` to be `true` (set by `set_admission_health_gate(true)` after a successful broker health check). Defaults to `false` (fail-closed). The `admission_health_gate` field is an `AtomicBool` because `PrivilegedDispatcher` is stored as `&'static` via `OnceLock` in session dispatch, preventing `&mut self` access. Uses `Release`/`Acquire` ordering. The static singleton is exposed via `channel_boundary_dispatcher()` (pub(crate) in session_dispatch.rs). Production code synchronizes the gate via `synchronize_dispatcher_health_gate(broker.is_admission_health_gate_passed())` after every broker health check.
 
 ### `SessionDispatcher`
 

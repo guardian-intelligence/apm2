@@ -81,7 +81,8 @@ pub const MAX_PREDICATE_ID_LENGTH: usize = 64;
 pub const MAX_DENY_REASON_LENGTH: usize = 1024;
 
 /// Maximum string length for `schema_id` fields (SEC-CTRL-FAC-0016).
-pub const MAX_SCHEMA_ID_LENGTH: usize = 256;
+/// Actual schema IDs are ~40 bytes; 128 provides headroom.
+pub const MAX_SCHEMA_ID_LENGTH: usize = 128;
 
 /// Maximum string length for `schema_version` fields (SEC-CTRL-FAC-0016).
 pub const MAX_SCHEMA_VERSION_LENGTH: usize = 64;
@@ -699,6 +700,23 @@ impl BrokerHealthChecker {
         Self {
             history: Vec::new(),
             health_seq: 0,
+        }
+    }
+
+    /// Creates a health checker restored from persisted state.
+    ///
+    /// The `health_seq` is loaded from `BrokerState::health_seq` so that
+    /// the counter resumes from the last known value after a daemon restart.
+    /// This prevents replay of old health receipts from a previous daemon
+    /// lifetime (INV-BH-013).
+    ///
+    /// History is not persisted and starts empty; the first health check
+    /// after restart will populate it.
+    #[must_use]
+    pub const fn from_persisted_seq(health_seq: u64) -> Self {
+        Self {
+            history: Vec::new(),
+            health_seq,
         }
     }
 
@@ -3495,12 +3513,12 @@ mod tests {
         );
 
         // Now use the production admission gate — it should DENY.
+        // MINOR-4: The broker now uses its own current_tick() and
+        // state.health_seq as floors, so no caller-supplied values.
         let result = broker.evaluate_admission_health_gate(
             &checker,
             &eval_window,
             WorkerHealthPolicy::StrictHealthy,
-            0,
-            0,
         );
         assert!(
             result.is_err(),
@@ -3527,8 +3545,6 @@ mod tests {
             &checker,
             &eval_window,
             WorkerHealthPolicy::StrictHealthy,
-            0,
-            0,
         );
         assert!(
             result.is_err(),
@@ -3551,19 +3567,24 @@ mod tests {
             .build_evaluation_window("test-boundary", "test-clock", 0, 100)
             .unwrap();
 
-        // Run health check at current tick (0).
+        // Run health check at current broker tick (1).
         let _ = broker
             .check_health(None, &eval_window, &[], &mut checker)
             .unwrap();
 
-        // Require a minimum broker tick of 100 — the receipt was issued at
-        // tick 0, so it should be rejected as stale.
+        // Advance the broker tick well past the receipt's tick so that
+        // the broker's current_tick() floor rejects the old receipt.
+        // MINOR-4: The broker now uses self.current_tick() as the
+        // min_broker_tick floor internally, so advancing the tick
+        // makes the old receipt stale.
+        for _ in 0..99 {
+            let _ = broker.advance_tick();
+        }
+
         let result = broker.evaluate_admission_health_gate(
             &checker,
             &eval_window,
             WorkerHealthPolicy::StrictHealthy,
-            100, // min_broker_tick
-            0,
         );
         assert!(
             matches!(result, Err(WorkerHealthGateError::StaleReceipt { .. })),

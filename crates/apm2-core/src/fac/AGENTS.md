@@ -26,7 +26,9 @@ default mode.
   synchronized; callers must hold appropriate locks for concurrent access.
 - `BrokerState`: Persisted broker state including schema metadata, monotonic tick
   counter, admitted policy digest set, freshness/revocation/convergence hashes,
-  and convergence receipts. Serialized to canonical JSON.
+  convergence receipts, and persisted `health_seq` counter. Serialized to
+  canonical JSON. The `health_seq` field uses `#[serde(default)]` for backwards
+  compatibility with state files predating TCK-00585.
 - `BrokerError`: Fail-closed error taxonomy covering input validation, capacity
   limits, persistence, and deserialization failures.
 - `BrokerSignatureVerifier`: Implements `SignatureVerifier` trait from
@@ -84,6 +86,9 @@ default mode.
   non-short-circuiting iteration.
 - CTR-2501 deviation: `current_time_secs()` uses `SystemTime::now()` for token
   `issued_at` timestamps (wall-clock anchored expiry). Documented inline.
+- CTR-HEALTH-001 deviation: `check_health()` and `evaluate_admission_health_gate()`
+  do not follow PCAC lifecycle. They are control-plane safety predicates, not
+  authority-bearing effects. Documented inline.
 
 ## broker_health Submodule (TCK-00585)
 
@@ -116,7 +121,8 @@ health gate to refuse job admission when broker health is degraded.
   TP001/TP002/TP003 checks, signs receipts, and tracks history. The `health_seq`
   advances on every health check invocation (including error-path synthetic
   receipts), providing per-invocation freshness independent of broker tick.
-  Returns `Result` to enforce input bounds.
+  Returns `Result` to enforce input bounds. Can be restored from persisted state
+  via `from_persisted_seq(health_seq)` using the `BrokerState::health_seq` value.
 - `WorkerHealthPolicy`: Policy enum for worker admission gate. `StrictHealthy`
   (default) requires `Healthy`; `AllowDegraded` permits `Degraded`.
 - `WorkerHealthGateError`: Fail-closed error taxonomy for worker health gate
@@ -129,7 +135,12 @@ health gate to refuse job admission when broker health is degraded.
   functions (`validate_envelope_tp001`, `validate_freshness_horizon_tp002`,
   `validate_convergence_horizon_tp003`).
 - `FacBroker::check_health()` convenience method wires broker state into the
-  health checker. Returns `Result` for input bounds enforcement.
+  health checker. Persists `health_seq` to `BrokerState` after each call.
+  Returns `Result` for input bounds enforcement.
+- `FacBroker::evaluate_admission_health_gate()` enforces policy-driven admission
+  control using the broker's own `current_tick()` and `state.health_seq` as
+  minimum floors (preventing caller-supplied staleness). Delegates to
+  `evaluate_worker_health_gate()`.
 - `evaluate_worker_health_gate()` enforces policy-driven admission control:
   verifies receipt existence, payload integrity (content hash recomputation +
   constant-time comparison), signature authenticity (via `BrokerSignatureVerifier`),
@@ -198,11 +209,14 @@ health gate to refuse job admission when broker health is degraded.
 - [INV-BH-015] `FacBroker::evaluate_admission_health_gate()` is the
   canonical production entry point for worker admission health gating.
   It wires the broker's verifying key, computes the expected eval window
-  hash, and delegates to `evaluate_worker_health_gate()`. Both
+  hash, and uses `self.current_tick()` and `self.state.health_seq` as
+  minimum floors (preventing caller-supplied staleness). Both
   `evaluate_admission_health_gate()` and `check_health()` update the
   broker's `admission_health_gate_passed` flag, which is enforced by
   `issue_channel_context_token()` as a mandatory precondition
-  (INV-BRK-HEALTH-GATE-001). This ensures health gate enforcement is
+  (INV-BRK-HEALTH-GATE-001). `check_health()` also persists
+  `health_seq` to `BrokerState` after each call so the counter survives
+  daemon restarts. This ensures health gate enforcement is
   active on ALL production admission/token issuance paths through the
   `FacBroker` API.
 

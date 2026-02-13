@@ -758,6 +758,35 @@ pub(crate) fn channel_boundary_dispatcher() -> &'static PrivilegedDispatcher {
     DISPATCHER.get_or_init(PrivilegedDispatcher::new)
 }
 
+/// Updates the static dispatcher's admission health gate based on a broker
+/// health check result.
+///
+/// This is the **production wiring** for the health gate lifecycle
+/// (INV-BRK-HEALTH-GATE-001). It must be called after every broker health
+/// check to synchronize the `PrivilegedDispatcher`'s `AtomicBool` gate with
+/// the `FacBroker`'s `admission_health_gate_passed` flag.
+///
+/// # Arguments
+///
+/// - `health_gate_passed`: pass `broker.is_admission_health_gate_passed()`
+///   after a `broker.check_health()` or
+///   `broker.evaluate_admission_health_gate()` call.
+///
+/// # Invariant
+///
+/// INV-BRK-HEALTH-GATE-001: The dispatcher gate reflects the broker gate.
+/// Callers MUST invoke this function after every health check so that the
+/// static dispatcher's `AtomicBool` stays synchronized with the broker's
+/// boolean flag. Failure to call this function leaves the dispatcher gate
+/// in its default `false` state (fail-closed).
+///
+// Note: No production caller yet — the daemon startup/health-check loop
+// will invoke this once wired (future ticket). Tested via E2E tests below.
+#[allow(dead_code)]
+pub(crate) fn synchronize_dispatcher_health_gate(health_gate_passed: bool) {
+    channel_boundary_dispatcher().set_admission_health_gate(health_gate_passed);
+}
+
 const MAX_QUARANTINED_BOUNDARY_CHANNELS: usize = 512;
 const MAX_BOUNDARY_CHANNEL_KEY_LENGTH: usize = 256;
 const MAX_BOUNDARY_QUARANTINE_REASON_LENGTH: usize = 1024;
@@ -27250,5 +27279,97 @@ mod tests {
                 mock_journal.started_count()
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // INV-BRK-HEALTH-GATE-001: synchronize_dispatcher_health_gate lifecycle
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn synchronize_dispatcher_health_gate_opens_and_closes_gate() {
+        // Verify the production wiring function that synchronizes the
+        // PrivilegedDispatcher's AtomicBool gate with FacBroker state.
+
+        // Start: gate defaults to false on the static dispatcher.
+        let d = channel_boundary_dispatcher();
+
+        // Open the gate via the production synchronization function.
+        synchronize_dispatcher_health_gate(true);
+        assert!(
+            d.admission_health_gate_passed(),
+            "gate must be open after synchronize_dispatcher_health_gate(true)"
+        );
+
+        // Close the gate via the production synchronization function.
+        synchronize_dispatcher_health_gate(false);
+        assert!(
+            !d.admission_health_gate_passed(),
+            "gate must be closed after synchronize_dispatcher_health_gate(false)"
+        );
+    }
+
+    #[test]
+    fn synchronize_dispatcher_health_gate_e2e_broker_check_to_token_issuance() {
+        // End-to-end test: broker health check -> gate sync -> token issuance.
+        use apm2_core::fac::broker::FacBroker;
+        use apm2_core::fac::broker_health::BrokerHealthChecker;
+
+        let mut broker = FacBroker::new();
+        let job_digest = [0x42; 32];
+        broker
+            .admit_policy_digest(job_digest)
+            .expect("job digest should admit");
+
+        // Before health check: gate is closed on both broker and dispatcher.
+        assert!(!broker.is_admission_health_gate_passed());
+
+        let mut checker = BrokerHealthChecker::new();
+        let eval_window = apm2_core::economics::queue_admission::HtfEvaluationWindow {
+            boundary_id: "test-boundary".to_string(),
+            authority_clock: "test-clock".to_string(),
+            tick_start: 100,
+            tick_end: 200,
+        };
+
+        // Issue an envelope so TP001 passes.
+        let envelope = broker
+            .issue_time_authority_envelope("test-boundary", "test-clock", 100, 200, 500)
+            .expect("envelope should issue");
+        broker.advance_freshness_horizon(300);
+
+        let receipt = broker
+            .check_health(Some(&envelope), &eval_window, &[], &mut checker)
+            .expect("health check should succeed");
+
+        assert_eq!(
+            receipt.status,
+            apm2_core::fac::broker_health::BrokerHealthStatus::Healthy
+        );
+        assert!(broker.is_admission_health_gate_passed());
+
+        // Production wiring: sync broker gate -> dispatcher gate.
+        synchronize_dispatcher_health_gate(broker.is_admission_health_gate_passed());
+        assert!(
+            channel_boundary_dispatcher().admission_health_gate_passed(),
+            "dispatcher gate must be open after sync from healthy broker"
+        );
+
+        // Now run a failing health check (no envelope => TP001 fails).
+        let receipt_fail = broker
+            .check_health(None, &eval_window, &[], &mut checker)
+            .expect("health check should return a receipt (Failed, not Err)");
+
+        assert_eq!(
+            receipt_fail.status,
+            apm2_core::fac::broker_health::BrokerHealthStatus::Failed
+        );
+        assert!(!broker.is_admission_health_gate_passed());
+
+        // Sync the failure to the dispatcher.
+        synchronize_dispatcher_health_gate(broker.is_admission_health_gate_passed());
+        assert!(
+            !channel_boundary_dispatcher().admission_health_gate_passed(),
+            "dispatcher gate must be closed after sync from failed broker"
+        );
     }
 }

@@ -247,6 +247,16 @@ pub struct BrokerState {
     pub convergence_horizon_hash: Hash,
     /// Convergence receipts for TP-EIO29-003 (bounded).
     pub convergence_receipts: Vec<ConvergenceReceipt>,
+    /// Monotonic health check sequence counter (INV-BH-013, TCK-00585).
+    ///
+    /// Persisted so that `BrokerHealthChecker` can resume from the last
+    /// known sequence after a daemon restart, preventing replay of old
+    /// health receipts from a previous daemon lifetime.
+    ///
+    /// Defaults to 0 for backwards compatibility with state files that
+    /// predate TCK-00585.
+    #[serde(default)]
+    pub health_seq: u64,
 }
 
 impl Default for BrokerState {
@@ -261,6 +271,7 @@ impl Default for BrokerState {
             revocation_frontier_hash: compute_initial_frontier_hash(),
             convergence_horizon_hash: compute_initial_convergence_hash(),
             convergence_receipts: Vec::new(),
+            health_seq: 0,
         }
     }
 }
@@ -970,6 +981,16 @@ impl FacBroker {
     ///
     /// Returns [`super::broker_health::BrokerHealthError`] if input bounds
     /// are violated (e.g., too many required authority sets).
+    ///
+    /// # PCAC Lifecycle Deviation (CTR-HEALTH-001)
+    ///
+    /// This method does NOT follow PCAC lifecycle (join/revalidate/consume/
+    /// effect). Health gate updates are control-plane safety predicates, not
+    /// authority-bearing effects. They do not consume queue entries, produce
+    /// durable effects, or mint tokens. The health gate gates access to
+    /// token issuance but is itself a read-only check + boolean flag update.
+    /// When full PCAC health lifecycle integration is implemented (future
+    /// ticket), this deviation will be removed.
     pub fn check_health(
         &mut self,
         envelope: Option<&TimeAuthorityEnvelopeV1>,
@@ -978,6 +999,14 @@ impl FacBroker {
         checker: &mut super::broker_health::BrokerHealthChecker,
     ) -> Result<super::broker_health::HealthReceiptV1, super::broker_health::BrokerHealthError>
     {
+        // CTR-HEALTH-001 deviation: Health gate updates do not follow PCAC
+        // lifecycle. Rationale: The health gate is a control-plane safety
+        // predicate, not an authority-bearing effect. It does not consume
+        // queue entries, produce durable effects, or mint tokens. It gates
+        // access to token issuance but is itself a read-only check +
+        // boolean flag update. When full PCAC health lifecycle integration
+        // is implemented (future ticket), this deviation will be removed.
+
         let verifier = BrokerSignatureVerifier::new(self.verifying_key());
         let freshness = self.freshness_horizon();
         let frontier = self.revocation_frontier();
@@ -1012,6 +1041,13 @@ impl FacBroker {
             },
         }
 
+        // INV-BH-013: Persist the health_seq counter so it survives daemon
+        // restarts. The checker's counter has already been advanced by the
+        // check_health call above, so we capture its current (post-advance)
+        // value. This ensures the next daemon lifetime resumes from where
+        // this one left off, preventing replay of old receipts.
+        self.state.health_seq = checker.current_health_seq();
+
         result
     }
 
@@ -1040,23 +1076,41 @@ impl FacBroker {
     /// - `eval_window`: the current evaluation window (used to compute the
     ///   expected `eval_window_hash`)
     /// - `policy`: the admission policy (strict-healthy or allow-degraded)
-    /// - `min_broker_tick`: minimum acceptable broker tick on the receipt
-    /// - `min_health_seq`: minimum acceptable health sequence on the receipt
+    ///
+    /// # Staleness Protection
+    ///
+    /// The broker enforces its own `current_tick()` and persisted
+    /// `state.health_seq` as minimum floors for the receipt recency and
+    /// health sequence checks. This prevents callers from supplying stale
+    /// thresholds that would accept outdated receipts.
     ///
     /// # Errors
     ///
     /// Returns a [`super::broker_health::WorkerHealthGateError`] if the gate
     /// rejects admission.
+    ///
+    /// # PCAC Lifecycle Deviation (CTR-HEALTH-001)
+    ///
+    /// See [`Self::check_health`] for rationale. The health gate evaluation
+    /// is a control-plane safety predicate, not an authority-bearing effect.
     pub fn evaluate_admission_health_gate(
         &mut self,
         checker: &super::broker_health::BrokerHealthChecker,
         eval_window: &HtfEvaluationWindow,
         policy: super::broker_health::WorkerHealthPolicy,
-        min_broker_tick: u64,
-        min_health_seq: u64,
     ) -> Result<(), super::broker_health::WorkerHealthGateError> {
+        // CTR-HEALTH-001 deviation: see check_health() for full rationale.
         let verifier = BrokerSignatureVerifier::new(self.verifying_key());
         let expected_hash = super::broker_health::compute_eval_window_hash(eval_window);
+
+        // MINOR-4 fix: Use the broker's own current tick as the minimum
+        // acceptable broker tick, and the checker's latest-assigned seq
+        // (current_health_seq - 1) as the minimum health seq. This prevents
+        // callers from supplying stale values that would accept outdated
+        // receipts. The saturating_sub(1) converts from "next to assign"
+        // to "last assigned" — we accept only the most recent receipt.
+        let min_broker_tick = self.current_tick();
+        let min_health_seq = checker.current_health_seq().saturating_sub(1);
 
         let result = super::broker_health::evaluate_worker_health_gate(
             checker.latest(),
@@ -1872,6 +1926,97 @@ mod tests {
         let restored = FacBroker::deserialize_state(&bytes).expect("deserialize should succeed");
 
         assert_eq!(restored, broker.state);
+    }
+
+    #[test]
+    fn health_seq_persisted_in_broker_state_after_check() {
+        // MAJOR-2: Verify that check_health updates state.health_seq
+        // so that it survives serialization/deserialization round trips.
+        let mut broker = FacBroker::new();
+        let mut checker = super::super::broker_health::BrokerHealthChecker::new();
+        let eval_window = crate::economics::queue_admission::HtfEvaluationWindow {
+            boundary_id: "test-boundary".to_string(),
+            authority_clock: "test-clock".to_string(),
+            tick_start: 100,
+            tick_end: 200,
+        };
+
+        // Run 3 health checks to advance health_seq to 3.
+        for _ in 0..3 {
+            let _ = broker
+                .check_health(None, &eval_window, &[], &mut checker)
+                .expect("health check should produce a receipt");
+        }
+
+        assert_eq!(
+            broker.state().health_seq,
+            3,
+            "state.health_seq must be 3 after 3 health checks"
+        );
+
+        // Round-trip through serialization.
+        let bytes = broker.serialize_state().expect("serialize should succeed");
+        let restored = FacBroker::deserialize_state(&bytes).expect("deserialize should succeed");
+
+        assert_eq!(
+            restored.health_seq, 3,
+            "health_seq must survive serialization round trip"
+        );
+
+        // Restore the checker from persisted state.
+        let restored_checker = super::super::broker_health::BrokerHealthChecker::from_persisted_seq(
+            restored.health_seq,
+        );
+        assert_eq!(
+            restored_checker.current_health_seq(),
+            3,
+            "restored checker must resume from persisted health_seq"
+        );
+    }
+
+    #[test]
+    fn health_seq_backwards_compat_default_zero() {
+        // MAJOR-2: Verify backwards compatibility — old state files
+        // without health_seq should deserialize with health_seq = 0.
+        let json = r#"{
+            "schema_id": "apm2.fac_broker.state.v1",
+            "schema_version": "1.0.0",
+            "current_tick": 1,
+            "freshness_horizon_tick_end": 1,
+            "admitted_policy_digests": [],
+            "freshness_horizon_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "revocation_frontier_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "convergence_horizon_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "convergence_receipts": []
+        }"#;
+        let result = FacBroker::deserialize_state(json.as_bytes());
+        // This will fail because the hashes are zero and not the expected
+        // domain-separated initial values — but that's a validation error,
+        // not a deserialization error. The point is: the JSON parses OK
+        // despite missing health_seq.
+        match result {
+            Ok(state) => {
+                assert_eq!(state.health_seq, 0, "missing health_seq must default to 0");
+            },
+            Err(BrokerError::Deserialization { detail }) => {
+                // If it fails on schema_id mismatch, that's fine — the
+                // backwards compat for serde parsing still works.
+                // The test proves the JSON parser accepted the missing field.
+                assert!(
+                    !detail.contains("health_seq"),
+                    "failure must NOT be about missing health_seq field, got: {detail}"
+                );
+            },
+            Err(other) => {
+                // Other validation errors (e.g., schema version mismatch)
+                // are acceptable — the point is health_seq was not the blocker.
+                let msg = format!("{other:?}");
+                assert!(
+                    !msg.contains("health_seq"),
+                    "failure must NOT be about health_seq, got: {msg}"
+                );
+            },
+        }
     }
 
     #[test]
