@@ -181,9 +181,12 @@ pub enum JobSpecError {
         max: usize,
     },
 
-    /// The `channel_context_token` is missing in default mode.
-    #[error("actuation.channel_context_token is required in default mode")]
-    MissingChannelContextToken,
+    /// A required token field is missing or empty.
+    #[error("missing required token: {field}")]
+    MissingToken {
+        /// Field that is missing.
+        field: &'static str,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +362,9 @@ impl FacJobSpecV1 {
     ///
     /// Checks lengths, non-empty required fields, schema match, and
     /// priority range. Does NOT check digest or `request_id` binding
-    /// (use [`validate_job_spec`] for full validation).
+    /// (use [`validate_job_spec`] for full validation). In particular,
+    /// this method intentionally does not require a channel token; workers
+    /// must apply full validation.
     ///
     /// # Errors
     ///
@@ -442,6 +447,12 @@ impl FacJobSpecV1 {
 ///
 /// Returns the first validation failure. Workers MUST deny/quarantine the
 /// job on any error (fail-closed).
+///
+/// Worker execution paths MUST also call
+/// [`crate::channel::decode_channel_context_token`] and
+/// [`crate::channel::validate_channel_boundary`] on
+/// `actuation.channel_context_token` and deny execution unless both checks
+/// succeed.
 pub fn validate_job_spec(spec: &FacJobSpecV1) -> Result<(), JobSpecError> {
     spec.validate_structure()?;
 
@@ -474,6 +485,16 @@ pub fn validate_job_spec(spec: &FacJobSpecV1) -> Result<(), JobSpecError> {
         return Err(JobSpecError::RequestIdMismatch {
             request_id: spec.actuation.request_id.clone(),
             job_spec_digest: spec.job_spec_digest.clone(),
+        });
+    }
+    if spec
+        .actuation
+        .channel_context_token
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        return Err(JobSpecError::MissingToken {
+            field: "actuation.channel_context_token",
         });
     }
 
@@ -890,6 +911,32 @@ mod tests {
         assert!(matches!(result, Err(JobSpecError::DigestMismatch { .. })));
     }
 
+    #[test]
+    fn validate_job_spec_rejects_missing_token() {
+        let mut spec = build_valid_spec();
+        spec.actuation.channel_context_token = None;
+        let result = validate_job_spec(&spec);
+        assert!(matches!(
+            result,
+            Err(JobSpecError::MissingToken {
+                field: "actuation.channel_context_token"
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_job_spec_rejects_empty_token() {
+        let mut spec = build_valid_spec();
+        spec.actuation.channel_context_token = Some(String::new());
+        let result = validate_job_spec(&spec);
+        assert!(matches!(
+            result,
+            Err(JobSpecError::MissingToken {
+                field: "actuation.channel_context_token"
+            })
+        ));
+    }
+
     // -------------------------------------------------------------------
     // Validation: request_id mismatch
     // -------------------------------------------------------------------
@@ -1044,10 +1091,13 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_preserves_validation() {
-        let spec = build_valid_spec();
+        let mut spec = build_valid_spec();
+        spec.actuation.channel_context_token = Some("VALID_TOKEN_VALUE".to_string());
         let json = serde_json::to_string_pretty(&spec).expect("serialize");
         let deserialized: FacJobSpecV1 = serde_json::from_str(&json).expect("deserialize");
-        assert!(validate_job_spec(&deserialized).is_ok());
+        if let Err(err) = validate_job_spec(&deserialized) {
+            panic!("deserialized job spec should validate in worker mode: {err:?}");
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1144,7 +1194,10 @@ mod tests {
         assert_eq!(spec, restored);
 
         // Validate deserialized
-        assert!(validate_job_spec(&restored).is_ok());
+        let result = validate_job_spec(&restored);
+        if let Err(err) = result {
+            panic!("deserialized job spec should validate in worker mode: {err:?}");
+        }
 
         // Tamper and verify detection
         let mut tampered = restored;
