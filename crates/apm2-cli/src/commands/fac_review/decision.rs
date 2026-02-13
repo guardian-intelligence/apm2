@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use super::barrier::{ensure_gh_cli_ready, fetch_pr_head_sha, resolve_authenticated_gh_login};
 use super::target::resolve_pr_target;
-use super::types::{COMMENT_CONFIRM_MAX_PAGES, now_iso8601, validate_expected_head_sha};
+use super::types::{
+    COMMENT_CONFIRM_MAX_PAGES, ReviewRunStatus, now_iso8601, validate_expected_head_sha,
+};
 use super::{github_projection, projection_store};
 use crate::exit_codes::codes as exit_codes;
 
@@ -226,7 +228,12 @@ pub fn run_decision_set(
             eprintln!("WARNING: failed to clean prepared review inputs: {err}");
         }
     }
-    let _ = terminate_review_agent(resolved_pr, normalized_dimension, &head_sha);
+    match terminate_review_agent(resolved_pr, normalized_dimension, &head_sha) {
+        Ok(_terminated) => {},
+        Err(err) => {
+            eprintln!("WARNING: review termination step skipped: {err}");
+        },
+    }
     Ok(exit_codes::SUCCESS)
 }
 
@@ -716,61 +723,60 @@ fn dimension_to_state_review_type(dimension: &str) -> &str {
     }
 }
 
-fn terminate_review_agent(pr_number: u32, dimension: &str, reviewed_sha: &str) -> Option<String> {
+fn terminate_review_agent(
+    pr_number: u32,
+    dimension: &str,
+    reviewed_sha: &str,
+) -> Result<bool, String> {
     let review_type = dimension_to_state_review_type(dimension);
-    let Ok(Some(state)) = super::state::load_review_run_state_strict(pr_number, review_type) else {
-        return None;
+    let Some(mut state) = super::state::load_review_run_state_strict(pr_number, review_type)?
+    else {
+        return Ok(false);
     };
+
     if !state.head_sha.eq_ignore_ascii_case(reviewed_sha) {
-        let warning = format!(
-            "WARNING: skipping agent termination: reviewed sha {reviewed_sha} does not match state sha {}",
+        let message = format!(
+            "skipping agent termination: reviewed sha {reviewed_sha} does not match state sha {}",
             state.head_sha
         );
-        eprintln!("{warning}");
-        return Some(warning);
+        eprintln!("WARNING: {message}");
+        return Ok(false);
     }
     let Some(pid) = state.pid else {
-        let warning = format!(
+        eprintln!(
             "WARNING: skipping agent termination: no pid on active state for PR #{pr_number}"
         );
-        eprintln!("{warning}");
-        return Some(warning);
+        return Ok(false);
     };
     let Some(recorded_proc_start) = state.proc_start_time else {
-        let warning =
-            format!("WARNING: skipping agent termination: missing proc_start_time for pid {pid}");
-        eprintln!("{warning}");
-        return Some(warning);
+        eprintln!("WARNING: skipping agent termination: missing proc_start_time for pid {pid}");
+        return Ok(false);
     };
     if !super::state::is_process_alive(pid) {
-        return None;
+        eprintln!("WARNING: skipping agent termination: pid {pid} is already not alive");
+        return Ok(false);
     }
-    // Verify process identity to avoid killing a reused PID.
-    let observed_start = super::state::get_process_start_time(pid);
-    if observed_start != Some(recorded_proc_start) {
-        let warning = format!(
-            "WARNING: skipping agent termination: pid {pid} identity mismatch observed={observed_start:?} expected={recorded_proc_start}"
-        );
-        eprintln!("{warning}");
-        return Some(warning);
+
+    super::dispatch::verify_process_identity(pid, Some(recorded_proc_start))
+        .map_err(|err| format!("failed to verify process identity for pid {pid}: {err}"))?;
+
+    super::dispatch::terminate_process_with_timeout(pid)
+        .map_err(|err| format!("failed to terminate review agent pid={pid}: {err}"))?;
+
+    if super::state::is_process_alive(pid) {
+        return Err(format!(
+            "review agent pid={pid} is still alive after termination attempt"
+        ));
     }
-    // SIGTERM → wait → SIGKILL
-    let _ = std::process::Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .status();
-    let deadline = std::time::Instant::now() + super::types::TERMINATE_TIMEOUT;
-    while std::time::Instant::now() < deadline {
-        if !super::state::is_process_alive(pid) {
-            eprintln!("INFO: terminated review agent pid={pid} after decision set");
-            return None;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let _ = std::process::Command::new("kill")
-        .args(["-KILL", &pid.to_string()])
-        .status();
-    eprintln!("WARNING: sent SIGKILL to review agent pid={pid}");
-    None
+
+    state.status = ReviewRunStatus::Failed;
+    state.terminal_reason = Some("manual_termination_after_decision".to_string());
+    super::state::write_review_run_state(&state).map_err(|err| {
+        format!("failed to persist terminal review state for PR #{pr_number}: {err}")
+    })?;
+
+    eprintln!("INFO: terminated review agent pid={pid} after decision set");
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -971,11 +977,11 @@ dimensions:
         let state = sample_run_state(pr_number, pid, "abcdef1234567890", Some(proc_start_time));
         state::write_review_run_state_for_home(&home, &state).expect("write run state");
 
-        let warning = super::terminate_review_agent(pr_number, "security", "1234567890abcdef")
-            .expect("warning expected");
+        let killed = super::terminate_review_agent(pr_number, "security", "1234567890abcdef")
+            .expect("termination result expected");
         assert!(
-            warning.contains("does not match"),
-            "unexpected warning: {warning}"
+            !killed,
+            "unexpected termination: should skip on sha mismatch"
         );
         assert!(state::is_process_alive(pid));
 
@@ -998,11 +1004,11 @@ dimensions:
         let state = sample_run_state(pr_number, pid, "abcdef1234567890", None);
         state::write_review_run_state_for_home(&home, &state).expect("write run state");
 
-        let warning = super::terminate_review_agent(pr_number, "security", "abcdef1234567890")
-            .expect("warning expected");
+        let killed = super::terminate_review_agent(pr_number, "security", "abcdef1234567890")
+            .expect("termination result expected");
         assert!(
-            warning.contains("missing proc_start_time"),
-            "unexpected warning: {warning}"
+            !killed,
+            "unexpected termination: should skip when proc_start_time missing"
         );
         assert!(state::is_process_alive(pid));
 
@@ -1032,12 +1038,9 @@ dimensions:
         );
         state::write_review_run_state_for_home(&home, &state).expect("write run state");
 
-        let warning = super::terminate_review_agent(pr_number, "security", "abcdef1234567890")
-            .expect("warning expected");
-        assert!(
-            warning.contains("identity mismatch"),
-            "unexpected warning: {warning}"
-        );
+        let err = super::terminate_review_agent(pr_number, "security", "abcdef1234567890")
+            .expect_err("identity mismatch should fail");
+        assert!(err.contains("failed to verify process identity"));
         assert!(state::is_process_alive(pid));
 
         let _ = child.kill();

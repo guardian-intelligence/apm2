@@ -960,45 +960,9 @@ fn run_terminate_inner(
     let mut killed = false;
     if let Some(pid) = run_state.pid {
         if state::is_process_alive(pid) {
-            // Verify process identity to avoid killing a reused PID.
-            let recorded = run_state.proc_start_time.ok_or_else(|| {
-                let message =
-                    format!("WARNING: skipping termination: missing proc_start_time for pid={pid}");
-                eprintln!("{message}");
-                message
-            })?;
-            let observed = state::get_process_start_time(pid).ok_or_else(|| {
-                let message = format!(
-                    "WARNING: skipping termination: unable to read /proc/{pid} process start_time"
-                );
-                eprintln!("{message}");
-                message
-            })?;
-            if observed != recorded {
-                let message = format!(
-                    "WARNING: skipping termination: pid {pid} identity mismatch: recorded={recorded}, observed={observed}"
-                );
-                eprintln!("{message}");
-                return Err(message);
-            }
-            // SIGTERM → wait → SIGKILL
-            let _ = std::process::Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .status();
-            let deadline = Instant::now() + TERMINATE_TIMEOUT;
-            while Instant::now() < deadline {
-                if !state::is_process_alive(pid) {
-                    killed = true;
-                    break;
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-            if !killed {
-                let _ = std::process::Command::new("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .status();
-                killed = true;
-            }
+            dispatch::verify_process_identity(pid, run_state.proc_start_time)?;
+            dispatch::terminate_process_with_timeout(pid)?;
+            killed = true;
         }
     }
 

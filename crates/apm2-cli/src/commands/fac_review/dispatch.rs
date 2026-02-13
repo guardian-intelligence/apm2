@@ -207,20 +207,23 @@ fn run_state_has_live_process(state: &ReviewRunState) -> bool {
     state.pid.is_some_and(is_process_alive)
 }
 
-fn verify_process_identity(pid: u32, recorded_proc_start_time: Option<u64>) -> Result<(), String> {
-    let expected_start = recorded_proc_start_time
-        .ok_or_else(|| format!("missing recorded proc_start_time for pid={pid}"))?;
+pub(super) fn verify_process_identity(
+    pid: u32,
+    recorded_proc_start_time: Option<u64>,
+) -> Result<(), String> {
+    let expected_start =
+        recorded_proc_start_time.ok_or_else(|| format!("missing proc_start_time for pid={pid}"))?;
     let observed_start = get_process_start_time(pid)
         .ok_or_else(|| format!("failed to read /proc/{pid}/stat starttime"))?;
     if observed_start != expected_start {
         return Err(format!(
-            "pid starttime mismatch pid={pid} expected={expected_start} observed={observed_start}"
+            "identity mismatch pid={pid} expected={expected_start} observed={observed_start}"
         ));
     }
     Ok(())
 }
 
-fn wait_for_process_exit(pid: u32, timeout: Duration) {
+pub(super) fn wait_for_process_exit(pid: u32, timeout: Duration) {
     let started = Instant::now();
     while started.elapsed() < timeout {
         if !is_process_alive(pid) {
@@ -230,7 +233,7 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) {
     }
 }
 
-fn send_signal(pid: u32, signal: &str) -> Result<(), String> {
+pub(super) fn send_signal(pid: u32, signal: &str) -> Result<(), String> {
     if !is_process_alive(pid) {
         return Ok(());
     }
@@ -244,7 +247,7 @@ fn send_signal(pid: u32, signal: &str) -> Result<(), String> {
     Err(format!("failed to send {signal} to pid {pid}"))
 }
 
-fn terminate_process_with_timeout(pid: u32) -> Result<(), String> {
+pub(super) fn terminate_process_with_timeout(pid: u32) -> Result<(), String> {
     if !is_process_alive(pid) {
         return Ok(());
     }
