@@ -7298,23 +7298,27 @@ pub struct PrivilegedDispatcher {
 
     /// INV-BRK-HEALTH-GATE-001: Fail-closed health gate for token issuance.
     ///
-    /// Starts `false` (fail-closed). Set to `true` during daemon startup
-    /// after initial health validation succeeds. Must be checked before
-    /// issuing channel context tokens via the dispatcher path.
+    /// Starts `false` (fail-closed). Continuously re-evaluated by the
+    /// background health poller (10s interval) using receipt-bound broker
+    /// health checks. The gate opens only when the daemon-level health
+    /// check returns `BrokerHealthStatus::Healthy` and closes on any
+    /// degradation or failure. Must be checked before issuing channel
+    /// context tokens via the dispatcher path.
     ///
     /// # Synchronization Protocol (RS-21)
     ///
-    /// - **Protected data**: Whether the daemon health gate has been opened.
-    /// - **Writers**: `set_admission_health_gate()` called from daemon startup
-    ///   (`main.rs`) after successful initialization.
+    /// - **Protected data**: Whether the daemon health gate is currently open.
+    /// - **Writers**: `set_admission_health_gate()` called from the background
+    ///   health poller task (`main.rs`, 10s interval) after each broker health
+    ///   evaluation. Single writer (the poller task).
     /// - **Readers**:
     ///   `validate_channel_boundary_and_issue_context_token_with_flow()` on
     ///   every token issuance attempt.
     /// - **Ordering**: `Release` on store, `Acquire` on load — ensures all
-    ///   initialization side-effects are visible before token issuance
+    ///   health evaluation side-effects are visible before token issuance
     ///   proceeds.
-    /// - **Happens-before**: store(true, Release) in main.rs startup
-    ///   happens-before load(Acquire) in token issuance paths.
+    /// - **Happens-before**: store(healthy, Release) in poller happens-before
+    ///   load(Acquire) in token issuance paths.
     admission_health_gate: AtomicBool,
 }
 
@@ -8363,14 +8367,14 @@ impl PrivilegedDispatcher {
 
     /// Opens or closes the admission health gate (INV-BRK-HEALTH-GATE-001).
     ///
-    /// Called from daemon startup (`main.rs`) after successful initialization
-    /// to open the gate, enabling token issuance. The gate starts closed
-    /// (fail-closed) and remains closed until this method is called with
-    /// `true`.
+    /// Called by the background health poller (10s interval in `main.rs`)
+    /// after each broker health evaluation. The gate starts closed
+    /// (fail-closed) and is continuously re-evaluated: opened when health
+    /// check returns `Healthy`, closed on `Failed`/`Degraded`/error.
     ///
     /// # Ordering
     ///
-    /// Uses `Release` ordering so that all initialization side-effects
+    /// Uses `Release` ordering so that all health evaluation side-effects
     /// are visible to subsequent `Acquire` loads in the token issuance
     /// path.
     pub fn set_admission_health_gate(&self, passed: bool) {

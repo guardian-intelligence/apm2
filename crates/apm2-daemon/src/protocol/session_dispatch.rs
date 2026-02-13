@@ -752,16 +752,24 @@ pub type SharedV1ManifestStore = Arc<V1ManifestStore>;
 ///
 /// # Visibility
 ///
-/// Public so that `main.rs` (binary crate) can set the admission health
-/// gate on the static singleton after daemon initialization.
+/// Public so that `main.rs` (binary crate) can update the admission health
+/// gate on the static singleton from the background health poller.
+///
+/// # Health Gate (INV-BRK-HEALTH-GATE-001)
+///
+/// The gate starts CLOSED (fail-closed). In production, the background
+/// health poller (10s interval) continuously evaluates broker health and
+/// updates the gate via `set_admission_health_gate()`. The gate opens
+/// only when the daemon-level health check returns `Healthy` and closes
+/// on any degradation or failure.
 pub fn channel_boundary_dispatcher() -> &'static PrivilegedDispatcher {
     static DISPATCHER: std::sync::OnceLock<PrivilegedDispatcher> = std::sync::OnceLock::new();
     DISPATCHER.get_or_init(|| {
         let dispatcher = PrivilegedDispatcher::new();
         // In test builds, open the health gate by default since there is no
-        // daemon startup sequence (main.rs) to open it. Production builds
-        // start with the gate closed (fail-closed) and main.rs explicitly
-        // opens it after initialization.
+        // daemon health poller to evaluate and open it. Production builds
+        // start with the gate closed (fail-closed) and the background
+        // health poller opens it after the first successful health check.
         #[cfg(test)]
         dispatcher.set_admission_health_gate(true);
         dispatcher
@@ -18334,6 +18342,109 @@ mod tests {
         assert!(
             result.is_ok(),
             "static dispatcher with open health gate must issue token: {result:?}"
+        );
+    }
+
+    /// MAJOR-1 fix: Verify that broker health check result drives the
+    /// dispatcher gate open/close lifecycle. Simulates the poller behavior:
+    /// - Healthy check opens the gate
+    /// - Failed check closes the gate (fail-closed invalidation)
+    /// - Re-healthy check re-opens the gate
+    #[test]
+    fn test_broker_health_check_drives_dispatcher_gate_lifecycle() {
+        use apm2_core::fac::{BrokerHealthChecker, BrokerHealthStatus, FacBroker};
+
+        use crate::protocol::dispatch::PrivilegedDispatcher;
+
+        let dispatcher = PrivilegedDispatcher::new();
+        assert!(
+            !dispatcher.admission_health_gate_passed(),
+            "gate must start closed (fail-closed)"
+        );
+
+        let mut broker = FacBroker::new();
+        let mut checker = BrokerHealthChecker::new();
+
+        // --- Healthy check: gate should open ---
+        let tick = broker.advance_tick();
+        let eval_window = apm2_core::economics::queue_admission::HtfEvaluationWindow {
+            boundary_id: "test-poller".to_string(),
+            authority_clock: "test-lifecycle".to_string(),
+            tick_start: tick.saturating_sub(1),
+            tick_end: tick,
+        };
+        let envelope = broker
+            .issue_time_authority_envelope(
+                "test-poller",
+                "test-lifecycle",
+                eval_window.tick_start,
+                eval_window.tick_end,
+                100,
+            )
+            .expect("envelope issuance must succeed");
+        broker.advance_freshness_horizon(tick);
+
+        let receipt = broker
+            .check_health(Some(&envelope), &eval_window, &[], &mut checker)
+            .expect("health check must succeed");
+        assert_eq!(receipt.status, BrokerHealthStatus::Healthy);
+
+        // Simulate poller: update dispatcher gate based on receipt status.
+        dispatcher.set_admission_health_gate(receipt.status == BrokerHealthStatus::Healthy);
+        assert!(
+            dispatcher.admission_health_gate_passed(),
+            "gate must open after Healthy check"
+        );
+
+        // --- Failed check (no envelope): gate should close ---
+        let tick2 = broker.advance_tick();
+        let eval_window2 = apm2_core::economics::queue_admission::HtfEvaluationWindow {
+            boundary_id: "test-poller".to_string(),
+            authority_clock: "test-lifecycle".to_string(),
+            tick_start: tick2.saturating_sub(1),
+            tick_end: tick2,
+        };
+        // Deliberately pass None envelope to trigger TP001 failure.
+        let receipt2 = broker
+            .check_health(None, &eval_window2, &[], &mut checker)
+            .expect("health check returns Failed receipt, not Err");
+        assert_eq!(receipt2.status, BrokerHealthStatus::Failed);
+
+        // Simulate poller: close gate on unhealthy receipt.
+        dispatcher.set_admission_health_gate(receipt2.status == BrokerHealthStatus::Healthy);
+        assert!(
+            !dispatcher.admission_health_gate_passed(),
+            "gate must close after Failed check (fail-closed invalidation)"
+        );
+
+        // --- Re-healthy check: gate should re-open ---
+        let tick3 = broker.advance_tick();
+        let eval_window3 = apm2_core::economics::queue_admission::HtfEvaluationWindow {
+            boundary_id: "test-poller".to_string(),
+            authority_clock: "test-lifecycle".to_string(),
+            tick_start: tick3.saturating_sub(1),
+            tick_end: tick3,
+        };
+        let envelope3 = broker
+            .issue_time_authority_envelope(
+                "test-poller",
+                "test-lifecycle",
+                eval_window3.tick_start,
+                eval_window3.tick_end,
+                100,
+            )
+            .expect("envelope issuance must succeed");
+        broker.advance_freshness_horizon(tick3);
+
+        let receipt3 = broker
+            .check_health(Some(&envelope3), &eval_window3, &[], &mut checker)
+            .expect("health check must succeed");
+        assert_eq!(receipt3.status, BrokerHealthStatus::Healthy);
+
+        dispatcher.set_admission_health_gate(receipt3.status == BrokerHealthStatus::Healthy);
+        assert!(
+            dispatcher.admission_health_gate_passed(),
+            "gate must re-open after recovery to Healthy"
         );
     }
 
