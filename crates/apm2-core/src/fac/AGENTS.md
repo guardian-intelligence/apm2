@@ -98,12 +98,16 @@ health gate to refuse job admission when broker health is degraded.
   optional envelope, evaluation window, signature verifier, freshness/revocation/
   convergence horizons, convergence receipts, and required authority sets.
 - `BrokerHealthChecker`: Stateful checker maintaining a bounded history ring
-  (`MAX_HEALTH_HISTORY=64`). Runs TP001/TP002/TP003 checks, signs receipts, and
-  tracks history. Returns `Result` to enforce input bounds.
+  (`MAX_HEALTH_HISTORY=64`) and a monotonic `health_seq` counter. Runs
+  TP001/TP002/TP003 checks, signs receipts, and tracks history. The `health_seq`
+  advances on every health check invocation (including error-path synthetic
+  receipts), providing per-invocation freshness independent of broker tick.
+  Returns `Result` to enforce input bounds.
 - `WorkerHealthPolicy`: Policy enum for worker admission gate. `StrictHealthy`
   (default) requires `Healthy`; `AllowDegraded` permits `Degraded`.
 - `WorkerHealthGateError`: Fail-closed error taxonomy for worker health gate
-  denial (no receipt, degraded, failed, verification failed).
+  denial (no receipt, degraded, failed, verification failed, stale health
+  sequence).
 
 ### Core Capabilities
 
@@ -116,10 +120,11 @@ health gate to refuse job admission when broker health is degraded.
   verifies receipt existence, payload integrity (content hash recomputation +
   constant-time comparison), signature authenticity (via `BrokerSignatureVerifier`),
   evaluation window context binding (`expected_eval_window_hash`), receipt
-  recency (`min_broker_tick`), and health status against worker policy.
+  recency (`min_broker_tick`), health sequence freshness (`min_health_seq`),
+  and health status against worker policy.
 - Domain-separated BLAKE3 content hash (`apm2.fac_broker.health_receipt.v1`) over
-  schema identity, tick, eval window hash, status, and all per-check results
-  with injective u64 length-prefix framing.
+  schema identity, tick, health_seq, eval window hash, status, and all per-check
+  results with injective u64 length-prefix framing.
 - Bounded deserialization on all string fields (`schema_id`, `schema_version`,
   `predicate_id`, `deny_reason`) and Vec fields (`checks`) during JSON parsing.
 - Evaluation window hash included in receipt for boundary context binding.
@@ -160,6 +165,13 @@ health gate to refuse job admission when broker health is degraded.
 - [INV-BH-012] On health check input validation errors, a synthetic FAILED
   receipt is persisted so downstream gates cannot continue on a stale HEALTHY
   receipt. The synthetic receipt carries a machine-readable reason.
+- [INV-BH-013] A monotonically increasing `health_seq` counter in
+  `BrokerHealthChecker` advances on every health check invocation (including
+  error-path synthetic receipts). The counter is included in each
+  `HealthReceiptV1` and bound into the content hash via `u64::to_le_bytes()`.
+  The worker health gate enforces `receipt.health_seq >= min_health_seq` to
+  prevent same-tick replay attacks where an old HEALTHY receipt is presented
+  after health has degraded but the broker tick has not advanced.
 
 ## projection_compromise Submodule
 

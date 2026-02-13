@@ -33,6 +33,12 @@
 //! - [INV-BRK-HEALTH-012] On health check input validation errors, a synthetic
 //!   `FAILED` receipt is persisted so downstream gates cannot continue on a
 //!   stale `HEALTHY` receipt.
+//! - [INV-BRK-HEALTH-013] A monotonically increasing `health_seq` counter
+//!   advances on every health check invocation (including error-path synthetic
+//!   receipts). It is included in the receipt and content hash, providing
+//!   per-invocation freshness independent of broker tick advancement. The
+//!   worker gate enforces `receipt.health_seq >= min_health_seq` to prevent
+//!   same-tick replay attacks.
 
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -437,13 +443,21 @@ pub struct InvariantCheckResult {
 /// [`HealthReceiptV1::verify`] performs full payload-binding verification:
 /// 1. Validates `schema_id` and `schema_version` match expected constants.
 /// 2. Recomputes the canonical content hash from `(schema_id, schema_version,
-///    broker_tick, eval_window_hash, status, checks)`.
+///    broker_tick, health_seq, eval_window_hash, status, checks)`.
 /// 3. Constant-time compares the recomputed hash with the stored
 ///    `content_hash`.
 /// 4. Verifies the Ed25519 signature over `content_hash`.
 ///
 /// This ensures an attacker cannot tamper with payload fields (e.g., changing
 /// `status` from `FAILED` to `HEALTHY`) while keeping the original signature.
+///
+/// # Replay Protection (INV-BH-013)
+///
+/// The `health_seq` field is a monotonically increasing sequence number
+/// assigned by [`BrokerHealthChecker`]. It advances on every health check,
+/// even when the broker tick does not change. This prevents same-tick replay
+/// attacks where an old `HEALTHY` receipt is presented after health has
+/// degraded but the broker tick has not advanced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HealthReceiptV1 {
@@ -463,6 +477,12 @@ pub struct HealthReceiptV1 {
     pub status: BrokerHealthStatus,
     /// Broker tick at the time of the health check.
     pub broker_tick: u64,
+    /// Monotonic health check sequence number (INV-BH-013).
+    ///
+    /// Assigned by [`BrokerHealthChecker`] and incremented on every health
+    /// check invocation. Provides per-invocation freshness independent of
+    /// broker tick advancement, preventing same-tick replay attacks.
+    pub health_seq: u64,
     /// BLAKE3 hash of the evaluation window used for this health check,
     /// binding the receipt to a specific boundary context.
     pub eval_window_hash: Hash,
@@ -511,6 +531,7 @@ impl HealthReceiptV1 {
         // Step 2: Recompute canonical hash from payload fields
         let recomputed = compute_health_receipt_hash(
             self.broker_tick,
+            self.health_seq,
             self.eval_window_hash,
             self.status,
             &self.checks,
@@ -627,9 +648,27 @@ pub struct HealthCheckInput<'a> {
 /// `BrokerHealthChecker` is not internally synchronized. Callers must hold
 /// appropriate locks when accessing from multiple threads (same pattern as
 /// `FacBroker`).
+///
+/// # Monotonic Health Sequence (INV-BH-013)
+///
+/// The checker maintains a monotonically increasing `health_seq` counter that
+/// advances on every `check_health` call (including error-path synthetic
+/// receipts). This counter is included in each [`HealthReceiptV1`] and bound
+/// into the content hash, providing strict per-invocation freshness that is
+/// independent of the broker tick. Callers enforce replay protection via
+/// `min_health_seq` in [`evaluate_worker_health_gate`].
 pub struct BrokerHealthChecker {
     /// Recent health check history (bounded ring buffer).
     history: Vec<HealthReceiptV1>,
+    /// Monotonically increasing health check sequence number.
+    ///
+    /// Incremented on every `check_health` invocation (including error-path
+    /// synthetic receipts). Provides per-invocation freshness independent of
+    /// broker tick advancement.
+    ///
+    /// Synchronization: protected by the same external lock that guards
+    /// `&mut self` access. No interior mutability.
+    health_seq: u64,
 }
 
 impl Default for BrokerHealthChecker {
@@ -639,12 +678,24 @@ impl Default for BrokerHealthChecker {
 }
 
 impl BrokerHealthChecker {
-    /// Creates a new health checker with empty history.
+    /// Creates a new health checker with empty history and sequence 0.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             history: Vec::new(),
+            health_seq: 0,
         }
+    }
+
+    /// Returns the current health sequence number.
+    ///
+    /// This is the sequence number that will be assigned to the *next* health
+    /// receipt. After each `check_health` call, the returned receipt's
+    /// `health_seq` equals this value, and the internal counter advances to
+    /// `health_seq + 1`.
+    #[must_use]
+    pub const fn current_health_seq(&self) -> u64 {
+        self.health_seq
     }
 
     /// Runs a full health check against broker state and produces a signed
@@ -733,9 +784,16 @@ impl BrokerHealthChecker {
         // Compute eval_window hash for boundary context binding (SEC-MINOR-2)
         let eval_window_hash = compute_eval_window_hash(input.eval_window);
 
-        // Compute content hash (domain-separated, includes schema + eval_window)
+        // INV-BH-013: Capture and advance the monotonic health sequence.
+        // This happens AFTER input validation but BEFORE receipt construction,
+        // ensuring each receipt gets a unique, strictly increasing sequence.
+        let seq = self.health_seq;
+        self.health_seq = self.health_seq.wrapping_add(1);
+
+        // Compute content hash (domain-separated, includes schema + eval_window +
+        // health_seq)
         let content_hash =
-            compute_health_receipt_hash(broker_tick, eval_window_hash, status, &checks);
+            compute_health_receipt_hash(broker_tick, seq, eval_window_hash, status, &checks);
 
         // Sign the content hash
         let signature_bytes = signer.sign(&content_hash);
@@ -746,6 +804,7 @@ impl BrokerHealthChecker {
             schema_version: HEALTH_RECEIPT_SCHEMA_VERSION.to_string(),
             status,
             broker_tick,
+            health_seq: seq,
             eval_window_hash,
             checks,
             content_hash,
@@ -768,6 +827,9 @@ impl BrokerHealthChecker {
     /// This ensures downstream gates cannot rely on a stale `HEALTHY` receipt
     /// after a failed re-check attempt (INV-BH-012). The synthetic receipt
     /// carries a machine-readable reason in a single `EVAL_ERROR` check result.
+    ///
+    /// INV-BH-013: The monotonic `health_seq` is advanced even for synthetic
+    /// receipts, so sequence-based replay protection remains consistent.
     fn persist_synthetic_failed_receipt(
         &mut self,
         broker_tick: u64,
@@ -781,9 +843,14 @@ impl BrokerHealthChecker {
             deny_reason: Some(reason.to_string()),
         }];
 
+        // INV-BH-013: Capture and advance sequence for synthetic receipt.
+        let seq = self.health_seq;
+        self.health_seq = self.health_seq.wrapping_add(1);
+
         let eval_window_hash = compute_eval_window_hash(eval_window);
         let content_hash = compute_health_receipt_hash(
             broker_tick,
+            seq,
             eval_window_hash,
             BrokerHealthStatus::Failed,
             &checks,
@@ -795,6 +862,7 @@ impl BrokerHealthChecker {
             schema_version: HEALTH_RECEIPT_SCHEMA_VERSION.to_string(),
             status: BrokerHealthStatus::Failed,
             broker_tick,
+            health_seq: seq,
             eval_window_hash,
             checks,
             content_hash,
@@ -890,6 +958,21 @@ pub enum WorkerHealthGateError {
         /// The minimum required broker tick.
         min_tick: u64,
     },
+
+    /// Receipt `health_seq` is below the required minimum (stale sequence).
+    ///
+    /// This prevents same-tick replay attacks where an old `HEALTHY` receipt is
+    /// presented after health has degraded but the broker tick has not advanced
+    /// (INV-BH-013).
+    #[error(
+        "receipt health_seq {receipt_seq} is below minimum required seq {min_seq} (stale health sequence)"
+    )]
+    StaleHealthSeq {
+        /// The health sequence on the receipt.
+        receipt_seq: u64,
+        /// The minimum required health sequence.
+        min_seq: u64,
+    },
 }
 
 /// Policy for the worker health admission gate.
@@ -915,11 +998,14 @@ pub enum WorkerHealthPolicy {
 ///    `expected_eval_window_hash` (context binding, INV-BH-010).
 /// 5. **Recency**: The receipt's `broker_tick` is at or above `min_broker_tick`
 ///    (anti-replay staleness check, INV-BH-011).
-/// 6. The health status meets the configured policy.
+/// 6. **Sequence freshness**: The receipt's `health_seq` is at or above
+///    `min_health_seq` (per-invocation anti-replay, INV-BH-013).
+/// 7. The health status meets the configured policy.
 ///
-/// Steps 4 and 5 prevent replay of previously healthy receipts after broker
-/// state has degraded. An attacker cannot present a stale receipt from an
-/// earlier evaluation window or broker tick.
+/// Steps 4, 5, and 6 prevent replay of previously healthy receipts after
+/// broker state has degraded. Step 6 specifically closes the same-tick replay
+/// vector where an old `HEALTHY` receipt at tick T is presented after a newer
+/// `FAILED` receipt was issued at the same tick T.
 ///
 /// # Errors
 ///
@@ -930,6 +1016,7 @@ pub fn evaluate_worker_health_gate(
     policy: WorkerHealthPolicy,
     expected_eval_window_hash: Hash,
     min_broker_tick: u64,
+    min_health_seq: u64,
 ) -> Result<(), WorkerHealthGateError> {
     let receipt = receipt.ok_or(WorkerHealthGateError::NoHealthReceipt)?;
 
@@ -952,6 +1039,18 @@ pub fn evaluate_worker_health_gate(
         return Err(WorkerHealthGateError::StaleReceipt {
             receipt_tick: receipt.broker_tick,
             min_tick: min_broker_tick,
+        });
+    }
+
+    // INV-BH-013: Verify receipt freshness via monotonic health sequence.
+    // Reject stale receipts from earlier health check invocations. This
+    // closes the same-tick replay vector: even when broker tick does not
+    // advance between health checks, the health_seq always advances,
+    // so an old HEALTHY receipt cannot bypass a newer FAILED assessment.
+    if receipt.health_seq < min_health_seq {
+        return Err(WorkerHealthGateError::StaleHealthSeq {
+            receipt_seq: receipt.health_seq,
+            min_seq: min_health_seq,
         });
     }
 
@@ -982,6 +1081,7 @@ pub fn evaluate_worker_health_gate(
 /// - Domain separator
 /// - Schema ID and version (bound to interpretation)
 /// - Broker tick
+/// - Health sequence number (INV-BH-013: monotonic per-invocation freshness)
 /// - Evaluation window hash (boundary context binding)
 /// - Status byte
 /// - All check results (`predicate_id`, `passed`, `deny_reason`)
@@ -991,6 +1091,7 @@ pub fn evaluate_worker_health_gate(
 /// Length prefixes use `u64::to_le_bytes()` for injective framing.
 fn compute_health_receipt_hash(
     broker_tick: u64,
+    health_seq: u64,
     eval_window_hash: Hash,
     status: BrokerHealthStatus,
     checks: &[InvariantCheckResult],
@@ -1008,6 +1109,9 @@ fn compute_health_receipt_hash(
 
     // Broker tick
     hasher.update(&broker_tick.to_le_bytes());
+
+    // INV-BH-013: Health sequence number (monotonic replay protection)
+    hasher.update(&health_seq.to_le_bytes());
 
     // Evaluation window hash (SEC-MINOR-2: boundary context binding)
     hasher.update(&eval_window_hash);
@@ -1479,6 +1583,7 @@ mod tests {
             WorkerHealthPolicy::default(),
             expected_hash,
             42, // min_broker_tick matches receipt tick
+            0,  // min_health_seq: permissive for this test
         );
         assert!(result.is_ok());
     }
@@ -1498,6 +1603,7 @@ mod tests {
             WorkerHealthPolicy::StrictHealthy,
             [0u8; 32], // dummy hash, not reached
             0,         // dummy tick, not reached
+            0,         // dummy seq, not reached
         );
         assert!(matches!(
             result,
@@ -1537,6 +1643,7 @@ mod tests {
             WorkerHealthPolicy::StrictHealthy,
             expected_hash,
             1, // min_broker_tick matches receipt tick
+            0, // min_health_seq: permissive for this test
         );
         assert!(matches!(
             result,
@@ -1582,6 +1689,7 @@ mod tests {
             WorkerHealthPolicy::StrictHealthy,
             expected_hash,
             42,
+            0, // min_health_seq: permissive for this test
         );
         assert!(matches!(
             result,
@@ -1622,6 +1730,7 @@ mod tests {
         let eval_window_hash = compute_eval_window_hash(&eval_window);
         let content_hash = compute_health_receipt_hash(
             42,
+            0, // health_seq for manually constructed receipt
             eval_window_hash,
             BrokerHealthStatus::Degraded,
             &checks,
@@ -1633,6 +1742,7 @@ mod tests {
             schema_version: HEALTH_RECEIPT_SCHEMA_VERSION.to_string(),
             status: BrokerHealthStatus::Degraded,
             broker_tick: 42,
+            health_seq: 0,
             eval_window_hash,
             checks,
             content_hash,
@@ -1647,6 +1757,7 @@ mod tests {
             WorkerHealthPolicy::AllowDegraded,
             eval_window_hash,
             42,
+            0, // min_health_seq: permissive for this test
         );
         assert!(result.is_ok());
 
@@ -1657,6 +1768,7 @@ mod tests {
             WorkerHealthPolicy::StrictHealthy,
             eval_window_hash,
             42,
+            0, // min_health_seq: permissive for this test
         );
         assert!(matches!(
             result,
@@ -2049,6 +2161,7 @@ mod tests {
                 "schema_version": "1.0.0",
                 "status": "HEALTHY",
                 "broker_tick": 1,
+                "health_seq": 0,
                 "eval_window_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
                 "checks": {checks_array},
                 "content_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
@@ -2069,6 +2182,7 @@ mod tests {
                 "schema_version": "1.0.0",
                 "status": "HEALTHY",
                 "broker_tick": 1,
+                "health_seq": 0,
                 "eval_window_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
                 "checks": [],
                 "content_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
@@ -2235,6 +2349,7 @@ mod tests {
                 "schema_version": "1.0.0",
                 "status": "HEALTHY",
                 "broker_tick": 1,
+                "health_seq": 0,
                 "eval_window_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
                 "checks": [],
                 "content_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
@@ -2258,6 +2373,7 @@ mod tests {
                 "schema_version": "{huge_version}",
                 "status": "HEALTHY",
                 "broker_tick": 1,
+                "health_seq": 0,
                 "eval_window_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
                 "checks": [],
                 "content_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
@@ -2318,6 +2434,7 @@ mod tests {
             WorkerHealthPolicy::StrictHealthy,
             wrong_hash,
             42,
+            0, // min_health_seq: permissive for this test
         );
         assert!(
             matches!(result, Err(WorkerHealthGateError::EvalWindowMismatch)),
@@ -2358,6 +2475,7 @@ mod tests {
             WorkerHealthPolicy::StrictHealthy,
             correct_hash,
             1, // min_broker_tick well below receipt tick 42
+            0, // min_health_seq: permissive for this test
         );
         assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
@@ -2403,6 +2521,7 @@ mod tests {
             WorkerHealthPolicy::StrictHealthy,
             correct_hash,
             100, // min_broker_tick above receipt's 42
+            0,   // min_health_seq: permissive for this test
         );
         assert!(
             matches!(
@@ -2451,6 +2570,7 @@ mod tests {
             WorkerHealthPolicy::StrictHealthy,
             correct_hash,
             42, // exactly matches receipt tick
+            0,  // min_health_seq: permissive for this test
         );
         assert!(
             result.is_ok(),
@@ -2491,6 +2611,7 @@ mod tests {
             WorkerHealthPolicy::StrictHealthy,
             correct_hash,
             43,
+            0, // min_health_seq: permissive for this test
         );
         assert!(
             matches!(
@@ -2558,6 +2679,7 @@ mod tests {
             WorkerHealthPolicy::StrictHealthy,
             correct_hash,
             20, // min_broker_tick = current tick
+            0,  // min_health_seq: permissive (tick check catches this)
         );
         assert!(
             matches!(
@@ -2578,6 +2700,7 @@ mod tests {
             WorkerHealthPolicy::StrictHealthy,
             correct_hash,
             20,
+            0, // min_health_seq: permissive for this test
         );
         assert!(
             matches!(result, Err(WorkerHealthGateError::HealthFailed { .. })),
@@ -2728,6 +2851,7 @@ mod tests {
             WorkerHealthPolicy::StrictHealthy,
             correct_hash,
             10,
+            0, // min_health_seq: permissive for this test
         );
         assert!(
             matches!(result, Err(WorkerHealthGateError::HealthFailed { .. })),
@@ -2781,5 +2905,349 @@ mod tests {
         let latest = checker.latest().unwrap();
         assert_eq!(latest.status, BrokerHealthStatus::Failed);
         assert_eq!(latest.checks[0].predicate_id, "EVAL_ERROR");
+    }
+
+    // -----------------------------------------------------------------------
+    // INV-BH-013: health_seq monotonicity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn consecutive_health_checks_produce_incrementing_health_seq() {
+        let signer = test_signer();
+        let mut checker = BrokerHealthChecker::new();
+
+        assert_eq!(
+            checker.current_health_seq(),
+            0,
+            "initial health_seq must be 0"
+        );
+
+        let eval_window = valid_eval_window();
+        let input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+
+        let r1 = checker.check_health(&input, 42, &signer).unwrap();
+        assert_eq!(r1.health_seq, 0, "first receipt health_seq must be 0");
+        assert_eq!(
+            checker.current_health_seq(),
+            1,
+            "after first check, next seq must be 1"
+        );
+
+        let r2 = checker.check_health(&input, 42, &signer).unwrap();
+        assert_eq!(r2.health_seq, 1, "second receipt health_seq must be 1");
+        assert_eq!(
+            checker.current_health_seq(),
+            2,
+            "after second check, next seq must be 2"
+        );
+
+        // health_seq is strictly increasing even with same broker_tick
+        assert!(r2.health_seq > r1.health_seq);
+
+        // Content hashes differ due to health_seq difference
+        assert_ne!(
+            r1.content_hash, r2.content_hash,
+            "same tick but different health_seq must produce different hashes"
+        );
+    }
+
+    #[test]
+    fn health_seq_included_in_content_hash() {
+        // Verify that health_seq is bound into the content hash by
+        // computing two hashes that differ only in health_seq.
+        let eval_window = valid_eval_window();
+        let eval_window_hash = compute_eval_window_hash(&eval_window);
+        let checks: Vec<InvariantCheckResult> = vec![];
+
+        let hash_seq_0 = compute_health_receipt_hash(
+            42,
+            0, // health_seq = 0
+            eval_window_hash,
+            BrokerHealthStatus::Healthy,
+            &checks,
+        );
+        let hash_seq_1 = compute_health_receipt_hash(
+            42,
+            1, // health_seq = 1
+            eval_window_hash,
+            BrokerHealthStatus::Healthy,
+            &checks,
+        );
+
+        assert_ne!(
+            hash_seq_0, hash_seq_1,
+            "different health_seq must produce different content hashes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // INV-BH-013: Same-tick replay attack prevention
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn same_tick_replay_rejected_via_health_seq() {
+        // Scenario: Broker is HEALTHY at tick T with health_seq=N, then
+        // health degrades and a FAILED receipt is issued at the same tick T
+        // with health_seq=N+1. A replay of the old HEALTHY receipt with
+        // min_health_seq=N+1 MUST be denied.
+        let signer = test_signer();
+        let verifier = make_verifier(&signer);
+        let mut checker = BrokerHealthChecker::new();
+
+        let envelope = valid_envelope(&signer);
+        let eval_window = valid_eval_window();
+        let freshness = valid_freshness_horizon();
+        let frontier = valid_revocation_frontier();
+        let convergence = valid_convergence_horizon();
+
+        // Step 1: Broker is HEALTHY at tick 100, health_seq=0
+        let healthy_input = HealthCheckInput {
+            envelope: Some(&envelope),
+            eval_window: &eval_window,
+            verifier: Some(&verifier),
+            freshness_horizon: Some(&freshness),
+            revocation_frontier: Some(&frontier),
+            convergence_horizon: Some(&convergence),
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+        let healthy_receipt = checker.check_health(&healthy_input, 100, &signer).unwrap();
+        assert_eq!(healthy_receipt.status, BrokerHealthStatus::Healthy);
+        assert_eq!(healthy_receipt.health_seq, 0);
+        assert_eq!(healthy_receipt.broker_tick, 100);
+
+        // Step 2: Broker degrades at SAME tick 100, health_seq=1
+        let failed_input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: Some(&freshness),
+            revocation_frontier: Some(&frontier),
+            convergence_horizon: Some(&convergence),
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+        let failed_receipt = checker.check_health(&failed_input, 100, &signer).unwrap();
+        assert_eq!(failed_receipt.status, BrokerHealthStatus::Failed);
+        assert_eq!(failed_receipt.health_seq, 1);
+        assert_eq!(failed_receipt.broker_tick, 100);
+
+        let correct_hash = compute_eval_window_hash(&eval_window);
+
+        // Step 3: Replay attack — present old HEALTHY receipt (health_seq=0)
+        // with min_health_seq=1 (requiring the latest check)
+        let result = evaluate_worker_health_gate(
+            Some(&healthy_receipt),
+            &verifier,
+            WorkerHealthPolicy::StrictHealthy,
+            correct_hash,
+            100, // min_broker_tick: same tick, would pass tick check
+            1,   // min_health_seq: requires seq >= 1, old receipt has 0
+        );
+        assert!(
+            matches!(
+                result,
+                Err(WorkerHealthGateError::StaleHealthSeq {
+                    receipt_seq: 0,
+                    min_seq: 1,
+                })
+            ),
+            "same-tick replay of old HEALTHY receipt must be rejected via health_seq, got {result:?}"
+        );
+
+        // Step 4: Current FAILED receipt passes health_seq check but is
+        // rejected on status
+        let result = evaluate_worker_health_gate(
+            Some(&failed_receipt),
+            &verifier,
+            WorkerHealthPolicy::StrictHealthy,
+            correct_hash,
+            100,
+            1, // min_health_seq: failed receipt has seq=1, passes
+        );
+        assert!(
+            matches!(result, Err(WorkerHealthGateError::HealthFailed { .. })),
+            "current FAILED receipt should pass seq check but fail on status, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn min_health_seq_enforcement_rejects_stale_seq() {
+        // Verify that min_health_seq enforcement works at exact boundaries.
+        let signer = test_signer();
+        let verifier = make_verifier(&signer);
+        let mut checker = BrokerHealthChecker::new();
+
+        let envelope = valid_envelope(&signer);
+        let eval_window = valid_eval_window();
+        let freshness = valid_freshness_horizon();
+        let frontier = valid_revocation_frontier();
+        let convergence = valid_convergence_horizon();
+
+        let input = HealthCheckInput {
+            envelope: Some(&envelope),
+            eval_window: &eval_window,
+            verifier: Some(&verifier),
+            freshness_horizon: Some(&freshness),
+            revocation_frontier: Some(&frontier),
+            convergence_horizon: Some(&convergence),
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+
+        // Generate 6 receipts (health_seq 0..5)
+        let mut receipts = Vec::new();
+        for _ in 0..6 {
+            receipts.push(checker.check_health(&input, 50, &signer).unwrap());
+        }
+        assert_eq!(receipts[5].health_seq, 5);
+
+        let correct_hash = compute_eval_window_hash(&eval_window);
+
+        // health_seq=5 with min_health_seq=6 => denied
+        let result = evaluate_worker_health_gate(
+            Some(&receipts[5]),
+            &verifier,
+            WorkerHealthPolicy::StrictHealthy,
+            correct_hash,
+            50,
+            6, // min_health_seq > receipt.health_seq
+        );
+        assert!(
+            matches!(
+                result,
+                Err(WorkerHealthGateError::StaleHealthSeq {
+                    receipt_seq: 5,
+                    min_seq: 6,
+                })
+            ),
+            "receipt with health_seq=5 must be rejected when min_health_seq=6, got {result:?}"
+        );
+
+        // health_seq=5 with min_health_seq=5 => accepted (>= semantics)
+        let result = evaluate_worker_health_gate(
+            Some(&receipts[5]),
+            &verifier,
+            WorkerHealthPolicy::StrictHealthy,
+            correct_hash,
+            50,
+            5, // min_health_seq == receipt.health_seq
+        );
+        assert!(
+            result.is_ok(),
+            "receipt with health_seq=5 must pass when min_health_seq=5, got {result:?}"
+        );
+
+        // health_seq=5 with min_health_seq=4 => accepted
+        let result = evaluate_worker_health_gate(
+            Some(&receipts[5]),
+            &verifier,
+            WorkerHealthPolicy::StrictHealthy,
+            correct_hash,
+            50,
+            4, // min_health_seq < receipt.health_seq
+        );
+        assert!(
+            result.is_ok(),
+            "receipt with health_seq=5 must pass when min_health_seq=4, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn synthetic_failed_receipt_advances_health_seq() {
+        // Verify that error-path synthetic receipts also advance health_seq.
+        let signer = test_signer();
+        let mut checker = BrokerHealthChecker::new();
+
+        let eval_window = valid_eval_window();
+
+        // First: normal check (health_seq=0)
+        let input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+        let r1 = checker.check_health(&input, 1, &signer).unwrap();
+        assert_eq!(r1.health_seq, 0);
+
+        // Second: error path (oversized input) — health_seq should be 1
+        let oversized: Vec<Hash> = (0..=MAX_HEALTH_REQUIRED_AUTHORITY_SETS)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (i & 0xFF) as u8;
+                h[1] = ((i >> 8) & 0xFF) as u8;
+                h
+            })
+            .collect();
+
+        let error_input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &oversized,
+        };
+        let _ = checker.check_health(&error_input, 2, &signer);
+
+        let synthetic = checker.latest().unwrap();
+        assert_eq!(
+            synthetic.health_seq, 1,
+            "synthetic receipt must advance health_seq"
+        );
+
+        // Third: normal check after error — health_seq should be 2
+        let r3 = checker.check_health(&input, 3, &signer).unwrap();
+        assert_eq!(
+            r3.health_seq, 2,
+            "health_seq must continue advancing after synthetic receipt"
+        );
+    }
+
+    #[test]
+    fn health_receipt_verify_detects_tampered_health_seq() {
+        let signer = test_signer();
+        let verifier = make_verifier(&signer);
+        let mut checker = BrokerHealthChecker::new();
+
+        let eval_window = valid_eval_window();
+        let input = HealthCheckInput {
+            envelope: None,
+            eval_window: &eval_window,
+            verifier: None,
+            freshness_horizon: None,
+            revocation_frontier: None,
+            convergence_horizon: None,
+            convergence_receipts: &[],
+            required_authority_sets: &[],
+        };
+
+        let mut receipt = checker.check_health(&input, 1, &signer).unwrap();
+
+        // Tamper: change health_seq without re-signing
+        receipt.health_seq = 9999;
+
+        let result = receipt.verify(&verifier);
+        assert!(
+            matches!(result, Err(BrokerHealthError::ContentHashMismatch)),
+            "expected ContentHashMismatch for tampered health_seq, got {result:?}"
+        );
     }
 }
