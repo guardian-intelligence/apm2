@@ -1104,13 +1104,15 @@ impl FacBroker {
         let expected_hash = super::broker_health::compute_eval_window_hash(eval_window);
 
         // MINOR-4 fix: Use the broker's own current tick as the minimum
-        // acceptable broker tick, and the checker's latest-assigned seq
-        // (current_health_seq - 1) as the minimum health seq. This prevents
-        // callers from supplying stale values that would accept outdated
-        // receipts. The saturating_sub(1) converts from "next to assign"
-        // to "last assigned" — we accept only the most recent receipt.
+        // acceptable broker tick, and the broker's persisted health_seq as
+        // the minimum health sequence. The persisted state.health_seq is
+        // authoritative because it is updated by check_health() and
+        // survives daemon restarts. The checker is caller-supplied and may
+        // be stale, so we do NOT use checker.current_health_seq() here.
+        // We saturate-sub(1) to convert from "next to assign" to "last
+        // assigned" — we accept only the most recent receipt.
         let min_broker_tick = self.current_tick();
-        let min_health_seq = checker.current_health_seq().saturating_sub(1);
+        let min_health_seq = self.state.health_seq.saturating_sub(1);
 
         let result = super::broker_health::evaluate_worker_health_gate(
             checker.latest(),
