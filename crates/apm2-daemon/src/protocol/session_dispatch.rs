@@ -24701,6 +24701,54 @@ mod tests {
                 }
             }
 
+            struct PassingEffectJournal;
+            impl crate::admission_kernel::effect_journal::EffectJournal for PassingEffectJournal {
+                fn record_started(
+                    &self,
+                    _binding: &crate::admission_kernel::effect_journal::EffectJournalBindingV1,
+                ) -> Result<(), crate::admission_kernel::effect_journal::EffectJournalError>
+                {
+                    Ok(())
+                }
+                fn record_completed(
+                    &self,
+                    _request_id: &Hash,
+                ) -> Result<(), crate::admission_kernel::effect_journal::EffectJournalError>
+                {
+                    Ok(())
+                }
+                fn query_state(
+                    &self,
+                    _request_id: &Hash,
+                ) -> crate::admission_kernel::effect_journal::EffectExecutionState {
+                    crate::admission_kernel::effect_journal::EffectExecutionState::NotStarted
+                }
+                fn query_binding(
+                    &self,
+                    _request_id: &Hash,
+                ) -> Option<crate::admission_kernel::effect_journal::EffectJournalBindingV1>
+                {
+                    None
+                }
+                fn resolve_in_doubt(
+                    &self,
+                    _request_id: &Hash,
+                    _boundary_confirms_not_executed: bool,
+                ) -> Result<
+                    crate::admission_kernel::effect_journal::InDoubtResolutionV1,
+                    crate::admission_kernel::effect_journal::EffectJournalError,
+                > {
+                    Err(crate::admission_kernel::effect_journal::EffectJournalError::InvalidTransition {
+                        request_id: [0u8; 32],
+                        current: crate::admission_kernel::effect_journal::EffectExecutionState::NotStarted,
+                        target: crate::admission_kernel::effect_journal::EffectExecutionState::Unknown,
+                    })
+                }
+                fn len(&self) -> usize {
+                    0
+                }
+            }
+
             let pcac_kernel: Arc<dyn AuthorityJoinKernel> = Arc::new(PassingPcacKernel);
             let witness_cfg = crate::admission_kernel::WitnessProviderConfig {
                 provider_id: "test-provider/finalize-failure".to_string(),
@@ -24711,7 +24759,8 @@ mod tests {
                     .with_ledger_verifier(Arc::new(PassingLedgerVerifier))
                     .with_policy_resolver(Arc::new(PassingPolicyResolver))
                     .with_anti_rollback(Arc::new(FailingCommitAntiRollback))
-                    .with_quarantine_guard(Arc::new(PassingQuarantineGuard)),
+                    .with_quarantine_guard(Arc::new(PassingQuarantineGuard))
+                    .with_effect_journal(Arc::new(PassingEffectJournal)),
             )
         }
 
@@ -26698,6 +26747,9 @@ mod tests {
                 })
             }
             fn verify_committed(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
+                Ok(())
+            }
+            fn commit(&self, _anchor: &LedgerAnchorV1) -> Result<(), TrustError> {
                 Ok(())
             }
         }

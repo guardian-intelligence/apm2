@@ -5223,7 +5223,8 @@ fn test_tck_00502_execute_commits_anti_rollback_anchor() {
         .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
         .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
         .with_anti_rollback(anti_rollback.clone())
-        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+        .with_effect_journal(Arc::new(MockEffectJournal::new()));
 
     let request = valid_request(RiskTier::Tier2Plus);
     let mut plan = kernel.plan(&request).expect("plan must succeed");
@@ -5371,7 +5372,8 @@ fn test_tck_00502_fresh_install_bootstrap_without_preseeding() {
         .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
         .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
         .with_anti_rollback(anti_rollback.clone())
-        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+        .with_effect_journal(Arc::new(MockEffectJournal::new()));
 
     // plan() MUST succeed on fresh install (BLOCKER-1 fix).
     let request = valid_request(RiskTier::Tier2Plus);
@@ -5442,7 +5444,8 @@ fn test_tck_00502_effect_failure_does_not_advance_anchor() {
         .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
         .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
         .with_anti_rollback(anti_rollback.clone())
-        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+        .with_effect_journal(Arc::new(MockEffectJournal::new()));
 
     // plan() + execute() succeed.
     let request = valid_request(RiskTier::Tier2Plus);
@@ -5511,7 +5514,8 @@ fn test_tck_00502_sequential_finalize_advances_anchor_monotonically() {
         .with_ledger_verifier(Arc::new(MockLedgerVerifier::passing()))
         .with_policy_resolver(Arc::new(MockPolicyResolver::passing()))
         .with_anti_rollback(anti_rollback.clone())
-        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()));
+        .with_quarantine_guard(Arc::new(MockQuarantineGuard::passing()))
+        .with_effect_journal(Arc::new(MockEffectJournal::new()));
 
     // Simulate effect 1 (e.g., RequestTool): plan + execute + finalize
     let request1 = valid_request(RiskTier::Tier2Plus);
