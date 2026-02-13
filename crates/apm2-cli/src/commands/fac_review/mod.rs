@@ -2321,6 +2321,13 @@ mod tests {
     #[test]
     fn test_pulse_file_roundtrip() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("set temp pulse dir permissions");
+        }
         let path = temp_dir.path().join("review_pulse_security.json");
         write_pulse_file_to_path(&path, "0123456789abcdef").expect("write pulse");
         let pulse = read_pulse_file_from_path(&path)

@@ -1259,6 +1259,13 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+                .expect("set temp dir permissions");
+        }
         dir.join("test.log")
     }
 
@@ -1266,6 +1273,13 @@ mod tests {
     fn short_test_failure_hint_is_appended() {
         let log_path = temp_log_path("short");
         fs::write(&log_path, "=== stdout ===\n\n=== stderr ===\n\n").expect("write seed log");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600))
+                .expect("set log file mode");
+        }
 
         append_short_test_failure_hint(&log_path, 128);
 
@@ -1278,6 +1292,13 @@ mod tests {
     fn short_test_failure_hint_is_skipped_for_large_output() {
         let log_path = temp_log_path("large");
         fs::write(&log_path, "=== stdout ===\n\n=== stderr ===\n\n").expect("write seed log");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600))
+                .expect("set log file mode");
+        }
 
         append_short_test_failure_hint(&log_path, SHORT_TEST_OUTPUT_HINT_THRESHOLD_BYTES);
 

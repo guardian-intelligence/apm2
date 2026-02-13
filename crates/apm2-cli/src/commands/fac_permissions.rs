@@ -227,6 +227,25 @@ fn resolve_apm2_home() -> Result<PathBuf, FacPermissionsError> {
 pub fn ensure_dir_with_mode(path: &Path) -> Result<(), FacPermissionsError> {
     if path.exists() {
         ensure_path_is_directory(path)?;
+        #[cfg(unix)]
+        {
+            let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+                FacPermissionsError::MetadataError {
+                    path: path.to_path_buf(),
+                    error,
+                }
+            })?;
+            let actual_uid = metadata.uid();
+            let mode = metadata.mode() & 0o7777;
+            if mode & 0o077 != 0 {
+                return Err(FacPermissionsError::UnsafePermissions {
+                    path: path.to_path_buf(),
+                    actual_mode: mode,
+                    actual_uid,
+                    expected_uid: geteuid().as_raw(),
+                });
+            }
+        }
         return Ok(());
     }
 
@@ -281,6 +300,16 @@ pub fn write_fac_file_with_mode(path: &Path, data: &[u8]) -> Result<(), FacPermi
                 path: path.to_path_buf(),
             });
         }
+
+        let mode = metadata.mode() & 0o7777;
+        if mode & 0o077 != 0 {
+            return Err(FacPermissionsError::UnsafePermissions {
+                path: path.to_path_buf(),
+                actual_mode: mode,
+                actual_uid: metadata.uid(),
+                expected_uid: geteuid().as_raw(),
+            });
+        }
     }
     let mut options = std::fs::OpenOptions::new();
     options.create(true).write(true).truncate(true);
@@ -321,6 +350,16 @@ pub fn append_fac_file_with_mode(path: &Path) -> Result<std::fs::File, FacPermis
         if metadata.file_type().is_symlink() {
             return Err(FacPermissionsError::SymlinkDetected {
                 path: path.to_path_buf(),
+            });
+        }
+
+        let mode = metadata.mode() & 0o7777;
+        if mode & 0o077 != 0 {
+            return Err(FacPermissionsError::UnsafePermissions {
+                path: path.to_path_buf(),
+                actual_mode: mode,
+                actual_uid: metadata.uid(),
+                expected_uid: geteuid().as_raw(),
             });
         }
     }
@@ -437,6 +476,8 @@ fn validate_fac_root_permissions_at(apm2_home: &Path) -> Result<(), FacPermissio
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     /// TCK-00536: Verify that `ensure_dir_with_mode` creates directories with
@@ -502,6 +543,115 @@ mod tests {
             message.contains("not a directory"),
             "expected non-directory error: {message}"
         );
+    }
+
+    /// TCK-00536: Verify that `ensure_dir_with_mode` rejects existing
+    /// world-readable directories.
+    #[test]
+    #[cfg(unix)]
+    fn ensure_dir_with_mode_rejects_world_readable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let target = dir.path().join("unsafe_dir");
+        std::fs::create_dir(&target).expect("create dir");
+
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("set permissions");
+
+        let err = ensure_dir_with_mode(&target).expect_err("must reject world-readable directory");
+        let message = err.to_string();
+        assert!(
+            message.contains("unsafe permissions"),
+            "expected unsafe permissions error: {message}"
+        );
+    }
+
+    /// TCK-00536: Verify `write_fac_file_with_mode` rejects world-readable
+    /// pre-existing FAC files.
+    #[test]
+    #[cfg(unix)]
+    fn write_fac_file_with_mode_rejects_world_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let target = dir.path().join("artifact");
+        std::fs::write(&target, b"prior").expect("create file");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
+            .expect("set permissions");
+
+        let err = write_fac_file_with_mode(&target, b"next")
+            .expect_err("should reject unsafe file permissions");
+        let message = err.to_string();
+        assert!(
+            message.contains("unsafe permissions"),
+            "expected unsafe permissions error: {message}"
+        );
+        let data = std::fs::read(&target).expect("read file");
+        assert_eq!(data, b"prior");
+    }
+
+    /// TCK-00536: Verify `append_fac_file_with_mode` rejects world-readable
+    /// pre-existing FAC files.
+    #[test]
+    #[cfg(unix)]
+    fn append_fac_file_with_mode_rejects_world_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let target = dir.path().join("artifact");
+        std::fs::write(&target, b"prior").expect("create file");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
+            .expect("set permissions");
+
+        let err =
+            append_fac_file_with_mode(&target).expect_err("should reject unsafe file permissions");
+        let message = err.to_string();
+        assert!(
+            message.contains("unsafe permissions"),
+            "expected unsafe permissions error: {message}"
+        );
+        let data = std::fs::read(&target).expect("read file");
+        assert_eq!(data, b"prior");
+    }
+
+    /// TCK-00536: Verify `write_fac_file_with_mode` succeeds on safe
+    /// pre-existing FAC files with mode 0600.
+    #[test]
+    #[cfg(unix)]
+    fn write_fac_file_with_mode_accepts_0600_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let target = dir.path().join("artifact");
+        std::fs::write(&target, b"prior").expect("create file");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("set permissions");
+
+        write_fac_file_with_mode(&target, b"next").expect("should write safe pre-existing file");
+        let data = std::fs::read(&target).expect("read file");
+        assert_eq!(data, b"next");
+    }
+
+    /// TCK-00536: Verify `append_fac_file_with_mode` succeeds on safe
+    /// pre-existing FAC files with mode 0600.
+    #[test]
+    #[cfg(unix)]
+    fn append_fac_file_with_mode_accepts_0600_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let target = dir.path().join("artifact");
+        std::fs::write(&target, b"prior").expect("create file");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("set permissions");
+
+        let mut file =
+            append_fac_file_with_mode(&target).expect("should append to safe pre-existing file");
+        file.write_all(b" next")
+            .expect("append to pre-existing file");
+        let data = std::fs::read(&target).expect("read file");
+        assert_eq!(data, b"prior next");
     }
 
     /// TCK-00536: Verify that `validate_directory` rejects group/world-writable
