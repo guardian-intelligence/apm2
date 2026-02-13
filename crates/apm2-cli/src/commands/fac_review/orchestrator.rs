@@ -140,14 +140,44 @@ fn cleanup_stale_prepared_inputs(ttl: Duration) -> Result<(), String> {
     if !root.exists() {
         return Ok(());
     }
-    let entries =
+    let repo_dirs =
         fs::read_dir(root).map_err(|err| format!("failed to read {}: {err}", root.display()))?;
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if !path.is_dir() || !path_is_stale(&path, ttl) {
+    for repo_dir in repo_dirs.filter_map(Result::ok) {
+        let repo_path = repo_dir.path();
+        if !repo_path.is_dir() {
             continue;
         }
-        let _ = fs::remove_dir_all(&path);
+        let Ok(pr_dirs) = fs::read_dir(&repo_path) else {
+            continue;
+        };
+        for pr_dir in pr_dirs.filter_map(Result::ok) {
+            let pr_path = pr_dir.path();
+            if !pr_path.is_dir() {
+                continue;
+            }
+            let Ok(sha_dirs) = fs::read_dir(&pr_path) else {
+                continue;
+            };
+            for sha_dir in sha_dirs.filter_map(Result::ok) {
+                let sha_path = sha_dir.path();
+                if !sha_path.is_dir() || !path_is_stale(&sha_path, ttl) {
+                    continue;
+                }
+                let _ = fs::remove_dir_all(&sha_path);
+            }
+            if fs::read_dir(&pr_path)
+                .ok()
+                .is_some_and(|mut entries| entries.next().is_none())
+            {
+                let _ = fs::remove_dir(&pr_path);
+            }
+        }
+        if fs::read_dir(&repo_path)
+            .ok()
+            .is_some_and(|mut entries| entries.next().is_none())
+        {
+            let _ = fs::remove_dir(&repo_path);
+        }
     }
     Ok(())
 }
@@ -183,7 +213,7 @@ fn load_completion_signal(
     {
         return Ok(None);
     }
-    if receipt.decision_signature.trim().is_empty() {
+    if receipt.decision_summary.trim().is_empty() {
         return Ok(None);
     }
     let Some(verdict) = decision_to_verdict(&receipt.decision) else {

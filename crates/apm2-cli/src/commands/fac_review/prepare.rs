@@ -6,6 +6,7 @@ use std::process::Command;
 
 use serde::Serialize;
 
+use super::barrier::fetch_pr_head_sha_local;
 use super::projection_store;
 use super::target::resolve_pr_target;
 use super::types::{sanitize_for_path, validate_expected_head_sha};
@@ -181,8 +182,9 @@ fn resolve_head_sha(
         validate_expected_head_sha(&identity.head_sha)?;
         return Ok(identity.head_sha.to_ascii_lowercase());
     }
+    let remote_head_sha = fetch_pr_head_sha_local(pr_number)?;
     validate_expected_head_sha(local_head_sha)?;
-    Ok(local_head_sha.to_ascii_lowercase())
+    Ok(remote_head_sha)
 }
 
 fn resolve_main_base_ref(repo_root: &Path) -> Result<String, String> {

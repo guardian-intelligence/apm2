@@ -1048,7 +1048,8 @@ fn run_terminate_inner_for_home(
         head_sha: run_state.head_sha.clone(),
         decision_comment_id: authority.decision_comment_id,
         decision_author: authority.decision_author.clone(),
-        decision_signature: authority.decision_signature.clone(),
+        decision_summary: authority.decision_signature.clone(),
+        integrity_hmac: String::new(),
         outcome: if killed {
             "killed".to_string()
         } else {
@@ -1059,7 +1060,7 @@ fn run_terminate_inner_for_home(
             authority.decision_comment_id
         )),
     };
-    state::write_review_run_state_integrity_receipt_for_home(home, &receipt)?;
+    state::write_review_run_termination_receipt_for_home(home, &receipt)?;
 
     if json_output {
         println!(
@@ -2224,8 +2225,15 @@ mod tests {
             serde_json::json!("test-reviewer")
         );
         assert_eq!(
-            receipt["decision_signature"],
+            receipt["decision_summary"],
             serde_json::json!("security:approve|code-quality:missing")
+        );
+        let integrity_hmac = receipt["integrity_hmac"]
+            .as_str()
+            .expect("integrity_hmac must be present");
+        assert!(
+            !integrity_hmac.is_empty(),
+            "integrity_hmac must not be empty"
         );
 
         let _ = std::fs::remove_file(state_path);

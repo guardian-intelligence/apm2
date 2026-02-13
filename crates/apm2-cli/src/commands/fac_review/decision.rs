@@ -310,7 +310,8 @@ pub fn run_decision_set(
         decision: decision.as_str().to_string(),
         decision_comment_id: active_comment_id,
         decision_author: expected_author_login,
-        decision_signature: termination_authority.decision_signature.clone(),
+        decision_summary: termination_authority.decision_signature.clone(),
+        integrity_hmac: String::new(),
     };
     super::state::write_review_run_completion_receipt_for_home(&home, &completion_receipt)?;
 
@@ -414,14 +415,8 @@ fn resolve_expected_author_login(owner_repo: &str, pr_number: u32) -> Result<Str
         return Ok(cached);
     }
 
-    let login = std::env::var("APM2_REVIEWER_ID")
-        .ok()
+    let login = super::barrier::resolve_authenticated_gh_login()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("USER")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
         .unwrap_or_else(|| "local_reviewer".to_string());
     let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &login);
     Ok(login)
@@ -1111,11 +1106,12 @@ fn write_termination_receipt(
         head_sha: authority.head_sha.clone(),
         decision_comment_id: authority.decision_comment_id,
         decision_author: authority.decision_author.clone(),
-        decision_signature: authority.decision_signature.clone(),
+        decision_summary: authority.decision_signature.clone(),
+        integrity_hmac: String::new(),
         outcome: outcome_label.to_string(),
         outcome_reason,
     };
-    super::state::write_review_run_state_integrity_receipt_for_home(home, &receipt)?;
+    super::state::write_review_run_termination_receipt_for_home(home, &receipt)?;
     Ok(())
 }
 

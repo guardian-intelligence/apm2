@@ -32,7 +32,8 @@ pub struct ReviewRunTerminationReceipt {
     pub head_sha: String,
     pub decision_comment_id: u64,
     pub decision_author: String,
-    pub decision_signature: String,
+    pub decision_summary: String,
+    pub integrity_hmac: String,
     pub outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome_reason: Option<String>,
@@ -51,7 +52,8 @@ pub struct ReviewRunCompletionReceipt {
     pub decision: String,
     pub decision_comment_id: u64,
     pub decision_author: String,
-    pub decision_signature: String,
+    pub decision_summary: String,
+    pub integrity_hmac: String,
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -136,6 +138,36 @@ struct ReviewRunStateIntegrityBinding<'a> {
     head_sha: &'a str,
     pr_number: u32,
     review_type: &'a str,
+}
+
+#[derive(Serialize)]
+struct ReviewRunCompletionReceiptIntegrityBinding<'a> {
+    schema: &'a str,
+    emitted_at: &'a str,
+    repo: &'a str,
+    pr_number: u32,
+    review_type: &'a str,
+    run_id: &'a str,
+    head_sha: &'a str,
+    decision: &'a str,
+    decision_comment_id: u64,
+    decision_author: &'a str,
+    decision_summary: &'a str,
+}
+
+#[derive(Serialize)]
+struct ReviewRunTerminationReceiptIntegrityBinding<'a> {
+    emitted_at: &'a str,
+    repo: &'a str,
+    pr_number: u32,
+    review_type: &'a str,
+    run_id: &'a str,
+    head_sha: &'a str,
+    decision_comment_id: u64,
+    decision_author: &'a str,
+    decision_summary: &'a str,
+    outcome: &'a str,
+    outcome_reason: Option<&'a str>,
 }
 
 fn open_secret_for_read(path: &Path) -> Result<File, String> {
@@ -310,6 +342,111 @@ pub fn verify_review_run_state_integrity(
         return Ok(false);
     }
     Ok(expected.ct_eq(actual.as_slice()).into())
+}
+
+fn compute_hmac_hex(payload: &[u8], secret: &[u8]) -> Result<String, String> {
+    let mut mac = HmacSha256::new_from_slice(secret)
+        .map_err(|err| format!("invalid integrity secret: {err}"))?;
+    mac.update(payload);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn verify_hmac_hex(stored_hex: &str, computed_hex: &str) -> Result<bool, String> {
+    let expected =
+        hex::decode(stored_hex).map_err(|err| format!("invalid integrity_hmac encoding: {err}"))?;
+    let actual = hex::decode(computed_hex)
+        .map_err(|err| format!("invalid computed integrity_hmac encoding: {err}"))?;
+    if expected.len() != actual.len() {
+        return Ok(false);
+    }
+    Ok(expected.ct_eq(actual.as_slice()).into())
+}
+
+fn completion_receipt_integrity_payload(
+    receipt: &ReviewRunCompletionReceipt,
+) -> Result<Vec<u8>, String> {
+    let binding = ReviewRunCompletionReceiptIntegrityBinding {
+        schema: &receipt.schema,
+        emitted_at: &receipt.emitted_at,
+        repo: &receipt.repo,
+        pr_number: receipt.pr_number,
+        review_type: &receipt.review_type,
+        run_id: &receipt.run_id,
+        head_sha: &receipt.head_sha,
+        decision: &receipt.decision,
+        decision_comment_id: receipt.decision_comment_id,
+        decision_author: &receipt.decision_author,
+        decision_summary: &receipt.decision_summary,
+    };
+    serde_json::to_vec(&binding)
+        .map_err(|err| format!("failed to build completion receipt integrity payload: {err}"))
+}
+
+fn termination_receipt_integrity_payload(
+    receipt: &ReviewRunTerminationReceipt,
+) -> Result<Vec<u8>, String> {
+    let binding = ReviewRunTerminationReceiptIntegrityBinding {
+        emitted_at: &receipt.emitted_at,
+        repo: &receipt.repo,
+        pr_number: receipt.pr_number,
+        review_type: &receipt.review_type,
+        run_id: &receipt.run_id,
+        head_sha: &receipt.head_sha,
+        decision_comment_id: receipt.decision_comment_id,
+        decision_author: &receipt.decision_author,
+        decision_summary: &receipt.decision_summary,
+        outcome: &receipt.outcome,
+        outcome_reason: receipt.outcome_reason.as_deref(),
+    };
+    serde_json::to_vec(&binding)
+        .map_err(|err| format!("failed to build termination receipt integrity payload: {err}"))
+}
+
+fn bind_completion_receipt_integrity_for_home(
+    home: &Path,
+    receipt: &mut ReviewRunCompletionReceipt,
+) -> Result<(), String> {
+    let secret = match read_run_secret_for_home(home, receipt.pr_number, &receipt.review_type)? {
+        Some(secret) => secret,
+        None => rotate_run_secret_for_home(home, receipt.pr_number, &receipt.review_type)?,
+    };
+    let payload = completion_receipt_integrity_payload(receipt)?;
+    receipt.integrity_hmac = compute_hmac_hex(&payload, &secret)?;
+    Ok(())
+}
+
+fn verify_completion_receipt_integrity_for_home(
+    home: &Path,
+    receipt: &ReviewRunCompletionReceipt,
+) -> Result<(), String> {
+    let Some(secret) = read_run_secret_for_home(home, receipt.pr_number, &receipt.review_type)?
+    else {
+        return Err(TERMINAL_INTEGRITY_FAILURE.to_string());
+    };
+    if receipt.integrity_hmac.trim().is_empty() {
+        return Err(TERMINAL_INTEGRITY_FAILURE.to_string());
+    }
+    let payload = completion_receipt_integrity_payload(receipt)?;
+    let computed = compute_hmac_hex(&payload, &secret)?;
+    let matches = verify_hmac_hex(&receipt.integrity_hmac, &computed)
+        .map_err(|_| TERMINAL_INTEGRITY_FAILURE.to_string())?;
+    if !matches {
+        return Err(TERMINAL_INTEGRITY_FAILURE.to_string());
+    }
+    Ok(())
+}
+
+fn bind_termination_receipt_integrity_for_home(
+    home: &Path,
+    receipt: &mut ReviewRunTerminationReceipt,
+) -> Result<(), String> {
+    let secret = match read_run_secret_for_home(home, receipt.pr_number, &receipt.review_type)? {
+        Some(secret) => secret,
+        None => rotate_run_secret_for_home(home, receipt.pr_number, &receipt.review_type)?,
+    };
+    let payload = termination_receipt_integrity_payload(receipt)?;
+    receipt.integrity_hmac = compute_hmac_hex(&payload, &secret)?;
+    Ok(())
 }
 
 fn review_runs_dir_path() -> Result<PathBuf, String> {
@@ -622,14 +759,16 @@ pub fn write_review_run_state_for_home(
     Ok(path)
 }
 
-pub fn write_review_run_state_integrity_receipt_for_home(
+pub fn write_review_run_termination_receipt_for_home(
     home: &Path,
     receipt: &ReviewRunTerminationReceipt,
 ) -> Result<PathBuf, String> {
+    let mut receipt = receipt.clone();
+    bind_termination_receipt_integrity_for_home(home, &mut receipt)?;
     let path =
         review_run_termination_receipt_path_for_home(home, receipt.pr_number, &receipt.review_type);
     ensure_parent_dir(&path)?;
-    let payload = serde_json::to_vec_pretty(receipt)
+    let payload = serde_json::to_vec_pretty(&receipt)
         .map_err(|err| format!("failed to serialize termination receipt: {err}"))?;
     let parent = path
         .parent()
@@ -650,10 +789,12 @@ pub fn write_review_run_completion_receipt_for_home(
     home: &Path,
     receipt: &ReviewRunCompletionReceipt,
 ) -> Result<PathBuf, String> {
+    let mut receipt = receipt.clone();
+    bind_completion_receipt_integrity_for_home(home, &mut receipt)?;
     let path =
         review_run_completion_receipt_path_for_home(home, receipt.pr_number, &receipt.review_type);
     ensure_parent_dir(&path)?;
-    let payload = serde_json::to_vec_pretty(receipt)
+    let payload = serde_json::to_vec_pretty(&receipt)
         .map_err(|err| format!("failed to serialize completion receipt: {err}"))?;
     let parent = path
         .parent()
@@ -700,6 +841,12 @@ pub fn load_review_run_completion_receipt_for_home(
             receipt.review_type
         ));
     }
+    verify_completion_receipt_integrity_for_home(home, &receipt).map_err(|err| {
+        format!(
+            "completion receipt integrity verification failed at {}: {err}",
+            path.display()
+        )
+    })?;
     Ok(Some(receipt))
 }
 

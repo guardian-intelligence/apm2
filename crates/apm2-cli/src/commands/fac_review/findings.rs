@@ -1,5 +1,7 @@
 //! FAC-native review findings retrieval from local projection comments.
 
+use std::process::Command;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -195,8 +197,40 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
 fn fetch_issue_comments(
     owner_repo: &str,
     pr_number: u32,
-    _refresh: bool,
+    refresh: bool,
 ) -> Result<IssueCommentsFetch, String> {
+    if refresh {
+        if !projection_store::gh_read_fallback_enabled() {
+            return Err(projection_store::gh_read_fallback_disabled_error(
+                "findings.refresh",
+            ));
+        }
+        let mut comments = Vec::new();
+        for page in 1..=20_u32 {
+            let endpoint =
+                format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100&page={page}");
+            let output = Command::new("gh")
+                .args(["api", &endpoint])
+                .output()
+                .map_err(|err| format!("failed to execute gh api for findings refresh: {err}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "gh api failed refreshing findings comments: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            let page_comments: Vec<IssueComment> = serde_json::from_slice(&output.stdout)
+                .map_err(|err| format!("failed to parse findings refresh payload: {err}"))?;
+            if page_comments.is_empty() {
+                break;
+            }
+            comments.extend(page_comments);
+        }
+        let _ = projection_store::save_issue_comments_cache(owner_repo, pr_number, &comments);
+        let _ = projection_store::record_fallback_read(owner_repo, pr_number, "findings.refresh");
+        return Ok(IssueCommentsFetch { comments });
+    }
+
     let comments =
         projection_store::load_issue_comments_cache::<IssueComment>(owner_repo, pr_number)?
             .unwrap_or_default();
@@ -208,14 +242,8 @@ fn resolve_expected_author_login(owner_repo: &str, pr_number: u32) -> Result<Str
         return Ok(cached);
     }
 
-    let login = std::env::var("APM2_REVIEWER_ID")
-        .ok()
+    let login = super::barrier::resolve_authenticated_gh_login()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("USER")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
         .unwrap_or_else(|| "local_reviewer".to_string());
     let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &login);
     Ok(login)

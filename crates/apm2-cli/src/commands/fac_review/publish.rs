@@ -5,7 +5,7 @@ use std::path::Path;
 use clap::ValueEnum;
 use serde::Serialize;
 
-use super::barrier::{ensure_gh_cli_ready, render_comment_with_generated_metadata};
+use super::barrier::{render_comment_with_generated_metadata, resolve_authenticated_gh_login};
 use super::github_projection::{self, IssueCommentResponse};
 use super::projection_store;
 use super::target::resolve_pr_target;
@@ -52,8 +52,6 @@ pub fn run_publish(
     body_file: &Path,
     json_output: bool,
 ) -> Result<u8, String> {
-    ensure_gh_cli_ready()?;
-
     let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
     let reviewer_id = resolve_reviewer_id(&owner_repo, resolved_pr)?;
     let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
@@ -69,8 +67,23 @@ pub fn run_publish(
         &head_sha,
         &reviewer_id,
     )?;
-    let response =
-        github_projection::create_issue_comment(&owner_repo, resolved_pr, &enriched_body)?;
+    let (comment_id, comment_url) = match github_projection::create_issue_comment(
+        &owner_repo,
+        resolved_pr,
+        &enriched_body,
+    ) {
+        Ok(response) => (response.id, response.html_url),
+        Err(err) => {
+            eprintln!(
+                "WARNING: failed to project publish comment to GitHub for PR #{resolved_pr}: {err}"
+            );
+            let fallback_id = allocate_local_comment_id(&owner_repo, resolved_pr)?;
+            let fallback_url = format!(
+                "local://fac_projection/{owner_repo}/pr-{resolved_pr}/issue_comments#{fallback_id}"
+            );
+            (fallback_id, fallback_url)
+        },
+    };
 
     let summary = PublishSummary {
         schema: PUBLISH_SCHEMA.to_string(),
@@ -80,8 +93,8 @@ pub fn run_publish(
         head_sha,
         review_type: review_type_label.to_string(),
         body_file: body_file.display().to_string(),
-        comment_id: response.id,
-        comment_url: response.html_url,
+        comment_id,
+        comment_url,
     };
 
     let _ = projection_store::save_trusted_reviewer_id(&owner_repo, resolved_pr, &reviewer_id);
@@ -149,17 +162,23 @@ fn resolve_reviewer_id(owner_repo: &str, pr_number: u32) -> Result<String, Strin
         return Ok(cached);
     }
 
-    let reviewer_id = std::env::var("APM2_REVIEWER_ID")
-        .ok()
+    let reviewer_id = resolve_authenticated_gh_login()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("USER")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
         .unwrap_or_else(|| "local_reviewer".to_string());
     let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &reviewer_id);
     Ok(reviewer_id)
+}
+
+fn allocate_local_comment_id(owner_repo: &str, pr_number: u32) -> Result<u64, String> {
+    let comments =
+        projection_store::load_issue_comments_cache::<serde_json::Value>(owner_repo, pr_number)?
+            .unwrap_or_default();
+    Ok(comments
+        .iter()
+        .filter_map(|value| value.get("id").and_then(serde_json::Value::as_u64))
+        .max()
+        .unwrap_or_else(|| u64::from(pr_number).saturating_mul(1_000_000_000))
+        .saturating_add(1))
 }
 
 pub(super) fn create_issue_comment(
