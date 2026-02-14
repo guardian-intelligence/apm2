@@ -583,25 +583,9 @@ fn check_or_admit_canonicalizer_tuple(
             }
         },
         Err(BrokerError::Deserialization { detail }) => {
-            eprintln!("WARNING: canonicalizer tuple file is corrupted: {detail}");
-            broker
-                .admit_canonicalizer_tuple(fac_root)
-                .map(|_| CanonicalizerTupleCheck::AutoAdmitted {
-                    load_error: "corrupted canonicalizer tuple".to_string(),
-                })
-                .map_err(|e| format!("cannot persist canonicalizer tuple: {e}"))
+            Err(format!("canonicalizer tuple is corrupted: {detail}"))
         },
-        Err(err) => {
-            eprintln!(
-                "WARNING: failed to load canonicalizer tuple: {err}. Will attempt first-run admit"
-            );
-            broker
-                .admit_canonicalizer_tuple(fac_root)
-                .map(|_| CanonicalizerTupleCheck::AutoAdmitted {
-                    load_error: err.to_string(),
-                })
-                .map_err(|e| format!("cannot persist canonicalizer tuple: {e}"))
-        },
+        Err(err) => Err(format!("failed to load canonicalizer tuple: {err}")),
     }
 }
 
@@ -994,8 +978,8 @@ fn process_job(
             Some(&boundary_trace),
             None,
             None,
-            Some(canonicalizer_tuple_digest),
             None,
+            Some(canonicalizer_tuple_digest),
             policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -2165,6 +2149,31 @@ mod tests {
     }
 
     #[test]
+    fn test_check_or_admit_canonicalizer_tuple_rejects_deserialization_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let mut broker = FacBroker::new();
+        let tuple_path = fac_root
+            .join("broker")
+            .join("admitted_canonicalizer_tuple.v1.json");
+        fs::create_dir_all(tuple_path.parent().expect("tuple directory parent"))
+            .expect("create tuple directory");
+        fs::write(&tuple_path, b"{not-json").expect("write corrupted tuple");
+
+        let result = check_or_admit_canonicalizer_tuple(&mut broker, &fac_root);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("corrupted"),
+            "expected corruption error, got: {err}"
+        );
+        assert_eq!(
+            fs::read(&tuple_path).expect("read tuple").as_slice(),
+            b"{not-json"
+        );
+    }
+
+    #[test]
     fn test_emit_job_receipt_includes_canonicalizer_tuple_digest() {
         let dir = tempfile::tempdir().expect("tempdir");
         let fac_root = dir.path().join("private").join("fac");
@@ -2205,6 +2214,48 @@ mod tests {
                 .get("canonicalizer_tuple_digest")
                 .and_then(|value| value.as_str()),
             Some(tuple_digest.as_str())
+        );
+        assert!(
+            receipt_json.get("patch_digest").is_none(),
+            "patch_digest should remain unset in this receipt path"
+        );
+    }
+
+    #[test]
+    fn test_emit_job_receipt_channel_boundary_defect_path_sets_canonicalizer_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let canonicalizer_tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
+        let spec = make_receipt_test_spec();
+
+        let receipt_path = emit_job_receipt(
+            &fac_root,
+            &spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ChannelBoundaryViolation),
+            "channel boundary violation",
+            None,
+            None,
+            None,
+            None,
+            Some(&canonicalizer_tuple_digest),
+            &spec.job_spec_digest,
+        )
+        .expect("emit receipt");
+
+        let receipt_json = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&receipt_path).expect("read receipt"),
+        )
+        .expect("parse receipt JSON");
+        assert_eq!(
+            receipt_json
+                .get("canonicalizer_tuple_digest")
+                .and_then(|value| value.as_str()),
+            Some(canonicalizer_tuple_digest.as_str())
+        );
+        assert!(
+            receipt_json.get("patch_digest").is_none(),
+            "channel-boundary receipt should not set patch_digest"
         );
     }
 
