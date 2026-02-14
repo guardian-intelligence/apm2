@@ -1143,10 +1143,11 @@ fn run_terminate_inner_for_home(
 pub fn run_recover(
     repo: &str,
     pr_number: Option<u32>,
+    force: bool,
     refresh_identity: bool,
     json_output: bool,
 ) -> u8 {
-    lifecycle::run_recover(repo, pr_number, refresh_identity, json_output)
+    lifecycle::run_recover(repo, pr_number, force, refresh_identity, json_output)
 }
 
 pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&Path>) -> u8 {

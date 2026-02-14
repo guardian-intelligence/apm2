@@ -241,6 +241,13 @@ fn read_or_rotate_secret(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn findings_bundle_binding_payload(bundle: &FindingsBundle) -> Result<Vec<u8>, String> {
+    let mut sorted_dimensions = bundle.dimensions.clone();
+    sorted_dimensions.sort_by(|lhs, rhs| lhs.dimension.cmp(&rhs.dimension));
+    for dimension in &mut sorted_dimensions {
+        dimension
+            .findings
+            .sort_by(|lhs, rhs| lhs.finding_id.cmp(&rhs.finding_id));
+    }
     let binding = FindingsBundleIntegrityBinding {
         schema: &bundle.schema,
         owner_repo: &bundle.owner_repo,
@@ -248,7 +255,7 @@ fn findings_bundle_binding_payload(bundle: &FindingsBundle) -> Result<Vec<u8>, S
         head_sha: &bundle.head_sha,
         source: &bundle.source,
         updated_at: &bundle.updated_at,
-        dimensions: &bundle.dimensions,
+        dimensions: &sorted_dimensions,
     };
     serde_jcs::to_vec(&binding)
         .map_err(|err| format!("failed to build findings bundle integrity payload: {err}"))

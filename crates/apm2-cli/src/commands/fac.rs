@@ -522,6 +522,10 @@ pub struct RecoverArgs {
     #[arg(long)]
     pub pr: Option<u32>,
 
+    /// Force lifecycle recovery from the current local SHA.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+
     /// Refresh local projection identity from current authoritative PR head.
     #[arg(long, default_value_t = false)]
     pub refresh_identity: bool,
@@ -1554,7 +1558,13 @@ pub fn run_fac(
                 Ok(value) => value,
                 Err(code) => return code,
             };
-            fac_review::run_recover(&repo, args.pr, args.refresh_identity, output_json)
+            fac_review::run_recover(
+                &repo,
+                args.pr,
+                args.force,
+                args.refresh_identity,
+                output_json,
+            )
         },
         FacSubcommand::Logs(args) => {
             let repo = match derive_fac_repo_or_exit(json_output || args.json) {
@@ -4093,6 +4103,7 @@ mod tests {
 
         let recover = FacSubcommand::Recover(RecoverArgs {
             pr: Some(615),
+            force: false,
             refresh_identity: false,
             json: true,
         });

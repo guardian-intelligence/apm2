@@ -11,6 +11,7 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Command, id as current_process_id};
 
 use chrono::{DateTime, Duration, Utc};
 use clap::ValueEnum;
@@ -48,6 +49,7 @@ const REGISTRY_INTEGRITY_ROLE: &str = "agent_registry";
 const RUN_SECRET_MAX_FILE_BYTES: u64 = 128;
 const RUN_SECRET_LEN_BYTES: usize = 32;
 const RUN_SECRET_MAX_ENCODED_CHARS: usize = 128;
+const LIFECYCLE_HMAC_ERROR: &str = "lifecycle state integrity check failed";
 type HmacSha256 = Hmac<Sha256>;
 
 pub(super) const fn default_retry_budget() -> u32 {
@@ -660,6 +662,220 @@ fn bind_registry_integrity(registry: &mut AgentRegistry) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn process_parent_pid(pid: u32) -> Option<u32> {
+    let stat_path = format!("/proc/{pid}/stat");
+    let stat_content = fs::read_to_string(stat_path).ok()?;
+    let (_, tail) = stat_content.rsplit_once(") ")?;
+    tail.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(unix)]
+fn is_descendant_of_pid(child_pid: u32, ancestor_pid: u32) -> bool {
+    if child_pid == 0 || ancestor_pid == 0 {
+        return false;
+    }
+    if child_pid == ancestor_pid {
+        return true;
+    }
+    let mut cursor = child_pid;
+    for _ in 0..256 {
+        let Some(parent) = process_parent_pid(cursor) else {
+            return false;
+        };
+        if parent == ancestor_pid {
+            return true;
+        }
+        cursor = parent;
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn is_descendant_of_pid(_child_pid: u32, _ancestor_pid: u32) -> bool {
+    false
+}
+
+const fn is_authoritative_sha_event(event: &LifecycleEventKind) -> bool {
+    matches!(
+        event,
+        LifecycleEventKind::PushObserved | LifecycleEventKind::GatesPassed
+    )
+}
+
+fn is_sha_ancestor(ancestor_sha: &str, descendant_sha: &str) -> Option<bool> {
+    let output = Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor_sha, descendant_sha])
+        .output()
+        .ok()?;
+    match output.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+fn classify_sha_drift(event_sha: &str, current_sha: &str) -> (&'static str, &'static str) {
+    match is_sha_ancestor(event_sha, current_sha) {
+        Some(true) => ("sha_ancestor", "event sha is an ancestor of current sha"),
+        Some(false) => (
+            "sha_divergent",
+            "event sha is not an ancestor of current sha",
+        ),
+        None => ("sha_relation_unknown", "unable to establish sha order"),
+    }
+}
+
+fn is_pr_state_corruption_error(err: &str) -> bool {
+    err == LIFECYCLE_HMAC_ERROR
+        || err.starts_with("failed to parse lifecycle state")
+        || err.starts_with("unexpected lifecycle state schema")
+        || err.starts_with("lifecycle state identity mismatch")
+        || err.starts_with("lifecycle state owner mismatch")
+}
+
+fn pr_state_quarantine_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
+    let state_parent = pr_state_path(owner_repo, pr_number)?
+        .parent()
+        .ok_or_else(|| {
+            format!("lifecycle state path has no parent for PR #{pr_number} in {owner_repo}",)
+        })?
+        .join(".quarantine");
+    ensure_parent_dir(&state_parent)?;
+    let stamp = Utc::now().timestamp_millis();
+    for attempt in 0..64 {
+        let path = state_parent.join(format!("pr-{pr_number}.{stamp}.{attempt}.json.quarantine"));
+        if !path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(format!(
+        "failed to allocate lifecycle quarantine path for PR #{} in {}",
+        pr_number,
+        state_parent.display()
+    ))
+}
+
+fn quarantine_pr_state(owner_repo: &str, pr_number: u32) -> Result<Option<PathBuf>, String> {
+    let path = pr_state_path(owner_repo, pr_number)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let quarantine = pr_state_quarantine_path(owner_repo, pr_number)?;
+    fs::rename(&path, &quarantine).map_err(|err| {
+        format!(
+            "failed to quarantine lifecycle state {} -> {}: {err}",
+            path.display(),
+            quarantine.display()
+        )
+    })?;
+    Ok(Some(quarantine))
+}
+
+fn new_pr_state(owner_repo: &str, pr_number: u32, sha: &str) -> Result<PrLifecycleRecord, String> {
+    let mut state = PrLifecycleRecord::new(owner_repo, pr_number, sha);
+    bind_pr_lifecycle_record_integrity(&mut state)?;
+    Ok(state)
+}
+
+fn load_pr_state_with_recovery(
+    owner_repo: &str,
+    pr_number: u32,
+    sha: &str,
+    recover_on_corrupt: bool,
+) -> Result<PrLifecycleRecord, String> {
+    let path = pr_state_path(owner_repo, pr_number)?;
+    let bytes = match fs::read(&path) {
+        Ok(value) => value,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return new_pr_state(owner_repo, pr_number, sha);
+        },
+        Err(err) => {
+            return Err(format!(
+                "failed to read lifecycle state {}: {err}",
+                path.display()
+            ));
+        },
+    };
+    let mut parsed: PrLifecycleRecord = match serde_json::from_slice(&bytes) {
+        Ok(state) => state,
+        Err(err) => {
+            let err = format!("failed to parse lifecycle state {}: {err}", path.display());
+            if recover_on_corrupt {
+                if is_pr_state_corruption_error(&err) {
+                    if let Err(quarantine_err) = quarantine_pr_state(owner_repo, pr_number) {
+                        return Err(format!(
+                            "{err}; failed to quarantine corrupt state: {quarantine_err}"
+                        ));
+                    }
+                    return new_pr_state(owner_repo, pr_number, sha);
+                }
+            } else if is_pr_state_corruption_error(&err) {
+                let _ = quarantine_pr_state(owner_repo, pr_number);
+            }
+            return Err(err);
+        },
+    };
+    if parsed.schema != PR_STATE_SCHEMA {
+        let err = format!(
+            "unexpected lifecycle state schema {} at {}",
+            parsed.schema,
+            path.display()
+        );
+        if recover_on_corrupt && is_pr_state_corruption_error(&err) {
+            if let Err(quarantine_err) = quarantine_pr_state(owner_repo, pr_number) {
+                return Err(format!(
+                    "{err}; failed to quarantine corrupt state: {quarantine_err}"
+                ));
+            }
+            return new_pr_state(owner_repo, pr_number, sha);
+        }
+        if is_pr_state_corruption_error(&err) {
+            let _ = quarantine_pr_state(owner_repo, pr_number);
+        }
+        return Err(err);
+    }
+    parsed.owner_repo = parsed.owner_repo.to_ascii_lowercase();
+    if parsed.pr_number != pr_number {
+        let err = format!(
+            "lifecycle state identity mismatch for {}: expected pr={}, got pr={}",
+            path.display(),
+            pr_number,
+            parsed.pr_number
+        );
+        if recover_on_corrupt && is_pr_state_corruption_error(&err) {
+            if let Err(quarantine_err) = quarantine_pr_state(owner_repo, pr_number) {
+                return Err(format!(
+                    "{err}; failed to quarantine corrupt state: {quarantine_err}"
+                ));
+            }
+            return new_pr_state(owner_repo, pr_number, sha);
+        }
+        if is_pr_state_corruption_error(&err) {
+            let _ = quarantine_pr_state(owner_repo, pr_number);
+        }
+        return Err(err);
+    }
+    if let Err(err) = bind_pr_lifecycle_record_integrity(&mut parsed) {
+        if err == LIFECYCLE_HMAC_ERROR {
+            if recover_on_corrupt {
+                if let Err(quarantine_err) = quarantine_pr_state(owner_repo, pr_number) {
+                    return Err(format!(
+                        "{err}; failed to quarantine corrupt state: {quarantine_err}"
+                    ));
+                }
+                return new_pr_state(owner_repo, pr_number, sha);
+            }
+            if is_pr_state_corruption_error(&err) {
+                let _ = quarantine_pr_state(owner_repo, pr_number);
+            }
+            return Err(err);
+        }
+        return Err(err);
+    }
+    Ok(parsed)
+}
+
 fn prune_registry_stale_non_active_entries(registry: &mut AgentRegistry) -> usize {
     let cutoff = Utc::now() - registry_entry_ttl();
     let before = registry.entries.len();
@@ -740,41 +956,33 @@ fn apply_registry_retention(registry: &mut AgentRegistry) {
 }
 
 fn load_pr_state(owner_repo: &str, pr_number: u32, sha: &str) -> Result<PrLifecycleRecord, String> {
-    let path = pr_state_path(owner_repo, pr_number)?;
-    let bytes = match fs::read(&path) {
-        Ok(value) => value,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let mut state = PrLifecycleRecord::new(owner_repo, pr_number, sha);
-            bind_pr_lifecycle_record_integrity(&mut state)?;
-            return Ok(state);
-        },
+    load_pr_state_with_recovery(owner_repo, pr_number, sha, false)
+}
+
+fn load_pr_state_for_recover(
+    owner_repo: &str,
+    pr_number: u32,
+    sha: &str,
+    force: bool,
+) -> Result<PrLifecycleRecord, String> {
+    if force {
+        let _ = quarantine_pr_state(owner_repo, pr_number);
+        return new_pr_state(owner_repo, pr_number, sha);
+    }
+    match load_pr_state_with_recovery(owner_repo, pr_number, sha, true) {
+        Ok(state) => Ok(state),
         Err(err) => {
-            return Err(format!(
-                "failed to read lifecycle state {}: {err}",
-                path.display()
-            ));
+            if is_pr_state_corruption_error(&err) {
+                if let Err(quarantine_err) = quarantine_pr_state(owner_repo, pr_number) {
+                    return Err(format!(
+                        "{err}; failed to quarantine corrupt state: {quarantine_err}"
+                    ));
+                }
+                return new_pr_state(owner_repo, pr_number, sha);
+            }
+            Err(err)
         },
-    };
-    let mut parsed: PrLifecycleRecord = serde_json::from_slice(&bytes)
-        .map_err(|err| format!("failed to parse lifecycle state {}: {err}", path.display()))?;
-    if parsed.schema != PR_STATE_SCHEMA {
-        return Err(format!(
-            "unexpected lifecycle state schema {} at {}",
-            parsed.schema,
-            path.display()
-        ));
     }
-    parsed.owner_repo = parsed.owner_repo.to_ascii_lowercase();
-    if parsed.pr_number != pr_number {
-        return Err(format!(
-            "lifecycle state identity mismatch for {}: expected pr={}, got pr={}",
-            path.display(),
-            pr_number,
-            parsed.pr_number
-        ));
-    }
-    bind_pr_lifecycle_record_integrity(&mut parsed)?;
-    Ok(parsed)
 }
 
 fn save_pr_state(state: &PrLifecycleRecord) -> Result<PathBuf, String> {
@@ -815,6 +1023,90 @@ fn load_registry() -> Result<AgentRegistry, String> {
     Ok(parsed)
 }
 
+fn apply_event_to_record(
+    record: &mut PrLifecycleRecord,
+    sha: &str,
+    event: &LifecycleEventKind,
+) -> Result<(), String> {
+    let sha = sha.to_ascii_lowercase();
+
+    if !record.current_sha.eq_ignore_ascii_case(&sha) {
+        record.pr_state = PrLifecycleState::Stale;
+        let (relation_code, relation_hint) = classify_sha_drift(&sha, &record.current_sha);
+        let is_older_than_current = relation_code == "sha_ancestor";
+        record.append_event(
+            &sha,
+            "sha_drift_detected",
+            serde_json::json!({
+                "reason": "event_sha_mismatch",
+                "authoritative_event": is_authoritative_sha_event(event),
+                "relation": relation_code,
+                "relation_hint": relation_hint,
+            }),
+        );
+
+        if is_older_than_current && is_authoritative_sha_event(event) {
+            return Err(format!(
+                "rejecting lifecycle event {} for PR #{} sha {} because it is older than current sha {} (relation={})",
+                event.as_str(),
+                record.pr_number,
+                sha,
+                record.current_sha,
+                relation_code
+            ));
+        }
+
+        if !is_authoritative_sha_event(event) {
+            eprintln!(
+                "WARNING: ignoring lifecycle event {} for PR #{} sha {} because current sha is {} (relation={})",
+                event.as_str(),
+                record.pr_number,
+                sha,
+                record.current_sha,
+                relation_code,
+            );
+            return Ok(());
+        }
+
+        if !is_older_than_current {
+            record.current_sha.clone_from(&sha);
+        }
+    }
+
+    match event {
+        LifecycleEventKind::VerdictSet {
+            dimension,
+            decision,
+        } => {
+            let dim = normalize_verdict_dimension(dimension)?;
+            let dec = normalize_verdict_decision(decision)?;
+            record.verdicts.insert(dim.to_string(), dec.to_string());
+        },
+        LifecycleEventKind::ShaDriftDetected => {
+            record.current_sha.clone_from(&sha);
+        },
+        _ => {},
+    }
+
+    let next_state = next_state_for_event(record, event)?;
+    record.pr_state = next_state;
+    if record.pr_state == PrLifecycleState::Stuck {
+        record.error_budget_used = record.error_budget_used.saturating_add(1);
+        if record.error_budget_used >= MAX_ERROR_BUDGET {
+            record.append_event(
+                &sha,
+                "error_budget_exhausted",
+                serde_json::json!({
+                    "error_budget_used": record.error_budget_used,
+                    "max_error_budget": MAX_ERROR_BUDGET,
+                }),
+            );
+        }
+    }
+    record.append_event(&sha, event.as_str(), event_detail(event));
+    Ok(())
+}
+
 fn save_registry(registry: &AgentRegistry) -> Result<PathBuf, String> {
     let mut copy = registry.clone();
     copy.integrity_hmac = None;
@@ -832,6 +1124,14 @@ fn token_ttl() -> Duration {
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_TOKEN_TTL_SECS);
     Duration::seconds(secs)
+}
+
+fn reviewer_agent_type(review_state_type: &str) -> Option<AgentType> {
+    match review_state_type {
+        "security" => Some(AgentType::ReviewerSecurity),
+        "quality" => Some(AgentType::ReviewerQuality),
+        _ => None,
+    }
 }
 
 fn generate_completion_token() -> String {
@@ -1130,49 +1430,7 @@ pub fn apply_event(
     ensure_machine_artifact()?;
     let _state_lock = acquire_pr_state_lock(owner_repo, pr_number)?;
     let mut record = load_pr_state(owner_repo, pr_number, sha)?;
-    let sha = sha.to_ascii_lowercase();
-
-    if !record.current_sha.eq_ignore_ascii_case(&sha) {
-        record.pr_state = PrLifecycleState::Stale;
-        record.current_sha.clone_from(&sha);
-        record.append_event(
-            &sha,
-            "sha_drift_detected",
-            serde_json::json!({"reason":"event_sha_mismatch"}),
-        );
-    }
-
-    match &event {
-        LifecycleEventKind::VerdictSet {
-            dimension,
-            decision,
-        } => {
-            let dim = normalize_verdict_dimension(dimension)?;
-            let dec = normalize_verdict_decision(decision)?;
-            record.verdicts.insert(dim.to_string(), dec.to_string());
-        },
-        LifecycleEventKind::ShaDriftDetected => {
-            record.current_sha.clone_from(&sha);
-        },
-        _ => {},
-    }
-
-    let next_state = next_state_for_event(&record, event)?;
-    record.pr_state = next_state;
-    if record.pr_state == PrLifecycleState::Stuck {
-        record.error_budget_used = record.error_budget_used.saturating_add(1);
-        if record.error_budget_used >= MAX_ERROR_BUDGET {
-            record.append_event(
-                &sha,
-                "error_budget_exhausted",
-                serde_json::json!({
-                    "error_budget_used": record.error_budget_used,
-                    "max_error_budget": MAX_ERROR_BUDGET,
-                }),
-            );
-        }
-    }
-    record.append_event(&sha, event.as_str(), event_detail(event));
+    apply_event_to_record(&mut record, sha, event)?;
     save_pr_state(&record)?;
     Ok(record)
 }
@@ -1478,25 +1736,58 @@ fn run_verdict_set_inner(
     );
     let home = apm2_home_dir()?;
     let projected_decision = projected.decision.clone();
+    let caller_pid = current_process_id();
+    let called_by_review_agent = termination_state
+        .as_ref()
+        .and_then(|state| state.pid)
+        .is_some_and(|reviewer_pid| is_descendant_of_pid(caller_pid, reviewer_pid));
+    let finalize_verdict = || -> Result<u8, String> {
+        let lifecycle_dimension = match projected.review_state_type.as_str() {
+            "quality" => "code-quality".to_string(),
+            "security" => "security".to_string(),
+            _ => normalize_verdict_dimension(dimension)?.to_string(),
+        };
+        apply_event(
+            &projected.owner_repo,
+            projected.pr_number,
+            &projected.head_sha,
+            &LifecycleEventKind::VerdictSet {
+                dimension: lifecycle_dimension,
+                decision: projected_decision.clone(),
+            },
+        )?;
+        dispatch::write_completion_receipt_for_verdict(&home, &authority, &projected_decision)?;
+        Ok(exit_codes::SUCCESS)
+    };
+
+    if called_by_review_agent {
+        let review_type = projected.review_state_type.as_str();
+        if !run_id.is_empty() {
+            if let Some(agent_type) = reviewer_agent_type(review_type) {
+                if let Err(err) = mark_registered_agent_reaped(
+                    &projected.owner_repo,
+                    projected.pr_number,
+                    &run_id,
+                    agent_type,
+                    "verdict_set_by_child_of_reviewer",
+                ) {
+                    eprintln!(
+                        "WARNING: failed to reclaim registry slot for PR #{} run_id={run_id}: {err}",
+                        projected.pr_number
+                    );
+                }
+            } else {
+                eprintln!(
+                    "WARNING: unknown review type `{review_type}` while reclaiming registry for verdict set"
+                );
+            }
+        }
+        return finalize_verdict();
+    }
 
     match dispatch::terminate_review_agent_for_home(&home, &authority)? {
         dispatch::TerminationOutcome::Killed | dispatch::TerminationOutcome::AlreadyDead => {
-            let lifecycle_dimension = match projected.review_state_type.as_str() {
-                "quality" => "code-quality".to_string(),
-                "security" => "security".to_string(),
-                _ => normalize_verdict_dimension(dimension)?.to_string(),
-            };
-            apply_event(
-                &projected.owner_repo,
-                projected.pr_number,
-                &projected.head_sha,
-                &LifecycleEventKind::VerdictSet {
-                    dimension: lifecycle_dimension,
-                    decision: projected_decision.clone(),
-                },
-            )?;
-            dispatch::write_completion_receipt_for_verdict(&home, &authority, &projected_decision)?;
-            Ok(exit_codes::SUCCESS)
+            finalize_verdict()
         },
         dispatch::TerminationOutcome::SkippedMismatch => {
             if termination_state_non_terminal_alive {
@@ -1505,22 +1796,7 @@ fn run_verdict_set_inner(
                     projected.pr_number, dimension
                 ));
             }
-            let lifecycle_dimension = match projected.review_state_type.as_str() {
-                "quality" => "code-quality".to_string(),
-                "security" => "security".to_string(),
-                _ => normalize_verdict_dimension(dimension)?.to_string(),
-            };
-            apply_event(
-                &projected.owner_repo,
-                projected.pr_number,
-                &projected.head_sha,
-                &LifecycleEventKind::VerdictSet {
-                    dimension: lifecycle_dimension,
-                    decision: projected_decision.clone(),
-                },
-            )?;
-            dispatch::write_completion_receipt_for_verdict(&home, &authority, &projected_decision)?;
-            Ok(exit_codes::SUCCESS)
+            finalize_verdict()
         },
         dispatch::TerminationOutcome::IdentityFailure(reason) => Err(format!(
             "verdict NOT finalized for PR #{} type={}: reviewer termination failed (identity): {reason}",
@@ -1559,10 +1835,11 @@ pub fn run_verdict_show(
 pub fn run_recover(
     repo: &str,
     pr_number: Option<u32>,
+    force: bool,
     refresh_identity: bool,
     json_output: bool,
 ) -> u8 {
-    match run_recover_inner(repo, pr_number, refresh_identity) {
+    match run_recover_inner(repo, pr_number, force, refresh_identity) {
         Ok(summary) => {
             if json_output {
                 println!(
@@ -1602,6 +1879,7 @@ pub fn run_recover(
 fn run_recover_inner(
     repo: &str,
     pr_number: Option<u32>,
+    force: bool,
     refresh_identity: bool,
 ) -> Result<RecoverSummary, String> {
     ensure_machine_artifact()?;
@@ -1614,18 +1892,19 @@ fn run_recover_inner(
     let reaped = reap_registry_stale_entries(&mut registry);
     save_registry(&registry)?;
 
-    apply_event(
-        &owner_repo,
-        resolved_pr,
+    let mut reduced = load_pr_state_for_recover(&owner_repo, resolved_pr, &head_sha, force)?;
+    apply_event_to_record(
+        &mut reduced,
         &head_sha,
         &LifecycleEventKind::RecoverRequested,
     )?;
-    let reduced = apply_event(
-        &owner_repo,
-        resolved_pr,
+    save_pr_state(&reduced)?;
+    apply_event_to_record(
+        &mut reduced,
         &head_sha,
         &LifecycleEventKind::RecoverCompleted,
     )?;
+    save_pr_state(&reduced)?;
 
     if refresh_identity {
         projection_store::save_identity_with_context(

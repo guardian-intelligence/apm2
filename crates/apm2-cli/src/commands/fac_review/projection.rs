@@ -781,11 +781,14 @@ struct GateMarkerSpan {
 }
 
 fn fetch_pr_body_for_projection(owner_repo: &str, pr_number: u32) -> Result<String, String> {
-    if let Some(snapshot) = projection_store::load_pr_body_snapshot(owner_repo, pr_number)? {
-        return Ok(snapshot);
+    let snapshot = projection_store::load_pr_body_snapshot(owner_repo, pr_number)?;
+    if let Some(body) = snapshot.as_ref()
+        && !body.trim().is_empty()
+    {
+        return Ok(body.clone());
     }
 
-    Ok(String::new())
+    github_projection::fetch_pr_body(owner_repo, pr_number)
 }
 
 fn parse_gate_statuses(section: &str) -> Vec<ShaGateStatus> {
