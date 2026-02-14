@@ -244,33 +244,34 @@ fn ensure_fac_directory(path: Option<&Path>) -> Result<(), NodeIdentityError> {
 }
 
 fn read_host_name() -> Result<String, NodeIdentityError> {
-    for path in HOSTNAME_PATHS {
-        if let Ok(value) = read_text_file(path) {
-            let value = trim_identity_value(&value)?;
-            if !value.is_empty() {
-                return Ok(value.to_string());
-            }
+    if let Some(value) = read_identity_value_from_sources(HOSTNAME_PATHS) {
+        return Ok(value);
+    }
+
+    if let Ok(value) = std::env::var("HOSTNAME") {
+        if let Ok(trimmed) = trim_identity_value(&value) {
+            return Ok(trimmed.to_string());
         }
     }
 
-    std::env::var("HOSTNAME")
-        .map_err(|_| NodeIdentityError::MissingInput { detail: "hostname" })
-        .and_then(|value| trim_identity_value(&value).map(str::to_string))
+    Err(NodeIdentityError::MissingInput { detail: "hostname" })
 }
 
 fn read_machine_id() -> Result<String, NodeIdentityError> {
-    for path in MACHINE_ID_PATHS {
-        if let Ok(value) = read_text_file(path) {
-            let value = trim_identity_value(&value)?;
-            if !value.is_empty() {
-                return Ok(value.to_string());
+    read_identity_value_from_sources(MACHINE_ID_PATHS).ok_or(NodeIdentityError::MissingInput {
+        detail: "machine-id",
+    })
+}
+
+fn read_identity_value_from_sources(sources: &[&str]) -> Option<String> {
+    for source in sources {
+        if let Ok(value) = read_text_file(source) {
+            if let Ok(trimmed) = trim_identity_value(&value) {
+                return Some(trimmed.to_string());
             }
         }
     }
-
-    Err(NodeIdentityError::MissingInput {
-        detail: "machine-id",
-    })
+    None
 }
 
 fn read_text_file(path: &str) -> Result<String, NodeIdentityError> {
@@ -288,7 +289,7 @@ fn read_bounded_file(path: &Path, max_size: u64) -> Result<String, NodeIdentityE
 
 fn read_bounded_bytes(path: &Path, max_size: u64) -> Result<Vec<u8>, NodeIdentityError> {
     ensure_safe_path(path, "read")?;
-    let mut file = open_file_no_follow(path)?;
+    let file = open_file_no_follow(path)?;
 
     let metadata = file.metadata().map_err(|e| NodeIdentityError::Io {
         context: "read metadata",
@@ -304,12 +305,19 @@ fn read_bounded_bytes(path: &Path, max_size: u64) -> Result<Vec<u8>, NodeIdentit
     }
 
     let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)
+    file.take(max_size.saturating_add(1))
+        .read_to_end(&mut buffer)
         .map_err(|e| NodeIdentityError::Io {
             context: "read bounded file",
             source: e,
             path: Some(path.to_path_buf()),
         })?;
+    if buffer.len() as u64 > max_size {
+        return Err(NodeIdentityError::FileTooLarge {
+            path: path.to_path_buf(),
+            max: max_size,
+        });
+    }
 
     Ok(buffer)
 }
@@ -544,6 +552,21 @@ mod tests {
     }
 
     #[test]
+    fn read_identity_sources_fallback_to_later_candidate_when_first_is_empty() {
+        let dir = tempdir().expect("tempdir");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::write(&first, "\n").expect("write empty");
+        std::fs::write(&second, "node-02\n").expect("write valid");
+        let first = first.to_string_lossy().into_owned();
+        let second = second.to_string_lossy().into_owned();
+        let sources: Vec<&str> = vec![&first, &second];
+
+        let value = read_identity_value_from_sources(&sources).expect("candidate fallback");
+        assert_eq!(value, "node-02");
+    }
+
+    #[test]
     fn boundary_id_custom_value_is_persisted() {
         let home = tempdir().expect("tempdir");
         let _ = load_or_default_boundary_id(home.path()).expect("seed default boundary");
@@ -598,5 +621,19 @@ mod tests {
             .expect("node fingerprint");
         assert!(fp.starts_with("b3-256:"));
         assert_eq!(fp.len(), 71);
+    }
+
+    #[test]
+    fn read_bounded_file_rejects_oversized_data() {
+        let dir = tempdir().expect("tempdir");
+        let identity = dir.path().join("identity");
+        let oversized_len = usize::try_from(MAX_FILE_SIZE).expect("MAX_FILE_SIZE should fit usize");
+        std::fs::write(&identity, vec![b'x'; oversized_len + 1]).expect("write identity");
+
+        let result = read_bounded_file(&identity, MAX_FILE_SIZE - 1);
+        assert!(matches!(
+            result,
+            Err(NodeIdentityError::FileTooLarge { .. })
+        ));
     }
 }

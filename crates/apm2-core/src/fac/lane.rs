@@ -324,6 +324,7 @@ pub struct LaneProfileV1 {
     /// Node fingerprint (b3-256 hex).
     pub node_fingerprint: String,
     /// Boundary identifier for evaluation context routing.
+    #[serde(default)]
     pub boundary_id: String,
     /// Resource limits.
     pub resource_profile: ResourceProfile,
@@ -403,13 +404,16 @@ impl LaneProfileV1 {
     pub fn load(lane_dir: &Path) -> Result<Self, LaneError> {
         let profile_path = lane_dir.join("profile.v1.json");
         let bytes = bounded_read_file(&profile_path, MAX_PROFILE_FILE_SIZE)?;
-        let profile: Self = serde_json::from_slice(&bytes).map_err(|e| {
+        let mut profile: Self = serde_json::from_slice(&bytes).map_err(|e| {
             LaneError::Serialization(format!(
                 "failed to parse profile at {}: {e}",
                 profile_path.display()
             ))
         })?;
         let expected_lane_id = lane_dir_lane_id(lane_dir)?;
+        if profile.boundary_id.is_empty() {
+            profile.boundary_id = legacy_boundary_id_fallback(&profile.node_fingerprint);
+        }
         if profile.schema != LANE_PROFILE_V1_SCHEMA {
             return Err(LaneError::InvalidRecord {
                 lane_id: expected_lane_id.to_string(),
@@ -442,6 +446,14 @@ impl LaneProfileV1 {
         validate_boundary_id(expected_lane_id, &profile.boundary_id)?;
         validate_lane_id(&profile.lane_id)?;
         Ok(profile)
+    }
+}
+
+fn legacy_boundary_id_fallback(node_fingerprint: &str) -> String {
+    if node_fingerprint.is_empty() {
+        "unknown".to_string()
+    } else {
+        node_fingerprint.to_string()
     }
 }
 
@@ -1511,6 +1523,30 @@ mod tests {
         profile.persist(&lane_dir).expect("persist");
         let loaded = LaneProfileV1::load(&lane_dir).expect("load");
         assert_eq!(profile, loaded);
+    }
+
+    #[test]
+    fn lane_profile_load_assigns_legacy_default_boundary_id_when_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let lane_dir = dir.path().join("lane-00");
+        fs::create_dir_all(&lane_dir).expect("create lane dir");
+
+        let node_fingerprint = "b3-256:legacy-fingerprint";
+        let profile =
+            LaneProfileV1::new("lane-00", node_fingerprint, "boundary-00").expect("create profile");
+        let mut payload = serde_json::to_value(profile).expect("serialize");
+        payload
+            .as_object_mut()
+            .expect("profile object")
+            .remove("boundary_id");
+        std::fs::write(
+            lane_dir.join("profile.v1.json"),
+            serde_json::to_vec_pretty(&payload).expect("serialize legacy profile"),
+        )
+        .expect("write legacy profile");
+
+        let loaded = LaneProfileV1::load(&lane_dir).expect("load");
+        assert_eq!(loaded.boundary_id, node_fingerprint);
     }
 
     // ── LaneLeaseV1 ────────────────────────────────────────────────────
