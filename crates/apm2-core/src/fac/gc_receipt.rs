@@ -1,10 +1,12 @@
-#![allow(clippy::disallowed_methods, clippy::missing_errors_doc)]
+#![allow(clippy::disallowed_methods)]
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use {blake3, serde_json};
+
+use crate::determinism::canonicalize_json;
 
 pub const GC_RECEIPT_SCHEMA: &str = "apm2.fac.gc_receipt.v1";
 pub const MAX_GC_ACTIONS: usize = 4096;
@@ -26,6 +28,11 @@ pub struct GcReceiptV1 {
 }
 
 impl GcReceiptV1 {
+    /// Validate this receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if required fields are missing or invalid.
     pub fn validate(&self) -> Result<(), String> {
         if self.schema != GC_RECEIPT_SCHEMA {
             return Err("invalid schema".to_string());
@@ -54,10 +61,24 @@ impl GcReceiptV1 {
         Ok(())
     }
 
+    /// Serialize this receipt with canonical JSON ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization or canonicalization fails.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
-        serde_json::to_vec(self).map_err(|error| format!("failed to serialize gc receipt: {error}"))
+        let json = serde_json::to_string(self)
+            .map_err(|error| format!("failed to serialize gc receipt: {error}"))?;
+        canonicalize_json(&json)
+            .map_err(|error| format!("failed to canonicalize gc receipt: {error}"))
+            .map(String::into_bytes)
     }
 
+    /// Compute the receipt content hash over canonicalized JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if JSON canonicalization fails.
     pub fn compute_content_hash(&self) -> Result<String, String> {
         let mut copy = self.clone();
         copy.content_hash = String::new();
@@ -96,6 +117,11 @@ pub struct GcError {
     pub reason: String,
 }
 
+/// Persist the receipt into `receipts_dir` and return the created path.
+///
+/// # Errors
+///
+/// Returns `Err` if writing or validation fails.
 pub fn persist_gc_receipt(
     receipts_dir: &Path,
     mut receipt: GcReceiptV1,

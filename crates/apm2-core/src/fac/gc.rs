@@ -1,5 +1,9 @@
-#![allow(clippy::disallowed_methods, clippy::missing_errors_doc)]
+#![allow(clippy::disallowed_methods)]
 
+use std::fs::OpenOptions;
+use std::io;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,6 +15,10 @@ pub const GATE_CACHE_TTL_SECS: u64 = 2_592_000;
 pub const QUARANTINE_RETENTION_SECS: u64 = 2_592_000;
 const FAC_CARGO_HOME_DIR: &str = "cargo_home";
 const FAC_LEGACY_EVIDENCE_DIR: &str = "evidence";
+/// Maximum recursion depth for directory-size estimation.
+const MAX_TRAVERSAL_DEPTH: usize = 64;
+/// Maximum number of directory entries processed during size estimation.
+const MAX_DIR_ENTRIES: usize = 100_000;
 
 #[derive(Debug, Clone)]
 pub struct GcPlan {
@@ -32,6 +40,11 @@ pub enum GcPlanError {
     Precondition(String),
 }
 
+/// Create a garbage-collection plan from all known FAC artifacts.
+///
+/// # Errors
+///
+/// Returns `GcPlanError::Io` when workspace inspection fails.
 pub fn plan_gc(fac_root: &Path, lane_manager: &LaneManager) -> Result<GcPlan, GcPlanError> {
     let mut targets = Vec::new();
     let statuses = lane_manager
@@ -120,6 +133,12 @@ pub fn plan_gc(fac_root: &Path, lane_manager: &LaneManager) -> Result<GcPlan, Gc
     Ok(GcPlan { targets })
 }
 
+/// Execute a garbage-collection plan and produce a best-effort receipt.
+///
+/// # Errors
+///
+/// This function records all per-target failures into `errors` and does not
+/// abort early.
 #[must_use]
 pub fn execute_gc(plan: &GcPlan) -> GcReceiptV1 {
     #[allow(clippy::disallowed_methods)]
@@ -132,15 +151,26 @@ pub fn execute_gc(plan: &GcPlan) -> GcReceiptV1 {
     let mut errors = Vec::new();
 
     for target in &plan.targets {
-        if is_lane_path_locked(target)
-            .map_err(|error| error.to_string())
-            .is_ok_and(|locked| locked)
-        {
-            errors.push(crate::fac::gc_receipt::GcError {
-                target_path: target.path.display().to_string(),
-                reason: "lane is not idle".to_string(),
-            });
-            continue;
+        match is_lane_path_locked(target) {
+            Ok(true) => {
+                errors.push(crate::fac::gc_receipt::GcError {
+                    target_path: target.path.display().to_string(),
+                    reason: "lane is not idle".to_string(),
+                });
+                continue;
+            },
+            Ok(false) => (),
+            Err(error) => {
+                eprintln!(
+                    "WARNING: lock check failed for {}: {error}, skipping",
+                    target.path.display()
+                );
+                errors.push(crate::fac::gc_receipt::GcError {
+                    target_path: target.path.display().to_string(),
+                    reason: format!("lock check failed: {error}"),
+                });
+                continue;
+            },
         }
 
         match safe_rmtree_v1(&target.path, &target.allowed_parent) {
@@ -218,18 +248,33 @@ fn safe_rmtree_error_to_string(error: SafeRmtreeError) -> String {
 
 fn estimate_dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
-    let mut stack = Vec::from([path.to_path_buf()]);
+    let mut stack = Vec::from([(path.to_path_buf(), 0usize)]);
+    let mut entries_count = 0usize;
+
     while let Some(current) = stack.pop() {
-        if let Ok(entries) = std::fs::read_dir(current) {
-            for entry in entries.flatten() {
-                let entry_path = entry.path();
-                if let Ok(metadata) = entry_path.symlink_metadata() {
-                    if metadata.is_file() {
-                        total = total.saturating_add(metadata.len());
-                    } else if metadata.is_dir() {
-                        stack.push(entry_path);
-                    }
-                }
+        let (current, depth) = current;
+        if depth >= MAX_TRAVERSAL_DEPTH {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            entries_count += 1;
+            if entries_count >= MAX_DIR_ENTRIES {
+                return total;
+            }
+            let entry_path = entry.path();
+            let Ok(metadata) = entry_path.symlink_metadata() else {
+                continue;
+            };
+            if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+            } else if metadata.is_dir() {
+                stack.push((entry_path, depth + 1));
             }
         }
     }
@@ -285,8 +330,50 @@ fn is_lane_path_locked(target: &GcTarget) -> Result<bool, std::io::Error> {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid lane path")
         })?;
     let lock_path = locks_dir.join(format!("{lane_name}.lock"));
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    match flock_exclusive_nonblocking(&lock_file) {
+        Ok(true) => {
+            #[cfg(unix)]
+            {
+                let fd = lock_file.as_raw_fd();
+                #[allow(unsafe_code)]
+                let rc = unsafe { libc::flock(fd, libc::LOCK_UN) };
+                if rc != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(false)
+        },
+        Ok(false) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
 
-    Ok(lock_path.exists())
+#[cfg(unix)]
+fn flock_exclusive_nonblocking(file: &std::fs::File) -> io::Result<bool> {
+    let fd = file.as_raw_fd();
+    // SAFETY: flock is a standard POSIX call. fd is a valid file descriptor
+    // owned by `file`. LOCK_EX | LOCK_NB is non-blocking exclusive lock.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() == io::ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        return Ok(false);
+    }
+    Err(err)
+}
+
+#[cfg(not(unix))]
+fn flock_exclusive_nonblocking(_: &std::fs::File) -> io::Result<bool> {
+    Ok(true)
 }
 
 #[cfg(test)]

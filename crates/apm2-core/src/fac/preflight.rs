@@ -1,5 +1,7 @@
 #![allow(clippy::missing_errors_doc)]
 
+use std::fs::OpenOptions;
+use std::io;
 use std::path::Path;
 
 use nix::sys::statvfs::statvfs;
@@ -40,7 +42,8 @@ pub fn run_preflight(
         min_free_bytes
     };
 
-    let apm2_home_status = check_disk_space(fac_root).map_err(PreflightError::Io)?;
+    let apm2_home_status = check_disk_space(fac_root)
+        .map_err(|error| PreflightError::Io(format!("workspace disk probe failed: {error}")))?;
     let mut workspace_min = apm2_home_status;
 
     let statuses = lane_manager
@@ -64,27 +67,58 @@ pub fn run_preflight(
         });
     }
 
+    let gc_lock_path = fac_root.join("gc.lock");
+    let gc_lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&gc_lock_path)
+        .map_err(|error| {
+            PreflightError::Io(format!(
+                "failed to open GC lock file {}: {error}",
+                gc_lock_path.display()
+            ))
+        })?;
+    let locked = flock_exclusive_nonblocking(&gc_lock_file).map_err(|error| {
+        PreflightError::Io(format!(
+            "failed to acquire GC lock {}: {error}",
+            gc_lock_path.display()
+        ))
+    })?;
+    if !locked {
+        return Err(PreflightError::Io(
+            "concurrent GC already running".to_string(),
+        ));
+    }
+
     let plan = plan_gc(fac_root, lane_manager).map_err(|error| match error {
         super::gc::GcPlanError::Io(message) => PreflightError::Io(message),
         super::gc::GcPlanError::Precondition(message) => PreflightError::Precondition(message),
     })?;
+    let before_preflight = check_disk_space(fac_root).map_err(|error| {
+        PreflightError::Io(format!(
+            "failed to check preflight free space before gc: {error}"
+        ))
+    })?;
     let mut receipt = execute_gc(&plan);
-    let after_preflight = match check_disk_space(fac_root) {
-        Ok(value) => value,
-        Err(error) => {
-            return Err(PreflightError::Io(format!(
-                "failed to re-check preflight free space: {error}"
-            )));
-        },
-    };
+    let after_preflight = check_disk_space(fac_root).map_err(|error| {
+        PreflightError::Io(format!(
+            "failed to re-check preflight free space after gc: {error}"
+        ))
+    })?;
 
-    receipt.before_free_bytes = apm2_home_status;
+    receipt.before_free_bytes = before_preflight;
     receipt.after_free_bytes = after_preflight;
     receipt.min_free_threshold = threshold;
 
     let receipts_dir = fac_root.join("receipts");
     receipt.schema = GC_RECEIPT_SCHEMA.to_string();
-    let _ = persist_gc_receipt(&receipts_dir, receipt);
+    persist_gc_receipt(&receipts_dir, receipt).map_err(|error| {
+        PreflightError::Io(format!(
+            "GC receipt persistence failed after destructive effects: {error}"
+        ))
+    })?;
 
     let passed = after_preflight >= threshold;
     if passed {
@@ -98,6 +132,30 @@ pub fn run_preflight(
             "insufficient disk space after gc: {after_preflight} < {threshold}"
         )))
     }
+}
+
+#[cfg(unix)]
+fn flock_exclusive_nonblocking(file: &std::fs::File) -> io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    // SAFETY: flock is a standard POSIX call. fd is a valid file descriptor
+    // owned by `file`. LOCK_EX | LOCK_NB is non-blocking exclusive lock.
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() == io::ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        return Ok(false);
+    }
+    Err(err)
+}
+
+#[cfg(not(unix))]
+fn flock_exclusive_nonblocking(_: &std::fs::File) -> io::Result<bool> {
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -159,5 +217,29 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(status, PreflightError::Precondition(_)));
+    }
+
+    #[test]
+    fn test_preflight_returns_error_when_receipt_persistence_fails() {
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let manager = LaneManager::new(fac_root.clone()).expect("manager");
+        manager.ensure_directories().expect("manager directories");
+
+        let receipts_dir = fac_root.join("receipts");
+        std::fs::remove_dir_all(&receipts_dir).unwrap_or_default();
+        std::fs::write(&receipts_dir, b"blocked").expect("write receipts marker");
+
+        let status = run_preflight(&fac_root, &manager, u64::MAX).err().unwrap();
+        match status {
+            PreflightError::Io(message) => {
+                assert!(
+                    message.contains("GC receipt persistence failed after destructive effects"),
+                    "{message}"
+                );
+            },
+            _ => panic!("expected persistence failure"),
+        }
     }
 }

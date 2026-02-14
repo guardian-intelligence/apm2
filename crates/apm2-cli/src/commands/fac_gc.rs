@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use apm2_core::fac::{
     DEFAULT_MIN_FREE_BYTES, GcActionKind, GcPlan, GcReceiptV1, LaneManager, check_disk_space,
     execute_gc, persist_gc_receipt, plan_gc,
@@ -25,22 +23,15 @@ pub struct GcArgs {
 
 /// Run garbage collection for FAC workspace artifacts.
 pub fn run_gc(args: &GcArgs) -> u8 {
-    let apm2_home = match resolve_apm2_home() {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("ERROR: cannot resolve APM2_HOME: {error}");
-            return exit_codes::GENERIC_ERROR;
-        },
-    };
-
-    let fac_root = apm2_home.join("private").join("fac");
-    let lane_manager = match LaneManager::new(fac_root.clone()) {
+    let lane_manager = match LaneManager::from_default_home() {
         Ok(manager) => manager,
         Err(error) => {
             eprintln!("ERROR: cannot initialize lane manager: {error}");
             return exit_codes::GENERIC_ERROR;
         },
     };
+
+    let fac_root = lane_manager.fac_root().to_path_buf();
 
     let plan = match plan_gc(&fac_root, &lane_manager) {
         Ok(plan) => plan,
@@ -72,9 +63,21 @@ pub fn run_gc(args: &GcArgs) -> u8 {
         return exit_codes::SUCCESS;
     }
 
+    let before_free = match check_disk_space(&fac_root) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("ERROR: cannot sample pre-gc free space: {error}");
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
     let mut receipt = execute_gc(&plan);
-    let before_free = check_disk_space(&fac_root).unwrap_or(0);
-    let after_free = check_disk_space(&fac_root).unwrap_or(before_free);
+    let after_free = match check_disk_space(&fac_root) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("ERROR: cannot sample post-gc free space: {error}");
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
     let action_count = receipt.actions.len();
     let error_count = receipt.errors.len();
 
@@ -148,18 +151,6 @@ fn gc_plan_to_json(plan: &GcPlan) -> serde_json::Value {
         }));
     }
     serde_json::json!({ "targets": entries, "count": plan.targets.len() })
-}
-
-fn resolve_apm2_home() -> Result<PathBuf, String> {
-    if let Some(override_dir) = std::env::var_os("APM2_HOME") {
-        let path = PathBuf::from(override_dir);
-        if !path.as_os_str().is_empty() {
-            return Ok(path);
-        }
-    }
-    let base_dirs = directories::BaseDirs::new()
-        .ok_or_else(|| "could not resolve home directory".to_string())?;
-    Ok(base_dirs.home_dir().join(".apm2"))
 }
 
 const fn gc_target_kind_to_str(kind: &GcActionKind) -> &'static str {
