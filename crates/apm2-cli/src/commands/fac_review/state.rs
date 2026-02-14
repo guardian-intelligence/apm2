@@ -1790,6 +1790,12 @@ mod tests {
         let home = temp.path();
         let path = review_run_state_path_for_home(home, 441, "security");
         std::fs::create_dir_all(path.parent().expect("path parent")).expect("create dir");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            path.parent().expect("path parent"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("harden test path");
 
         let legacy = serde_json::json!({
             "run_id": "pr441-security-s3-01234567",

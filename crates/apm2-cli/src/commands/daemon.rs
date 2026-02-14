@@ -57,7 +57,7 @@ pub fn install() -> Result<()> {
         .join("apm2-daemon.service");
 
     if let Some(parent) = unit_path.parent() {
-        crate::commands::fac_permissions::ensure_dir_with_mode(parent)
+        crate::commands::fac_permissions::ensure_dir_exists_standard(parent)
             .context("failed to create systemd unit directory")?;
     }
 
@@ -540,7 +540,7 @@ fn check_socket_reachable(rt: &tokio::runtime::Runtime, path: &Path) -> Result<(
 
 fn available_space_bytes(path: &std::path::Path) -> Result<u64> {
     if !path.exists() {
-        crate::commands::fac_permissions::ensure_dir_with_mode(path)
+        crate::commands::fac_permissions::ensure_dir_exists_standard(path)
             .context("failed to create data directory")?;
     }
     fs2::available_space(path).context("failed to read available space")

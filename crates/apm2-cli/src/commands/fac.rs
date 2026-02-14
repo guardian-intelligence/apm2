@@ -1768,9 +1768,9 @@ fn extract_episode_info(event: &EventRecord, episode_id: &str) -> Option<Episode
 
 /// Loads a tool log index from CAS by hash.
 fn load_tool_log_index_from_cas(cas_path: &Path, hash: &[u8]) -> Option<ToolLogIndexV1> {
-    let hex_hash = hex::encode(hash);
-    let (prefix, suffix) = hex_hash.split_at(4);
-    let file_path = cas_path.join("objects").join(prefix).join(suffix);
+    let Ok(file_path) = resolve_cas_file_path(cas_path, hash, "tool_log_index_hash") else {
+        return None;
+    };
 
     // SECURITY: Validate file size before reading to prevent DoS
     let metadata = std::fs::metadata(&file_path).ok()?;
@@ -1797,6 +1797,91 @@ fn load_tool_log_index_from_cas(cas_path: &Path, hash: &[u8]) -> Option<ToolLogI
     Some(index)
 }
 
+#[derive(Debug)]
+enum CasHashParseError {
+    Empty {
+        field: &'static str,
+    },
+    InvalidHex {
+        field: &'static str,
+        error: hex::FromHexError,
+    },
+    InvalidLength {
+        field: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+}
+
+impl std::fmt::Display for CasHashParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty { field } => write!(f, "{field} is empty"),
+            Self::InvalidHex { field, error } => write!(f, "{field} is not valid hex: {error}"),
+            Self::InvalidLength {
+                field,
+                expected,
+                actual,
+            } => {
+                write!(f, "{field} must be {expected} bytes, got {actual} bytes")
+            },
+        }
+    }
+}
+
+fn parse_cas_hash_32(field: &'static str, value: &str) -> Result<[u8; 32], CasHashParseError> {
+    if value.is_empty() {
+        return Err(CasHashParseError::Empty { field });
+    }
+    let bytes =
+        hex::decode(value).map_err(|error| CasHashParseError::InvalidHex { field, error })?;
+    if bytes.len() != 32 {
+        return Err(CasHashParseError::InvalidLength {
+            field,
+            expected: 32,
+            actual: bytes.len(),
+        });
+    }
+    let mut parsed = [0u8; 32];
+    parsed.copy_from_slice(&bytes);
+    Ok(parsed)
+}
+
+fn output_hash_validation_error(json_output: bool, field: &str, error: &CasHashParseError) -> u8 {
+    output_error(
+        json_output,
+        "invalid_hash",
+        &format!("invalid {field}: {error}"),
+        exit_codes::VALIDATION_ERROR,
+    )
+}
+
+fn resolve_cas_file_path(
+    cas_path: &Path,
+    hash: &[u8],
+    field: &'static str,
+) -> Result<PathBuf, CasHashParseError> {
+    if hash.len() != 32 {
+        return Err(CasHashParseError::InvalidLength {
+            field,
+            expected: 32,
+            actual: hash.len(),
+        });
+    }
+    let hex_hash = hex::encode(hash);
+    let (prefix, suffix) = hex_hash.split_at(4);
+    Ok(cas_path.join("objects").join(prefix).join(suffix))
+}
+
+fn parse_cas_hash_to_path(
+    cas_path: &Path,
+    value: &str,
+    field: &'static str,
+) -> Result<(PathBuf, [u8; 32]), CasHashParseError> {
+    let hash = parse_cas_hash_32(field, value)?;
+    Ok((resolve_cas_file_path(cas_path, &hash, field)?, hash))
+}
+
 // =============================================================================
 // Receipt Show Command
 // =============================================================================
@@ -1813,30 +1898,13 @@ fn run_receipt_show(args: &ReceiptShowArgs, cas_path: &Path, json_output: bool) 
         );
     }
 
-    // Parse hex hash
-    let hash_bytes = match hex::decode(&args.receipt_hash) {
-        Ok(bytes) if bytes.len() == 32 => bytes,
-        Ok(bytes) => {
-            return output_error(
-                json_output,
-                "invalid_hash",
-                &format!("Receipt hash must be 32 bytes, got {}", bytes.len()),
-                exit_codes::VALIDATION_ERROR,
-            );
-        },
-        Err(e) => {
-            return output_error(
-                json_output,
-                "invalid_hash",
-                &format!("Invalid hex encoding: {e}"),
-                exit_codes::VALIDATION_ERROR,
-            );
-        },
-    };
-
-    // Load from CAS
-    let (prefix, suffix) = args.receipt_hash.split_at(4);
-    let file_path = cas_path.join("objects").join(prefix).join(suffix);
+    let (file_path, hash_bytes) =
+        match parse_cas_hash_to_path(cas_path, &args.receipt_hash, "receipt_hash") {
+            Ok(value) => value,
+            Err(error) => {
+                return output_hash_validation_error(json_output, "receipt hash", &error);
+            },
+        };
 
     // SECURITY: Validate file size before reading to prevent DoS
     let metadata = match std::fs::metadata(&file_path) {
@@ -2097,7 +2165,7 @@ fn run_context_rebuild(
     };
 
     // Find episode spawn event to get context pack hash
-    let mut context_pack_hash: Option<Vec<u8>> = None;
+    let mut context_pack_hash: Option<[u8; 32]> = None;
     let mut artifacts_retrieved = 0u64;
     let batch_size = 1000u64;
     let mut scanned_count = 0u64;
@@ -2134,10 +2202,27 @@ fn run_context_rebuild(
                         if let Ok(payload) =
                             serde_json::from_slice::<serde_json::Value>(&event.payload)
                         {
-                            context_pack_hash = payload
-                                .get("context_pack_hash")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| hex::decode(s).ok());
+                            if let Some(hash_str) =
+                                payload.get("context_pack_hash").and_then(|v| v.as_str())
+                            {
+                                let parsed_hash = match parse_cas_hash_32(
+                                    "context_pack_hash",
+                                    hash_str,
+                                ) {
+                                    Ok(hash) => hash,
+                                    Err(error) => {
+                                        return output_error(
+                                            json_output,
+                                            "invalid_hash",
+                                            &format!(
+                                                "Invalid context pack hash in episode event: {error}"
+                                            ),
+                                            exit_codes::VALIDATION_ERROR,
+                                        );
+                                    },
+                                };
+                                context_pack_hash = Some(parsed_hash);
+                            }
                         }
                         break;
                     }
@@ -2165,9 +2250,18 @@ fn run_context_rebuild(
     };
 
     // Load context pack from CAS
-    let hex_hash = hex::encode(&context_pack_hash);
-    let (prefix, suffix) = hex_hash.split_at(4);
-    let pack_path = cas_path.join("objects").join(prefix).join(suffix);
+    let hex_hash = hex::encode(context_pack_hash);
+    let (pack_path, _) = match parse_cas_hash_to_path(cas_path, &hex_hash, "context pack hash") {
+        Ok(value) => value,
+        Err(error) => {
+            return output_error(
+                json_output,
+                "invalid_hash",
+                &format!("Invalid context pack hash in ledger: {error}"),
+                exit_codes::VALIDATION_ERROR,
+            );
+        },
+    };
 
     // SECURITY: Validate file size before reading to prevent DoS
     let metadata = match std::fs::metadata(&pack_path) {
@@ -2229,10 +2323,19 @@ fn run_context_rebuild(
         if let Some(artifacts) = pack_json.get("artifacts").and_then(|v| v.as_array()) {
             for artifact in artifacts {
                 if let Some(hash_str) = artifact.get("hash").and_then(|v| v.as_str()) {
-                    if let Ok(artifact_hash) = hex::decode(hash_str) {
-                        if retrieve_artifact_to_dir(cas_path, &artifact_hash, &output_dir).is_ok() {
-                            artifacts_retrieved += 1;
-                        }
+                    let artifact_hash = match parse_cas_hash_32("artifact hash", hash_str) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return output_error(
+                                json_output,
+                                "invalid_hash",
+                                &format!("Invalid artifact hash in context pack: {error}"),
+                                exit_codes::VALIDATION_ERROR,
+                            );
+                        },
+                    };
+                    if retrieve_artifact_to_dir(cas_path, &artifact_hash, &output_dir).is_ok() {
+                        artifacts_retrieved += 1;
                     }
                 }
             }
@@ -3030,6 +3133,46 @@ mod tests {
         let hash1: [u8; 0] = [];
         let hash2: [u8; 0] = [];
         assert!(constant_time_hash_eq(&hash1, &hash2));
+    }
+
+    #[test]
+    fn test_parse_cas_hash_32_accepts_valid_hash() {
+        let hash_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let parsed = parse_cas_hash_32("artifact_hash", hash_hex).expect("valid hash should parse");
+        assert_eq!(parsed.len(), 32);
+        assert_eq!(parsed[0], 0x01);
+        assert_eq!(parsed[31], 0xef);
+    }
+
+    #[test]
+    fn test_parse_cas_hash_32_rejects_short_hash() {
+        let hash_hex = "deadbeef";
+        let error =
+            parse_cas_hash_32("artifact_hash", hash_hex).expect_err("short hash should fail");
+        assert!(matches!(error, CasHashParseError::InvalidLength { .. }));
+    }
+
+    #[test]
+    fn test_parse_cas_hash_32_rejects_non_hex() {
+        let error = parse_cas_hash_32(
+            "artifact_hash",
+            "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+        )
+        .expect_err("non-hex hash should fail");
+        assert!(matches!(error, CasHashParseError::InvalidHex { .. }));
+    }
+
+    #[test]
+    fn test_parse_cas_hash_to_path_roundtrip() {
+        let cas_path = std::path::Path::new("/tmp/cas");
+        let hash_hex = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let (path, bytes) = parse_cas_hash_to_path(cas_path, hash_hex, "artifact_hash")
+            .expect("parse should succeed");
+        assert_eq!(bytes[0], 0xff);
+        assert_eq!(
+            path,
+            cas_path.join("objects").join("ffff").join(&hash_hex[4..])
+        );
     }
 
     // --- detect_receipt_type prefix matching tests ---

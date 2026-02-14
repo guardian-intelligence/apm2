@@ -26,6 +26,11 @@ use nix::unistd::geteuid;
 /// 0700 = owner read/write/execute only.
 const REQUIRED_MODE_MASK: u32 = 0o700;
 
+#[cfg(unix)]
+const fn fac_file_open_flags() -> i32 {
+    libc::O_NOFOLLOW | libc::O_CLOEXEC
+}
+
 /// Subdirectories under `$APM2_HOME` that must satisfy the permissions
 /// invariant.
 const FAC_SUBDIRS: &[&str] = &[
@@ -171,7 +176,8 @@ fn path_kind(metadata: &std::fs::Metadata) -> String {
     format!("mode({mode:o})")
 }
 
-fn ensure_path_is_directory(path: &Path) -> Result<(), FacPermissionsError> {
+#[cfg(unix)]
+fn ensure_directory_is_directory(path: &Path) -> Result<std::fs::Metadata, FacPermissionsError> {
     let metadata =
         std::fs::symlink_metadata(path).map_err(|error| FacPermissionsError::MetadataError {
             path: path.to_path_buf(),
@@ -182,17 +188,34 @@ fn ensure_path_is_directory(path: &Path) -> Result<(), FacPermissionsError> {
             path: path.to_path_buf(),
         });
     }
-    #[cfg(unix)]
-    let kind = path_kind(&metadata);
-    #[cfg(not(unix))]
-    let kind = "entry".to_string();
     if !metadata.is_dir() {
         return Err(FacPermissionsError::NotDirectory {
             path: path.to_path_buf(),
-            kind,
+            kind: path_kind(&metadata),
         });
     }
-    Ok(())
+    Ok(metadata)
+}
+
+#[cfg(not(unix))]
+fn ensure_directory_is_directory(path: &Path) -> Result<std::fs::Metadata, FacPermissionsError> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| FacPermissionsError::MetadataError {
+            path: path.to_path_buf(),
+            error,
+        })?;
+    if metadata.file_type().is_symlink() {
+        return Err(FacPermissionsError::SymlinkDetected {
+            path: path.to_path_buf(),
+        });
+    }
+    if !metadata.is_dir() {
+        return Err(FacPermissionsError::NotDirectory {
+            path: path.to_path_buf(),
+            kind: "entry".to_string(),
+        });
+    }
+    Ok(metadata)
 }
 
 /// Resolve the APM2 home directory path.
@@ -242,10 +265,40 @@ pub fn ensure_dir_with_mode(path: &Path) -> Result<(), FacPermissionsError> {
         })
 }
 
+/// Create a directory if missing without enforcing ownership or permissions.
+///
+/// This helper is intentionally relaxed for shared system directories such as
+/// `~/.config/systemd/user` and filesystem paths that are not sensitive FAC
+/// state.
+#[cfg(unix)]
+pub fn ensure_dir_exists_standard(path: &Path) -> Result<(), FacPermissionsError> {
+    if !path.exists() {
+        std::fs::create_dir_all(path).map_err(|error| FacPermissionsError::CreationFailed {
+            path: path.to_path_buf(),
+            error,
+        })?;
+    }
+
+    let _metadata = ensure_directory_is_directory(path)?;
+    Ok(())
+}
+
 #[cfg(not(unix))]
 pub fn ensure_dir_with_mode(path: &Path) -> Result<(), FacPermissionsError> {
     if path.exists() {
-        ensure_path_is_directory(path)?;
+        ensure_directory_is_directory(path)?;
+        return Ok(());
+    }
+    std::fs::create_dir_all(path).map_err(|error| FacPermissionsError::CreationFailed {
+        path: path.to_path_buf(),
+        error,
+    })
+}
+
+#[cfg(not(unix))]
+pub fn ensure_dir_exists_standard(path: &Path) -> Result<(), FacPermissionsError> {
+    if path.exists() {
+        ensure_directory_is_directory(path)?;
         return Ok(());
     }
     std::fs::create_dir_all(path).map_err(|error| FacPermissionsError::CreationFailed {
@@ -258,6 +311,64 @@ fn ensure_parent_dir_for_file(path: &Path) -> Result<(), FacPermissionsError> {
     ensure_dir_with_mode(path)
 }
 
+#[cfg(unix)]
+fn validate_existing_file(path: &Path) -> Result<(), FacPermissionsError> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| FacPermissionsError::MetadataError {
+            path: path.to_path_buf(),
+            error,
+        })?;
+    if metadata.file_type().is_symlink() {
+        return Err(FacPermissionsError::SymlinkDetected {
+            path: path.to_path_buf(),
+        });
+    }
+    let mode = metadata.mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        return Err(FacPermissionsError::UnsafePermissions {
+            path: path.to_path_buf(),
+            actual_mode: mode,
+            actual_uid: metadata.uid(),
+            expected_uid: geteuid().as_raw(),
+        });
+    }
+    if metadata.uid() != geteuid().as_raw() {
+        return Err(FacPermissionsError::OwnershipMismatch {
+            path: path.to_path_buf(),
+            actual_uid: metadata.uid(),
+            expected_uid: geteuid().as_raw(),
+        });
+    }
+    if !metadata.is_file() {
+        return Err(FacPermissionsError::NotDirectory {
+            path: path.to_path_buf(),
+            kind: "file".to_string(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_existing_file(path: &Path) -> Result<(), FacPermissionsError> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| FacPermissionsError::MetadataError {
+            path: path.to_path_buf(),
+            error,
+        })?;
+    if metadata.file_type().is_symlink() {
+        return Err(FacPermissionsError::SymlinkDetected {
+            path: path.to_path_buf(),
+        });
+    }
+    if !metadata.is_file() {
+        return Err(FacPermissionsError::NotDirectory {
+            path: path.to_path_buf(),
+            kind: "file".to_string(),
+        });
+    }
+    Ok(())
+}
+
 pub fn write_fac_file_with_mode(path: &Path, data: &[u8]) -> Result<(), FacPermissionsError> {
     let parent = path
         .parent()
@@ -268,48 +379,43 @@ pub fn write_fac_file_with_mode(path: &Path, data: &[u8]) -> Result<(), FacPermi
     ensure_parent_dir_for_file(parent)?;
 
     if path.exists() {
-        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-            FacPermissionsError::MetadataError {
-                path: path.to_path_buf(),
-                error,
-            }
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(FacPermissionsError::SymlinkDetected {
-                path: path.to_path_buf(),
-            });
-        }
-
-        #[cfg(unix)]
-        {
-            let mode = metadata.mode() & 0o7777;
-            if mode & 0o077 != 0 {
-                return Err(FacPermissionsError::UnsafePermissions {
-                    path: path.to_path_buf(),
-                    actual_mode: mode,
-                    actual_uid: metadata.uid(),
-                    expected_uid: geteuid().as_raw(),
-                });
-            }
-        }
+        validate_existing_file(path)?;
     }
+
+    let temp_path = path.with_extension("tmp");
+    if temp_path.exists() {
+        validate_existing_file(&temp_path)?;
+    }
+
     let mut options = std::fs::OpenOptions::new();
     options.create(true).write(true).truncate(true);
     #[cfg(unix)]
     {
+        options.custom_flags(fac_file_open_flags());
         options.mode(0o600);
     }
-    let mut file = options
-        .open(path)
-        .map_err(|error| FacPermissionsError::FileAccessError {
-            path: path.to_path_buf(),
-            error,
-        })?;
+    let mut file =
+        options
+            .open(&temp_path)
+            .map_err(|error| FacPermissionsError::FileAccessError {
+                path: temp_path.clone(),
+                error,
+            })?;
     file.write_all(data)
         .map_err(|error| FacPermissionsError::FileAccessError {
-            path: path.to_path_buf(),
+            path: temp_path.clone(),
             error,
         })?;
+    file.sync_all()
+        .map_err(|error| FacPermissionsError::FileAccessError {
+            path: temp_path.clone(),
+            error,
+        })?;
+    drop(file);
+    std::fs::rename(&temp_path, path).map_err(|error| FacPermissionsError::FileAccessError {
+        path: path.to_path_buf(),
+        error,
+    })?;
     Ok(())
 }
 
@@ -323,35 +429,13 @@ pub fn append_fac_file_with_mode(path: &Path) -> Result<std::fs::File, FacPermis
     ensure_parent_dir_for_file(parent)?;
 
     if path.exists() {
-        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-            FacPermissionsError::MetadataError {
-                path: path.to_path_buf(),
-                error,
-            }
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(FacPermissionsError::SymlinkDetected {
-                path: path.to_path_buf(),
-            });
-        }
-
-        #[cfg(unix)]
-        {
-            let mode = metadata.mode() & 0o7777;
-            if mode & 0o077 != 0 {
-                return Err(FacPermissionsError::UnsafePermissions {
-                    path: path.to_path_buf(),
-                    actual_mode: mode,
-                    actual_uid: metadata.uid(),
-                    expected_uid: geteuid().as_raw(),
-                });
-            }
-        }
+        validate_existing_file(path)?;
     }
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true).write(true);
     #[cfg(unix)]
     {
+        options.custom_flags(fac_file_open_flags());
         options.mode(0o600);
     }
     options
@@ -379,12 +463,7 @@ fn validate_directory(path: &Path, expected_uid: u32) -> Result<(), FacPermissio
     if !path.exists() {
         ensure_dir_with_mode(path)?;
     }
-    ensure_path_is_directory(path)?;
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|error| FacPermissionsError::MetadataError {
-            path: path.to_path_buf(),
-            error,
-        })?;
+    let metadata = ensure_directory_is_directory(path)?;
 
     // Check ownership and permissions atomically from metadata.
     let actual_uid = metadata.uid();
@@ -414,9 +493,9 @@ fn validate_directory(path: &Path, _expected_uid: u32) -> Result<(), FacPermissi
     // On non-Unix platforms, ensure the directory exists but skip permission
     // checks.
     if !path.exists() {
-        ensure_dir_with_mode(path)?;
+        ensure_dir_exists_standard(path)?;
     }
-    ensure_path_is_directory(path)?;
+    ensure_directory_is_directory(path)?;
     Ok(())
 }
 
