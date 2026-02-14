@@ -256,7 +256,7 @@ pub struct GatesArgs {
     pub direct: bool,
 
     /// Wall timeout for bounded test execution (seconds).
-    #[arg(long, default_value_t = 600)]
+    #[arg(long, default_value_t = 240)]
     pub timeout_seconds: u64,
 
     /// Maximum seconds to wait for worker completion in default mode.

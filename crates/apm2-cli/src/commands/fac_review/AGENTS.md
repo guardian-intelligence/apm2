@@ -50,7 +50,7 @@ apm2 fac review run --pr <N> --type all
 - **Liveness monitoring**: Pulse files track reviewer health; stall threshold is 90 seconds.
 - **Idempotent dispatch**: `DispatchIdempotencyKey` prevents duplicate reviews for the same SHA.
 - **SHA freshness**: Reviews are invalidated if PR head moves during execution.
-- **Uniform bounded tests**: Test gate uses a fixed 600s timeout for all workspaces.
+- **Uniform bounded tests**: Test gate uses a fixed 240s timeout for all workspaces.
 - **NDJSON telemetry**: All lifecycle events are appended to `~/.apm2/review_events.ndjson`.
 - **CI-aware restart**: `apm2 fac restart` analyzes CI check-suite state before restarting.
 - **Worktree-aware dispatch**: Detached review dispatch resolves and uses the worktree whose `HEAD` matches target SHA.
@@ -284,3 +284,8 @@ pub use types::ReviewRunType;
   - Added `rustfmt --version` to environment digest inputs.
   - Optionally captured `sccache --version` (with fallback when unavailable).
   - Extended command env allowlist with `CARGO_HOME`, `CARGO_TARGET_DIR`, `CARGO_BUILD_JOBS`, `NEXTEST_TEST_THREADS`, `RUSTC_WRAPPER`, and `SCCACHE_*`.
+- TCK-00518: Default-mode gates enqueue+wait with `--direct` unsafe bypass.
+  - Default `apm2 fac gates` creates job spec, obtains broker token, enqueues, and waits for worker receipt.
+  - `--direct` flag runs gates locally without broker/worker (unsafe bypass; marks receipt `unsafe_direct: true`).
+  - `--wait-timeout` bounds the wait for worker completion (default 300s); fails fast with remediation hints.
+  - Timeout default aligned to 240s to match `MAX_MANUAL_TIMEOUT_SECONDS`.
