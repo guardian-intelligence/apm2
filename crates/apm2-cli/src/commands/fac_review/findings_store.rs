@@ -2,13 +2,19 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
+use hmac::{Hmac, Mac};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
+use serde_jcs;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use super::types::{
     apm2_home_dir, ensure_parent_dir, normalize_decision_dimension, now_iso8601, sanitize_for_path,
@@ -16,6 +22,11 @@ use super::types::{
 };
 
 pub(super) const FINDINGS_BUNDLE_SCHEMA: &str = "apm2.fac.sha_findings.bundle.v1";
+const FINDINGS_BUNDLE_INTEGRITY_ROLE: &str = "findings_bundle";
+const FINDINGS_SECRET_MAX_FILE_BYTES: u64 = 128;
+const FINDINGS_SECRET_LEN_BYTES: usize = 32;
+const FINDINGS_SECRET_MAX_ENCODED_CHARS: usize = 128;
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +38,19 @@ pub(super) struct FindingsBundle {
     pub source: String,
     pub updated_at: String,
     pub dimensions: Vec<StoredDimensionFindings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_hmac: Option<String>,
+}
+
+#[derive(Serialize)]
+struct FindingsBundleIntegrityBinding<'a> {
+    schema: &'a str,
+    owner_repo: &'a str,
+    pr_number: u32,
+    head_sha: &'a str,
+    source: &'a str,
+    updated_at: &'a str,
+    dimensions: &'a [StoredDimensionFindings],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +100,193 @@ pub(super) fn findings_bundle_path(
         .join(format!("pr-{pr_number}"))
         .join(format!("sha-{}", sanitize_for_path(head_sha)))
         .join("bundle.json"))
+}
+
+fn findings_secrets_dir() -> Result<PathBuf, String> {
+    Ok(apm2_home_dir()?
+        .join("private")
+        .join("fac")
+        .join("findings")
+        .join("secrets"))
+}
+
+fn findings_secret_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
+    Ok(findings_secrets_dir()?
+        .join(FINDINGS_BUNDLE_INTEGRITY_ROLE)
+        .join(sanitize_for_path(owner_repo))
+        .join(format!("pr-{pr_number}.secret")))
+}
+
+#[cfg(unix)]
+fn open_secret_for_read(path: &Path) -> Result<File, std::io::Error> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.custom_flags(libc::O_NOFOLLOW);
+    options.open(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            err
+        } else {
+            std::io::Error::new(
+                err.kind(),
+                format!("failed to open findings secret {}: {err}", path.display()),
+            )
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn open_secret_for_read(path: &Path) -> Result<File, std::io::Error> {
+    OpenOptions::new().read(true).open(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            err
+        } else {
+            std::io::Error::new(
+                err.kind(),
+                format!("failed to open findings secret {}: {err}", path.display()),
+            )
+        }
+    })
+}
+
+fn read_secret_hex_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let mut file = match open_secret_for_read(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "failed to open findings secret {}: {err}",
+                path.display()
+            ));
+        },
+    };
+
+    let size = file
+        .metadata()
+        .map_err(|err| format!("failed to stat findings secret {}: {err}", path.display()))?
+        .len();
+    if size > FINDINGS_SECRET_MAX_FILE_BYTES {
+        return Err(format!(
+            "findings secret {} exceeds maximum size ({} > {})",
+            path.display(),
+            size,
+            FINDINGS_SECRET_MAX_FILE_BYTES
+        ));
+    }
+
+    let mut encoded = String::new();
+    file.read_to_string(&mut encoded)
+        .map_err(|err| format!("failed to read findings secret {}: {err}", path.display()))?;
+    let encoded = encoded.trim();
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+    if encoded.len() > FINDINGS_SECRET_MAX_ENCODED_CHARS {
+        return Err(format!(
+            "findings secret {} exceeds maximum encoded length",
+            path.display()
+        ));
+    }
+
+    let secret = hex::decode(encoded)
+        .map_err(|err| format!("failed to decode findings secret {}: {err}", path.display()))?;
+    if secret.len() != FINDINGS_SECRET_LEN_BYTES {
+        return Err(format!(
+            "findings secret {} has invalid length {} (expected {})",
+            path.display(),
+            secret.len(),
+            FINDINGS_SECRET_LEN_BYTES
+        ));
+    }
+
+    Ok(Some(secret))
+}
+
+fn write_secret_atomic(path: &Path, encoded_secret: &str) -> Result<(), String> {
+    ensure_parent_dir(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("findings secret path has no parent: {}", path.display()))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|err| format!("failed to create findings secret temp file: {err}"))?;
+    #[cfg(unix)]
+    {
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("failed to set findings secret temp file mode: {err}"))?;
+    }
+    temp.write_all(encoded_secret.as_bytes())
+        .map_err(|err| format!("failed to write findings secret {}: {err}", path.display()))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|err| format!("failed to sync findings secret {}: {err}", path.display()))?;
+    temp.persist(path).map_err(|err| {
+        format!(
+            "failed to persist findings secret {}: {err}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn rotate_secret(path: &Path) -> Result<Vec<u8>, String> {
+    let mut secret = [0u8; FINDINGS_SECRET_LEN_BYTES];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+    let encoded = hex::encode(secret);
+    write_secret_atomic(path, &encoded)?;
+    Ok(secret.to_vec())
+}
+
+fn read_or_rotate_secret(path: &Path) -> Result<Vec<u8>, String> {
+    read_secret_hex_bytes(path)?.map_or_else(|| rotate_secret(path), Ok)
+}
+
+fn findings_bundle_binding_payload(bundle: &FindingsBundle) -> Result<Vec<u8>, String> {
+    let binding = FindingsBundleIntegrityBinding {
+        schema: &bundle.schema,
+        owner_repo: &bundle.owner_repo,
+        pr_number: bundle.pr_number,
+        head_sha: &bundle.head_sha,
+        source: &bundle.source,
+        updated_at: &bundle.updated_at,
+        dimensions: &bundle.dimensions,
+    };
+    serde_jcs::to_vec(&binding)
+        .map_err(|err| format!("failed to build findings bundle integrity payload: {err}"))
+}
+
+fn compute_hmac(secret: &[u8], payload: &[u8]) -> Result<String, String> {
+    let mut mac = HmacSha256::new_from_slice(secret)
+        .map_err(|err| format!("invalid findings integrity secret: {err}"))?;
+    mac.update(payload);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn verify_hmac(stored: &str, computed: &str) -> Result<bool, String> {
+    let expected = hex::decode(stored)
+        .map_err(|err| format!("invalid findings integrity_hmac encoding: {err}"))?;
+    let actual = hex::decode(computed)
+        .map_err(|err| format!("invalid findings computed integrity_hmac encoding: {err}"))?;
+    if expected.len() != actual.len() {
+        return Ok(false);
+    }
+    Ok(expected.ct_eq(actual.as_slice()).into())
+}
+
+fn bind_findings_bundle_integrity(bundle: &mut FindingsBundle) -> Result<(), String> {
+    let secret =
+        read_or_rotate_secret(&findings_secret_path(&bundle.owner_repo, bundle.pr_number)?)?;
+    let payload = findings_bundle_binding_payload(bundle)?;
+    let computed = compute_hmac(&secret, &payload)?;
+    if let Some(stored) = bundle.integrity_hmac.as_deref() {
+        let matches = verify_hmac(stored, &computed)?;
+        if !matches {
+            return Err("findings bundle integrity check failed".to_string());
+        }
+        return Ok(());
+    }
+
+    bundle.integrity_hmac = Some(computed);
+    Ok(())
 }
 
 fn findings_lock_path(owner_repo: &str, pr_number: u32, head_sha: &str) -> Result<PathBuf, String> {
@@ -131,15 +342,19 @@ pub(super) fn load_findings_bundle(
         },
     };
 
-    let bundle = serde_json::from_slice::<FindingsBundle>(&bytes)
+    let mut bundle = serde_json::from_slice::<FindingsBundle>(&bytes)
         .map_err(|err| format!("failed to parse findings bundle {}: {err}", path.display()))?;
     validate_loaded_bundle_identity(&bundle, owner_repo, pr_number, head_sha)?;
+    bind_findings_bundle_integrity(&mut bundle)?;
     Ok(Some(bundle))
 }
 
 pub(super) fn save_findings_bundle(bundle: &FindingsBundle) -> Result<(), String> {
     let path = findings_bundle_path(&bundle.owner_repo, bundle.pr_number, &bundle.head_sha)?;
-    write_json_atomic(&path, bundle)
+    let mut copy = bundle.clone();
+    copy.integrity_hmac = None;
+    bind_findings_bundle_integrity(&mut copy)?;
+    write_json_atomic(&path, &copy)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -204,7 +419,7 @@ pub(super) fn append_dimension_finding(
             location,
             reviewer_id,
             evidence_pointer,
-        ),
+        )?,
         raw_evidence_pointer: normalize_optional_text(evidence_pointer)
             .unwrap_or_else(|| "none".to_string()),
     };
@@ -265,6 +480,7 @@ fn empty_bundle(owner_repo: &str, pr_number: u32, head_sha: &str, source: &str) 
         head_sha: head_sha.to_string(),
         source: source.to_string(),
         updated_at: now_iso8601(),
+        integrity_hmac: None,
         dimensions: vec![
             StoredDimensionFindings {
                 dimension: "security".to_string(),
@@ -372,7 +588,7 @@ fn finding_digest(
     location: Option<&str>,
     reviewer_id: Option<&str>,
     evidence_pointer: Option<&str>,
-) -> String {
+) -> Result<String, String> {
     let payload = serde_json::json!({
         "owner_repo": owner_repo,
         "pr_number": pr_number,
@@ -387,9 +603,10 @@ fn finding_digest(
         "reviewer_id": reviewer_id.map_or("", str::trim),
         "evidence_pointer": evidence_pointer.map_or("", str::trim),
     });
-    let canonical = serde_json::to_string(&payload).unwrap_or_default();
-    let digest = sha2::Sha256::digest(canonical.as_bytes());
-    hex::encode(digest)
+    let canonical = serde_jcs::to_vec(&payload)
+        .map_err(|err| format!("failed to serialize finding digest payload: {err}"))?;
+    let digest = sha2::Sha256::digest(&canonical);
+    Ok(hex::encode(digest))
 }
 
 fn upsert_dimension<'a>(

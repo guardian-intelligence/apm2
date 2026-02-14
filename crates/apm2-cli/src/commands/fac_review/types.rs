@@ -671,7 +671,11 @@ fn is_fac_sensitive_dir(path: &Path) -> bool {
         return false;
     };
     let fac_root = home.join("private").join("fac");
+    let fac_lifecycle_root = home.join("fac_lifecycle");
+    let fac_projection_root = home.join("fac_projection");
     path.starts_with(&fac_root)
+        || path.starts_with(&fac_lifecycle_root)
+        || path.starts_with(&fac_projection_root)
 }
 
 pub fn ensure_parent_dir(path: &Path) -> Result<(), String> {

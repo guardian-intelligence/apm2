@@ -1103,9 +1103,6 @@ fn run_terminate_inner_for_home(
         dispatch::TerminationOutcome::IdentityFailure(reason) => Some(format!(
             "failed to terminate PR #{resolved_pr} type={review_type}: {reason}"
         )),
-        dispatch::TerminationOutcome::IntegrityFailure(reason) => Some(format!(
-            "integrity verification failed during termination for PR #{resolved_pr} type={review_type}: {reason}"
-        )),
     };
     if let Some(message) = failure {
         return Err(message);

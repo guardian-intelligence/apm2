@@ -17,8 +17,8 @@ use super::state::{
     get_process_start_time, load_review_run_state_for_home, load_review_run_state_strict_for_home,
     load_review_run_state_verified_for_home, load_review_run_termination_receipt_for_home,
     next_review_sequence_number_for_home, try_acquire_review_lease_for_home,
-    verify_review_run_state_integrity_binding, write_review_run_completion_receipt_for_home,
-    write_review_run_state_for_home, write_review_run_termination_receipt_for_home,
+    write_review_run_completion_receipt_for_home, write_review_run_state_for_home,
+    write_review_run_termination_receipt_for_home,
 };
 use super::types::{
     DISPATCH_LOCK_ACQUIRE_TIMEOUT, DISPATCH_PENDING_TTL, DispatchIdempotencyKey,
@@ -441,7 +441,6 @@ pub enum TerminationOutcome {
     Killed,
     AlreadyDead,
     SkippedMismatch,
-    IntegrityFailure(String),
     IdentityFailure(String),
 }
 
@@ -519,14 +518,6 @@ pub fn terminate_review_agent_for_home(
             )),
         );
     };
-    if let Err(err) = verify_review_run_state_integrity_binding(home, &state) {
-        return finalize_termination_outcome(
-            home,
-            authority,
-            TerminationOutcome::IntegrityFailure(err),
-        );
-    }
-
     if let Err(err) = verify_process_identity(pid, Some(recorded_proc_start)) {
         return finalize_termination_outcome(
             home,
@@ -610,7 +601,6 @@ fn write_termination_receipt(
         TerminationOutcome::AlreadyDead => ("already_dead", None),
         TerminationOutcome::SkippedMismatch => ("skipped_mismatch", None),
         TerminationOutcome::IdentityFailure(reason) => ("identity_failure", Some(reason.clone())),
-        TerminationOutcome::IntegrityFailure(reason) => ("integrity_failure", Some(reason.clone())),
     };
     let receipt = super::state::ReviewRunTerminationReceipt {
         schema: super::state::TERMINATION_RECEIPT_SCHEMA.to_string(),

@@ -514,6 +514,7 @@ mod tests {
             head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
             source: "test".to_string(),
             updated_at: "2026-02-14T00:00:00Z".to_string(),
+            integrity_hmac: None,
             dimensions: vec![
                 StoredDimensionFindings {
                     dimension: SECURITY_DIMENSION.to_string(),

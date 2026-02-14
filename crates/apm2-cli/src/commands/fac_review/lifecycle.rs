@@ -6,16 +6,21 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
 use clap::ValueEnum;
 use fs2::FileExt;
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use serde_jcs;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use super::projection::fetch_pr_head_sha_authoritative;
 use super::target::resolve_pr_target;
@@ -33,9 +38,17 @@ const AGENT_REGISTRY_SCHEMA: &str = "apm2.fac.agent_registry.v1";
 const RECOVER_SUMMARY_SCHEMA: &str = "apm2.fac.recover_summary.v1";
 const MAX_EVENT_HISTORY: usize = 256;
 const MAX_ACTIVE_AGENTS_PER_PR: usize = 2;
+const MAX_REGISTRY_ENTRIES: usize = 4096;
 const MAX_ERROR_BUDGET: u32 = 10;
 const DEFAULT_RETRY_BUDGET: u32 = 3;
+const REGISTRY_NON_ACTIVE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 const DEFAULT_TOKEN_TTL_SECS: i64 = 3600;
+const PR_STATE_INTEGRITY_ROLE: &str = "pr_state";
+const REGISTRY_INTEGRITY_ROLE: &str = "agent_registry";
+const RUN_SECRET_MAX_FILE_BYTES: u64 = 128;
+const RUN_SECRET_LEN_BYTES: usize = 32;
+const RUN_SECRET_MAX_ENCODED_CHARS: usize = 128;
+type HmacSha256 = Hmac<Sha256>;
 
 pub(super) const fn default_retry_budget() -> u32 {
     DEFAULT_RETRY_BUDGET
@@ -166,6 +179,8 @@ pub struct PrLifecycleRecord {
     pub last_event_seq: u64,
     #[serde(default)]
     pub events: Vec<LifecycleEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_hmac: Option<String>,
 }
 
 impl PrLifecycleRecord {
@@ -182,6 +197,7 @@ impl PrLifecycleRecord {
             updated_at: now_iso8601(),
             last_event_seq: 0,
             events: Vec::new(),
+            integrity_hmac: None,
         }
     }
 
@@ -236,6 +252,8 @@ struct AgentRegistry {
     updated_at: String,
     #[serde(default)]
     entries: Vec<TrackedAgent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    integrity_hmac: Option<String>,
 }
 
 impl Default for AgentRegistry {
@@ -244,6 +262,7 @@ impl Default for AgentRegistry {
             schema: AGENT_REGISTRY_SCHEMA.to_string(),
             updated_at: now_iso8601(),
             entries: Vec::new(),
+            integrity_hmac: None,
         }
     }
 }
@@ -394,12 +413,340 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String>
     Ok(())
 }
 
+#[derive(Serialize)]
+struct PrLifecycleRecordIntegrityBinding<'a> {
+    schema: &'a str,
+    owner_repo: &'a str,
+    pr_number: u32,
+    current_sha: &'a str,
+    pr_state: &'a str,
+    error_budget_used: u32,
+    retry_budget_remaining: u32,
+    updated_at: &'a str,
+    last_event_seq: u64,
+    #[serde(default)]
+    events: &'a [LifecycleEvent],
+}
+
+#[derive(Serialize)]
+struct AgentRegistryIntegrityBinding<'a> {
+    schema: &'a str,
+    updated_at: &'a str,
+    #[serde(default)]
+    entries: &'a [TrackedAgent],
+}
+
+fn registry_entry_ttl() -> Duration {
+    let secs = std::env::var("APM2_FAC_REGISTRY_NON_ACTIVE_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(REGISTRY_NON_ACTIVE_TTL_SECS);
+    Duration::seconds(secs)
+}
+
+fn lifecycle_secrets_dir() -> Result<PathBuf, String> {
+    Ok(lifecycle_root()?.join("secrets"))
+}
+
+fn pr_state_secret_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
+    Ok(lifecycle_secrets_dir()?
+        .join(PR_STATE_INTEGRITY_ROLE)
+        .join(sanitize_for_path(owner_repo))
+        .join(format!("pr-{pr_number}.secret")))
+}
+
+fn registry_secret_path() -> Result<PathBuf, String> {
+    Ok(lifecycle_secrets_dir()?
+        .join(REGISTRY_INTEGRITY_ROLE)
+        .join("agent_registry.secret"))
+}
+
+#[cfg(unix)]
+fn open_secret_for_read(path: &Path) -> Result<File, std::io::Error> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.custom_flags(libc::O_NOFOLLOW);
+    options.open(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            err
+        } else {
+            std::io::Error::new(
+                err.kind(),
+                format!("failed to open lifecycle secret {}: {err}", path.display()),
+            )
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn open_secret_for_read(path: &Path) -> Result<File, std::io::Error> {
+    OpenOptions::new().read(true).open(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            err
+        } else {
+            std::io::Error::new(
+                err.kind(),
+                format!("failed to open lifecycle secret {}: {err}", path.display()),
+            )
+        }
+    })
+}
+
+fn read_secret_hex_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let mut file = match open_secret_for_read(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "failed to open lifecycle secret {}: {err}",
+                path.display()
+            ));
+        },
+    };
+    let size = file
+        .metadata()
+        .map_err(|err| format!("failed to stat secret {}: {err}", path.display()))?
+        .len();
+    if size > RUN_SECRET_MAX_FILE_BYTES {
+        return Err(format!(
+            "lifecycle secret {} exceeds maximum size ({} > {})",
+            path.display(),
+            size,
+            RUN_SECRET_MAX_FILE_BYTES
+        ));
+    }
+    let mut encoded = String::new();
+    file.read_to_string(&mut encoded)
+        .map_err(|err| format!("failed to read lifecycle secret {}: {err}", path.display()))?;
+    let encoded = encoded.trim();
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+    if encoded.len() > RUN_SECRET_MAX_ENCODED_CHARS {
+        return Err(format!(
+            "lifecycle secret {} exceeds maximum encoded length",
+            path.display()
+        ));
+    }
+    let secret = hex::decode(encoded).map_err(|err| {
+        format!(
+            "failed to decode lifecycle secret {}: {err}",
+            path.display()
+        )
+    })?;
+    if secret.len() != RUN_SECRET_LEN_BYTES {
+        return Err(format!(
+            "lifecycle secret {} has invalid length {} (expected {})",
+            path.display(),
+            secret.len(),
+            RUN_SECRET_LEN_BYTES
+        ));
+    }
+    Ok(Some(secret))
+}
+
+fn write_secret_atomic(path: &Path, encoded_secret: &str) -> Result<(), String> {
+    ensure_parent_dir(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("lifecycle secret path has no parent: {}", path.display()))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|err| format!("failed to create lifecycle secret temp file: {err}"))?;
+    #[cfg(unix)]
+    {
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("failed to set lifecycle secret temp file mode: {err}"))?;
+    }
+    temp.write_all(encoded_secret.as_bytes())
+        .map_err(|err| format!("failed to write lifecycle secret {}: {err}", path.display()))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|err| format!("failed to sync lifecycle secret {}: {err}", path.display()))?;
+    temp.persist(path).map_err(|err| {
+        format!(
+            "failed to persist lifecycle secret {}: {err}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn rotate_secret(path: &Path) -> Result<Vec<u8>, String> {
+    let mut secret = [0u8; RUN_SECRET_LEN_BYTES];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+    let encoded = hex::encode(secret);
+    write_secret_atomic(path, &encoded)?;
+    Ok(secret.to_vec())
+}
+
+fn read_or_rotate_secret(path: &Path) -> Result<Vec<u8>, String> {
+    read_secret_hex_bytes(path)?.map_or_else(|| rotate_secret(path), Ok)
+}
+
+fn pr_state_binding_payload(state: &PrLifecycleRecord) -> Result<Vec<u8>, String> {
+    let binding = PrLifecycleRecordIntegrityBinding {
+        schema: &state.schema,
+        owner_repo: &state.owner_repo,
+        pr_number: state.pr_number,
+        current_sha: &state.current_sha,
+        pr_state: state.pr_state.as_str(),
+        error_budget_used: state.error_budget_used,
+        retry_budget_remaining: state.retry_budget_remaining,
+        updated_at: &state.updated_at,
+        last_event_seq: state.last_event_seq,
+        events: &state.events,
+    };
+    serde_jcs::to_vec(&binding)
+        .map_err(|err| format!("failed to build lifecycle record integrity payload: {err}"))
+}
+
+fn registry_binding_payload(registry: &AgentRegistry) -> Result<Vec<u8>, String> {
+    let binding = AgentRegistryIntegrityBinding {
+        schema: &registry.schema,
+        updated_at: &registry.updated_at,
+        entries: &registry.entries,
+    };
+    serde_jcs::to_vec(&binding)
+        .map_err(|err| format!("failed to build registry integrity payload: {err}"))
+}
+
+fn compute_hmac(secret: &[u8], payload: &[u8]) -> Result<String, String> {
+    let mut mac = HmacSha256::new_from_slice(secret)
+        .map_err(|err| format!("invalid lifecycle integrity secret: {err}"))?;
+    mac.update(payload);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn verify_hmac(stored: &str, computed: &str) -> Result<bool, String> {
+    let expected = hex::decode(stored)
+        .map_err(|err| format!("invalid lifecycle integrity_hmac encoding: {err}"))?;
+    let actual = hex::decode(computed)
+        .map_err(|err| format!("invalid lifecycle computed integrity_hmac encoding: {err}"))?;
+    if expected.len() != actual.len() {
+        return Ok(false);
+    }
+    Ok(expected.ct_eq(actual.as_slice()).into())
+}
+
+fn bind_pr_lifecycle_record_integrity(state: &mut PrLifecycleRecord) -> Result<(), String> {
+    let secret = read_or_rotate_secret(&pr_state_secret_path(&state.owner_repo, state.pr_number)?)?;
+    let payload = pr_state_binding_payload(state)?;
+    let computed = compute_hmac(&secret, &payload)?;
+    if let Some(stored) = state.integrity_hmac.as_deref() {
+        let matches = verify_hmac(stored, &computed)?;
+        if !matches {
+            return Err("lifecycle state integrity check failed".to_string());
+        }
+        return Ok(());
+    }
+    state.integrity_hmac = Some(computed);
+    Ok(())
+}
+
+fn bind_registry_integrity(registry: &mut AgentRegistry) -> Result<(), String> {
+    let secret = read_or_rotate_secret(&registry_secret_path()?)?;
+    let payload = registry_binding_payload(registry)?;
+    let computed = compute_hmac(&secret, &payload)?;
+    if let Some(stored) = registry.integrity_hmac.as_deref() {
+        let matches = verify_hmac(stored, &computed)?;
+        if !matches {
+            return Err("agent registry integrity check failed".to_string());
+        }
+        return Ok(());
+    }
+    registry.integrity_hmac = Some(computed);
+    Ok(())
+}
+
+fn prune_registry_stale_non_active_entries(registry: &mut AgentRegistry) -> usize {
+    let cutoff = Utc::now() - registry_entry_ttl();
+    let before = registry.entries.len();
+    registry.entries.retain(|entry| {
+        if entry.state.is_active() {
+            return true;
+        }
+        if let Some(seen) = entry
+            .completed_at
+            .as_deref()
+            .map_or_else(|| parse_utc(&entry.started_at), parse_utc)
+        {
+            return seen >= cutoff;
+        }
+        false
+    });
+    before.saturating_sub(registry.entries.len())
+}
+
+fn prune_registry_to_entry_limit(registry: &mut AgentRegistry) -> usize {
+    if registry.entries.len() <= MAX_REGISTRY_ENTRIES {
+        return 0;
+    }
+    let active_count = registry
+        .entries
+        .iter()
+        .filter(|entry| entry.state.is_active())
+        .count();
+    let keep_non_active = MAX_REGISTRY_ENTRIES.saturating_sub(active_count);
+    let mut non_active: Vec<(DateTime<Utc>, usize)> = registry
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| {
+            if entry.state.is_active() {
+                return None;
+            }
+            let last_seen = entry
+                .completed_at
+                .as_deref()
+                .and_then(parse_utc)
+                .or_else(|| parse_utc(&entry.started_at))
+                .unwrap_or_else(Utc::now);
+            Some((last_seen, idx))
+        })
+        .collect();
+    if non_active.len() <= keep_non_active {
+        return 0;
+    }
+    non_active.sort_unstable_by_key(|(seen, _)| *seen);
+    let mut keep = std::collections::BTreeSet::new();
+    for (_, idx) in non_active.iter().rev().take(keep_non_active) {
+        keep.insert(*idx);
+    }
+    let before = registry.entries.len();
+    let entries = std::mem::take(&mut registry.entries);
+    registry.entries = entries
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| {
+            if entry.state.is_active() || keep.contains(&idx) {
+                Some(entry)
+            } else {
+                None
+            }
+        })
+        .collect();
+    before.saturating_sub(registry.entries.len())
+}
+
+fn apply_registry_retention(registry: &mut AgentRegistry) {
+    let reaped = reap_registry_stale_entries(registry);
+    let stale = prune_registry_stale_non_active_entries(registry);
+    let excess = prune_registry_to_entry_limit(registry);
+    if reaped + stale + excess > 0 {
+        registry.updated_at = now_iso8601();
+    }
+}
+
 fn load_pr_state(owner_repo: &str, pr_number: u32, sha: &str) -> Result<PrLifecycleRecord, String> {
     let path = pr_state_path(owner_repo, pr_number)?;
     let bytes = match fs::read(&path) {
         Ok(value) => value,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PrLifecycleRecord::new(owner_repo, pr_number, sha));
+            let mut state = PrLifecycleRecord::new(owner_repo, pr_number, sha);
+            bind_pr_lifecycle_record_integrity(&mut state)?;
+            return Ok(state);
         },
         Err(err) => {
             return Err(format!(
@@ -426,12 +773,16 @@ fn load_pr_state(owner_repo: &str, pr_number: u32, sha: &str) -> Result<PrLifecy
             parsed.pr_number
         ));
     }
+    bind_pr_lifecycle_record_integrity(&mut parsed)?;
     Ok(parsed)
 }
 
 fn save_pr_state(state: &PrLifecycleRecord) -> Result<PathBuf, String> {
-    let path = pr_state_path(&state.owner_repo, state.pr_number)?;
-    atomic_write_json(&path, state)?;
+    let mut record = state.clone();
+    record.integrity_hmac = None;
+    bind_pr_lifecycle_record_integrity(&mut record)?;
+    let path = pr_state_path(&record.owner_repo, record.pr_number)?;
+    atomic_write_json(&path, &record)?;
     Ok(path)
 }
 
@@ -458,13 +809,19 @@ fn load_registry() -> Result<AgentRegistry, String> {
             path.display()
         ));
     }
+    bind_registry_integrity(&mut parsed)?;
+    apply_registry_retention(&mut parsed);
     parsed.updated_at = now_iso8601();
     Ok(parsed)
 }
 
 fn save_registry(registry: &AgentRegistry) -> Result<PathBuf, String> {
+    let mut copy = registry.clone();
+    copy.integrity_hmac = None;
+    apply_registry_retention(&mut copy);
+    bind_registry_integrity(&mut copy)?;
     let path = registry_path()?;
-    atomic_write_json(&path, registry)?;
+    atomic_write_json(&path, &copy)?;
     Ok(path)
 }
 
@@ -1167,10 +1524,6 @@ fn run_verdict_set_inner(
         },
         dispatch::TerminationOutcome::IdentityFailure(reason) => Err(format!(
             "verdict NOT finalized for PR #{} type={}: reviewer termination failed (identity): {reason}",
-            projected.pr_number, dimension
-        )),
-        dispatch::TerminationOutcome::IntegrityFailure(reason) => Err(format!(
-            "verdict NOT finalized for PR #{} type={}: reviewer termination integrity check failed: {reason}",
             projected.pr_number, dimension
         )),
     }

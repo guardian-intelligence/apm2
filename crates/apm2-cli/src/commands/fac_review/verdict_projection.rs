@@ -3,13 +3,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
+use hmac::{Hmac, Mac};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use serde_jcs;
 use sha2::Digest;
+use subtle::ConstantTimeEq;
 
 use super::github_auth::resolve_local_reviewer_identity;
 use super::target::resolve_pr_target;
@@ -29,6 +35,11 @@ const SECURITY_DIMENSION: &str = "security";
 const CODE_QUALITY_DIMENSION: &str = "code-quality";
 const ACTIVE_DIMENSIONS: [&str; 2] = [SECURITY_DIMENSION, CODE_QUALITY_DIMENSION];
 const VERDICT_PROJECTION_FILE: &str = "verdict_projection.json";
+const PROJECTION_INTEGRITY_ROLE: &str = "decision_projection";
+const PROJECTION_SECRET_MAX_FILE_BYTES: u64 = 128;
+const PROJECTION_SECRET_LEN_BYTES: usize = 32;
+const PROJECTION_SECRET_MAX_ENCODED_CHARS: usize = 128;
+type HmacSha256 = Hmac<sha2::Sha256>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,8 +77,23 @@ struct DecisionProjectionRecord {
     decision_comment_url: String,
     #[serde(default)]
     decision_signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    integrity_hmac: Option<String>,
     #[serde(default)]
     dimensions: BTreeMap<String, DecisionEntry>,
+}
+
+#[derive(Serialize)]
+struct DecisionProjectionRecordIntegrityBinding<'a> {
+    schema: &'a str,
+    owner_repo: &'a str,
+    pr_number: u32,
+    head_sha: &'a str,
+    updated_at: &'a str,
+    decision_comment_id: u64,
+    decision_comment_url: &'a str,
+    decision_signature: &'a str,
+    dimensions: &'a BTreeMap<String, DecisionEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +259,7 @@ pub fn persist_verdict_projection(
                 decision_comment_id: allocate_local_comment_id(resolved_pr, seeded_comment_id),
                 decision_comment_url: String::new(),
                 decision_signature: String::new(),
+                integrity_hmac: None,
                 dimensions: BTreeMap::new(),
             }
         });
@@ -264,7 +291,7 @@ pub fn persist_verdict_projection(
     );
 
     let payload = projection_record_to_payload(&record);
-    record.decision_signature = signature_for_payload(&payload);
+    record.decision_signature = signature_for_payload(&payload)?;
 
     let (projected_comment_id, projected_comment_url) =
         project_decision_comment(&owner_repo, resolved_pr, &record, &payload)?;
@@ -423,6 +450,201 @@ fn projection_lock_path_for_home(home: &Path, owner_repo: &str, pr_number: u32) 
     projection_pr_dir_for_home(home, owner_repo, pr_number).join("verdict_projection.lock")
 }
 
+fn projection_secrets_dir(home: &Path) -> PathBuf {
+    home.join("fac_projection").join("secrets")
+}
+
+fn projection_secret_path(home: &Path, owner_repo: &str, pr_number: u32) -> PathBuf {
+    projection_secrets_dir(home)
+        .join(PROJECTION_INTEGRITY_ROLE)
+        .join(sanitize_for_path(owner_repo))
+        .join(format!("pr-{pr_number}.secret"))
+}
+
+#[cfg(unix)]
+fn open_secret_for_read(path: &Path) -> Result<File, std::io::Error> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.custom_flags(libc::O_NOFOLLOW);
+    options.open(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            err
+        } else {
+            std::io::Error::new(
+                err.kind(),
+                format!("failed to open projection secret {}: {err}", path.display()),
+            )
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn open_secret_for_read(path: &Path) -> Result<File, std::io::Error> {
+    OpenOptions::new().read(true).open(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            err
+        } else {
+            std::io::Error::new(
+                err.kind(),
+                format!("failed to open projection secret {}: {err}", path.display()),
+            )
+        }
+    })
+}
+
+fn read_secret_hex_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let mut file = match open_secret_for_read(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "failed to open projection secret {}: {err}",
+                path.display()
+            ));
+        },
+    };
+    let size = file
+        .metadata()
+        .map_err(|err| format!("failed to stat projection secret {}: {err}", path.display()))?
+        .len();
+    if size > PROJECTION_SECRET_MAX_FILE_BYTES {
+        return Err(format!(
+            "projection secret {} exceeds maximum size ({} > {})",
+            path.display(),
+            size,
+            PROJECTION_SECRET_MAX_FILE_BYTES
+        ));
+    }
+    let mut encoded = String::new();
+    file.read_to_string(&mut encoded)
+        .map_err(|err| format!("failed to read projection secret {}: {err}", path.display()))?;
+    let encoded = encoded.trim();
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+    if encoded.len() > PROJECTION_SECRET_MAX_ENCODED_CHARS {
+        return Err(format!(
+            "projection secret {} exceeds maximum encoded length",
+            path.display()
+        ));
+    }
+    let secret = hex::decode(encoded).map_err(|err| {
+        format!(
+            "failed to decode projection secret {}: {err}",
+            path.display()
+        )
+    })?;
+    if secret.len() != PROJECTION_SECRET_LEN_BYTES {
+        return Err(format!(
+            "projection secret {} has invalid length {} (expected {})",
+            path.display(),
+            secret.len(),
+            PROJECTION_SECRET_LEN_BYTES
+        ));
+    }
+    Ok(Some(secret))
+}
+
+fn write_secret_atomic(path: &Path, encoded_secret: &str) -> Result<(), String> {
+    super::types::ensure_parent_dir(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("projection secret path has no parent: {}", path.display()))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|err| format!("failed to create projection secret temp file: {err}"))?;
+    #[cfg(unix)]
+    {
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("failed to set projection secret temp file mode: {err}"))?;
+    }
+    temp.write_all(encoded_secret.as_bytes()).map_err(|err| {
+        format!(
+            "failed to write projection secret {}: {err}",
+            path.display()
+        )
+    })?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|err| format!("failed to sync projection secret {}: {err}", path.display()))?;
+    temp.persist(path).map_err(|err| {
+        format!(
+            "failed to persist projection secret {}: {err}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn rotate_secret(path: &Path) -> Result<Vec<u8>, String> {
+    let mut secret = [0u8; PROJECTION_SECRET_LEN_BYTES];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+    let encoded = hex::encode(secret);
+    write_secret_atomic(path, &encoded)?;
+    Ok(secret.to_vec())
+}
+
+fn read_or_rotate_secret(path: &Path) -> Result<Vec<u8>, String> {
+    read_secret_hex_bytes(path)?.map_or_else(|| rotate_secret(path), Ok)
+}
+
+fn projection_record_binding_payload(record: &DecisionProjectionRecord) -> Result<Vec<u8>, String> {
+    let binding = DecisionProjectionRecordIntegrityBinding {
+        schema: &record.schema,
+        owner_repo: &record.owner_repo,
+        pr_number: record.pr_number,
+        head_sha: &record.head_sha,
+        updated_at: &record.updated_at,
+        decision_comment_id: record.decision_comment_id,
+        decision_comment_url: &record.decision_comment_url,
+        decision_signature: &record.decision_signature,
+        dimensions: &record.dimensions,
+    };
+    serde_jcs::to_vec(&binding)
+        .map_err(|err| format!("failed to build decision projection integrity payload: {err}"))
+}
+
+fn compute_hmac(secret: &[u8], payload: &[u8]) -> Result<String, String> {
+    let mut mac = HmacSha256::new_from_slice(secret)
+        .map_err(|err| format!("invalid decision projection integrity secret: {err}"))?;
+    mac.update(payload);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn verify_hmac(stored: &str, computed: &str) -> Result<bool, String> {
+    let expected = hex::decode(stored)
+        .map_err(|err| format!("invalid decision projection integrity_hmac encoding: {err}"))?;
+    let actual = hex::decode(computed).map_err(|err| {
+        format!("invalid decision projection computed integrity_hmac encoding: {err}")
+    })?;
+    if expected.len() != actual.len() {
+        return Ok(false);
+    }
+    Ok(expected.ct_eq(actual.as_slice()).into())
+}
+
+fn bind_decision_projection_record_integrity(
+    home: &Path,
+    record: &mut DecisionProjectionRecord,
+) -> Result<(), String> {
+    let secret = read_or_rotate_secret(&projection_secret_path(
+        home,
+        &record.owner_repo,
+        record.pr_number,
+    ))?;
+    let payload = projection_record_binding_payload(record)?;
+    let computed = compute_hmac(&secret, &payload)?;
+    if let Some(stored) = record.integrity_hmac.as_deref() {
+        let matches = verify_hmac(stored, &computed)?;
+        if !matches {
+            return Err("decision projection integrity check failed".to_string());
+        }
+        return Ok(());
+    }
+    record.integrity_hmac = Some(computed);
+    Ok(())
+}
+
 fn acquire_projection_lock_for_home(
     home: &Path,
     owner_repo: &str,
@@ -556,13 +778,14 @@ fn load_decision_projection_for_home(
     validate_expected_head_sha(head_sha)?;
 
     let sha_path = projection_record_sha_path_for_home(home, owner_repo, pr_number, head_sha);
-    if let Some(record) = load_projection_record_from_path(&sha_path)? {
+    if let Some(mut record) = load_projection_record_from_path(&sha_path)? {
         validate_projection_record_identity(&record, owner_repo, pr_number)?;
         validate_projection_record_sha(&record, head_sha)?;
+        bind_decision_projection_record_integrity(home, &mut record)?;
         return Ok(Some(record));
     }
 
-    let Some(record) = load_projection_record_from_path(&projection_record_path_for_home(
+    let Some(mut record) = load_projection_record_from_path(&projection_record_path_for_home(
         home, owner_repo, pr_number,
     ))?
     else {
@@ -575,6 +798,7 @@ fn load_decision_projection_for_home(
         return Ok(None);
     }
     validate_projection_record_sha(&record, head_sha)?;
+    bind_decision_projection_record_integrity(home, &mut record)?;
     Ok(Some(record))
 }
 
@@ -583,15 +807,14 @@ fn save_decision_projection_for_home(
     record: &DecisionProjectionRecord,
 ) -> Result<(), String> {
     validate_expected_head_sha(&record.head_sha)?;
-    let sha_path = projection_record_sha_path_for_home(
-        home,
-        &record.owner_repo,
-        record.pr_number,
-        &record.head_sha,
-    );
-    let root_path = projection_record_path_for_home(home, &record.owner_repo, record.pr_number);
-    write_json_atomic(&sha_path, record)?;
-    if let Err(err) = write_json_atomic(&root_path, record) {
+    let mut copy = record.clone();
+    copy.integrity_hmac = None;
+    bind_decision_projection_record_integrity(home, &mut copy)?;
+    let sha_path =
+        projection_record_sha_path_for_home(home, &copy.owner_repo, copy.pr_number, &copy.head_sha);
+    let root_path = projection_record_path_for_home(home, &copy.owner_repo, copy.pr_number);
+    write_json_atomic(&sha_path, &copy)?;
+    if let Err(err) = write_json_atomic(&root_path, &copy) {
         let _ = fs::remove_file(&sha_path);
         return Err(err);
     }
@@ -701,10 +924,11 @@ fn aggregate_overall_decision(dimensions: &[DimensionDecisionView]) -> &'static 
     }
 }
 
-fn signature_for_payload(payload: &DecisionComment) -> String {
-    let canonical = serde_json::to_string(payload).unwrap_or_default();
-    let digest = sha2::Sha256::digest(canonical.as_bytes());
-    hex::encode(digest)
+fn signature_for_payload(payload: &DecisionComment) -> Result<String, String> {
+    let canonical = serde_jcs::to_vec(payload)
+        .map_err(|err| format!("failed to serialize decision projection payload: {err}"))?;
+    let digest = sha2::Sha256::digest(canonical);
+    Ok(hex::encode(digest))
 }
 
 fn normalize_signature_hex(value: &str) -> Result<String, String> {
@@ -724,10 +948,10 @@ fn normalize_signature_hex(value: &str) -> Result<String, String> {
 fn resolve_verified_decision_signature(
     record: &DecisionProjectionRecord,
 ) -> Result<String, String> {
-    let expected = normalize_signature_hex(&signature_for_payload(&projection_record_to_payload(
-        record,
-    )))
-    .map_err(|err| format!("failed to compute expected decision signature: {err}"))?;
+    let expected = normalize_signature_hex(
+        &signature_for_payload(&projection_record_to_payload(record))
+            .map_err(|err| format!("failed to compute expected decision signature: {err}"))?,
+    )?;
     if record.decision_signature.trim().is_empty() {
         return Ok(expected);
     }
@@ -1115,8 +1339,10 @@ mod tests {
             decision_comment_id: 88,
             decision_comment_url: "local://fac_projection/example/repo/pr-441/issue_comments#88"
                 .to_string(),
-            decision_signature: super::signature_for_payload(&payload),
+            decision_signature: super::signature_for_payload(&payload)
+                .expect("serialize decision payload"),
             dimensions,
+            integrity_hmac: None,
         };
 
         super::save_decision_projection_for_home(home, &record).expect("write decision projection");
@@ -1168,6 +1394,7 @@ mod tests {
                 .to_string(),
             decision_signature: String::new(),
             dimensions,
+            integrity_hmac: None,
         };
         let report = build_show_report_from_record(head_sha, &record);
         assert_eq!(report.overall_decision, "pending");
@@ -1207,6 +1434,7 @@ mod tests {
                 .to_string(),
             decision_signature: String::new(),
             dimensions,
+            integrity_hmac: None,
         };
         let report = build_show_report_from_record(head_sha, &record);
         assert!(report.fail_closed);
