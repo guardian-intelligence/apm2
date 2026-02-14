@@ -72,6 +72,7 @@ use apm2_core::economics::queue_admission::{
     QueueSchedulerState, evaluate_queue_admission,
 };
 use apm2_core::fac::broker::{BrokerSignatureVerifier, FacBroker};
+use apm2_core::fac::broker_health::WorkerHealthPolicy;
 use apm2_core::fac::job_spec::{
     FacJobSpecV1, JobSpecError, MAX_JOB_SPEC_SIZE, deserialize_job_spec, validate_job_spec,
 };
@@ -151,6 +152,8 @@ struct PendingCandidate {
     path: PathBuf,
     /// Deserialized job spec (valid parse only, not yet fully validated).
     spec: FacJobSpecV1,
+    /// Raw bytes from the bounded read.
+    raw_bytes: Vec<u8>,
 }
 
 // =============================================================================
@@ -191,12 +194,48 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
         return exit_codes::GENERIC_ERROR;
     }
 
+    // Load persistent signing key for stable broker identity and receipts across
+    // restarts.
+    let persistent_signer = match load_or_generate_persistent_signer() {
+        Ok(signer) => signer,
+        Err(e) => {
+            output_worker_error(json_output, &format!("cannot load signing key: {e}"));
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+    let persistent_signer_key_bytes = persistent_signer.secret_key_bytes().to_vec();
+
+    let signer = match Signer::from_bytes(&persistent_signer_key_bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            output_worker_error(
+                json_output,
+                &format!("cannot initialize receipt signer: {e}"),
+            );
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    let mk_default_state_broker = || {
+        let default_state = apm2_core::fac::broker::BrokerState::default();
+        let signer = Signer::from_bytes(&persistent_signer_key_bytes).ok()?;
+        FacBroker::from_signer_and_state(signer, default_state).ok()
+    };
+
     // Create broker for token verification and admission evaluation.
     // In default mode, the broker and worker share a process: the same
     // FacBroker instance issues tokens AND verifies them. This is documented
     // as a limitation of default-mode operation. Distributed workers would
     // need to load the broker's persisted verifying key.
-    let mut broker = FacBroker::new();
+    let mut broker = load_broker_state().map_or_else(
+        || mk_default_state_broker().unwrap_or_else(FacBroker::new),
+        |state| {
+            Signer::from_bytes(&persistent_signer_key_bytes)
+                .ok()
+                .and_then(|signer| FacBroker::from_signer_and_state(signer, state).ok())
+                .unwrap_or_else(|| mk_default_state_broker().unwrap_or_else(FacBroker::new))
+        },
+    );
 
     // Perform admission health gate check so the broker can issue tokens.
     // In default (local) mode we use minimal health check inputs.
@@ -216,9 +255,14 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
         .unwrap_or_else(|_| make_default_eval_window());
 
     let _health = broker.check_health(None, &eval_window, &[], &mut checker);
+    if let Err(e) =
+        broker.evaluate_admission_health_gate(&checker, &eval_window, WorkerHealthPolicy::default())
+    {
+        output_worker_error(json_output, &format!("admission health gate failed: {e}"));
+        return exit_codes::GENERIC_ERROR;
+    }
 
     let verifying_key = broker.verifying_key();
-    let signer = Signer::generate();
 
     let mut total_processed: u64 = 0;
     let mut summary = WorkerSummary {
@@ -247,6 +291,7 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
 
         if candidates.is_empty() {
             if once {
+                let _ = save_broker_state(&broker);
                 if json_output {
                     print_json(&summary);
                 } else {
@@ -258,12 +303,21 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
             continue;
         }
 
+        let scheduler = build_scheduler_state(&candidates);
         for candidate in &candidates {
             if max_jobs > 0 && total_processed >= max_jobs {
                 break;
             }
 
-            let outcome = process_job(candidate, &queue_root, &verifying_key, &mut broker, &signer);
+            let outcome = process_job(
+                candidate,
+                &queue_root,
+                &verifying_key,
+                &scheduler,
+                &mut broker,
+                &signer,
+                candidates.len(),
+            );
 
             match &outcome {
                 JobOutcome::Quarantined { reason } => {
@@ -295,7 +349,13 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
             summary.jobs_processed += 1;
             total_processed += 1;
 
+            if matches!(&outcome, JobOutcome::Skipped { reason } if reason.contains("no lane available"))
+            {
+                break;
+            }
+
             if once {
+                let _ = save_broker_state(&broker);
                 if json_output {
                     print_json(&summary);
                 }
@@ -318,6 +378,7 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
         print_json(&summary);
     }
 
+    let _ = save_broker_state(&broker);
     exit_codes::SUCCESS
 }
 
@@ -388,7 +449,11 @@ fn scan_pending(queue_root: &Path) -> Result<Vec<PendingCandidate>, String> {
             },
         };
 
-        candidates.push(PendingCandidate { path, spec });
+        candidates.push(PendingCandidate {
+            path,
+            spec,
+            raw_bytes: bytes,
+        });
     }
 
     // Sort deterministically (INV-WRK-005): priority ASC, enqueue_time ASC,
@@ -429,6 +494,19 @@ fn parse_queue_lane(lane_str: &str) -> QueueLane {
     }
 }
 
+/// Builds queue scheduler state from the observed pending candidates.
+///
+/// This keeps admission checks aligned with live queue depth during a single
+/// scan cycle and avoids admitting every job through an empty scheduler.
+fn build_scheduler_state(candidates: &[PendingCandidate]) -> QueueSchedulerState {
+    let mut scheduler = QueueSchedulerState::new();
+    for candidate in candidates {
+        let lane = parse_queue_lane(&candidate.spec.queue_lane);
+        let _ = scheduler.record_admission(lane);
+    }
+    scheduler
+}
+
 // =============================================================================
 // Job processing
 // =============================================================================
@@ -440,8 +518,10 @@ fn process_job(
     candidate: &PendingCandidate,
     queue_root: &Path,
     verifying_key: &apm2_core::crypto::VerifyingKey,
+    scheduler: &QueueSchedulerState,
     broker: &mut FacBroker,
     signer: &Signer,
+    _candidates_count: usize,
 ) -> JobOutcome {
     let path = &candidate.path;
     let file_name = match path.file_name().and_then(|n| n.to_str()) {
@@ -453,31 +533,14 @@ fn process_job(
         },
     };
 
-    // Step 1+2: Re-read and fully validate (bounded deserialize + digest check).
-    let bytes = match read_bounded(path, MAX_JOB_SPEC_SIZE) {
-        Ok(b) => b,
-        Err(e) => {
-            // Read failure during processing -> quarantine + receipt.
-            let reason = format!("cannot read file: {e}");
-            let _ = move_to_dir_safe(path, &queue_root.join(QUARANTINED_DIR), &file_name);
-            write_receipt(queue_root, &file_name, "quarantine", &reason, None);
-            return JobOutcome::Quarantined { reason };
-        },
-    };
-
-    let spec = match deserialize_job_spec(&bytes) {
-        Ok(s) => s,
-        Err(e) => {
-            // Malformed JSON -> quarantine + receipt.
-            let reason = format!("deserialization failed: {e}");
-            let _ = move_to_dir_safe(path, &queue_root.join(QUARANTINED_DIR), &file_name);
-            write_receipt(queue_root, &file_name, "quarantine", &reason, None);
-            return JobOutcome::Quarantined { reason };
-        },
-    };
+    // Step 1+2: Use the bounded bytes already loaded by scan_pending.
+    //
+    // The file was already validated by `scan_pending`; this avoids duplicate I/O.
+    let _ = &candidate.raw_bytes;
+    let spec = &candidate.spec;
 
     // Validate structure + digest + request_id binding.
-    if let Err(e) = validate_job_spec(&spec) {
+    if let Err(e) = validate_job_spec(spec) {
         let is_digest_error = matches!(
             e,
             JobSpecError::DigestMismatch { .. } | JobSpecError::RequestIdMismatch { .. }
@@ -512,10 +575,8 @@ fn process_job(
         },
     };
 
-    let current_time_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    // Use broker tick for temporal checks to avoid wall-clock rollback.
+    let current_time_secs = broker.current_tick();
 
     let boundary_check = match decode_channel_context_token(
         token,
@@ -551,11 +612,17 @@ fn process_job(
 
     // Step 4: Evaluate RFC-0029 queue admission.
     //
+    if !broker.is_admission_health_gate_passed() {
+        let reason = "broker admission health gate not passed (INV-BH-003)".to_string();
+        let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+        write_receipt(queue_root, &file_name, "deny", &reason, Some(&spec.job_id));
+        return JobOutcome::Denied { reason };
+    }
+
     // Parse the spec's queue_lane to determine the correct lane, rather than
     // hard-coding Bulk (MAJOR-3 fix).
     let lane = parse_queue_lane(&spec.queue_lane);
 
-    let scheduler = QueueSchedulerState::new();
     let verifier = BrokerSignatureVerifier::new(*verifying_key);
 
     // Build a proper admission request with broker-issued authority artifacts
@@ -608,7 +675,7 @@ fn process_job(
         current_tick,
     };
 
-    let decision = evaluate_queue_admission(&admission_request, &scheduler, Some(&verifier));
+    let decision = evaluate_queue_admission(&admission_request, scheduler, Some(&verifier));
 
     if decision.verdict != QueueAdmissionVerdict::Allow {
         let reason = decision.defect().map_or_else(
@@ -709,7 +776,7 @@ fn process_job(
 
     // Step 8: Write authoritative GateReceipt and move to completed.
     let evidence_hash = compute_evidence_hash(spec.job_id.as_bytes());
-    let changeset_digest = compute_evidence_hash(spec.job_spec_digest.as_bytes());
+    let changeset_digest = compute_evidence_hash(spec.source.head_sha.as_bytes());
     let receipt_id = format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs());
     let receipt = GateReceiptBuilder::new(&receipt_id, "fac-worker-exec", &spec.actuation.lease_id)
         .changeset_digest(changeset_digest)
@@ -792,9 +859,10 @@ fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
 ///
 /// Returns an error if the file is larger than `max_size` or cannot be read.
 fn read_bounded(path: &Path, max_size: usize) -> Result<Vec<u8>, String> {
-    let metadata =
-        fs::metadata(path).map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
-
+    let file = fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
     let file_size = metadata.len();
     if file_size > max_size as u64 {
         return Err(format!("file size {file_size} exceeds max {max_size}"));
@@ -804,7 +872,6 @@ fn read_bounded(path: &Path, max_size: usize) -> Result<Vec<u8>, String> {
     #[allow(clippy::cast_possible_truncation)]
     let alloc_size = file_size as usize;
     let mut buf = Vec::with_capacity(alloc_size);
-    let file = fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
 
     // Read up to max_size + 1 to detect if the file grew between stat and read.
     let read_limit = max_size.saturating_add(1);
@@ -822,6 +889,64 @@ fn read_bounded(path: &Path, max_size: usize) -> Result<Vec<u8>, String> {
     }
 
     Ok(buf)
+}
+
+/// Loads or generates a persistent signing key from
+/// `$APM2_HOME/private/fac/signing_key`.
+///
+/// On first run, generates a new key and saves it with 0600 permissions.
+/// On subsequent runs, loads the existing key. This keeps broker state and
+/// receipts consistent across worker restarts.
+fn load_or_generate_persistent_signer() -> Result<Signer, String> {
+    let fac_root = resolve_fac_root()?;
+    let key_path = fac_root.join("signing_key");
+
+    if key_path.exists() {
+        let bytes = read_bounded(&key_path, 64)?;
+        Signer::from_bytes(&bytes).map_err(|e| format!("invalid signing key: {e}"))
+    } else {
+        let signer = Signer::generate();
+        let key_bytes = signer.secret_key_bytes();
+        if let Some(parent) = key_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("cannot create key directory: {e}"))?;
+        }
+        fs::write(&key_path, key_bytes.as_ref())
+            .map_err(|e| format!("cannot write signing key: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            fs::set_permissions(&key_path, perms)
+                .map_err(|e| format!("cannot set key permissions: {e}"))?;
+        }
+        Ok(signer)
+    }
+}
+
+/// Loads persisted broker state from
+/// `$APM2_HOME/private/fac/broker_state.json`.
+///
+/// Returns None if the file doesn't exist.
+fn load_broker_state() -> Option<apm2_core::fac::broker::BrokerState> {
+    let Ok(fac_root) = resolve_fac_root() else {
+        return None;
+    };
+    let state_path = fac_root.join("broker_state.json");
+    if !state_path.exists() {
+        return None;
+    }
+    let bytes = read_bounded(&state_path, 1_048_576).ok()?;
+    FacBroker::deserialize_state(&bytes).ok()
+}
+
+/// Saves broker state to `$APM2_HOME/private/fac/broker_state.json`.
+fn save_broker_state(broker: &FacBroker) -> Result<(), String> {
+    let fac_root = resolve_fac_root()?;
+    let state_path = fac_root.join("broker_state.json");
+    let bytes = broker
+        .serialize_state()
+        .map_err(|e| format!("cannot serialize broker state: {e}"))?;
+    fs::write(&state_path, bytes).map_err(|e| format!("cannot write broker state: {e}"))
 }
 
 /// Atomically moves a file to a destination directory with collision-safe
