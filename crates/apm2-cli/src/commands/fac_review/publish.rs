@@ -5,14 +5,12 @@ use std::path::Path;
 use clap::ValueEnum;
 use serde::Serialize;
 
-use super::barrier::{
-    ensure_gh_cli_ready, fetch_pr_head_sha, render_comment_with_generated_metadata,
-    resolve_authenticated_gh_login,
-};
-use super::github_projection::{self, IssueCommentResponse};
-use super::projection_store;
+use super::github_auth::resolve_local_reviewer_identity;
 use super::target::resolve_pr_target;
-use super::types::{QUALITY_MARKER, SECURITY_MARKER, validate_expected_head_sha};
+use super::types::{
+    QUALITY_MARKER, SECURITY_MARKER, allocate_local_comment_id, validate_expected_head_sha,
+};
+use super::{findings_store, github_projection, projection_store, verdict_projection};
 use crate::exit_codes::codes as exit_codes;
 
 const PUBLISH_SCHEMA: &str = "apm2.fac.review.publish.v1";
@@ -49,21 +47,20 @@ struct PublishSummary {
 pub fn run_publish(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     review_type: ReviewPublishTypeArg,
     body_file: &Path,
     json_output: bool,
 ) -> Result<u8, String> {
-    ensure_gh_cli_ready()?;
-
-    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
+    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
     let reviewer_id = resolve_reviewer_id(&owner_repo, resolved_pr)?;
     let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
 
     let raw_body = std::fs::read_to_string(body_file)
         .map_err(|err| format!("failed to read body file {}: {err}", body_file.display()))?;
     let (marker, review_type_label) = review_type.metadata_spec();
+    let verdict =
+        resolve_dimension_verdict(&owner_repo, resolved_pr, &head_sha, review_type_label)?;
     let enriched_body = render_comment_with_generated_metadata(
         &raw_body,
         marker,
@@ -71,9 +68,25 @@ pub fn run_publish(
         resolved_pr,
         &head_sha,
         &reviewer_id,
+        &verdict,
     )?;
-    let response =
-        github_projection::create_issue_comment(&owner_repo, resolved_pr, &enriched_body)?;
+    let (comment_id, comment_url) = match github_projection::create_issue_comment(
+        &owner_repo,
+        resolved_pr,
+        &enriched_body,
+    ) {
+        Ok(response) => (response.id, response.html_url),
+        Err(err) => {
+            eprintln!(
+                "WARNING: failed to project publish comment to GitHub for PR #{resolved_pr}: {err}"
+            );
+            let fallback_id = next_local_comment_id(&owner_repo, resolved_pr);
+            let fallback_url = format!(
+                "local://fac_projection/{owner_repo}/pr-{resolved_pr}/issue_comments#{fallback_id}"
+            );
+            (fallback_id, fallback_url)
+        },
+    };
 
     let summary = PublishSummary {
         schema: PUBLISH_SCHEMA.to_string(),
@@ -83,9 +96,18 @@ pub fn run_publish(
         head_sha,
         review_type: review_type_label.to_string(),
         body_file: body_file.display().to_string(),
-        comment_id: response.id,
-        comment_url: response.html_url,
+        comment_id,
+        comment_url,
     };
+
+    findings_store::upsert_dimension_verdict(
+        &owner_repo,
+        resolved_pr,
+        &summary.head_sha,
+        review_type_label,
+        &verdict,
+        "publish",
+    )?;
 
     let _ = projection_store::save_trusted_reviewer_id(&owner_repo, resolved_pr, &reviewer_id);
     let _ = projection_store::save_identity_with_context(
@@ -134,24 +156,13 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
         return Ok(identity.head_sha.to_ascii_lowercase());
     }
 
-    if !projection_store::gh_read_fallback_enabled() {
-        return Err(projection_store::gh_read_fallback_disabled_error(
-            "publish.resolve_head_sha",
-        ));
+    if let Some(value) = super::state::resolve_local_review_head_sha(pr_number) {
+        return Ok(value);
     }
 
-    let value = fetch_pr_head_sha(owner_repo, pr_number)?;
-    validate_expected_head_sha(&value)?;
-    let value = value.to_ascii_lowercase();
-    let _ =
-        projection_store::record_fallback_read(owner_repo, pr_number, "publish.resolve_head_sha");
-    let _ = projection_store::save_identity_with_context(
-        owner_repo,
-        pr_number,
-        &value,
-        "gh-fallback:publish.resolve_head_sha",
-    );
-    Ok(value)
+    Err(format!(
+        "missing local head SHA for PR #{pr_number}; pass --sha explicitly or run local FAC review first"
+    ))
 }
 
 fn resolve_reviewer_id(owner_repo: &str, pr_number: u32) -> Result<String, String> {
@@ -159,36 +170,92 @@ fn resolve_reviewer_id(owner_repo: &str, pr_number: u32) -> Result<String, Strin
         return Ok(cached);
     }
 
-    if !projection_store::gh_read_fallback_enabled() {
-        return Err(projection_store::gh_read_fallback_disabled_error(
-            "publish.resolve_reviewer_id",
-        ));
-    }
-
-    let reviewer_id = resolve_authenticated_gh_login().ok_or_else(|| {
-        "failed to resolve authenticated GitHub login for metadata reviewer_id".to_string()
-    })?;
-    let _ = projection_store::record_fallback_read(
-        owner_repo,
-        pr_number,
-        "publish.resolve_reviewer_id",
-    );
+    let reviewer_id = resolve_local_reviewer_identity();
     let _ = projection_store::save_trusted_reviewer_id(owner_repo, pr_number, &reviewer_id);
     Ok(reviewer_id)
 }
 
-pub(super) fn create_issue_comment(
+fn strip_existing_metadata_block(body: &str, marker: &str) -> String {
+    let pattern = format!(r"(?s){}\s*```json.*?```", regex::escape(marker));
+    let Ok(re) = regex::Regex::new(&pattern) else {
+        return body.to_string();
+    };
+    re.replacen(body, 1, "").to_string()
+}
+
+fn build_generated_metadata_block(
+    marker: &str,
+    review_type: &str,
+    pr_number: u32,
+    head_sha: &str,
+    reviewer_id: &str,
+    verdict: &str,
+) -> Result<String, String> {
+    let payload = serde_json::json!({
+        "schema": "apm2.review.metadata.v1",
+        "review_type": review_type,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+        "verdict": verdict,
+        "reviewer_id": reviewer_id,
+    });
+    let json = serde_json::to_string_pretty(&payload)
+        .map_err(|err| format!("failed to serialize generated review metadata: {err}"))?;
+    Ok(format!("{marker}\n```json\n{json}\n```"))
+}
+
+fn render_comment_with_generated_metadata(
+    body: &str,
+    marker: &str,
+    review_type: &str,
+    pr_number: u32,
+    head_sha: &str,
+    reviewer_id: &str,
+    verdict: &str,
+) -> Result<String, String> {
+    let stripped = strip_existing_metadata_block(body, marker);
+    let metadata = build_generated_metadata_block(
+        marker,
+        review_type,
+        pr_number,
+        head_sha,
+        reviewer_id,
+        verdict,
+    )?;
+    let normalized = stripped.trim_end();
+    if normalized.is_empty() {
+        Ok(format!("{metadata}\n"))
+    } else {
+        Ok(format!("{normalized}\n\n{metadata}\n"))
+    }
+}
+
+fn resolve_dimension_verdict(
     owner_repo: &str,
     pr_number: u32,
-    body: &str,
-) -> Result<IssueCommentResponse, String> {
-    github_projection::create_issue_comment(owner_repo, pr_number, body)
+    head_sha: &str,
+    dimension: &str,
+) -> Result<String, String> {
+    verdict_projection::resolve_verdict_for_dimension(owner_repo, pr_number, head_sha, dimension)?
+        .ok_or_else(|| {
+            format!(
+                "missing explicit verdict for PR #{pr_number} sha {head_sha} dimension `{dimension}`; run `apm2 fac review verdict set` first"
+            )
+        })
+}
+
+fn next_local_comment_id(_owner_repo: &str, pr_number: u32) -> u64 {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    allocate_local_comment_id(pr_number, Some(seed))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ReviewPublishTypeArg;
-    use crate::commands::fac_review::barrier::render_comment_with_generated_metadata;
+    use super::{ReviewPublishTypeArg, render_comment_with_generated_metadata};
+    use crate::commands::fac_review::types::SECURITY_MARKER;
 
     #[test]
     fn review_publish_type_arg_maps_to_expected_metadata_spec() {
@@ -216,6 +283,7 @@ mod tests {
             321,
             "0123456789abcdef0123456789abcdef01234567",
             "fac-reviewer",
+            "FAIL",
         )
         .expect("rendered");
 
@@ -225,5 +293,72 @@ mod tests {
         assert!(rendered.contains("\"reviewer_id\": \"fac-reviewer\""));
         assert!(rendered.contains("\"verdict\": \"FAIL\""));
         assert!(!rendered.contains("\"severity_counts\""));
+    }
+
+    #[test]
+    fn render_comment_with_generated_metadata_replaces_existing_block() {
+        let body = r#"
+## Security Review: PASS
+
+<!-- apm2-review-metadata:v1:security -->
+```json
+{
+  "schema": "apm2.review.metadata.v1",
+  "review_type": "security",
+  "pr_number": 1,
+  "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "verdict": "PASS",
+  "severity_counts": { "blocker": 0, "major": 0, "minor": 0, "nit": 0 },
+  "reviewer_id": "old"
+}
+```
+"#;
+        let rendered = render_comment_with_generated_metadata(
+            body,
+            SECURITY_MARKER,
+            "security",
+            441,
+            "0123456789abcdef0123456789abcdef01234567",
+            "new-reviewer",
+            "PASS",
+        )
+        .expect("rendered");
+        assert_eq!(rendered.matches(SECURITY_MARKER).count(), 1);
+        assert!(rendered.contains("\"pr_number\": 441"));
+        assert!(rendered.contains("\"reviewer_id\": \"new-reviewer\""));
+        assert!(!rendered.contains("\"head_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""));
+        assert!(!rendered.contains("\"severity_counts\""));
+    }
+
+    #[test]
+    fn render_comment_with_generated_metadata_uses_current_header_not_stale_metadata_verdict() {
+        let body = r#"
+## Security Review: PASS
+
+<!-- apm2-review-metadata:v1:security -->
+```json
+{
+  "schema": "apm2.review.metadata.v1",
+  "review_type": "security",
+  "pr_number": 1,
+  "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "verdict": "FAIL",
+  "reviewer_id": "old"
+}
+```
+"#;
+        let rendered = render_comment_with_generated_metadata(
+            body,
+            SECURITY_MARKER,
+            "security",
+            441,
+            "0123456789abcdef0123456789abcdef01234567",
+            "new-reviewer",
+            "PASS",
+        )
+        .expect("rendered");
+        assert!(rendered.contains("## Security Review: PASS"));
+        assert!(rendered.contains("\"verdict\": \"PASS\""));
+        assert!(!rendered.contains("\"verdict\": \"FAIL\""));
     }
 }

@@ -19,17 +19,17 @@
 //!   context
 //! - `apm2 fac resume <work_id>` - Show crash-only resume helpers from ledger
 //!   anchor
-//! - `apm2 fac review run <PR_URL>` - Run FAC review orchestration (parallel,
-//!   multi-model)
-//! - `apm2 fac review dispatch <PR_URL>` - Dispatch detached FAC review runs
+//! - `apm2 fac review run --pr <N>` - Run FAC review orchestration (parallel,
+//!   multi-model; defaults from local branch mapping when omitted)
+//! - `apm2 fac review dispatch --pr <N>` - Dispatch detached FAC review runs
 //! - `apm2 fac review status` - Show FAC review state and recent events
 //! - `apm2 fac review findings` - Retrieve SHA-bound review findings in a
 //!   structured FAC-native format
-//! - `apm2 fac review comment` - Publish one SHA-bound finding comment
-//! - `apm2 fac review decision` - Show/set SHA-bound approve/deny decisions per
+//! - `apm2 fac review verdict` - Show/set SHA-bound approve/deny verdicts per
 //!   review dimension
 //! - `apm2 fac restart --pr <PR_NUMBER>` - Intelligent pipeline restart from
 //!   optimal point
+//! - `apm2 fac recover --pr <N>` - Repair/reconcile local FAC lifecycle state
 //! - `apm2 fac review project` - Render one projection status line
 //! - `apm2 fac review tail` - Tail FAC review NDJSON telemetry stream
 //!
@@ -175,9 +175,15 @@ pub enum FacSubcommand {
 
     /// Restart the evidence/review pipeline from the optimal point.
     ///
-    /// Reads current CI state from the PR status comment and determines
-    /// whether to re-run evidence gates, dispatch reviews, or both.
+    /// Reads local authoritative FAC verdict artifacts and determines whether
+    /// to re-run evidence gates, dispatch reviews, or no-op.
     Restart(RestartArgs),
+
+    /// Repair or reconcile local FAC lifecycle state.
+    ///
+    /// Reaps stale agent registry entries and can refresh local PR identity
+    /// from authoritative remote state.
+    Recover(RecoverArgs),
 
     /// Show local pipeline, evidence, and review log paths.
     ///
@@ -398,10 +404,6 @@ pub struct LaneStatusArgs {
 /// Arguments for `apm2 fac push`.
 #[derive(Debug, Args)]
 pub struct PushArgs {
-    /// Repository in owner/repo format.
-    #[arg(long, default_value = "guardian-intelligence/apm2")]
-    pub repo: String,
-
     /// Git remote name.
     #[arg(long, default_value = "origin")]
     pub remote: String,
@@ -419,21 +421,29 @@ pub struct PushArgs {
 /// Arguments for `apm2 fac restart`.
 #[derive(Debug, Args)]
 pub struct RestartArgs {
-    /// Repository in owner/repo format.
-    #[arg(long, default_value = "guardian-intelligence/apm2")]
-    pub repo: String,
-
     /// Pull request number (auto-detected from current branch if omitted).
     #[arg(long)]
     pub pr: Option<u32>,
 
-    /// Pull request URL (alternative to --pr).
-    #[arg(long)]
-    pub pr_url: Option<String>,
-
     /// Restart everything regardless of current CI state.
     #[arg(long, default_value_t = false)]
     pub force: bool,
+}
+
+/// Arguments for `apm2 fac recover`.
+#[derive(Debug, Args)]
+pub struct RecoverArgs {
+    /// Pull request number (auto-detected from local branch if omitted).
+    #[arg(long)]
+    pub pr: Option<u32>,
+
+    /// Refresh local projection identity from current authoritative PR head.
+    #[arg(long, default_value_t = false)]
+    pub refresh_identity: bool,
+
+    /// Emit JSON output.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac logs`.
@@ -443,15 +453,15 @@ pub struct LogsArgs {
     #[arg(long)]
     pub pr: Option<u32>,
 
-    /// Repository in owner/repo format (used for finding selector zoom-in).
-    #[arg(long, default_value = "guardian-intelligence/apm2")]
-    pub repo: String,
-
     /// Selector type for digest-first zoom-in (`finding` or `tool_output`).
     #[arg(long)]
     pub selector_type: Option<String>,
 
-    /// Selector token to resolve (typed by `--selector-type`).
+    /// Selector token to resolve.
+    ///
+    /// `finding` selectors:
+    /// `finding:v2:<owner/repo>:<pr>:<sha>:<dimension>:<finding_id>`
+    /// `tool_output` selectors: `tool_output:v1:<sha>:<gate>`
     #[arg(long)]
     pub selector: Option<String>,
 
@@ -463,14 +473,6 @@ pub struct LogsArgs {
 /// Arguments for `apm2 fac pipeline` (hidden, internal).
 #[derive(Debug, Args)]
 pub struct PipelineArgs {
-    /// Repository in owner/repo format.
-    #[arg(long)]
-    pub repo: String,
-
-    /// Pull request URL.
-    #[arg(long)]
-    pub pr_url: String,
-
     /// Pull request number.
     #[arg(long)]
     pub pr: u32,
@@ -502,12 +504,15 @@ pub enum ReviewSubcommand {
     Prepare(ReviewPrepareArgs),
     /// Publish review findings and auto-generate machine-readable metadata.
     Publish(ReviewPublishArgs),
-    /// Retrieve structured review findings for a PR head SHA.
-    Findings(ReviewFindingsArgs),
-    /// Publish one SHA-bound finding comment with machine-readable metadata.
+    /// Append one structured SHA-bound finding to local FAC findings.
+    Finding(ReviewFindingArgs),
+    /// Compatibility shim for deprecated `review comment` (maps to finding).
+    #[command(hide = true)]
     Comment(ReviewCommentArgs),
-    /// Show or set explicit decision state per review dimension.
-    Decision(ReviewDecisionArgs),
+    /// Retrieve structured SHA-bound review findings for a PR head SHA.
+    Findings(ReviewFindingsArgs),
+    /// Show or set explicit verdict state per review dimension.
+    Verdict(ReviewVerdictArgs),
     /// Render one condensed projection line for GitHub log surfaces.
     Project(ReviewProjectArgs),
     /// Tail FAC review NDJSON event stream.
@@ -526,8 +531,9 @@ pub enum ReviewFormatArg {
 /// Arguments for `apm2 fac review run`.
 #[derive(Debug, Args)]
 pub struct ReviewRunArgs {
-    /// GitHub pull request URL.
-    pub pr_url: String,
+    /// Pull request number (auto-detected from local branch if omitted).
+    #[arg(long)]
+    pub pr: Option<u32>,
 
     /// Review selection (`all`, `security`, or `quality`).
     #[arg(
@@ -558,10 +564,6 @@ pub struct ReviewWaitArgs {
     #[arg(long)]
     pub pr: u32,
 
-    /// Optional pull request URL filter (must match --pr when both set).
-    #[arg(long)]
-    pub pr_url: Option<String>,
-
     /// Optional reviewer lane filter (`security` or `quality`).
     #[arg(long = "type", value_enum)]
     pub review_type: Option<ReviewStatusTypeArg>,
@@ -586,8 +588,9 @@ pub struct ReviewWaitArgs {
 /// Arguments for `apm2 fac review dispatch`.
 #[derive(Debug, Args)]
 pub struct ReviewDispatchArgs {
-    /// GitHub pull request URL.
-    pub pr_url: String,
+    /// Pull request number (auto-detected from local branch if omitted).
+    #[arg(long)]
+    pub pr: Option<u32>,
 
     /// Review selection (`all`, `security`, or `quality`).
     #[arg(
@@ -633,10 +636,6 @@ pub struct ReviewStatusArgs {
     #[arg(long)]
     pub pr: Option<u32>,
 
-    /// Optional pull request URL filter.
-    #[arg(long)]
-    pub pr_url: Option<String>,
-
     /// Optional reviewer lane filter (`security` or `quality`).
     #[arg(long = "type", value_enum)]
     pub review_type: Option<ReviewStatusTypeArg>,
@@ -649,24 +648,16 @@ pub struct ReviewStatusArgs {
 /// Arguments for `apm2 fac review findings`.
 #[derive(Debug, Args)]
 pub struct ReviewFindingsArgs {
-    /// Repository in owner/repo format (used when --pr is provided).
-    #[arg(long, default_value = "guardian-intelligence/apm2")]
-    pub repo: String,
-
     /// Pull request number.
     #[arg(long)]
     pub pr: Option<u32>,
-
-    /// Pull request URL (alternative to --pr).
-    #[arg(long)]
-    pub pr_url: Option<String>,
 
     /// Optional head SHA override (defaults to PR head SHA).
     #[arg(long)]
     pub sha: Option<String>,
 
-    /// Ignore local cached comments and re-fetch from GitHub projection.
-    #[arg(long, default_value_t = false)]
+    /// Deprecated compatibility flag; ignored because findings are local-only.
+    #[arg(long, default_value_t = false, hide = true)]
     pub refresh: bool,
 
     /// Emit JSON output for this command.
@@ -677,17 +668,9 @@ pub struct ReviewFindingsArgs {
 /// Arguments for `apm2 fac review prepare`.
 #[derive(Debug, Args)]
 pub struct ReviewPrepareArgs {
-    /// Repository in owner/repo format (used when --pr is provided).
-    #[arg(long, default_value = "guardian-intelligence/apm2")]
-    pub repo: String,
-
     /// Pull request number.
     #[arg(long)]
     pub pr: Option<u32>,
-
-    /// Pull request URL (alternative to --pr).
-    #[arg(long)]
-    pub pr_url: Option<String>,
 
     /// Optional head SHA override (defaults to PR head SHA).
     #[arg(long)]
@@ -701,17 +684,9 @@ pub struct ReviewPrepareArgs {
 /// Arguments for `apm2 fac review publish`.
 #[derive(Debug, Args)]
 pub struct ReviewPublishArgs {
-    /// Repository in owner/repo format (used when --pr is provided).
-    #[arg(long, default_value = "guardian-intelligence/apm2")]
-    pub repo: String,
-
     /// Pull request number.
     #[arg(long)]
     pub pr: Option<u32>,
-
-    /// Pull request URL (alternative to --pr).
-    #[arg(long)]
-    pub pr_url: Option<String>,
 
     /// Optional head SHA override (defaults to PR head SHA).
     #[arg(long)]
@@ -730,34 +705,74 @@ pub struct ReviewPublishArgs {
     pub json: bool,
 }
 
-/// Arguments for `apm2 fac review comment`.
+/// Arguments for `apm2 fac review finding`.
 #[derive(Debug, Args)]
-pub struct ReviewCommentArgs {
-    /// Repository in owner/repo format (used when --pr is provided).
-    #[arg(long, default_value = "guardian-intelligence/apm2")]
-    pub repo: String,
-
+pub struct ReviewFindingArgs {
     /// Pull request number.
     #[arg(long)]
     pub pr: Option<u32>,
 
-    /// Pull request URL (alternative to --pr).
-    #[arg(long)]
-    pub pr_url: Option<String>,
-
-    /// Optional head SHA override (defaults to `git rev-parse HEAD`).
+    /// Optional head SHA override (defaults to local PR identity SHA).
     #[arg(long)]
     pub sha: Option<String>,
 
-    /// Finding severity (`blocker`, `major`, `minor`, or `nit`).
-    #[arg(long, value_enum)]
-    pub severity: fac_review::ReviewCommentSeverityArg,
+    /// Review dimension (`security` or `code-quality`).
+    #[arg(long = "type", value_enum)]
+    pub review_type: fac_review::ReviewFindingTypeArg,
 
-    /// Finding type (`security` or `code-quality`).
+    /// Finding severity (`blocker`, `major`, `minor`, `nit`).
+    #[arg(long, value_enum)]
+    pub severity: fac_review::ReviewFindingSeverityArg,
+
+    /// Short finding summary.
+    #[arg(long)]
+    pub summary: String,
+
+    /// Optional risk statement.
+    #[arg(long)]
+    pub risk: Option<String>,
+
+    /// Optional impact statement.
+    #[arg(long)]
+    pub impact: Option<String>,
+
+    /// Optional location hint (`path:line` or symbol name).
+    #[arg(long)]
+    pub location: Option<String>,
+
+    /// Optional reviewer identity tag.
+    #[arg(long)]
+    pub reviewer_id: Option<String>,
+
+    /// Optional evidence pointer (selector or local path hint).
+    #[arg(long)]
+    pub evidence_pointer: Option<String>,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for deprecated `apm2 fac review comment` compatibility shim.
+#[derive(Debug, Args)]
+pub struct ReviewCommentArgs {
+    /// Pull request number.
+    #[arg(long)]
+    pub pr: Option<u32>,
+
+    /// Optional head SHA override (defaults to local PR identity SHA).
+    #[arg(long)]
+    pub sha: Option<String>,
+
+    /// Review dimension (`security` or `code-quality`).
     #[arg(long = "type", value_enum)]
     pub review_type: fac_review::ReviewCommentTypeArg,
 
-    /// Finding body text. If omitted, body is read from stdin.
+    /// Finding severity (`blocker`, `major`, `minor`, `nit`).
+    #[arg(long, value_enum)]
+    pub severity: fac_review::ReviewCommentSeverityArg,
+
+    /// Finding body text (when omitted, read from stdin).
     #[arg(long)]
     pub body: Option<String>,
 
@@ -766,36 +781,28 @@ pub struct ReviewCommentArgs {
     pub json: bool,
 }
 
-/// Arguments for `apm2 fac review decision`.
+/// Arguments for `apm2 fac review verdict`.
 #[derive(Debug, Args)]
-pub struct ReviewDecisionArgs {
+pub struct ReviewVerdictArgs {
     #[command(subcommand)]
-    pub subcommand: ReviewDecisionSubcommand,
+    pub subcommand: ReviewVerdictSubcommand,
 }
 
-/// Subcommands for `apm2 fac review decision`.
+/// Subcommands for `apm2 fac review verdict`.
 #[derive(Debug, Subcommand)]
-pub enum ReviewDecisionSubcommand {
-    /// Show SHA-bound decision state for all active review dimensions.
-    Show(ReviewDecisionShowArgs),
-    /// Set SHA-bound decision for one review dimension.
-    Set(ReviewDecisionSetArgs),
+pub enum ReviewVerdictSubcommand {
+    /// Show SHA-bound verdict state for all active review dimensions.
+    Show(ReviewVerdictShowArgs),
+    /// Set SHA-bound verdict for one review dimension.
+    Set(ReviewVerdictSetArgs),
 }
 
-/// Arguments for `apm2 fac review decision show`.
+/// Arguments for `apm2 fac review verdict show`.
 #[derive(Debug, Args)]
-pub struct ReviewDecisionShowArgs {
-    /// Repository in owner/repo format (used when --pr is provided).
-    #[arg(long, default_value = "guardian-intelligence/apm2")]
-    pub repo: String,
-
+pub struct ReviewVerdictShowArgs {
     /// Pull request number.
     #[arg(long)]
     pub pr: Option<u32>,
-
-    /// Pull request URL (alternative to --pr).
-    #[arg(long)]
-    pub pr_url: Option<String>,
 
     /// Optional head SHA override (defaults to PR head SHA).
     #[arg(long)]
@@ -806,38 +813,30 @@ pub struct ReviewDecisionShowArgs {
     pub json: bool,
 }
 
-/// Arguments for `apm2 fac review decision set`.
+/// Arguments for `apm2 fac review verdict set`.
 #[derive(Debug, Args)]
-pub struct ReviewDecisionSetArgs {
-    /// Repository in owner/repo format (used when --pr is provided).
-    #[arg(long, default_value = "guardian-intelligence/apm2")]
-    pub repo: String,
-
+pub struct ReviewVerdictSetArgs {
     /// Pull request number.
     #[arg(long)]
     pub pr: Option<u32>,
-
-    /// Pull request URL (alternative to --pr).
-    #[arg(long)]
-    pub pr_url: Option<String>,
 
     /// Optional head SHA override (defaults to PR head SHA).
     #[arg(long)]
     pub sha: Option<String>,
 
-    /// Decision dimension (`security` or `code-quality`).
+    /// Verdict dimension (`security` or `code-quality`).
     #[arg(long)]
     pub dimension: String,
 
-    /// Decision value (`approve` or `deny`).
+    /// Verdict value (`approve` or `deny`).
     #[arg(long, value_enum)]
-    pub decision: fac_review::DecisionValueArg,
+    pub verdict: fac_review::VerdictValueArg,
 
-    /// Optional free-form reason attached to this decision.
+    /// Optional free-form reason attached to this verdict.
     #[arg(long)]
     pub reason: Option<String>,
 
-    /// Keep prepared review input files under /tmp after decision is written.
+    /// Keep prepared review input files under /tmp after verdict is written.
     #[arg(long, default_value_t = false)]
     pub keep_prepared_inputs: bool,
 
@@ -893,17 +892,9 @@ pub struct ReviewTailArgs {
 /// Arguments for `apm2 fac review terminate`.
 #[derive(Debug, Args)]
 pub struct ReviewTerminateArgs {
-    /// Repository in owner/repo format.
-    #[arg(long, default_value = "guardian-intelligence/apm2")]
-    pub repo: String,
-
     /// Pull request number.
     #[arg(long)]
     pub pr: Option<u32>,
-
-    /// Pull request URL (alternative to --pr).
-    #[arg(long)]
-    pub pr_url: Option<String>,
 
     /// Reviewer type to terminate (security or quality).
     #[arg(long = "type", value_enum)]
@@ -1069,16 +1060,22 @@ pub fn run_fac(
     config_path: &Path,
 ) -> u8 {
     let json_output = cmd.json;
+    let machine_output = json_output || subcommand_requests_machine_output(&cmd.subcommand);
     let ledger_path = resolve_ledger_path(cmd.ledger_path.as_deref());
     let cas_path = resolve_cas_path(cmd.cas_path.as_deref());
 
     if !matches!(
         cmd.subcommand,
-        FacSubcommand::Gates(_) | FacSubcommand::Doctor(_) | FacSubcommand::Lane(_)
+        FacSubcommand::Gates(_)
+            | FacSubcommand::Doctor(_)
+            | FacSubcommand::Lane(_)
+            | FacSubcommand::Recover(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
-            eprintln!("WARNING: Could not auto-start daemon: {e}");
+            if !machine_output {
+                eprintln!("WARNING: Could not auto-start daemon: {e}");
+            }
         }
     }
 
@@ -1153,112 +1150,198 @@ pub fn run_fac(
         FacSubcommand::Lane(args) => match &args.subcommand {
             LaneSubcommand::Status(status_args) => run_lane_status(status_args, json_output),
         },
-        FacSubcommand::Push(args) => fac_review::run_push(
-            &args.repo,
-            &args.remote,
-            args.branch.as_deref(),
-            args.ticket.as_deref(),
-        ),
-        FacSubcommand::Restart(args) => fac_review::run_restart(
-            &args.repo,
-            args.pr,
-            args.pr_url.as_deref(),
-            args.force,
-            json_output,
-        ),
-        FacSubcommand::Logs(args) => fac_review::run_logs(
-            args.pr,
-            &args.repo,
-            args.selector_type.as_deref(),
-            args.selector.as_deref(),
-            json_output || args.json,
-        ),
+        FacSubcommand::Push(args) => {
+            let repo = match derive_fac_repo_or_exit(json_output) {
+                Ok(value) => value,
+                Err(code) => return code,
+            };
+            fac_review::run_push(
+                &repo,
+                &args.remote,
+                args.branch.as_deref(),
+                args.ticket.as_deref(),
+            )
+        },
+        FacSubcommand::Restart(args) => {
+            let repo = match derive_fac_repo_or_exit(json_output) {
+                Ok(value) => value,
+                Err(code) => return code,
+            };
+            fac_review::run_restart(&repo, args.pr, args.force, json_output)
+        },
+        FacSubcommand::Recover(args) => {
+            let output_json = json_output || args.json;
+            let repo = match derive_fac_repo_or_exit(output_json) {
+                Ok(value) => value,
+                Err(code) => return code,
+            };
+            fac_review::run_recover(&repo, args.pr, args.refresh_identity, output_json)
+        },
+        FacSubcommand::Logs(args) => {
+            let repo = match derive_fac_repo_or_exit(json_output || args.json) {
+                Ok(value) => value,
+                Err(code) => return code,
+            };
+            fac_review::run_logs(
+                args.pr,
+                &repo,
+                args.selector_type.as_deref(),
+                args.selector.as_deref(),
+                json_output || args.json,
+            )
+        },
         FacSubcommand::Pipeline(args) => {
-            fac_review::run_pipeline(&args.repo, &args.pr_url, args.pr, &args.sha)
+            let repo = match derive_fac_repo_or_exit(json_output) {
+                Ok(value) => value,
+                Err(code) => return code,
+            };
+            fac_review::run_pipeline(&repo, args.pr, &args.sha)
         },
         FacSubcommand::Review(args) => match &args.subcommand {
-            ReviewSubcommand::Run(run_args) => fac_review::run_review(
-                &run_args.pr_url,
-                run_args.review_type,
-                run_args.expected_head_sha.as_deref(),
-                run_args.force,
-                json_output,
-            ),
+            ReviewSubcommand::Run(run_args) => {
+                let repo = match derive_fac_repo_or_exit(json_output) {
+                    Ok(value) => value,
+                    Err(code) => return code,
+                };
+                fac_review::run_review(
+                    &repo,
+                    run_args.pr,
+                    run_args.review_type,
+                    run_args.expected_head_sha.as_deref(),
+                    run_args.force,
+                    json_output,
+                )
+            },
             ReviewSubcommand::Wait(wait_args) => fac_review::run_wait(
                 wait_args.pr,
-                wait_args.pr_url.as_deref(),
                 wait_args.review_type.map(ReviewStatusTypeArg::as_str),
                 wait_args.wait_for_sha.as_deref(),
                 wait_args.timeout_seconds,
                 wait_args.poll_interval_seconds,
                 matches!(wait_args.format, ReviewFormatArg::Json),
             ),
-            ReviewSubcommand::Dispatch(dispatch_args) => fac_review::run_dispatch(
-                &dispatch_args.pr_url,
-                dispatch_args.review_type,
-                dispatch_args.expected_head_sha.as_deref(),
-                dispatch_args.force,
-                json_output,
-            ),
+            ReviewSubcommand::Dispatch(dispatch_args) => {
+                let repo = match derive_fac_repo_or_exit(json_output) {
+                    Ok(value) => value,
+                    Err(code) => return code,
+                };
+                fac_review::run_dispatch(
+                    &repo,
+                    dispatch_args.pr,
+                    dispatch_args.review_type,
+                    dispatch_args.expected_head_sha.as_deref(),
+                    dispatch_args.force,
+                    json_output,
+                )
+            },
             ReviewSubcommand::Status(status_args) => fac_review::run_status(
                 status_args.pr,
-                status_args.pr_url.as_deref(),
                 status_args.review_type.map(ReviewStatusTypeArg::as_str),
                 json_output || status_args.json,
             ),
-            ReviewSubcommand::Prepare(prepare_args) => fac_review::run_prepare(
-                &prepare_args.repo,
-                prepare_args.pr,
-                prepare_args.pr_url.as_deref(),
-                prepare_args.sha.as_deref(),
-                json_output || prepare_args.json,
-            ),
-            ReviewSubcommand::Publish(publish_args) => fac_review::run_publish(
-                &publish_args.repo,
-                publish_args.pr,
-                publish_args.pr_url.as_deref(),
-                publish_args.sha.as_deref(),
-                publish_args.review_type,
-                &publish_args.body_file,
-                json_output || publish_args.json,
-            ),
-            ReviewSubcommand::Findings(findings_args) => fac_review::run_findings(
-                &findings_args.repo,
-                findings_args.pr,
-                findings_args.pr_url.as_deref(),
-                findings_args.sha.as_deref(),
-                findings_args.refresh,
-                json_output || findings_args.json,
-            ),
-            ReviewSubcommand::Comment(comment_args) => fac_review::run_comment(
-                &comment_args.repo,
-                comment_args.pr,
-                comment_args.pr_url.as_deref(),
-                comment_args.sha.as_deref(),
-                comment_args.severity,
-                comment_args.review_type,
-                comment_args.body.as_deref(),
-                json_output || comment_args.json,
-            ),
-            ReviewSubcommand::Decision(decision_args) => match &decision_args.subcommand {
-                ReviewDecisionSubcommand::Show(show_args) => fac_review::run_decision_show(
-                    &show_args.repo,
-                    show_args.pr,
-                    show_args.pr_url.as_deref(),
-                    show_args.sha.as_deref(),
-                    json_output || show_args.json,
-                ),
-                ReviewDecisionSubcommand::Set(set_args) => fac_review::run_decision_set(
-                    &set_args.repo,
-                    set_args.pr,
-                    set_args.pr_url.as_deref(),
-                    set_args.sha.as_deref(),
-                    &set_args.dimension,
-                    set_args.decision,
-                    set_args.reason.as_deref(),
-                    set_args.keep_prepared_inputs,
-                    json_output || set_args.json,
-                ),
+            ReviewSubcommand::Prepare(prepare_args) => {
+                let repo = match derive_fac_repo_or_exit(json_output || prepare_args.json) {
+                    Ok(value) => value,
+                    Err(code) => return code,
+                };
+                fac_review::run_prepare(
+                    &repo,
+                    prepare_args.pr,
+                    prepare_args.sha.as_deref(),
+                    json_output || prepare_args.json,
+                )
+            },
+            ReviewSubcommand::Publish(publish_args) => {
+                let repo = match derive_fac_repo_or_exit(json_output || publish_args.json) {
+                    Ok(value) => value,
+                    Err(code) => return code,
+                };
+                fac_review::run_publish(
+                    &repo,
+                    publish_args.pr,
+                    publish_args.sha.as_deref(),
+                    publish_args.review_type,
+                    &publish_args.body_file,
+                    json_output || publish_args.json,
+                )
+            },
+            ReviewSubcommand::Finding(finding_args) => {
+                let repo = match derive_fac_repo_or_exit(json_output || finding_args.json) {
+                    Ok(value) => value,
+                    Err(code) => return code,
+                };
+                fac_review::run_finding(
+                    &repo,
+                    finding_args.pr,
+                    finding_args.sha.as_deref(),
+                    finding_args.review_type,
+                    finding_args.severity,
+                    &finding_args.summary,
+                    finding_args.risk.as_deref(),
+                    finding_args.impact.as_deref(),
+                    finding_args.location.as_deref(),
+                    finding_args.reviewer_id.as_deref(),
+                    finding_args.evidence_pointer.as_deref(),
+                    json_output || finding_args.json,
+                )
+            },
+            ReviewSubcommand::Comment(comment_args) => {
+                let repo = match derive_fac_repo_or_exit(json_output || comment_args.json) {
+                    Ok(value) => value,
+                    Err(code) => return code,
+                };
+                fac_review::run_comment_compat(
+                    &repo,
+                    comment_args.pr,
+                    comment_args.sha.as_deref(),
+                    comment_args.review_type,
+                    comment_args.severity,
+                    comment_args.body.as_deref(),
+                    json_output || comment_args.json,
+                )
+            },
+            ReviewSubcommand::Findings(findings_args) => {
+                let repo = match derive_fac_repo_or_exit(json_output || findings_args.json) {
+                    Ok(value) => value,
+                    Err(code) => return code,
+                };
+                fac_review::run_findings(
+                    &repo,
+                    findings_args.pr,
+                    findings_args.sha.as_deref(),
+                    findings_args.refresh,
+                    json_output || findings_args.json,
+                )
+            },
+            ReviewSubcommand::Verdict(verdict_args) => match &verdict_args.subcommand {
+                ReviewVerdictSubcommand::Show(show_args) => {
+                    let repo = match derive_fac_repo_or_exit(json_output || show_args.json) {
+                        Ok(value) => value,
+                        Err(code) => return code,
+                    };
+                    fac_review::run_verdict_show(
+                        &repo,
+                        show_args.pr,
+                        show_args.sha.as_deref(),
+                        json_output || show_args.json,
+                    )
+                },
+                ReviewVerdictSubcommand::Set(set_args) => {
+                    let repo = match derive_fac_repo_or_exit(json_output || set_args.json) {
+                        Ok(value) => value,
+                        Err(code) => return code,
+                    };
+                    fac_review::run_verdict_set(
+                        &repo,
+                        set_args.pr,
+                        set_args.sha.as_deref(),
+                        &set_args.dimension,
+                        set_args.verdict,
+                        set_args.reason.as_deref(),
+                        set_args.keep_prepared_inputs,
+                        json_output || set_args.json,
+                    )
+                },
             },
             ReviewSubcommand::Project(project_args) => fac_review::run_project(
                 project_args.pr,
@@ -1273,15 +1356,60 @@ pub fn run_fac(
             ReviewSubcommand::Tail(tail_args) => {
                 fac_review::run_tail(tail_args.lines, tail_args.follow)
             },
-            ReviewSubcommand::Terminate(term_args) => fac_review::run_terminate(
-                &term_args.repo,
-                term_args.pr,
-                term_args.pr_url.as_deref(),
-                term_args.review_type.as_str(),
-                json_output || term_args.json,
-            ),
+            ReviewSubcommand::Terminate(term_args) => {
+                let repo = match derive_fac_repo_or_exit(json_output || term_args.json) {
+                    Ok(value) => value,
+                    Err(code) => return code,
+                };
+                fac_review::run_terminate(
+                    &repo,
+                    term_args.pr,
+                    term_args.review_type.as_str(),
+                    json_output || term_args.json,
+                )
+            },
         },
         FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
+    }
+}
+
+const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool {
+    match subcommand {
+        FacSubcommand::Doctor(args) => args.json,
+        FacSubcommand::Recover(args) => args.json,
+        FacSubcommand::Logs(args) => args.json,
+        FacSubcommand::Review(args) => match &args.subcommand {
+            ReviewSubcommand::Wait(wait_args) => matches!(wait_args.format, ReviewFormatArg::Json),
+            ReviewSubcommand::Status(status_args) => status_args.json,
+            ReviewSubcommand::Prepare(prepare_args) => prepare_args.json,
+            ReviewSubcommand::Publish(publish_args) => publish_args.json,
+            ReviewSubcommand::Finding(finding_args) => finding_args.json,
+            ReviewSubcommand::Comment(comment_args) => comment_args.json,
+            ReviewSubcommand::Findings(findings_args) => findings_args.json,
+            ReviewSubcommand::Verdict(verdict_args) => match &verdict_args.subcommand {
+                ReviewVerdictSubcommand::Show(show_args) => show_args.json,
+                ReviewVerdictSubcommand::Set(set_args) => set_args.json,
+            },
+            ReviewSubcommand::Project(project_args) => {
+                matches!(project_args.format, ReviewFormatArg::Json)
+            },
+            ReviewSubcommand::Terminate(term_args) => term_args.json,
+            ReviewSubcommand::Run(_)
+            | ReviewSubcommand::Dispatch(_)
+            | ReviewSubcommand::Tail(_) => false,
+        },
+        FacSubcommand::Gates(_)
+        | FacSubcommand::Work(_)
+        | FacSubcommand::RoleLaunch(_)
+        | FacSubcommand::Episode(_)
+        | FacSubcommand::Receipt(_)
+        | FacSubcommand::Context(_)
+        | FacSubcommand::Resume(_)
+        | FacSubcommand::Lane(_)
+        | FacSubcommand::Push(_)
+        | FacSubcommand::Restart(_)
+        | FacSubcommand::Pipeline(_)
+        | FacSubcommand::Pr(_) => false,
     }
 }
 
@@ -2637,6 +2765,17 @@ fn constant_time_hash_eq(computed: &[u8], expected: &[u8]) -> bool {
     bool::from(computed.ct_eq(expected))
 }
 
+fn derive_fac_repo_or_exit(json_output: bool) -> Result<String, u8> {
+    fac_review::derive_repo().map_err(|err| {
+        output_error(
+            json_output,
+            "fac_repo_derivation_failed",
+            &format!("failed to derive repository from git origin: {err}"),
+            exit_codes::GENERIC_ERROR,
+        )
+    })
+}
+
 /// Output an error in the appropriate format.
 fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> u8 {
     if json_output {
@@ -2696,6 +2835,11 @@ mod tests {
 
         #[command(subcommand)]
         subcommand: FacSubcommand,
+    }
+
+    fn assert_fac_command_parses(args: &[&str]) {
+        FacLogsCliHarness::try_parse_from(args.iter().copied())
+            .unwrap_or_else(|err| panic!("failed to parse `{}`: {err}", args.join(" ")));
     }
 
     #[test]
@@ -3071,5 +3215,113 @@ mod tests {
             },
             other => panic!("expected logs subcommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_subcommand_machine_output_detection_for_nested_json() {
+        let review_status = FacSubcommand::Review(ReviewArgs {
+            subcommand: ReviewSubcommand::Status(ReviewStatusArgs {
+                pr: Some(615),
+                review_type: None,
+                json: true,
+            }),
+        });
+        assert!(subcommand_requests_machine_output(&review_status));
+
+        let recover = FacSubcommand::Recover(RecoverArgs {
+            pr: Some(615),
+            refresh_identity: false,
+            json: true,
+        });
+        assert!(subcommand_requests_machine_output(&recover));
+
+        let restart = FacSubcommand::Restart(RestartArgs {
+            pr: Some(615),
+            force: false,
+        });
+        assert!(!subcommand_requests_machine_output(&restart));
+    }
+
+    #[test]
+    fn test_review_prompt_command_sequence_parses_with_verdict_surface() {
+        assert_fac_command_parses(&["fac", "review", "prepare", "--json"]);
+        assert_fac_command_parses(&[
+            "fac",
+            "review",
+            "publish",
+            "--type",
+            "security",
+            "--body-file",
+            "/tmp/security_findings.md",
+            "--json",
+        ]);
+        assert_fac_command_parses(&[
+            "fac",
+            "review",
+            "publish",
+            "--type",
+            "code-quality",
+            "--body-file",
+            "/tmp/code_quality_findings.md",
+            "--json",
+        ]);
+        assert_fac_command_parses(&["fac", "review", "findings", "--json"]);
+        assert_fac_command_parses(&[
+            "fac",
+            "review",
+            "finding",
+            "--type",
+            "security",
+            "--severity",
+            "major",
+            "--summary",
+            "Unsafe deserialization path",
+            "--risk",
+            "RCE",
+            "--impact",
+            "Compromise of CI runner",
+            "--location",
+            "src/parser.rs:88",
+            "--json",
+        ]);
+        assert_fac_command_parses(&[
+            "fac",
+            "review",
+            "comment",
+            "--type",
+            "code-quality",
+            "--severity",
+            "minor",
+            "--body",
+            "Legacy compatibility shim still accepted",
+            "--json",
+        ]);
+        assert_fac_command_parses(&["fac", "review", "findings", "--refresh", "--json"]);
+        assert_fac_command_parses(&[
+            "fac",
+            "review",
+            "verdict",
+            "set",
+            "--dimension",
+            "security",
+            "--verdict",
+            "approve",
+            "--reason",
+            "PASS for 0123456789abcdef0123456789abcdef01234567",
+            "--json",
+        ]);
+        assert_fac_command_parses(&[
+            "fac",
+            "review",
+            "verdict",
+            "set",
+            "--dimension",
+            "code-quality",
+            "--verdict",
+            "deny",
+            "--reason",
+            "BLOCKER/MAJOR findings for 0123456789abcdef0123456789abcdef01234567",
+            "--json",
+        ]);
     }
 }

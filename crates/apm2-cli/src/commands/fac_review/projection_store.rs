@@ -1,14 +1,14 @@
 //! Local authoritative projection storage for FAC review CLI flows.
 //!
 //! This module provides a local-first state surface under
-//! `~/.apm2/fac_projection`. GitHub reads are treated as temporary fallback and
-//! can be disabled via `APM2_FAC_GH_READ_FALLBACK=0`.
+//! `~/.apm2/fac_projection`.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use fs2::FileExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +22,6 @@ const BRANCH_HINT_SCHEMA: &str = "apm2.fac.projection.branch_hint.v1";
 const ISSUE_COMMENTS_SCHEMA: &str = "apm2.fac.projection.issue_comments.v1";
 const REVIEWER_SCHEMA: &str = "apm2.fac.projection.reviewer.v1";
 const PR_BODY_SCHEMA: &str = "apm2.fac.projection.pr_body.v1";
-const GH_READ_FALLBACK_ENV: &str = "APM2_FAC_GH_READ_FALLBACK";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -77,20 +76,6 @@ struct PrBodySnapshot {
     updated_at: String,
 }
 
-pub(super) fn gh_read_fallback_enabled() -> bool {
-    let Some(raw) = std::env::var_os(GH_READ_FALLBACK_ENV) else {
-        return true;
-    };
-    let value = raw.to_string_lossy().trim().to_ascii_lowercase();
-    !matches!(value.as_str(), "0" | "false" | "no" | "off")
-}
-
-pub(super) fn gh_read_fallback_disabled_error(operation: &str) -> String {
-    format!(
-        "{operation} requires local projection data; GitHub read fallback is disabled (set {GH_READ_FALLBACK_ENV}=1 temporarily to allow bootstrap)"
-    )
-}
-
 fn projection_root() -> Result<PathBuf, String> {
     Ok(apm2_home_dir()?.join(PROJECTION_ROOT_DIR))
 }
@@ -124,16 +109,16 @@ fn issue_comments_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, Stri
     Ok(pr_dir(owner_repo, pr_number)?.join("issue_comments.json"))
 }
 
+fn issue_comments_lock_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
+    Ok(pr_dir(owner_repo, pr_number)?.join("issue_comments.lock"))
+}
+
 fn reviewer_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
     Ok(pr_dir(owner_repo, pr_number)?.join("reviewer.json"))
 }
 
 fn pr_body_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
     Ok(pr_dir(owner_repo, pr_number)?.join("pr_body_snapshot.json"))
-}
-
-fn fallback_reads_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
-    Ok(pr_dir(owner_repo, pr_number)?.join("fallback_reads.ndjson"))
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
@@ -294,6 +279,27 @@ pub(super) fn upsert_issue_comment_cache_entry(
     body: &str,
     reviewer_login: &str,
 ) -> Result<(), String> {
+    let lock_path = issue_comments_lock_path(owner_repo, pr_number)?;
+    ensure_parent_dir(&lock_path)?;
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| {
+            format!(
+                "failed to open issue comment cache lock {}: {err}",
+                lock_path.display()
+            )
+        })?;
+    lock_file.lock_exclusive().map_err(|err| {
+        format!(
+            "failed to acquire issue comment cache lock {}: {err}",
+            lock_path.display()
+        )
+    })?;
+
     let mut comments =
         load_issue_comments_cache::<serde_json::Value>(owner_repo, pr_number)?.unwrap_or_default();
     let entry = serde_json::json!({
@@ -313,7 +319,9 @@ pub(super) fn upsert_issue_comment_cache_entry(
         comments.push(entry);
     }
 
-    save_issue_comments_cache(owner_repo, pr_number, &comments)
+    let write_result = save_issue_comments_cache(owner_repo, pr_number, &comments);
+    drop(lock_file);
+    write_result
 }
 
 pub(super) fn save_trusted_reviewer_id(
@@ -369,26 +377,6 @@ pub(super) fn load_pr_body_snapshot(
         return Ok(None);
     };
     Ok(Some(payload.body))
-}
-
-pub(super) fn record_fallback_read(
-    owner_repo: &str,
-    pr_number: u32,
-    operation: &str,
-) -> Result<(), String> {
-    let path = fallback_reads_path(owner_repo, pr_number)?;
-    ensure_parent_dir(&path)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|err| format!("failed to open fallback log {}: {err}", path.display()))?;
-    let line = serde_json::json!({
-        "ts": now_iso8601(),
-        "operation": operation,
-    });
-    writeln!(file, "{line}")
-        .map_err(|err| format!("failed to append fallback log {}: {err}", path.display()))
 }
 
 fn current_branch() -> Result<String, String> {

@@ -92,6 +92,16 @@ pub(super) fn update_issue_comment(
     Ok(())
 }
 
+#[allow(dead_code)]
+pub(super) fn patch_issue_comment_body(
+    owner_repo: &str,
+    comment_id: u64,
+    body: &str,
+) -> Result<(), String> {
+    update_issue_comment(owner_repo, comment_id, body)
+}
+
+#[allow(dead_code)]
 pub(super) fn fetch_pr_body(owner_repo: &str, pr_number: u32) -> Result<String, String> {
     let output = Command::new("gh")
         .arg("pr")

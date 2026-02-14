@@ -7,6 +7,7 @@ use apm2_daemon::telemetry::reviewer::{
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 
+use super::projection_store;
 use super::state::{
     ReviewRunStateLoad, load_review_run_state, read_pulse_file, review_run_state_path,
     with_review_state_shared,
@@ -15,6 +16,7 @@ use super::state::{
 use super::types::ReviewKind;
 use super::types::{
     MAX_RESTART_ATTEMPTS, ProjectionError, ProjectionStatus, ReviewStateFile, entry_pr_number,
+    is_verdict_finalized_agent_stop_reason, validate_expected_head_sha,
 };
 
 // ── Projection state predicates ─────────────────────────────────────────────
@@ -405,6 +407,16 @@ fn render_state_code_from_run_state(
                     }
                 },
                 "failed" | "crashed" => {
+                    if state
+                        .terminal_reason
+                        .as_deref()
+                        .is_some_and(is_verdict_finalized_agent_stop_reason)
+                    {
+                        return format!(
+                            "done:{model}/{backend}:r{}:{head_short}",
+                            state.restart_count
+                        );
+                    }
                     let reason = state
                         .terminal_reason
                         .clone()
@@ -684,6 +696,37 @@ pub fn run_project_inner(
     })
 }
 
+// ── Projection preflight helpers (GitHub I/O boundary) ──────────────────────
+
+pub fn fetch_pr_head_sha_local(pr_number: u32) -> Result<String, String> {
+    let owner_repo = super::target::derive_repo_from_origin()?;
+
+    // When on a branch associated with this PR, git rev-parse HEAD is
+    // authoritative.
+    if let Ok(branch) = super::target::current_branch()
+        && let Some(identity) = projection_store::load_branch_identity(&owner_repo, &branch)?
+        && identity.pr_number == pr_number
+        && let Ok(workspace_sha) = super::target::current_head_sha()
+    {
+        validate_expected_head_sha(&workspace_sha)?;
+        return Ok(workspace_sha.to_ascii_lowercase());
+    }
+
+    // Cross-branch fallback: trust projection store cache.
+    if let Some(identity) = projection_store::load_pr_identity(&owner_repo, pr_number)? {
+        validate_expected_head_sha(&identity.head_sha)?;
+        return Ok(identity.head_sha.to_ascii_lowercase());
+    }
+
+    if let Some(value) = super::state::resolve_local_review_head_sha(pr_number) {
+        return Ok(value);
+    }
+
+    Err(format!(
+        "missing local head SHA for PR #{pr_number}; run local FAC push/dispatch first or pass --sha explicitly"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::DateTime;
@@ -695,7 +738,7 @@ mod tests {
     fn sample_run_state(status: ReviewRunStatus, started_at: &str) -> ReviewRunState {
         ReviewRunState {
             run_id: "pr441-security-s2-01234567".to_string(),
-            pr_url: "https://github.com/example/repo/pull/441".to_string(),
+            owner_repo: "example/repo".to_string(),
             pr_number: 441,
             head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
             review_type: "security".to_string(),
