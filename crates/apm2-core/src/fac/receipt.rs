@@ -1011,6 +1011,12 @@ pub fn deserialize_job_receipt(bytes: &[u8]) -> Result<FacJobReceiptV1, FacJobRe
     Ok(receipt)
 }
 
+/// Compute the v1 content hash (does **not** include `unsafe_direct`).
+///
+/// Use [`compute_job_receipt_content_hash_v2`] for new receipts. This
+/// function exists for backwards-compatible verification of receipts
+/// produced by workers using `FacJobReceiptV1Builder::try_build`.
+#[must_use]
 pub fn compute_job_receipt_content_hash(receipt: &FacJobReceiptV1) -> String {
     let canonical = receipt.canonical_bytes();
     let mut hasher = blake3::Hasher::new();

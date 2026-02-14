@@ -18,9 +18,10 @@ use apm2_core::fac::{
     ChannelBoundaryTrace, DenialReasonCode, FacBroker, FacJobOutcome, FacJobReceiptV1,
     FacJobReceiptV1Builder, FacJobSpecV1, FacJobSpecV1Builder, FacPolicyV1, JobSource,
     LaneProfileV1, MAX_JOB_RECEIPT_SIZE, MAX_JOB_SPEC_SIZE, MAX_POLICY_SIZE,
-    QueueAdmissionTrace as JobQueueAdmissionTrace, compute_job_receipt_content_hash_v2,
-    compute_policy_hash, compute_test_env, deserialize_job_receipt, deserialize_policy,
-    parse_policy_hash, persist_content_addressed_receipt_v2, persist_policy,
+    QueueAdmissionTrace as JobQueueAdmissionTrace, compute_job_receipt_content_hash,
+    compute_job_receipt_content_hash_v2, compute_policy_hash, compute_test_env,
+    deserialize_job_receipt, deserialize_policy, parse_policy_hash,
+    persist_content_addressed_receipt_v2, persist_policy,
 };
 use apm2_daemon::telemetry::is_cgroup_v2_available;
 use blake3;
@@ -839,12 +840,15 @@ fn wait_for_matching_receipt(
 
                     // BLOCKER-1c: Verify receipt content hash matches
                     // canonical bytes to detect post-creation tampering.
-                    let expected_hash = compute_job_receipt_content_hash_v2(&receipt);
-                    if receipt.content_hash != expected_hash {
+                    // Accept both v2 (preferred, includes unsafe_direct) and
+                    // v1 (backwards-compatible with existing worker receipts).
+                    let expected_v2 = compute_job_receipt_content_hash_v2(&receipt);
+                    let expected_v1 = compute_job_receipt_content_hash(&receipt);
+                    if receipt.content_hash != expected_v2 && receipt.content_hash != expected_v1 {
                         return Err(format!(
                             "receipt content hash mismatch: receipt says {}, \
-                             recomputed {}. Possible tampering.",
-                            receipt.content_hash, expected_hash
+                             recomputed v2={}, v1={}. Possible tampering.",
+                            receipt.content_hash, expected_v2, expected_v1
                         ));
                     }
 
