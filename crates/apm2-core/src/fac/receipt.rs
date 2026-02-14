@@ -290,6 +290,9 @@ pub struct FacJobReceiptV1 {
     pub job_id: String,
     /// BLAKE3 digest of the job spec.
     pub job_spec_digest: String,
+    /// Optional policy hash used for policy binding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_hash: Option<String>,
     /// Outcome.
     pub outcome: FacJobOutcome,
     /// Stable denial reason for non-completed outcomes.
@@ -336,6 +339,14 @@ impl FacJobReceiptV1 {
 
         bytes.extend_from_slice(&(self.job_spec_digest.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.job_spec_digest.as_bytes());
+
+        if let Some(policy_hash) = &self.policy_hash {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&(policy_hash.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(policy_hash.as_bytes());
+        } else {
+            bytes.push(0u8);
+        }
 
         let outcome_str = serde_json::to_string(&self.outcome).unwrap_or_default();
         bytes.extend_from_slice(&(outcome_str.len() as u32).to_be_bytes());
@@ -454,6 +465,20 @@ impl FacJobReceiptV1 {
                 "job_spec_digest must be 'b3-256:<64 hex>'".to_string(),
             ));
         }
+        if let Some(policy_hash) = &self.policy_hash {
+            if policy_hash.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "policy_hash",
+                    actual: policy_hash.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if !is_valid_b3_256_digest(policy_hash) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "policy_hash must be 'b3-256:<64 hex>'".to_string(),
+                ));
+            }
+        }
         if self.content_hash.len() > MAX_STRING_LENGTH {
             return Err(FacJobReceiptError::StringTooLong {
                 field: "content_hash",
@@ -558,6 +583,7 @@ pub struct FacJobReceiptV1Builder {
     outcome: Option<FacJobOutcome>,
     denial_reason: Option<DenialReasonCode>,
     reason: Option<String>,
+    policy_hash: Option<String>,
     rfc0028_channel_boundary: Option<ChannelBoundaryTrace>,
     eio29_queue_admission: Option<QueueAdmissionTrace>,
     eio29_budget_admission: Option<BudgetAdmissionTrace>,
@@ -598,6 +624,13 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = Some(reason.into());
+        self
+    }
+
+    /// Sets the policy hash.
+    #[must_use]
+    pub fn policy_hash(mut self, policy_hash: impl Into<String>) -> Self {
+        self.policy_hash = Some(policy_hash.into());
         self
     }
 
@@ -667,6 +700,21 @@ impl FacJobReceiptV1Builder {
             return Err(FacJobReceiptError::InvalidData(
                 "job_spec_digest must be 'b3-256:<64 hex>'".to_string(),
             ));
+        }
+
+        if let Some(policy_hash) = &self.policy_hash {
+            if policy_hash.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "policy_hash",
+                    actual: policy_hash.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if !is_valid_b3_256_digest(policy_hash) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "policy_hash must be 'b3-256:<64 hex>'".to_string(),
+                ));
+            }
         }
 
         if job_spec_digest.len() > MAX_STRING_LENGTH {
@@ -771,6 +819,7 @@ impl FacJobReceiptV1Builder {
             receipt_id,
             job_id,
             job_spec_digest,
+            policy_hash: self.policy_hash,
             outcome,
             denial_reason: self.denial_reason,
             reason,
