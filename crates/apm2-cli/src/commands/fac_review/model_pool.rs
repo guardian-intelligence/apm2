@@ -152,16 +152,16 @@ pub fn backend_tool_available(backend: ReviewBackend) -> bool {
         ReviewBackend::Gemini => "gemini",
         ReviewBackend::ClaudeCode => "claude",
     };
-    // Probe for the binary by attempting to run it with `--version`.
-    // If the OS cannot locate the executable, the error kind is NotFound.
-    // This avoids passing strings through `sh -lc` shell parsing.
-    Command::new(tool)
-        .arg("--version")
+    // Check if the binary is locatable via `which`. This avoids passing
+    // untrusted strings through `sh -lc` while remaining portable across
+    // tools that may not implement `--version`.
+    Command::new("which")
+        .arg(tool)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok()
+        .is_ok_and(|s| s.success())
 }
 
 // ── Provider slots ──────────────────────────────────────────────────────────

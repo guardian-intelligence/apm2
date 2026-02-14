@@ -358,16 +358,16 @@ fn terminate_pending_dispatch_entry(entry: &PendingDispatchEntry) -> Result<(), 
 // ── Tool availability ───────────────────────────────────────────────────────
 
 fn command_available(command: &str) -> bool {
-    // Probe for the binary by attempting to run it with `--version`.
-    // If the OS cannot locate the executable, the error kind is NotFound.
-    // This avoids passing untrusted strings through `sh -lc`.
-    Command::new(command)
-        .arg("--version")
+    // Check if the binary is locatable via `which`. This avoids passing
+    // untrusted strings through `sh -lc` while remaining portable across
+    // tools that may not implement `--version`.
+    Command::new("which")
+        .arg(command)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok()
+        .is_ok_and(|s| s.success())
 }
 
 fn strip_deleted_executable_suffix(path: &Path) -> Option<PathBuf> {
