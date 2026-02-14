@@ -108,6 +108,7 @@ pub mod role_conformance;
 mod role_spec;
 mod role_spec_v2;
 pub mod safe_rmtree;
+pub mod scheduler_state;
 pub mod selection_policy;
 pub mod serde_helpers;
 pub mod taint;
