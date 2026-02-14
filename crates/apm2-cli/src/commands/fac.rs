@@ -2700,9 +2700,17 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
 
     // Perform safe deletion of workspace, target, and logs
     let lane_dir = manager.lane_dir(&args.lane_id);
-    let lanes_root = lane_dir
-        .parent()
-        .expect("lane_dir has parent (lanes/ directory)");
+    let Some(lanes_root) = lane_dir.parent() else {
+        return output_error(
+            json_output,
+            "lane_error",
+            &format!(
+                "Lane directory {} has no parent directory",
+                lane_dir.display()
+            ),
+            exit_codes::GENERIC_ERROR,
+        );
+    };
 
     let subdirs = ["workspace", "target", "logs"];
     let mut total_files: u64 = 0;
@@ -2748,12 +2756,15 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
 
     // If any deletions were refused, mark lane as CORRUPT
     if !refused_receipts.is_empty() {
-        // Attempt to write a CORRUPT lease
         let corrupt_reason = refused_receipts
             .iter()
             .map(|r| r.reason.as_str())
             .collect::<Vec<_>>()
             .join("; ");
+
+        // Persist CORRUPT state to the lease file so that lane_status
+        // reflects the corruption even after restart.
+        persist_corrupt_lease(&manager, &args.lane_id, &corrupt_reason, json_output);
 
         if json_output {
             let response = serde_json::json!({
@@ -2817,6 +2828,45 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
     }
 
     exit_codes::SUCCESS
+}
+
+/// Persist a CORRUPT lease to the lane directory so that `lane_status`
+/// reports CORRUPT even after restart.
+///
+/// This is best-effort: if the lease write fails, a warning is printed
+/// but the overall CORRUPT error flow continues (fail-closed: the lane
+/// is already in a bad state).
+fn persist_corrupt_lease(manager: &LaneManager, lane_id: &str, reason: &str, json_output: bool) {
+    let lane_dir = manager.lane_dir(lane_id);
+    // Truncate reason to avoid exceeding string length limits.
+    let truncated_reason = if reason.len() > 200 {
+        format!("{}...", &reason[..197])
+    } else {
+        reason.to_string()
+    };
+
+    match LaneLeaseV1::new(
+        lane_id,
+        &truncated_reason,
+        0, // pid=0: no running process
+        LaneState::Corrupt,
+        "1970-01-01T00:00:00Z", // sentinel timestamp
+        "corrupt",
+        "corrupt",
+    ) {
+        Ok(lease) => {
+            if let Err(e) = lease.persist(&lane_dir) {
+                if !json_output {
+                    eprintln!("  Warning: failed to persist CORRUPT lease for lane {lane_id}: {e}");
+                }
+            }
+        },
+        Err(e) => {
+            if !json_output {
+                eprintln!("  Warning: failed to create CORRUPT lease for lane {lane_id}: {e}");
+            }
+        },
+    }
 }
 
 /// Best-effort process kill using SIGTERM then SIGKILL.

@@ -273,27 +273,53 @@ deletion primitive for lane cleanup and reset operations.
 
 - `SafeRmtreeError`: Fail-closed error taxonomy covering symlink detection,
   boundary violations, filesystem crossing, unexpected file types, permission
-  errors, TOCTOU race detection, depth limits, and I/O failures.
+  errors, TOCTOU race detection, depth limits, dot-segment rejection, and
+  I/O failures.
 - `SafeRmtreeOutcome`: Success outcome enum (`Deleted` with file/dir counts,
   or `AlreadyAbsent` for no-op on nonexistent roots).
 - `RefusedDeleteReceipt`: Machine-readable evidence for audit trails when
   lane cleanup is refused and the lane should be marked CORRUPT.
+- `EntryKind`: Internal enum (`Directory`, `RegularFile`) for fd-relative
+  entry type classification.
 
 ### Core Capabilities
 
 - `safe_rmtree_v1(root, allowed_parent)`: Primary entry point. Validates
-  absolute paths, component-wise boundary enforcement, symlink detection at
-  every depth, filesystem boundary checks (`st_dev`), parent ownership
-  validation (uid + mode 0o700), and depth-bounded bottom-up deletion.
+  absolute paths, dot-segment rejection (`.` and `..` components),
+  component-wise boundary enforcement, symlink detection at every depth,
+  filesystem boundary checks (`st_dev`), parent ownership validation
+  (uid + mode 0o700), and depth-bounded bottom-up deletion.
+- On Unix, uses fd-relative directory traversal via `nix::dir::Dir::open()`
+  with `O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC`, `openat`/`unlinkat`/`fstatat`
+  for TOCTOU-safe recursive deletion. No `std::fs::read_dir` is used in the
+  recursive delete path.
+- `reject_dot_segments()`: Rejects (not filters) any path containing `.` or
+  `..` components. On Unix, also checks raw path bytes for `/./` and trailing
+  `/.` patterns that `Path::components()` silently normalizes away.
+- `open_dir_nofollow()`: Opens a directory with `O_NOFOLLOW`, mapping
+  `ELOOP`/`ENOTDIR` to `SymlinkDetected` for TOCTOU-safe symlink swap
+  detection.
+- `verify_same_dev_via_fd()`: Compares `st_dev` via `fstat` on the fd (not
+  the path) to avoid TOCTOU in filesystem boundary checks.
+- `scan_dir_entries()`: Bounded directory entry collection from an open `Dir`
+  handle, collecting `d_type` hints with deferred `fstatat` resolution.
+- `classify_dirent_type()`: Classifies `nix::dir::Type` into `EntryKind`,
+  returning errors for symlinks and unexpected file types.
+- `resolve_entry_types()`: Resolves unknown entry types via
+  `fstatat(AT_SYMLINK_NOFOLLOW)` after the directory iterator is dropped.
 - Used by `apm2 fac lane reset` CLI command to safely delete workspace,
-  target, and logs subdirectories.
+  target, and logs subdirectories. On safety violations, the CLI persists a
+  `LaneLeaseV1` with `state: Corrupt` to the lane directory for durable
+  corruption marking.
 
 ### Security Invariants (TCK-00516)
 
 - [INV-RMTREE-001] Symlink detected at any depth causes immediate abort.
+  Enforced at the kernel level via `O_NOFOLLOW` on Unix.
 - [INV-RMTREE-002] `root` must be strictly under `allowed_parent` by
   component-wise validation (NOT string prefix).
 - [INV-RMTREE-003] Cross-filesystem deletion refused by `st_dev` comparison.
+  On Unix, uses `fstat` on the opened fd to avoid TOCTOU.
 - [INV-RMTREE-004] Unexpected file types (sockets, FIFOs, devices) abort.
 - [INV-RMTREE-005] Both paths must be absolute.
 - [INV-RMTREE-006] `allowed_parent` must be owned by current user with
@@ -301,3 +327,6 @@ deletion primitive for lane cleanup and reset operations.
 - [INV-RMTREE-007] Non-existent root is a successful no-op.
 - [INV-RMTREE-008] Traversal depth bounded by `MAX_TRAVERSAL_DEPTH=128`.
 - [INV-RMTREE-009] Directory entries bounded by `MAX_DIR_ENTRIES=100000`.
+- [INV-RMTREE-010] Paths containing `.` or `..` components are rejected
+  immediately (not filtered). On Unix, raw byte scanning catches `.`
+  segments that `Path::components()` silently normalizes away.

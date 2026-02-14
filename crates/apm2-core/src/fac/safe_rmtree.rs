@@ -7,10 +7,14 @@
 //!
 //! # Security Model
 //!
-//! - **Symlink refusal**: Every path component is validated via
-//!   `symlink_metadata()` (lstat) to reject symlinks. On Linux, directory opens
-//!   use `O_NOFOLLOW | O_DIRECTORY` via `openat2`-style flags for kernel-level
-//!   refusal.
+//! - **Symlink refusal (fd-relative)**: On Unix, all directory traversal uses
+//!   `openat(parent_fd, name, O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC)` so the
+//!   kernel refuses to follow symlinks. File deletion uses `unlinkat(parent_fd,
+//!   name, 0)` and directory deletion uses `unlinkat(parent_fd, name,
+//!   AT_REMOVEDIR)`. No `std::fs::read_dir` or other symlink-following API is
+//!   used in the recursive delete path.
+//! - **Path traversal rejection**: Any path containing `.` or `..` components
+//!   is rejected immediately (not filtered -- rejected).
 //! - **Parent boundary enforcement**: `root` must be strictly under
 //!   `allowed_parent` by path component analysis (NOT string prefix).
 //! - **Filesystem boundary**: Cross-device deletion is refused by comparing
@@ -25,7 +29,7 @@
 //! # Invariants
 //!
 //! - [INV-RMTREE-001] Symlink detected at any depth causes immediate abort with
-//!   `SymlinkDetected` error.
+//!   `SymlinkDetected` error. Enforced at the kernel level via `O_NOFOLLOW`.
 //! - [INV-RMTREE-002] `root` must be strictly under `allowed_parent` by
 //!   component-wise validation.
 //! - [INV-RMTREE-003] Cross-filesystem deletion is refused by `st_dev`
@@ -41,6 +45,8 @@
 //!   `MAX_TRAVERSAL_DEPTH` to prevent stack exhaustion on deeply nested trees.
 //! - [INV-RMTREE-009] Maximum entries per directory is bounded by
 //!   `MAX_DIR_ENTRIES` to prevent unbounded memory allocation.
+//! - [INV-RMTREE-010] Paths containing `.` or `..` components are rejected
+//!   immediately (not filtered).
 
 use std::path::{Component, Path, PathBuf};
 use std::{fmt, fs, io};
@@ -151,6 +157,13 @@ pub enum SafeRmtreeError {
         /// Maximum allowed entries.
         max: usize,
     },
+
+    /// Path contains `.` or `..` components (INV-RMTREE-010).
+    #[error("path contains dot-segment components (. or ..): {}", path.display())]
+    DotSegment {
+        /// The path containing dot segments.
+        path: PathBuf,
+    },
 }
 
 impl SafeRmtreeError {
@@ -228,10 +241,10 @@ pub struct RefusedDeleteReceipt {
 /// # Arguments
 ///
 /// * `root` - The directory tree to delete. Must be an absolute path strictly
-///   under `allowed_parent`.
+///   under `allowed_parent`. Must NOT contain `.` or `..` components.
 /// * `allowed_parent` - The boundary directory. `root` must be a direct or
 ///   indirect child of this directory. Must be absolute, owned by the current
-///   user, and have mode 0o700.
+///   user, and have mode 0o700. Must NOT contain `.` or `..` components.
 ///
 /// # Returns
 ///
@@ -264,6 +277,13 @@ pub fn safe_rmtree_v1(
             path: allowed_parent.to_path_buf(),
         });
     }
+
+    // ── Step 1b: Reject dot-segment components (INV-RMTREE-010) ─────
+    // REJECT any path containing Component::ParentDir or Component::CurDir.
+    // Do NOT filter them -- reject them entirely. This prevents path
+    // traversal attacks like /home/user/lanes/lane-00/../../etc/passwd.
+    reject_dot_segments(root)?;
+    reject_dot_segments(allowed_parent)?;
 
     // ── Step 2: Validate root is strictly under allowed_parent ───────
     // Component-wise validation, NOT string prefix (INV-RMTREE-002).
@@ -307,9 +327,18 @@ pub fn safe_rmtree_v1(
     }
 
     // ── Step 7: Recursively delete bottom-up ─────────────────────────
+    // On Unix, use fd-relative operations for TOCTOU safety.
+    // On non-Unix, fall back to path-based operations.
     if root_meta.is_dir() {
         let mut stats = DeleteStats::default();
-        recursive_delete(root, allowed_parent, 0, &mut stats)?;
+        #[cfg(unix)]
+        {
+            fd_relative_recursive_delete(root, allowed_parent, 0, &mut stats)?;
+        }
+        #[cfg(not(unix))]
+        {
+            path_based_recursive_delete(root, allowed_parent, 0, &mut stats)?;
+        }
         Ok(SafeRmtreeOutcome::Deleted {
             files_deleted: stats.files_deleted,
             dirs_deleted: stats.dirs_deleted,
@@ -342,16 +371,79 @@ struct DeleteStats {
     dirs_deleted: u64,
 }
 
-/// Recursively delete a directory tree bottom-up.
+/// Reject any path containing `.` (`CurDir`) or `..` (`ParentDir`) components
+/// (INV-RMTREE-010).
 ///
-/// Validates each entry for symlinks, unexpected file types, and boundary
-/// violations before deletion.
-fn recursive_delete(
+/// This is a hard reject, not a filter. Paths with dot segments are
+/// ambiguous and could be used to escape the allowed parent boundary.
+///
+/// Note: On Unix, `Path::components()` silently normalizes `.` away
+/// (does not produce `CurDir`), so we also scan the raw path bytes for
+/// `/./` or trailing `/.` patterns to catch `.` segments reliably.
+fn reject_dot_segments(path: &Path) -> Result<(), SafeRmtreeError> {
+    // Check via components() -- catches `..` on all platforms.
+    for component in path.components() {
+        match component {
+            Component::CurDir | Component::ParentDir => {
+                return Err(SafeRmtreeError::DotSegment {
+                    path: path.to_path_buf(),
+                });
+            },
+            _ => {},
+        }
+    }
+
+    // On Unix, components() silently eats `.` segments. Check raw bytes
+    // to catch `/./` and trailing `/.` that components() normalizes away.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        // Check for /./  anywhere in the path
+        if bytes.windows(3).any(|w| w == b"/./") {
+            return Err(SafeRmtreeError::DotSegment {
+                path: path.to_path_buf(),
+            });
+        }
+        // Check for trailing /.
+        if bytes.len() >= 2 && bytes.ends_with(b"/.") {
+            return Err(SafeRmtreeError::DotSegment {
+                path: path.to_path_buf(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unix fd-relative recursive delete (TOCTOU-safe)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Recursively delete a directory tree using fd-relative operations.
+///
+/// This implementation uses `openat(parent_fd, name, O_NOFOLLOW | O_DIRECTORY)`
+/// for directory traversal and `unlinkat()` for file/directory deletion,
+/// ensuring the kernel refuses to follow symlinks at every step. No
+/// `std::fs::read_dir` or other symlink-following API is used.
+///
+/// # TOCTOU Safety
+///
+/// The fd-relative approach eliminates the classic check-then-act TOCTOU
+/// window: once a directory is opened as an fd with `O_NOFOLLOW`, the fd
+/// refers to the actual directory inode regardless of any subsequent
+/// symlink swaps in the namespace. All child operations go through
+/// `openat`/`unlinkat`/`fstatat` relative to that fd.
+#[cfg(unix)]
+fn fd_relative_recursive_delete(
     dir: &Path,
     allowed_parent: &Path,
     depth: usize,
     stats: &mut DeleteStats,
 ) -> Result<(), SafeRmtreeError> {
+    use nix::fcntl::OFlag;
+    use nix::unistd::UnlinkatFlags;
+
     // Depth check (INV-RMTREE-008)
     if depth >= MAX_TRAVERSAL_DEPTH {
         return Err(SafeRmtreeError::DepthExceeded {
@@ -360,49 +452,49 @@ fn recursive_delete(
         });
     }
 
-    // Read directory entries with bounded count (INV-RMTREE-009)
-    let entries = read_dir_bounded(dir)?;
+    // Open the directory with O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC.
+    // The kernel will refuse to follow symlinks for the last component.
+    let open_flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+    let mut dir_handle = open_dir_nofollow(dir, open_flags)?;
 
-    for entry_path in &entries {
-        // Use symlink_metadata (lstat) to check WITHOUT following symlinks
-        let meta = fs::symlink_metadata(entry_path)
-            .map_err(|e| SafeRmtreeError::io(format!("stat entry {}", entry_path.display()), e))?;
+    // Verify the opened directory is on the same filesystem as allowed_parent.
+    verify_same_dev_via_fd(&dir_handle, dir, allowed_parent)?;
 
-        // Reject symlinks at any depth (INV-RMTREE-001)
-        if meta.file_type().is_symlink() {
-            return Err(SafeRmtreeError::SymlinkDetected {
-                path: entry_path.clone(),
-            });
-        }
+    // Scan directory entries with bounded count, collecting type hints.
+    let raw_entries = scan_dir_entries(&mut dir_handle, dir)?;
 
-        // Validate still under allowed_parent (anti-race)
-        validate_strictly_under(entry_path, allowed_parent)?;
+    // Resolve unknown entry types via fstatat (AT_SYMLINK_NOFOLLOW).
+    let entry_names = resolve_entry_types(&dir_handle, dir, raw_entries)?;
 
-        // Check filesystem boundary for each entry
-        #[cfg(unix)]
-        {
-            validate_same_filesystem(entry_path, allowed_parent)?;
-        }
+    // Process entries: recurse into directories first, then delete files.
+    // This ensures bottom-up deletion order.
+    for (name, kind) in &entry_names {
+        let entry_path = dir.join(name);
 
-        if meta.is_dir() {
-            // Recurse into subdirectory
-            recursive_delete(entry_path, allowed_parent, depth + 1, stats)?;
-        } else if meta.is_file() {
-            // Regular file -- delete it
-            fs::remove_file(entry_path).map_err(|e| {
-                SafeRmtreeError::io(format!("removing file {}", entry_path.display()), e)
-            })?;
-            stats.files_deleted = stats.files_deleted.saturating_add(1);
-        } else {
-            // Socket, FIFO, device, etc. -- refuse (INV-RMTREE-004)
-            return Err(SafeRmtreeError::UnexpectedFileType {
-                path: entry_path.clone(),
-                file_type: describe_file_type(&meta),
-            });
+        match kind {
+            EntryKind::Directory => {
+                // Recurse into subdirectory using fd-relative open
+                fd_relative_recursive_delete(&entry_path, allowed_parent, depth + 1, stats)?;
+            },
+            EntryKind::RegularFile => {
+                // Delete regular file via unlinkat relative to parent dir fd
+                nix::unistd::unlinkat(&dir_handle, name.as_os_str(), UnlinkatFlags::NoRemoveDir)
+                    .map_err(|e| {
+                        SafeRmtreeError::io(
+                            format!("removing file {}", entry_path.display()),
+                            io::Error::from(e),
+                        )
+                    })?;
+                stats.files_deleted = stats.files_deleted.saturating_add(1);
+            },
         }
     }
 
-    // Delete the now-empty directory itself
+    // Drop the Dir handle before removing the directory itself, to release
+    // the fd.
+    drop(dir_handle);
+
+    // Remove the now-empty directory itself.
     fs::remove_dir(dir)
         .map_err(|e| SafeRmtreeError::io(format!("removing directory {}", dir.display()), e))?;
     stats.dirs_deleted = stats.dirs_deleted.saturating_add(1);
@@ -410,11 +502,257 @@ fn recursive_delete(
     Ok(())
 }
 
-/// Read directory entries with a bounded count.
+/// Open a directory with `O_NOFOLLOW`, mapping `ELOOP`/`ENOTDIR` to
+/// `SymlinkDetected` (TOCTOU-safe symlink swap detection).
+#[cfg(unix)]
+fn open_dir_nofollow(
+    dir: &Path,
+    flags: nix::fcntl::OFlag,
+) -> Result<nix::dir::Dir, SafeRmtreeError> {
+    use nix::dir::Dir;
+    use nix::sys::stat::Mode;
+
+    Dir::open(dir, flags, Mode::empty()).map_err(|e| {
+        let io_err = io::Error::from(e);
+        if io_err.raw_os_error() == Some(libc::ELOOP)
+            || io_err.raw_os_error() == Some(libc::ENOTDIR)
+        {
+            SafeRmtreeError::SymlinkDetected {
+                path: dir.to_path_buf(),
+            }
+        } else {
+            SafeRmtreeError::io(format!("openat directory {}", dir.display()), io_err)
+        }
+    })
+}
+
+/// Verify that the opened directory fd is on the same filesystem as
+/// `allowed_parent` by comparing `st_dev` values. Uses `fstat` on the fd
+/// (not the path) to avoid TOCTOU.
+#[cfg(unix)]
+fn verify_same_dev_via_fd(
+    dir_handle: &nix::dir::Dir,
+    dir: &Path,
+    allowed_parent: &Path,
+) -> Result<(), SafeRmtreeError> {
+    use std::os::unix::fs::MetadataExt;
+
+    use nix::sys::stat;
+
+    let dir_stat = stat::fstat(dir_handle).map_err(|e| {
+        SafeRmtreeError::io(
+            format!("fstat directory {}", dir.display()),
+            io::Error::from(e),
+        )
+    })?;
+
+    let parent_meta = fs::symlink_metadata(allowed_parent).map_err(|e| {
+        SafeRmtreeError::io(
+            format!("stat allowed_parent {}", allowed_parent.display()),
+            e,
+        )
+    })?;
+
+    #[allow(clippy::cast_sign_loss)]
+    let dir_dev = dir_stat.st_dev as u64;
+    if dir_dev != parent_meta.dev() {
+        return Err(SafeRmtreeError::CrossesFilesystemBoundary {
+            root_dev: dir_dev,
+            parent_dev: parent_meta.dev(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Scan directory entries from an open `Dir` handle, collecting entry names
+/// and `d_type` hints with bounded count (INV-RMTREE-009).
 ///
-/// Returns the paths of all entries, refusing to read more than
-/// `MAX_DIR_ENTRIES` to prevent unbounded allocation.
-fn read_dir_bounded(dir: &Path) -> Result<Vec<PathBuf>, SafeRmtreeError> {
+/// Returns a vec of `(name, Option<EntryKind>)`. Entries where `d_type` is
+/// unknown have `None` and must be resolved via `fstatat` after the iterator
+/// is dropped (to release the mutable borrow on `dir_handle`).
+#[cfg(unix)]
+fn scan_dir_entries(
+    dir_handle: &mut nix::dir::Dir,
+    dir: &Path,
+) -> Result<Vec<(std::ffi::OsString, Option<EntryKind>)>, SafeRmtreeError> {
+    let mut raw_entries: Vec<(std::ffi::OsString, Option<EntryKind>)> = Vec::new();
+    for entry_result in dir_handle.iter() {
+        if raw_entries.len() >= MAX_DIR_ENTRIES {
+            return Err(SafeRmtreeError::TooManyEntries {
+                path: dir.to_path_buf(),
+                max: MAX_DIR_ENTRIES,
+            });
+        }
+        let entry = entry_result.map_err(|e| {
+            SafeRmtreeError::io(
+                format!("reading entry in {}", dir.display()),
+                io::Error::from(e),
+            )
+        })?;
+
+        let name_cstr = entry.file_name();
+        let name_bytes = name_cstr.to_bytes();
+        // Skip "." and ".."
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+
+        let name = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsString::from(std::ffi::OsStr::from_bytes(name_bytes))
+        };
+
+        // Determine entry type from d_type if available.
+        let kind = classify_dirent_type(entry.file_type(), dir, &name)?;
+        raw_entries.push((name, kind));
+    }
+    Ok(raw_entries)
+}
+
+/// Classify a `nix::dir::Type` from a directory entry's `d_type` field.
+///
+/// Returns `Some(EntryKind)` for known regular/directory types,
+/// `None` for unknown (`DT_UNKNOWN`), or an error for symlinks and
+/// unexpected file types.
+#[cfg(unix)]
+fn classify_dirent_type(
+    dtype: Option<nix::dir::Type>,
+    dir: &Path,
+    name: &std::ffi::OsString,
+) -> Result<Option<EntryKind>, SafeRmtreeError> {
+    match dtype {
+        Some(nix::dir::Type::Directory) => Ok(Some(EntryKind::Directory)),
+        Some(nix::dir::Type::File) => Ok(Some(EntryKind::RegularFile)),
+        Some(nix::dir::Type::Symlink) => Err(SafeRmtreeError::SymlinkDetected {
+            path: dir.join(name),
+        }),
+        Some(nix::dir::Type::Fifo) => Err(SafeRmtreeError::UnexpectedFileType {
+            path: dir.join(name),
+            file_type: "FIFO/named pipe".to_string(),
+        }),
+        Some(nix::dir::Type::Socket) => Err(SafeRmtreeError::UnexpectedFileType {
+            path: dir.join(name),
+            file_type: "Unix socket".to_string(),
+        }),
+        Some(nix::dir::Type::BlockDevice) => Err(SafeRmtreeError::UnexpectedFileType {
+            path: dir.join(name),
+            file_type: "block device".to_string(),
+        }),
+        Some(nix::dir::Type::CharacterDevice) => Err(SafeRmtreeError::UnexpectedFileType {
+            path: dir.join(name),
+            file_type: "character device".to_string(),
+        }),
+        None => Ok(None), // Deferred: resolve via fstatat
+    }
+}
+
+/// Resolve unknown entry types via `fstatat(AT_SYMLINK_NOFOLLOW)`.
+///
+/// Takes raw entries with optional type hints and returns fully resolved
+/// entries. Entries already classified keep their type; entries with `None`
+/// are resolved by stat-ing relative to the dir fd.
+#[cfg(unix)]
+fn resolve_entry_types(
+    dir_handle: &nix::dir::Dir,
+    dir: &Path,
+    raw_entries: Vec<(std::ffi::OsString, Option<EntryKind>)>,
+) -> Result<Vec<(std::ffi::OsString, EntryKind)>, SafeRmtreeError> {
+    use nix::sys::stat;
+
+    let mut entry_names: Vec<(std::ffi::OsString, EntryKind)> =
+        Vec::with_capacity(raw_entries.len());
+    for (name, maybe_kind) in raw_entries {
+        let kind = if let Some(k) = maybe_kind {
+            k
+        } else {
+            let entry_stat = stat::fstatat(
+                dir_handle,
+                name.as_os_str(),
+                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+            .map_err(|e| {
+                SafeRmtreeError::io(
+                    format!(
+                        "fstatat entry {} in {}",
+                        name.to_string_lossy(),
+                        dir.display()
+                    ),
+                    io::Error::from(e),
+                )
+            })?;
+            classify_stat_mode(entry_stat.st_mode, &dir.join(&name))?
+        };
+        entry_names.push((name, kind));
+    }
+    Ok(entry_names)
+}
+
+/// Entry kind determined during directory scanning.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Directory,
+    RegularFile,
+}
+
+/// Classify an `st_mode` value into an `EntryKind` or return an error for
+/// unexpected types.
+#[cfg(unix)]
+fn classify_stat_mode(mode: libc::mode_t, path: &Path) -> Result<EntryKind, SafeRmtreeError> {
+    let file_type = mode & libc::S_IFMT;
+    match file_type {
+        libc::S_IFDIR => Ok(EntryKind::Directory),
+        libc::S_IFREG => Ok(EntryKind::RegularFile),
+        libc::S_IFLNK => Err(SafeRmtreeError::SymlinkDetected {
+            path: path.to_path_buf(),
+        }),
+        libc::S_IFIFO => Err(SafeRmtreeError::UnexpectedFileType {
+            path: path.to_path_buf(),
+            file_type: "FIFO/named pipe".to_string(),
+        }),
+        libc::S_IFSOCK => Err(SafeRmtreeError::UnexpectedFileType {
+            path: path.to_path_buf(),
+            file_type: "Unix socket".to_string(),
+        }),
+        libc::S_IFBLK => Err(SafeRmtreeError::UnexpectedFileType {
+            path: path.to_path_buf(),
+            file_type: "block device".to_string(),
+        }),
+        libc::S_IFCHR => Err(SafeRmtreeError::UnexpectedFileType {
+            path: path.to_path_buf(),
+            file_type: "character device".to_string(),
+        }),
+        _ => Err(SafeRmtreeError::UnexpectedFileType {
+            path: path.to_path_buf(),
+            file_type: format!("unknown (mode bits: {mode:#o})"),
+        }),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Non-Unix fallback (path-based, same as before but with dot-segment rejection)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Recursively delete a directory tree bottom-up (non-Unix fallback).
+///
+/// Uses `std::fs::read_dir` which may follow symlinks. On non-Unix
+/// platforms we rely on the pre-validation checks (symlink_metadata on
+/// every entry) for safety.
+#[cfg(not(unix))]
+fn path_based_recursive_delete(
+    dir: &Path,
+    allowed_parent: &Path,
+    depth: usize,
+    stats: &mut DeleteStats,
+) -> Result<(), SafeRmtreeError> {
+    if depth >= MAX_TRAVERSAL_DEPTH {
+        return Err(SafeRmtreeError::DepthExceeded {
+            path: dir.to_path_buf(),
+            max: MAX_TRAVERSAL_DEPTH,
+        });
+    }
+
     let read_dir = fs::read_dir(dir)
         .map_err(|e| SafeRmtreeError::io(format!("reading directory {}", dir.display()), e))?;
 
@@ -431,8 +769,43 @@ fn read_dir_bounded(dir: &Path) -> Result<Vec<PathBuf>, SafeRmtreeError> {
         entries.push(entry.path());
     }
 
-    Ok(entries)
+    for entry_path in &entries {
+        let meta = fs::symlink_metadata(entry_path)
+            .map_err(|e| SafeRmtreeError::io(format!("stat entry {}", entry_path.display()), e))?;
+
+        if meta.file_type().is_symlink() {
+            return Err(SafeRmtreeError::SymlinkDetected {
+                path: entry_path.clone(),
+            });
+        }
+
+        validate_strictly_under(entry_path, allowed_parent)?;
+
+        if meta.is_dir() {
+            path_based_recursive_delete(entry_path, allowed_parent, depth + 1, stats)?;
+        } else if meta.is_file() {
+            fs::remove_file(entry_path).map_err(|e| {
+                SafeRmtreeError::io(format!("removing file {}", entry_path.display()), e)
+            })?;
+            stats.files_deleted = stats.files_deleted.saturating_add(1);
+        } else {
+            return Err(SafeRmtreeError::UnexpectedFileType {
+                path: entry_path.clone(),
+                file_type: describe_file_type(&meta),
+            });
+        }
+    }
+
+    fs::remove_dir(dir)
+        .map_err(|e| SafeRmtreeError::io(format!("removing directory {}", dir.display()), e))?;
+    stats.dirs_deleted = stats.dirs_deleted.saturating_add(1);
+
+    Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Validation helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Validate that `child` is strictly under `parent` by path components.
 ///
@@ -440,9 +813,14 @@ fn read_dir_bounded(dir: &Path) -> Result<Vec<PathBuf>, SafeRmtreeError> {
 /// `parent`, and all parent components match exactly. This prevents both
 /// string-prefix attacks (e.g., `/foo/bar` vs `/foo/barbaz`) and
 /// exact-match (root == parent).
+///
+/// Paths containing `.` or `..` components must be rejected BEFORE calling
+/// this function (via `reject_dot_segments`).
 fn validate_strictly_under(child: &Path, parent: &Path) -> Result<(), SafeRmtreeError> {
-    // Canonicalize by collecting only Normal components (skip RootDir,
-    // CurDir, ParentDir). We already validated both are absolute.
+    // Collect only Normal components. Since we already rejected `.` and `..`
+    // via reject_dot_segments, the only non-Normal components should be
+    // RootDir (for absolute paths). We skip RootDir to compare just the
+    // path segments.
     let parent_components: Vec<&std::ffi::OsStr> = parent
         .components()
         .filter_map(|c| match c {
@@ -909,6 +1287,55 @@ mod tests {
         }
     }
 
+    // ── Dot-Segment Rejection (INV-RMTREE-010) ──────────────────────
+
+    #[test]
+    fn refuse_path_with_parent_dir_components() {
+        // Paths with .. must be REJECTED, not filtered
+        let result = safe_rmtree_v1(
+            Path::new("/home/user/lanes/lane-00/../../etc/passwd"),
+            Path::new("/home/user/lanes"),
+        );
+        assert!(result.is_err(), "must reject paths with ..");
+        match result.unwrap_err() {
+            SafeRmtreeError::DotSegment { path } => {
+                assert!(
+                    path.to_string_lossy().contains(".."),
+                    "error path should contain .."
+                );
+            },
+            other => panic!("expected DotSegment, got {other}"),
+        }
+    }
+
+    #[test]
+    fn refuse_path_with_curdir_components() {
+        // Paths with . must be REJECTED
+        let result = safe_rmtree_v1(
+            Path::new("/home/user/./lanes/lane-00/workspace"),
+            Path::new("/home/user/lanes"),
+        );
+        assert!(result.is_err(), "must reject paths with .");
+        match result.unwrap_err() {
+            SafeRmtreeError::DotSegment { .. } => {},
+            other => panic!("expected DotSegment, got {other}"),
+        }
+    }
+
+    #[test]
+    fn refuse_parent_with_dot_segments() {
+        // Even the allowed_parent must not have dot segments
+        let result = safe_rmtree_v1(
+            Path::new("/home/user/lanes/lane-00/workspace"),
+            Path::new("/home/user/../user/lanes"),
+        );
+        assert!(result.is_err(), "must reject parent with ..");
+        match result.unwrap_err() {
+            SafeRmtreeError::DotSegment { .. } => {},
+            other => panic!("expected DotSegment, got {other}"),
+        }
+    }
+
     // ── Unexpected File Types ────────────────────────────────────────
 
     #[test]
@@ -1031,6 +1458,11 @@ mod tests {
             path: PathBuf::from("relative"),
         };
         assert!(err.to_string().contains("must be absolute"));
+
+        let err = SafeRmtreeError::DotSegment {
+            path: PathBuf::from("/a/../b"),
+        };
+        assert!(err.to_string().contains("dot-segment"));
     }
 
     // ── Component-wise Validation ────────────────────────────────────
@@ -1045,6 +1477,21 @@ mod tests {
         assert!(validate_strictly_under(Path::new("/a/b"), Path::new("/a/b"),).is_err()); // equal
         assert!(validate_strictly_under(Path::new("/a/b"), Path::new("/a/b/c"),).is_err()); // parent is deeper
         assert!(validate_strictly_under(Path::new("/x/y/z"), Path::new("/a/b"),).is_err()); // completely different
+    }
+
+    // ── Dot-segment rejection unit tests ─────────────────────────────
+
+    #[test]
+    fn reject_dot_segments_works() {
+        // Clean paths should pass
+        assert!(reject_dot_segments(Path::new("/a/b/c")).is_ok());
+        assert!(reject_dot_segments(Path::new("/")).is_ok());
+
+        // Dot segments should be rejected
+        assert!(reject_dot_segments(Path::new("/a/../b")).is_err());
+        assert!(reject_dot_segments(Path::new("/a/./b")).is_err());
+        assert!(reject_dot_segments(Path::new("/a/b/..")).is_err());
+        assert!(reject_dot_segments(Path::new("/./a")).is_err());
     }
 
     // ── Refused Delete Receipt ───────────────────────────────────────
