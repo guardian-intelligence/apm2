@@ -32,11 +32,9 @@ mod merge_conflicts;
 mod model_pool;
 mod orchestrator;
 mod pipeline;
-mod pr_body;
 mod prepare;
 mod projection;
 mod projection_store;
-mod publish;
 mod push;
 mod restart;
 mod state;
@@ -61,15 +59,14 @@ pub use finding::{
 };
 pub use lifecycle::VerdictValueArg;
 use projection::{projection_state_done, projection_state_failed, run_project_inner};
-pub use publish::ReviewPublishTypeArg;
 use state::{
     list_review_pr_numbers, load_review_run_state, read_pulse_file, review_run_state_path,
 };
 pub use types::ReviewRunType;
 use types::{
-    DispatchSummary, ProjectionStatus, ReviewKind, TERMINAL_MANUAL_TERMINATION_DECISION_BOUND,
-    TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED, TERMINATE_TIMEOUT,
-    is_verdict_finalized_agent_stop_reason, validate_expected_head_sha,
+    DispatchReviewResult, DispatchSummary, ProjectionStatus, ReviewKind,
+    TERMINAL_MANUAL_TERMINATION_DECISION_BOUND, TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED,
+    TERMINATE_TIMEOUT, is_verdict_finalized_agent_stop_reason, validate_expected_head_sha,
 };
 
 use crate::exit_codes::codes as exit_codes;
@@ -608,6 +605,7 @@ pub fn run_finding(
     review_type: ReviewFindingTypeArg,
     severity: ReviewFindingSeverityArg,
     summary: &str,
+    details: Option<&str>,
     risk: Option<&str>,
     impact: Option<&str>,
     location: Option<&str>,
@@ -622,6 +620,7 @@ pub fn run_finding(
         review_type,
         severity,
         summary,
+        details,
         risk,
         impact,
         location,
@@ -694,35 +693,6 @@ pub fn run_prepare(repo: &str, pr_number: Option<u32>, sha: Option<&str>, json_o
             if json_output {
                 let payload = serde_json::json!({
                     "error": "fac_review_prepare_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
-pub fn run_publish(
-    repo: &str,
-    pr_number: Option<u32>,
-    sha: Option<&str>,
-    review_type: ReviewPublishTypeArg,
-    body_file: &Path,
-    json_output: bool,
-) -> u8 {
-    match publish::run_publish(repo, pr_number, sha, review_type, body_file, json_output) {
-        Ok(code) => code,
-        Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_publish_failed",
                     "message": err,
                 });
                 println!(
@@ -1233,7 +1203,7 @@ fn run_dispatch_inner(
     expected_head_sha: Option<&str>,
     force: bool,
 ) -> Result<DispatchSummary, String> {
-    let current_head_sha = projection::fetch_pr_head_sha_local(pr_number)?;
+    let current_head_sha = projection::fetch_pr_head_sha_authoritative(owner_repo, pr_number)?;
     if let Some(identity) = projection_store::load_pr_identity(owner_repo, pr_number)? {
         validate_expected_head_sha(&identity.head_sha)?;
         if !identity.head_sha.eq_ignore_ascii_case(&current_head_sha) {
@@ -1273,18 +1243,34 @@ fn run_dispatch_inner(
             dispatch_epoch,
             force,
         )?;
-        if !result.mode.eq_ignore_ascii_case("joined")
-            && lifecycle::register_reviewer_dispatch(
+        if !result.mode.eq_ignore_ascii_case("joined") {
+            let run_id = result
+                .run_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "non-joined {} dispatch returned empty run_id (mode={})",
+                        kind.as_str(),
+                        result.mode
+                    )
+                })?;
+            let token = lifecycle::register_reviewer_dispatch(
                 owner_repo,
                 pr_number,
                 &current_head_sha,
                 kind.as_str(),
-                result.run_id.as_deref(),
+                Some(run_id),
                 result.pid,
-                None,
-            )?
-            .is_some()
-        {
+                result.pid.and_then(state::get_process_start_time),
+            )?;
+            if token.is_none() {
+                return Err(format!(
+                    "lifecycle registration failed for {} review: register_reviewer_dispatch returned none",
+                    kind.as_str()
+                ));
+            }
             eprintln!(
                 "fac dispatch: registered {} reviewer slot for PR #{} sha {}",
                 kind.as_str(),
@@ -1302,6 +1288,23 @@ fn run_dispatch_inner(
         dispatch_epoch,
         results,
     })
+}
+
+pub(super) fn dispatch_reviews_with_lifecycle(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    force: bool,
+) -> Result<Vec<DispatchReviewResult>, String> {
+    validate_expected_head_sha(head_sha)?;
+    let summary = run_dispatch_inner(
+        owner_repo,
+        pr_number,
+        ReviewRunType::All,
+        Some(head_sha),
+        force,
+    )?;
+    Ok(summary.results)
 }
 
 // ── Status / Tail ───────────────────────────────────────────────────────────

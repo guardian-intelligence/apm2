@@ -131,16 +131,12 @@ fn resolve_selector_zoom(
                         )
                     })?;
 
-            let content_ref = if finding_record.raw_evidence_pointer.trim().is_empty() {
-                let bundle_path = findings_store::findings_bundle_path(
-                    &finding.owner_repo,
-                    finding.pr,
-                    &finding.sha,
-                )?;
-                format!("{}#{}", bundle_path.display(), finding_record.finding_id)
-            } else {
-                finding_record.raw_evidence_pointer.clone()
-            };
+            let bundle_path = findings_store::findings_bundle_path(
+                &finding.owner_repo,
+                finding.pr,
+                &finding.sha,
+            )?;
+            let content_ref = format!("{}#{}", bundle_path.display(), finding_record.finding_id);
 
             let content_digest = if finding_record.evidence_digest.trim().is_empty() {
                 sha256_hex(finding_record.summary.as_bytes())

@@ -1,10 +1,13 @@
 //! Verdict projection and decision-authority helpers.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
@@ -14,7 +17,7 @@ use super::types::{
     TerminationAuthority, allocate_local_comment_id, normalize_decision_dimension, now_iso8601,
     sanitize_for_path, validate_expected_head_sha,
 };
-use super::{github_projection, projection_store};
+use super::{findings_store, github_projection, projection_store};
 use crate::exit_codes::codes as exit_codes;
 
 const DECISION_MARKER: &str = "apm2-review-verdict:v1";
@@ -203,15 +206,24 @@ pub fn persist_verdict_projection(
     let expected_author_login = resolve_expected_author_login(&owner_repo, resolved_pr)?;
     let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
     let home = super::types::apm2_home_dir()?;
+    let _projection_lock = acquire_projection_lock_for_home(&home, &owner_repo, resolved_pr)?;
 
     let mut record = load_decision_projection_for_home(&home, &owner_repo, resolved_pr, &head_sha)?
         .unwrap_or_else(|| {
-            let seeded_comment_id =
-                load_latest_projection_for_home(&home, &owner_repo, resolved_pr)
-                    .ok()
-                    .flatten()
-                    .map(|value| value.decision_comment_id)
-                    .filter(|value| *value > 0);
+            let seeded_comment_id = {
+                let latest_projection =
+                    load_latest_projection_for_home(&home, &owner_repo, resolved_pr)
+                        .ok()
+                        .flatten()
+                        .map(|value| value.decision_comment_id)
+                        .filter(|value| *value > 0);
+                let latest_cached_comment = max_cached_issue_comment_id(&owner_repo, resolved_pr);
+                match (latest_projection, latest_cached_comment) {
+                    (Some(lhs), Some(rhs)) => Some(lhs.max(rhs)),
+                    (Some(value), None) | (None, Some(value)) => Some(value),
+                    (None, None) => None,
+                }
+            };
             DecisionProjectionRecord {
                 schema: PROJECTION_VERDICT_SCHEMA.to_string(),
                 owner_repo: owner_repo.to_ascii_lowercase(),
@@ -333,11 +345,14 @@ fn project_decision_comment(
     record: &DecisionProjectionRecord,
     payload: &DecisionComment,
 ) -> Result<(u64, String), String> {
-    let body = render_decision_comment_body(payload)?;
+    let body = render_decision_comment_body(owner_repo, pr_number, &record.head_sha, payload)?;
 
     let mut comment_id = record.decision_comment_id;
     if comment_id == 0 {
-        comment_id = allocate_local_comment_id(pr_number, None);
+        comment_id = allocate_local_comment_id(
+            pr_number,
+            max_cached_issue_comment_id(owner_repo, pr_number),
+        );
     }
 
     let mut comment_url = if record.decision_comment_url.trim().is_empty() {
@@ -402,6 +417,38 @@ fn projection_record_sha_path_for_home(
     head_sha: &str,
 ) -> PathBuf {
     projection_sha_dir_for_home(home, owner_repo, pr_number, head_sha).join(VERDICT_PROJECTION_FILE)
+}
+
+fn projection_lock_path_for_home(home: &Path, owner_repo: &str, pr_number: u32) -> PathBuf {
+    projection_pr_dir_for_home(home, owner_repo, pr_number).join("verdict_projection.lock")
+}
+
+fn acquire_projection_lock_for_home(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<std::fs::File, String> {
+    let lock_path = projection_lock_path_for_home(home, owner_repo, pr_number);
+    super::types::ensure_parent_dir(&lock_path)?;
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| {
+            format!(
+                "failed to open verdict projection lock {}: {err}",
+                lock_path.display()
+            )
+        })?;
+    lock_file.lock_exclusive().map_err(|err| {
+        format!(
+            "failed to acquire verdict projection lock {}: {err}",
+            lock_path.display()
+        )
+    })?;
+    Ok(lock_file)
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
@@ -488,6 +535,18 @@ fn load_latest_projection_for_home(
     ))
 }
 
+fn max_cached_issue_comment_id(owner_repo: &str, pr_number: u32) -> Option<u64> {
+    projection_store::load_issue_comments_cache::<serde_json::Value>(owner_repo, pr_number)
+        .ok()
+        .flatten()
+        .and_then(|comments| {
+            comments
+                .into_iter()
+                .filter_map(|value| value.get("id").and_then(serde_json::Value::as_u64))
+                .max()
+        })
+}
+
 fn load_decision_projection_for_home(
     home: &Path,
     owner_repo: &str,
@@ -524,15 +583,19 @@ fn save_decision_projection_for_home(
     record: &DecisionProjectionRecord,
 ) -> Result<(), String> {
     validate_expected_head_sha(&record.head_sha)?;
-    let root_path = projection_record_path_for_home(home, &record.owner_repo, record.pr_number);
     let sha_path = projection_record_sha_path_for_home(
         home,
         &record.owner_repo,
         record.pr_number,
         &record.head_sha,
     );
-    write_json_atomic(&root_path, record)?;
-    write_json_atomic(&sha_path, record)
+    let root_path = projection_record_path_for_home(home, &record.owner_repo, record.pr_number);
+    write_json_atomic(&sha_path, record)?;
+    if let Err(err) = write_json_atomic(&root_path, record) {
+        let _ = fs::remove_file(&sha_path);
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn build_show_report_from_record(
@@ -544,8 +607,7 @@ fn build_show_report_from_record(
 
     for dimension in ACTIVE_DIMENSIONS {
         let Some(entry) = record.dimensions.get(dimension) else {
-            fail_closed = true;
-            errors.push(format!("missing decision for dimension `{dimension}`"));
+            // Missing dimensions are normal while verdicts are still pending.
             continue;
         };
         if normalize_decision_value(&entry.decision).is_none() {
@@ -593,11 +655,11 @@ fn missing_projection_report(pr_number: u32, head_sha: &str) -> DecisionShowRepo
         pr_number,
         head_sha: head_sha.to_string(),
         overall_decision: "pending".to_string(),
-        fail_closed: true,
+        fail_closed: false,
         dimensions: build_unknown_dimension_views(head_sha),
         source_comment_id: None,
         source_comment_url: None,
-        errors: vec!["missing decision projection".to_string()],
+        errors: Vec::new(),
     }
 }
 
@@ -689,19 +751,8 @@ fn review_type_to_dimension(review_type: &str) -> Result<&'static str, String> {
     }
 }
 
-fn load_projection_reviewer_for_home(
-    home: &Path,
-    owner_repo: &str,
-    pr_number: u32,
-) -> Result<String, String> {
-    let path = projection_pr_dir_for_home(home, owner_repo, pr_number).join("reviewer.json");
-    let bytes = fs::read(&path).map_err(|err| {
-        format!(
-            "failed to read reviewer projection {}: {err}",
-            path.display()
-        )
-    })?;
-    let payload: ProjectionReviewerIdentity = serde_json::from_slice(&bytes).map_err(|err| {
+fn parse_projection_reviewer_payload(path: &Path, bytes: &[u8]) -> Result<String, String> {
+    let payload: ProjectionReviewerIdentity = serde_json::from_slice(bytes).map_err(|err| {
         format!(
             "failed to parse reviewer projection {}: {err}",
             path.display()
@@ -719,6 +770,40 @@ fn load_projection_reviewer_for_home(
         return Err(format!("empty reviewer identity in {}", path.display()));
     }
     Ok(reviewer.to_string())
+}
+
+fn load_projection_reviewer_for_home(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<String, String> {
+    let path = projection_pr_dir_for_home(home, owner_repo, pr_number).join("reviewer.json");
+    let bytes = fs::read(&path).map_err(|err| {
+        format!(
+            "failed to read reviewer projection {}: {err}",
+            path.display()
+        )
+    })?;
+    parse_projection_reviewer_payload(&path, &bytes)
+}
+
+fn load_projection_reviewer_optional_for_home(
+    home: &Path,
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<Option<String>, String> {
+    let path = projection_pr_dir_for_home(home, owner_repo, pr_number).join("reviewer.json");
+    let bytes = match fs::read(&path) {
+        Ok(value) => value,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "failed to read reviewer projection {}: {err}",
+                path.display()
+            ));
+        },
+    };
+    parse_projection_reviewer_payload(&path, &bytes).map(Some)
 }
 
 pub fn resolve_termination_authority_for_home(
@@ -787,7 +872,8 @@ pub fn resolve_completion_signal_from_projection_for_home(
 ) -> Result<Option<ProjectionCompletionSignal>, String> {
     validate_expected_head_sha(head_sha)?;
     let dimension = review_type_to_dimension(review_type)?;
-    let Ok(trusted_reviewer) = load_projection_reviewer_for_home(home, owner_repo, pr_number)
+    let Some(trusted_reviewer) =
+        load_projection_reviewer_optional_for_home(home, owner_repo, pr_number)?
     else {
         return Ok(None);
     };
@@ -832,11 +918,102 @@ pub fn resolve_completion_signal_from_projection_for_home(
     }))
 }
 
-fn render_decision_comment_body(payload: &DecisionComment) -> Result<String, String> {
+fn summarize_single_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn append_dimension_findings_section(
+    out: &mut String,
+    bundle: Option<&findings_store::FindingsBundle>,
+    dimension: &str,
+) {
+    let _ = writeln!(out, "### {dimension}");
+    let Some(bundle) = bundle else {
+        out.push_str("- No findings recorded for this SHA.\n\n");
+        return;
+    };
+    let Some(stored_dimension) = findings_store::find_dimension(bundle, dimension) else {
+        out.push_str("- No findings recorded for this dimension.\n\n");
+        return;
+    };
+    if stored_dimension.findings.is_empty() {
+        out.push_str("- No findings recorded for this dimension.\n\n");
+        return;
+    }
+
+    for finding in &stored_dimension.findings {
+        let _ = write!(
+            out,
+            "- [{}] {}",
+            finding.severity,
+            summarize_single_line(&finding.summary)
+        );
+        if let Some(location) = finding.location.as_deref() {
+            let normalized = summarize_single_line(location);
+            if !normalized.is_empty() {
+                let _ = write!(out, " (location: {normalized})");
+            }
+        }
+        out.push('\n');
+        if let Some(details) = finding.details.as_deref() {
+            let normalized = summarize_single_line(details);
+            if !normalized.is_empty() {
+                let _ = writeln!(out, "  details: {normalized}");
+            }
+        }
+        if let Some(risk) = finding.risk.as_deref() {
+            let normalized = summarize_single_line(risk);
+            if !normalized.is_empty() {
+                let _ = writeln!(out, "  risk: {normalized}");
+            }
+        }
+        if let Some(impact) = finding.impact.as_deref() {
+            let normalized = summarize_single_line(impact);
+            if !normalized.is_empty() {
+                let _ = writeln!(out, "  impact: {normalized}");
+            }
+        }
+    }
+    out.push('\n');
+}
+
+fn render_findings_markdown(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    payload: &DecisionComment,
+) -> Result<String, String> {
+    let bundle = findings_store::load_findings_bundle(owner_repo, pr_number, head_sha)?;
+    let mut out = String::new();
+    out.push_str("## FAC Findings\n\n");
+    let active_dimensions = payload
+        .dimensions
+        .keys()
+        .map(|value| normalize_decision_dimension(value).unwrap_or(value))
+        .collect::<BTreeSet<_>>();
+
+    if active_dimensions.is_empty() {
+        out.push_str("- No verdict dimensions set yet.\n");
+        return Ok(out);
+    }
+
+    for dimension in active_dimensions {
+        append_dimension_findings_section(&mut out, bundle.as_ref(), dimension);
+    }
+    Ok(out)
+}
+
+fn render_decision_comment_body(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    payload: &DecisionComment,
+) -> Result<String, String> {
     let yaml = serde_yaml::to_string(payload)
         .map_err(|err| format!("failed to serialize decision payload: {err}"))?;
+    let findings = render_findings_markdown(owner_repo, pr_number, head_sha, payload)?;
     Ok(format!(
-        "<!-- {DECISION_MARKER} -->\n```yaml\n# {DECISION_MARKER}\n{yaml}```\n"
+        "<!-- {DECISION_MARKER} -->\n```yaml\n# {DECISION_MARKER}\n{yaml}```\n\n{findings}\n"
     ))
 }
 
@@ -886,6 +1063,7 @@ mod tests {
 
     use super::{
         DECISION_SCHEMA, DecisionComment, DecisionEntry, DecisionProjectionRecord,
+        build_show_report_from_record, missing_projection_report,
         resolve_completion_signal_from_projection_for_home,
     };
 
@@ -953,5 +1131,85 @@ mod tests {
         assert_eq!(resolved.decision_comment_id, 88);
         assert_eq!(resolved.decision_author, "fac-bot");
         assert_eq!(resolved.decision_summary.len(), 64);
+    }
+
+    #[test]
+    fn missing_projection_report_is_pending_without_fail_closed() {
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let report = missing_projection_report(441, head_sha);
+        assert_eq!(report.pr_number, 441);
+        assert_eq!(report.head_sha, head_sha);
+        assert_eq!(report.overall_decision, "pending");
+        assert!(!report.fail_closed);
+        assert!(report.errors.is_empty());
+    }
+
+    #[test]
+    fn partial_projection_report_stays_pending_without_fail_closed() {
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: String::new(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-13T00:00:00Z".to_string(),
+            },
+        );
+        let record = DecisionProjectionRecord {
+            schema: "apm2.fac.projection.verdict.v1".to_string(),
+            owner_repo: "example/repo".to_string(),
+            pr_number: 441,
+            head_sha: head_sha.to_string(),
+            updated_at: "2026-02-13T00:00:00Z".to_string(),
+            decision_comment_id: 88,
+            decision_comment_url: "local://fac_projection/example/repo/pr-441/issue_comments#88"
+                .to_string(),
+            decision_signature: String::new(),
+            dimensions,
+        };
+        let report = build_show_report_from_record(head_sha, &record);
+        assert_eq!(report.overall_decision, "pending");
+        assert!(!report.fail_closed);
+    }
+
+    #[test]
+    fn invalid_decision_value_remains_fail_closed() {
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "invalid".to_string(),
+                reason: String::new(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-13T00:00:00Z".to_string(),
+            },
+        );
+        dimensions.insert(
+            "code-quality".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: String::new(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-13T00:00:00Z".to_string(),
+            },
+        );
+        let record = DecisionProjectionRecord {
+            schema: "apm2.fac.projection.verdict.v1".to_string(),
+            owner_repo: "example/repo".to_string(),
+            pr_number: 441,
+            head_sha: head_sha.to_string(),
+            updated_at: "2026-02-13T00:00:00Z".to_string(),
+            decision_comment_id: 88,
+            decision_comment_url: "local://fac_projection/example/repo/pr-441/issue_comments#88"
+                .to_string(),
+            decision_signature: String::new(),
+            dimensions,
+        };
+        let report = build_show_report_from_record(head_sha, &record);
+        assert!(report.fail_closed);
+        assert!(!report.errors.is_empty());
     }
 }

@@ -191,7 +191,7 @@ jobs:
             current_head="$(gh api "repos/${repo}/pulls/${pr_number}" --jq '.head.sha' 2>/dev/null || true)"
             if [[ -n "$current_head" && "$current_head" != "$head_sha" ]]; then
               echo "fac-gate: STALE sha=${head_sha} superseded by ${current_head}"
-              exit 1
+              exit 0
             fi
 
             set +e
@@ -205,9 +205,24 @@ jobs:
               echo "fac-gate: FAIL reason=fac_cli_unavailable rc=${verdict_rc}"
               exit 1
             fi
-            if [[ $verdict_rc -ne 0 && -z "$verdict_payload" ]]; then
-              echo "fac-gate: WARN verdict read returned rc=${verdict_rc}; treating as pending"
+            if [[ $verdict_rc -ne 0 ]]; then
+              if [[ -n "$verdict_payload" ]]; then
+                message="$(echo "$verdict_payload" | jq -r '.message // .error // "unknown_error"' 2>/dev/null || echo "unknown_error")"
+                echo "fac-gate: FAIL reason=verdict_show_failed rc=${verdict_rc} message=${message}"
+                exit 1
+              fi
+              echo "fac-gate: WARN verdict read returned rc=${verdict_rc} with empty payload; treating as pending"
               verdict_payload='{}'
+            fi
+            if echo "$verdict_payload" | jq -e '
+              (type == "object")
+              and (
+                (.error? != null)
+                or (.fail_closed? == true)
+              )' >/dev/null 2>&1; then
+              message="$(echo "$verdict_payload" | jq -r '.message // .error // "projection_fail_closed"' 2>/dev/null || echo "projection_fail_closed")"
+              echo "fac-gate: FAIL reason=verdict_payload_error message=${message}"
+              exit 1
             fi
             sec_decision="$(parse_dimension_decision "$verdict_payload" "security")"
             qual_decision="$(parse_dimension_decision "$verdict_payload" "code-quality")"

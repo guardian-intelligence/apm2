@@ -64,6 +64,8 @@ struct FindingSummary {
     finding_id: String,
     summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     risk: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     impact: Option<String>,
@@ -112,6 +114,7 @@ fn run_finding_inner(
     review_type: ReviewFindingTypeArg,
     severity: ReviewFindingSeverityArg,
     summary: &str,
+    details: Option<&str>,
     risk: Option<&str>,
     impact: Option<&str>,
     location: Option<&str>,
@@ -135,6 +138,7 @@ fn run_finding_inner(
         dimension,
         severity.as_str(),
         normalized_summary,
+        details,
         risk,
         impact,
         location,
@@ -160,6 +164,7 @@ fn run_finding_inner(
         severity: finding.severity.clone(),
         finding_id: finding.finding_id.clone(),
         summary: finding.summary.clone(),
+        details: normalize_optional(finding.details.as_deref()),
         risk: normalize_optional(finding.risk.as_deref()),
         impact: normalize_optional(finding.impact.as_deref()),
         location: normalize_optional(finding.location.as_deref()),
@@ -187,6 +192,9 @@ fn run_finding_inner(
         println!("  Severity:      {}", summary.severity);
         println!("  Finding ID:    {}", summary.finding_id);
         println!("  Summary:       {}", summary.summary);
+        if let Some(details) = summary.details.as_deref() {
+            println!("  Details:       {details}");
+        }
         if let Some(risk) = summary.risk.as_deref() {
             println!("  Risk:          {risk}");
         }
@@ -209,6 +217,7 @@ pub fn run_finding(
     review_type: ReviewFindingTypeArg,
     severity: ReviewFindingSeverityArg,
     summary: &str,
+    details: Option<&str>,
     risk: Option<&str>,
     impact: Option<&str>,
     location: Option<&str>,
@@ -223,6 +232,7 @@ pub fn run_finding(
         review_type,
         severity,
         summary,
+        details,
         risk,
         impact,
         location,
@@ -280,6 +290,7 @@ pub fn run_comment_compat(
         review_type,
         severity,
         &summary,
+        Some(&summary),
         None,
         None,
         None,

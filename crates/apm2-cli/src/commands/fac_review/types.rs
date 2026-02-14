@@ -34,8 +34,6 @@ pub const DISPATCH_LOCK_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Durati
 
 pub const SECURITY_PROMPT_PATH: &str = "documents/reviews/SECURITY_REVIEW_PROMPT.cac.json";
 pub const QUALITY_PROMPT_PATH: &str = "documents/reviews/CODE_QUALITY_PROMPT.cac.json";
-pub const SECURITY_MARKER: &str = "<!-- apm2-review-metadata:v1:security -->";
-pub const QUALITY_MARKER: &str = "<!-- apm2-review-metadata:v1:code-quality -->";
 pub const TERMINAL_AMBIGUOUS_DISPATCH_OWNERSHIP: &str = "ambiguous_dispatch_ownership";
 pub const TERMINAL_STALE_HEAD_AMBIGUITY: &str = "stale_head_ambiguity";
 pub const TERMINAL_SHA_DRIFT_SUPERSEDED: &str = "sha_drift_superseded";
@@ -668,10 +666,26 @@ pub fn apm2_home_dir() -> Result<PathBuf, String> {
     Ok(base_dirs.home_dir().join(".apm2"))
 }
 
+fn is_fac_sensitive_dir(path: &Path) -> bool {
+    let Ok(home) = apm2_home_dir() else {
+        return false;
+    };
+    let fac_root = home.join("private").join("fac");
+    path.starts_with(&fac_root)
+}
+
 pub fn ensure_parent_dir(path: &Path) -> Result<(), String> {
     let Some(parent) = path.parent() else {
         return Err(format!("path has no parent: {}", path.display()));
     };
+    if is_fac_sensitive_dir(parent) {
+        return crate::commands::fac_permissions::ensure_dir_with_mode(parent).map_err(|err| {
+            format!(
+                "failed to create secure parent dir {}: {err}",
+                parent.display()
+            )
+        });
+    }
     std::fs::create_dir_all(parent)
         .map_err(|err| format!("failed to create parent dir {}: {err}", parent.display()))
 }

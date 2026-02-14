@@ -54,9 +54,10 @@
 use std::path::{Path, PathBuf};
 
 use apm2_core::fac::{
-    LaneManager, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
-    REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, SUMMARY_RECEIPT_SCHEMA, TOOL_EXECUTION_RECEIPT_SCHEMA,
-    TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
+    LaneLeaseV1, LaneManager, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
+    REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA,
+    SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
+    safe_rmtree_v1,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
@@ -201,6 +202,13 @@ pub enum FacSubcommand {
     /// parallel `security + quality` orchestration, model fallback, and
     /// NDJSON telemetry under `~/.apm2`.
     Review(ReviewArgs),
+
+    /// Queue consumer with RFC-0028 authorization + RFC-0029 admission gating.
+    ///
+    /// Scans `$APM2_HOME/queue/pending/` for job specs, validates against
+    /// RFC-0028 channel context tokens and RFC-0029 admission, then
+    /// atomically claims and executes valid jobs.
+    Worker(WorkerArgs),
 
     /// GitHub App credential management and PR operations.
     ///
@@ -390,6 +398,13 @@ pub enum LaneSubcommand {
     /// Reports each lane's state derived from lock state, lease records,
     /// and PID liveness checks. Detects stale leases from crashed jobs.
     Status(LaneStatusArgs),
+    /// Reset a lane by deleting its workspace, target, and logs.
+    ///
+    /// Refuses to reset a RUNNING lane unless `--force` is provided.
+    /// With `--force`, attempts to kill the lane's process before
+    /// cleaning up. Uses `safe_rmtree_v1` which refuses symlink
+    /// traversal and crossing filesystem boundaries.
+    Reset(LaneResetArgs),
 }
 
 /// Arguments for `apm2 fac lane status`.
@@ -399,6 +414,33 @@ pub struct LaneStatusArgs {
     /// CORRUPT).
     #[arg(long)]
     pub state: Option<String>,
+}
+
+/// Arguments for `apm2 fac lane reset`.
+#[derive(Debug, Args)]
+pub struct LaneResetArgs {
+    /// Lane identifier to reset (e.g., `lane-00`).
+    pub lane_id: String,
+
+    /// Force reset even if lane is RUNNING. Kills the lane's process first.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+}
+
+/// Arguments for `apm2 fac worker`.
+#[derive(Debug, Args)]
+pub struct WorkerArgs {
+    /// Process exactly one job and exit.
+    #[arg(long, default_value_t = false)]
+    pub once: bool,
+
+    /// Seconds between queue scans in continuous mode.
+    #[arg(long, default_value_t = 5)]
+    pub poll_interval_secs: u64,
+
+    /// Maximum total jobs to process before exiting (0 = unlimited).
+    #[arg(long, default_value_t = 0)]
+    pub max_jobs: u64,
 }
 
 /// Arguments for `apm2 fac push`.
@@ -500,10 +542,9 @@ pub enum ReviewSubcommand {
     Wait(ReviewWaitArgs),
     /// Show FAC review state/events from local operational artifacts.
     Status(ReviewStatusArgs),
-    /// Materialize local review inputs (diff + commit history) under /tmp.
+    /// Materialize local review inputs (diff + commit history) under FAC
+    /// private storage.
     Prepare(ReviewPrepareArgs),
-    /// Publish review findings and auto-generate machine-readable metadata.
-    Publish(ReviewPublishArgs),
     /// Append one structured SHA-bound finding to local FAC findings.
     Finding(ReviewFindingArgs),
     /// Compatibility shim for deprecated `review comment` (maps to finding).
@@ -681,30 +722,6 @@ pub struct ReviewPrepareArgs {
     pub json: bool,
 }
 
-/// Arguments for `apm2 fac review publish`.
-#[derive(Debug, Args)]
-pub struct ReviewPublishArgs {
-    /// Pull request number.
-    #[arg(long)]
-    pub pr: Option<u32>,
-
-    /// Optional head SHA override (defaults to PR head SHA).
-    #[arg(long)]
-    pub sha: Option<String>,
-
-    /// Review dimension to publish (`security` or `code-quality`).
-    #[arg(long = "type", value_enum)]
-    pub review_type: fac_review::ReviewPublishTypeArg,
-
-    /// Path to markdown findings body.
-    #[arg(long)]
-    pub body_file: PathBuf,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
-
 /// Arguments for `apm2 fac review finding`.
 #[derive(Debug, Args)]
 pub struct ReviewFindingArgs {
@@ -727,6 +744,10 @@ pub struct ReviewFindingArgs {
     /// Short finding summary.
     #[arg(long)]
     pub summary: String,
+
+    /// Optional detailed remediation body (alias: --body).
+    #[arg(long = "details", alias = "body")]
+    pub details: Option<String>,
 
     /// Optional risk statement.
     #[arg(long)]
@@ -836,7 +857,8 @@ pub struct ReviewVerdictSetArgs {
     #[arg(long)]
     pub reason: Option<String>,
 
-    /// Keep prepared review input files under /tmp after verdict is written.
+    /// Keep prepared review input files under FAC private storage after verdict
+    /// is written.
     #[arg(long, default_value_t = false)]
     pub keep_prepared_inputs: bool,
 
@@ -1061,6 +1083,16 @@ pub fn run_fac(
 ) -> u8 {
     let json_output = cmd.json;
     let machine_output = json_output || subcommand_requests_machine_output(&cmd.subcommand);
+
+    if let Err(err) = crate::commands::fac_permissions::validate_fac_root_permissions() {
+        return output_error(
+            machine_output,
+            "fac_root_permissions_failed",
+            &format!("FAC root permissions check failed (fail-closed): {err}"),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
     let ledger_path = resolve_ledger_path(cmd.ledger_path.as_deref());
     let cas_path = resolve_cas_path(cmd.cas_path.as_deref());
 
@@ -1069,6 +1101,7 @@ pub fn run_fac(
         FacSubcommand::Gates(_)
             | FacSubcommand::Doctor(_)
             | FacSubcommand::Lane(_)
+            | FacSubcommand::Worker(_)
             | FacSubcommand::Recover(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
@@ -1149,6 +1182,7 @@ pub fn run_fac(
         FacSubcommand::Resume(args) => run_resume(args, &ledger_path, json_output),
         FacSubcommand::Lane(args) => match &args.subcommand {
             LaneSubcommand::Status(status_args) => run_lane_status(status_args, json_output),
+            LaneSubcommand::Reset(reset_args) => run_lane_reset(reset_args, json_output),
         },
         FacSubcommand::Push(args) => {
             let repo = match derive_fac_repo_or_exit(json_output) {
@@ -1251,20 +1285,6 @@ pub fn run_fac(
                     json_output || prepare_args.json,
                 )
             },
-            ReviewSubcommand::Publish(publish_args) => {
-                let repo = match derive_fac_repo_or_exit(json_output || publish_args.json) {
-                    Ok(value) => value,
-                    Err(code) => return code,
-                };
-                fac_review::run_publish(
-                    &repo,
-                    publish_args.pr,
-                    publish_args.sha.as_deref(),
-                    publish_args.review_type,
-                    &publish_args.body_file,
-                    json_output || publish_args.json,
-                )
-            },
             ReviewSubcommand::Finding(finding_args) => {
                 let repo = match derive_fac_repo_or_exit(json_output || finding_args.json) {
                     Ok(value) => value,
@@ -1277,6 +1297,7 @@ pub fn run_fac(
                     finding_args.review_type,
                     finding_args.severity,
                     &finding_args.summary,
+                    finding_args.details.as_deref(),
                     finding_args.risk.as_deref(),
                     finding_args.impact.as_deref(),
                     finding_args.location.as_deref(),
@@ -1369,6 +1390,12 @@ pub fn run_fac(
                 )
             },
         },
+        FacSubcommand::Worker(args) => crate::commands::fac_worker::run_fac_worker(
+            args.once,
+            args.poll_interval_secs,
+            args.max_jobs,
+            json_output,
+        ),
         FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
     }
 }
@@ -1382,7 +1409,6 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
             ReviewSubcommand::Wait(wait_args) => matches!(wait_args.format, ReviewFormatArg::Json),
             ReviewSubcommand::Status(status_args) => status_args.json,
             ReviewSubcommand::Prepare(prepare_args) => prepare_args.json,
-            ReviewSubcommand::Publish(publish_args) => publish_args.json,
             ReviewSubcommand::Finding(finding_args) => finding_args.json,
             ReviewSubcommand::Comment(comment_args) => comment_args.json,
             ReviewSubcommand::Findings(findings_args) => findings_args.json,
@@ -1408,6 +1434,7 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Lane(_)
         | FacSubcommand::Push(_)
         | FacSubcommand::Restart(_)
+        | FacSubcommand::Worker(_)
         | FacSubcommand::Pipeline(_)
         | FacSubcommand::Pr(_) => false,
     }
@@ -1880,7 +1907,8 @@ fn extract_episode_info(event: &EventRecord, episode_id: &str) -> Option<Episode
             tool_log_index_hash: payload
                 .get("tool_log_index_hash")
                 .and_then(|v| v.as_str())
-                .and_then(|s| hex::decode(s).ok()),
+                .and_then(|s| parse_cas_hash_32("tool_log_index_hash", s).ok())
+                .map(|value| value.to_vec()),
         });
     }
 
@@ -1903,12 +1931,16 @@ fn extract_episode_info(event: &EventRecord, episode_id: &str) -> Option<Episode
         tool_log_index_hash: payload
             .get("tool_log_index_hash")
             .and_then(|v| v.as_str())
-            .and_then(|s| hex::decode(s).ok()),
+            .and_then(|s| parse_cas_hash_32("tool_log_index_hash", s).ok())
+            .map(|value| value.to_vec()),
     })
 }
 
 /// Loads a tool log index from CAS by hash.
 fn load_tool_log_index_from_cas(cas_path: &Path, hash: &[u8]) -> Option<ToolLogIndexV1> {
+    if hash.len() != 32 {
+        return None;
+    }
     let hex_hash = hex::encode(hash);
     let (prefix, suffix) = hex_hash.split_at(4);
     let file_path = cas_path.join("objects").join(prefix).join(suffix);
@@ -1954,30 +1986,30 @@ fn run_receipt_show(args: &ReceiptShowArgs, cas_path: &Path, json_output: bool) 
         );
     }
 
-    // Parse hex hash
-    let hash_bytes = match hex::decode(&args.receipt_hash) {
-        Ok(bytes) if bytes.len() == 32 => bytes,
-        Ok(bytes) => {
-            return output_error(
-                json_output,
-                "invalid_hash",
-                &format!("Receipt hash must be 32 bytes, got {}", bytes.len()),
-                exit_codes::VALIDATION_ERROR,
-            );
-        },
-        Err(e) => {
-            return output_error(
-                json_output,
-                "invalid_hash",
-                &format!("Invalid hex encoding: {e}"),
-                exit_codes::VALIDATION_ERROR,
-            );
-        },
-    };
-
-    // Load from CAS
-    let (prefix, suffix) = args.receipt_hash.split_at(4);
-    let file_path = cas_path.join("objects").join(prefix).join(suffix);
+    // Parse and normalize hash.
+    let (file_path, hash_bytes) =
+        match parse_cas_hash_to_path(cas_path, &args.receipt_hash, "receipt_hash") {
+            Ok(value) => value,
+            Err(CasHashParseError::InvalidHex { message, .. }) => {
+                return output_error(
+                    json_output,
+                    "invalid_hash",
+                    &format!("Invalid hex encoding: {message}"),
+                    exit_codes::VALIDATION_ERROR,
+                );
+            },
+            Err(CasHashParseError::InvalidLength {
+                expected, actual, ..
+            }) => {
+                return output_error(
+                    json_output,
+                    "invalid_hash",
+                    &format!("Receipt hash must be {expected} bytes, got {actual}"),
+                    exit_codes::VALIDATION_ERROR,
+                );
+            },
+        };
+    let normalized_hash = hex::encode(hash_bytes);
 
     // SECURITY: Validate file size before reading to prevent DoS
     let metadata = match std::fs::metadata(&file_path) {
@@ -2060,7 +2092,7 @@ fn run_receipt_show(args: &ReceiptShowArgs, cas_path: &Path, json_output: bool) 
         );
 
     let response = ReceiptShowResponse {
-        hash: args.receipt_hash.clone(),
+        hash: normalized_hash,
         receipt_type,
         size_bytes: content.len() as u64,
         content: parsed_content,
@@ -2150,6 +2182,19 @@ fn detect_receipt_type(json: &serde_json::Value) -> String {
     "unknown".to_string()
 }
 
+fn default_context_rebuild_output_dir(episode_id: &str) -> PathBuf {
+    let apm2_home = std::env::var_os("APM2_HOME")
+        .map(PathBuf::from)
+        .filter(|value| !value.as_os_str().is_empty())
+        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".apm2")))
+        .unwrap_or_else(|| PathBuf::from(".apm2-fallback"));
+    apm2_home
+        .join("private")
+        .join("fac")
+        .join("context_rebuild")
+        .join(episode_id)
+}
+
 // =============================================================================
 // Context Rebuild Command
 // =============================================================================
@@ -2180,14 +2225,13 @@ fn run_context_rebuild(
     }
 
     // Determine output directory
-    let output_dir = args.output_dir.clone().unwrap_or_else(|| {
-        std::env::temp_dir()
-            .join("apm2-context-rebuild")
-            .join(&args.episode_id)
-    });
+    let output_dir = args
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| default_context_rebuild_output_dir(&args.episode_id));
 
-    // Create output directory
-    if let Err(e) = std::fs::create_dir_all(&output_dir) {
+    // Create output directory with secure permissions.
+    if let Err(e) = crate::commands::fac_permissions::ensure_dir_with_mode(&output_dir) {
         return output_error(
             json_output,
             "io_error",
@@ -2263,7 +2307,8 @@ fn run_context_rebuild(
                             context_pack_hash = payload
                                 .get("context_pack_hash")
                                 .and_then(|v| v.as_str())
-                                .and_then(|s| hex::decode(s).ok());
+                                .and_then(|s| parse_cas_hash_32("context_pack_hash", s).ok())
+                                .map(|value| value.to_vec());
                         }
                         break;
                     }
@@ -2355,7 +2400,7 @@ fn run_context_rebuild(
         if let Some(artifacts) = pack_json.get("artifacts").and_then(|v| v.as_array()) {
             for artifact in artifacts {
                 if let Some(hash_str) = artifact.get("hash").and_then(|v| v.as_str()) {
-                    if let Ok(artifact_hash) = hex::decode(hash_str) {
+                    if let Ok(artifact_hash) = parse_cas_hash_32("artifact_hash", hash_str) {
                         if retrieve_artifact_to_dir(cas_path, &artifact_hash, &output_dir).is_ok() {
                             artifacts_retrieved += 1;
                         }
@@ -2405,6 +2450,12 @@ fn retrieve_artifact_to_dir(
     hash: &[u8],
     output_dir: &Path,
 ) -> Result<(), std::io::Error> {
+    if hash.len() != 32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("artifact hash must be 32 bytes, got {}", hash.len()),
+        ));
+    }
     let hex_hash = hex::encode(hash);
     let (prefix, suffix) = hex_hash.split_at(4);
     let src_path = cas_path.join("objects").join(prefix).join(suffix);
@@ -2582,6 +2633,385 @@ fn run_lane_status(args: &LaneStatusArgs, json_output: bool) -> u8 {
     }
 
     exit_codes::SUCCESS
+}
+
+// =============================================================================
+// Lane Reset Command (TCK-00516)
+// =============================================================================
+
+/// Execute `apm2 fac lane reset <lane_id>`.
+///
+/// Resets a lane by deleting its workspace, target, and logs subdirectories
+/// using `safe_rmtree_v1` (symlink-safe, boundary-enforced deletion).
+///
+/// # State Machine
+///
+/// - IDLE: resets workspace/target/logs, removes lease, remains IDLE.
+/// - CORRUPT: resets workspace/target/logs, removes lease, transitions to IDLE.
+/// - LEASED/CLEANUP: resets workspace/target/logs, removes lease, transitions
+///   to IDLE.
+/// - RUNNING: refuses unless `--force` is provided. With `--force`, kills the
+///   process first, then resets.
+///
+/// # Security
+///
+/// Deletion is performed via `safe_rmtree_v1` which refuses:
+/// - Symlink traversal at any depth
+/// - Crossing filesystem boundaries
+/// - Unexpected file types (FIFOs, sockets, devices)
+/// - Deletion outside the allowed parent boundary
+fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
+    let manager = match LaneManager::from_default_home() {
+        Ok(m) => m,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "lane_error",
+                &format!("Failed to initialize lane manager: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // Ensure directories exist
+    if let Err(e) = manager.ensure_directories() {
+        return output_error(
+            json_output,
+            "lane_error",
+            &format!("Failed to ensure lane directories: {e}"),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    // Acquire exclusive lock for the lane BEFORE any status reads or
+    // mutations. The lock is held across the entire reset operation
+    // (status check + force-kill + deletion + lease cleanup) to prevent
+    // concurrent writers from racing the reset.
+    let _lock_guard = match manager.acquire_lock(&args.lane_id) {
+        Ok(guard) => guard,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "lane_error",
+                &format!("Failed to acquire lock for lane {}: {e}", args.lane_id),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // Get current lane status (under lock)
+    let status = match manager.lane_status(&args.lane_id) {
+        Ok(s) => s,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "lane_error",
+                &format!("Failed to query lane status: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // Check if lane is RUNNING and refuse without --force
+    if status.state == LaneState::Running && !args.force {
+        return output_error(
+            json_output,
+            "lane_running",
+            &format!(
+                "Lane {} is RUNNING (pid={}). Use --force to kill the process and reset.",
+                args.lane_id,
+                status.pid.unwrap_or(0)
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    // With --force on a RUNNING lane, attempt to kill the process (under lock).
+    // If kill fails (EPERM, PID reuse, etc.), abort the reset and mark CORRUPT
+    // to prevent deleting directories of a still-running process.
+    if status.state == LaneState::Running && args.force {
+        if let Some(pid) = status.pid {
+            if !json_output {
+                println!("Force-killing process {} for lane {}...", pid, args.lane_id);
+            }
+            if !kill_process_best_effort(pid) {
+                let corrupt_reason = format!(
+                    "failed to kill process {} for lane {} -- process may still be running or PID was reused",
+                    pid, args.lane_id
+                );
+                persist_corrupt_lease(&manager, &args.lane_id, &corrupt_reason, json_output);
+                return output_error(
+                    json_output,
+                    "kill_failed",
+                    &corrupt_reason,
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
+        }
+    }
+
+    // Perform safe deletion of workspace, target, and logs (under lock)
+    let lane_dir = manager.lane_dir(&args.lane_id);
+    let Some(lanes_root) = lane_dir.parent() else {
+        return output_error(
+            json_output,
+            "lane_error",
+            &format!(
+                "Lane directory {} has no parent directory",
+                lane_dir.display()
+            ),
+            exit_codes::GENERIC_ERROR,
+        );
+    };
+
+    let subdirs = ["workspace", "target", "logs"];
+    let mut total_files: u64 = 0;
+    let mut total_dirs: u64 = 0;
+    let mut refused_receipts: Vec<RefusedDeleteReceipt> = Vec::new();
+
+    for subdir in &subdirs {
+        let subdir_path = lane_dir.join(subdir);
+        match safe_rmtree_v1(&subdir_path, lanes_root) {
+            Ok(SafeRmtreeOutcome::Deleted {
+                files_deleted,
+                dirs_deleted,
+            }) => {
+                total_files = total_files.saturating_add(files_deleted);
+                total_dirs = total_dirs.saturating_add(dirs_deleted);
+                if !json_output {
+                    println!(
+                        "  Deleted {}/{}: {} files, {} dirs",
+                        args.lane_id, subdir, files_deleted, dirs_deleted
+                    );
+                }
+            },
+            Ok(SafeRmtreeOutcome::AlreadyAbsent) => {
+                if !json_output {
+                    println!("  {}/{}: already absent", args.lane_id, subdir);
+                }
+            },
+            Err(e) => {
+                let receipt = RefusedDeleteReceipt {
+                    root: subdir_path.clone(),
+                    allowed_parent: lanes_root.to_path_buf(),
+                    reason: e.to_string(),
+                    mark_corrupt: true,
+                };
+                refused_receipts.push(receipt);
+
+                if !json_output {
+                    eprintln!("  ERROR deleting {}/{}: {e}", args.lane_id, subdir);
+                }
+            },
+        }
+    }
+
+    // If any deletions were refused, mark lane as CORRUPT (under lock)
+    if !refused_receipts.is_empty() {
+        let corrupt_reason = refused_receipts
+            .iter()
+            .map(|r| r.reason.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        // Persist CORRUPT state to the lease file so that lane_status
+        // reflects the corruption even after restart.
+        persist_corrupt_lease(&manager, &args.lane_id, &corrupt_reason, json_output);
+
+        if json_output {
+            let response = serde_json::json!({
+                "lane_id": args.lane_id,
+                "status": "CORRUPT",
+                "reason": corrupt_reason,
+                "refused_receipts": refused_receipts.iter().map(|r| {
+                    serde_json::json!({
+                        "root": r.root.display().to_string(),
+                        "allowed_parent": r.allowed_parent.display().to_string(),
+                        "reason": r.reason,
+                        "mark_corrupt": r.mark_corrupt,
+                    })
+                }).collect::<Vec<_>>(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&response).unwrap_or_default()
+            );
+        } else {
+            eprintln!("Lane {} marked CORRUPT: {corrupt_reason}", args.lane_id);
+        }
+
+        return exit_codes::GENERIC_ERROR;
+    }
+
+    // Remove the lease file to transition lane to IDLE (under lock)
+    let lane_dir_owned = manager.lane_dir(&args.lane_id);
+    if let Err(e) = LaneLeaseV1::remove(&lane_dir_owned) {
+        return output_error(
+            json_output,
+            "lane_error",
+            &format!("Failed to remove lease for lane {}: {e}", args.lane_id),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    // Re-create the empty subdirectories for the reset lane so it is
+    // ready for reuse. This calls ensure_directories() which re-inits
+    // all lanes, not just the reset lane. This is acceptable because
+    // ensure_directories is idempotent (mkdir -p semantics) and only
+    // creates directories that don't already exist.
+    if let Err(e) = manager.ensure_directories() {
+        if !json_output {
+            eprintln!("Warning: failed to re-create lane directories: {e}");
+        }
+    }
+
+    // Lock is released here when _lock_guard drops.
+
+    if json_output {
+        let response = serde_json::json!({
+            "lane_id": args.lane_id,
+            "status": "IDLE",
+            "files_deleted": total_files,
+            "dirs_deleted": total_dirs,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&response).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "Lane {} reset to IDLE ({} files, {} dirs deleted)",
+            args.lane_id, total_files, total_dirs
+        );
+    }
+
+    exit_codes::SUCCESS
+}
+
+/// Persist a CORRUPT lease to the lane directory so that `lane_status`
+/// reports CORRUPT even after restart.
+///
+/// This is best-effort: if the lease write fails, a warning is printed
+/// but the overall CORRUPT error flow continues (fail-closed: the lane
+/// is already in a bad state).
+fn persist_corrupt_lease(manager: &LaneManager, lane_id: &str, reason: &str, json_output: bool) {
+    let lane_dir = manager.lane_dir(lane_id);
+    // Truncate reason to avoid exceeding string length limits.
+    // Use char_indices to find a safe UTF-8 boundary instead of byte
+    // slicing, which would panic on multi-byte characters.
+    let truncated_reason = if reason.len() > 200 {
+        let truncated: String = reason
+            .char_indices()
+            .take_while(|&(i, _)| i < 197)
+            .map(|(_, c)| c)
+            .collect();
+        format!("{truncated}...")
+    } else {
+        reason.to_string()
+    };
+
+    match LaneLeaseV1::new(
+        lane_id,
+        &truncated_reason,
+        0, // pid=0: no running process
+        LaneState::Corrupt,
+        "1970-01-01T00:00:00Z", // sentinel timestamp
+        "corrupt",
+        "corrupt",
+    ) {
+        Ok(lease) => {
+            if let Err(e) = lease.persist(&lane_dir) {
+                if !json_output {
+                    eprintln!("  Warning: failed to persist CORRUPT lease for lane {lane_id}: {e}");
+                }
+            }
+        },
+        Err(e) => {
+            if !json_output {
+                eprintln!("  Warning: failed to create CORRUPT lease for lane {lane_id}: {e}");
+            }
+        },
+    }
+}
+
+/// Best-effort process kill using SIGTERM then SIGKILL.
+///
+/// Returns `true` if the process is confirmed dead (ESRCH) or was
+/// successfully killed, `false` if the process could not be signaled
+/// (EPERM or other errors). The caller MUST abort the reset and mark
+/// the lane CORRUPT if this returns `false`.
+///
+/// # PID Reuse Safety
+///
+/// Stale lease PIDs may have been reused by a different process. We
+/// verify the process exists via `/proc/<pid>/comm` before sending
+/// signals. If `/proc/<pid>/comm` does not exist, the PID is dead and
+/// we return `true` (success).
+///
+/// # Blocking Wait (intentional)
+///
+/// This function blocks the calling thread for up to ~5.2 seconds while
+/// waiting for the process to exit after SIGTERM. This is acceptable because
+/// `kill_process_best_effort` is called exclusively from the `apm2 fac lane
+/// reset --force` CLI command, which is an interactive operator action that
+/// expects synchronous completion before proceeding with directory deletion.
+/// The blocking wait ensures the process has actually exited before we
+/// attempt to delete its workspace.
+fn kill_process_best_effort(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{self, Signal};
+        use nix::unistd::Pid;
+
+        let Ok(pid_i32) = i32::try_from(pid) else {
+            return false;
+        };
+        let nix_pid = Pid::from_raw(pid_i32);
+
+        // Verify PID is alive via /proc/<pid>/comm. If the procfs entry
+        // does not exist, the process is already dead -- success.
+        let proc_comm = format!("/proc/{pid}/comm");
+        if std::fs::read_to_string(&proc_comm).is_err() {
+            return true; // Process doesn't exist
+        }
+
+        // Send SIGTERM first (graceful shutdown request).
+        match signal::kill(nix_pid, Signal::SIGTERM) {
+            Ok(()) => {},
+            Err(nix::errno::Errno::ESRCH) => return true, // already gone
+            Err(_) => return false,                       /* EPERM or other: can't signal, don't
+                                                            * proceed */
+        }
+
+        // Wait for graceful shutdown (up to 5 seconds, polling every 100ms).
+        // See doc comment above for why this blocking wait is intentional.
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // kill(pid, signal 0) checks existence without sending a signal.
+            match signal::kill(nix_pid, None) {
+                Err(nix::errno::Errno::ESRCH) => return true, // gone
+                Ok(()) => {},                                 // still alive
+                Err(_) => return false,                       // can't determine, don't proceed
+            }
+        }
+
+        // Process still alive after 5s -- send SIGKILL (uncatchable).
+        match signal::kill(nix_pid, Signal::SIGKILL) {
+            Err(nix::errno::Errno::ESRCH) => return true,
+            Err(_) => return false,
+            Ok(()) => {},
+        }
+
+        // Final wait for SIGKILL to take effect.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        matches!(signal::kill(nix_pid, None), Err(nix::errno::Errno::ESRCH))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 // =============================================================================
@@ -2763,6 +3193,50 @@ fn constant_time_hash_eq(computed: &[u8], expected: &[u8]) -> bool {
         return false;
     }
     bool::from(computed.ct_eq(expected))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CasHashParseError {
+    InvalidHex {
+        field: &'static str,
+        message: String,
+    },
+    InvalidLength {
+        field: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+}
+
+fn parse_cas_hash_32(field: &'static str, hash_hex: &str) -> Result<[u8; 32], CasHashParseError> {
+    let decoded = hex::decode(hash_hex.trim()).map_err(|err| CasHashParseError::InvalidHex {
+        field,
+        message: err.to_string(),
+    })?;
+    if decoded.len() != 32 {
+        return Err(CasHashParseError::InvalidLength {
+            field,
+            expected: 32,
+            actual: decoded.len(),
+        });
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&decoded);
+    Ok(bytes)
+}
+
+fn parse_cas_hash_to_path(
+    cas_path: &Path,
+    hash_hex: &str,
+    field: &'static str,
+) -> Result<(PathBuf, [u8; 32]), CasHashParseError> {
+    let hash_bytes = parse_cas_hash_32(field, hash_hex)?;
+    let normalized_hex = hex::encode(hash_bytes);
+    let (prefix, suffix) = normalized_hex.split_at(4);
+    Ok((
+        cas_path.join("objects").join(prefix).join(suffix),
+        hash_bytes,
+    ))
 }
 
 fn derive_fac_repo_or_exit(json_output: bool) -> Result<String, u8> {
@@ -3158,6 +3632,46 @@ mod tests {
         assert!(constant_time_hash_eq(&hash1, &hash2));
     }
 
+    #[test]
+    fn test_parse_cas_hash_32_accepts_valid_hash() {
+        let hash_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let parsed = parse_cas_hash_32("artifact_hash", hash_hex).expect("valid hash should parse");
+        assert_eq!(parsed.len(), 32);
+        assert_eq!(parsed[0], 0x01);
+        assert_eq!(parsed[31], 0xef);
+    }
+
+    #[test]
+    fn test_parse_cas_hash_32_rejects_short_hash() {
+        let hash_hex = "deadbeef";
+        let error =
+            parse_cas_hash_32("artifact_hash", hash_hex).expect_err("short hash should fail");
+        assert!(matches!(error, CasHashParseError::InvalidLength { .. }));
+    }
+
+    #[test]
+    fn test_parse_cas_hash_32_rejects_non_hex() {
+        let error = parse_cas_hash_32(
+            "artifact_hash",
+            "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+        )
+        .expect_err("non-hex hash should fail");
+        assert!(matches!(error, CasHashParseError::InvalidHex { .. }));
+    }
+
+    #[test]
+    fn test_parse_cas_hash_to_path_roundtrip() {
+        let cas_path = std::path::Path::new("/tmp/cas");
+        let hash_hex = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let (path, bytes) = parse_cas_hash_to_path(cas_path, hash_hex, "artifact_hash")
+            .expect("parse should succeed");
+        assert_eq!(bytes[0], 0xff);
+        assert_eq!(
+            path,
+            cas_path.join("objects").join("ffff").join(&hash_hex[4..])
+        );
+    }
+
     // --- detect_receipt_type prefix matching tests ---
 
     #[test]
@@ -3240,31 +3754,18 @@ mod tests {
             force: false,
         });
         assert!(!subcommand_requests_machine_output(&restart));
+
+        let worker = FacSubcommand::Worker(WorkerArgs {
+            once: true,
+            poll_interval_secs: 1,
+            max_jobs: 1,
+        });
+        assert!(!subcommand_requests_machine_output(&worker));
     }
 
     #[test]
     fn test_review_prompt_command_sequence_parses_with_verdict_surface() {
         assert_fac_command_parses(&["fac", "review", "prepare", "--json"]);
-        assert_fac_command_parses(&[
-            "fac",
-            "review",
-            "publish",
-            "--type",
-            "security",
-            "--body-file",
-            "/tmp/security_findings.md",
-            "--json",
-        ]);
-        assert_fac_command_parses(&[
-            "fac",
-            "review",
-            "publish",
-            "--type",
-            "code-quality",
-            "--body-file",
-            "/tmp/code_quality_findings.md",
-            "--json",
-        ]);
         assert_fac_command_parses(&["fac", "review", "findings", "--json"]);
         assert_fac_command_parses(&[
             "fac",
@@ -3276,6 +3777,8 @@ mod tests {
             "major",
             "--summary",
             "Unsafe deserialization path",
+            "--body",
+            "Untrusted bytes reach bincode::deserialize without schema guard.",
             "--risk",
             "RCE",
             "--impact",
@@ -3322,6 +3825,21 @@ mod tests {
             "--reason",
             "BLOCKER/MAJOR findings for 0123456789abcdef0123456789abcdef01234567",
             "--json",
+        ]);
+    }
+
+    #[test]
+    fn test_lane_reset_and_worker_commands_parse() {
+        assert_fac_command_parses(&["fac", "lane", "reset", "lane-00"]);
+        assert_fac_command_parses(&["fac", "lane", "reset", "lane-07", "--force"]);
+        assert_fac_command_parses(&["fac", "worker", "--once"]);
+        assert_fac_command_parses(&[
+            "fac",
+            "worker",
+            "--poll-interval-secs",
+            "2",
+            "--max-jobs",
+            "5",
         ]);
     }
 }

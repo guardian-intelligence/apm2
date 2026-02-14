@@ -1,5 +1,6 @@
 //! Local SHA-bound findings storage and projection helpers.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -44,6 +45,8 @@ pub(super) struct StoredFinding {
     pub finding_id: String,
     pub severity: String,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,44 +133,13 @@ pub(super) fn load_findings_bundle(
 
     let bundle = serde_json::from_slice::<FindingsBundle>(&bytes)
         .map_err(|err| format!("failed to parse findings bundle {}: {err}", path.display()))?;
+    validate_loaded_bundle_identity(&bundle, owner_repo, pr_number, head_sha)?;
     Ok(Some(bundle))
 }
 
 pub(super) fn save_findings_bundle(bundle: &FindingsBundle) -> Result<(), String> {
     let path = findings_bundle_path(&bundle.owner_repo, bundle.pr_number, &bundle.head_sha)?;
     write_json_atomic(&path, bundle)
-}
-
-pub(super) fn upsert_dimension_verdict(
-    owner_repo: &str,
-    pr_number: u32,
-    head_sha: &str,
-    dimension: &str,
-    verdict: &str,
-    source: &str,
-) -> Result<FindingsBundle, String> {
-    validate_expected_head_sha(head_sha)?;
-    let normalized_sha = head_sha.to_ascii_lowercase();
-    let _lock = acquire_findings_lock(owner_repo, pr_number, &normalized_sha)?;
-    let normalized_dimension = normalize_decision_dimension(dimension)?.to_string();
-    let _normalized_verdict = normalize_verdict(verdict)?;
-
-    let mut bundle = load_findings_bundle(owner_repo, pr_number, &normalized_sha)?
-        .unwrap_or_else(|| empty_bundle(owner_repo, pr_number, &normalized_sha, source));
-
-    if bundle.schema != FINDINGS_BUNDLE_SCHEMA {
-        return Err(format!(
-            "unsupported findings bundle schema `{}` at repo={} pr={} sha={}",
-            bundle.schema, owner_repo, pr_number, normalized_sha
-        ));
-    }
-
-    let _ = upsert_dimension(&mut bundle, &normalized_dimension);
-
-    bundle.source = source.to_string();
-    bundle.updated_at = now_iso8601();
-    save_findings_bundle(&bundle)?;
-    Ok(bundle)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -178,6 +150,7 @@ pub(super) fn append_dimension_finding(
     dimension: &str,
     severity: &str,
     summary: &str,
+    details: Option<&str>,
     risk: Option<&str>,
     impact: Option<&str>,
     location: Option<&str>,
@@ -206,11 +179,13 @@ pub(super) fn append_dimension_finding(
 
     let dimension_entry = upsert_dimension(&mut bundle, &normalized_dimension);
     let created_at = now_iso8601();
-    let finding_id = allocate_finding_id(pr_number, &normalized_dimension);
+    let finding_id =
+        allocate_finding_id(pr_number, &normalized_dimension, &dimension_entry.findings);
     let finding = StoredFinding {
         finding_id,
         severity: normalized_severity,
         summary: normalized_summary.to_string(),
+        details: normalize_optional_text(details),
         risk: normalize_optional_text(risk),
         impact: normalize_optional_text(impact),
         location: normalize_optional_text(location),
@@ -223,6 +198,7 @@ pub(super) fn append_dimension_finding(
             &normalized_dimension,
             severity,
             normalized_summary,
+            details,
             risk,
             impact,
             location,
@@ -306,14 +282,38 @@ fn empty_bundle(owner_repo: &str, pr_number: u32, head_sha: &str, source: &str) 
     }
 }
 
-fn normalize_verdict(verdict: &str) -> Result<&'static str, String> {
-    match verdict.trim().to_ascii_uppercase().as_str() {
-        "PASS" => Ok("PASS"),
-        "FAIL" => Ok("FAIL"),
-        other => Err(format!(
-            "invalid verdict `{other}` (expected PASS|FAIL) for SHA-bound findings store"
-        )),
+fn validate_loaded_bundle_identity(
+    bundle: &FindingsBundle,
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<(), String> {
+    if bundle.schema != FINDINGS_BUNDLE_SCHEMA {
+        return Err(format!(
+            "unsupported findings bundle schema `{}` at repo={} pr={} sha={}",
+            bundle.schema, owner_repo, pr_number, head_sha
+        ));
     }
+    if !bundle.owner_repo.eq_ignore_ascii_case(owner_repo) {
+        return Err(format!(
+            "findings bundle repo mismatch: expected {owner_repo}, got {}",
+            bundle.owner_repo
+        ));
+    }
+    if bundle.pr_number != pr_number {
+        return Err(format!(
+            "findings bundle PR mismatch: expected #{pr_number}, got #{}",
+            bundle.pr_number
+        ));
+    }
+    validate_expected_head_sha(&bundle.head_sha)?;
+    if !bundle.head_sha.eq_ignore_ascii_case(head_sha) {
+        return Err(format!(
+            "findings bundle SHA mismatch: expected {head_sha}, got {}",
+            bundle.head_sha
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_severity(severity: &str) -> Result<&'static str, String> {
@@ -335,13 +335,27 @@ fn normalize_optional_text(value: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn allocate_finding_id(pr_number: u32, dimension: &str) -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
+fn allocate_finding_id(pr_number: u32, dimension: &str, existing: &[StoredFinding]) -> String {
     let dim = dimension.replace('-', "_");
-    format!("f-{pr_number}-{dim}-{nanos}")
+    let existing_ids = existing
+        .iter()
+        .map(|value| value.finding_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for attempt in 0..1024u16 {
+        let micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_micros())
+            .unwrap_or_default();
+        let candidate = format!("f-{pr_number}-{dim}-{micros}-{attempt}");
+        if !existing_ids.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default();
+    format!("f-{pr_number}-{dim}-{secs}-overflow")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -352,6 +366,7 @@ fn finding_digest(
     dimension: &str,
     severity: &str,
     summary: &str,
+    details: Option<&str>,
     risk: Option<&str>,
     impact: Option<&str>,
     location: Option<&str>,
@@ -365,6 +380,7 @@ fn finding_digest(
         "dimension": dimension,
         "severity": severity.trim().to_ascii_uppercase(),
         "summary": summary.trim(),
+        "details": details.map_or("", str::trim),
         "risk": risk.map_or("", str::trim),
         "impact": impact.map_or("", str::trim),
         "location": location.map_or("", str::trim),
@@ -400,12 +416,45 @@ fn upsert_dimension<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_verdict;
+    use super::{
+        StoredFinding, allocate_finding_id, empty_bundle, validate_loaded_bundle_identity,
+    };
 
     #[test]
-    fn normalize_verdict_accepts_pass_fail() {
-        assert_eq!(normalize_verdict("PASS").expect("pass"), "PASS");
-        assert_eq!(normalize_verdict("fail").expect("fail"), "FAIL");
-        assert!(normalize_verdict("unknown").is_err());
+    fn allocate_finding_id_avoids_existing_collision() {
+        let first = allocate_finding_id(77, "security", &[]);
+        let existing = vec![StoredFinding {
+            finding_id: first.clone(),
+            severity: "MAJOR".to_string(),
+            summary: "existing".to_string(),
+            details: None,
+            risk: None,
+            impact: None,
+            location: None,
+            reviewer_id: None,
+            created_at: "2026-02-14T00:00:00Z".to_string(),
+            evidence_digest: "digest".to_string(),
+            raw_evidence_pointer: "none".to_string(),
+        }];
+        let second = allocate_finding_id(77, "security", &existing);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn validate_loaded_bundle_identity_rejects_mismatch() {
+        let bundle = empty_bundle(
+            "guardian-intelligence/apm2",
+            482,
+            "0123456789abcdef0123456789abcdef01234567",
+            "test",
+        );
+        let err = validate_loaded_bundle_identity(
+            &bundle,
+            "guardian-intelligence/apm2",
+            999,
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .expect_err("pr mismatch should fail");
+        assert!(err.contains("PR mismatch"));
     }
 }

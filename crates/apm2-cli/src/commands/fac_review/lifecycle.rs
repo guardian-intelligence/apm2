@@ -17,7 +17,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::projection::fetch_pr_head_sha_local;
+use super::projection::fetch_pr_head_sha_authoritative;
 use super::target::resolve_pr_target;
 use super::types::{
     TerminationAuthority, apm2_home_dir, ensure_parent_dir,
@@ -308,6 +308,13 @@ fn pr_state_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
         .join(format!("pr-{pr_number}.json")))
 }
 
+fn pr_state_lock_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
+    Ok(lifecycle_root()?
+        .join("pr")
+        .join(sanitize_for_path(owner_repo))
+        .join(format!("pr-{pr_number}.lock")))
+}
+
 fn machine_artifact_path() -> Result<PathBuf, String> {
     Ok(lifecycle_root()?.join("fac_lifecycle_machine.v1.json"))
 }
@@ -338,6 +345,30 @@ fn acquire_registry_lock() -> Result<std::fs::File, String> {
     lock_file.lock_exclusive().map_err(|err| {
         format!(
             "failed to acquire registry lock {}: {err}",
+            lock_path.display()
+        )
+    })?;
+    Ok(lock_file)
+}
+
+fn acquire_pr_state_lock(owner_repo: &str, pr_number: u32) -> Result<std::fs::File, String> {
+    let lock_path = pr_state_lock_path(owner_repo, pr_number)?;
+    ensure_parent_dir(&lock_path)?;
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| {
+            format!(
+                "failed to open lifecycle state lock {}: {err}",
+                lock_path.display()
+            )
+        })?;
+    lock_file.lock_exclusive().map_err(|err| {
+        format!(
+            "failed to acquire lifecycle state lock {}: {err}",
             lock_path.display()
         )
     })?;
@@ -548,7 +579,26 @@ fn next_state_for_event(
 ) -> Result<PrLifecycleState, String> {
     use PrLifecycleState as S;
     match event {
-        LifecycleEventKind::PushObserved => Ok(S::Pushed),
+        LifecycleEventKind::PushObserved => match state.pr_state {
+            S::Untracked
+            | S::Pushed
+            | S::GatesRunning
+            | S::GatesPassed
+            | S::GatesFailed
+            | S::ReviewsDispatched
+            | S::ReviewInProgress
+            | S::VerdictPending
+            | S::VerdictApprove
+            | S::VerdictDeny
+            | S::MergeReady
+            | S::Stuck
+            | S::Stale
+            | S::Recovering => Ok(S::Pushed),
+            _ => Err(format!(
+                "illegal transition: {} + push_observed",
+                state.pr_state.as_str()
+            )),
+        },
         LifecycleEventKind::GatesStarted => match state.pr_state {
             S::Pushed | S::GatesFailed | S::Recovering => Ok(S::GatesRunning),
             _ => Err(format!(
@@ -633,9 +683,15 @@ fn next_state_for_event(
         },
         LifecycleEventKind::AgentCrashed { .. } => Ok(S::Stuck),
         LifecycleEventKind::ShaDriftDetected => Ok(S::Stale),
-        LifecycleEventKind::RecoverRequested => Ok(S::Recovering),
+        LifecycleEventKind::RecoverRequested => match state.pr_state {
+            S::Stale | S::Stuck | S::Quarantined => Ok(S::Recovering),
+            _ => Err(format!(
+                "illegal transition: {} + recover_requested",
+                state.pr_state.as_str()
+            )),
+        },
         LifecycleEventKind::RecoverCompleted => match state.pr_state {
-            S::Recovering | S::Stale | S::Stuck | S::Quarantined => Ok(S::Pushed),
+            S::Recovering => Ok(S::Pushed),
             _ => Err(format!(
                 "illegal transition: {} + recover_completed",
                 state.pr_state.as_str()
@@ -675,13 +731,13 @@ pub fn ensure_machine_artifact() -> Result<PathBuf, String> {
         return Ok(path);
     }
     let transitions = vec![
-        serde_json::json!({"from":"untracked","event":"push_observed","to":"pushed"}),
-        serde_json::json!({"from":"pushed","event":"gates_started","to":"gates_running"}),
+        serde_json::json!({"from":"untracked|pushed|gates_running|gates_passed|gates_failed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|merge_ready|stuck|stale|recovering","event":"push_observed","to":"pushed"}),
+        serde_json::json!({"from":"pushed|gates_failed|recovering","event":"gates_started","to":"gates_running"}),
         serde_json::json!({"from":"gates_running","event":"gates_passed","to":"gates_passed"}),
         serde_json::json!({"from":"gates_running","event":"gates_failed","to":"gates_failed"}),
-        serde_json::json!({"from":"gates_passed","event":"reviews_dispatched","to":"reviews_dispatched"}),
-        serde_json::json!({"from":"reviews_dispatched","event":"reviewer_spawned","to":"review_in_progress"}),
-        serde_json::json!({"from":"review_in_progress","event":"verdict_set","to":"verdict_pending|verdict_deny|merge_ready"}),
+        serde_json::json!({"from":"gates_passed|reviews_dispatched|review_in_progress|verdict_pending","event":"reviews_dispatched","to":"reviews_dispatched"}),
+        serde_json::json!({"from":"reviews_dispatched|review_in_progress|verdict_pending","event":"reviewer_spawned","to":"review_in_progress"}),
+        serde_json::json!({"from":"reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|merge_ready","event":"verdict_set","to":"verdict_pending|verdict_deny|merge_ready"}),
         serde_json::json!({"from":"*","event":"sha_drift_detected","to":"stale"}),
         serde_json::json!({"from":"stale|stuck|quarantined","event":"recover_requested","to":"recovering"}),
         serde_json::json!({"from":"recovering","event":"recover_completed","to":"pushed"}),
@@ -714,7 +770,8 @@ pub fn apply_event(
     event: &LifecycleEventKind,
 ) -> Result<PrLifecycleRecord, String> {
     validate_expected_head_sha(sha)?;
-    let _ = ensure_machine_artifact();
+    ensure_machine_artifact()?;
+    let _state_lock = acquire_pr_state_lock(owner_repo, pr_number)?;
     let mut record = load_pr_state(owner_repo, pr_number, sha)?;
     let sha = sha.to_ascii_lowercase();
 
@@ -835,6 +892,51 @@ pub fn register_agent_spawn(
     Ok(token)
 }
 
+fn mark_registered_agent_reaped(
+    owner_repo: &str,
+    pr_number: u32,
+    run_id: &str,
+    agent_type: AgentType,
+    reason: &str,
+) -> Result<(), String> {
+    let _lock = acquire_registry_lock()?;
+    let mut registry = load_registry()?;
+    let agent_id = tracked_agent_id(owner_repo, pr_number, run_id, agent_type);
+    let mut changed = false;
+    for entry in &mut registry.entries {
+        if entry.agent_id == agent_id {
+            entry.state = TrackedAgentState::Reaped;
+            entry.completed_at = Some(now_iso8601());
+            entry.reap_reason = Some(reason.to_string());
+            changed = true;
+            break;
+        }
+    }
+    if changed {
+        registry.updated_at = now_iso8601();
+        save_registry(&registry)?;
+    }
+    Ok(())
+}
+
+fn rollback_registered_reviewer_dispatch(
+    owner_repo: &str,
+    pr_number: u32,
+    run_id: &str,
+    agent_type: AgentType,
+    pid: Option<u32>,
+    reason: &str,
+) -> Result<(), String> {
+    if let Some(pid) = pid
+        && state::is_process_alive(pid)
+    {
+        dispatch::terminate_process_with_timeout(pid).map_err(|err| {
+            format!("failed to terminate spawned reviewer pid={pid} during rollback: {err}")
+        })?;
+    }
+    mark_registered_agent_reaped(owner_repo, pr_number, run_id, agent_type, reason)
+}
+
 pub fn register_reviewer_dispatch(
     owner_repo: &str,
     pr_number: u32,
@@ -852,21 +954,7 @@ pub fn register_reviewer_dispatch(
     let Some(run_id) = run_id else {
         return Ok(None);
     };
-    apply_event(
-        owner_repo,
-        pr_number,
-        sha,
-        &LifecycleEventKind::ReviewsDispatched,
-    )?;
-    apply_event(
-        owner_repo,
-        pr_number,
-        sha,
-        &LifecycleEventKind::ReviewerSpawned {
-            review_type: review_type.to_string(),
-        },
-    )?;
-    let token = register_agent_spawn(
+    let token = match register_agent_spawn(
         owner_repo,
         pr_number,
         sha,
@@ -874,7 +962,69 @@ pub fn register_reviewer_dispatch(
         agent_type,
         pid,
         proc_start_time,
-    )?;
+    ) {
+        Ok(token) => token,
+        Err(err) => {
+            if let Some(pid) = pid
+                && state::is_process_alive(pid)
+            {
+                dispatch::terminate_process_with_timeout(pid).map_err(|kill_err| {
+                    format!(
+                        "{err}; additionally failed to terminate unregistered reviewer pid={pid}: {kill_err}"
+                    )
+                })?;
+            }
+            return Err(err);
+        },
+    };
+    if let Err(err) = apply_event(
+        owner_repo,
+        pr_number,
+        sha,
+        &LifecycleEventKind::ReviewsDispatched,
+    ) {
+        let rollback_reason = "rollback:lifecycle_reviews_dispatched_failed";
+        match rollback_registered_reviewer_dispatch(
+            owner_repo,
+            pr_number,
+            run_id,
+            agent_type,
+            pid,
+            rollback_reason,
+        ) {
+            Ok(()) => return Err(err),
+            Err(rollback_err) => {
+                return Err(format!(
+                    "{err}; additionally failed to rollback registry entry run_id={run_id}: {rollback_err}"
+                ));
+            },
+        }
+    }
+    if let Err(err) = apply_event(
+        owner_repo,
+        pr_number,
+        sha,
+        &LifecycleEventKind::ReviewerSpawned {
+            review_type: review_type.to_string(),
+        },
+    ) {
+        let rollback_reason = "rollback:lifecycle_reviewer_spawned_failed";
+        match rollback_registered_reviewer_dispatch(
+            owner_repo,
+            pr_number,
+            run_id,
+            agent_type,
+            pid,
+            rollback_reason,
+        ) {
+            Ok(()) => return Err(err),
+            Err(rollback_err) => {
+                return Err(format!(
+                    "{err}; additionally failed to rollback registry entry run_id={run_id}: {rollback_err}"
+                ));
+            },
+        }
+    }
     Ok(Some(token))
 }
 
@@ -1101,9 +1251,9 @@ fn run_recover_inner(
     pr_number: Option<u32>,
     refresh_identity: bool,
 ) -> Result<RecoverSummary, String> {
-    let _ = ensure_machine_artifact();
+    ensure_machine_artifact()?;
     let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
-    let head_sha = fetch_pr_head_sha_local(resolved_pr)?;
+    let head_sha = fetch_pr_head_sha_authoritative(&owner_repo, resolved_pr)?;
     validate_expected_head_sha(&head_sha)?;
 
     let _lock = acquire_registry_lock()?;
@@ -1150,8 +1300,8 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{
-        AgentType, LifecycleEventKind, PrLifecycleState, active_agents_for_pr, apply_event,
-        load_registry, register_agent_spawn, token_hash,
+        AgentType, LifecycleEventKind, PrLifecycleState, TrackedAgentState, active_agents_for_pr,
+        apply_event, load_registry, register_agent_spawn, register_reviewer_dispatch, token_hash,
     };
     use crate::commands::fac_review::lifecycle::tracked_agent_id;
 
@@ -1241,6 +1391,27 @@ mod tests {
     }
 
     #[test]
+    fn recover_requested_is_rejected_from_non_recovery_states() {
+        let pr = next_pr();
+        let repo = next_repo("recover-guard", pr);
+        let sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let err = apply_event(&repo, pr, sha, &LifecycleEventKind::RecoverRequested)
+            .expect_err("recover_requested should be illegal from untracked");
+        assert!(err.contains("illegal transition"));
+    }
+
+    #[test]
+    fn recover_completed_requires_recovering_state() {
+        let pr = next_pr();
+        let repo = next_repo("recover-complete-guard", pr);
+        let sha = "cccccccccccccccccccccccccccccccccccccccc";
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+        let err = apply_event(&repo, pr, sha, &LifecycleEventKind::RecoverCompleted)
+            .expect_err("recover_completed should require recovering");
+        assert!(err.contains("illegal transition"));
+    }
+
+    #[test]
     fn at_capacity_is_enforced_for_same_pr() {
         let pr = next_pr();
         let repo = next_repo("capacity", pr);
@@ -1287,5 +1458,33 @@ mod tests {
         assert_eq!(hash.len(), 64);
         let registry = load_registry().expect("registry");
         let _ = active_agents_for_pr(&registry, "owner/repo", 99);
+    }
+
+    #[test]
+    fn register_reviewer_dispatch_rolls_back_registry_on_illegal_lifecycle_transition() {
+        let pr = next_pr();
+        let repo = next_repo("dispatch-rollback", pr);
+        let sha = "dddddddddddddddddddddddddddddddddddddddd";
+        let run_id = format!("pr{pr}-security-s1-dddddddd");
+
+        let err = register_reviewer_dispatch(&repo, pr, sha, "security", Some(&run_id), None, None)
+            .expect_err(
+                "register should fail because lifecycle transition is illegal from untracked",
+            );
+        assert!(err.contains("illegal transition"));
+
+        let registry = load_registry().expect("registry");
+        assert_eq!(active_agents_for_pr(&registry, &repo, pr), 0);
+        let entry_id = tracked_agent_id(&repo, pr, &run_id, AgentType::ReviewerSecurity);
+        let entry = registry
+            .entries
+            .iter()
+            .find(|value| value.agent_id == entry_id)
+            .expect("spawned registry entry should exist for forensic audit");
+        assert_eq!(entry.state, TrackedAgentState::Reaped);
+        assert_eq!(
+            entry.reap_reason.as_deref(),
+            Some("rollback:lifecycle_reviews_dispatched_failed")
+        );
     }
 }

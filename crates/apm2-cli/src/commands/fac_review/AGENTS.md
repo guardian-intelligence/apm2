@@ -38,12 +38,9 @@ apm2 fac review run --pr <N> --type all
        +-- logs.rs           (review log retrieval by PR/selector)
        +-- pipeline.rs       (end-to-end pipeline: dispatch + project)
        +-- prepare.rs        (review input preparation)
-       +-- projection.rs     (projection snapshot for GitHub surfaces)
+       +-- projection.rs     (projection snapshot for GitHub surfaces + PR body gate-status sync)
        +-- projection_store.rs (local canonical projection cache under ~/.apm2/fac_projection)
        +-- github_projection.rs (dedicated GitHub projection writer/read-fallback boundary)
-       +-- publish.rs        (review comment publishing to GitHub)
-       +-- comment.rs        (single SHA-bound finding comment publishing)
-       +-- pr_body.rs        (PR body gate-status marker sync + history retention)
        +-- push.rs           (branch push with commit signing)
        +-- target.rs         (review target resolution)
 ```
@@ -231,7 +228,6 @@ pub struct ProjectionStatus { pub security: String, pub quality: String, pub ter
 
 ```rust
 pub use decision::VerdictValueArg;
-pub use publish::ReviewPublishTypeArg;
 pub use types::ReviewRunType;
 ```
 
@@ -254,9 +250,8 @@ pub use types::ReviewRunType;
 | `run_dispatch(repo, pr, type, sha, force, json)` | Dispatch reviews as detached processes |
 | `run_status(pr_number, type_filter, json)` | Show review run status (optionally one reviewer lane) |
 | `run_findings(repo, pr, sha, refresh, json)` | Aggregate review findings with optional cache refresh |
-| `run_comment(repo, pr, sha, severity, type, body, json)` | Publish a single SHA-bound finding comment |
+| `run_comment(repo, pr, sha, severity, type, body, json)` | Compatibility shim to append a structured finding |
 | `run_prepare(repo, pr, sha, json)` | Prepare review inputs |
-| `run_publish(repo, pr, sha, type, body, json)` | Publish review comment to GitHub |
 | `run_verdict_set(repo, pr, sha, dim, verdict, reason, keep, json)` | Set review verdict |
 | `run_verdict_show(repo, pr, sha, json)` | Show review verdicts |
 | `run_project(pr, sha, since, after_seq, errors, fail_term, format_json, json)` | Best-effort projection for debug/log surfaces; non-critical by default |

@@ -28,8 +28,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::github_projection;
 use super::types::now_iso8601;
+use super::{github_projection, projection_store};
 
 // ── Marker ───────────────────────────────────────────────────────────────────
 
@@ -134,10 +134,10 @@ pub fn create_status_comment(
     owner_repo: &str,
     pr_number: u32,
     status: &CiStatus,
-) -> Result<u64, String> {
+) -> Result<(u64, String), String> {
     let body = status.to_comment_body();
     github_projection::create_issue_comment(owner_repo, pr_number, &body)
-        .map(|response| response.id)
+        .map(|response| (response.id, response.html_url))
         .map_err(|err| format!("status comment POST failed: {err}"))
 }
 
@@ -150,6 +150,38 @@ pub fn update_status_comment(
     let body = status.to_comment_body();
     github_projection::update_issue_comment(owner_repo, comment_id, &body)
         .map_err(|err| format!("status comment PATCH failed: {err}"))
+}
+
+fn find_cached_status_comment_id(owner_repo: &str, pr_number: u32) -> Option<u64> {
+    let comments =
+        projection_store::load_issue_comments_cache::<serde_json::Value>(owner_repo, pr_number)
+            .ok()
+            .flatten()?;
+    comments.iter().rev().find_map(|comment| {
+        let body = comment.get("body").and_then(serde_json::Value::as_str)?;
+        if !body.contains(STATUS_MARKER) {
+            return None;
+        }
+        comment.get("id").and_then(serde_json::Value::as_u64)
+    })
+}
+
+fn cache_status_comment(
+    owner_repo: &str,
+    pr_number: u32,
+    comment_id: u64,
+    status: &CiStatus,
+    html_url: &str,
+) {
+    let body = status.to_comment_body();
+    let _ = projection_store::upsert_issue_comment_cache_entry(
+        owner_repo,
+        pr_number,
+        comment_id,
+        html_url,
+        &body,
+        "apm2-fac-ci-status",
+    );
 }
 
 // ── Deferred updater ─────────────────────────────────────────────────────────
@@ -176,13 +208,62 @@ impl ThrottledUpdater {
     }
 
     fn sync_status_comment(&self, status: &CiStatus) -> Result<(), String> {
-        let Some(comment_id) = self.comment_id.get() else {
-            let created_id = create_status_comment(&self.owner_repo, self.pr_number, status)?;
-            self.comment_id.set(Some(created_id));
-            return Ok(());
-        };
+        let cached_id = self
+            .comment_id
+            .get()
+            .or_else(|| find_cached_status_comment_id(&self.owner_repo, self.pr_number))
+            .or_else(|| {
+                match github_projection::find_latest_issue_comment_id_with_marker(
+                    &self.owner_repo,
+                    self.pr_number,
+                    STATUS_MARKER,
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        eprintln!(
+                            "WARNING: ci_status remote status-comment discovery failed: {err}"
+                        );
+                        None
+                    },
+                }
+            });
 
-        update_status_comment(&self.owner_repo, comment_id, status)
+        if let Some(comment_id) = cached_id {
+            match update_status_comment(&self.owner_repo, comment_id, status) {
+                Ok(()) => {
+                    self.comment_id.set(Some(comment_id));
+                    let html_url = format!(
+                        "https://github.com/{}/pull/{}#issuecomment-{}",
+                        self.owner_repo, self.pr_number, comment_id
+                    );
+                    cache_status_comment(
+                        &self.owner_repo,
+                        self.pr_number,
+                        comment_id,
+                        status,
+                        &html_url,
+                    );
+                    return Ok(());
+                },
+                Err(err) => {
+                    eprintln!(
+                        "WARNING: ci_status patch for comment {comment_id} failed; creating replacement status comment: {err}"
+                    );
+                },
+            }
+        }
+
+        let (created_id, created_url) =
+            create_status_comment(&self.owner_repo, self.pr_number, status)?;
+        self.comment_id.set(Some(created_id));
+        cache_status_comment(
+            &self.owner_repo,
+            self.pr_number,
+            created_id,
+            status,
+            &created_url,
+        );
+        Ok(())
     }
 
     /// Sync the current status projection to GitHub.

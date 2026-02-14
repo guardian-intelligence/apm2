@@ -28,6 +28,7 @@ use super::types::{
     TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED, TERMINATE_TIMEOUT, TerminationAuthority,
     apm2_home_dir, ensure_parent_dir, now_iso8601,
 };
+use crate::commands::fac_permissions;
 
 const SYSTEMD_DISPATCH_ENV_ALLOWLIST: [&str; 11] = [
     "PATH",
@@ -175,7 +176,7 @@ fn resolve_head_for_path(path: &Path) -> Result<String, String> {
     Ok(sha.to_ascii_lowercase())
 }
 
-fn resolve_worktree_for_sha(expected_sha: &str) -> Result<PathBuf, String> {
+pub(super) fn resolve_worktree_for_sha(expected_sha: &str) -> Result<PathBuf, String> {
     super::types::validate_expected_head_sha(expected_sha)?;
     let expected_sha = expected_sha.to_ascii_lowercase();
 
@@ -1557,7 +1558,7 @@ fn spawn_detached_review(
     }
 
     let dispatch_dir = apm2_home_dir()?.join("review_dispatch");
-    fs::create_dir_all(&dispatch_dir).map_err(|err| {
+    fac_permissions::ensure_dir_with_mode(&dispatch_dir).map_err(|err| {
         format!(
             "failed to create dispatch directory {}: {err}",
             dispatch_dir.display()
@@ -1567,14 +1568,10 @@ fn spawn_detached_review(
         "pr{pr_number}-{}-{head_short}-{dispatch_epoch}.log",
         review_kind.as_str()
     ));
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
+    let stdout = fac_permissions::append_fac_file_with_mode(&log_path)
         .map_err(|err| format!("failed to open dispatch log {}: {err}", log_path.display()))?;
-    let stderr = stdout
-        .try_clone()
-        .map_err(|err| format!("failed to clone dispatch log handle: {err}"))?;
+    let stderr = fac_permissions::append_fac_file_with_mode(&log_path)
+        .map_err(|err| format!("failed to open dispatch log {}: {err}", log_path.display()))?;
     let child = Command::new(&exe_path)
         .arg("fac")
         .arg("review")

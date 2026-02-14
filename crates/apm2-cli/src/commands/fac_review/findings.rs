@@ -207,6 +207,8 @@ struct FindingRecord {
     sha: String,
     summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     risk: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     impact: Option<String>,
@@ -378,6 +380,7 @@ fn to_finding_record(
         reviewer_type: dimension.to_string(),
         sha: head_sha.to_string(),
         summary: finding.summary.clone(),
+        details: finding.details.clone(),
         risk: finding.risk.clone(),
         impact: finding.impact.clone(),
         location: finding.location.clone(),
@@ -520,6 +523,7 @@ mod tests {
                         finding_id: "sec-000001".to_string(),
                         severity: "MAJOR".to_string(),
                         summary: "Missing auth check".to_string(),
+                        details: Some("authorization guard missing on privileged path".to_string()),
                         risk: Some("auth bypass".to_string()),
                         impact: Some("privilege escalation".to_string()),
                         location: Some("src/auth.rs:44".to_string()),
