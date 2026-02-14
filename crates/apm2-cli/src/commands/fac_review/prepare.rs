@@ -6,12 +6,14 @@ use std::process::Command;
 
 use serde::Serialize;
 
-use super::barrier::{ensure_gh_cli_ready, fetch_pr_head_sha};
+use super::barrier::fetch_pr_head_sha;
+use super::projection_store;
 use super::target::resolve_pr_target;
-use super::types::{sanitize_for_path, validate_expected_head_sha};
+use super::types::{apm2_home_dir, sanitize_for_path, validate_expected_head_sha};
+use crate::commands::fac_permissions;
 use crate::exit_codes::codes as exit_codes;
 
-const DEFAULT_TMP_ROOT: &str = "/tmp/apm2-fac-review";
+const DEFAULT_TMP_SUBDIR: &str = "private/fac/prepared";
 const PREPARE_SCHEMA: &str = "apm2.fac.review.prepare.v1";
 
 #[derive(Debug, Serialize)]
@@ -30,28 +32,33 @@ struct PrepareSummary {
 pub fn run_prepare(
     repo: &str,
     pr_number: Option<u32>,
-    pr_url: Option<&str>,
     sha: Option<&str>,
     json_output: bool,
 ) -> Result<u8, String> {
-    ensure_gh_cli_ready()?;
-    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number, pr_url)?;
-    let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
-
+    let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
     let repo_root = resolve_repo_root()?;
     let local_head = resolve_local_head_sha(&repo_root)?;
+    let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
     if !local_head.eq_ignore_ascii_case(&head_sha) {
         return Err(format!(
             "local HEAD {local_head} does not match PR head {head_sha}; sync your branch and retry `apm2 fac review prepare`"
         ));
+    }
+    if pr_number.is_some() {
+        let _ = projection_store::save_identity_with_context(
+            &owner_repo,
+            resolved_pr,
+            &head_sha,
+            "prepare",
+        );
     }
 
     let base_ref = resolve_main_base_ref(&repo_root)?;
     let diff = collect_diff_against_main(&repo_root, &base_ref, &head_sha)?;
     let commit_history = collect_commit_history_against_main(&repo_root, &base_ref, &head_sha)?;
 
-    let prepared_dir = prepared_review_dir(&owner_repo, resolved_pr, &head_sha);
-    fs::create_dir_all(&prepared_dir).map_err(|err| {
+    let prepared_dir = prepared_review_dir(&owner_repo, resolved_pr, &head_sha)?;
+    fac_permissions::ensure_dir_with_mode(&prepared_dir).map_err(|err| {
         format!(
             "failed to create prepared review directory {}: {err}",
             prepared_dir.display()
@@ -110,7 +117,7 @@ pub fn cleanup_prepared_review_inputs(
     pr_number: u32,
     head_sha: &str,
 ) -> Result<bool, String> {
-    cleanup_prepared_review_inputs_at(&review_tmp_root(), owner_repo, pr_number, head_sha)
+    cleanup_prepared_review_inputs_at(&review_tmp_root()?, owner_repo, pr_number, head_sha)
 }
 
 fn cleanup_prepared_review_inputs_at(
@@ -174,9 +181,9 @@ fn resolve_head_sha(owner_repo: &str, pr_number: u32, sha: Option<&str>) -> Resu
         validate_expected_head_sha(value)?;
         return Ok(value.to_ascii_lowercase());
     }
-    let value = fetch_pr_head_sha(owner_repo, pr_number)?;
-    validate_expected_head_sha(&value)?;
-    Ok(value.to_ascii_lowercase())
+    let remote_head_sha = fetch_pr_head_sha(owner_repo, pr_number)?;
+    validate_expected_head_sha(&remote_head_sha)?;
+    Ok(remote_head_sha)
 }
 
 fn resolve_main_base_ref(repo_root: &Path) -> Result<String, String> {
@@ -184,9 +191,9 @@ fn resolve_main_base_ref(repo_root: &Path) -> Result<String, String> {
     let remote_status = Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", remote_main])
         .current_dir(repo_root)
-        .status()
+        .output()
         .map_err(|err| format!("failed to resolve base ref: {err}"))?;
-    if remote_status.success() {
+    if remote_status.status.success() {
         return Ok("origin/main".to_string());
     }
 
@@ -194,9 +201,9 @@ fn resolve_main_base_ref(repo_root: &Path) -> Result<String, String> {
     let local_status = Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", local_main])
         .current_dir(repo_root)
-        .status()
+        .output()
         .map_err(|err| format!("failed to resolve base ref: {err}"))?;
-    if local_status.success() {
+    if local_status.status.success() {
         return Ok("main".to_string());
     }
 
@@ -260,10 +267,14 @@ fn collect_commit_history_against_main(
     Ok(String::from_utf8_lossy(&head_output.stdout).to_string())
 }
 
-fn review_tmp_root() -> PathBuf {
-    std::env::var_os("APM2_FAC_REVIEW_TMP_DIR")
-        .filter(|value| !value.is_empty())
-        .map_or_else(|| PathBuf::from(DEFAULT_TMP_ROOT), PathBuf::from)
+fn review_tmp_root() -> Result<PathBuf, String> {
+    let Some(custom_root) =
+        std::env::var_os("APM2_FAC_REVIEW_TMP_DIR").filter(|value| !value.is_empty())
+    else {
+        return apm2_home_dir().map(|apm2_home| apm2_home.join(DEFAULT_TMP_SUBDIR));
+    };
+
+    Ok(PathBuf::from(custom_root))
 }
 
 fn prepared_review_dir_from_root(
@@ -277,8 +288,17 @@ fn prepared_review_dir_from_root(
         .join(head_sha.to_ascii_lowercase())
 }
 
-pub fn prepared_review_dir(owner_repo: &str, pr_number: u32, head_sha: &str) -> PathBuf {
-    prepared_review_dir_from_root(&review_tmp_root(), owner_repo, pr_number, head_sha)
+pub fn prepared_review_dir(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<PathBuf, String> {
+    Ok(prepared_review_dir_from_root(
+        &review_tmp_root()?,
+        owner_repo,
+        pr_number,
+        head_sha,
+    ))
 }
 
 #[cfg(test)]
@@ -311,7 +331,8 @@ mod tests {
             99,
             "0123456789abcdef0123456789abcdef01234567",
         );
-        std::fs::create_dir_all(&prepared).expect("create prepared dir");
+        crate::commands::fac_permissions::ensure_dir_with_mode(&prepared)
+            .expect("create prepared dir");
         std::fs::write(prepared.join("review.diff"), "diff").expect("write diff");
 
         let removed = cleanup_prepared_review_inputs_at(
