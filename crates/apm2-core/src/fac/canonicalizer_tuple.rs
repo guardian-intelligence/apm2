@@ -9,6 +9,7 @@ pub const CANONICALIZER_TUPLE_SCHEMA: &str = "apm2.canonicalizer_tuple.v1";
 
 /// Canonicalization semantics used for digest computation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalizerTupleV1 {
     /// Schema identifier.
     pub schema: String,

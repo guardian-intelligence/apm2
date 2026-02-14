@@ -628,7 +628,15 @@ impl FacBroker {
     // -----------------------------------------------------------------------
 
     fn read_canonicalizer_tuple_file(tuple_path: &Path) -> Result<Vec<u8>, BrokerError> {
-        let metadata = fs::metadata(tuple_path).map_err(|e| BrokerError::Persistence {
+        let file = File::open(tuple_path).map_err(|e| BrokerError::Persistence {
+            detail: format!(
+                "cannot open admitted canonicalizer tuple {}: {}",
+                tuple_path.display(),
+                e
+            ),
+        })?;
+
+        let metadata = file.metadata().map_err(|e| BrokerError::Persistence {
             detail: format!(
                 "cannot read admitted canonicalizer tuple {}: {e}",
                 tuple_path.display()
@@ -643,14 +651,6 @@ impl FacBroker {
                 max: MAX_CANONICALIZER_TUPLE_FILE_SIZE,
             });
         }
-
-        let file = File::open(tuple_path).map_err(|e| BrokerError::Persistence {
-            detail: format!(
-                "cannot open admitted canonicalizer tuple {}: {}",
-                tuple_path.display(),
-                e
-            ),
-        })?;
 
         let mut bytes = Vec::new();
         let mut bounded_reader = file.take(max_size + 1);

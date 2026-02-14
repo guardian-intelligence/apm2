@@ -417,6 +417,9 @@ impl FacJobReceiptV1 {
             bytes.push(0u8);
         }
 
+        // For backward compatibility with pre-tuple receipts, omit the `0u8`
+        // presence marker when `canonicalizer_tuple_digest` is absent, because
+        // older receipts encoded without this optional field at all.
         if let Some(digest) = &self.canonicalizer_tuple_digest {
             bytes.push(1u8);
             bytes.extend_from_slice(&(digest.len() as u32).to_be_bytes());
