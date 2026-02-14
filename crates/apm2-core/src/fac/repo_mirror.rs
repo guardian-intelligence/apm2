@@ -318,7 +318,11 @@ impl RepoMirrorManager {
     ) -> Result<PatchOutcome, RepoMirrorError> {
         if patch_bytes.len() > MAX_PATCH_SIZE {
             return Err(RepoMirrorError::PatchApplyFailed {
-                reason: format!("patch too large: {}", patch_bytes.len()),
+                reason: format!(
+                    "patch too large: {} exceeds maximum {}",
+                    patch_bytes.len(),
+                    MAX_PATCH_SIZE
+                ),
             });
         }
 
@@ -367,6 +371,10 @@ impl RepoMirrorManager {
             return Err(RepoMirrorError::PatchApplyFailed { reason });
         }
 
+        // SAFETY: Path traversal prevention is delegated to `git apply`, which by
+        // default refuses patches that attempt to modify files outside the
+        // repository root. Standard git safety rejects paths with `../`
+        // components. See: https://git-scm.com/docs/git-apply
         let changed = git_command(
             &[
                 "-C",
@@ -636,6 +644,20 @@ fn validate_remote_url(remote_url: &str) -> Result<(), RepoMirrorError> {
             reason: "remote URL must not start with hyphen".to_string(),
         });
     }
+    let safe_prefixes = ["https://", "ssh://", "git://", "file://", "/", "."];
+    if !safe_prefixes
+        .iter()
+        .any(|prefix| remote_url.starts_with(prefix))
+    {
+        return Err(RepoMirrorError::InvalidRemoteUrl {
+            reason: format!("remote URL protocol not in allowlist; must start with one of: {safe_prefixes:?}"),
+        });
+    }
+    if remote_url.starts_with("ext::") {
+        return Err(RepoMirrorError::InvalidRemoteUrl {
+            reason: "ext:: protocol is forbidden".to_string(),
+        });
+    }
 
     Ok(())
 }
@@ -776,6 +798,24 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_patch_rejects_oversized_patch() {
+        let oversized = vec![b'a'; MAX_PATCH_SIZE + 1];
+        let manager = RepoMirrorManager::new(Path::new("/tmp/nonexistent"));
+        let result = manager.apply_patch(Path::new("/tmp/workspace"), &oversized);
+        assert!(result.is_err());
+
+        match result {
+            Err(RepoMirrorError::PatchApplyFailed { reason }) => {
+                assert!(
+                    reason.contains("exceeds maximum"),
+                    "error should mention size limit: {reason}"
+                );
+            },
+            other => panic!("expected PatchApplyFailed, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_ensure_mirror_rejects_injected_remote_url() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mgr = RepoMirrorManager::new(&temp.path().join("private").join("fac"));
@@ -783,6 +823,18 @@ mod tests {
         assert!(matches!(
             mgr.ensure_mirror("sample", Some("-attacker")),
             Err(RepoMirrorError::InvalidRemoteUrl { .. })
+        ));
+        assert!(matches!(
+            mgr.ensure_mirror("sample", Some("ext::/tmp/repo")),
+            Err(RepoMirrorError::InvalidRemoteUrl { .. })
+        ));
+        assert!(matches!(
+            mgr.ensure_mirror("sample", Some("ftp://example.com/repo")),
+            Err(RepoMirrorError::InvalidRemoteUrl { .. })
+        ));
+        assert!(matches!(
+            validate_remote_url("https://example.com/repo"),
+            Ok(())
         ));
     }
 

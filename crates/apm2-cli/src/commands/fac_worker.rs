@@ -1137,7 +1137,11 @@ fn process_job(
 
         if let Some(expected_digest) = patch_obj.get("digest").and_then(|v| v.as_str()) {
             let actual_digest = format!("b3-256:{}", blake3::hash(&patch_bytes).to_hex());
-            if expected_digest != actual_digest {
+            let expected_bytes = expected_digest.as_bytes();
+            let actual_bytes = actual_digest.as_bytes();
+            if expected_bytes.len() != actual_bytes.len()
+                || !bool::from(expected_bytes.ct_eq(actual_bytes))
+            {
                 return deny_with_reason(&format!(
                     "patch digest mismatch: expected {expected_digest}, got {actual_digest}"
                 ));
