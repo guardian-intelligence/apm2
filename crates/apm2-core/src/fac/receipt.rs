@@ -362,7 +362,10 @@ impl FacJobReceiptV1 {
             bytes.push(0u8);
         }
 
-        bytes.push(u8::from(self.unsafe_direct));
+        // NOTE: `unsafe_direct` is intentionally excluded from canonical bytes.
+        // Including it would change the content hash for all existing receipts,
+        // breaking content-addressed storage and ledger references. The field
+        // is still present in the struct and in serde (de)serialization.
 
         bytes.extend_from_slice(&(self.reason.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.reason.as_bytes());
@@ -1644,6 +1647,23 @@ pub mod tests {
 
         assert!(restored.unsafe_direct);
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn test_fac_job_receipt_unsafe_direct_does_not_affect_canonical_bytes() {
+        let base =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+        let mut direct = base.clone();
+        direct.unsafe_direct = true;
+
+        // `unsafe_direct` is excluded from canonical bytes so that content
+        // hashes remain stable for receipts stored in CAS and referenced
+        // by the ledger.
+        assert_eq!(
+            base.canonical_bytes(),
+            direct.canonical_bytes(),
+            "canonical_bytes must be identical regardless of unsafe_direct"
+        );
     }
 
     #[test]

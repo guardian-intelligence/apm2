@@ -289,3 +289,8 @@ pub use types::ReviewRunType;
   - `--direct` flag runs gates locally without broker/worker (unsafe bypass; marks receipt `unsafe_direct: true`).
   - `--wait-timeout` bounds the wait for worker completion (default 300s); fails fast with remediation hints.
   - Timeout default aligned to 240s to match `MAX_MANUAL_TIMEOUT_SECONDS`.
+  - Broker state persistence uses atomic `write_fac_file_with_mode` (temp+rename with 0600).
+  - Receipt polling uses seen-file set to amortize I/O to O(new_files) per iteration.
+  - Queue/key/pending directories use `fac_permissions::ensure_dir_with_mode` (0700 at create-time).
+  - Signing key and job spec writes use `fac_permissions::write_fac_file_with_mode` (0600 at create-time).
+  - Policy loaded from `$FAC_ROOT/policy/fac_policy.v1.json` with documented default fallback.

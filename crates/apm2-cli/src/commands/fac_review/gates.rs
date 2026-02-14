@@ -5,8 +5,6 @@
 
 use std::fs;
 use std::io::Read;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::sleep;
@@ -36,6 +34,7 @@ use super::timeout_policy::{
     resolve_bounded_test_timeout,
 };
 use super::types::apm2_home_dir;
+use crate::commands::fac_permissions;
 use crate::exit_codes::codes as exit_codes;
 
 const HTF_TEST_HEARTBEAT_SECONDS: u64 = 10;
@@ -539,10 +538,10 @@ fn ensure_queue_root_dirs(queue_root: &Path) -> Result<(), String> {
         CONSUME_RECEIPTS_DIR,
     ] {
         let path = queue_root.join(dir);
-        if !path.exists() {
-            fs::create_dir_all(&path)
-                .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-        }
+        // Use secure directory creation with 0700 mode at create-time,
+        // avoiding the TOCTOU window from default-then-chmod patterns.
+        fac_permissions::ensure_dir_with_mode(&path)
+            .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -565,6 +564,12 @@ fn load_broker_state(state_path: &Path) -> Option<BrokerState> {
     FacBroker::deserialize_state(&bytes).ok()
 }
 
+/// Bootstrap the broker for channel context token issuance.
+///
+/// Policy is loaded from `$FAC_ROOT/policy/fac_policy.v1.json` if it exists,
+/// otherwise `FacPolicyV1::default_policy()` is used and persisted as the
+/// authoritative policy for this FAC root.  To override, place a custom policy
+/// at the path above before invoking any gate command.
 fn bootstrap_broker_for_issuance(fac_root: &Path, broker: &mut FacBroker) -> Result<(), String> {
     let mut checker = BrokerHealthChecker::new();
     let current_tick = broker.current_tick();
@@ -610,7 +615,9 @@ fn save_broker_state(broker: &FacBroker, fac_root: &Path) -> Result<(), String> 
     let bytes = broker
         .serialize_state()
         .map_err(|e| format!("cannot serialize broker state: {e}"))?;
-    fs::write(&state_path, bytes).map_err(|e| format!("cannot write broker state: {e}"))
+    // Atomic write via temp-file-and-rename to prevent corruption on crash.
+    fac_permissions::write_fac_file_with_mode(&state_path, &bytes)
+        .map_err(|e| format!("cannot write broker state: {e}"))
 }
 
 fn load_or_generate_persistent_signer(fac_root: &Path) -> Result<Signer, String> {
@@ -622,18 +629,14 @@ fn load_or_generate_persistent_signer(fac_root: &Path) -> Result<Signer, String>
     } else {
         let signer = Signer::generate();
         let key_bytes = signer.secret_key_bytes();
+        // Use secure directory creation (0700) and file write (0600) at
+        // create-time to eliminate the TOCTOU window from mkdir + chmod.
         if let Some(parent) = key_path.parent() {
-            fs::create_dir_all(parent)
+            fac_permissions::ensure_dir_with_mode(parent)
                 .map_err(|e| format!("cannot create signing key directory: {e}"))?;
         }
-        fs::write(&key_path, key_bytes.as_ref())
+        fac_permissions::write_fac_file_with_mode(&key_path, key_bytes.as_ref())
             .map_err(|e| format!("cannot write signing key: {e}"))?;
-        #[cfg(unix)]
-        {
-            let perms = std::fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&key_path, perms)
-                .map_err(|e| format!("cannot set signing key permissions: {e}"))?;
-        }
         Ok(signer)
     }
 }
@@ -672,16 +675,16 @@ fn write_pending_job_spec(queue_root: &Path, spec: &FacJobSpecV1) -> Result<Path
     }
 
     let pending_dir = queue_root.join(PENDING_DIR);
-    fs::create_dir_all(&pending_dir)
+    // Use secure directory creation (0700 at create-time) to prevent TOCTOU.
+    fac_permissions::ensure_dir_with_mode(&pending_dir)
         .map_err(|e| format!("cannot create pending directory: {e}"))?;
 
     let file_name = format!("{}.json", spec.job_id);
     let target = pending_dir.join(file_name);
-    let temp = pending_dir.join(format!(".pending-{}.tmp", spec.job_id));
-    fs::write(&temp, job_spec_json)
-        .map_err(|e| format!("cannot write pending job spec temp file: {e}"))?;
-    fs::rename(&temp, &target)
-        .map_err(|e| format!("cannot move pending job spec to {}: {e}", target.display()))?;
+    // Atomic write with restrictive permissions (0600) via
+    // write_fac_file_with_mode.
+    fac_permissions::write_fac_file_with_mode(&target, &job_spec_json)
+        .map_err(|e| format!("cannot write pending job spec: {e}"))?;
 
     Ok(target)
 }
@@ -693,32 +696,36 @@ fn wait_for_matching_receipt(
 ) -> Result<FacJobReceiptV1, String> {
     let start = Instant::now();
     let timeout = Duration::from_secs(wait_timeout);
+    // Track already-scanned filenames to avoid O(N) re-reads on each poll
+    // iteration. Only newly-appeared files are read and deserialized.
+    let mut seen_files = std::collections::HashSet::<std::ffi::OsString>::new();
 
     loop {
         if let Ok(entries) = fs::read_dir(receipts_dir) {
             for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                if seen_files.contains(&file_name) {
+                    continue;
+                }
                 let path = entry.path();
                 if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                    seen_files.insert(file_name);
                     continue;
                 }
-                let bytes = match fs::read(&path) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        return Err(format!(
-                            "failed to read FAC receipt {}: {e}",
-                            path.display()
-                        ));
-                    },
+                let Ok(bytes) = read_bounded(&path, MAX_JOB_RECEIPT_SIZE) else {
+                    // File may be in-flight (temp rename). Skip and
+                    // retry on next iteration rather than failing the
+                    // entire poll.
+                    continue;
                 };
-                if bytes.len() > MAX_JOB_RECEIPT_SIZE {
-                    continue;
-                }
                 let Ok(receipt) = deserialize_job_receipt(&bytes) else {
+                    seen_files.insert(file_name);
                     continue;
                 };
                 if receipt.job_id == job_id {
                     return Ok(receipt);
                 }
+                seen_files.insert(file_name);
             }
         }
 
@@ -1086,6 +1093,43 @@ mod tests {
 
         let found = wait_for_matching_receipt(dir, "job-001", 5).expect("find matching receipt");
         assert_eq!(found.receipt_id, "receipt-001");
+    }
+
+    #[test]
+    fn test_wait_for_matching_receipt_skips_non_json_and_oversized() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let dir = temp_dir.path();
+
+        // Non-JSON file should be skipped without error.
+        fs::write(dir.join("not-json.txt"), "hello").expect("write non-json");
+
+        // Write valid matching receipt.
+        let receipt = FacJobReceiptV1Builder::new(
+            "receipt-002",
+            "job-002",
+            "b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .outcome(FacJobOutcome::Completed)
+        .reason("ok")
+        .timestamp_secs(1_700_000_000)
+        .rfc0028_channel_boundary(ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+        })
+        .eio29_queue_admission(JobQueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+        })
+        .try_build()
+        .expect("build receipt");
+
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("serialize");
+        fs::write(dir.join("receipt-match.json"), bytes).expect("write receipt");
+
+        let found = wait_for_matching_receipt(dir, "job-002", 2).expect("find receipt");
+        assert_eq!(found.receipt_id, "receipt-002");
     }
 
     fn run_git(repo: &Path, args: &[&str]) {
