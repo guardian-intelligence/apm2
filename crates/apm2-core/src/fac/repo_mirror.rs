@@ -217,12 +217,12 @@ impl RepoMirrorManager {
             })
             .collect();
 
-        if with_time.len() <= MAX_MIRROR_COUNT {
+        if with_time.len() < MAX_MIRROR_COUNT {
             return Ok(());
         }
 
         with_time.sort_by_key(|(_, t)| *t);
-        let to_remove = with_time.len() - MAX_MIRROR_COUNT;
+        let to_remove = with_time.len() - MAX_MIRROR_COUNT + 1;
 
         for (path, _) in with_time.into_iter().take(to_remove) {
             safe_rmtree_v1(&path, &self.mirror_root).map_err(RepoMirrorError::SafeRmtreeError)?;
@@ -644,7 +644,8 @@ fn validate_remote_url(remote_url: &str) -> Result<(), RepoMirrorError> {
             reason: "remote URL must not start with hyphen".to_string(),
         });
     }
-    let safe_prefixes = ["https://", "ssh://", "git://", "file://", "/", "."];
+    // file:// is disallowed to avoid arbitrary local-file reads through git remotes.
+    let safe_prefixes = ["https://", "ssh://", "git://", "/", "."];
     if !safe_prefixes
         .iter()
         .any(|prefix| remote_url.starts_with(prefix))
@@ -874,7 +875,7 @@ mod tests {
             .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("git"))
             .count();
 
-        assert_eq!(count, MAX_MIRROR_COUNT + 1);
+        assert_eq!(count, MAX_MIRROR_COUNT);
         assert_eq!(head_sha.len(), 40);
     }
 

@@ -1045,8 +1045,12 @@ fn process_job(
         };
     }
 
-    let mirror_manager = RepoMirrorManager::new(fac_root);
     let mut patch_digest: Option<String> = None;
+    // process_job executes one job at a time in a single worker lane, so
+    // blocking mirror I/O is intentionally accepted in this default-mode
+    // execution path. The entire job execution remains sequential behind the
+    // lane lease and remains fail-closed on error.
+    let mirror_manager = RepoMirrorManager::new(fac_root);
     if let Err(e) = mirror_manager.ensure_mirror(&spec.source.repo_id, None) {
         let reason = format!("mirror ensure failed: {e}");
         let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);

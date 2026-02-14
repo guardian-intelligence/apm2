@@ -336,7 +336,6 @@ impl FacJobSpecV1 {
     /// # Errors
     ///
     /// Returns `JobSpecError` for schema, field, and bound violations.
-    #[allow(clippy::too_many_lines)]
     pub fn validate_structure(&self) -> Result<(), JobSpecError> {
         if self.schema != JOB_SPEC_SCHEMA_ID {
             return Err(JobSpecError::SchemaMismatch {
@@ -370,49 +369,7 @@ impl FacJobSpecV1 {
         validate_repo_id(&self.source.repo_id)?;
         validate_head_sha(&self.source.head_sha)?;
         if self.source.kind == "patch_injection" {
-            let patch = self
-                .source
-                .patch
-                .as_ref()
-                .ok_or(JobSpecError::MissingPatchField {
-                    field: "source.patch",
-                })?;
-            let patch_obj = patch
-                .as_object()
-                .ok_or_else(|| JobSpecError::InvalidPatchFormat {
-                    reason: "patch must be a JSON object".to_string(),
-                })?;
-            if !patch_obj.contains_key("bytes") {
-                return Err(JobSpecError::InvalidPatchFormat {
-                    reason: "patch descriptor must contain 'bytes' field for inline patch data"
-                        .to_string(),
-                });
-            }
-            if patch_obj
-                .get("bytes")
-                .is_some_and(|bytes| !bytes.is_string())
-            {
-                return Err(JobSpecError::InvalidPatchFormat {
-                    reason: "patch bytes must be a string".to_string(),
-                });
-            }
-            if let Some(digest) = patch_obj.get("digest").and_then(|value| value.as_str()) {
-                if !digest.starts_with(B3_256_PREFIX) || digest.len() != 71 {
-                    return Err(JobSpecError::InvalidPatchFormat {
-                        reason: "patch digest must be b3-256:<64hex>".to_string(),
-                    });
-                }
-                if !digest
-                    .as_bytes()
-                    .iter()
-                    .skip(B3_256_PREFIX.len())
-                    .all(u8::is_ascii_hexdigit)
-                {
-                    return Err(JobSpecError::InvalidPatchFormat {
-                        reason: "patch digest must be b3-256:<64hex>".to_string(),
-                    });
-                }
-            }
+            self.validate_patch_source()?;
         }
         if let Some(patch) = &self.source.patch {
             let patch_bytes =
@@ -472,6 +429,53 @@ impl FacJobSpecV1 {
             });
         }
 
+        Ok(())
+    }
+
+    fn validate_patch_source(&self) -> Result<(), JobSpecError> {
+        let patch = self
+            .source
+            .patch
+            .as_ref()
+            .ok_or(JobSpecError::MissingPatchField {
+                field: "source.patch",
+            })?;
+        let patch_obj = patch
+            .as_object()
+            .ok_or_else(|| JobSpecError::InvalidPatchFormat {
+                reason: "patch must be a JSON object".to_string(),
+            })?;
+        if !patch_obj.contains_key("bytes") {
+            return Err(JobSpecError::InvalidPatchFormat {
+                reason: "patch descriptor must contain 'bytes' field for inline patch data"
+                    .to_string(),
+            });
+        }
+        if patch_obj
+            .get("bytes")
+            .is_some_and(|bytes| !bytes.is_string())
+        {
+            return Err(JobSpecError::InvalidPatchFormat {
+                reason: "patch bytes must be a string".to_string(),
+            });
+        }
+        if let Some(digest) = patch_obj.get("digest").and_then(|value| value.as_str()) {
+            if !digest.starts_with(B3_256_PREFIX) || digest.len() != 71 {
+                return Err(JobSpecError::InvalidPatchFormat {
+                    reason: "patch digest must be b3-256:<64hex>".to_string(),
+                });
+            }
+            if !digest
+                .as_bytes()
+                .iter()
+                .skip(B3_256_PREFIX.len())
+                .all(u8::is_ascii_hexdigit)
+            {
+                return Err(JobSpecError::InvalidPatchFormat {
+                    reason: "patch digest must be b3-256:<64hex>".to_string(),
+                });
+            }
+        }
         Ok(())
     }
 }
