@@ -635,22 +635,7 @@ impl FacBroker {
                 e
             ),
         })?;
-
-        let metadata = file.metadata().map_err(|e| BrokerError::Persistence {
-            detail: format!(
-                "cannot read admitted canonicalizer tuple {}: {e}",
-                tuple_path.display()
-            ),
-        })?;
-
-        let size = metadata.len();
         let max_size = MAX_CANONICALIZER_TUPLE_FILE_SIZE as u64;
-        if size > max_size {
-            return Err(BrokerError::StateTooLarge {
-                size: usize::try_from(size).unwrap_or(usize::MAX),
-                max: MAX_CANONICALIZER_TUPLE_FILE_SIZE,
-            });
-        }
 
         let mut bytes = Vec::new();
         let mut bounded_reader = file.take(max_size + 1);

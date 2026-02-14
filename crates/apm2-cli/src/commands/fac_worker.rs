@@ -163,10 +163,10 @@ struct WorkerSummary {
     jobs_skipped: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum CanonicalizerTupleCheck {
     Matched,
-    AutoAdmitted { load_error: String },
+    Missing,
     Mismatch(CanonicalizerTupleV1),
 }
 
@@ -371,12 +371,13 @@ pub fn run_fac_worker(
 
     let current_tuple = CanonicalizerTupleV1::from_current();
     let current_tuple_digest = compute_canonicalizer_tuple_digest();
-    match check_or_admit_canonicalizer_tuple(&mut broker, &fac_root) {
+    match check_or_admit_canonicalizer_tuple(&fac_root) {
         Ok(CanonicalizerTupleCheck::Matched) => {},
-        Ok(CanonicalizerTupleCheck::AutoAdmitted { load_error }) => {
+        Ok(CanonicalizerTupleCheck::Missing) => {
             eprintln!(
-                "INFO: no admitted canonicalizer tuple found, admitting current: {load_error}"
+                "FATAL: no admitted canonicalizer tuple found. Run 'apm2 fac canonicalizer admit' to bootstrap."
             );
+            return exit_codes::GENERIC_ERROR;
         },
         Ok(CanonicalizerTupleCheck::Mismatch(admitted_tuple)) => {
             eprintln!("FATAL: canonicalizer tuple mismatch");
@@ -555,23 +556,14 @@ fn persist_queue_scheduler_state(
     }
 }
 
-fn check_or_admit_canonicalizer_tuple(
-    broker: &mut FacBroker,
-    fac_root: &Path,
-) -> Result<CanonicalizerTupleCheck, String> {
+fn check_or_admit_canonicalizer_tuple(fac_root: &Path) -> Result<CanonicalizerTupleCheck, String> {
     let tuple = CanonicalizerTupleV1::from_current();
     let tuple_path = fac_root
         .join("broker")
         .join("admitted_canonicalizer_tuple.v1.json");
 
     if !tuple_path.exists() {
-        eprintln!("INFO: canonicalizer tuple file missing (first run), admitting current tuple");
-        return broker
-            .admit_canonicalizer_tuple(fac_root)
-            .map(|_| CanonicalizerTupleCheck::AutoAdmitted {
-                load_error: "file not found".to_string(),
-            })
-            .map_err(|e| format!("cannot persist canonicalizer tuple: {e}"));
+        return Ok(CanonicalizerTupleCheck::Missing);
     }
 
     match FacBroker::load_admitted_tuple(fac_root) {
@@ -2104,21 +2096,17 @@ mod tests {
     }
 
     #[test]
-    fn test_check_or_admit_canonicalizer_tuple_auto_admits() {
+    fn test_check_or_admit_canonicalizer_tuple_missing_is_fail_closed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let fac_root = dir.path().join("private").join("fac");
-        let mut broker = FacBroker::new();
+        let _broker = FacBroker::new();
 
-        let result = check_or_admit_canonicalizer_tuple(&mut broker, &fac_root)
-            .expect("first-run admission should auto-admit");
+        let result = check_or_admit_canonicalizer_tuple(&fac_root)
+            .expect("first run should return a canonicalizer check result");
         match result {
-            CanonicalizerTupleCheck::AutoAdmitted { .. } => {},
+            CanonicalizerTupleCheck::Missing => {},
             other => panic!("unexpected result: {other:?}"),
         }
-
-        let loaded =
-            FacBroker::load_admitted_tuple(&fac_root).expect("admitted tuple should be persisted");
-        assert_eq!(loaded, CanonicalizerTupleV1::from_current());
     }
 
     #[test]
@@ -2140,7 +2128,7 @@ mod tests {
         let tuple_bytes = serde_json::to_vec_pretty(&tuple).expect("serialize mismatch tuple");
         fs::write(&tuple_path, tuple_bytes).expect("write mismatch tuple");
 
-        match check_or_admit_canonicalizer_tuple(&mut broker, &fac_root) {
+        match check_or_admit_canonicalizer_tuple(&fac_root) {
             Ok(CanonicalizerTupleCheck::Mismatch(admitted_tuple)) => {
                 assert_ne!(admitted_tuple, CanonicalizerTupleV1::from_current());
             },
@@ -2152,7 +2140,7 @@ mod tests {
     fn test_check_or_admit_canonicalizer_tuple_rejects_deserialization_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
         let fac_root = dir.path().join("private").join("fac");
-        let mut broker = FacBroker::new();
+        let _broker = FacBroker::new();
         let tuple_path = fac_root
             .join("broker")
             .join("admitted_canonicalizer_tuple.v1.json");
@@ -2160,7 +2148,7 @@ mod tests {
             .expect("create tuple directory");
         fs::write(&tuple_path, b"{not-json").expect("write corrupted tuple");
 
-        let result = check_or_admit_canonicalizer_tuple(&mut broker, &fac_root);
+        let result = check_or_admit_canonicalizer_tuple(&fac_root);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(

@@ -908,7 +908,7 @@ fn main() -> Result<()> {
 fn ensure_canonicalizer_tuple_admitted(
     fac_root: &Path,
     current_tuple: &apm2_core::fac::CanonicalizerTupleV1,
-    tuple_broker: &mut apm2_core::fac::FacBroker,
+    _tuple_broker: &mut apm2_core::fac::FacBroker,
 ) -> Result<()> {
     use apm2_core::fac::FacBroker;
 
@@ -916,14 +916,9 @@ fn ensure_canonicalizer_tuple_admitted(
         .join("broker")
         .join("admitted_canonicalizer_tuple.v1.json");
     if !tuple_path.exists() {
-        tuple_broker
-            .admit_canonicalizer_tuple(fac_root)
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "failed to persist canonicalizer tuple for first-run startup: {error}"
-                )
-            })?;
-        return Ok(());
+        return Err(anyhow::anyhow!(
+            "No admitted canonicalizer tuple found. Run 'apm2 fac canonicalizer admit' to bootstrap."
+        ));
     }
 
     let admitted_tuple = FacBroker::load_admitted_tuple(fac_root).map_err(|error| {
@@ -3351,21 +3346,18 @@ mod crash_recovery_integration_tests {
     }
 
     #[test]
-    fn test_ensure_canonicalizer_tuple_admitted_first_run() {
+    fn test_ensure_canonicalizer_tuple_admitted_rejects_missing_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let fac_root = dir.path().join("private").join("fac");
         let current_tuple = apm2_core::fac::CanonicalizerTupleV1::from_current();
         let mut tuple_broker = apm2_core::fac::FacBroker::new();
 
-        ensure_canonicalizer_tuple_admitted(&fac_root, &current_tuple, &mut tuple_broker)
-            .expect("first-run tuple admission should succeed");
-
+        let err = ensure_canonicalizer_tuple_admitted(&fac_root, &current_tuple, &mut tuple_broker)
+            .expect_err("first-run without tuple should fail");
         assert!(
-            fac_root
-                .join("broker")
-                .join("admitted_canonicalizer_tuple.v1.json")
-                .exists(),
-            "tuple file should be persisted during first-run admission"
+            err.to_string()
+                .contains("No admitted canonicalizer tuple found."),
+            "expected missing tuple failure, got: {err}"
         );
     }
 
