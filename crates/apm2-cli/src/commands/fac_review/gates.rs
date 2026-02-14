@@ -21,8 +21,8 @@ use apm2_core::fac::{
     FacJobReceiptV1Builder, FacJobSpecV1, FacJobSpecV1Builder, FacPolicyV1, JobSource,
     LaneProfileV1, MAX_JOB_RECEIPT_SIZE, MAX_JOB_SPEC_SIZE, MAX_POLICY_SIZE,
     QueueAdmissionTrace as JobQueueAdmissionTrace, compute_policy_hash, compute_test_env,
-    deserialize_job_receipt, deserialize_policy, parse_policy_hash, persist_content_addressed_receipt,
-    persist_policy,
+    deserialize_job_receipt, deserialize_policy, parse_policy_hash,
+    persist_content_addressed_receipt, persist_policy,
 };
 use apm2_daemon::telemetry::is_cgroup_v2_available;
 use blake3;
@@ -510,7 +510,7 @@ fn build_gates_job_spec(
         source,
     )
     .priority(25)
-        .memory_max_bytes(memory_max_bytes)
+    .memory_max_bytes(memory_max_bytes)
     .test_timeout_seconds(effective_timeout_seconds)
     .require_nextest(!quick);
 
@@ -794,8 +794,7 @@ fn emit_direct_fac_receipt(
     .reason(&reason)
     .rfc0028_channel_boundary(boundary_trace)
     .eio29_queue_admission(queue_trace)
-    .timestamp_secs(current_timestamp_epoch_secs())
-    ;
+    .timestamp_secs(current_timestamp_epoch_secs());
     if !passed {
         receipt = receipt.denial_reason(DenialReasonCode::ValidationFailed);
     }
