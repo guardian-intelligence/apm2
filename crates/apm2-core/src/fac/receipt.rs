@@ -62,6 +62,9 @@
 //! assert!(receipt.validate_signature(&signer.verifying_key()).is_ok());
 //! ```
 
+use std::fs;
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -70,6 +73,15 @@ use super::policy_resolution::MAX_STRING_LENGTH;
 use crate::crypto::{Signature, VerifyingKey};
 // Re-export the generated proto type for wire format serialization.
 pub use crate::events::GateReceipt as GateReceiptProto;
+
+/// Schema identifier for `FacJobReceiptV1`.
+pub const FAC_JOB_RECEIPT_SCHEMA: &str = "apm2.fac.job_receipt.v1";
+
+/// Maximum human-reason length for `FacJobReceiptV1`.
+const MAX_FAC_JOB_REASON_LENGTH: usize = 512;
+
+/// Maximum RFC-0028 boundary defect classes included in a receipt trace.
+const MAX_FAC_JOB_BOUNDARY_DEFECT_CLASSES: usize = 32;
 
 // =============================================================================
 // Version Constants
@@ -151,6 +163,443 @@ pub enum ReceiptError {
         /// List of supported payload schema versions.
         supported: Vec<u32>,
     },
+}
+
+// =============================================================================
+// FAC Job Receipt Types
+// =============================================================================
+
+/// Errors that can occur during `FacJobReceiptV1` operations.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FacJobReceiptError {
+    /// Required field missing.
+    #[error("missing required field: {0}")]
+    MissingField(&'static str),
+
+    /// String field exceeds maximum length.
+    #[error("string field {field} exceeds max length: {actual} > {max}")]
+    StringTooLong {
+        /// The oversized field.
+        field: &'static str,
+        /// Actual length.
+        actual: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
+
+    /// Invalid structured data.
+    #[error("invalid receipt data: {0}")]
+    InvalidData(String),
+
+    /// Serialization/deserialization failure.
+    #[error("receipt serialization failed: {0}")]
+    Serialization(String),
+}
+
+/// Receipt outcome for a worker job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FacJobOutcome {
+    /// The job was completed successfully.
+    Completed,
+    /// The job was denied.
+    Denied,
+    /// The job was quarantined due to malformed input.
+    Quarantined,
+}
+
+/// Stable machine-readable denial reason codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DenialReasonCode {
+    /// Malformed or oversized job spec.
+    MalformedSpec,
+    /// Job spec digest mismatch.
+    DigestMismatch,
+    /// Missing RFC-0028 channel context token.
+    MissingChannelToken,
+    /// RFC-0028 token decode failure.
+    TokenDecodeFailed,
+    /// RFC-0028 channel boundary violation.
+    ChannelBoundaryViolation,
+    /// Broker admission health gate not passed.
+    AdmissionHealthGateFailed,
+    /// RFC-0029 queue admission denied.
+    QueueAdmissionDenied,
+    /// PCAC authority already consumed.
+    AuthorityAlreadyConsumed,
+    /// PCAC consume operation failed.
+    PcacConsumeFailed,
+    /// Lane acquisition failed.
+    LaneAcquisitionFailed,
+    /// General validation failure.
+    ValidationFailed,
+}
+
+/// Trace of the RFC-0028 channel boundary check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelBoundaryTrace {
+    /// Whether the boundary check passed.
+    pub passed: bool,
+    /// Number of defects found.
+    pub defect_count: u32,
+    /// Bound and stringified defect classes.
+    pub defect_classes: Vec<String>,
+}
+
+/// Trace of the RFC-0029 queue admission decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueAdmissionTrace {
+    /// The admission verdict.
+    pub verdict: String,
+    /// The queue lane that was evaluated.
+    pub queue_lane: String,
+    /// Optional deny reason.
+    pub defect_reason: Option<String>,
+}
+
+/// Placeholder trace for RFC-0029 budget admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetAdmissionTrace {
+    /// Budget admission verdict.
+    pub verdict: String,
+    /// Optional reason for budget denial.
+    pub reason: Option<String>,
+}
+
+/// Unified worker receipt for FAC job outcomes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FacJobReceiptV1 {
+    /// Schema identifier.
+    pub schema: String,
+    /// Unique receipt ID.
+    pub receipt_id: String,
+    /// Job ID from the spec.
+    pub job_id: String,
+    /// BLAKE3 digest of the job spec.
+    pub job_spec_digest: String,
+    /// Outcome.
+    pub outcome: FacJobOutcome,
+    /// Stable denial reason for non-completed outcomes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denial_reason: Option<DenialReasonCode>,
+    /// Human-readable reason (bounded).
+    pub reason: String,
+    /// RFC-0028 boundary trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rfc0028_channel_boundary: Option<ChannelBoundaryTrace>,
+    /// RFC-0029 queue admission trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eio29_queue_admission: Option<QueueAdmissionTrace>,
+    /// RFC-0029 budget admission trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eio29_budget_admission: Option<BudgetAdmissionTrace>,
+    /// Epoch timestamp.
+    pub timestamp_secs: u64,
+    /// BLAKE3 body hash for content-addressed storage.
+    pub content_hash: String,
+}
+
+/// Builder for `FacJobReceiptV1`.
+#[derive(Debug, Default)]
+pub struct FacJobReceiptV1Builder {
+    receipt_id: String,
+    job_id: String,
+    job_spec_digest: Option<String>,
+    outcome: Option<FacJobOutcome>,
+    denial_reason: Option<DenialReasonCode>,
+    reason: Option<String>,
+    rfc0028_channel_boundary: Option<ChannelBoundaryTrace>,
+    eio29_queue_admission: Option<QueueAdmissionTrace>,
+    eio29_budget_admission: Option<BudgetAdmissionTrace>,
+    timestamp_secs: Option<u64>,
+}
+
+impl FacJobReceiptV1Builder {
+    /// Creates a new builder with required IDs and digest.
+    #[must_use]
+    pub fn new(
+        receipt_id: impl Into<String>,
+        job_id: impl Into<String>,
+        job_spec_digest: impl Into<String>,
+    ) -> Self {
+        Self {
+            receipt_id: receipt_id.into(),
+            job_id: job_id.into(),
+            job_spec_digest: Some(job_spec_digest.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Sets the outcome.
+    #[must_use]
+    pub const fn outcome(mut self, outcome: FacJobOutcome) -> Self {
+        self.outcome = Some(outcome);
+        self
+    }
+
+    /// Sets the denial code.
+    #[must_use]
+    pub const fn denial_reason(mut self, reason: DenialReasonCode) -> Self {
+        self.denial_reason = Some(reason);
+        self
+    }
+
+    /// Sets the human reason.
+    #[must_use]
+    pub fn reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    /// Sets the boundary trace.
+    #[must_use]
+    pub fn rfc0028_channel_boundary(mut self, trace: ChannelBoundaryTrace) -> Self {
+        self.rfc0028_channel_boundary = Some(trace);
+        self
+    }
+
+    /// Sets the queue admission trace.
+    #[must_use]
+    pub fn eio29_queue_admission(mut self, trace: QueueAdmissionTrace) -> Self {
+        self.eio29_queue_admission = Some(trace);
+        self
+    }
+
+    /// Sets the budget admission trace.
+    #[must_use]
+    pub fn eio29_budget_admission(mut self, trace: BudgetAdmissionTrace) -> Self {
+        self.eio29_budget_admission = Some(trace);
+        self
+    }
+
+    /// Sets receipt timestamp.
+    #[must_use]
+    pub const fn timestamp_secs(mut self, timestamp_secs: u64) -> Self {
+        self.timestamp_secs = Some(timestamp_secs);
+        self
+    }
+
+    /// Builds a receipt and computes the content hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacJobReceiptError`] if:
+    /// - A required field is missing.
+    /// - A string exceeds maximum allowed length.
+    /// - The receipt is malformed (invalid digest, failed hashing, etc.).
+    #[allow(clippy::too_many_lines)]
+    pub fn try_build(self) -> Result<FacJobReceiptV1, FacJobReceiptError> {
+        let receipt_id = self.receipt_id;
+        let job_id = self.job_id;
+        let job_spec_digest = self
+            .job_spec_digest
+            .ok_or(FacJobReceiptError::MissingField("job_spec_digest"))?;
+        let outcome = self.outcome.unwrap_or(FacJobOutcome::Denied);
+        let reason = self.reason.unwrap_or_else(|| "unspecified".to_string());
+        let timestamp_secs = self.timestamp_secs.unwrap_or(0);
+
+        if receipt_id.len() > MAX_STRING_LENGTH {
+            return Err(FacJobReceiptError::StringTooLong {
+                field: "receipt_id",
+                actual: receipt_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if job_id.len() > MAX_STRING_LENGTH {
+            return Err(FacJobReceiptError::StringTooLong {
+                field: "job_id",
+                actual: job_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+
+        if job_spec_digest.is_empty()
+            || !job_spec_digest.starts_with("b3-256:")
+            || job_spec_digest.len() != 71
+        {
+            return Err(FacJobReceiptError::InvalidData(
+                "job_spec_digest must be 'b3-256:<64 hex>'".to_string(),
+            ));
+        }
+
+        if job_spec_digest.len() > MAX_STRING_LENGTH {
+            return Err(FacJobReceiptError::StringTooLong {
+                field: "job_spec_digest",
+                actual: job_spec_digest.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+
+        let reason_len = reason.chars().count();
+        if reason_len > MAX_FAC_JOB_REASON_LENGTH {
+            return Err(FacJobReceiptError::StringTooLong {
+                field: "reason",
+                actual: reason_len,
+                max: MAX_FAC_JOB_REASON_LENGTH,
+            });
+        }
+
+        match outcome {
+            FacJobOutcome::Completed => {
+                if self.rfc0028_channel_boundary.is_none() {
+                    return Err(FacJobReceiptError::MissingField("rfc0028_channel_boundary"));
+                }
+                if self.eio29_queue_admission.is_none() {
+                    return Err(FacJobReceiptError::MissingField("eio29_queue_admission"));
+                }
+            },
+            FacJobOutcome::Denied | FacJobOutcome::Quarantined => {
+                if self.denial_reason.is_none() {
+                    return Err(FacJobReceiptError::MissingField("denial_reason"));
+                }
+            },
+        }
+
+        if let Some(trace) = self.rfc0028_channel_boundary.as_ref() {
+            if trace.defect_classes.len() > MAX_FAC_JOB_BOUNDARY_DEFECT_CLASSES {
+                return Err(FacJobReceiptError::InvalidData(
+                    "channel boundary defect class count exceeds limit".to_string(),
+                ));
+            }
+            for class in &trace.defect_classes {
+                if class.len() > MAX_STRING_LENGTH {
+                    return Err(FacJobReceiptError::StringTooLong {
+                        field: "rfc0028_channel_boundary.defect_classes",
+                        actual: class.len(),
+                        max: MAX_STRING_LENGTH,
+                    });
+                }
+            }
+        }
+
+        if let Some(trace) = self.eio29_queue_admission.as_ref() {
+            if trace.verdict.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "eio29_queue_admission.verdict",
+                    actual: trace.verdict.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if trace.queue_lane.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "eio29_queue_admission.queue_lane",
+                    actual: trace.queue_lane.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if let Some(defect_reason) = &trace.defect_reason
+                && defect_reason.len() > MAX_STRING_LENGTH
+            {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "eio29_queue_admission.defect_reason",
+                    actual: defect_reason.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+        }
+
+        if let Some(trace) = self.eio29_budget_admission.as_ref() {
+            if trace.verdict.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "eio29_budget_admission.verdict",
+                    actual: trace.verdict.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if let Some(reason) = &trace.reason
+                && reason.len() > MAX_STRING_LENGTH
+            {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "eio29_budget_admission.reason",
+                    actual: reason.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+        }
+
+        let candidate = FacJobReceiptV1 {
+            schema: FAC_JOB_RECEIPT_SCHEMA.to_string(),
+            receipt_id,
+            job_id,
+            job_spec_digest,
+            outcome,
+            denial_reason: self.denial_reason,
+            reason,
+            rfc0028_channel_boundary: self.rfc0028_channel_boundary,
+            eio29_queue_admission: self.eio29_queue_admission,
+            eio29_budget_admission: self.eio29_budget_admission,
+            timestamp_secs,
+            content_hash: String::new(),
+        };
+
+        let body = serialize_job_receipt_body_without_content_hash(&candidate)
+            .map_err(|e| FacJobReceiptError::Serialization(e.to_string()))?;
+        let mut receipt = candidate;
+        receipt.content_hash = compute_job_receipt_content_hash(&body);
+        Ok(receipt)
+    }
+}
+
+fn serialize_job_receipt_body_without_content_hash(
+    receipt: &FacJobReceiptV1,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut receipt = receipt.clone();
+    receipt.content_hash.clear();
+    serde_json::to_vec_pretty(&receipt)
+}
+
+fn compute_job_receipt_content_hash(bytes: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"apm2.fac.job_receipt.v1:content_hash");
+    hasher.update(bytes);
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Persist a content-addressed job receipt.
+///
+/// Writes the receipt to `<blake3_hex>.json` under `fac_receipts_dir` using
+/// an atomic temp-file rename.
+///
+/// # Errors
+///
+/// Returns an error string if serialization, hashing, or persistence fails.
+pub fn persist_content_addressed_receipt(
+    fac_receipts_dir: &Path,
+    receipt: &FacJobReceiptV1,
+) -> Result<PathBuf, String> {
+    let body = serialize_job_receipt_body_without_content_hash(receipt)
+        .map_err(|e| format!("cannot serialize receipt body: {e}"))?;
+    let expected_hash = compute_job_receipt_content_hash(&body);
+
+    if !receipt.content_hash.is_empty() && receipt.content_hash != expected_hash {
+        return Err("receipt content_hash does not match serialized body".to_string());
+    }
+
+    fs::create_dir_all(fac_receipts_dir)
+        .map_err(|e| format!("cannot create receipt directory: {e}"))?;
+
+    let canonical_receipt = FacJobReceiptV1 {
+        content_hash: expected_hash.clone(),
+        ..receipt.clone()
+    };
+    let body = serde_json::to_vec_pretty(&canonical_receipt)
+        .map_err(|e| format!("cannot serialize receipt: {e}"))?;
+
+    let final_path = fac_receipts_dir.join(format!("{expected_hash}.json"));
+    let temp_path = fac_receipts_dir.join(format!("{expected_hash}.tmp"));
+    fs::write(&temp_path, body).map_err(|e| format!("cannot write temp receipt file: {e}"))?;
+    fs::rename(&temp_path, &final_path)
+        .map_err(|e| format!("cannot move receipt to {}: {e}", final_path.display()))?;
+
+    Ok(final_path)
 }
 
 // =============================================================================
@@ -775,6 +1224,235 @@ pub mod tests {
 
     use super::*;
     use crate::crypto::Signer;
+
+    fn sample_fac_receipt(
+        outcome: FacJobOutcome,
+        denial_reason: Option<DenialReasonCode>,
+    ) -> Result<FacJobReceiptV1, FacJobReceiptError> {
+        let mut builder = FacJobReceiptV1Builder::new(
+            "receipt-job-001",
+            "job-001",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .outcome(outcome)
+        .reason("sample reason")
+        .timestamp_secs(1_700_000_000)
+        .rfc0028_channel_boundary(ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+        });
+
+        match outcome {
+            FacJobOutcome::Completed => {
+                builder = builder
+                    .eio29_queue_admission(QueueAdmissionTrace {
+                        verdict: "allow".to_string(),
+                        queue_lane: "bulk".to_string(),
+                        defect_reason: None,
+                    })
+                    .eio29_budget_admission(BudgetAdmissionTrace {
+                        verdict: "allow".to_string(),
+                        reason: None,
+                    });
+            },
+            FacJobOutcome::Denied | FacJobOutcome::Quarantined => {
+                if let Some(reason) = denial_reason {
+                    builder = builder.denial_reason(reason);
+                }
+            },
+        }
+
+        builder.try_build()
+    }
+
+    #[test]
+    fn test_fac_job_receipt_round_trip_json() {
+        let receipt =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+
+        let serialized = serde_json::to_vec_pretty(&receipt).expect("serialize fac job receipt");
+        let decoded: FacJobReceiptV1 =
+            serde_json::from_slice(&serialized).expect("deserialize fac job receipt");
+
+        assert_eq!(receipt, decoded);
+    }
+
+    #[test]
+    fn test_fac_job_receipt_content_hash_is_deterministic() {
+        let first =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+        let second =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+
+        assert_eq!(first.content_hash, second.content_hash);
+    }
+
+    #[test]
+    fn test_fac_job_receipt_builder_requires_completion_boundary_trace() {
+        let result = FacJobReceiptV1Builder::new(
+            "receipt-job-002",
+            "job-002",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .outcome(FacJobOutcome::Completed)
+        .reason("ok")
+        .timestamp_secs(1_700_000_001)
+        .eio29_queue_admission(QueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+        })
+        .try_build();
+
+        assert!(matches!(
+            result,
+            Err(FacJobReceiptError::MissingField("rfc0028_channel_boundary"))
+        ));
+    }
+
+    #[test]
+    fn test_fac_job_receipt_builder_requires_queue_admission_trace() {
+        let result = FacJobReceiptV1Builder::new(
+            "receipt-job-003",
+            "job-003",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .outcome(FacJobOutcome::Completed)
+        .reason("ok")
+        .timestamp_secs(1_700_000_002)
+        .rfc0028_channel_boundary(ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+        })
+        .try_build();
+
+        assert!(matches!(
+            result,
+            Err(FacJobReceiptError::MissingField("eio29_queue_admission"))
+        ));
+    }
+
+    #[test]
+    fn test_fac_job_receipt_builder_requires_denial_reason() {
+        let result = FacJobReceiptV1Builder::new(
+            "receipt-job-004",
+            "job-004",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .outcome(FacJobOutcome::Denied)
+        .reason("not allowed")
+        .rfc0028_channel_boundary(ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+        })
+        .eio29_queue_admission(QueueAdmissionTrace {
+            verdict: "deny".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: Some("missing authority".to_string()),
+        })
+        .try_build();
+
+        assert!(matches!(
+            result,
+            Err(FacJobReceiptError::MissingField("denial_reason"))
+        ));
+    }
+
+    #[test]
+    fn test_fac_job_outcome_serializes_snake_case() {
+        let completed =
+            serde_json::to_string(&FacJobOutcome::Completed).expect("serialize completed outcome");
+        assert_eq!(completed, "\"completed\"");
+        let denied =
+            serde_json::to_string(&FacJobOutcome::Denied).expect("serialize denied outcome");
+        assert_eq!(denied, "\"denied\"");
+        let quarantined = serde_json::to_string(&FacJobOutcome::Quarantined)
+            .expect("serialize quarantined outcome");
+        assert_eq!(quarantined, "\"quarantined\"");
+    }
+
+    #[test]
+    fn test_denial_reason_code_serializes_snake_case() {
+        let map = [
+            (DenialReasonCode::MalformedSpec, "\"malformed_spec\""),
+            (DenialReasonCode::DigestMismatch, "\"digest_mismatch\""),
+            (
+                DenialReasonCode::MissingChannelToken,
+                "\"missing_channel_token\"",
+            ),
+            (
+                DenialReasonCode::TokenDecodeFailed,
+                "\"token_decode_failed\"",
+            ),
+            (
+                DenialReasonCode::ChannelBoundaryViolation,
+                "\"channel_boundary_violation\"",
+            ),
+            (
+                DenialReasonCode::AdmissionHealthGateFailed,
+                "\"admission_health_gate_failed\"",
+            ),
+            (
+                DenialReasonCode::QueueAdmissionDenied,
+                "\"queue_admission_denied\"",
+            ),
+            (
+                DenialReasonCode::AuthorityAlreadyConsumed,
+                "\"authority_already_consumed\"",
+            ),
+            (
+                DenialReasonCode::PcacConsumeFailed,
+                "\"pcac_consume_failed\"",
+            ),
+            (
+                DenialReasonCode::LaneAcquisitionFailed,
+                "\"lane_acquisition_failed\"",
+            ),
+            (DenialReasonCode::ValidationFailed, "\"validation_failed\""),
+        ];
+
+        for (variant, expected) in map {
+            assert_eq!(
+                serde_json::to_string(&variant).expect("serialize reason"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_fac_job_receipt_builder_enforces_reason_bound() {
+        let long_reason = "x".repeat(MAX_FAC_JOB_REASON_LENGTH + 1);
+        let result = FacJobReceiptV1Builder::new(
+            "receipt-job-005",
+            "job-005",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .outcome(FacJobOutcome::Quarantined)
+        .denial_reason(DenialReasonCode::MalformedSpec)
+        .reason(long_reason)
+        .rfc0028_channel_boundary(ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+        })
+        .eio29_queue_admission(QueueAdmissionTrace {
+            verdict: "deny".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: Some("denied".to_string()),
+        })
+        .try_build();
+
+        assert!(matches!(
+            result,
+            Err(FacJobReceiptError::StringTooLong {
+                field: "reason",
+                ..
+            })
+        ));
+    }
 
     fn create_test_receipt(signer: &Signer) -> GateReceipt {
         GateReceiptBuilder::new("receipt-001", "gate-aat", "lease-001")

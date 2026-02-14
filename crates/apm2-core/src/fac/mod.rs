@@ -293,9 +293,12 @@ pub use quarantine::{
     QuarantineError, QuarantineEvent, QuarantineProjection, RunnerPoolQuarantined,
     RunnerPoolQuarantinedProto,
 };
+pub use receipt::persist_content_addressed_receipt;
 // Re-export receipt types
 pub use receipt::{
-    GateReceipt, GateReceiptBuilder, GateReceiptProto, ReceiptError, SUPPORTED_PAYLOAD_KINDS,
+    BudgetAdmissionTrace, ChannelBoundaryTrace, DenialReasonCode, FacJobOutcome,
+    FacJobReceiptError, FacJobReceiptV1, FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder,
+    GateReceiptProto, QueueAdmissionTrace, ReceiptError, SUPPORTED_PAYLOAD_KINDS,
     SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
 };
 // Re-export retry manager types
