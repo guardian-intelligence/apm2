@@ -303,6 +303,10 @@ pub struct FacJobReceiptV1 {
     /// Stable denial reason for non-completed outcomes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub denial_reason: Option<DenialReasonCode>,
+    /// If true, this receipt came from direct-mode execution without
+    /// admission control.
+    #[serde(default)]
+    pub unsafe_direct: bool,
     /// Human-readable reason (bounded).
     pub reason: String,
     /// RFC-0028 boundary trace.
@@ -357,6 +361,8 @@ impl FacJobReceiptV1 {
         } else {
             bytes.push(0u8);
         }
+
+        bytes.push(u8::from(self.unsafe_direct));
 
         bytes.extend_from_slice(&(self.reason.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.reason.as_bytes());
@@ -588,6 +594,7 @@ pub struct FacJobReceiptV1Builder {
     outcome: Option<FacJobOutcome>,
     denial_reason: Option<DenialReasonCode>,
     reason: Option<String>,
+    unsafe_direct: bool,
     policy_hash: Option<String>,
     patch_digest: Option<String>,
     rfc0028_channel_boundary: Option<ChannelBoundaryTrace>,
@@ -630,6 +637,13 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = Some(reason.into());
+        self
+    }
+
+    /// Marks whether this receipt was produced by unsafe direct mode.
+    #[must_use]
+    pub const fn unsafe_direct(mut self, unsafe_direct: bool) -> Self {
+        self.unsafe_direct = unsafe_direct;
         self
     }
 
@@ -830,6 +844,7 @@ impl FacJobReceiptV1Builder {
             patch_digest,
             outcome,
             denial_reason: self.denial_reason,
+            unsafe_direct: self.unsafe_direct,
             reason,
             rfc0028_channel_boundary: self.rfc0028_channel_boundary,
             eio29_queue_admission: self.eio29_queue_admission,
@@ -1615,6 +1630,19 @@ pub mod tests {
         let bytes = serde_json::to_vec(&original).expect("serialize sample receipt");
         let restored = deserialize_job_receipt(&bytes).expect("deserialize receipt");
 
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn test_fac_job_receipt_unsafe_direct_roundtrip() {
+        let mut original =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+        original.unsafe_direct = true;
+
+        let bytes = serde_json::to_vec(&original).expect("serialize unsafe_direct receipt");
+        let restored = deserialize_job_receipt(&bytes).expect("deserialize unsafe_direct receipt");
+
+        assert!(restored.unsafe_direct);
         assert_eq!(restored, original);
     }
 

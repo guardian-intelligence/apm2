@@ -258,7 +258,7 @@ pub use types::ReviewRunType;
 | `run_restart(repo, pr, force, json)` | CI-aware pipeline restart |
 | `run_pipeline(repo, pr_number, sha)` | End-to-end: dispatch + project |
 | `run_logs(pr, repo, selector_type, selector, json)` | Retrieve review logs |
-| `run_gates(force, quick, timeout, mem, pids, cpu, json)` | Run pre-review gate checks |
+| `run_gates(force, quick, timeout, mem, pids, cpu, json, direct, wait_timeout)` | Run pre-review gate checks |
 
 ## Related Modules
 
