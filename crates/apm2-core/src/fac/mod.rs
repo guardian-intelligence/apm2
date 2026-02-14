@@ -84,6 +84,13 @@ pub mod determinism;
 mod domain_separator;
 pub mod echo_trap;
 pub mod flake_class;
+mod flock_util;
+/// Garbage-collection planner and execution primitives.
+#[allow(missing_docs)]
+pub mod gc;
+/// Garbage-collection receipt schema and persistence helpers.
+#[allow(missing_docs)]
+pub mod gc_receipt;
 pub mod harness_sandbox;
 pub mod job_spec;
 mod key_policy;
@@ -91,13 +98,18 @@ pub mod lane;
 mod lease;
 pub mod merge_receipt;
 mod node_identity;
+pub mod policy;
 pub mod policy_inheritance;
 mod policy_resolution;
+/// Disk preflight and auto-GC escalation policy.
+#[allow(missing_docs)]
+pub mod preflight;
 pub mod projection;
 pub mod projection_compromise;
 pub mod projection_receipt_recorded;
 pub mod quarantine;
 mod receipt;
+mod repo_mirror;
 pub mod retry_manager;
 pub mod review_blocked;
 pub mod review_receipt;
@@ -106,8 +118,10 @@ pub mod role_conformance;
 mod role_spec;
 mod role_spec_v2;
 pub mod safe_rmtree;
+pub mod scheduler_state;
 pub mod selection_policy;
 pub mod serde_helpers;
+mod systemd_properties;
 pub mod taint;
 mod terminal_verifier;
 pub mod transcript_binding;
@@ -219,6 +233,11 @@ pub use echo_trap::{
 };
 // Re-export flake classification routing types
 pub use flake_class::FlakeRouting;
+pub use gc::{GcPlan, GcPlanError, GcTarget, execute_gc, plan_gc};
+pub use gc_receipt::{
+    DEFAULT_MIN_FREE_BYTES, GC_RECEIPT_SCHEMA, GcAction, GcActionKind, GcError, GcReceiptV1,
+    MAX_GC_ACTIONS, MAX_GC_RECEIPT_SIZE, persist_gc_receipt,
+};
 // Re-export harness sandbox types
 pub use harness_sandbox::{
     EgressRule, HarnessSandboxError, MAX_EGRESS_RULES, MAX_HOST_LENGTH,
@@ -248,6 +267,10 @@ pub use lease::{
 pub use merge_receipt::{
     MAX_GATE_RECEIPTS as MAX_MERGE_GATE_RECEIPTS, MergeReceipt, MergeReceiptError,
     MergeReceiptProto,
+};
+pub use policy::{
+    EnvSetEntry, FacPolicyError, FacPolicyV1, POLICY_SCHEMA_ID, compute_policy_hash,
+    deserialize_policy, parse_policy_hash, persist_policy,
 };
 // Re-export policy inheritance types (TCK-00340)
 pub use policy_inheritance::{
@@ -301,6 +324,10 @@ pub use receipt::{
     GateReceiptProto, MAX_JOB_RECEIPT_SIZE, QueueAdmissionTrace, ReceiptError,
     SUPPORTED_PAYLOAD_KINDS, SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
     deserialize_job_receipt,
+};
+pub use repo_mirror::{
+    CheckoutOutcome, MAX_MIRROR_DIR_NAME, MAX_PATCH_SIZE, PatchOutcome, REPO_MIRROR_SCHEMA,
+    RepoMirrorError, RepoMirrorManager,
 };
 // Re-export retry manager types
 pub use retry_manager::{
@@ -517,8 +544,9 @@ pub use lane::{
     DEFAULT_LANE_COUNT, LANE_COUNT_ENV_VAR, LANE_ID_PREFIX, LANE_LEASE_V1_SCHEMA,
     LANE_LOCK_TIMEOUT, LANE_PROFILE_V1_SCHEMA, LaneError, LaneLeaseV1, LaneLockGuard, LaneManager,
     LanePolicy, LaneProfileV1, LaneState, LaneStatusV1, LaneTimeouts, MAX_LANE_COUNT,
-    MAX_LANE_ID_LENGTH, MAX_LEASE_FILE_SIZE, MAX_PROFILE_FILE_SIZE,
-    MAX_STRING_LENGTH as MAX_LANE_STRING_LENGTH, ResourceProfile,
+    MAX_LANE_ID_LENGTH, MAX_LEASE_FILE_SIZE, MAX_MEMORY_MAX_BYTES, MAX_PROFILE_FILE_SIZE,
+    MAX_STRING_LENGTH as MAX_LANE_STRING_LENGTH, MAX_TEST_TIMEOUT_SECONDS, ResourceProfile,
+    compute_test_env,
 };
 // Re-export node identity types (TCK-00556).
 pub use node_identity::{
@@ -526,8 +554,10 @@ pub use node_identity::{
     NODE_IDENTITY_SCHEMA_ID, NodeIdentityError, derive_node_fingerprint,
     load_or_default_boundary_id, load_or_derive_node_fingerprint,
 };
+pub use preflight::{PreflightError, PreflightStatus, check_disk_space, run_preflight};
 // Re-export safe rmtree types (TCK-00516)
 pub use safe_rmtree::{
     MAX_DIR_ENTRIES, MAX_TRAVERSAL_DEPTH, RefusedDeleteReceipt, SafeRmtreeError, SafeRmtreeOutcome,
     safe_rmtree_v1,
 };
+pub use systemd_properties::SystemdUnitProperties;

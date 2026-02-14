@@ -242,6 +242,8 @@ pub enum DenialReasonCode {
     LaneAcquisitionFailed,
     /// General validation failure.
     ValidationFailed,
+    /// Disk pressure preflight rejected job due to insufficient free space.
+    InsufficientDiskSpace,
 }
 
 /// Trace of the RFC-0028 channel boundary check.
@@ -290,6 +292,12 @@ pub struct FacJobReceiptV1 {
     pub job_id: String,
     /// BLAKE3 digest of the job spec.
     pub job_spec_digest: String,
+    /// Optional policy hash used for policy binding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_hash: Option<String>,
+    /// Optional patch digest for patch-injected jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patch_digest: Option<String>,
     /// Outcome.
     pub outcome: FacJobOutcome,
     /// Stable denial reason for non-completed outcomes.
@@ -398,6 +406,14 @@ impl FacJobReceiptV1 {
             bytes.push(0u8);
         }
 
+        if let Some(digest) = &self.patch_digest {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&(digest.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(digest.as_bytes());
+        } else {
+            bytes.push(0u8);
+        }
+
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
 
         bytes
@@ -453,6 +469,20 @@ impl FacJobReceiptV1 {
             return Err(FacJobReceiptError::InvalidData(
                 "job_spec_digest must be 'b3-256:<64 hex>'".to_string(),
             ));
+        }
+        if let Some(policy_hash) = &self.policy_hash {
+            if !is_strict_b3_256_digest(policy_hash) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "policy_hash must be exactly 71 chars in b3-256:<64hex> format".to_string(),
+                ));
+            }
+        }
+        if let Some(patch_digest) = &self.patch_digest {
+            if !is_strict_b3_256_digest(patch_digest) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "patch_digest must be exactly 71 chars in b3-256:<64hex> format".to_string(),
+                ));
+            }
         }
         if self.content_hash.len() > MAX_STRING_LENGTH {
             return Err(FacJobReceiptError::StringTooLong {
@@ -558,6 +588,8 @@ pub struct FacJobReceiptV1Builder {
     outcome: Option<FacJobOutcome>,
     denial_reason: Option<DenialReasonCode>,
     reason: Option<String>,
+    policy_hash: Option<String>,
+    patch_digest: Option<String>,
     rfc0028_channel_boundary: Option<ChannelBoundaryTrace>,
     eio29_queue_admission: Option<QueueAdmissionTrace>,
     eio29_budget_admission: Option<BudgetAdmissionTrace>,
@@ -598,6 +630,20 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = Some(reason.into());
+        self
+    }
+
+    /// Sets the policy hash.
+    #[must_use]
+    pub fn policy_hash(mut self, policy_hash: impl Into<String>) -> Self {
+        self.policy_hash = Some(policy_hash.into());
+        self
+    }
+
+    /// Sets the patch digest.
+    #[must_use]
+    pub fn patch_digest(mut self, patch_digest: impl Into<String>) -> Self {
+        self.patch_digest = Some(patch_digest.into());
         self
     }
 
@@ -647,6 +693,7 @@ impl FacJobReceiptV1Builder {
         let outcome = self.outcome.unwrap_or(FacJobOutcome::Denied);
         let reason = self.reason.unwrap_or_else(|| "unspecified".to_string());
         let timestamp_secs = self.timestamp_secs.unwrap_or(0);
+        let patch_digest = self.patch_digest;
 
         if receipt_id.len() > MAX_STRING_LENGTH {
             return Err(FacJobReceiptError::StringTooLong {
@@ -667,6 +714,14 @@ impl FacJobReceiptV1Builder {
             return Err(FacJobReceiptError::InvalidData(
                 "job_spec_digest must be 'b3-256:<64 hex>'".to_string(),
             ));
+        }
+
+        if let Some(policy_hash) = &self.policy_hash {
+            if !is_strict_b3_256_digest(policy_hash) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "policy_hash must be exactly 71 chars in b3-256:<64hex> format".to_string(),
+                ));
+            }
         }
 
         if job_spec_digest.len() > MAX_STRING_LENGTH {
@@ -771,6 +826,8 @@ impl FacJobReceiptV1Builder {
             receipt_id,
             job_id,
             job_spec_digest,
+            policy_hash: self.policy_hash,
+            patch_digest,
             outcome,
             denial_reason: self.denial_reason,
             reason,
@@ -822,6 +879,10 @@ pub fn compute_job_receipt_content_hash(receipt: &FacJobReceiptV1) -> String {
 
 fn is_valid_b3_256_digest(value: &str) -> bool {
     parse_b3_256_digest(value).is_some()
+}
+
+fn is_strict_b3_256_digest(value: &str) -> bool {
+    value.len() == 71 && value.starts_with("b3-256:") && is_valid_b3_256_digest(value)
 }
 
 /// Persist a content-addressed job receipt.
@@ -1573,6 +1634,18 @@ pub mod tests {
     }
 
     #[test]
+    fn test_fac_job_receipt_validate_rejects_invalid_policy_hash() {
+        let mut receipt =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
+        receipt.policy_hash = Some("not-a-digest".to_string());
+
+        assert!(matches!(
+            receipt.validate(),
+            Err(FacJobReceiptError::InvalidData { .. })
+        ));
+    }
+
+    #[test]
     fn test_fac_job_receipt_validate_rejects_missing_boundary_for_completed() {
         let mut receipt =
             sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample completed receipt");
@@ -1686,6 +1759,35 @@ pub mod tests {
     }
 
     #[test]
+    fn test_fac_job_receipt_builder_rejects_invalid_policy_hash() {
+        let result = FacJobReceiptV1Builder::new(
+            "receipt-job-007",
+            "job-007",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .policy_hash("x")
+        .outcome(FacJobOutcome::Completed)
+        .reason("ok")
+        .timestamp_secs(1_700_000_004)
+        .rfc0028_channel_boundary(ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+        })
+        .eio29_queue_admission(QueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+        })
+        .try_build();
+
+        assert!(matches!(
+            result,
+            Err(FacJobReceiptError::InvalidData { .. })
+        ));
+    }
+
+    #[test]
     fn test_fac_job_outcome_serializes_snake_case() {
         let completed =
             serde_json::to_string(&FacJobOutcome::Completed).expect("serialize completed outcome");
@@ -1736,6 +1838,10 @@ pub mod tests {
                 "\"lane_acquisition_failed\"",
             ),
             (DenialReasonCode::ValidationFailed, "\"validation_failed\""),
+            (
+                DenialReasonCode::InsufficientDiskSpace,
+                "\"insufficient_disk_space\"",
+            ),
         ];
 
         for (variant, expected) in map {

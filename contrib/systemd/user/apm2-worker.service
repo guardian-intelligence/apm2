@@ -1,0 +1,40 @@
+[Unit]
+Description=APM2 FAC Worker
+Documentation=https://github.com/guardian-intelligence/apm2
+After=network-online.target apm2-daemon.service
+Wants=apm2-daemon.service
+Requires=apm2-daemon.service
+
+[Service]
+Type=simple
+# Resource limits derived from LaneProfileV1 defaults
+# CPUQuota=200%
+# MemoryMax=25769803776
+# TasksMax=1536
+# IOWeight=100
+# TimeoutStartSec=240
+# RuntimeMaxSec=1800
+# KillMode=control-group
+CPUQuota=200%
+MemoryMax=25769803776
+TasksMax=1536
+IOWeight=100
+TimeoutStartSec=240
+RuntimeMaxSec=1800
+KillMode=control-group
+ExecStart=/usr/local/bin/apm2 fac worker --poll-interval 10
+Restart=always
+RestartSec=5
+WatchdogSec=300
+WorkingDirectory=%h
+Environment=APM2_HOME=%h/.apm2
+Environment=RUST_LOG=info
+LoadCredential=gh-token:%h/.apm2/private/creds/gh-token
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.apm2
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

@@ -79,12 +79,18 @@ use apm2_core::fac::job_spec::{
     FacJobSpecV1, JobSpecError, MAX_JOB_SPEC_SIZE, deserialize_job_spec, validate_job_spec,
 };
 use apm2_core::fac::lane::LaneManager;
+use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
 use apm2_core::fac::{
-    BudgetAdmissionTrace, ChannelBoundaryTrace, DenialReasonCode, FacJobOutcome,
-    FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder,
-    QueueAdmissionTrace as JobQueueAdmissionTrace, persist_content_addressed_receipt,
+    BudgetAdmissionTrace, ChannelBoundaryTrace, DEFAULT_MIN_FREE_BYTES, DenialReasonCode,
+    FacJobOutcome, FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder, LaneProfileV1,
+    MAX_POLICY_SIZE, QueueAdmissionTrace as JobQueueAdmissionTrace, RepoMirrorManager,
+    SystemdUnitProperties, compute_policy_hash, deserialize_policy, parse_policy_hash,
+    persist_content_addressed_receipt, persist_policy, run_preflight,
 };
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde::Serialize;
+use subtle::ConstantTimeEq;
 
 use crate::exit_codes::codes as exit_codes;
 
@@ -111,6 +117,7 @@ const MAX_POLL_INTERVAL_SECS: u64 = 3600;
 
 /// Max number of boundary defect classes retained in a trace.
 const MAX_BOUNDARY_DEFECT_CLASSES: usize = 32;
+const SCHEDULER_RECOVERY_SCHEMA: &str = "apm2.scheduler_recovery.v1";
 
 /// FAC receipt directory under `$APM2_HOME/private/fac`.
 const FAC_RECEIPTS_DIR: &str = "receipts";
@@ -155,6 +162,16 @@ struct WorkerSummary {
     jobs_skipped: usize,
 }
 
+#[derive(Debug)]
+struct SchedulerRecoveryReceipt {
+    /// Scheduler recovery receipt schema.
+    schema: String,
+    /// Recovery reason for reconstructing scheduler state.
+    reason: String,
+    /// Recovery timestamp in epoch seconds.
+    timestamp_secs: u64,
+}
+
 /// A candidate pending job for sorting and processing.
 #[derive(Debug)]
 struct PendingCandidate {
@@ -183,7 +200,15 @@ struct PendingCandidate {
 /// * `poll_interval_secs` - Seconds between queue scans in continuous mode.
 /// * `max_jobs` - Maximum total jobs to process before exiting (0 = unlimited).
 /// * `json_output` - If true, emit JSON output.
-pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_output: bool) -> u8 {
+/// * `print_unit` - If true, print systemd unit directives/properties for each
+///   job.
+pub fn run_fac_worker(
+    once: bool,
+    poll_interval_secs: u64,
+    max_jobs: u64,
+    json_output: bool,
+    print_unit: bool,
+) -> u8 {
     let poll_interval_secs = poll_interval_secs.min(MAX_POLL_INTERVAL_SECS);
 
     // Resolve queue root directory
@@ -254,6 +279,36 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
         },
     );
 
+    let mut queue_state = match load_scheduler_state(&fac_root) {
+        Ok(Some(saved)) => QueueSchedulerState::from_persisted(&saved),
+        Ok(None) => {
+            let recovery = SchedulerRecoveryReceipt {
+                schema: SCHEDULER_RECOVERY_SCHEMA.to_string(),
+                reason: "scheduler state missing, reconstructing conservatively".to_string(),
+                timestamp_secs: current_timestamp_epoch_secs(),
+            };
+            eprintln!(
+                "INFO: scheduler state reconstructed: {} ({}, {})",
+                recovery.schema, recovery.reason, recovery.timestamp_secs
+            );
+            QueueSchedulerState::new()
+        },
+        Err(e) => {
+            let recovery = SchedulerRecoveryReceipt {
+                schema: SCHEDULER_RECOVERY_SCHEMA.to_string(),
+                reason: "scheduler state missing or corrupt, reconstructing conservatively"
+                    .to_string(),
+                timestamp_secs: current_timestamp_epoch_secs(),
+            };
+            eprintln!("WARNING: failed to load scheduler state: {e}, starting fresh");
+            eprintln!(
+                "INFO: scheduler state reconstructed: {} ({}, {})",
+                recovery.schema, recovery.reason, recovery.timestamp_secs
+            );
+            QueueSchedulerState::new()
+        },
+    };
+
     // Perform admission health gate check so the broker can issue tokens.
     // In default (local) mode we use minimal health check inputs.
     let mut checker = apm2_core::fac::broker_health::BrokerHealthChecker::new();
@@ -293,6 +348,19 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
         return exit_codes::GENERIC_ERROR;
     }
 
+    let (policy_hash, policy_digest) = match load_or_create_policy(&fac_root) {
+        Ok(policy) => policy,
+        Err(e) => {
+            output_worker_error(json_output, &format!("cannot load fac policy: {e}"));
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    if let Err(e) = broker.admit_policy_digest(policy_digest) {
+        output_worker_error(json_output, &format!("cannot admit fac policy digest: {e}"));
+        return exit_codes::GENERIC_ERROR;
+    }
+
     let verifying_key = broker.verifying_key();
 
     let mut total_processed: u64 = 0;
@@ -313,6 +381,7 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
             Err(e) => {
                 output_worker_error(json_output, &format!("scan error: {e}"));
                 if once {
+                    persist_queue_scheduler_state(&fac_root, &queue_state, broker.current_tick());
                     return exit_codes::GENERIC_ERROR;
                 }
                 sleep_remaining(cycle_start, poll_interval_secs);
@@ -320,8 +389,11 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
             },
         };
 
+        let mut cycle_scheduler = queue_state.clone();
+
         if candidates.is_empty() {
             if once {
+                persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick());
                 let _ = save_broker_state(&broker);
                 if json_output {
                     print_json(&summary);
@@ -334,22 +406,34 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
             continue;
         }
 
-        let scheduler = build_scheduler_state(&candidates);
         for candidate in &candidates {
             if max_jobs > 0 && total_processed >= max_jobs {
                 break;
             }
 
-            let outcome = process_job(
-                candidate,
-                &queue_root,
-                &fac_root,
-                &verifying_key,
-                &scheduler,
-                &mut broker,
-                &signer,
-                candidates.len(),
-            );
+            let lane = parse_queue_lane(&candidate.spec.queue_lane);
+            let outcome = if let Err(e) = cycle_scheduler.record_admission(lane) {
+                JobOutcome::Denied {
+                    reason: format!("scheduler admission reservation failed: {e}"),
+                }
+            } else {
+                let outcome = process_job(
+                    candidate,
+                    &queue_root,
+                    &fac_root,
+                    &verifying_key,
+                    &cycle_scheduler,
+                    lane,
+                    &mut broker,
+                    &signer,
+                    &policy_hash,
+                    &policy_digest,
+                    candidates.len(),
+                    print_unit,
+                );
+                cycle_scheduler.record_completion(lane);
+                outcome
+            };
 
             match &outcome {
                 JobOutcome::Quarantined { reason } => {
@@ -387,6 +471,7 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
             }
 
             if once {
+                persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick());
                 let _ = save_broker_state(&broker);
                 if json_output {
                     print_json(&summary);
@@ -394,6 +479,9 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
                 return exit_codes::SUCCESS;
             }
         }
+
+        persist_queue_scheduler_state(&fac_root, &cycle_scheduler, broker.current_tick());
+        queue_state = cycle_scheduler;
 
         if max_jobs > 0 && total_processed >= max_jobs {
             break;
@@ -410,8 +498,21 @@ pub fn run_fac_worker(once: bool, poll_interval_secs: u64, max_jobs: u64, json_o
         print_json(&summary);
     }
 
+    persist_queue_scheduler_state(&fac_root, &queue_state, broker.current_tick());
     let _ = save_broker_state(&broker);
     exit_codes::SUCCESS
+}
+
+fn persist_queue_scheduler_state(
+    fac_root: &Path,
+    queue_state: &QueueSchedulerState,
+    current_tick: u64,
+) {
+    let mut state = queue_state.to_scheduler_state_v1(current_tick);
+    state.persisted_at_secs = current_timestamp_epoch_secs();
+    if let Err(e) = persist_scheduler_state(fac_root, &state) {
+        eprintln!("WARNING: failed to persist scheduler state: {e}");
+    }
 }
 
 // =============================================================================
@@ -544,19 +645,6 @@ fn parse_queue_lane(lane_str: &str) -> QueueLane {
     }
 }
 
-/// Builds queue scheduler state from the observed pending candidates.
-///
-/// This keeps admission checks aligned with live queue depth during a single
-/// scan cycle and avoids admitting every job through an empty scheduler.
-fn build_scheduler_state(candidates: &[PendingCandidate]) -> QueueSchedulerState {
-    let mut scheduler = QueueSchedulerState::new();
-    for candidate in candidates {
-        let lane = parse_queue_lane(&candidate.spec.queue_lane);
-        let _ = scheduler.record_admission(lane);
-    }
-    scheduler
-}
-
 // =============================================================================
 // Job processing
 // =============================================================================
@@ -571,9 +659,13 @@ fn process_job(
     fac_root: &Path,
     verifying_key: &apm2_core::crypto::VerifyingKey,
     scheduler: &QueueSchedulerState,
+    lane: QueueLane,
     broker: &mut FacBroker,
     signer: &Signer,
+    policy_hash: &str,
+    policy_digest: &[u8; 32],
     _candidates_count: usize,
+    print_unit: bool,
 ) -> JobOutcome {
     let path = &candidate.path;
     let file_name = match path.file_name().and_then(|n| n.to_str()) {
@@ -609,6 +701,8 @@ fn process_job(
                 None,
                 None,
                 None,
+                None,
+                policy_hash,
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for quarantined job: {receipt_err}"
@@ -633,6 +727,8 @@ fn process_job(
             None,
             None,
             None,
+            None,
+            policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -654,6 +750,8 @@ fn process_job(
                 None,
                 None,
                 None,
+                None,
+                policy_hash,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -661,8 +759,8 @@ fn process_job(
         },
     };
 
-    // Use broker tick for temporal checks to avoid wall-clock rollback.
-    let current_time_secs = broker.current_tick();
+    // Use monotonic wall-clock seconds for token temporal validation.
+    let current_time_secs = current_timestamp_epoch_secs();
 
     let boundary_check = match decode_channel_context_token(
         token,
@@ -684,12 +782,85 @@ fn process_job(
                 None,
                 None,
                 None,
+                None,
+                policy_hash,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
             return JobOutcome::Denied { reason };
         },
     };
+
+    let admitted_policy_root_digest = if let Some(binding) =
+        boundary_check.boundary_flow_policy_binding.as_ref()
+    {
+        if !bool::from(
+            binding
+                .policy_digest
+                .ct_eq(&binding.admitted_policy_root_digest),
+        ) {
+            let reason = "policy digest mismatch within channel boundary binding".to_string();
+            let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::ChannelBoundaryViolation),
+                &reason,
+                None,
+                None,
+                None,
+                None,
+                policy_hash,
+            ) {
+                eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+            }
+
+            return JobOutcome::Denied { reason };
+        }
+
+        binding.admitted_policy_root_digest
+    } else {
+        let reason = "missing boundary-flow policy binding".to_string();
+        let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ChannelBoundaryViolation),
+            &reason,
+            None,
+            None,
+            None,
+            None,
+            policy_hash,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied { reason };
+    };
+
+    if !broker.is_policy_digest_admitted(&admitted_policy_root_digest)
+        || !bool::from(admitted_policy_root_digest.ct_eq(policy_digest))
+    {
+        let reason = "policy digest mismatch with admitted fac policy".to_string();
+        let _ = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name);
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ChannelBoundaryViolation),
+            &reason,
+            None,
+            None,
+            None,
+            None,
+            policy_hash,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied { reason };
+    }
 
     // Validate boundary check defects.
     let defects = validate_channel_boundary(&boundary_check);
@@ -713,6 +884,8 @@ fn process_job(
             Some(&boundary_trace),
             None,
             None,
+            None,
+            policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -738,15 +911,13 @@ fn process_job(
             Some(&boundary_trace),
             Some(&admission_trace),
             None,
+            None,
+            policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
         return JobOutcome::Denied { reason };
     }
-
-    // Parse the spec's queue_lane to determine the correct lane, rather than
-    // hard-coding Bulk (MAJOR-3 fix).
-    let lane = parse_queue_lane(&spec.queue_lane);
 
     let verifier = BrokerSignatureVerifier::new(*verifying_key);
 
@@ -817,6 +988,8 @@ fn process_job(
             Some(&boundary_trace),
             Some(&queue_trace),
             None,
+            None,
+            policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -836,6 +1009,8 @@ fn process_job(
             Some(&boundary_trace),
             Some(&queue_trace),
             None,
+            None,
+            policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -855,6 +1030,8 @@ fn process_job(
             Some(&boundary_trace),
             Some(&queue_trace),
             None,
+            None,
+            policy_hash,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -919,6 +1096,73 @@ fn process_job(
         };
     };
 
+    let claimed_path = claimed_dir.join(&file_name);
+
+    if let Err(error) = run_preflight(fac_root, &lane_mgr, DEFAULT_MIN_FREE_BYTES) {
+        if let Err(move_err) =
+            move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name)
+        {
+            eprintln!("worker: WARNING: failed to move job to denied: {move_err}");
+        }
+        let reason = format!("preflight failed: {error:?}");
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::InsufficientDiskSpace),
+            &reason,
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+            None,
+            policy_hash,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied {
+            reason: format!("preflight failed: {error:?}"),
+        };
+    }
+
+    // Step 7: Compute authoritative Systemd properties for the acquired lane.
+    // This is the single source of truth for CPU/memory/PIDs/IO/timeouts and
+    // is shared between user-mode and system-mode execution backends.
+    let lane_dir = lane_mgr.lane_dir(&acquired_lane_id);
+    let lane_profile = match LaneProfileV1::load(&lane_dir) {
+        Ok(profile) => profile,
+        Err(e) => {
+            let reason = format!("lane profile load failed for {acquired_lane_id}: {e}");
+            let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::ValidationFailed),
+                &reason,
+                Some(&boundary_trace),
+                Some(&queue_trace),
+                None,
+                None,
+                policy_hash,
+            ) {
+                eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+            }
+            return JobOutcome::Denied { reason };
+        },
+    };
+
+    let lane_systemd_properties =
+        SystemdUnitProperties::from_lane_profile(&lane_profile, Some(&spec.constraints));
+    if print_unit {
+        eprintln!(
+            "worker: computed systemd properties for job {}",
+            spec.job_id
+        );
+        eprintln!("{}", lane_systemd_properties.to_unit_directives());
+        eprintln!("worker: D-Bus properties for job {}", spec.job_id);
+        eprintln!("{:?}", lane_systemd_properties.to_dbus_properties());
+    }
+
     // Step 7: Execute job under containment.
     //
     // For the default-mode MVP, execution validates that the job is structurally
@@ -928,11 +1172,144 @@ fn process_job(
     //
     // We verify that the claimed file is still present and intact before
     // marking as completed.
-    let claimed_path = claimed_dir.join(&file_name);
     if !claimed_path.exists() {
         return JobOutcome::Skipped {
             reason: "claimed file disappeared during execution".to_string(),
         };
+    }
+
+    let mut patch_digest: Option<String> = None;
+    // process_job executes one job at a time in a single worker lane, so
+    // blocking mirror I/O is intentionally accepted in this default-mode
+    // execution path. The entire job execution remains sequential behind the
+    // lane lease and remains fail-closed on error.
+    let mirror_manager = RepoMirrorManager::new(fac_root);
+    if let Err(e) = mirror_manager.ensure_mirror(&spec.source.repo_id, None) {
+        let reason = format!("mirror ensure failed: {e}");
+        let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ValidationFailed),
+            &reason,
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+            None,
+            policy_hash,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied { reason };
+    }
+
+    let lanes_root = fac_root.join("lanes");
+    let lane_workspace = lane_mgr.lane_dir(&acquired_lane_id).join("workspace");
+    if let Err(e) = mirror_manager.checkout_to_lane(
+        &spec.source.repo_id,
+        &spec.source.head_sha,
+        &lane_workspace,
+        &lanes_root,
+    ) {
+        let reason = format!("lane workspace checkout failed: {e}");
+        let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ValidationFailed),
+            &reason,
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+            None,
+            policy_hash,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied { reason };
+    }
+
+    if spec.source.kind == "patch_injection" {
+        let inline_patch_error =
+            "patch_injection requires inline patch bytes (CAS backend not yet implemented)";
+
+        let deny_with_reason = |reason: &str| -> JobOutcome {
+            let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::ValidationFailed),
+                reason,
+                Some(&boundary_trace),
+                Some(&queue_trace),
+                None,
+                None,
+                policy_hash,
+            ) {
+                eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+            }
+            JobOutcome::Denied {
+                reason: reason.to_string(),
+            }
+        };
+
+        let Some(patch_value) = &spec.source.patch else {
+            return deny_with_reason(inline_patch_error);
+        };
+        let Some(patch_obj) = patch_value.as_object() else {
+            return deny_with_reason(inline_patch_error);
+        };
+        let Some(bytes_b64) = patch_obj.get("bytes").and_then(|value| value.as_str()) else {
+            return deny_with_reason(inline_patch_error);
+        };
+        let patch_bytes = match STANDARD.decode(bytes_b64) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return deny_with_reason(&format!("invalid base64 in patch.bytes: {err}"));
+            },
+        };
+
+        if let Some(expected_digest) = patch_obj.get("digest").and_then(|v| v.as_str()) {
+            let actual_digest = format!("b3-256:{}", blake3::hash(&patch_bytes).to_hex());
+            let expected_bytes = expected_digest.as_bytes();
+            let actual_bytes = actual_digest.as_bytes();
+            if expected_bytes.len() != actual_bytes.len()
+                || !bool::from(expected_bytes.ct_eq(actual_bytes))
+            {
+                return deny_with_reason(&format!(
+                    "patch digest mismatch: expected {expected_digest}, got {actual_digest}"
+                ));
+            }
+        }
+
+        let patch_outcome = match mirror_manager.apply_patch(&lane_workspace, &patch_bytes) {
+            Ok(patch_outcome) => patch_outcome,
+            Err(err) => {
+                return deny_with_reason(&format!("patch apply failed: {err}"));
+            },
+        };
+        patch_digest = Some(patch_outcome.patch_digest);
+    } else if spec.source.kind != "mirror_commit" {
+        let reason = format!("unsupported source kind: {}", spec.source.kind);
+        let _ = move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name);
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ValidationFailed),
+            &reason,
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+            None,
+            policy_hash,
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied { reason };
     }
 
     // Step 8: Write authoritative GateReceipt and move to completed.
@@ -961,6 +1338,8 @@ fn process_job(
         Some(&boundary_trace),
         Some(&queue_trace),
         None,
+        patch_digest.as_deref(),
+        policy_hash,
     ) {
         eprintln!("worker: receipt emission failed, cannot complete job: {receipt_err}");
         if let Err(move_err) =
@@ -1238,6 +1617,28 @@ fn emit_scan_receipt(
     persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
 }
 
+fn load_or_create_policy(fac_root: &Path) -> Result<(String, [u8; 32]), String> {
+    let policy_dir = fac_root.join("policy");
+    let policy_path = policy_dir.join("fac_policy.v1.json");
+
+    let policy = if policy_path.exists() {
+        let bytes = read_bounded(&policy_path, MAX_POLICY_SIZE)?;
+        deserialize_policy(&bytes).map_err(|e| format!("cannot load fac policy: {e}"))?
+    } else {
+        let default_policy = apm2_core::fac::FacPolicyV1::default_policy();
+        persist_policy(fac_root, &default_policy)
+            .map_err(|e| format!("cannot persist default fac policy: {e}"))?;
+        default_policy
+    };
+
+    let policy_hash =
+        compute_policy_hash(&policy).map_err(|e| format!("cannot compute policy hash: {e}"))?;
+    let policy_digest =
+        parse_policy_hash(&policy_hash).ok_or_else(|| "invalid policy hash".to_string())?;
+
+    Ok((policy_hash, policy_digest))
+}
+
 /// Emit a unified `FacJobReceiptV1` and persist under
 /// `$APM2_HOME/private/fac/receipts`.
 #[allow(clippy::too_many_arguments)]
@@ -1250,12 +1651,15 @@ fn emit_job_receipt(
     rfc0028_channel_boundary: Option<&ChannelBoundaryTrace>,
     eio29_queue_admission: Option<&JobQueueAdmissionTrace>,
     eio29_budget_admission: Option<&BudgetAdmissionTrace>,
+    patch_digest: Option<&str>,
+    policy_hash: &str,
 ) -> Result<PathBuf, String> {
     let mut builder = FacJobReceiptV1Builder::new(
         format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs()),
         &spec.job_id,
         &spec.job_spec_digest,
     )
+    .policy_hash(policy_hash)
     .outcome(outcome)
     .reason(reason)
     .timestamp_secs(current_timestamp_epoch_secs());
@@ -1272,6 +1676,9 @@ fn emit_job_receipt(
     }
     if let Some(budget_admission_trace) = eio29_budget_admission {
         builder = builder.eio29_budget_admission(budget_admission_trace.clone());
+    }
+    if let Some(patch_digest) = patch_digest {
+        builder = builder.patch_digest(patch_digest);
     }
 
     let receipt = builder

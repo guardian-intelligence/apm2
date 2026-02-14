@@ -93,6 +93,38 @@ default mode.
   do not follow PCAC lifecycle. They are control-plane safety predicates, not
   authority-bearing effects. Documented inline.
 
+## scheduler_state Submodule (TCK-00531)
+
+The `scheduler_state` submodule stores RFC-0029 anti-starvation continuity state.
+Snapshots are persisted under `$APM2_HOME/private/fac/scheduler/state.v1.json`.
+
+### Key Types
+
+- `SchedulerStateV1`: Versioned, schema-checked snapshot of scheduler backlog and
+  anti-starvation metadata.
+- `LaneSnapshot`: Per-lane backlog and wait-time snapshot (`lane`, `backlog`,
+  `max_wait_ticks`).
+- `SCHEDULER_STATE_SCHEMA`: Canonical schema identifier for persisted state.
+
+### Core Capabilities
+
+- Atomic persistence with temp-file write + rename for crash safety.
+- Bounded reads with metadata checks before deserialization (`1 MiB` max payload).
+- Symlink-safe path handling for load and persist helpers.
+- BLAKE3 content-hash computation and verification (`b3-256`).
+- Conversion between in-memory `QueueSchedulerState` and persisted snapshots.
+
+### Security Invariants (TCK-00531)
+
+- [INV-SCH-001] Corrupt, oversize, or schema-mismatched scheduler state does
+  not crash the worker and is treated as reconstruction required.
+- [INV-SCH-002] Persisted scheduler state uses atomic durability guarantees
+  (temp-file + rename).
+- [INV-SCH-003] Unknown lane names, duplicates, and invalid backlog values are
+  rejected during load.
+- [INV-SCH-004] Restarted workers preserve anti-starvation continuity for
+  `max_wait_ticks` via snapshot restoration.
+
 ## broker_health Submodule (TCK-00585)
 
 The `broker_health` submodule implements RFC-0029 invariant health monitoring for
@@ -350,3 +382,63 @@ deletion primitive for lane cleanup and reset operations.
 - [INV-RMTREE-010] Paths containing `.` or `..` components are rejected
   immediately (not filtered). On Unix, raw byte scanning catches `.`
   segments that `Path::components()` silently normalizes away.
+
+### `repo_mirror` — Node-Local Bare Mirror + Lane Checkout
+
+**Core type**: `RepoMirrorManager`
+- Manages bare git mirrors under `$APM2_HOME/private/fac/repo_mirror/<repo_id>.git`
+- Bounded mirror count: MAX_MIRROR_COUNT (64), LRU eviction
+- Symlink-safe: uses `core.symlinks=false` for all checkouts
+- Command injection prevention: URL protocol allowlist, `--` separators
+
+**Key methods**:
+- `ensure_mirror(repo_id, remote_url)` — Initialize or update bare mirror
+- `checkout_to_lane(repo_id, head_sha, workspace, allowed_parent)` — Checkout specific SHA to lane workspace
+- `apply_patch(workspace, patch_bytes)` — Apply patch via stdin to git apply, returns BLAKE3 digest
+
+**Security invariants**:
+- All git commands use `std::process::Command` (no shell expansion)
+- `GIT_TERMINAL_PROMPT=0` prevents interactive prompts
+- `core.symlinks=false` prevents symlink creation in workspaces
+- `--no-hardlinks` prevents object sharing between mirror and workspace
+- Path traversal prevention delegated to `git apply` (standard git safety)
+
+### `systemd_properties` — Authoritative lane→systemd unit property mapping
+
+The `systemd_properties` submodule is the single translation layer from
+`LaneProfileV1` + `JobConstraints` into executable unit constraints for both
+default worker flow and future system-mode execution backends.
+
+## Core Type
+
+**Core type**: `SystemdUnitProperties`
+
+- Canonical fields:
+  - `cpu_quota_percent` → `CPUQuota`
+  - `memory_max_bytes` → `MemoryMax`
+  - `tasks_max` → `TasksMax`
+  - `io_weight` → `IOWeight`
+  - `timeout_start_sec` → `TimeoutStartSec`
+  - `runtime_max_sec` → `RuntimeMaxSec`
+  - `kill_mode` → `KillMode` (default `control-group`)
+- Input binding:
+  - `from_lane_profile(&LaneProfileV1, Option<&JobConstraints>)`
+- Override semantics:
+  - `memory_max_bytes` and `test_timeout_seconds` use MIN(job, lane).
+
+## Rendering API
+
+- `to_unit_directives() -> String`: `[Service]` section directives.
+- `to_dbus_properties() -> Vec<(String, String)>`: serializable property
+  key/value pairs for transient-unit invocation.
+
+## Security Invariants (TCK-00530)
+
+- [INV-SYS-001] Unit limits are generated from persisted lane profile defaults
+  or authoritative overrides only; no duplicated ad-hoc calculations in caller
+  sites.
+- [INV-SYS-002] `JobConstraints` values are applied with lane ceiling semantics
+  (`min`) so a job cannot increase resource or timeout limits above lane
+  defaults.
+- [INV-SYS-003] `LaneProfileV1` loading failures fail the job path as a denial
+  with machine-readable receipt output, not silent continuation.
