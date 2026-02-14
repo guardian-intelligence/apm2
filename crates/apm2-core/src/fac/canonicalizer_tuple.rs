@@ -50,6 +50,22 @@ impl CanonicalizerTupleV1 {
         }
     }
 
+    /// Validate canonicalizer tuple invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tuple metadata does not match expected schema
+    /// and identifier invariants.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != CANONICALIZER_TUPLE_SCHEMA {
+            return Err(format!(
+                "invalid schema: expected {CANONICALIZER_TUPLE_SCHEMA}, got {}",
+                self.schema
+            ));
+        }
+        Ok(())
+    }
+
     /// Compute canonical, content-addressed digest of this tuple.
     ///
     /// # Panics

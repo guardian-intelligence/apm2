@@ -61,6 +61,7 @@ use apm2_core::fac::{
     SUMMARY_RECEIPT_SCHEMA, SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA,
     TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1, safe_rmtree_v1,
 };
+use apm2_core::github::resolve_apm2_home;
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
 use clap::{Args, Subcommand};
@@ -1780,7 +1781,9 @@ fn resolve_ledger_path(explicit: Option<&Path>) -> PathBuf {
 
 /// Resolves FAC root directory (`$APM2_HOME/private/fac`).
 fn resolve_fac_root() -> Result<PathBuf, String> {
-    resolve_apm2_home().map(|home| home.join("private").join("fac"))
+    resolve_apm2_home()
+        .map(|home| home.join("private").join("fac"))
+        .ok_or_else(|| "could not resolve APM2 home".to_string())
 }
 
 /// Resolves the CAS path from explicit path, env var, or default.
@@ -1798,19 +1801,6 @@ fn resolve_cas_path(explicit: Option<&Path>) -> PathBuf {
         || PathBuf::from("/var/lib/apm2").join(DEFAULT_CAS_DIRNAME),
         |dirs| dirs.data_dir().join(DEFAULT_CAS_DIRNAME),
     )
-}
-
-/// Resolves the `$APM2_HOME` directory from environment or default.
-fn resolve_apm2_home() -> Result<PathBuf, String> {
-    if let Some(override_dir) = std::env::var_os("APM2_HOME") {
-        let path = PathBuf::from(override_dir);
-        if !path.as_os_str().is_empty() {
-            return Ok(path);
-        }
-    }
-    let base_dirs = directories::BaseDirs::new()
-        .ok_or_else(|| "could not resolve home directory".to_string())?;
-    Ok(base_dirs.home_dir().join(".apm2"))
 }
 
 /// Opens the ledger at the given path.

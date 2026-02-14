@@ -973,10 +973,32 @@ async fn async_main(args: Args) -> Result<()> {
     let apm2_home = resolve_apm2_home().ok_or_else(|| {
         anyhow::anyhow!("failed to resolve APM2 home from $APM2_HOME or home directory")
     })?;
+    let fac_root = apm2_home.join("private").join("fac");
     let node_fingerprint = apm2_core::fac::load_or_derive_node_fingerprint(&apm2_home)
         .context("failed to load or derive node fingerprint")?;
     let boundary_id = apm2_core::fac::load_or_default_boundary_id(&apm2_home)
         .context("failed to load boundary id")?;
+    let current_tuple = apm2_core::fac::CanonicalizerTupleV1::from_current();
+    let mut tuple_broker = apm2_core::fac::FacBroker::new();
+    match apm2_core::fac::FacBroker::load_admitted_tuple(&fac_root) {
+        Ok(admitted_tuple) => {
+            if admitted_tuple != current_tuple {
+                return Err(anyhow::anyhow!(
+                    "FATAL: canonicalizer tuple mismatch in broker: admitted={} current={}",
+                    admitted_tuple.compute_digest(),
+                    current_tuple.compute_digest()
+                ));
+            }
+        },
+        Err(error) => {
+            warn!(
+                "canonicalizer tuple not admitted in broker state ({error}), attempting first-run admit"
+            );
+            if let Err(e) = tuple_broker.admit_canonicalizer_tuple(&fac_root) {
+                warn!("WARNING: failed to admit canonicalizer tuple: {e}");
+            }
+        },
+    }
     info!(
         apm2_home = %apm2_home.display(),
         node_fingerprint = %node_fingerprint,

@@ -73,7 +73,7 @@ use apm2_core::economics::queue_admission::{
     HtfEvaluationWindow, QueueAdmissionDecision, QueueAdmissionRequest, QueueAdmissionVerdict,
     QueueLane, QueueSchedulerState, evaluate_queue_admission,
 };
-use apm2_core::fac::broker::{BrokerSignatureVerifier, FacBroker};
+use apm2_core::fac::broker::{BrokerError, BrokerSignatureVerifier, FacBroker};
 use apm2_core::fac::broker_health::WorkerHealthPolicy;
 use apm2_core::fac::job_spec::{
     FacJobSpecV1, JobSpecError, MAX_JOB_SPEC_SIZE, deserialize_job_spec, validate_job_spec,
@@ -87,6 +87,7 @@ use apm2_core::fac::{
     RepoMirrorManager, SystemdUnitProperties, compute_policy_hash, deserialize_policy,
     parse_policy_hash, persist_content_addressed_receipt, persist_policy, run_preflight,
 };
+use apm2_core::github::resolve_apm2_home;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::Serialize;
@@ -559,6 +560,20 @@ fn check_or_admit_canonicalizer_tuple(
     fac_root: &Path,
 ) -> Result<CanonicalizerTupleCheck, String> {
     let tuple = CanonicalizerTupleV1::from_current();
+    let tuple_path = fac_root
+        .join("broker")
+        .join("admitted_canonicalizer_tuple.v1.json");
+
+    if !tuple_path.exists() {
+        eprintln!("INFO: canonicalizer tuple file missing (first run), admitting current tuple");
+        return broker
+            .admit_canonicalizer_tuple(fac_root)
+            .map(|_| CanonicalizerTupleCheck::AutoAdmitted {
+                load_error: "file not found".to_string(),
+            })
+            .map_err(|e| format!("cannot persist canonicalizer tuple: {e}"));
+    }
+
     match FacBroker::load_admitted_tuple(fac_root) {
         Ok(admitted_tuple) => {
             if admitted_tuple == tuple {
@@ -567,12 +582,26 @@ fn check_or_admit_canonicalizer_tuple(
                 Ok(CanonicalizerTupleCheck::Mismatch(admitted_tuple))
             }
         },
-        Err(err) => broker
-            .admit_canonicalizer_tuple(fac_root)
-            .map(|_| CanonicalizerTupleCheck::AutoAdmitted {
-                load_error: err.to_string(),
-            })
-            .map_err(|e| format!("cannot persist canonicalizer tuple: {e}")),
+        Err(BrokerError::Deserialization { detail }) => {
+            eprintln!("WARNING: canonicalizer tuple file is corrupted: {detail}");
+            broker
+                .admit_canonicalizer_tuple(fac_root)
+                .map(|_| CanonicalizerTupleCheck::AutoAdmitted {
+                    load_error: "corrupted canonicalizer tuple".to_string(),
+                })
+                .map_err(|e| format!("cannot persist canonicalizer tuple: {e}"))
+        },
+        Err(err) => {
+            eprintln!(
+                "WARNING: failed to load canonicalizer tuple: {err}. Will attempt first-run admit"
+            );
+            broker
+                .admit_canonicalizer_tuple(fac_root)
+                .map(|_| CanonicalizerTupleCheck::AutoAdmitted {
+                    load_error: err.to_string(),
+                })
+                .map_err(|e| format!("cannot persist canonicalizer tuple: {e}"))
+        },
     }
 }
 
@@ -1469,27 +1498,14 @@ fn process_job(
 
 /// Resolves the queue root directory from `$APM2_HOME/queue`.
 fn resolve_queue_root() -> Result<PathBuf, String> {
-    let home = resolve_apm2_home()?;
+    let home = resolve_apm2_home().ok_or_else(|| "could not resolve APM2 home".to_string())?;
     Ok(home.join(QUEUE_DIR))
 }
 
 /// Resolves the FAC root directory at `$APM2_HOME/private/fac`.
 fn resolve_fac_root() -> Result<PathBuf, String> {
-    let home = resolve_apm2_home()?;
+    let home = resolve_apm2_home().ok_or_else(|| "could not resolve APM2 home".to_string())?;
     Ok(home.join("private").join("fac"))
-}
-
-/// Resolves `$APM2_HOME` from environment or default.
-fn resolve_apm2_home() -> Result<PathBuf, String> {
-    if let Some(override_dir) = std::env::var_os("APM2_HOME") {
-        let path = PathBuf::from(override_dir);
-        if !path.as_os_str().is_empty() {
-            return Ok(path);
-        }
-    }
-    let base_dirs = directories::BaseDirs::new()
-        .ok_or_else(|| "could not resolve home directory".to_string())?;
-    Ok(base_dirs.home_dir().join(".apm2"))
 }
 
 /// Ensures all required queue subdirectories exist.

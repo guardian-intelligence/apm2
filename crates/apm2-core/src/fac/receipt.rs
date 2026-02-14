@@ -421,8 +421,6 @@ impl FacJobReceiptV1 {
             bytes.push(1u8);
             bytes.extend_from_slice(&(digest.len() as u32).to_be_bytes());
             bytes.extend_from_slice(digest.as_bytes());
-        } else {
-            bytes.push(0u8);
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());

@@ -584,9 +584,15 @@ impl FacBroker {
             ),
         })?;
 
-        serde_json::from_slice(&bytes).map_err(|e| BrokerError::Deserialization {
-            detail: format!("cannot deserialize admitted canonicalizer tuple: {e}"),
-        })
+        let tuple: CanonicalizerTupleV1 =
+            serde_json::from_slice(&bytes).map_err(|e| BrokerError::Deserialization {
+                detail: format!("cannot deserialize admitted canonicalizer tuple: {e}"),
+            })?;
+        tuple
+            .validate()
+            .map_err(|detail| BrokerError::Deserialization { detail })?;
+
+        Ok(tuple)
     }
 
     // -----------------------------------------------------------------------
