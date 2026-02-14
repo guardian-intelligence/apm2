@@ -81,11 +81,11 @@ use apm2_core::fac::job_spec::{
 use apm2_core::fac::lane::LaneManager;
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
 use apm2_core::fac::{
-    BudgetAdmissionTrace, ChannelBoundaryTrace, DenialReasonCode, FacJobOutcome,
-    FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder, DEFAULT_MIN_FREE_BYTES,
-    LaneProfileV1, MAX_POLICY_SIZE, QueueAdmissionTrace as JobQueueAdmissionTrace,
-    RepoMirrorManager, SystemdUnitProperties, compute_policy_hash, deserialize_policy,
-    parse_policy_hash, persist_content_addressed_receipt, persist_policy, run_preflight,
+    BudgetAdmissionTrace, ChannelBoundaryTrace, DEFAULT_MIN_FREE_BYTES, DenialReasonCode,
+    FacJobOutcome, FacJobReceiptV1Builder, GateReceipt, GateReceiptBuilder, LaneProfileV1,
+    MAX_POLICY_SIZE, QueueAdmissionTrace as JobQueueAdmissionTrace, RepoMirrorManager,
+    SystemdUnitProperties, compute_policy_hash, deserialize_policy, parse_policy_hash,
+    persist_content_addressed_receipt, persist_policy, run_preflight,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -1099,11 +1099,9 @@ fn process_job(
     let claimed_path = claimed_dir.join(&file_name);
 
     if let Err(error) = run_preflight(fac_root, &lane_mgr, DEFAULT_MIN_FREE_BYTES) {
-        if let Err(move_err) = move_to_dir_safe(
-            &claimed_path,
-            &queue_root.join(DENIED_DIR),
-            &file_name,
-        ) {
+        if let Err(move_err) =
+            move_to_dir_safe(&claimed_path, &queue_root.join(DENIED_DIR), &file_name)
+        {
             eprintln!("worker: WARNING: failed to move job to denied: {move_err}");
         }
         let reason = format!("preflight failed: {error:?}");
@@ -1124,6 +1122,7 @@ fn process_job(
         return JobOutcome::Denied {
             reason: format!("preflight failed: {error:?}"),
         };
+    }
 
     // Step 7: Compute authoritative Systemd properties for the acquired lane.
     // This is the single source of truth for CPU/memory/PIDs/IO/timeouts and
