@@ -1325,12 +1325,15 @@ inconsistencies deterministically on worker startup.
   Receipt persistence is mandatory in apply mode (fail-closed); dry-run mode
   uses best-effort persistence. Worker startup aborts on reconciliation failure
   to prevent processing jobs with inconsistent queue/lane state. If Phase 1
-  (lane reconciliation) succeeds but Phase 2 (queue reconciliation) fails, a
-  partial receipt containing Phase 1 actions is persisted before the Phase 2
-  error is propagated, ensuring lane recovery mutations are never silently lost.
-  If partial receipt persistence also fails, a combined error is returned that
-  includes both the Phase-2 failure context and the persistence failure context,
-  so apply-mode lane mutations never lack durable receipt evidence.
+  (lane reconciliation) fails after mutating some lanes, a partial receipt
+  containing the completed Phase 1 actions is persisted before the error is
+  propagated. Similarly, if Phase 1 succeeds but Phase 2 (queue reconciliation)
+  fails, a partial receipt containing Phase 1 actions is persisted before the
+  Phase 2 error is propagated. In both cases, this ensures lane and queue
+  recovery mutations are never silently lost. If partial receipt persistence
+  also fails, a combined error is returned that includes both the phase
+  failure context and the persistence failure context, so apply-mode mutations
+  never lack durable receipt evidence.
 - [INV-RECON-002] Stale lease detection is fail-closed: ambiguous PID state
   (EPERM) marks lane CORRUPT (not recovered). Corrupt marker persistence
   failure is a hard error in apply mode — ambiguous states must not proceed
@@ -1359,9 +1362,13 @@ inconsistencies deterministically on worker startup.
   stored in the lease record and git state after a crash may be arbitrary
   (the workspace will be re-checked-out on next job assignment). If any
   cleanup step fails, the lane is marked CORRUPT via `LaneCorruptMarkerV1`
-  rather than silently continuing (fail-closed). CLEANUP persist failure is a
-  hard error — lease removal is blocked without durable CLEANUP evidence to
-  prevent silent lifecycle bypass.
+  and the worker continues startup (the corrupt marker is the fail-closed
+  safety net — the lane will not accept new jobs until explicitly reset via
+  `apm2 fac lane reset`). This prevents crash loops in SystemMode where
+  `safe_rmtree_v1` rejects 0o770 lane directory permissions
+  (INV-RMTREE-006). CLEANUP persist failure is a hard error — lease
+  removal is blocked without durable CLEANUP evidence to prevent silent
+  lifecycle bypass.
 - [INV-RECON-007] Move operations are fail-closed: `move_file_safe` propagates
   rename failures as `ReconcileError::MoveFailed`. Queue reconciliation counters
   only increment after confirmed rename success. Requeue failures attempt
@@ -1394,7 +1401,12 @@ inconsistencies deterministically on worker startup.
   for the full exemption rationale.
 - [INV-RECON-013] `move_file_safe` hardens destination file permissions to
   0o600 after `fs::rename` to prevent information disclosure from preserved
-  source permissions (CTR-2611).
+  source permissions (CTR-2611). After a successful rename, chmod failure is
+  logged as a warning but does NOT return `Err`, because the file has already
+  been moved — returning `Err` would cause the caller to interpret the move
+  as failed and attempt a fallback move from the original path (which no
+  longer exists), creating unrecorded queue mutations that break
+  INV-RECON-001/007.
 - [INV-RECON-014] In the `LaneState::Corrupt` branch of `reconcile_lanes`,
   if a durable corrupt marker does not already exist, one is persisted via
   `persist_corrupt_marker`. This ensures that derived corruption states

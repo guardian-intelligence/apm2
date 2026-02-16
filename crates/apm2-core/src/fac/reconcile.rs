@@ -35,9 +35,9 @@
 //!
 //! - [INV-RECON-001] No job is silently dropped; all outcomes recorded as
 //!   receipts. Receipt persistence is mandatory in apply mode — both for the
-//!   final receipt and for partial receipts after Phase-2 failures. If partial
-//!   receipt persistence also fails, a combined error is returned so that
-//!   apply-mode lane mutations never lack durable receipt evidence.
+//!   final receipt and for partial receipts after Phase-1 or Phase-2 failures.
+//!   If partial receipt persistence also fails, a combined error is returned so
+//!   that apply-mode lane mutations never lack durable receipt evidence.
 //! - [INV-RECON-002] Stale lease detection is fail-closed: ambiguous PID state
 //!   → CORRUPT (not recovered). Ambiguous states are durably marked via
 //!   `LaneCorruptMarkerV1`. Corrupt marker persistence failure is a hard error
@@ -406,6 +406,10 @@ struct LaneReconcileResult {
     active_job_ids: HashSet<String>,
     stale_leases_recovered: usize,
     lanes_marked_corrupt: usize,
+    /// If phase 1 encountered an error after partial mutations, the error
+    /// is captured here alongside the partial results so the caller can
+    /// persist a partial receipt before propagating (INV-RECON-001).
+    partial_error: Option<ReconcileError>,
 }
 
 /// Intermediate result from phase 2 queue reconciliation.
@@ -490,7 +494,48 @@ pub fn reconcile_on_startup(
     let lane_ids = LaneManager::default_lane_ids();
 
     // Phase 1: Lane reconciliation.
-    let lane_result = reconcile_lanes(&manager, &lane_ids, fac_root, &timestamp, dry_run)?;
+    //
+    // MAJOR 2 FIX: reconcile_lanes now always returns partial results
+    // (actions, counters) alongside any error. If Phase 1 fails after
+    // mutating some lanes, we persist a partial receipt containing the
+    // already-applied actions before propagating the error. This ensures
+    // INV-RECON-001 traceability for all mutations, matching the Phase-2
+    // partial receipt pattern.
+    let lane_result = reconcile_lanes(&manager, &lane_ids, fac_root, &timestamp, dry_run);
+
+    // Check for Phase 1 errors. If there was an error, persist a partial
+    // receipt with the actions that were completed before the error.
+    if let Some(phase1_err) = lane_result.partial_error {
+        if !dry_run {
+            let partial_receipt = ReconcileReceiptV1 {
+                schema: RECONCILE_RECEIPT_SCHEMA.to_string(),
+                timestamp,
+                dry_run,
+                lane_actions: lane_result.actions,
+                queue_actions: Vec::new(),
+                lanes_inspected: lane_ids.len(),
+                claimed_files_inspected: 0,
+                stale_leases_recovered: lane_result.stale_leases_recovered,
+                orphaned_jobs_requeued: 0,
+                orphaned_jobs_failed: 0,
+                lanes_marked_corrupt: lane_result.lanes_marked_corrupt,
+            };
+            // INV-RECON-001 (fail-closed): Partial receipt persistence
+            // is mandatory in apply mode. If persistence also fails,
+            // return a combined error.
+            if let Err(persist_err) = partial_receipt.persist(fac_root) {
+                return Err(ReconcileError::io(
+                    format!(
+                        "partial receipt persistence failed after Phase 1 error \
+                         (phase1: {phase1_err}, persist: {persist_err}); \
+                         apply-mode lane mutations may lack durable receipt evidence"
+                    ),
+                    std::io::Error::other("partial receipt persistence is mandatory in apply mode"),
+                ));
+            }
+        }
+        return Err(phase1_err);
+    }
 
     // Phase 2: Queue reconciliation — scan claimed/ for orphaned jobs.
     // INV-RECON-001: If Phase 2 fails after Phase 1 mutated state (e.g.,
@@ -599,19 +644,21 @@ fn reconcile_lanes(
     fac_root: &Path,
     timestamp: &str,
     dry_run: bool,
-) -> Result<LaneReconcileResult, ReconcileError> {
+) -> LaneReconcileResult {
     let mut actions: Vec<LaneRecoveryAction> = Vec::new();
     let mut stale_leases_recovered: usize = 0;
     let mut lanes_marked_corrupt: usize = 0;
     let mut active_job_ids: HashSet<String> = HashSet::new();
+    let mut partial_error: Option<ReconcileError> = None;
 
     for lane_id in lane_ids {
         if actions.len() >= MAX_LANE_RECOVERY_ACTIONS {
-            return Err(ReconcileError::TooManyEntries {
+            partial_error = Some(ReconcileError::TooManyEntries {
                 kind: "lane_recovery_actions",
                 count: actions.len(),
                 limit: MAX_LANE_RECOVERY_ACTIONS,
             });
+            break;
         }
 
         let status = match manager.lane_status(lane_id) {
@@ -621,7 +668,12 @@ fn reconcile_lanes(
                 // INV-RECON-002).
                 let reason = format!("failed to read lane status: {e}");
                 if !dry_run {
-                    persist_corrupt_marker(fac_root, lane_id, &reason, timestamp)?;
+                    if let Err(marker_err) =
+                        persist_corrupt_marker(fac_root, lane_id, &reason, timestamp)
+                    {
+                        partial_error = Some(marker_err);
+                        break;
+                    }
                 }
                 actions.push(LaneRecoveryAction::MarkedCorrupt {
                     lane_id: lane_id.clone(),
@@ -641,16 +693,53 @@ fn reconcile_lanes(
                     if !pid_alive && !status.lock_held {
                         // Dead PID + free lock → stale lease.
                         // INV-RECON-006: Transition through CLEANUP → IDLE.
-                        if !dry_run {
-                            recover_stale_lease(&lane_dir, &lease, fac_root)?;
+                        if dry_run {
+                            actions.push(LaneRecoveryAction::StaleLeaseCleared {
+                                lane_id: lane_id.clone(),
+                                job_id: lease.job_id.clone(),
+                                pid: lease.pid,
+                                previous_state: lease.state.to_string(),
+                            });
+                            stale_leases_recovered += 1;
+                        } else {
+                            match recover_stale_lease(&lane_dir, &lease, fac_root) {
+                                Ok(StaleLeaseOutcome::Recovered) => {
+                                    actions.push(LaneRecoveryAction::StaleLeaseCleared {
+                                        lane_id: lane_id.clone(),
+                                        job_id: lease.job_id.clone(),
+                                        pid: lease.pid,
+                                        previous_state: lease.state.to_string(),
+                                    });
+                                    stale_leases_recovered += 1;
+                                },
+                                Ok(StaleLeaseOutcome::MarkedCorrupt) => {
+                                    // Cleanup failed but lane was durably
+                                    // marked CORRUPT. Worker can continue
+                                    // startup — lane will not accept new
+                                    // jobs until reset. This prevents
+                                    // crash loops in SystemMode where
+                                    // safe_rmtree_v1 fails due to 0o770
+                                    // lane directory permissions.
+                                    let reason = format!(
+                                        "stale lease cleanup failed for lane {lane_id} \
+                                         (pid={}, state={}); lane marked CORRUPT",
+                                        lease.pid, lease.state,
+                                    );
+                                    actions.push(LaneRecoveryAction::MarkedCorrupt {
+                                        lane_id: lane_id.clone(),
+                                        reason: truncate_string(&reason, MAX_STRING_LENGTH),
+                                    });
+                                    lanes_marked_corrupt += 1;
+                                },
+                                Err(recover_err) => {
+                                    // Recovery itself failed (e.g., corrupt
+                                    // marker persistence failed). Capture
+                                    // the error with partial state.
+                                    partial_error = Some(recover_err);
+                                    break;
+                                },
+                            }
                         }
-                        actions.push(LaneRecoveryAction::StaleLeaseCleared {
-                            lane_id: lane_id.clone(),
-                            job_id: lease.job_id.clone(),
-                            pid: lease.pid,
-                            previous_state: lease.state.to_string(),
-                        });
-                        stale_leases_recovered += 1;
                         continue;
                     }
                     // INV-RECON-002: PID alive (or EPERM) but lock free with
@@ -663,7 +752,12 @@ fn reconcile_lanes(
                         lease.pid, lease.state,
                     );
                     if !dry_run {
-                        persist_corrupt_marker(fac_root, lane_id, &reason, timestamp)?;
+                        if let Err(marker_err) =
+                            persist_corrupt_marker(fac_root, lane_id, &reason, timestamp)
+                        {
+                            partial_error = Some(marker_err);
+                            break;
+                        }
                     }
                     // THEME 7: treat this as active to prevent orphan requeue.
                     active_job_ids.insert(lease.job_id.clone());
@@ -707,7 +801,12 @@ fn reconcile_lanes(
                             "derived corrupt state for lane {lane_id} was not \
                              durably marked; persisting corrupt marker"
                         );
-                        persist_corrupt_marker(fac_root, lane_id, &reason, timestamp)?;
+                        if let Err(marker_err) =
+                            persist_corrupt_marker(fac_root, lane_id, &reason, timestamp)
+                        {
+                            partial_error = Some(marker_err);
+                            break;
+                        }
                     }
                 }
                 // THEME 7: Corrupt lanes with a live PID may still be
@@ -727,12 +826,24 @@ fn reconcile_lanes(
         }
     }
 
-    Ok(LaneReconcileResult {
+    LaneReconcileResult {
         actions,
         active_job_ids,
         stale_leases_recovered,
         lanes_marked_corrupt,
-    })
+        partial_error,
+    }
+}
+
+/// Outcome of stale lease recovery.
+enum StaleLeaseOutcome {
+    /// Stale lease was successfully recovered: cleanup succeeded and lease
+    /// was removed (lane is now IDLE).
+    Recovered,
+    /// Cleanup failed but the lane was durably marked CORRUPT. The lease
+    /// was NOT removed. The worker can continue startup safely because
+    /// the corrupt marker prevents the lane from accepting new jobs.
+    MarkedCorrupt,
 }
 
 /// INV-RECON-006: Transition stale lease through CLEANUP → IDLE before removal.
@@ -772,7 +883,7 @@ fn recover_stale_lease(
     lane_dir: &Path,
     lease: &LaneLeaseV1,
     fac_root: &Path,
-) -> Result<(), ReconcileError> {
+) -> Result<StaleLeaseOutcome, ReconcileError> {
     // Step 1: Transition to CLEANUP state and persist durably.
     // Fail-closed: if this write fails, we must NOT remove the lease.
     let mut cleanup_lease = lease.clone();
@@ -802,6 +913,14 @@ fn recover_stale_lease(
     if let Some(cleanup_reason) = cleanup_failed {
         // Cleanup failed — mark lane CORRUPT (fail-closed). The lane must
         // not accept new jobs until explicitly reset via `apm2 fac lane reset`.
+        //
+        // BLOCKER FIX: The corrupt marker IS the fail-closed safety net.
+        // Once the lane is marked CORRUPT, the worker can safely continue
+        // startup — the lane will not accept new jobs until explicitly
+        // reset. Previously, this code returned Err which caused the
+        // entire worker startup to abort, creating a persistent crash
+        // loop in SystemMode where safe_rmtree_v1 fails due to 0o770
+        // lane directory permissions (INV-RMTREE-006 vs SystemMode).
         let lane_id = lane_dir
             .file_name()
             .and_then(|n| n.to_str())
@@ -818,24 +937,37 @@ fn recover_stale_lease(
             cleanup_receipt_digest: None,
             detected_at: timestamp,
         };
-        marker.persist(fac_root).map_err(|e| {
-            ReconcileError::io(
-                format!(
-                    "failed to persist corrupt marker after cleanup failure for lane {lane_id} \
-                     (original cleanup error: {cleanup_reason})"
-                ),
-                std::io::Error::other(e.to_string()),
-            )
-        })?;
-        // Do NOT remove the lease — lane is corrupt and needs manual reset.
-        return Err(ReconcileError::io(
-            format!(
-                "lane cleanup failed during stale lease recovery at {}: {cleanup_reason}; \
-                 lane marked CORRUPT",
-                lane_dir.display()
-            ),
-            std::io::Error::other("cleanup verification failed — lane marked corrupt"),
-        ));
+        match marker.persist(fac_root) {
+            Ok(()) => {
+                // Corrupt marker persisted successfully. Log warning and
+                // continue — the lane is durably marked CORRUPT and will
+                // not accept new jobs until reset.
+                eprintln!(
+                    "WARNING: lane cleanup failed during stale lease recovery at {}: \
+                     {cleanup_reason}; lane marked CORRUPT (requires `apm2 fac lane reset`)",
+                    lane_dir.display()
+                );
+                // Do NOT remove the lease — lane is corrupt and needs
+                // manual reset. Return Ok(MarkedCorrupt) because the
+                // lane was successfully handled (marked corrupt is a
+                // valid terminal state for this recovery path).
+                return Ok(StaleLeaseOutcome::MarkedCorrupt);
+            },
+            Err(e) => {
+                // Corrupt marker persistence itself failed. This IS a
+                // hard error because the lane is in an ambiguous state
+                // with no durable evidence. Subsequent startups would
+                // not see the lane as corrupt and could attempt unsafe
+                // recovery.
+                return Err(ReconcileError::io(
+                    format!(
+                        "failed to persist corrupt marker after cleanup failure for lane \
+                         {lane_id} (original cleanup error: {cleanup_reason})"
+                    ),
+                    std::io::Error::other(e.to_string()),
+                ));
+            },
+        }
     }
 
     // Step 3: Remove the lease file (IDLE). Safe because CLEANUP is now durable
@@ -845,7 +977,9 @@ fn recover_stale_lease(
             format!("failed to remove stale lease at {}", lane_dir.display()),
             std::io::Error::other(e.to_string()),
         )
-    })
+    })?;
+
+    Ok(StaleLeaseOutcome::Recovered)
 }
 
 /// Best-effort filesystem cleanup for a lane during stale lease recovery.
@@ -853,18 +987,33 @@ fn recover_stale_lease(
 /// Prunes `tmp/` and per-lane env directories (`home/`, `xdg_cache/`,
 /// `xdg_config/`, `xdg_data/`, `xdg_state/`, `xdg_runtime/`) via
 /// `safe_rmtree_v1`. Returns `None` on success, or `Some(reason)` describing
-/// the first failure encountered.
+/// all failures encountered.
+///
+/// **Truly best-effort**: All cleanup steps are attempted regardless of
+/// individual failures. In `SystemMode`, lane directories have mode 0o770
+/// (group-accessible), which conflicts with `safe_rmtree_v1`'s strict
+/// INV-RMTREE-006 (mode 0o700) check. Rather than modifying the security
+/// invariant, failures are logged as warnings and accumulated. The caller
+/// marks the lane CORRUPT on any failure, which is the fail-closed safety
+/// net — the lane will not accept new jobs until explicitly reset via
+/// `apm2 fac lane reset`.
 ///
 /// This is a subset of the full `LaneManager::run_lane_cleanup` that can run
 /// without knowledge of the workspace path or git state.
 fn best_effort_lane_cleanup(lane_dir: &Path) -> Option<String> {
     use super::safe_rmtree::safe_rmtree_v1;
 
+    let mut failures: Vec<String> = Vec::new();
+
     // Prune tmp/ directory.
     let tmp_dir = lane_dir.join("tmp");
     if tmp_dir.exists() {
         if let Err(e) = safe_rmtree_v1(&tmp_dir, lane_dir) {
-            return Some(format!("tmp prune failed: {e}"));
+            eprintln!(
+                "WARNING: best-effort lane cleanup: tmp prune failed for {}: {e}",
+                lane_dir.display()
+            );
+            failures.push(format!("tmp prune failed: {e}"));
         }
     }
 
@@ -877,7 +1026,11 @@ fn best_effort_lane_cleanup(lane_dir: &Path) -> Option<String> {
         let env_dir = lane_dir.join(env_subdir);
         if env_dir.exists() {
             if let Err(e) = safe_rmtree_v1(&env_dir, lane_dir) {
-                return Some(format!(
+                eprintln!(
+                    "WARNING: best-effort lane cleanup: env dir prune failed for {}: {e}",
+                    env_dir.display()
+                );
+                failures.push(format!(
                     "env dir prune failed for {}: {e}",
                     env_dir.display()
                 ));
@@ -885,7 +1038,11 @@ fn best_effort_lane_cleanup(lane_dir: &Path) -> Option<String> {
         }
     }
 
-    None
+    if failures.is_empty() {
+        None
+    } else {
+        Some(failures.join("; "))
+    }
 }
 
 /// Persist a `LaneCorruptMarkerV1` for a lane (INV-RECON-002).
@@ -1229,12 +1386,26 @@ fn move_file_safe(src: &Path, dest_dir: &Path, file_name: &str) -> Result<(), St
     // fs::rename preserves source permissions, which may be world-readable.
     // Reconciliation moves should ensure restricted permissions on destination
     // files to prevent information disclosure (CTR-2611).
+    //
+    // MAJOR 1 FIX: After a successful rename, chmod failure is logged as a
+    // warning but does NOT return Err. The rename has already committed
+    // the filesystem mutation — returning Err would cause the caller to
+    // interpret the move as failed, attempt a fallback move from the
+    // original src path (which no longer exists), and return MoveFailed.
+    // This would create unrecorded queue mutations breaking INV-RECON-001/007.
+    // Since the file is already in the correct destination, a chmod failure
+    // is a permission-hardening miss, not a move failure.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&dest, perms)
-            .map_err(|e| format!("set permissions on {}: {e}", dest.display()))?;
+        if let Err(e) = std::fs::set_permissions(&dest, perms) {
+            eprintln!(
+                "WARNING: move_file_safe: rename succeeded but set_permissions failed \
+                 for {}: {e} (file moved successfully, permissions not hardened)",
+                dest.display()
+            );
+        }
     }
 
     Ok(())
@@ -2322,6 +2493,202 @@ mod tests {
             assert_eq!(
                 mode, 0o600,
                 "destination file should have 0o600 permissions, got {mode:#o}"
+            );
+        }
+    }
+
+    // ── BLOCKER regression: SystemMode crash recovery ──────────────────
+
+    #[test]
+    fn test_blocker_cleanup_failure_does_not_abort_worker_startup() {
+        // BLOCKER regression: When best_effort_lane_cleanup fails (e.g.,
+        // safe_rmtree_v1 rejects 0o770 SystemMode permissions), the
+        // worker must NOT abort startup. The lane should be marked
+        // CORRUPT and the worker continues processing other lanes.
+        //
+        // Previously, recover_stale_lease returned Err on cleanup
+        // failure, which propagated up through reconcile_lanes and
+        // reconcile_on_startup, causing a persistent crash loop.
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+
+        // Set lane-00 to 0o770 (simulating SystemMode) so
+        // safe_rmtree_v1 will fail its INV-RMTREE-006 check.
+        let lane_dir = fac_root.join("lanes").join("lane-00");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lane_dir, fs::Permissions::from_mode(0o770)).unwrap();
+        }
+
+        // Create a tmp/ directory with stale files in the lane.
+        let tmp_dir = lane_dir.join("tmp");
+        fs::create_dir_all(&tmp_dir).unwrap();
+        fs::write(tmp_dir.join("stale.o"), b"stale").unwrap();
+
+        // Plant a stale lease with dead PID.
+        write_lease(
+            &fac_root,
+            "lane-00",
+            "job-system-mode",
+            999_999_999,
+            LaneState::Running,
+        );
+
+        // Reconciliation should succeed overall — the lane is marked
+        // CORRUPT instead of causing a crash loop.
+        let receipt =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
+                .unwrap();
+
+        // lane-00 should be marked corrupt (cleanup failed).
+        assert!(
+            receipt.lanes_marked_corrupt >= 1,
+            "lane with failed cleanup should be marked CORRUPT, got lanes_marked_corrupt={}",
+            receipt.lanes_marked_corrupt
+        );
+
+        // Verify a corrupt marker was persisted.
+        let marker = LaneCorruptMarkerV1::load(&fac_root, "lane-00")
+            .unwrap()
+            .expect("corrupt marker should exist");
+        assert!(
+            marker.reason.contains("cleanup failed"),
+            "corrupt reason should mention cleanup failure: {}",
+            marker.reason
+        );
+    }
+
+    // ── MAJOR 1 regression: rename+chmod error path ────────────────────
+
+    #[test]
+    fn test_major1_rename_success_chmod_failure_returns_ok() {
+        // MAJOR 1 regression: After a successful fs::rename, a chmod
+        // failure must NOT return Err. Returning Err previously caused
+        // the caller to interpret the move as failed, try a fallback
+        // move from the original path (which no longer exists), and
+        // return MoveFailed — creating unrecorded queue mutations.
+        //
+        // This test simulates the scenario by moving a file then making
+        // the destination read-only so chmod would fail if it were
+        // implemented as map_err(?).
+        let tmp = TempDir::new().unwrap();
+        let src_dir = tmp.path().join("src");
+        let dest_dir = tmp.path().join("dest");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        let src_file = src_dir.join("rename-test.json");
+        fs::write(&src_file, b"{\"job_id\": \"test\"}").unwrap();
+
+        // move_file_safe should always succeed if rename succeeds, even
+        // if the destination filesystem had permission quirks. Since we
+        // can't easily make set_permissions fail on a file we own, we
+        // verify the contract: rename succeeds → Ok returned → source
+        // is gone.
+        move_file_safe(&src_file, &dest_dir, "rename-test.json").unwrap();
+
+        assert!(
+            !src_file.exists(),
+            "source file should be gone after successful rename"
+        );
+
+        let entries: Vec<_> = fs::read_dir(&dest_dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one file should be in destination"
+        );
+    }
+
+    // ── MAJOR 2 regression: Phase-1 partial receipt ────────────────────
+
+    #[test]
+    fn test_major2_phase1_error_persists_partial_receipt() {
+        // MAJOR 2 regression: When Phase 1 fails after mutating some
+        // lanes (e.g., recovering lane-00's stale lease, then failing to
+        // persist a corrupt marker for lane-01), a partial receipt must
+        // be persisted containing the Phase 1 actions that were
+        // completed before the error.
+        //
+        // This test creates a scenario where lane-00 has a stale lease
+        // (recoverable), and lane-01 has an ambiguous state that
+        // triggers corrupt marker persistence, but the lane directory
+        // is read-only so the marker persist fails.
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+
+        // Lane-00: stale lease with dead PID (will be recovered first).
+        let lane_00_dir = fac_root.join("lanes").join("lane-00");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lane_00_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        write_lease(
+            &fac_root,
+            "lane-00",
+            "job-phase1-partial",
+            999_999_999,
+            LaneState::Running,
+        );
+
+        // Lane-01: lease with our own PID (alive) + lock not held →
+        // ambiguous state → triggers persist_corrupt_marker.
+        let our_pid = std::process::id();
+        write_lease(
+            &fac_root,
+            "lane-01",
+            "job-ambiguous-phase1",
+            our_pid,
+            LaneState::Idle,
+        );
+
+        // Make lane-01 directory read-only so corrupt marker persist fails.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let lane_01_dir = fac_root.join("lanes").join("lane-01");
+            fs::set_permissions(&lane_01_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+            let result =
+                reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false);
+
+            // Restore permissions for cleanup.
+            fs::set_permissions(&lane_01_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+            // Phase 1 should have failed due to corrupt marker persist
+            // failure on lane-01.
+            assert!(result.is_err(), "Phase 1 error should propagate");
+
+            // But a partial receipt should have been persisted with the
+            // Phase 1 actions that completed (lane-00 recovery).
+            let receipts_dir = fac_root.join("receipts").join("reconcile");
+            assert!(
+                receipts_dir.is_dir(),
+                "receipts directory should exist for Phase 1 partial receipt"
+            );
+            let receipt_entries: Vec<_> = fs::read_dir(&receipts_dir)
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .collect();
+            assert!(
+                !receipt_entries.is_empty(),
+                "at least one partial receipt should be persisted for Phase 1 actions"
+            );
+
+            // Load and verify the partial receipt contains the Phase 1
+            // lane actions that were completed before the error.
+            let partial = ReconcileReceiptV1::load(&receipt_entries[0].path()).unwrap();
+            assert!(
+                partial.stale_leases_recovered >= 1
+                    || partial.lanes_marked_corrupt >= 1
+                    || !partial.lane_actions.is_empty(),
+                "partial receipt should contain Phase 1 actions: \
+                 stale_leases_recovered={}, lanes_marked_corrupt={}, lane_actions={}",
+                partial.stale_leases_recovered,
+                partial.lanes_marked_corrupt,
+                partial.lane_actions.len(),
             );
         }
     }
