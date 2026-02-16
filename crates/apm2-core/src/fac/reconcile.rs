@@ -41,7 +41,8 @@
 //! - [INV-RECON-002] Stale lease detection is fail-closed: ambiguous PID state
 //!   → CORRUPT (not recovered). Ambiguous states are durably marked via
 //!   `LaneCorruptMarkerV1`. Corrupt marker persistence failure is a hard error
-//!   in apply mode — ambiguous states must not proceed without durable evidence.
+//!   in apply mode — ambiguous states must not proceed without durable
+//!   evidence.
 //! - [INV-RECON-003] All in-memory collections are bounded by hard MAX_*
 //!   constants.
 //! - [INV-RECON-004] Reconciliation is idempotent and safe to call on every
