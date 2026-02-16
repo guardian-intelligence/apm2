@@ -1323,7 +1323,10 @@ inconsistencies deterministically on worker startup.
 - [INV-RECON-001] No job is silently dropped; all outcomes recorded as receipts.
   Receipt persistence is mandatory in apply mode (fail-closed); dry-run mode
   uses best-effort persistence. Worker startup aborts on reconciliation failure
-  to prevent processing jobs with inconsistent queue/lane state.
+  to prevent processing jobs with inconsistent queue/lane state. If Phase 1
+  (lane reconciliation) succeeds but Phase 2 (queue reconciliation) fails, a
+  partial receipt containing Phase 1 actions is persisted before the Phase 2
+  error is propagated, ensuring lane recovery mutations are never silently lost.
 - [INV-RECON-002] Stale lease detection is fail-closed: ambiguous PID state
   (EPERM) marks lane CORRUPT (not recovered). Corrupt lanes with alive PIDs
   contribute their job_id to the active_job_ids set, preventing queue
@@ -1337,6 +1340,9 @@ inconsistencies deterministically on worker startup.
 - [INV-RECON-004] Reconciliation is idempotent and safe to call on every
   startup.
 - [INV-RECON-005] Queue reads are bounded (`MAX_CLAIMED_SCAN_ENTRIES=4096`).
+  Every directory entry (including symlinks, directories, and special files)
+  counts toward the scan cap BEFORE file-type filtering. This prevents
+  adversarial flooding of non-regular entries to bypass the scan budget.
 - [INV-RECON-006] Stale lease recovery routes through the CLEANUP state
   transition (`recover_stale_lease`): the lease is persisted as CLEANUP state,
   then removed to reach IDLE. This mirrors the normal lane lifecycle and
@@ -1349,6 +1355,9 @@ inconsistencies deterministically on worker startup.
   block/char devices, sockets) via `entry.file_type()` check.
   `extract_job_id_from_claimed` validates with `symlink_metadata` and reads
   via `open_file_no_follow` (O_NOFOLLOW) to prevent symlink traversal.
+  The `queue/claimed` directory itself is verified via `symlink_metadata()`
+  before traversal; if it is a symlink, reconciliation fails closed to
+  prevent iterating and moving files from outside the queue tree.
 - [INV-RECON-009] All filesystem writes use hardened I/O from `lane.rs`:
   directories via `create_dir_restricted` (0o700), files via `atomic_write`
   (NamedTempFile + 0o600 permissions + `sync_all` + atomic rename). Receipt

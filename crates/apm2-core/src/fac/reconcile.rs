@@ -34,7 +34,9 @@
 //! # Invariants
 //!
 //! - [INV-RECON-001] No job is silently dropped; all outcomes recorded as
-//!   receipts. Receipt persistence is mandatory in apply mode.
+//!   receipts. Receipt persistence is mandatory in apply mode. If Phase 1 (lane
+//!   reconciliation) succeeds but Phase 2 (queue reconciliation) fails, a
+//!   partial receipt is persisted before the error is propagated.
 //! - [INV-RECON-002] Stale lease detection is fail-closed: ambiguous PID state
 //!   → CORRUPT (not recovered). Ambiguous states are durably marked via
 //!   `LaneCorruptMarkerV1`.
@@ -42,11 +44,14 @@
 //!   constants.
 //! - [INV-RECON-004] Reconciliation is idempotent and safe to call on every
 //!   startup.
-//! - [INV-RECON-005] Queue reads are bounded (MAX_CLAIMED_SCAN_ENTRIES).
+//! - [INV-RECON-005] Queue reads are bounded (MAX_CLAIMED_SCAN_ENTRIES). Every
+//!   directory entry counts toward the cap before file-type filtering.
 //! - [INV-RECON-006] Stale lease recovery transitions through CLEANUP → IDLE
 //!   with receipts before removing the lease.
 //! - [INV-RECON-007] Move operations are fail-closed: counters only increment
 //!   after confirmed rename success.
+//! - [INV-RECON-008] The `queue/claimed` directory itself is verified via
+//!   `symlink_metadata()` before traversal; symlinked directories are rejected.
 
 use std::collections::HashSet;
 use std::fs;
@@ -422,12 +427,47 @@ pub fn reconcile_on_startup(
     let lane_result = reconcile_lanes(&manager, &lane_ids, fac_root, &timestamp, dry_run)?;
 
     // Phase 2: Queue reconciliation — scan claimed/ for orphaned jobs.
-    let queue_result = reconcile_queue(
+    // INV-RECON-001: If Phase 2 fails after Phase 1 mutated state (e.g.,
+    // clearing stale leases), we must persist a partial receipt containing
+    // Phase 1 actions before propagating the Phase 2 error.
+    let queue_result = match reconcile_queue(
         queue_root,
         &lane_result.active_job_ids,
         orphan_policy,
         dry_run,
-    )?;
+    ) {
+        Ok(result) => result,
+        Err(phase2_err) => {
+            // Phase 1 may have mutated state (stale lease recovery).
+            // Persist a partial receipt with Phase 1 results so those
+            // actions are never silently lost (INV-RECON-001).
+            if !dry_run {
+                let partial_receipt = ReconcileReceiptV1 {
+                    schema: RECONCILE_RECEIPT_SCHEMA.to_string(),
+                    timestamp,
+                    dry_run,
+                    lane_actions: lane_result.actions,
+                    queue_actions: Vec::new(),
+                    lanes_inspected: lane_ids.len(),
+                    claimed_files_inspected: 0,
+                    stale_leases_recovered: lane_result.stale_leases_recovered,
+                    orphaned_jobs_requeued: 0,
+                    orphaned_jobs_failed: 0,
+                    lanes_marked_corrupt: lane_result.lanes_marked_corrupt,
+                };
+                // Best-effort persist of partial receipt — even if this fails,
+                // propagate the original Phase 2 error (which is the primary
+                // failure). Log the persistence failure.
+                if let Err(persist_err) = partial_receipt.persist(fac_root) {
+                    eprintln!(
+                        "WARNING: failed to persist partial reconcile receipt \
+                         after Phase 2 failure: {persist_err}"
+                    );
+                }
+            }
+            return Err(phase2_err);
+        },
+    };
 
     let receipt = ReconcileReceiptV1 {
         schema: RECONCILE_RECEIPT_SCHEMA.to_string(),
@@ -672,13 +712,49 @@ fn reconcile_queue(
     let mut orphaned_jobs_failed: usize = 0;
     let mut claimed_files_inspected: usize = 0;
 
-    if !claimed_dir.is_dir() {
-        return Ok(QueueReconcileResult {
-            actions,
-            claimed_files_inspected,
-            orphaned_jobs_requeued,
-            orphaned_jobs_failed,
-        });
+    // INV-RECON-008: Verify claimed_dir is a real directory, not a symlink.
+    // Using symlink_metadata to detect symlinks without following them.
+    // If claimed_dir is a symlink, reconciliation must fail closed to prevent
+    // iterating and moving files from outside the queue tree.
+    match fs::symlink_metadata(&claimed_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(ReconcileError::io(
+                    format!(
+                        "queue/claimed directory is a symlink: {}",
+                        claimed_dir.display()
+                    ),
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "claimed directory symlink traversal rejected",
+                    ),
+                ));
+            }
+            if !meta.is_dir() {
+                // Not a directory and not a symlink — nothing to scan.
+                return Ok(QueueReconcileResult {
+                    actions,
+                    claimed_files_inspected,
+                    orphaned_jobs_requeued,
+                    orphaned_jobs_failed,
+                });
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Directory does not exist — nothing to reconcile.
+            return Ok(QueueReconcileResult {
+                actions,
+                claimed_files_inspected,
+                orphaned_jobs_requeued,
+                orphaned_jobs_failed,
+            });
+        },
+        Err(e) => {
+            return Err(ReconcileError::io(
+                format!("stat claimed directory {}", claimed_dir.display()),
+                e,
+            ));
+        },
     }
 
     let entries = fs::read_dir(&claimed_dir).map_err(|e| {
@@ -689,7 +765,12 @@ fn reconcile_queue(
     })?;
 
     for entry in entries {
-        if claimed_files_inspected >= MAX_CLAIMED_SCAN_ENTRIES {
+        // INV-RECON-005: Count EVERY directory entry toward the scan cap
+        // BEFORE file-type filtering. This prevents an attacker from flooding
+        // queue/claimed with symlinks, directories, or special files to bypass
+        // the MAX_CLAIMED_SCAN_ENTRIES budget and cause unbounded traversal.
+        claimed_files_inspected += 1;
+        if claimed_files_inspected > MAX_CLAIMED_SCAN_ENTRIES {
             return Err(ReconcileError::TooManyEntries {
                 kind: "claimed_scan",
                 count: claimed_files_inspected,
@@ -733,8 +814,6 @@ fn reconcile_queue(
         if !file_type.is_file() {
             continue;
         }
-
-        claimed_files_inspected += 1;
 
         let path = entry.path();
         let file_name = match path.file_name().and_then(|n| n.to_str()) {
@@ -1413,6 +1492,152 @@ mod tests {
             entries.len(),
             2,
             "two receipts should exist with unique filenames"
+        );
+    }
+
+    #[test]
+    fn test_non_regular_entries_count_toward_scan_cap() {
+        // Non-regular entries (symlinks, directories) MUST count toward the
+        // MAX_CLAIMED_SCAN_ENTRIES budget to prevent an attacker from flooding
+        // claimed/ with non-regular entries to bypass the scan cap.
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let claimed_dir = queue_root.join("claimed");
+            let target = queue_root.join("pending").join("decoy.json");
+            fs::write(&target, b"{}").unwrap();
+
+            // Create one symlink and one subdirectory in claimed/.
+            symlink(&target, claimed_dir.join("symlink-entry.json")).unwrap();
+            fs::create_dir(claimed_dir.join("subdir-entry")).unwrap();
+            // Create one real claimed job.
+            write_claimed_job(&queue_root, "job-real");
+        }
+
+        let receipt =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
+                .unwrap();
+
+        // All three entries (symlink + directory + regular file) should count
+        // toward claimed_files_inspected, not just the regular file.
+        #[cfg(unix)]
+        assert!(
+            receipt.claimed_files_inspected >= 3,
+            "all directory entries (including non-regular) must count toward scan cap, \
+             got {}",
+            receipt.claimed_files_inspected
+        );
+    }
+
+    #[test]
+    fn test_claimed_dir_symlink_rejected() {
+        // If queue/claimed itself is a symlink, reconciliation must fail
+        // closed to prevent iterating files from outside the queue tree.
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            // Remove the real claimed/ directory and replace with a symlink
+            // to a decoy directory.
+            let claimed_dir = queue_root.join("claimed");
+            let decoy_dir = queue_root.join("decoy_target");
+            fs::create_dir_all(&decoy_dir).unwrap();
+            fs::write(decoy_dir.join("trap.json"), b"{\"job_id\":\"trap\"}").unwrap();
+            fs::remove_dir_all(&claimed_dir).unwrap();
+            symlink(&decoy_dir, &claimed_dir).unwrap();
+
+            let result =
+                reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false);
+
+            assert!(
+                result.is_err(),
+                "reconciliation must fail closed when claimed/ is a symlink"
+            );
+            let err_msg = format!("{}", result.unwrap_err());
+            assert!(
+                err_msg.contains("symlink"),
+                "error message should mention symlink: {err_msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_partial_receipt_persisted_on_phase2_failure() {
+        // If Phase 1 (lane reconciliation) succeeds and mutates state, but
+        // Phase 2 (queue reconciliation) fails, a partial receipt containing
+        // Phase 1 actions must be persisted before the error is returned
+        // (INV-RECON-001).
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+
+        // Plant a stale lease so Phase 1 actually does work (mutation).
+        write_lease(
+            &fac_root,
+            "lane-00",
+            "job-stale-partial",
+            999_999_999,
+            LaneState::Running,
+        );
+
+        // Plant a claimed job, then sabotage both pending/ and denied/ and
+        // make queue_root read-only so the move operation fails (Phase 2
+        // error).
+        write_claimed_job(&queue_root, "job-orphan-partial");
+        let pending = queue_root.join("pending");
+        let denied = queue_root.join("denied");
+        fs::remove_dir_all(&pending).unwrap();
+        fs::remove_dir_all(&denied).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o500);
+            fs::set_permissions(&queue_root, perms).unwrap();
+        }
+
+        let result =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false);
+
+        // Restore permissions for cleanup.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o700);
+            fs::set_permissions(&queue_root, perms).unwrap();
+        }
+
+        // Phase 2 should have failed.
+        assert!(result.is_err(), "Phase 2 failure should propagate");
+
+        // But Phase 1's partial receipt should have been persisted.
+        let receipts_dir = fac_root.join("receipts").join("reconcile");
+        assert!(
+            receipts_dir.is_dir(),
+            "receipts directory should exist for partial receipt"
+        );
+        let receipt_entries: Vec<_> = fs::read_dir(&receipts_dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(
+            receipt_entries.len(),
+            1,
+            "exactly one partial receipt should be persisted despite Phase 2 failure"
+        );
+
+        // Load the partial receipt and verify it contains Phase 1 actions.
+        let receipt_path = receipt_entries[0].path();
+        let partial_receipt = ReconcileReceiptV1::load(&receipt_path).unwrap();
+        assert_eq!(
+            partial_receipt.stale_leases_recovered, 1,
+            "partial receipt should record Phase 1 lane recovery"
+        );
+        assert!(
+            partial_receipt.queue_actions.is_empty(),
+            "partial receipt should have empty queue_actions since Phase 2 failed"
         );
     }
 }
