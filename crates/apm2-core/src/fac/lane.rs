@@ -1999,17 +1999,74 @@ pub(crate) fn create_dir_restricted(path: &Path) -> Result<(), LaneError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(
-                if matches!(select_backend(), Ok(ExecutionBackend::SystemMode)) {
-                    0o770
-                } else {
-                    0o700
+        let mode = if matches!(select_backend(), Ok(ExecutionBackend::SystemMode)) {
+            0o770
+        } else {
+            0o700
+        };
+
+        // CTR-2611: When `DirBuilder::recursive(true)` is used, the mode
+        // only applies to the **leaf** directory; intermediate directories
+        // are created with default permissions influenced by the process
+        // umask. To ensure every newly created component has the restricted
+        // mode, walk up from `path` to find the first existing ancestor,
+        // then create each missing component individually with the desired
+        // mode.
+        let mut components_to_create: Vec<&std::path::Path> = Vec::new();
+        let mut current = path;
+        loop {
+            match fs::symlink_metadata(current) {
+                Ok(meta) if meta.is_dir() => break,
+                Ok(_) => {
+                    return Err(LaneError::io(
+                        format!(
+                            "ancestor path {} exists but is not a directory",
+                            current.display()
+                        ),
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "ancestor exists but is not a directory",
+                        ),
+                    ));
                 },
-            )
-            .create(path)
-            .map_err(|e| LaneError::io(format!("creating directory {}", path.display()), e))
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    components_to_create.push(current);
+                    match current.parent() {
+                        Some(parent) if parent != current => current = parent,
+                        _ => break,
+                    }
+                },
+                Err(e) => {
+                    return Err(LaneError::io(
+                        format!("stat ancestor {}", current.display()),
+                        e,
+                    ));
+                },
+            }
+        }
+
+        // Create missing components from outermost to innermost, each with
+        // the restricted mode. Using `recursive(false)` so the mode is
+        // applied to the single directory being created.
+        for component in components_to_create.into_iter().rev() {
+            fs::DirBuilder::new()
+                .recursive(false)
+                .mode(mode)
+                .create(component)
+                .or_else(|e| {
+                    // Tolerate AlreadyExists (concurrent creation race)
+                    if e.kind() == io::ErrorKind::AlreadyExists {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                })
+                .map_err(|e| {
+                    LaneError::io(format!("creating directory {}", component.display()), e)
+                })?;
+        }
+
+        Ok(())
     }
     #[cfg(not(unix))]
     {
@@ -2818,6 +2875,44 @@ mod tests {
         symlink(&target, &symlink_path).expect("create symlink dir");
 
         assert!(create_dir_restricted(&symlink_path.join("child")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_restricted_sets_mode_on_intermediates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let base = dir.path().join("existing_base");
+        fs::create_dir_all(&base).expect("create base");
+        // Set base to 0o700 to match expected environment.
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).expect("set base perms");
+
+        // Create a deeply nested path where intermediate dirs don't exist.
+        let deep_path = base.join("a").join("b").join("c");
+        create_dir_restricted(&deep_path).expect("create deep path");
+
+        // Verify all intermediate directories have the restricted mode
+        // (0o700 in user-mode, which is the default).
+        for component_name in &["a", "b", "c"] {
+            let component_path = base.join(if *component_name == "a" {
+                "a".to_string()
+            } else if *component_name == "b" {
+                "a/b".to_string()
+            } else {
+                "a/b/c".to_string()
+            });
+            let meta = fs::symlink_metadata(&component_path)
+                .unwrap_or_else(|_| panic!("stat {}", component_path.display()));
+            let mode = meta.permissions().mode() & 0o777;
+            // In user-mode (default), the mode should be 0o700.
+            assert_eq!(
+                mode,
+                0o700,
+                "directory {} should have mode 0o700, got {mode:#o}",
+                component_path.display()
+            );
+        }
     }
 
     #[cfg(unix)]

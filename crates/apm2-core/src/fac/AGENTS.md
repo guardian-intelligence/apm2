@@ -1367,7 +1367,8 @@ inconsistencies deterministically on worker startup.
   before traversal; if it is a symlink, reconciliation fails closed to
   prevent iterating and moving files from outside the queue tree.
 - [INV-RECON-009] All filesystem writes use hardened I/O from `lane.rs`:
-  directories via `create_dir_restricted` (0o700), files via `atomic_write`
+  directories via `create_dir_restricted` (0o700 on every newly created
+  component, not just the leaf — CTR-2611), files via `atomic_write`
   (NamedTempFile + 0o600 permissions + `sync_all` + atomic rename). Receipt
   filenames include nanosecond timestamp + random suffix for collision
   resistance.
@@ -1377,6 +1378,22 @@ inconsistencies deterministically on worker startup.
 - [INV-RECON-011] CLI JSON error output uses `serde_json::json!()` +
   `serde_json::to_string()` instead of raw string interpolation, preventing
   malformed JSON from unsanitized error messages.
+- [INV-RECON-012] Reconciliation is exempt from AJC lifecycle requirements
+  (RS-42, RFC-0027). It runs at startup as an internal crash-recovery
+  mechanism before the worker accepts any external authority — it is itself
+  the authority reset for crash recovery. Boundary conditions: runs before
+  the job-processing loop, no broker tokens issued, mutations limited to
+  local queue/lane filesystem state. See `reconcile_on_startup` doc comment
+  for the full exemption rationale.
+- [INV-RECON-013] `move_file_safe` hardens destination file permissions to
+  0o600 after `fs::rename` to prevent information disclosure from preserved
+  source permissions (CTR-2611).
+- [INV-RECON-014] In the `LaneState::Corrupt` branch of `reconcile_lanes`,
+  if a durable corrupt marker does not already exist, one is persisted via
+  `persist_corrupt_marker`. This ensures that derived corruption states
+  (e.g., lock free but PID alive) are durably marked so subsequent restarts
+  see the lane as corrupt even if the runtime conditions that triggered the
+  derivation have changed.
 - CTR-2501 deviation: `current_timestamp_rfc3339()` and `wall_clock_nanos()`
   use wall-clock time for receipt timestamps and file deduplication suffixes.
   Documented inline with security justification.

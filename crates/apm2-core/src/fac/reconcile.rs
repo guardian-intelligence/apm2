@@ -56,6 +56,12 @@
 //!   after confirmed rename success.
 //! - [INV-RECON-008] The `queue/claimed` directory itself is verified via
 //!   `symlink_metadata()` before traversal; symlinked directories are rejected.
+//! - [INV-RECON-012] Reconciliation is exempt from AJC lifecycle requirements
+//!   (RS-42, RFC-0027). It runs at startup as an internal crash-recovery
+//!   mechanism before the worker accepts any external authority — it is itself
+//!   the authority reset for crash recovery. See the doc comment on
+//!   `reconcile_on_startup` for the full exemption rationale and boundary
+//!   conditions.
 
 use std::collections::HashSet;
 use std::fs;
@@ -405,6 +411,46 @@ struct QueueReconcileResult {
 ///    based on the configured policy.
 /// 5. Emits a structured reconciliation receipt.
 ///
+/// # AJC Lifecycle Exemption (INV-RECON-012)
+///
+/// This function performs authoritative mutations (requeueing jobs, marking
+/// lanes corrupt, clearing stale leases) **without** an AJC lifecycle
+/// (`join → revalidate → consume → effect`). This is an intentional and
+/// documented exemption from the PCAC standard (RS-42, RFC-0027) for the
+/// following reasons:
+///
+/// 1. **Startup-time authority reset.** Reconciliation runs as the *first*
+///    operation on worker startup, before the worker accepts any external
+///    authority, issues any tokens, or processes any jobs. There is no active
+///    authority context to join or revalidate against — the reconciliation
+///    *itself* is the mechanism that restores the system to a state where
+///    authority contexts can be established.
+///
+/// 2. **Crash recovery is self-authorising.** The mutations performed here
+///    (clearing dead-PID leases, requeueing orphaned files, marking corrupt
+///    lanes) are internal infrastructure recovery actions, not
+///    externally-requested authority-bearing effects. The "authority" is the
+///    worker process itself repairing its own local state after an unclean
+///    shutdown.
+///
+/// 3. **No external request surface.** Reconciliation is invoked only by the
+///    worker's own startup path or by the CLI `apm2 fac reconcile` command.
+///    There is no IPC handler, no network endpoint, and no delegated capability
+///    that could be confused or replayed. The filesystem-level access to
+///    `$APM2_HOME` is the sole trust anchor.
+///
+/// 4. **Boundary conditions.** This exemption holds only when:
+///    - Reconciliation runs before the worker's job-processing loop starts.
+///    - No broker tokens have been issued for the current epoch.
+///    - The mutations are limited to local queue/lane filesystem state.
+///
+///    If reconciliation were ever extended to perform cross-node or
+///    broker-mediated actions, AJC integration would be required.
+///
+/// All recovery actions emit structured `ReconcileReceiptV1` receipts for
+/// auditability, and receipt persistence is fail-closed in apply mode
+/// (INV-RECON-001).
+///
 /// # Arguments
 ///
 /// * `fac_root` — Path to `$APM2_HOME/private/fac`.
@@ -530,6 +576,7 @@ pub fn reconcile_on_startup(
 ///
 /// THEME 7: Corrupt lanes with live PIDs add their `job_id` to `active_job_ids`
 /// to prevent orphan requeue of still-executing jobs.
+#[allow(clippy::too_many_lines)] // lane reconciliation with corrupt-marker persistence is inherently branchy
 fn reconcile_lanes(
     manager: &LaneManager,
     lane_ids: &[String],
@@ -626,6 +673,27 @@ fn reconcile_lanes(
                 });
             },
             LaneState::Corrupt => {
+                // INV-RECON-002: Ensure derived corruption is durably marked.
+                // If `lane_status` returned Corrupt (e.g., lock free but PID
+                // alive), a durable corrupt marker may not yet exist — for
+                // example if the corruption was derived from runtime state
+                // rather than a persisted marker. Check for the marker and
+                // persist one if absent so that subsequent startups see the
+                // lane as corrupt without depending on the same runtime
+                // conditions (which may have changed).
+                if !dry_run {
+                    let marker_exists = LaneCorruptMarkerV1::load(fac_root, lane_id)
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    if !marker_exists {
+                        let reason = format!(
+                            "derived corrupt state for lane {lane_id} was not \
+                             durably marked; persisting corrupt marker"
+                        );
+                        persist_corrupt_marker(fac_root, lane_id, &reason, timestamp)?;
+                    }
+                }
                 // THEME 7: Corrupt lanes with a live PID may still be
                 // executing. Add their job_id to active_job_ids to prevent
                 // orphan requeue of still-running jobs.
@@ -1020,7 +1088,21 @@ fn move_file_safe(src: &Path, dest_dir: &Path, file_name: &str) -> Result<(), St
     let dest = dest_dir.join(&unique_name);
 
     fs::rename(src, &dest)
-        .map_err(|e| format!("rename {} -> {}: {e}", src.display(), dest.display()))
+        .map_err(|e| format!("rename {} -> {}: {e}", src.display(), dest.display()))?;
+
+    // Harden destination permissions to 0o600 after move.
+    // fs::rename preserves source permissions, which may be world-readable.
+    // Reconciliation moves should ensure restricted permissions on destination
+    // files to prevent information disclosure (CTR-2611).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&dest, perms)
+            .map_err(|e| format!("set permissions on {}: {e}", dest.display()))?;
+    }
+
+    Ok(())
 }
 
 // SECURITY JUSTIFICATION (CTR-2501): Reconciliation receipt timestamps use
@@ -1812,6 +1894,98 @@ mod tests {
                 err_msg.contains("partial receipt persistence failed")
                     && err_msg.contains("phase2"),
                 "combined error should mention both partial receipt and phase 2: {err_msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_corrupt_branch_persists_marker_when_absent() {
+        // INV-RECON-014: When reconcile_lanes encounters a LaneState::Corrupt
+        // derived from runtime state (e.g., lock free + PID alive), but no
+        // durable corrupt marker exists on disk, reconciliation must persist
+        // one. This test verifies that behaviour by creating a scenario where
+        // derive_lane_state returns Corrupt without a persisted marker.
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+
+        // Create a lease for lane-00 where our own PID is alive and the
+        // lock is NOT held. derive_lane_state sees: lock_free + lease
+        // present + PID alive → Corrupt (INV-LANE-004).
+        // Importantly, do NOT plant a LaneCorruptMarkerV1 — the corruption
+        // is derived from runtime state only.
+        let our_pid = std::process::id();
+        write_lease(
+            &fac_root,
+            "lane-00",
+            "job-derived-corrupt",
+            our_pid,
+            LaneState::Running,
+        );
+
+        // Confirm no marker exists before reconciliation.
+        let marker_before =
+            LaneCorruptMarkerV1::load(&fac_root, "lane-00").expect("load marker before");
+        assert!(
+            marker_before.is_none(),
+            "no marker should exist before reconciliation"
+        );
+
+        let receipt =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
+                .unwrap();
+
+        // The lane should be counted as corrupt.
+        assert!(
+            receipt.lanes_marked_corrupt >= 1,
+            "lane-00 should be marked corrupt, got lanes_marked_corrupt={}",
+            receipt.lanes_marked_corrupt
+        );
+
+        // A durable corrupt marker should now exist on disk.
+        let marker_after =
+            LaneCorruptMarkerV1::load(&fac_root, "lane-00").expect("load marker after");
+        assert!(
+            marker_after.is_some(),
+            "durable corrupt marker must be persisted for derived corrupt state"
+        );
+    }
+
+    #[test]
+    fn test_move_file_safe_hardens_permissions() {
+        // INV-RECON-013: move_file_safe must set destination file permissions
+        // to 0o600 after rename, regardless of source permissions.
+        let tmp = TempDir::new().unwrap();
+        let src_dir = tmp.path().join("src");
+        let dest_dir = tmp.path().join("dest");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        // Create a source file with permissive permissions.
+        let src_file = src_dir.join("test-job.json");
+        fs::write(&src_file, b"{\"job_id\": \"test\"}").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Set source file to world-readable.
+            fs::set_permissions(&src_file, fs::Permissions::from_mode(0o644)).unwrap();
+
+            move_file_safe(&src_file, &dest_dir, "test-job.json").unwrap();
+
+            // Verify the file was moved.
+            assert!(!src_file.exists(), "source file should be gone");
+
+            // Find the moved file in dest_dir.
+            let entries: Vec<_> = fs::read_dir(&dest_dir)
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .collect();
+            assert_eq!(entries.len(), 1, "exactly one file in dest");
+
+            // Check that permissions were hardened to 0o600.
+            let dest_meta = entries[0].metadata().unwrap();
+            let mode = dest_meta.permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "destination file should have 0o600 permissions, got {mode:#o}"
             );
         }
     }
