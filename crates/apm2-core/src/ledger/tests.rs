@@ -3072,3 +3072,133 @@ fn tck_00630_full_lifecycle_migrate_write_restart_remigrate() {
         );
     }
 }
+
+/// Regression: frozen snapshot has rows but canonical `events` chain is empty.
+/// This indicates data loss after a prior successful migration.  Must fail
+/// closed with `MigrationPartialState`.
+#[test]
+fn tck_00630_frozen_exists_events_empty_frozen_nonempty_fails_closed() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("frozen_nonempty_events_empty.db");
+
+    // Step 1: Perform a normal migration of 3 legacy rows.
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 3);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 3);
+    }
+
+    // Step 2: Simulate data loss — delete all rows from `events`.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DELETE FROM events").unwrap();
+        // Verify: frozen has rows, events is empty.
+        let frozen_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ledger_events_legacy_frozen",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(frozen_count > 0, "frozen snapshot must have rows");
+        let events_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events_count, 0, "events must be empty for this test");
+    }
+
+    // Step 3: Re-create `ledger_events` (simulates daemon restart with
+    // init_schema_with_signing_key that does CREATE TABLE IF NOT EXISTS).
+    {
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_ledger_events_table(&conn);
+    }
+
+    // Step 4: Migration must fail closed.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let result = migrate_legacy_ledger_events(&conn);
+        assert!(
+            matches!(result, Err(LedgerError::MigrationPartialState { .. })),
+            "expected MigrationPartialState error for frozen-nonempty + events-empty, got: {result:?}"
+        );
+        // Verify the error message mentions data loss.
+        if let Err(LedgerError::MigrationPartialState { message }) = result {
+            assert!(
+                message.contains("data loss"),
+                "error message should mention data loss: {message}"
+            );
+        }
+    }
+}
+
+/// Regression: frozen snapshot is empty AND canonical `events` is empty.
+/// This means the original legacy table was empty when migrated — valid no-op.
+#[test]
+fn tck_00630_frozen_exists_events_empty_frozen_empty_noop() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("frozen_empty_events_empty.db");
+
+    // Step 1: Perform a migration with an empty legacy table (0 rows).
+    {
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_ledger_events_table(&conn);
+        // Don't insert any rows — empty legacy table.
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 0);
+        assert!(!stats.already_migrated, "first migration of empty table");
+    }
+
+    // Verify state: frozen exists (empty), events is empty.
+    {
+        let conn = Connection::open(&path).unwrap();
+        let frozen_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='ledger_events_legacy_frozen'",
+                [],
+                |row| row.get::<_, i64>(0).map(|v| v > 0),
+            )
+            .unwrap();
+        assert!(frozen_exists, "frozen table must exist after migration");
+        let frozen_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ledger_events_legacy_frozen",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(frozen_count, 0, "frozen snapshot must be empty");
+        let events_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events_count, 0, "events must be empty");
+    }
+
+    // Step 2: Re-create `ledger_events` (simulates daemon restart).
+    {
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_ledger_events_table(&conn);
+    }
+
+    // Step 3: Migration should succeed as a no-op (already_migrated = true).
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert!(
+            stats.already_migrated,
+            "empty-frozen + empty-events should be treated as already migrated"
+        );
+        assert_eq!(stats.rows_migrated, 0);
+    }
+}

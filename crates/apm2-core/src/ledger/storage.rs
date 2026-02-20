@@ -159,6 +159,15 @@ pub enum LedgerError {
         /// Number of rows in `events`.
         events_rows: u64,
     },
+
+    /// Migration error: the frozen snapshot indicates a prior migration
+    /// occurred but the canonical `events` chain is empty, suggesting
+    /// data loss or truncation.
+    #[error("migration failed: {message}")]
+    MigrationPartialState {
+        /// Human-readable description of the partial state.
+        message: String,
+    },
 }
 
 /// Statistics returned by [`migrate_legacy_ledger_events`].
@@ -251,6 +260,9 @@ pub fn init_canonical_schema(conn: &Connection) -> Result<(), LedgerError> {
 ///
 /// - [`LedgerError::AmbiguousSchemaState`] if `events` has rows and
 ///   `ledger_events` still exists.
+/// - [`LedgerError::MigrationPartialState`] if `ledger_events_legacy_frozen`
+///   has rows but `events` is empty (canonical chain missing after prior
+///   migration — possible data loss).
 /// - [`LedgerError::LegacySchemaMismatch`] if the `ledger_events` table schema
 ///   does not match the expected shape.
 /// - [`LedgerError::Database`] for `SQLite` errors.
@@ -293,7 +305,37 @@ pub fn migrate_legacy_ledger_events(conn: &Connection) -> Result<MigrationStats,
             }
         }
 
-        // No live rows — previous migration completed cleanly.
+        // No live legacy rows — check canonical events chain integrity.
+        // If the frozen snapshot has rows but `events` is empty, data was
+        // lost or truncated after a prior migration.  Fail closed.
+        let events_rows: u64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| {
+            row.get::<_, i64>(0).map(|v| v as u64)
+        })?;
+        if events_rows == 0 {
+            let frozen_snapshot_rows: u64 = conn.query_row(
+                "SELECT COUNT(*) FROM ledger_events_legacy_frozen",
+                [],
+                |row| row.get::<_, i64>(0).map(|v| v as u64),
+            )?;
+            if frozen_snapshot_rows > 0 {
+                return Err(LedgerError::MigrationPartialState {
+                    message: format!(
+                        "ledger_events_legacy_frozen has {frozen_snapshot_rows} row(s) but \
+                         canonical events chain is empty; possible data loss — \
+                         manual remediation required"
+                    ),
+                });
+            }
+            // frozen_snapshot_rows == 0: empty legacy was migrated, nothing
+            // to restore — this is a valid no-op.
+            return Ok(MigrationStats {
+                rows_migrated: 0,
+                already_migrated: true,
+            });
+        }
+
+        // events_rows > 0 and no live legacy rows — previous migration
+        // completed cleanly.
         return Ok(MigrationStats {
             rows_migrated: 0,
             already_migrated: true,
