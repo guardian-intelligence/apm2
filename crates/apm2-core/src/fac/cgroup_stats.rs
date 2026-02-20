@@ -16,6 +16,11 @@
 //! | `io.stat`       | `rbytes`/`wbytes` summed across devices |
 //! | `pids.peak`     | single value -> `tasks_count` (fallback: `pids.current`) |
 //!
+//! # Fail-Safe Design
+//!
+//! Collection never blocks or fails the FAC job: each stat is independently
+//! read and parsed, so a single unreadable file does not poison the aggregate.
+//!
 //! # Security Invariants
 //!
 //! - \[INV-CGSTAT-001\] All file reads are bounded by `MAX_CGROUP_STAT_READ`.
