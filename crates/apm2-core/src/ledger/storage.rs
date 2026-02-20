@@ -159,6 +159,25 @@ pub enum LedgerError {
         /// Number of rows in `events`.
         events_rows: u64,
     },
+
+    /// Migration error: the frozen table exists from a prior migration but
+    /// a live `ledger_events` table was recreated with new rows.
+    ///
+    /// This indicates a legacy writer appended rows after the initial
+    /// migration completed. Returning `already_migrated = true` would
+    /// silently skip those rows, violating the fail-closed invariant.
+    /// Manual remediation is required.
+    #[error(
+        "migration failed: ledger_events_legacy_frozen exists but \
+         ledger_events also has {live_legacy_rows} row(s); \
+         manual remediation required"
+    )]
+    MigrationLegacyRecreated {
+        /// Number of rows in the recreated live `ledger_events` table.
+        live_legacy_rows: u64,
+        /// Number of rows in the frozen audit table.
+        frozen_rows: u64,
+    },
 }
 
 /// Statistics returned by [`migrate_legacy_ledger_events`].
@@ -179,6 +198,29 @@ pub struct MigrationStats {
 /// preventing multi-gigabyte in-memory accumulation.
 const MAX_LEGACY_MIGRATION_ROWS: u64 = 10_000_000;
 
+/// Initializes the canonical `events` table schema on a raw `SQLite`
+/// connection.
+///
+/// This is a prerequisite for [`migrate_legacy_ledger_events`]: the
+/// canonical `events` table must exist before migration can insert rows
+/// into it.  The function is idempotent (`CREATE TABLE IF NOT EXISTS`)
+/// and also runs the RFC-0014 consensus column migration.
+///
+/// Callers that open the database through [`SqliteLedgerBackend::open`]
+/// do not need to call this — the schema is applied automatically.  This
+/// function is intended for daemon startup paths that open a raw
+/// `Connection` (e.g., via `rusqlite::Connection::open`) and then call
+/// `migrate_legacy_ledger_events` before constructing a full `Ledger`.
+///
+/// # Errors
+///
+/// Returns [`LedgerError::Database`] if the schema cannot be applied.
+pub fn init_canonical_schema(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(SCHEMA_SQL)?;
+    SqliteLedgerBackend::migrate_consensus_columns(conn)?;
+    Ok(())
+}
+
 /// Migrates legacy `ledger_events` rows into the canonical `events` table
 /// with a real hash chain.
 ///
@@ -198,11 +240,12 @@ const MAX_LEGACY_MIGRATION_ROWS: u64 = 10_000_000;
 ///
 /// - If `ledger_events` does not exist, returns `Ok` with `already_migrated =
 ///   true`.
-/// - If `ledger_events_legacy_frozen` exists and `events` is empty, returns
-///   `Ok` with `already_migrated = true` (previous migration completed).
-/// - If both `ledger_events_legacy_frozen` exists and `events` has rows,
-///   returns `Ok` with `already_migrated = true` (previous migration completed
-///   and new events appended).
+/// - If `ledger_events_legacy_frozen` exists and `ledger_events` has zero rows,
+///   returns `Ok` with `already_migrated = true` (previous migration
+///   completed).
+/// - If `ledger_events_legacy_frozen` exists AND `ledger_events` also has rows,
+///   fails with [`LedgerError::MigrationLegacyRecreated`] (fail-closed: a
+///   legacy writer recreated the table after migration).
 /// - If `events` already has rows and `ledger_events` still exists, fails with
 ///   `AmbiguousSchemaState`.
 ///
@@ -236,10 +279,28 @@ pub fn migrate_legacy_ledger_events(conn: &Connection) -> Result<MigrationStats,
     // (idempotency check).
     let frozen_exists = SqliteLedgerBackend::table_exists(conn, "ledger_events_legacy_frozen")?;
     if frozen_exists {
-        // A previous migration already ran. The `ledger_events` table we
-        // see is actually the view or leftover — but since we renamed it,
-        // if frozen exists, migration was completed. Verify by checking
-        // that `events` has rows or both are empty.
+        // Fail-closed: if a live `ledger_events` table also exists with
+        // rows, a legacy writer must have recreated it after the initial
+        // migration.  Returning `already_migrated = true` here would
+        // silently skip those rows, violating the fail-closed
+        // partial-state invariant.
+        let live_legacy_rows: u64 =
+            conn.query_row("SELECT COUNT(*) FROM ledger_events", [], |row| {
+                row.get::<_, i64>(0).map(|v| v as u64)
+            })?;
+        if live_legacy_rows > 0 {
+            let frozen_rows: u64 = conn.query_row(
+                "SELECT COUNT(*) FROM ledger_events_legacy_frozen",
+                [],
+                |row| row.get::<_, i64>(0).map(|v| v as u64),
+            )?;
+            return Err(LedgerError::MigrationLegacyRecreated {
+                live_legacy_rows,
+                frozen_rows,
+            });
+        }
+
+        // No live rows — previous migration completed cleanly.
         return Ok(MigrationStats {
             rows_migrated: 0,
             already_migrated: true,
