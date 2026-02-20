@@ -210,6 +210,16 @@ Returns the hash of the last event, or genesis hash (32 zero bytes) if empty. Us
 
 Verifies the entire hash chain from genesis. Returns `HashChainBroken` or `SignatureInvalid` on failure.
 
+### `migrate_legacy_ledger_events(conn) -> Result<MigrationStats, LedgerError>`
+
+RFC-0032 Phase 0: Migrates legacy `ledger_events` rows into the canonical `events` table with a real hash chain. Callable from daemon startup before opening a `Ledger`. Runs atomically under an EXCLUSIVE SQLite transaction. Idempotent: safe to call on every startup. After migration, `determine_read_mode()` returns `CanonicalEvents` and write operations succeed. The original `ledger_events` table is renamed to `ledger_events_legacy_frozen` for audit.
+
+**Invariants:**
+- [INV-LED-010] Migration is atomic: on failure the database is unchanged
+- [INV-LED-011] Migration is idempotent: running twice does not duplicate rows or change hashes
+- [INV-LED-012] Hash chain is contiguous after migration: no NULL `event_hash` values
+- [INV-LED-013] Fail-closed: ambiguous schema state (both tables have rows) is rejected
+
 ### `Ledger::open_reader() -> Result<LedgerReader, LedgerError>`
 
 Creates a read-only connection for concurrent reads. Not supported for in-memory databases.
