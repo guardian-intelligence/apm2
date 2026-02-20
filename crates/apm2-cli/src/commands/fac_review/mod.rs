@@ -2901,6 +2901,31 @@ fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommended
         };
     }
 
+    // Gate failure with push-attempt evidence: the build/test pipeline failed
+    // before reviewer agents were ever dispatched.  Restarting reviews cannot
+    // help until the code is fixed — emit dispatch_implementor instead of
+    // restart_reviews.
+    if active_agents == 0
+        && has_pending_verdict
+        && !input.merge_readiness.gates_pass
+        && input
+            .latest_push_attempt
+            .is_some_and(|attempt| attempt.failed_stage.is_some())
+    {
+        let reason = push_failure_hint.unwrap_or_else(|| {
+            "push gate failure requires implementor remediation before reviews can run".to_string()
+        });
+        return DoctorRecommendedAction {
+            action: "dispatch_implementor".to_string(),
+            reason,
+            priority: "high".to_string(),
+            command: Some(format!(
+                "apm2 fac review findings --pr {} --json",
+                input.pr_number
+            )),
+        };
+    }
+
     if active_agents == 0 && has_pending_verdict {
         let force_restart =
             has_forced_restart_terminal_reason(input.reviews, input.review_terminal_reasons);
@@ -6710,6 +6735,86 @@ mod tests {
         assert_eq!(
             selected,
             vec![(42, "guardian-intelligence/apm2".to_string())]
+        );
+    }
+
+    // Regression: when push gate fails (e.g. test/clippy/build stage fails), the
+    // doctor must emit dispatch_implementor — not restart_reviews.  Restarting
+    // reviews cannot recover a gate failure; an implementor fix is required
+    // first.
+    #[test]
+    fn test_build_recommended_action_gate_failure_emits_dispatch_implementor_not_restart_reviews() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = pending_findings_summary();
+        let terminal_reasons = std::collections::BTreeMap::new();
+        let merge_readiness = super::DoctorMergeReadiness {
+            merge_ready: false,
+            all_verdicts_approve: false,
+            gates_pass: false,
+            sha_fresh: true,
+            sha_freshness_source: super::DoctorShaFreshnessSource::RemoteMatch,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let push_attempt = super::DoctorPushAttemptSummary {
+            ts: "2026-01-01T00:00:00Z".to_string(),
+            sha: "aaaa".to_string(),
+            failed_stage: Some("gate_test".to_string()),
+            exit_code: Some(1),
+            duration_s: Some(30),
+            error_hint: Some("test gate failed".to_string()),
+        };
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            pr_number: 42,
+            health: &[],
+            lifecycle: None,
+            agent_activity: super::build_doctor_agent_activity_summary(None),
+            reviews: &reviews,
+            review_terminal_reasons: &terminal_reasons,
+            run_state_diagnostics: &[],
+            findings_summary: &findings,
+            merge_readiness: &merge_readiness,
+            latest_push_attempt: Some(&push_attempt),
+        });
+        assert_eq!(
+            action.action, "dispatch_implementor",
+            "gate failure must emit dispatch_implementor, got: {} (reason: {})",
+            action.action, action.reason
+        );
+    }
+
+    // Complementary: when gates pass but no reviewer agents exist, the correct
+    // action remains restart_reviews (the original intent of that branch).
+    #[test]
+    fn test_build_recommended_action_no_agents_gates_pass_emits_restart_reviews() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = pending_findings_summary();
+        let terminal_reasons = std::collections::BTreeMap::new();
+        let merge_readiness = super::DoctorMergeReadiness {
+            merge_ready: false,
+            all_verdicts_approve: false,
+            gates_pass: true,
+            sha_fresh: true,
+            sha_freshness_source: super::DoctorShaFreshnessSource::RemoteMatch,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            pr_number: 42,
+            health: &[],
+            lifecycle: None,
+            agent_activity: super::build_doctor_agent_activity_summary(None),
+            reviews: &reviews,
+            review_terminal_reasons: &terminal_reasons,
+            run_state_diagnostics: &[],
+            findings_summary: &findings,
+            merge_readiness: &merge_readiness,
+            latest_push_attempt: None,
+        });
+        assert_eq!(
+            action.action, "restart_reviews",
+            "no-agent + gates-pass must emit restart_reviews, got: {}",
+            action.action
         );
     }
 }
