@@ -9,7 +9,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use apm2_core::crypto::Hash;
 use apm2_core::orchestrator_kernel::{
     CompositeCursor, CursorEvent, CursorStore, EffectExecutionState, EffectJournal,
     ExecutionOutcome, InDoubtResolution, IntentStore, LedgerReader, OrchestratorDomain,
@@ -17,10 +16,6 @@ use apm2_core::orchestrator_kernel::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::admission_kernel::effect_journal as daemon_effect_journal;
-use crate::admission_kernel::effect_journal::EffectJournal as _;
-use crate::admission_kernel::prerequisites::LedgerAnchorV1;
-use crate::admission_kernel::types::EnforcementTier;
 use crate::gate::{GateOrchestrator, GateOrchestratorEvent, GateType};
 use crate::ledger::SqliteLedgerEventEmitter;
 use crate::protocol::dispatch::LedgerEventEmitter;
@@ -28,8 +23,6 @@ use crate::protocol::dispatch::LedgerEventEmitter;
 const TIMEOUT_CURSOR_KEY: i64 = 1;
 const TIMEOUT_PERSISTOR_SESSION_ID: &str = "gate-timeout-poller";
 const TIMEOUT_PERSISTOR_ACTOR_ID: &str = "orchestrator:timeout-poller";
-const TIMEOUT_PROFILE_ID: &str = "gate_timeout_kernel";
-const TIMEOUT_TOOL_CLASS: &str = "gate.timeout";
 
 /// Kernel configuration for gate-timeout orchestration ticks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +95,7 @@ impl GateTimeoutKernel {
                 fac_root.display()
             ))
         })?;
-        let journal_path = fac_root.join("gate_timeout_effect_journal.log");
+        let journal_path = fac_root.join("gate_timeout_effect_journal.sqlite");
         let effect_journal =
             GateTimeoutEffectJournal::open(&journal_path).map_err(GateTimeoutKernelError::Init)?;
 
@@ -593,43 +586,62 @@ impl MemoryTimeoutIntentStore {
 
 #[derive(Debug)]
 struct GateTimeoutEffectJournal {
-    inner: daemon_effect_journal::FileBackedEffectJournal,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl GateTimeoutEffectJournal {
     fn open(path: &Path) -> Result<Self, String> {
-        daemon_effect_journal::FileBackedEffectJournal::open(path)
-            .map(|inner| Self { inner })
-            .map_err(|e| format!("failed to open timeout effect journal: {e}"))
+        let conn = Connection::open(path)
+            .map_err(|e| format!("failed to open timeout effect journal sqlite db: {e}"))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS gate_timeout_effect_journal_state (
+                intent_key TEXT PRIMARY KEY,
+                state TEXT NOT NULL CHECK (state IN ('started', 'completed', 'unknown')),
+                updated_at_ns INTEGER NOT NULL
+            )",
+            [],
+        )
+        .map_err(|e| format!("failed to create gate_timeout_effect_journal_state table: {e}"))?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
-    fn request_id_from_key(key: &str) -> Hash {
-        derive_hash(b"apm2.gate.timeout.intent.request_id.v1", key)
+    fn load_state(&self, key: &str) -> Result<Option<String>, String> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| format!("timeout effect journal lock poisoned: {e}"))?;
+        guard
+            .query_row(
+                "SELECT state
+                 FROM gate_timeout_effect_journal_state
+                 WHERE intent_key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("failed to load timeout effect state for key '{key}': {e}"))
     }
 
-    fn build_binding(key: &str, request_id: Hash) -> daemon_effect_journal::EffectJournalBindingV1 {
-        let now_ns = epoch_now_ns_u64();
-        daemon_effect_journal::EffectJournalBindingV1 {
-            request_id,
-            request_digest: derive_hash(b"apm2.gate.timeout.intent.request_digest.v1", key),
-            as_of_ledger_anchor: LedgerAnchorV1 {
-                ledger_id: derive_hash(b"apm2.gate.timeout.intent.ledger_id.v1", key),
-                event_hash: derive_hash(b"apm2.gate.timeout.intent.event_hash.v1", key),
-                height: 1,
-                he_time: now_ns,
-            },
-            policy_root_digest: derive_hash(b"apm2.gate.timeout.intent.policy_root.v1", key),
-            policy_root_epoch: 1,
-            leakage_witness_seed_hash: derive_hash(b"apm2.gate.timeout.intent.leakage.v1", key),
-            timing_witness_seed_hash: derive_hash(b"apm2.gate.timeout.intent.timing.v1", key),
-            boundary_profile_id: TIMEOUT_PROFILE_ID.to_string(),
-            enforcement_tier: EnforcementTier::FailClosed,
-            ajc_id: derive_hash(b"apm2.gate.timeout.intent.ajc_id.v1", key),
-            authority_join_hash: derive_hash(b"apm2.gate.timeout.intent.join_hash.v1", key),
-            session_id: TIMEOUT_PERSISTOR_SESSION_ID.to_string(),
-            tool_class: TIMEOUT_TOOL_CLASS.to_string(),
-            declared_idempotent: true,
-        }
+    fn upsert_state(&self, key: &str, state: &str, updated_at_ns: i64) -> Result<(), String> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| format!("timeout effect journal lock poisoned: {e}"))?;
+        guard
+            .execute(
+                "INSERT INTO gate_timeout_effect_journal_state (intent_key, state, updated_at_ns)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(intent_key) DO UPDATE SET
+                     state = excluded.state,
+                     updated_at_ns = excluded.updated_at_ns",
+                params![key, state, updated_at_ns],
+            )
+            .map_err(|e| {
+                format!("failed to upsert timeout effect state='{state}' for key '{key}': {e}")
+            })?;
+        Ok(())
     }
 }
 
@@ -637,48 +649,31 @@ impl EffectJournal<String> for GateTimeoutEffectJournal {
     type Error = String;
 
     async fn query_state(&self, key: &String) -> Result<EffectExecutionState, Self::Error> {
-        let request_id = Self::request_id_from_key(key);
-        let state = self.inner.query_state(&request_id);
-        Ok(match state {
-            daemon_effect_journal::EffectExecutionState::NotStarted => {
-                EffectExecutionState::NotStarted
-            },
-            daemon_effect_journal::EffectExecutionState::Started => EffectExecutionState::Started,
-            daemon_effect_journal::EffectExecutionState::Completed => {
-                EffectExecutionState::Completed
-            },
-            daemon_effect_journal::EffectExecutionState::Unknown => EffectExecutionState::Unknown,
+        let state = self.load_state(key.as_str())?;
+        Ok(match state.as_deref() {
+            None => EffectExecutionState::NotStarted,
+            Some("completed") => EffectExecutionState::Completed,
+            // Any non-terminal marker is in-doubt for timeout effects and is
+            // handled fail-closed via explicit `resolve_in_doubt`.
+            Some(_) => EffectExecutionState::Unknown,
         })
     }
 
     async fn record_started(&self, key: &String) -> Result<(), Self::Error> {
-        let request_id = Self::request_id_from_key(key);
-        let binding = Self::build_binding(key, request_id);
-        self.inner
-            .record_started(&binding)
-            .map_err(|e| format!("timeout effect record_started failed: {e}"))
+        if matches!(self.load_state(key.as_str())?.as_deref(), Some("completed")) {
+            return Ok(());
+        }
+        self.upsert_state(key.as_str(), "started", epoch_now_ns_i64()?)
     }
 
     async fn record_completed(&self, key: &String) -> Result<(), Self::Error> {
-        let request_id = Self::request_id_from_key(key);
-        self.inner
-            .record_completed(&request_id)
-            .map_err(|e| format!("timeout effect record_completed failed: {e}"))
+        self.upsert_state(key.as_str(), "completed", epoch_now_ns_i64()?)
     }
 
     async fn resolve_in_doubt(&self, key: &String) -> Result<InDoubtResolution, Self::Error> {
-        let request_id = Self::request_id_from_key(key);
-        let resolution = self
-            .inner
-            .resolve_in_doubt(&request_id, false)
-            .map_err(|e| format!("timeout effect resolve_in_doubt failed: {e}"))?;
-        Ok(match resolution {
-            daemon_effect_journal::InDoubtResolutionV1::Deny { reason } => {
-                InDoubtResolution::Deny { reason }
-            },
-            daemon_effect_journal::InDoubtResolutionV1::AllowReExecution { .. } => {
-                InDoubtResolution::AllowReExecution
-            },
+        self.upsert_state(key.as_str(), "unknown", epoch_now_ns_i64()?)?;
+        Ok(InDoubtResolution::Deny {
+            reason: "timeout effect state is in-doubt; manual reconciliation required".to_string(),
         })
     }
 }
@@ -753,13 +748,6 @@ fn parse_gate_type(raw: &str) -> Option<GateType> {
         "security" => Some(GateType::Security),
         _ => None,
     }
-}
-
-fn derive_hash(domain: &[u8], key: &str) -> Hash {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(domain);
-    hasher.update(key.as_bytes());
-    *hasher.finalize().as_bytes()
 }
 
 fn epoch_now_ns_u64() -> u64 {
