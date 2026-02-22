@@ -19,4 +19,7 @@ pub trait IntentStore<Intent, IntentKey>: Send + Sync {
 
     /// Marks an intent as blocked with a fail-closed reason.
     async fn mark_blocked(&self, key: &IntentKey, reason: &str) -> Result<(), Self::Error>;
+
+    /// Marks an intent as retryable and returns it to pending execution.
+    async fn mark_retryable(&self, key: &IntentKey, reason: &str) -> Result<(), Self::Error>;
 }

@@ -41,6 +41,13 @@ pub trait EffectJournal<Key>: Send + Sync {
     /// Durably records that execution completed for `key`.
     async fn record_completed(&self, key: &Key) -> Result<(), Self::Error>;
 
+    /// Durably clears a pre-dispatch started fence for `key` when execute
+    /// exits with `Retry` before any external side effect dispatch.
+    ///
+    /// Implementations MUST fail-closed if `key` is not in a retryable
+    /// pre-dispatch state.
+    async fn record_retryable(&self, key: &Key) -> Result<(), Self::Error>;
+
     /// Resolves in-doubt state for `key`.
     ///
     /// Implementations MUST be explicit and fail-closed on ambiguity.

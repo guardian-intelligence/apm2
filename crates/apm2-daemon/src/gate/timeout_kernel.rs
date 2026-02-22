@@ -378,6 +378,13 @@ impl IntentStore<GateTimeoutIntent, String> for TimeoutIntentStore {
             Self::Memory(store) => store.mark_blocked(key, reason),
         }
     }
+
+    async fn mark_retryable(&self, key: &String, reason: &str) -> Result<(), Self::Error> {
+        match self {
+            Self::Sqlite(store) => store.mark_retryable(key, reason),
+            Self::Memory(store) => store.mark_retryable(key, reason),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -517,6 +524,23 @@ impl SqliteTimeoutIntentStore {
             .map_err(|e| format!("failed to mark timeout intent blocked: {e}"))?;
         Ok(())
     }
+
+    fn mark_retryable(&self, key: &str, _reason: &str) -> Result<(), String> {
+        let now_ns = epoch_now_ns_i64()?;
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| format!("intent store lock poisoned: {e}"))?;
+        guard
+            .execute(
+                "UPDATE gate_timeout_intents
+                 SET state = 'pending', blocked_reason = NULL, updated_at_ns = ?2
+                 WHERE intent_key = ?1",
+                params![key, now_ns],
+            )
+            .map_err(|e| format!("failed to mark timeout intent retryable: {e}"))?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -582,6 +606,25 @@ impl MemoryTimeoutIntentStore {
             .insert(key.to_string(), "blocked".to_string());
         Ok(())
     }
+
+    fn mark_retryable(&self, key: &str, _reason: &str) -> Result<(), String> {
+        self.states
+            .lock()
+            .map_err(|e| format!("memory intent states lock poisoned: {e}"))?
+            .insert(key.to_string(), "pending".to_string());
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|e| format!("memory intent pending lock poisoned: {e}"))?;
+        if pending.iter().any(|intent| intent.key() == key) {
+            return Ok(());
+        }
+        let Some(intent) = intent_from_key(key) else {
+            return Err(format!("invalid timeout intent key '{key}'"));
+        };
+        pending.push_back(intent);
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -643,6 +686,20 @@ impl GateTimeoutEffectJournal {
             })?;
         Ok(())
     }
+
+    fn delete_state(&self, key: &str) -> Result<(), String> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| format!("timeout effect journal lock poisoned: {e}"))?;
+        guard
+            .execute(
+                "DELETE FROM gate_timeout_effect_journal_state WHERE intent_key = ?1",
+                params![key],
+            )
+            .map_err(|e| format!("failed to delete timeout effect state for key '{key}': {e}"))?;
+        Ok(())
+    }
 }
 
 impl EffectJournal<String> for GateTimeoutEffectJournal {
@@ -668,6 +725,22 @@ impl EffectJournal<String> for GateTimeoutEffectJournal {
 
     async fn record_completed(&self, key: &String) -> Result<(), Self::Error> {
         self.upsert_state(key.as_str(), "completed", epoch_now_ns_i64()?)
+    }
+
+    async fn record_retryable(&self, key: &String) -> Result<(), Self::Error> {
+        let state = self.load_state(key.as_str())?;
+        match state.as_deref() {
+            Some("started") => self.delete_state(key.as_str()),
+            Some("completed") => Err(format!(
+                "cannot mark timeout effect retryable for completed key '{key}'"
+            )),
+            Some(other) => Err(format!(
+                "cannot mark timeout effect retryable from state '{other}' for key '{key}'"
+            )),
+            None => Err(format!(
+                "cannot mark timeout effect retryable for unknown key '{key}'"
+            )),
+        }
     }
 
     async fn resolve_in_doubt(&self, key: &String) -> Result<InDoubtResolution, Self::Error> {
@@ -748,6 +821,15 @@ fn parse_gate_type(raw: &str) -> Option<GateType> {
         "security" => Some(GateType::Security),
         _ => None,
     }
+}
+
+fn intent_from_key(key: &str) -> Option<GateTimeoutIntent> {
+    let (work_id, gate_type_raw) = key.split_once("::")?;
+    let gate_type = parse_gate_type(gate_type_raw)?;
+    Some(GateTimeoutIntent {
+        work_id: work_id.to_string(),
+        gate_type,
+    })
 }
 
 fn epoch_now_ns_u64() -> u64 {

@@ -77,12 +77,18 @@ pub enum ControllerLoopError {
     /// Journal post-effect record failed.
     #[error("record_completed failed: {0}")]
     RecordCompleted(String),
+    /// Journal retryable rollback failed.
+    #[error("record_retryable failed: {0}")]
+    RecordRetryable(String),
     /// Mark-done failed.
     #[error("mark_done failed: {0}")]
     MarkDone(String),
     /// Mark-blocked failed.
     #[error("mark_blocked failed: {0}")]
     MarkBlocked(String),
+    /// Mark-retryable failed.
+    #[error("mark_retryable failed: {0}")]
+    MarkRetryable(String),
     /// Receipt persistence failed.
     #[error("receipt persistence failed: {0}")]
     PersistReceipts(String),
@@ -256,17 +262,15 @@ where
                 report.blocked_intents = report.blocked_intents.saturating_add(1);
             },
             Ok(ExecutionOutcome::Retry { reason }) => {
-                intent_store
-                    .mark_blocked(
-                        &key,
-                        &format!(
-                            "retry outcome after effect dispatch is fail-closed blocked: {reason}"
-                        ),
-                    )
+                effect_journal
+                    .record_retryable(&key)
                     .await
-                    .map_err(|e| ControllerLoopError::MarkBlocked(e.to_string()))?;
+                    .map_err(|e| ControllerLoopError::RecordRetryable(e.to_string()))?;
+                intent_store
+                    .mark_retryable(&key, &reason)
+                    .await
+                    .map_err(|e| ControllerLoopError::MarkRetryable(e.to_string()))?;
                 report.retryable_intents = report.retryable_intents.saturating_add(1);
-                report.blocked_intents = report.blocked_intents.saturating_add(1);
             },
             Err(e) => {
                 intent_store
@@ -356,6 +360,7 @@ mod tests {
         pending: Mutex<VecDeque<String>>,
         done: Mutex<Vec<String>>,
         blocked: Mutex<Vec<(String, String)>>,
+        retryable: Mutex<Vec<(String, String)>>,
     }
 
     impl IntentStore<String, String> for TestIntentStore {
@@ -400,6 +405,18 @@ mod tests {
                 .push((key.clone(), reason.to_string()));
             Ok(())
         }
+
+        async fn mark_retryable(&self, key: &String, reason: &str) -> Result<(), Self::Error> {
+            let mut pending = self.pending.lock().map_err(|e| e.to_string())?;
+            if !pending.contains(key) {
+                pending.push_back(key.clone());
+            }
+            self.retryable
+                .lock()
+                .map_err(|e| e.to_string())?
+                .push((key.clone(), reason.to_string()));
+            Ok(())
+        }
     }
 
     #[derive(Debug, Default)]
@@ -433,6 +450,14 @@ mod tests {
                 .lock()
                 .map_err(|e| e.to_string())?
                 .insert(key.clone(), EffectExecutionState::Completed);
+            Ok(())
+        }
+
+        async fn record_retryable(&self, key: &String) -> Result<(), Self::Error> {
+            self.states
+                .lock()
+                .map_err(|e| e.to_string())?
+                .insert(key.clone(), EffectExecutionState::NotStarted);
             Ok(())
         }
 
@@ -536,9 +561,11 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
-    struct RetryDomain;
+    struct RetryThenCompleteDomain {
+        attempts: HashMap<String, usize>,
+    }
 
-    impl OrchestratorDomain<TestEvent, String, String, String> for RetryDomain {
+    impl OrchestratorDomain<TestEvent, String, String, String> for RetryThenCompleteDomain {
         type Error = String;
 
         fn intent_key(&self, intent: &String) -> String {
@@ -555,11 +582,19 @@ mod tests {
 
         async fn execute(
             &mut self,
-            _intent: &String,
+            intent: &String,
         ) -> Result<ExecutionOutcome<String>, Self::Error> {
-            Ok(ExecutionOutcome::Retry {
-                reason: "retry for test".to_string(),
-            })
+            let attempt = self.attempts.entry(intent.clone()).or_insert(0);
+            *attempt = attempt.saturating_add(1);
+            if *attempt == 1 {
+                Ok(ExecutionOutcome::Retry {
+                    reason: "retry for test".to_string(),
+                })
+            } else {
+                Ok(ExecutionOutcome::Completed {
+                    receipts: vec![format!("receipt-{intent}")],
+                })
+            }
         }
     }
 
@@ -612,6 +647,18 @@ mod tests {
                 .lock()
                 .map_err(|e| e.to_string())?
                 .insert(key.clone(), "blocked".to_string());
+            self.blocked
+                .lock()
+                .map_err(|e| e.to_string())?
+                .insert(key.clone(), reason.to_string());
+            Ok(())
+        }
+
+        async fn mark_retryable(&self, key: &String, reason: &str) -> Result<(), Self::Error> {
+            self.states
+                .lock()
+                .map_err(|e| e.to_string())?
+                .insert(key.clone(), "pending".to_string());
             self.blocked
                 .lock()
                 .map_err(|e| e.to_string())?
@@ -672,6 +719,14 @@ mod tests {
                 .lock()
                 .map_err(|e| e.to_string())?
                 .insert(key.clone(), EffectExecutionState::Completed);
+            Ok(())
+        }
+
+        async fn record_retryable(&self, key: &String) -> Result<(), Self::Error> {
+            self.states
+                .lock()
+                .map_err(|e| e.to_string())?
+                .insert(key.clone(), EffectExecutionState::NotStarted);
             Ok(())
         }
 
@@ -906,8 +961,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tick_fail_closed_blocks_retry_outcomes() {
-        let mut domain = RetryDomain;
+    async fn run_tick_requeues_retry_outcomes() {
+        let mut domain = RetryThenCompleteDomain::default();
         let ledger = TestLedgerReader::default();
         let cursor_store = TestCursorStore::default();
         let intent_store = TestIntentStore::default();
@@ -919,7 +974,7 @@ mod tests {
             .await
             .expect("enqueue should succeed");
 
-        let report = run_tick(
+        let first_report = run_tick(
             &mut domain,
             &ledger,
             &cursor_store,
@@ -932,19 +987,61 @@ mod tests {
             },
         )
         .await
-        .expect("tick should succeed");
+        .expect("first tick should succeed");
 
-        assert_eq!(report.retryable_intents, 1);
-        assert_eq!(report.blocked_intents, 1);
-        assert_eq!(report.completed_intents, 0);
-        assert_eq!(report.persisted_receipts, 0);
-        let blocked = intent_store
-            .blocked
+        assert_eq!(first_report.retryable_intents, 1);
+        assert_eq!(first_report.blocked_intents, 0);
+        assert_eq!(first_report.completed_intents, 0);
+        assert_eq!(first_report.persisted_receipts, 0);
+        {
+            let retryable = intent_store
+                .retryable
+                .lock()
+                .expect("retryable lock should not be poisoned");
+            assert_eq!(retryable.len(), 1);
+            assert_eq!(retryable[0].0, "intent-a");
+        }
+        {
+            let blocked = intent_store
+                .blocked
+                .lock()
+                .expect("blocked lock should not be poisoned");
+            assert!(blocked.is_empty());
+        }
+        {
+            let first_receipts = receipts
+                .receipts
+                .lock()
+                .expect("first receipts lock should not be poisoned");
+            assert!(first_receipts.is_empty());
+        }
+
+        let second_report = run_tick(
+            &mut domain,
+            &ledger,
+            &cursor_store,
+            &intent_store,
+            &journal,
+            &receipts,
+            TickConfig {
+                observe_limit: 0,
+                execute_limit: 1,
+            },
+        )
+        .await
+        .expect("second tick should succeed");
+
+        assert_eq!(second_report.retryable_intents, 0);
+        assert_eq!(second_report.completed_intents, 1);
+        assert_eq!(second_report.persisted_receipts, 1);
+        let second_receipts = receipts
+            .receipts
             .lock()
-            .expect("blocked lock should not be poisoned");
-        assert_eq!(blocked.len(), 1);
-        assert_eq!(blocked[0].0, "intent-a");
-        assert!(blocked[0].1.contains("fail-closed blocked"));
+            .expect("second receipts lock should not be poisoned");
+        assert_eq!(
+            second_receipts.as_slice(),
+            &["receipt-intent-a".to_string()]
+        );
     }
 
     #[tokio::test]

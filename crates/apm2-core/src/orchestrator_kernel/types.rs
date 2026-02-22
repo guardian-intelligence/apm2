@@ -46,6 +46,10 @@ pub enum ExecutionOutcome<Receipt> {
         reason: String,
     },
     /// Execution hit a transient condition and can be retried later.
+    ///
+    /// Contracts:
+    /// - The domain MUST return `Retry` only when no external side effect was
+    ///   dispatched for this intent.
     Retry {
         /// Diagnostic reason for retry.
         reason: String,
