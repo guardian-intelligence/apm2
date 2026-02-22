@@ -14,7 +14,9 @@ ticket_meta:
     agent_roles: ["AGENT_IMPLEMENTER"]
     responsibility_domains: ["DOMAIN_KERNEL", "DOMAIN_DAEMON", "DOMAIN_RUNTIME"]
   dependencies:
-    tickets: []
+    tickets:
+      - "TCK-00660"
+      - "TCK-00636"
 
 root_cause_analysis:
   summary: |
