@@ -487,16 +487,11 @@ impl PulsePublisher {
         event_record: &EventRecord,
     ) -> BridgeTopicHints {
         let normalized_event_type = normalize_event_type(notification.event_type.as_str());
+        let is_work_scoped_event = Self::is_work_scoped_event_type(normalized_event_type);
         let mut hints = BridgeTopicHints::default();
 
         if !event_record.session_id.is_empty() {
             hints.session_id = Some(event_record.session_id.clone());
-        }
-
-        if Self::is_work_scoped_event_type(normalized_event_type)
-            && !event_record.session_id.is_empty()
-        {
-            hints.work_id = Some(event_record.session_id.clone());
         }
 
         if event_record.payload.len() > MAX_BRIDGE_ROUTING_PAYLOAD_BYTES {
@@ -506,6 +501,13 @@ impl PulsePublisher {
                 max_payload_bytes = MAX_BRIDGE_ROUTING_PAYLOAD_BYTES,
                 "Bridge routing skipped payload decode: payload exceeds bound"
             );
+            // Last-resort fallback only when payload cannot be inspected.
+            if is_work_scoped_event
+                && hints.work_id.is_none()
+                && !event_record.session_id.is_empty()
+            {
+                hints.work_id = Some(event_record.session_id.clone());
+            }
             return hints;
         }
 
@@ -540,6 +542,12 @@ impl PulsePublisher {
                 event_record.payload.as_slice(),
                 &mut hints,
             );
+        }
+
+        // Lowest-precedence compatibility fallback for legacy records where
+        // work_id is carried in session_id and payload extraction failed.
+        if is_work_scoped_event && hints.work_id.is_none() && !event_record.session_id.is_empty() {
+            hints.work_id = Some(event_record.session_id.clone());
         }
 
         hints
@@ -1489,6 +1497,67 @@ mod tests {
         assert_eq!(
             decode_envelope_topic(&frames[0]),
             "work.W-BRIDGE-001.events"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bridge_payload_work_id_overrides_session_id_fallback() {
+        let (sender, receiver) = create_commit_notification_channel();
+        let mock_ledger = Arc::new(MockLedgerBackend::new());
+        let bridge_payload = serde_json::json!({
+            "event_type": "work_transitioned",
+            "work_id": "W-BRIDGE-PAYLOAD",
+            "from_state": "OPEN",
+            "to_state": "CLAIMED"
+        })
+        .to_string()
+        .into_bytes();
+        // session_id intentionally differs from payload work_id.
+        let event_record = EventRecord::new(
+            "work_transitioned",
+            "W-LEGACY-SESSION-ID",
+            "actor-bridge",
+            bridge_payload,
+        );
+        mock_ledger.events.lock().unwrap().insert(1, event_record);
+
+        let registry = Arc::new(SubscriptionRegistry::new(ResourceQuotaConfig::for_testing()));
+        registry
+            .register_connection("conn-bridge-priority")
+            .unwrap();
+        let sub = SubscriptionState::new(
+            "sub-bridge-priority",
+            "client-sub-bridge-priority",
+            vec![
+                test_pattern("work.W-BRIDGE-PAYLOAD.events"),
+                test_pattern("work.W-LEGACY-SESSION-ID.events"),
+            ],
+            0,
+        );
+        registry
+            .add_subscription("conn-bridge-priority", sub)
+            .unwrap();
+
+        let mut publisher = PulsePublisher::new(
+            PulsePublisherConfig::for_testing(),
+            receiver,
+            mock_ledger,
+            Arc::clone(&registry),
+        );
+        let mock_sink = Arc::new(MockPulseFrameSink::new());
+        publisher.register_connection("conn-bridge-priority", mock_sink.clone());
+
+        let notification = CommitNotification::new(1, [0x15; 32], "work_transitioned", "kernel");
+        sender.send(notification).await.unwrap();
+
+        let count = publisher.drain_batch(10).await;
+        assert_eq!(count, 1);
+
+        let frames = mock_sink.received_frames();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            decode_envelope_topic(&frames[0]),
+            "work.W-BRIDGE-PAYLOAD.events"
         );
     }
 
