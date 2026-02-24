@@ -2368,8 +2368,19 @@ mod tests {
             SqliteTimeoutObservedLeaseStore::new(Arc::clone(&conn))
                 .expect("sqlite observed lease store init should succeed"),
         );
-        let lease = sample_gate_lease("lease-sqlite-1", 9_999);
-        let state = sample_observed_state(&lease, GateType::Security, 2_000, 30_000, 40_000);
+        // GT-TIME-003: use current wall-clock time so the lease expires in the
+        // future, avoiding rebase-induced value changes on load_all().
+        let now_wall_ms = epoch_now_ms_u64();
+        let now_mono_ns = monotonic_now_ns().expect("monotonic clock should be available");
+        let expires_at = now_wall_ms + 100_000; // 100 seconds in the future
+        let lease = sample_gate_lease("lease-sqlite-1", expires_at);
+        let state = sample_observed_state(
+            &lease,
+            GateType::Security,
+            now_wall_ms,
+            now_mono_ns,
+            now_mono_ns + 100_000 * 1_000_000, // deadline 100s into the future
+        );
 
         store.upsert(&state).expect("sqlite upsert should succeed");
         let loaded = store
@@ -2378,7 +2389,21 @@ mod tests {
         let loaded_state = loaded
             .get("lease-sqlite-1")
             .expect("lease should be present in sqlite store");
-        assert_eq!(loaded_state, &state);
+        // Assert identity and ordering properties rather than exact equality,
+        // because load_all() may rebase monotonic values.
+        assert_eq!(
+            loaded_state.lease.lease_id, state.lease.lease_id,
+            "lease identity must be preserved through sqlite roundtrip"
+        );
+        let mono_now = monotonic_now_ns().expect("monotonic clock should be available");
+        assert!(
+            !loaded_state.is_timed_out(mono_now),
+            "fresh lease (expires_at 100s in future) must not be timed out"
+        );
+        assert!(
+            loaded_state.deadline_monotonic_ns >= mono_now,
+            "deadline must be in the future for a non-expired lease"
+        );
 
         let reopened = TimeoutObservedLeaseStore::Sqlite(
             SqliteTimeoutObservedLeaseStore::new(Arc::clone(&conn))
