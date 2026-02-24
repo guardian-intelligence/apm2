@@ -43,6 +43,7 @@ Consumes authoritative changeset publication identity and autonomously orchestra
 - [CTR-GT03] Events are returned per-invocation, not buffered in shared state.
 - [CTR-GT04] Idempotency keys bounded to `MAX_IDEMPOTENCY_KEYS`.
 - [CTR-GT07] Both `GateStartKernel` and `GateTimeoutKernel` implement the cursor-generic `orchestrator_kernel` traits (`CursorEvent<CompositeCursor>`, `LedgerReader` with `type Cursor = CompositeCursor`, `CursorStore<CompositeCursor>`). New kernel consumers should choose a `KernelCursor` matching their ledger truth.
+- [CTR-GT08] `GateTimeoutKernel` delegates all freeze-aware dual-table polling to `crate::ledger_poll::poll_events_blocking()` (TCK-00675). Hand-rolled cursor comparisons or canonical `event_id` synthesis in gate code is a code-quality finding.
 
 ### `GateType`
 
@@ -134,3 +135,4 @@ Abstraction over GitHub merge operations for testability.
 - TCK-00390: Merge executor implementation
 - TCK-00672: End-to-end changeset identity wiring (CSID-003 gate-start migration)
 - TCK-00674: Eliminate restart-induced mass timeouts by rebasing persisted monotonic deadlines
+- TCK-00675: Extract freeze-aware SQLite ledger polling into shared `ledger_poll` module

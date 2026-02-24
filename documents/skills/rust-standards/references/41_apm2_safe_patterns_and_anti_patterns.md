@@ -189,3 +189,13 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
   - Persist rebased values immediately (idempotent upsert) so future loads are consistent.
 - Grep anchors: `observed_monotonic_ns`, `deadline_monotonic_ns`, `MONO_EPOCH`, `monotonic_now_ns`.
 [PROVENANCE] TCK-00674; RS-40 (INV-2501, RSK-2503); gate_timeout_kernel.rs.
+
+### ANTI-5
+
+[CONTRACT: CTR-2629] Canonical Ledger Polling Uses Shared Module.
+- REJECT IF: any daemon consumer hand-rolls freeze-aware dual-table (`ledger_events` + `events`) cursor merge SQL instead of delegating to `crate::ledger_poll::{poll_events_blocking, poll_events_async}`.
+- REJECT IF: canonical `event_id` synthesis uses ad-hoc formatting (e.g., `format!("canonical-{seq_id}")`) instead of `crate::ledger_poll::canonical_event_id()`.
+- REJECT IF: canonical event IDs are compared without fixed-width zero-padding (`canonical-{seq_id:020}` / `CANONICAL_EVENT_ID_WIDTH = 20`). Unpadded IDs produce incorrect lexicographic ordering for `seq_id >= 10`.
+- ENFORCE BY: all freeze-aware polling delegates to `ledger_poll` module; all canonical ID synthesis delegates to `canonical_event_id()`; cursor normalisation uses `normalize_canonical_cursor_event_id()`.
+- Grep anchors: `ledger_poll`, `canonical_event_id`, `poll_events_blocking`, `CANONICAL_EVENT_ID_PREFIX`, `CANONICAL_EVENT_ID_CMP_SQL_EXPR`.
+[PROVENANCE] TCK-00675; LED-POLL-001 through LED-POLL-005.

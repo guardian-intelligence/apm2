@@ -182,8 +182,6 @@ impl HashChainCheckpoint {
 }
 
 impl SqliteLedgerEventEmitter {
-    const CANONICAL_EVENT_ID_PREFIX: &'static str = "canonical-";
-    const CANONICAL_EVENT_ID_WIDTH: usize = 20;
     const LEDGER_CHAIN_GENESIS: &'static str = "genesis";
     const LEDGER_METADATA_TABLE: &'static str = "ledger_metadata";
     const HASH_CHAIN_UNINITIALIZED_VALUE: &'static str = "legacy-uninitialized";
@@ -310,35 +308,20 @@ impl SqliteLedgerEventEmitter {
         self.frozen.load(Ordering::Acquire)
     }
 
-    /// Returns the canonical synthetic event ID for a canonical `events`
-    /// table `seq_id`.
-    fn canonical_event_id_from_seq(seq_id: i64) -> String {
-        format!(
-            "{}{seq_id:0width$}",
-            Self::CANONICAL_EVENT_ID_PREFIX,
-            width = Self::CANONICAL_EVENT_ID_WIDTH
-        )
-    }
-
     /// Parses the canonical synthetic `event_id` and returns its numeric
     /// `seq_id` component.
+    ///
+    /// Delegates to [`crate::ledger_poll::parse_canonical_event_id`].
     fn parse_canonical_event_id(event_id: &str) -> Option<i64> {
-        event_id
-            .strip_prefix(Self::CANONICAL_EVENT_ID_PREFIX)?
-            .parse::<i64>()
-            .ok()
+        crate::ledger_poll::parse_canonical_event_id(event_id)
     }
 
     /// Normalizes canonical cursor IDs to the fixed-width representation.
     ///
-    /// This preserves compatibility with older unpadded cursor IDs
-    /// (`canonical-9`) persisted before fixed-width canonical IDs were
-    /// introduced.
+    /// Delegates to
+    /// [`crate::ledger_poll::normalize_canonical_cursor_event_id`].
     fn normalize_canonical_cursor_event_id(cursor_event_id: &str) -> String {
-        Self::parse_canonical_event_id(cursor_event_id).map_or_else(
-            || cursor_event_id.to_string(),
-            Self::canonical_event_id_from_seq,
-        )
+        crate::ledger_poll::normalize_canonical_cursor_event_id(cursor_event_id)
     }
 
     // ---- Freeze-aware canonical read helpers (TCK-00631 / Finding 1) ----
@@ -359,10 +342,14 @@ impl SqliteLedgerEventEmitter {
     // SignedLedgerEvent.timestamp_ns
 
     /// Maps a canonical `events` row to a `SignedLedgerEvent`.
+    ///
+    /// Uses [`crate::ledger_poll::canonical_event_id`] for the synthesised
+    /// `event_id`, ensuring consistent zero-padded formatting across all
+    /// canonical read paths.
     fn canonical_row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SignedLedgerEvent> {
         let seq_id: i64 = row.get(0)?;
         Ok(SignedLedgerEvent {
-            event_id: Self::canonical_event_id_from_seq(seq_id),
+            event_id: crate::ledger_poll::canonical_event_id(seq_id),
             event_type: row.get(1)?,
             work_id: row.get(2)?, // session_id maps to work_id
             actor_id: row.get(3)?,
@@ -10067,11 +10054,11 @@ mod tests {
             for event in &batch {
                 let suffix = event
                     .event_id
-                    .strip_prefix(SqliteLedgerEventEmitter::CANONICAL_EVENT_ID_PREFIX)
+                    .strip_prefix(crate::ledger_poll::CANONICAL_EVENT_ID_PREFIX)
                     .expect("canonical events must use canonical- prefix");
                 assert_eq!(
                     suffix.len(),
-                    SqliteLedgerEventEmitter::CANONICAL_EVENT_ID_WIDTH,
+                    crate::ledger_poll::CANONICAL_EVENT_ID_WIDTH,
                     "canonical event IDs must be fixed-width zero padded"
                 );
                 seen_seq_ids.push(

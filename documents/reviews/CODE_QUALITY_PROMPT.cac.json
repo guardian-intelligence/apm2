@@ -72,6 +72,11 @@
           "id": "INV-CQ-007",
           "description": "Any persisted monotonic timestamp (Instant-derived values stored in SQLite, files, or other durable storage) MUST have an explicit rebase-on-load path that recalculates deadlines from a wall-clock anchor (e.g. GateLease.expires_at). Persisted monotonic values MUST NOT trigger irreversible actions (timeouts, denials, state transitions) solely due to monotonic epoch rewind after process restart. Grep anchors: observed_monotonic_ns, deadline_monotonic_ns, MONO_EPOCH, Instant::now.",
           "criticality": "CORRECTNESS"
+        },
+        {
+          "id": "INV-CQ-008",
+          "description": "All freeze-aware dual-table (legacy ledger_events + canonical events) cursor polling MUST delegate to crate::ledger_poll::{poll_events_blocking, poll_events_async}. All canonical event_id synthesis MUST use crate::ledger_poll::canonical_event_id(). Hand-rolled cursor merge SQL, ad-hoc canonical/legacy table union queries, or unpadded canonical event_id formatting are code-quality findings. Grep anchors: ledger_poll, canonical_event_id, poll_events_blocking, CANONICAL_EVENT_ID_PREFIX.",
+          "criticality": "CORRECTNESS"
         }
       ]
     },

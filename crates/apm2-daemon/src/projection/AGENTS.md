@@ -210,13 +210,14 @@ Maps `changeset_digest` to `work_id` to PR metadata for projection routing. Also
 
 Ledger event tailer that drives projection decisions. Uses a composite cursor `(timestamp_ns, event_id)` for deterministic ordering and at-least-once delivery semantics.
 
-**Freeze-aware canonical reads (TCK-00638):** When the canonical `events` table exists (freeze mode active), `poll_events` and `poll_events_async` merge results from both `ledger_events` (legacy) and `events` (canonical) tables, sorted by `(timestamp_ns, event_id)` and truncated to the batch limit. Canonical events use synthesised `event_id` = `"canonical-{seq_id:020}"` (20-digit zero-padded) and map `session_id` to `work_id`. Canonical mode is lazily detected via `sqlite_master` probe and cached in an `AtomicU8` (0=unknown, 1=legacy-only, 2=canonical-active). The zero-padded format ensures lexicographic ordering matches numeric `seq_id` ordering, preventing cursor skip when >9 canonical events share the same timestamp (MAJOR fix: timestamp collision cursor skip).
+**Freeze-aware canonical reads (TCK-00675):** `poll_events` and `poll_events_async` delegate to the shared `crate::ledger_poll` module (`poll_events_blocking` / `poll_events_async`), which is the single canonical implementation of freeze-aware dual-table (legacy `ledger_events` + canonical `events`) cursor polling. Canonical events use synthesised `event_id` = `"canonical-{seq_id:020}"` via `crate::ledger_poll::canonical_event_id()` (20-digit zero-padded) and map `session_id` to `work_id`. The zero-padded format ensures lexicographic ordering matches numeric `seq_id` ordering, preventing cursor skip when >9 canonical events share the same timestamp (MAJOR fix: timestamp collision cursor skip).
 
 **Invariants:**
 
-- [INV-LT01] Canonical mode detection is cached after first probe -- no repeated `sqlite_master` queries per poll cycle.
-- [INV-LT02] Merged results are always sorted by `(timestamp_ns, event_id)` for deterministic cursor advancement.
+- [INV-LT01] Canonical mode detection is performed per poll cycle via `sqlite_master` probe in the shared `ledger_poll` module -- no stale caching.
+- [INV-LT02] Merged results are always sorted by `(timestamp_ns, event_id)` for deterministic cursor advancement (via `sort_and_truncate_events`).
 - [INV-LT03] When no canonical `events` table exists, the tailer operates in legacy-only mode with no error.
+- [INV-LT04] All canonical `event_id` synthesis MUST use `crate::ledger_poll::canonical_event_id()` -- hand-rolled formatting is a code-quality finding (TCK-00675).
 
 ### `IntentBuffer` (TCK-00504)
 
@@ -378,3 +379,4 @@ Worker that drains the deferred replay backlog after sink recovery. For each rep
 - TCK-00638: RFC-0032 Phase 2 `work_context` projection table and `evidence.published` tailer for work context entries
 - TCK-00636: RFC-0032 Phase 1 `work_spec_snapshot` projection table mapping `work_id` to `spec_snapshot_hash` for work-authority alias reconciliation, `work.opened` event tailer
 - TCK-00645: RFC-0032 Phase 4 `work_active_loop_profile` projection table for active loop profile selection, `PublishWorkLoopProfile` CAS + evidence anchor
+- TCK-00675: Extract freeze-aware SQLite ledger polling into shared `ledger_poll` module; `LedgerTailer` delegates to `crate::ledger_poll`
