@@ -123,8 +123,22 @@
     {
       "id": "BEH-DAEMON-PROTO-020",
       "kind": "invariant",
-      "title": "WorkShow handlers use spawn_blocking for rusqlite offloading (INV-CQ-OK-003)",
-      "description": "get_spec_hash calls refresh_projection which runs rusqlite queries; offloaded via tokio::task::spawn_blocking.",
+      "title": "WorkShow handlers use block_in_place for rusqlite offloading (INV-CQ-OK-003)",
+      "description": "get_spec_hash calls refresh_projection which runs rusqlite queries; offloaded via tokio::task::block_in_place to avoid forbidden Handle::current().block_on() in async contexts.",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-021",
+      "kind": "safety",
+      "title": "Session WorkShow enforces active-session registry gate",
+      "description": "HMAC token validation alone is insufficient; session must exist in active registry (not terminated). Mirrors PublishEvidence pattern (RFC-0032::REQ-0149).",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-022",
+      "kind": "safety",
+      "title": "Session WorkShow enforces work-scope binding",
+      "description": "request.work_id must match session's authorized work_id; prevents cross-work metadata leakage via horizontal access with a valid token.",
       "rfc": ["RFC-0032"]
     }
   ]

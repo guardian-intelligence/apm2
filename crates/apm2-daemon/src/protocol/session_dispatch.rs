@@ -12559,19 +12559,36 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     ///
     /// Returns the full `WorkSpecV1` JSON content for a given `work_id` by:
     /// 1. Validating the session token (INV-SESS-001)
-    /// 2. Parsing the `work_id` into a typed [`WorkId`]
-    /// 3. Looking up the `spec_snapshot_hash` in the alias reconciliation gate
-    /// 4. Retrieving the canonical `WorkSpec` JSON from CAS
+    /// 2. Verifying the session is active in the registry (revocation gate)
+    /// 3. Enforcing work_id scope binding (request.work_id == session.work_id)
+    /// 4. Parsing the `work_id` into a typed [`WorkId`]
+    /// 5. Looking up the `spec_snapshot_hash` in the alias reconciliation gate
+    /// 6. Retrieving the canonical `WorkSpec` JSON from CAS
     ///
     /// This is a read-only query accessible from the session socket so that
     /// reviewer agents (BEH-CLI-005, BEH-DAEMON-010) can query work scope,
     /// requirements, and definition of done.
     ///
+    /// # Security: Active-session registry gate
+    ///
+    /// HMAC token validation alone is not sufficient because `EndSession`
+    /// revokes only session-registry state. A retained token could continue
+    /// reading `WorkSpec` data after `EndSession` if we don't verify the
+    /// session still exists in the registry. This mirrors the pattern used
+    /// by `handle_publish_evidence` (RFC-0032::REQ-0149 Security BLOCKER 1).
+    ///
+    /// # Security: Work-scope binding
+    ///
+    /// The `request.work_id` must match the session's authorized `work_id`
+    /// to prevent cross-work metadata leakage. Without this check,
+    /// possession of any valid session token would allow reading `WorkSpec`
+    /// content for unrelated work items.
+    ///
     /// # INV-CQ-OK-003: No blocking I/O on async executor
     ///
     /// The alias reconciliation gate's `get_spec_hash()` calls
     /// `refresh_projection()` which executes rusqlite queries. This is
-    /// offloaded via `tokio::task::spawn_blocking` to avoid blocking the
+    /// offloaded via `tokio::task::block_in_place` to avoid blocking the
     /// tokio executor thread pool.
     fn handle_work_show(
         &self,
@@ -12587,10 +12604,46 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
         // INV-SESS-001: Validate session token before any further processing.
         // All session socket handlers require a valid token.
-        let _token = match self.validate_token(&request.session_token) {
+        let token = match self.validate_token(&request.session_token) {
             Ok(t) => t,
             Err(resp) => return Ok(resp),
         };
+
+        // Security gate 1: Verify session is active in the registry.
+        // HMAC token validation alone is not sufficient — EndSession
+        // revokes session-registry state but the HMAC remains valid
+        // until expiry. A retained token could read WorkSpec data
+        // after termination without this check.
+        if let Some(ref registry) = self.session_registry {
+            let Some(session_state) = registry.get_session(&token.session_id) else {
+                warn!(
+                    session_id = %token.session_id,
+                    "WorkShow rejected: session not found in registry (may have been terminated)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorPermissionDenied,
+                    "WorkShow: session not found or already terminated",
+                ));
+            };
+
+            // Security gate 2: Enforce work-scope binding.
+            // request.work_id must match the session's authorized work_id
+            // to prevent cross-work metadata leakage. Without this check,
+            // any valid session token could read WorkSpec for unrelated
+            // work items.
+            if request.work_id != session_state.work_id {
+                warn!(
+                    session_id = %token.session_id,
+                    requested_work_id = %request.work_id,
+                    authorized_work_id = %session_state.work_id,
+                    "WorkShow rejected: work_id does not match session scope"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorPermissionDenied,
+                    "WorkShow: work_id does not match session scope",
+                ));
+            }
+        }
 
         // Parse work_id into typed WorkId at the boundary (parse, don't
         // validate). The WorkId constructor enforces non-empty and
@@ -12607,6 +12660,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
         debug!(
             work_id = %work_id,
+            session_id = %token.session_id,
             "Processing WorkShow request (session scope)"
         );
 
@@ -12619,30 +12673,15 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         };
 
         // INV-CQ-OK-003: The gate's get_spec_hash() calls refresh_projection()
-        // which executes rusqlite queries synchronously. Offload to the
-        // blocking thread pool via spawn_blocking to avoid starving the
-        // tokio executor.
+        // which executes rusqlite queries synchronously. Offload via
+        // block_in_place to signal to the tokio runtime that the current
+        // thread will block, allowing the runtime to compensate by
+        // spawning replacement worker threads. This avoids the forbidden
+        // Handle::current().block_on() pattern which can deadlock or panic
+        // in async contexts.
         let gate = Arc::clone(gate);
         let work_id_str = work_id.as_str().to_owned();
-        let spec_hash_result = {
-            let handle = tokio::runtime::Handle::current();
-            match handle.block_on(tokio::task::spawn_blocking(move || {
-                gate.get_spec_hash(&work_id_str)
-            })) {
-                Ok(inner) => inner,
-                Err(e) => {
-                    warn!(
-                        work_id = %work_id,
-                        error = %e,
-                        "WorkShow: spawn_blocking join error"
-                    );
-                    return Ok(SessionResponse::error(
-                        SessionErrorCode::SessionErrorInternal,
-                        format!("WorkShow: internal error: {e}"),
-                    ));
-                },
-            }
-        };
+        let spec_hash_result = tokio::task::block_in_place(|| gate.get_spec_hash(&work_id_str));
 
         let spec_hash = match spec_hash_result {
             Ok(Some(hash)) => hash,
@@ -13134,6 +13173,15 @@ pub fn encode_unsubscribe_pulse_request(request: &UnsubscribePulseRequest) -> By
 #[must_use]
 pub fn encode_session_status_request(request: &SessionStatusRequest) -> Bytes {
     let mut buf = vec![SessionMessageType::SessionStatus.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `WorkShow` request to bytes for sending on the session socket
+/// (RFC-0032, IPC-SESS-007).
+#[must_use]
+pub fn encode_work_show_session_request(request: &WorkShowRequest) -> Bytes {
+    let mut buf = vec![SessionMessageType::WorkShow.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }
@@ -27686,6 +27734,205 @@ mod tests {
                  successful PublishEvidence. Found {} still Started.",
                 mock_journal.started_count()
             );
+        }
+    }
+
+    // ========================================================================
+    // WorkShow security regression tests (RFC-0032, IPC-SESS-007)
+    // ========================================================================
+
+    /// Security regression: WorkShow MUST reject requests when the session
+    /// has been terminated (no longer in active registry). A retained HMAC
+    /// token should not allow reading WorkSpec data after EndSession.
+    #[test]
+    fn work_show_rejects_terminated_session() {
+        use crate::episode::InMemorySessionRegistry;
+        use crate::session::{SessionRegistry, SessionState, SessionTerminationInfo};
+
+        let minter = test_minter();
+        let token = test_token(&minter);
+        let ctx = make_session_ctx();
+
+        let registry = Arc::new(InMemorySessionRegistry::new());
+        // Register and then terminate the session
+        registry
+            .register_session(SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-TCK-00683".to_string(),
+                role: 1,
+                lease_id: "lease-001".to_string(),
+                ephemeral_handle: "handle-001".to_string(),
+                policy_resolved_ref: "policy-ref".to_string(),
+                capability_manifest_hash: vec![0u8; 32],
+                episode_id: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
+            })
+            .expect("registration should succeed");
+        registry
+            .mark_terminated(
+                "session-001",
+                SessionTerminationInfo {
+                    session_id: "session-001".to_string(),
+                    rationale_code: "operator_requested".to_string(),
+                    exit_classification: "SUCCESS".to_string(),
+                    exit_code: Some(0),
+                    terminated_at_ns: 1_700_000_000_000_000_000,
+                    actual_tokens_consumed: None,
+                },
+            )
+            .expect("mark_terminated should succeed");
+
+        let registry_dyn: Arc<dyn SessionRegistry> = registry;
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(minter)
+            .with_session_registry(registry_dyn);
+
+        let request = WorkShowRequest {
+            work_id: "W-TCK-00683".to_string(),
+            session_token: serde_json::to_string(&token).unwrap(),
+        };
+        let frame = encode_work_show_session_request(&request);
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+        match response {
+            SessionResponse::Error(err) => {
+                assert_eq!(
+                    err.code,
+                    SessionErrorCode::SessionErrorPermissionDenied as i32,
+                    "Terminated session must receive PERMISSION_DENIED, got code: {}",
+                    err.code
+                );
+                assert!(
+                    err.message.contains("not found or already terminated"),
+                    "Error message should indicate terminated session, got: {}",
+                    err.message
+                );
+            },
+            other => {
+                panic!("Expected Error response for terminated session WorkShow, got: {other:?}")
+            },
+        }
+    }
+
+    /// Security regression: WorkShow MUST reject requests where the
+    /// request.work_id does not match the session's authorized work_id.
+    /// This prevents cross-work metadata leakage via horizontal access.
+    #[test]
+    fn work_show_rejects_cross_work_id_mismatch() {
+        use crate::episode::InMemorySessionRegistry;
+        use crate::session::{SessionRegistry, SessionState};
+
+        let minter = test_minter();
+        let token = test_token(&minter);
+        let ctx = make_session_ctx();
+
+        let registry = Arc::new(InMemorySessionRegistry::new());
+        // Register session bound to W-TCK-00683
+        registry
+            .register_session(SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-TCK-00683".to_string(),
+                role: 1,
+                lease_id: "lease-001".to_string(),
+                ephemeral_handle: "handle-001".to_string(),
+                policy_resolved_ref: "policy-ref".to_string(),
+                capability_manifest_hash: vec![0u8; 32],
+                episode_id: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
+            })
+            .expect("registration should succeed");
+
+        let registry_dyn: Arc<dyn SessionRegistry> = registry;
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(minter)
+            .with_session_registry(registry_dyn);
+
+        // Request a DIFFERENT work_id than the session is authorized for
+        let request = WorkShowRequest {
+            work_id: "W-TCK-99999".to_string(),
+            session_token: serde_json::to_string(&token).unwrap(),
+        };
+        let frame = encode_work_show_session_request(&request);
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+        match response {
+            SessionResponse::Error(err) => {
+                assert_eq!(
+                    err.code,
+                    SessionErrorCode::SessionErrorPermissionDenied as i32,
+                    "Cross-work access must receive PERMISSION_DENIED, got code: {}",
+                    err.code
+                );
+                assert!(
+                    err.message.contains("does not match session scope"),
+                    "Error message should indicate scope mismatch, got: {}",
+                    err.message
+                );
+            },
+            other => panic!("Expected Error response for cross-work WorkShow, got: {other:?}"),
+        }
+    }
+
+    /// Security regression: WorkShow with a valid session and matching
+    /// work_id MUST pass the active-session and work-scope gates (and then
+    /// fail at the gate/CAS layer since we don't wire those in this test).
+    #[test]
+    fn work_show_passes_security_gates_for_valid_session() {
+        use crate::episode::InMemorySessionRegistry;
+        use crate::session::{SessionRegistry, SessionState};
+
+        let minter = test_minter();
+        let token = test_token(&minter);
+        let ctx = make_session_ctx();
+
+        let registry = Arc::new(InMemorySessionRegistry::new());
+        registry
+            .register_session(SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-TCK-00683".to_string(),
+                role: 1,
+                lease_id: "lease-001".to_string(),
+                ephemeral_handle: "handle-001".to_string(),
+                policy_resolved_ref: "policy-ref".to_string(),
+                capability_manifest_hash: vec![0u8; 32],
+                episode_id: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
+            })
+            .expect("registration should succeed");
+
+        let registry_dyn: Arc<dyn SessionRegistry> = registry;
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(minter)
+            .with_session_registry(registry_dyn);
+
+        // Request the SAME work_id that the session is authorized for
+        let request = WorkShowRequest {
+            work_id: "W-TCK-00683".to_string(),
+            session_token: serde_json::to_string(&token).unwrap(),
+        };
+        let frame = encode_work_show_session_request(&request);
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+        // Should pass security gates but fail at the alias reconciliation
+        // gate (not configured), proving the security checks were passed.
+        match response {
+            SessionResponse::Error(err) => {
+                assert!(
+                    err.message
+                        .contains("alias reconciliation gate not configured"),
+                    "Valid session should pass security gates and fail at gate layer, got: {}",
+                    err.message
+                );
+                // Must NOT be a permission denied error
+                assert_ne!(
+                    err.code,
+                    SessionErrorCode::SessionErrorPermissionDenied as i32,
+                    "Valid session must not receive PERMISSION_DENIED"
+                );
+            },
+            other => {
+                panic!("Expected Error (gate not configured) for valid session, got: {other:?}")
+            },
         }
     }
 }

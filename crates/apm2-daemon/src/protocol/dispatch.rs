@@ -15569,6 +15569,13 @@ impl PrivilegedDispatcher {
     /// requirements, and definition_of_done. The operator (privileged) socket
     /// does not require session token validation — caller identity is
     /// established by socket-level credential passing.
+    ///
+    /// # INV-CQ-OK-003: No blocking I/O on async executor
+    ///
+    /// The alias reconciliation gate's `get_spec_hash()` calls
+    /// `refresh_projection()` which executes rusqlite queries. This is
+    /// offloaded via `tokio::task::block_in_place` to avoid blocking the
+    /// tokio executor thread pool.
     fn handle_work_show(
         &self,
         payload: &[u8],
@@ -15601,29 +15608,15 @@ impl PrivilegedDispatcher {
 
         // 1. Look up the spec_snapshot_hash from the alias reconciliation gate.
         // INV-CQ-OK-003: get_spec_hash() calls refresh_projection() which
-        // executes rusqlite queries synchronously. Offload to the blocking
-        // thread pool via spawn_blocking to avoid starving the tokio executor.
+        // executes rusqlite queries synchronously. Offload via
+        // block_in_place to signal to the tokio runtime that the current
+        // thread will block, allowing the runtime to compensate by
+        // spawning replacement worker threads. This avoids the forbidden
+        // Handle::current().block_on() pattern which can deadlock or panic
+        // in async contexts.
         let gate = Arc::clone(&self.alias_reconciliation_gate);
         let work_id_str = work_id.as_str().to_owned();
-        let spec_hash_result = {
-            let handle = tokio::runtime::Handle::current();
-            match handle.block_on(tokio::task::spawn_blocking(move || {
-                gate.get_spec_hash(&work_id_str)
-            })) {
-                Ok(inner) => inner,
-                Err(e) => {
-                    warn!(
-                        work_id = %work_id,
-                        error = %e,
-                        "WorkShow: spawn_blocking join error"
-                    );
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        format!("WorkShow: internal error: {e}"),
-                    ));
-                },
-            }
-        };
+        let spec_hash_result = tokio::task::block_in_place(|| gate.get_spec_hash(&work_id_str));
 
         let spec_hash = match spec_hash_result {
             Ok(Some(hash)) => hash,
