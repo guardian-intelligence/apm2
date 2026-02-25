@@ -38,7 +38,11 @@ pub const CANONICAL_EVENT_ID_WIDTH: usize = 20;
 
 /// Hard limit on events returned per poll call to prevent unbounded memory
 /// growth from a single query (denial-of-service prevention).
-const MAX_POLL_LIMIT: usize = 10_000;
+///
+/// Each `SignedLedgerEvent` payload can be up to ~1 MiB, so this cap limits a
+/// single poll to ~1 GiB peak allocation -- tolerable on production hosts
+/// while preventing the ~10 GiB spike that a 10,000-event cap would allow.
+const MAX_POLL_LIMIT: usize = 1_000;
 
 /// SQL zero-pad constant -- 20 zeros for `SUBSTR` padding in canonical queries.
 const SQL_ZERO_PAD: &str = "00000000000000000000";
@@ -124,7 +128,7 @@ fn detect_canonical_table(conn: &Connection) -> bool {
 ///
 /// ## Resource bounds
 ///
-/// `limit` is clamped to `MAX_POLL_LIMIT` (10,000) to prevent unbounded
+/// `limit` is clamped to `MAX_POLL_LIMIT` (1,000) to prevent unbounded
 /// memory allocation from a single call.
 ///
 /// # Errors
@@ -142,6 +146,13 @@ pub fn poll_events_blocking(
     if event_types.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
+
+    // Normalize canonical cursor IDs up-front so that legacy/unpadded cursors
+    // (e.g. "canonical-9") are converted to fixed-width
+    // ("canonical-00000000000000000009") before any SQL predicate uses them for
+    // lexicographic comparison.
+    let cursor_event_id = normalize_canonical_cursor_event_id(cursor_event_id);
+
     let limit = limit.min(MAX_POLL_LIMIT);
     let limit_i64 = i64::try_from(limit).map_err(|_| "poll limit exceeds i64 range".to_string())?;
 
@@ -154,7 +165,7 @@ pub fn poll_events_blocking(
         event_types,
         &placeholders,
         cursor_ts_ns,
-        cursor_event_id,
+        &cursor_event_id,
         limit_i64,
     )?;
 
@@ -165,7 +176,7 @@ pub fn poll_events_blocking(
             event_types,
             &placeholders,
             cursor_ts_ns,
-            cursor_event_id,
+            &cursor_event_id,
             limit_i64,
         )?;
         if !canonical.is_empty() {
@@ -311,6 +322,11 @@ fn poll_canonical(
     cursor_event_id: &str,
     limit_i64: i64,
 ) -> Result<Vec<SignedLedgerEvent>, String> {
+    // Defensive normalization: ensure any canonical cursor is fixed-width even
+    // if the caller forgot to normalize at the top level.
+    let cursor_event_id = normalize_canonical_cursor_event_id(cursor_event_id);
+    let cursor_event_id = cursor_event_id.as_str();
+
     let query = if cursor_event_id.is_empty() {
         format!(
             "SELECT seq_id, event_type, session_id, actor_id, payload, \
@@ -608,5 +624,75 @@ mod tests {
             poll_events_blocking(&conn, &["test_event"], 0, "", 100).expect("poll legacy only");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_id, "e1");
+    }
+
+    /// Regression test: resuming from an *unpadded* canonical cursor must NOT
+    /// skip padded canonical rows at the same timestamp.
+    ///
+    /// Without normalization, `"canonical-9"` >
+    /// `"canonical-00000000000000000010"` lexicographically, so the SQL
+    /// `event_id > ?` predicate would wrongly exclude `seq_id` 10..15.  After
+    /// the fix, `poll_events_blocking` normalizes the cursor to
+    /// `"canonical-00000000000000000009"` before querying.
+    #[test]
+    fn test_unpadded_canonical_cursor_does_not_skip_padded_rows() {
+        let conn = setup_test_db();
+
+        // Insert 15 canonical events all at the same timestamp (ts = 5000).
+        // seq_ids will be 1..=15 via AUTOINCREMENT.
+        for _ in 0..15 {
+            conn.execute(
+                "INSERT INTO events (event_type, session_id, actor_id, payload, timestamp_ns)
+                 VALUES ('test_event', 's1', 'a1', X'7B7D', 5000)",
+                [],
+            )
+            .expect("insert canonical event");
+        }
+
+        // Resume from an UNPADDED cursor "canonical-9" at the same timestamp.
+        // This simulates a legacy or manually-injected cursor that was persisted
+        // without zero-padding.
+        let events = poll_events_blocking(
+            &conn,
+            &["test_event"],
+            5000,          // same timestamp as all rows
+            "canonical-9", // unpadded -- the bug trigger
+            100,
+        )
+        .expect("poll with unpadded cursor");
+
+        // We should get seq_ids 10..=15  (6 events).
+        assert_eq!(
+            events.len(),
+            6,
+            "expected 6 canonical events after seq_id 9, got {}: {:?}",
+            events.len(),
+            events.iter().map(|e| &e.event_id).collect::<Vec<_>>()
+        );
+
+        // Verify the first returned event is seq_id 10.
+        assert_eq!(
+            events[0].event_id,
+            canonical_event_id(10),
+            "first event after cursor must be seq_id 10"
+        );
+
+        // Verify the last returned event is seq_id 15.
+        assert_eq!(
+            events[5].event_id,
+            canonical_event_id(15),
+            "last event must be seq_id 15"
+        );
+
+        // Verify all returned events are strictly after the normalized cursor.
+        let normalized_cursor = normalize_canonical_cursor_event_id("canonical-9");
+        for event in &events {
+            assert!(
+                event.event_id > normalized_cursor,
+                "event_id {} must be > normalized cursor {}",
+                event.event_id,
+                normalized_cursor
+            );
+        }
     }
 }
