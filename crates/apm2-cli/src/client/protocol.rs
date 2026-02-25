@@ -1265,6 +1265,9 @@ impl OperatorClient {
     ) -> Result<WorkShowResponse, ProtocolClientError> {
         let request = WorkShowRequest {
             work_id: work_id.to_string(),
+            // session_token is not required on the operator (privileged) socket;
+            // caller identity is established by socket-level credential passing.
+            session_token: String::new(),
         };
         let request_bytes = encode_work_show_request(&request);
 

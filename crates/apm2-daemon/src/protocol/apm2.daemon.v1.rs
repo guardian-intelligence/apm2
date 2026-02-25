@@ -2114,6 +2114,12 @@ pub struct WorkShowRequest {
     /// Canonical work identifier to query (W-...).
     #[prost(string, tag = "1")]
     pub work_id: ::prost::alloc::string::String,
+    /// Session token for authentication on session.sock (INV-SESS-001).
+    /// Required when the request is sent over the session socket; ignored
+    /// on the operator (privileged) socket where caller identity is
+    /// established by socket-level credential passing.
+    #[prost(string, tag = "2")]
+    pub session_token: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WorkShowResponse {

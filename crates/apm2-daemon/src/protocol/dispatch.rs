@@ -209,7 +209,7 @@ use crate::session::{EphemeralHandle, SessionRegistry, SessionState};
 use crate::state::SharedState;
 use crate::work::authority::{
     AliasReconciliationGate, ProjectionAliasReconciliationGate, ProjectionWorkAuthority,
-    WorkAuthority, WorkAuthorityError, WorkAuthorityStatus, work_id_to_hash,
+    SpecHashError, WorkAuthority, WorkAuthorityError, WorkAuthorityStatus, WorkId, work_id_to_hash,
 };
 use crate::work::projection::{WORK_DIAGNOSTIC_REASON_BLOCKS_UNSATISFIED, WorkDependencySeverity};
 
@@ -15561,11 +15561,14 @@ impl PrivilegedDispatcher {
     /// Handles `WorkShow` requests (IPC-PRIV-081, RFC-0032).
     ///
     /// Returns the full `WorkSpecV1` JSON content for a given `work_id` by:
-    /// 1. Looking up the `spec_snapshot_hash` in the work authority projection
-    /// 2. Retrieving the canonical `WorkSpec` JSON from CAS
+    /// 1. Parsing the `work_id` into a typed [`WorkId`]
+    /// 2. Looking up the `spec_snapshot_hash` in the work authority projection
+    /// 3. Retrieving the canonical `WorkSpec` JSON from CAS
     ///
     /// This is a read-only query used by reviewer agents to access work scope,
-    /// requirements, and definition_of_done.
+    /// requirements, and definition_of_done. The operator (privileged) socket
+    /// does not require session token validation — caller identity is
+    /// established by socket-level credential passing.
     fn handle_work_show(
         &self,
         payload: &[u8],
@@ -15578,41 +15581,75 @@ impl PrivilegedDispatcher {
                 }
             })?;
 
-        // CTR-1603: Validate work_id length to prevent DoS
-        if request.work_id.len() > MAX_ID_LENGTH {
-            return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                format!("work_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
-            ));
-        }
-
-        if request.work_id.is_empty() {
-            return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                "work_id cannot be empty",
-            ));
-        }
+        // Parse work_id into typed WorkId at the boundary (parse, don't
+        // validate). The WorkId constructor enforces non-empty and
+        // length-bounded invariants, eliminating inline string checks.
+        let work_id = match WorkId::try_from(request.work_id) {
+            Ok(id) => id,
+            Err(e) => {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("WorkShow: {e}"),
+                ));
+            },
+        };
 
         debug!(
-            work_id = %request.work_id,
+            work_id = %work_id,
             "Processing WorkShow request"
         );
 
         // 1. Look up the spec_snapshot_hash from the alias reconciliation gate.
         // INV-CQ-OK-003: get_spec_hash() calls refresh_projection() which
-        // executes rusqlite queries synchronously. Use block_in_place to
-        // signal the tokio runtime to move other tasks off this thread.
+        // executes rusqlite queries synchronously. Offload to the blocking
+        // thread pool via spawn_blocking to avoid starving the tokio executor.
         let gate = Arc::clone(&self.alias_reconciliation_gate);
-        let work_id_ref = request.work_id.clone();
-        let Some(spec_hash) = tokio::task::block_in_place(|| gate.get_spec_hash(&work_id_ref))
-        else {
-            return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                format!(
-                    "WorkShow: no spec_snapshot_hash found for work_id '{}'",
-                    request.work_id,
-                ),
-            ));
+        let work_id_str = work_id.as_str().to_owned();
+        let spec_hash_result = {
+            let handle = tokio::runtime::Handle::current();
+            match handle.block_on(tokio::task::spawn_blocking(move || {
+                gate.get_spec_hash(&work_id_str)
+            })) {
+                Ok(inner) => inner,
+                Err(e) => {
+                    warn!(
+                        work_id = %work_id,
+                        error = %e,
+                        "WorkShow: spawn_blocking join error"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("WorkShow: internal error: {e}"),
+                    ));
+                },
+            }
+        };
+
+        let spec_hash = match spec_hash_result {
+            Ok(Some(hash)) => hash,
+            Ok(None) => {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("WorkShow: no spec_snapshot_hash found for work_id '{work_id}'",),
+                ));
+            },
+            Err(SpecHashError::CasNotConfigured) => {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "WorkShow: CAS not configured",
+                ));
+            },
+            Err(e) => {
+                warn!(
+                    work_id = %work_id,
+                    error = %e,
+                    "WorkShow: spec hash lookup failed"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("WorkShow: spec hash lookup failed for work_id '{work_id}': {e}"),
+                ));
+            },
         };
 
         // 2. Retrieve the canonical WorkSpec JSON from CAS.
@@ -15627,22 +15664,21 @@ impl PrivilegedDispatcher {
             Ok(bytes) => bytes,
             Err(e) => {
                 warn!(
-                    work_id = %request.work_id,
+                    work_id = %work_id,
                     error = %e,
                     "WorkShow: failed to retrieve WorkSpec from CAS"
                 );
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
                     format!(
-                        "WorkShow: failed to retrieve WorkSpec from CAS for work_id '{}': {e}",
-                        request.work_id,
+                        "WorkShow: failed to retrieve WorkSpec from CAS for work_id '{work_id}': {e}",
                     ),
                 ));
             },
         };
 
         Ok(PrivilegedResponse::WorkShow(WorkShowResponse {
-            work_id: request.work_id,
+            work_id: work_id.as_str().to_owned(),
             work_spec_json: spec_bytes,
             spec_snapshot_hash: spec_hash.to_vec(),
         }))

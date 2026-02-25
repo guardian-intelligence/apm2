@@ -146,7 +146,7 @@ use crate::episode::{
 };
 use crate::gate::GateOrchestrator;
 use crate::htf::{ClockError, HolonicClock};
-use crate::work::authority::AliasReconciliationGate;
+use crate::work::authority::{AliasReconciliationGate, SpecHashError, WorkId};
 
 const RESERVED_DAEMON_EVENT_TYPE_PREFIXES: &[&str] = &[
     "gate_",
@@ -12558,8 +12558,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// Handles `WorkShow` requests (IPC-SESS-007, RFC-0032).
     ///
     /// Returns the full `WorkSpecV1` JSON content for a given `work_id` by:
-    /// 1. Looking up the `spec_snapshot_hash` in the alias reconciliation gate
-    /// 2. Retrieving the canonical `WorkSpec` JSON from CAS
+    /// 1. Validating the session token (INV-SESS-001)
+    /// 2. Parsing the `work_id` into a typed [`WorkId`]
+    /// 3. Looking up the `spec_snapshot_hash` in the alias reconciliation gate
+    /// 4. Retrieving the canonical `WorkSpec` JSON from CAS
     ///
     /// This is a read-only query accessible from the session socket so that
     /// reviewer agents (BEH-CLI-005, BEH-DAEMON-010) can query work scope,
@@ -12568,8 +12570,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// # INV-CQ-OK-003: No blocking I/O on async executor
     ///
     /// The alias reconciliation gate's `get_spec_hash()` calls
-    /// `refresh_projection()` which executes rusqlite queries. This is wrapped
-    /// in `tokio::task::spawn_blocking` to avoid blocking the tokio executor.
+    /// `refresh_projection()` which executes rusqlite queries. This is
+    /// offloaded via `tokio::task::spawn_blocking` to avoid blocking the
+    /// tokio executor thread pool.
     fn handle_work_show(
         &self,
         payload: &[u8],
@@ -12582,33 +12585,28 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 }
             })?;
 
-        // WorkShow is a read-only CAS retrieval query. Session socket
-        // connectivity is the access boundary — only agents with a session
-        // socket connection reach this handler. No session token is required
-        // because the query does not mutate state or access session-specific
-        // data, and reviewer agents may not have the same session_id as the
-        // work object they are reviewing.
+        // INV-SESS-001: Validate session token before any further processing.
+        // All session socket handlers require a valid token.
+        let _token = match self.validate_token(&request.session_token) {
+            Ok(t) => t,
+            Err(resp) => return Ok(resp),
+        };
 
-        // CTR-1603: Validate work_id length to prevent DoS
-        if request.work_id.len() > super::dispatch::MAX_ID_LENGTH {
-            return Ok(SessionResponse::error(
-                SessionErrorCode::SessionErrorInvalid,
-                format!(
-                    "work_id exceeds maximum length of {} bytes",
-                    super::dispatch::MAX_ID_LENGTH,
-                ),
-            ));
-        }
-
-        if request.work_id.is_empty() {
-            return Ok(SessionResponse::error(
-                SessionErrorCode::SessionErrorInvalid,
-                "work_id cannot be empty",
-            ));
-        }
+        // Parse work_id into typed WorkId at the boundary (parse, don't
+        // validate). The WorkId constructor enforces non-empty and
+        // length-bounded invariants, eliminating inline string checks.
+        let work_id = match WorkId::try_from(request.work_id) {
+            Ok(id) => id,
+            Err(e) => {
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorInvalid,
+                    format!("WorkShow: {e}"),
+                ));
+            },
+        };
 
         debug!(
-            work_id = %request.work_id,
+            work_id = %work_id,
             "Processing WorkShow request (session scope)"
         );
 
@@ -12621,18 +12619,56 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         };
 
         // INV-CQ-OK-003: The gate's get_spec_hash() calls refresh_projection()
-        // which executes rusqlite queries synchronously. Use block_in_place
-        // to signal the tokio runtime to move other tasks off this thread
-        // while the blocking I/O runs.
+        // which executes rusqlite queries synchronously. Offload to the
+        // blocking thread pool via spawn_blocking to avoid starving the
+        // tokio executor.
         let gate = Arc::clone(gate);
-        let work_id = request.work_id;
-        let spec_hash = tokio::task::block_in_place(|| gate.get_spec_hash(&work_id));
+        let work_id_str = work_id.as_str().to_owned();
+        let spec_hash_result = {
+            let handle = tokio::runtime::Handle::current();
+            match handle.block_on(tokio::task::spawn_blocking(move || {
+                gate.get_spec_hash(&work_id_str)
+            })) {
+                Ok(inner) => inner,
+                Err(e) => {
+                    warn!(
+                        work_id = %work_id,
+                        error = %e,
+                        "WorkShow: spawn_blocking join error"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInternal,
+                        format!("WorkShow: internal error: {e}"),
+                    ));
+                },
+            }
+        };
 
-        let Some(spec_hash) = spec_hash else {
-            return Ok(SessionResponse::error(
-                SessionErrorCode::SessionErrorInvalid,
-                format!("WorkShow: no spec_snapshot_hash found for work_id '{work_id}'",),
-            ));
+        let spec_hash = match spec_hash_result {
+            Ok(Some(hash)) => hash,
+            Ok(None) => {
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorInvalid,
+                    format!("WorkShow: no spec_snapshot_hash found for work_id '{work_id}'",),
+                ));
+            },
+            Err(SpecHashError::CasNotConfigured) => {
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorInternal,
+                    "WorkShow: CAS not configured",
+                ));
+            },
+            Err(e) => {
+                warn!(
+                    work_id = %work_id,
+                    error = %e,
+                    "WorkShow: spec hash lookup failed"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorInternal,
+                    format!("WorkShow: spec hash lookup failed for work_id '{work_id}': {e}"),
+                ));
+            },
         };
 
         // 2. Retrieve the canonical WorkSpec JSON from CAS.
@@ -12655,7 +12691,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         };
 
         Ok(SessionResponse::WorkShow(WorkShowResponse {
-            work_id,
+            work_id: work_id.as_str().to_owned(),
             work_spec_json: spec_bytes,
             spec_snapshot_hash: spec_hash.to_vec(),
         }))

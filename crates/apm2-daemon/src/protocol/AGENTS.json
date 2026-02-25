@@ -112,6 +112,20 @@
       "title": "PCAC lifecycle enforcement runs BEFORE idempotency queries",
       "description": "Prevents unauthorized callers from probing work_id existence (no existence oracle).",
       "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-019",
+      "kind": "invariant",
+      "title": "WorkShow session handler validates session token (INV-SESS-001) before CAS lookup",
+      "description": "Prevents unauthenticated work-spec retrieval on session.sock; token validated via constant-time HMAC.",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-020",
+      "kind": "invariant",
+      "title": "WorkShow handlers use spawn_blocking for rusqlite offloading (INV-CQ-OK-003)",
+      "description": "get_spec_hash calls refresh_projection which runs rusqlite queries; offloaded via tokio::task::spawn_blocking.",
+      "rfc": ["RFC-0032"]
     }
   ]
 }

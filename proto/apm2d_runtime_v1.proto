@@ -2093,6 +2093,11 @@ message ResolveTicketAliasResponse {
 message WorkShowRequest {
   // Canonical work identifier to query (W-...).
   string work_id = 1;
+  // Session token for authentication on session.sock (INV-SESS-001).
+  // Required when the request is sent over the session socket; ignored
+  // on the operator (privileged) socket where caller identity is
+  // established by socket-level credential passing.
+  string session_token = 2;
 }
 
 message WorkShowResponse {
