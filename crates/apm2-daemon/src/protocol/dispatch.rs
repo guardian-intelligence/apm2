@@ -15622,17 +15622,17 @@ impl PrivilegedDispatcher {
         }
     }
 
-    /// Handles `WorkShow` requests (IPC-PRIV-081, RFC-0032).
+    /// Handles `WorkShow` requests (IPC-PRIV-081, RFC-0032) — **sync test
+    /// path**.
     ///
-    /// Returns the full `WorkSpecV1` JSON content for a given `work_id` by:
-    /// 1. Parsing the `work_id` into a typed [`WorkId`]
-    /// 2. Looking up the `spec_snapshot_hash` in the work authority projection
-    /// 3. Retrieving the canonical `WorkSpec` JSON from CAS
+    /// Returns the `spec_snapshot_hash` for a given `work_id` but leaves
+    /// `work_spec_json` empty.  Full CAS retrieval is blocking I/O and is
+    /// only performed by the async production path
+    /// ([`Self::handle_work_show_async`]).
     ///
-    /// This is a read-only query used by reviewer agents to access work scope,
-    /// requirements, and definition_of_done. The operator (privileged) socket
-    /// does not require session token validation — caller identity is
-    /// established by socket-level credential passing.
+    /// Steps:
+    /// 1. Parse the `work_id` into a typed [`WorkId`]
+    /// 2. Look up the `spec_snapshot_hash` in the work authority projection
     ///
     /// # INV-CQ-OK-003: No blocking I/O on async executor
     ///
@@ -15714,34 +15714,13 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // 2. Retrieve the canonical WorkSpec JSON from CAS.
-        let Some(cas) = &self.cas else {
-            return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                "WorkShow: CAS not configured",
-            ));
-        };
-
-        let spec_bytes = match cas.retrieve(&spec_hash) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                warn!(
-                    work_id = %work_id,
-                    error = %e,
-                    "WorkShow: failed to retrieve WorkSpec from CAS"
-                );
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!(
-                        "WorkShow: failed to retrieve WorkSpec from CAS for work_id '{work_id}': {e}",
-                    ),
-                ));
-            },
-        };
-
+        // 2. Sync path returns only the spec hash — full CAS retrieval
+        // is blocking I/O and is only available via the async production
+        // path (`handle_work_show_async`).  The sync handler is retained
+        // for test fixtures that do not require the full WorkSpec body.
         Ok(PrivilegedResponse::WorkShow(WorkShowResponse {
             work_id: work_id.as_str().to_owned(),
-            work_spec_json: spec_bytes,
+            work_spec_json: Vec::new(),
             spec_snapshot_hash: spec_hash.to_vec(),
         }))
     }

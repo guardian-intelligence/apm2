@@ -12604,15 +12604,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     // WorkShow Handler (RFC-0032, IPC-SESS-007)
     // ========================================================================
 
-    /// Handles `WorkShow` requests (IPC-SESS-007, RFC-0032).
+    /// Handles `WorkShow` requests (IPC-SESS-007, RFC-0032) — **sync test
+    /// path**.
     ///
-    /// Returns the full `WorkSpecV1` JSON content for a given `work_id` by:
-    /// 1. Validating the session token (INV-SESS-001)
-    /// 2. Verifying the session is active in the registry (revocation gate)
-    /// 3. Enforcing work_id scope binding (request.work_id == session.work_id)
-    /// 4. Parsing the `work_id` into a typed [`WorkId`]
-    /// 5. Looking up the `spec_snapshot_hash` in the alias reconciliation gate
-    /// 6. Retrieving the canonical `WorkSpec` JSON from CAS
+    /// Returns the `spec_snapshot_hash` for a given `work_id` but leaves
+    /// `work_spec_json` empty.  Full CAS retrieval is blocking I/O and is
+    /// only performed by the async production path
+    /// ([`Self::handle_work_show_async`]).
+    ///
+    /// Steps:
+    /// 1. Validate the session token (INV-SESS-001)
+    /// 2. Verify the session is active in the registry (revocation gate)
+    /// 3. Enforce work_id scope binding (request.work_id == session.work_id)
+    /// 4. Parse the `work_id` into a typed [`WorkId`]
+    /// 5. Look up the `spec_snapshot_hash` in the alias reconciliation gate
     ///
     /// This is a read-only query accessible from the session socket so that
     /// reviewer agents (BEH-CLI-005, BEH-DAEMON-010) can query work scope,
@@ -12777,28 +12782,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             },
         };
 
-        // 2. Retrieve the canonical WorkSpec JSON from CAS.
-        let Some(cas) = &self.cas else {
-            return Ok(SessionResponse::error(
-                SessionErrorCode::SessionErrorInternal,
-                "WorkShow: CAS not configured",
-            ));
-        };
-
-        let Some(spec_bytes) = cas.retrieve(&spec_hash) else {
-            warn!(
-                work_id = %work_id,
-                "WorkShow: failed to retrieve WorkSpec from CAS"
-            );
-            return Ok(SessionResponse::error(
-                SessionErrorCode::SessionErrorInternal,
-                format!("WorkShow: WorkSpec not found in CAS for work_id '{work_id}'",),
-            ));
-        };
-
+        // 2. Sync path returns only the spec hash — full CAS retrieval
+        // is blocking I/O and is only available via the async production
+        // path (`handle_work_show_async`).  The sync handler is retained
+        // for test fixtures that do not require the full WorkSpec body.
         Ok(SessionResponse::WorkShow(WorkShowResponse {
             work_id: work_id.as_str().to_owned(),
-            work_spec_json: spec_bytes,
+            work_spec_json: Vec::new(),
             spec_snapshot_hash: spec_hash.to_vec(),
         }))
     }

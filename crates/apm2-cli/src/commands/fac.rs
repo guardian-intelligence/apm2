@@ -4628,14 +4628,13 @@ fn run_work_show(args: &WorkShowArgs, operator_socket: &Path, json_output: bool)
             let spec_hash_hex = hex::encode(&response.spec_snapshot_hash);
 
             // Extract title, rfc_id, status from the WorkSpec JSON for the
-            // envelope. Ticket meta can be nested under various shapes —
-            // extract using best-effort field traversal.
+            // envelope. WorkSpecV1 defines these as top-level fields.
             let title = spec_json
-                .pointer("/ticket_meta/ticket/title")
+                .get("title")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let rfc_id = spec_json
-                .pointer("/ticket_meta/binds/rfc_id")
+                .get("rfc_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let status = spec_json
