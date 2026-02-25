@@ -1222,7 +1222,7 @@ impl GateTimeoutDomain {
         })
     }
 
-    fn set_tick_now(&mut self, tick_now: TimeoutTickNow) {
+    const fn set_tick_now(&mut self, tick_now: TimeoutTickNow) {
         self.tick_now = Some(tick_now);
     }
 
@@ -1247,7 +1247,7 @@ impl GateTimeoutDomain {
     /// Production async callers should prefer
     /// [`Self::remove_work_leases_async`].
     #[allow(dead_code)]
-    fn remove_work_leases(&mut self, work_id: &str) -> Result<(), String> {
+    fn remove_work_leases(&mut self, work_id: &str) {
         let lease_ids: Vec<String> = self
             .observed_leases
             .iter()
@@ -1258,7 +1258,6 @@ impl GateTimeoutDomain {
             self.observed_leases.remove(&lease_id);
             self.mark_dirty_remove(&lease_id);
         }
-        Ok(())
     }
 }
 
@@ -1292,7 +1291,7 @@ impl OrchestratorDomain<TimeoutObservedEvent, GateTimeoutIntent, String, GateOrc
                     self.mark_dirty_remove(lease_id);
                 },
                 TimeoutObservedKind::AllCompleted { work_id } => {
-                    self.remove_work_leases(work_id)?;
+                    self.remove_work_leases(work_id);
                 },
                 TimeoutObservedKind::Skipped { .. } => {
                     // Intentionally ignored -- the event exists only to
