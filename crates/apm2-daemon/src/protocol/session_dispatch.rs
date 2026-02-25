@@ -2727,6 +2727,55 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
+    /// Async dispatch — production entry point for the IPC read loop.
+    ///
+    /// Identical to [`Self::dispatch`] except that `WorkShow` is routed
+    /// through `handle_work_show_async`, which uses
+    /// `tokio::task::spawn_blocking` to offload rusqlite I/O per
+    /// INV-CQ-OK-003. All other message types delegate to the sync
+    /// [`Self::dispatch`] (no blocking I/O on those paths).
+    pub async fn dispatch_async(
+        &self,
+        frame: &Bytes,
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<SessionResponse> {
+        // Fast-path: only WorkShow needs async offload. For all other
+        // message types we reuse the existing sync dispatch to avoid
+        // duplicating the handler match arms.
+        if !frame.is_empty() {
+            let tag = frame[0];
+            if SessionMessageType::from_tag(tag) == Some(SessionMessageType::WorkShow) {
+                // Re-check the pre-conditions that dispatch() also checks.
+                if !ctx.phase().allows_dispatch() {
+                    warn!(
+                        phase = %ctx.phase(),
+                        "Session dispatch rejected: connection not in SessionOpen phase"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInvalid,
+                        format!(
+                            "dispatch rejected: connection is in {} phase, not SessionOpen",
+                            ctx.phase()
+                        ),
+                    ));
+                }
+                if ctx.is_privileged() {
+                    debug!(
+                        peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+                        "Operator connection attempted session endpoint"
+                    );
+                    return Ok(SessionResponse::permission_denied());
+                }
+
+                let payload = &frame[1..];
+                return self.handle_work_show_async(payload, ctx).await;
+            }
+        }
+
+        // All non-WorkShow messages: delegate to the sync dispatcher.
+        self.dispatch(frame, ctx)
+    }
+
     /// Validates a session token from a request.
     ///
     /// # Security
@@ -12737,6 +12786,185 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         };
 
         let Some(spec_bytes) = cas.retrieve(&spec_hash) else {
+            warn!(
+                work_id = %work_id,
+                "WorkShow: failed to retrieve WorkSpec from CAS"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInternal,
+                format!("WorkShow: WorkSpec not found in CAS for work_id '{work_id}'",),
+            ));
+        };
+
+        Ok(SessionResponse::WorkShow(WorkShowResponse {
+            work_id: work_id.as_str().to_owned(),
+            work_spec_json: spec_bytes,
+            spec_snapshot_hash: spec_hash.to_vec(),
+        }))
+    }
+
+    /// Async `WorkShow` handler — offloads rusqlite I/O via
+    /// `tokio::task::spawn_blocking` per INV-CQ-OK-003.
+    ///
+    /// This is the production path used by [`Self::dispatch_async`].
+    /// The sync [`Self::handle_work_show`] is retained for test
+    /// compatibility where no tokio runtime is required.
+    async fn handle_work_show_async(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<SessionResponse> {
+        let request =
+            WorkShowRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid WorkShowRequest: {e}"),
+                }
+            })?;
+
+        // INV-SESS-001: Validate session token before any further processing.
+        let token = match self.validate_token(&request.session_token) {
+            Ok(t) => t,
+            Err(resp) => return Ok(resp),
+        };
+
+        // Security gate 1: Verify session is active in the registry.
+        let Some(ref registry) = self.session_registry else {
+            warn!(
+                session_id = %token.session_id,
+                "WorkShow denied: session_registry not configured (fail-closed)"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInternal,
+                "WorkShow: session registry not configured",
+            ));
+        };
+
+        let Some(session_state) = registry.get_session(&token.session_id) else {
+            warn!(
+                session_id = %token.session_id,
+                "WorkShow rejected: session not found in registry (may have been terminated)"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorPermissionDenied,
+                "WorkShow: session not found or already terminated",
+            ));
+        };
+
+        // Security gate 2: Enforce work-scope binding.
+        if request.work_id != session_state.work_id {
+            warn!(
+                session_id = %token.session_id,
+                requested_work_id = %request.work_id,
+                authorized_work_id = %session_state.work_id,
+                "WorkShow rejected: work_id does not match session scope"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorPermissionDenied,
+                "WorkShow: work_id does not match session scope",
+            ));
+        }
+
+        let work_id = match WorkId::try_from(request.work_id) {
+            Ok(id) => id,
+            Err(e) => {
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorInvalid,
+                    format!("WorkShow: {e}"),
+                ));
+            },
+        };
+
+        debug!(
+            work_id = %work_id,
+            session_id = %token.session_id,
+            "Processing WorkShow request (session scope, async)"
+        );
+
+        // 1. Look up spec_snapshot_hash from the alias reconciliation gate.
+        let Some(gate) = &self.alias_reconciliation_gate else {
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInternal,
+                "WorkShow: alias reconciliation gate not configured",
+            ));
+        };
+
+        // INV-CQ-OK-003: Offload rusqlite work to spawn_blocking.
+        // get_spec_hash() calls refresh_projection() which executes
+        // synchronous rusqlite queries. spawn_blocking ensures this
+        // never occupies a tokio executor thread.
+        let gate = Arc::clone(gate);
+        let work_id_str = work_id.as_str().to_owned();
+        let spec_hash_result =
+            match tokio::task::spawn_blocking(move || gate.get_spec_hash(&work_id_str)).await {
+                Ok(inner) => inner,
+                Err(e) => {
+                    warn!(
+                        work_id = %work_id,
+                        error = %e,
+                        "WorkShow: spawn_blocking panicked during get_spec_hash"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInternal,
+                        format!("WorkShow: internal error for work_id '{work_id}': {e}"),
+                    ));
+                },
+            };
+
+        let spec_hash = match spec_hash_result {
+            Ok(Some(hash)) => hash,
+            Ok(None) => {
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorInvalid,
+                    format!("WorkShow: no spec_snapshot_hash found for work_id '{work_id}'",),
+                ));
+            },
+            Err(SpecHashError::CasNotConfigured) => {
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorInternal,
+                    "WorkShow: CAS not configured",
+                ));
+            },
+            Err(e) => {
+                warn!(
+                    work_id = %work_id,
+                    error = %e,
+                    "WorkShow: spec hash lookup failed"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorInternal,
+                    format!("WorkShow: spec hash lookup failed for work_id '{work_id}': {e}"),
+                ));
+            },
+        };
+
+        // 2. Retrieve the canonical WorkSpec JSON from CAS.
+        // CAS retrieve performs I/O — also offloaded via spawn_blocking
+        // per INV-CQ-OK-003.
+        let Some(cas) = &self.cas else {
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInternal,
+                "WorkShow: CAS not configured",
+            ));
+        };
+
+        // spec_hash is [u8; 32] which is Copy — safe to use after move.
+        let cas = Arc::clone(cas);
+        let cas_result = match tokio::task::spawn_blocking(move || cas.retrieve(&spec_hash)).await {
+            Ok(inner) => inner,
+            Err(e) => {
+                warn!(
+                    work_id = %work_id,
+                    error = %e,
+                    "WorkShow: spawn_blocking panicked during CAS retrieve"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorInternal,
+                    format!("WorkShow: internal error for work_id '{work_id}': {e}"),
+                ));
+            },
+        };
+
+        let Some(spec_bytes) = cas_result else {
             warn!(
                 work_id = %work_id,
                 "WorkShow: failed to retrieve WorkSpec from CAS"

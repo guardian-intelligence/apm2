@@ -11744,6 +11744,70 @@ impl PrivilegedDispatcher {
         result
     }
 
+    /// Async dispatch — production entry point for the IPC read loop.
+    ///
+    /// Identical to [`Self::dispatch`] except that `WorkShow` is routed
+    /// through `handle_work_show_async`, which uses
+    /// `tokio::task::spawn_blocking` to offload rusqlite I/O per
+    /// INV-CQ-OK-003. All other message types delegate to the sync
+    /// [`Self::dispatch`] (no blocking I/O on those paths).
+    pub async fn dispatch_async(
+        &self,
+        frame: &Bytes,
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        // Fast-path: only WorkShow needs async offload. For all other
+        // message types we reuse the existing sync dispatch to avoid
+        // duplicating the 30+ handler match arms.
+        if !frame.is_empty() {
+            let tag = frame[0];
+            if PrivilegedMessageType::from_tag(tag) == Some(PrivilegedMessageType::WorkShow) {
+                // Re-check the pre-conditions that dispatch() also checks,
+                // because we are bypassing the sync path.
+                if !ctx.phase().allows_dispatch() {
+                    warn!(
+                        phase = %ctx.phase(),
+                        "Dispatch rejected: connection not in SessionOpen phase"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::PermissionDenied,
+                        format!(
+                            "dispatch rejected: connection is in {} phase, not SessionOpen",
+                            ctx.phase()
+                        ),
+                    ));
+                }
+                if !ctx.is_privileged() {
+                    debug!(
+                        peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+                        "Non-privileged connection attempted privileged endpoint"
+                    );
+                    return Ok(PrivilegedResponse::permission_denied());
+                }
+
+                let payload = &frame[1..];
+                let result = self.handle_work_show_async(payload, ctx).await;
+
+                // RFC-0032::REQ-0084: Emit IPC request completion metrics
+                if let Some(ref metrics) = self.metrics {
+                    let status = match &result {
+                        Ok(PrivilegedResponse::Error(_)) => "error",
+                        Ok(_) => "success",
+                        Err(_) => "protocol_error",
+                    };
+                    metrics
+                        .daemon_metrics()
+                        .ipc_request_completed("WorkShow", status);
+                }
+
+                return result;
+            }
+        }
+
+        // All non-WorkShow messages: delegate to the sync dispatcher.
+        self.dispatch(frame, ctx)
+    }
+
     /// Handles `ClaimWork` requests (IPC-PRIV-001).
     ///
     /// # RFC-0032::REQ-0069 Implementation
@@ -15659,6 +15723,139 @@ impl PrivilegedDispatcher {
         };
 
         let spec_bytes = match cas.retrieve(&spec_hash) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!(
+                    work_id = %work_id,
+                    error = %e,
+                    "WorkShow: failed to retrieve WorkSpec from CAS"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "WorkShow: failed to retrieve WorkSpec from CAS for work_id '{work_id}': {e}",
+                    ),
+                ));
+            },
+        };
+
+        Ok(PrivilegedResponse::WorkShow(WorkShowResponse {
+            work_id: work_id.as_str().to_owned(),
+            work_spec_json: spec_bytes,
+            spec_snapshot_hash: spec_hash.to_vec(),
+        }))
+    }
+
+    /// Async `WorkShow` handler — offloads rusqlite I/O via
+    /// `tokio::task::spawn_blocking` per INV-CQ-OK-003.
+    ///
+    /// This is the production path used by [`Self::dispatch_async`].
+    /// The sync [`Self::handle_work_show`] is retained for test
+    /// compatibility where no tokio runtime is required.
+    async fn handle_work_show_async(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request =
+            WorkShowRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid WorkShowRequest: {e}"),
+                }
+            })?;
+
+        let work_id = match WorkId::try_from(request.work_id) {
+            Ok(id) => id,
+            Err(e) => {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("WorkShow: {e}"),
+                ));
+            },
+        };
+
+        debug!(
+            work_id = %work_id,
+            "Processing WorkShow request"
+        );
+
+        // INV-CQ-OK-003: Offload rusqlite work to spawn_blocking.
+        // get_spec_hash() calls refresh_projection() which executes
+        // synchronous rusqlite queries. spawn_blocking ensures this
+        // never occupies a tokio executor thread.
+        let gate = Arc::clone(&self.alias_reconciliation_gate);
+        let work_id_str = work_id.as_str().to_owned();
+        let spec_hash_result =
+            match tokio::task::spawn_blocking(move || gate.get_spec_hash(&work_id_str)).await {
+                Ok(inner) => inner,
+                Err(e) => {
+                    warn!(
+                        work_id = %work_id,
+                        error = %e,
+                        "WorkShow: spawn_blocking panicked during get_spec_hash"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("WorkShow: internal error for work_id '{work_id}': {e}"),
+                    ));
+                },
+            };
+
+        let spec_hash = match spec_hash_result {
+            Ok(Some(hash)) => hash,
+            Ok(None) => {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("WorkShow: no spec_snapshot_hash found for work_id '{work_id}'",),
+                ));
+            },
+            Err(SpecHashError::CasNotConfigured) => {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "WorkShow: CAS not configured",
+                ));
+            },
+            Err(e) => {
+                warn!(
+                    work_id = %work_id,
+                    error = %e,
+                    "WorkShow: spec hash lookup failed"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("WorkShow: spec hash lookup failed for work_id '{work_id}': {e}"),
+                ));
+            },
+        };
+
+        // 2. Retrieve the canonical WorkSpec JSON from CAS.
+        // CAS retrieve performs filesystem I/O — also offloaded via
+        // spawn_blocking per INV-CQ-OK-003.
+        let Some(cas) = &self.cas else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "WorkShow: CAS not configured",
+            ));
+        };
+
+        // spec_hash is [u8; 32] which is Copy — safe to use after move.
+        let cas = Arc::clone(cas);
+        let cas_result = match tokio::task::spawn_blocking(move || cas.retrieve(&spec_hash)).await {
+            Ok(inner) => inner,
+            Err(e) => {
+                warn!(
+                    work_id = %work_id,
+                    error = %e,
+                    "WorkShow: spawn_blocking panicked during CAS retrieve"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("WorkShow: internal error for work_id '{work_id}': {e}"),
+                ));
+            },
+        };
+
+        let spec_bytes = match cas_result {
             Ok(bytes) => bytes,
             Err(e) => {
                 warn!(
