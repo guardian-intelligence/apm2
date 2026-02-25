@@ -180,6 +180,9 @@ use super::messages::{
     WorkListRequest,
     WorkListResponse,
     WorkRole,
+    // RFC-0032: WorkShow types
+    WorkShowRequest,
+    WorkShowResponse,
     WorkStatusRequest,
     WorkStatusResponse,
 };
@@ -6899,6 +6902,9 @@ pub enum PrivilegedMessageType {
     // --- Ticket Alias Resolution (RFC-0032, RFC-0032::REQ-0264) ---
     /// `ResolveTicketAlias` request (IPC-PRIV-080)
     ResolveTicketAlias  = 31,
+    // --- Work Spec Show (RFC-0032) ---
+    /// `WorkShow` request (IPC-PRIV-081)
+    WorkShow            = 32,
 }
 
 impl PrivilegedMessageType {
@@ -6951,6 +6957,8 @@ impl PrivilegedMessageType {
             30 => Some(Self::RecordWorkPrAssociation),
             // RFC-0032::REQ-0264: ResolveTicketAlias (RFC-0032 Phase 1)
             31 => Some(Self::ResolveTicketAlias),
+            // RFC-0032: WorkShow (read-only WorkSpec retrieval)
+            32 => Some(Self::WorkShow),
             // HEF tags (64-68)
             64 => Some(Self::SubscribePulse),
             66 => Some(Self::UnsubscribePulse),
@@ -7027,6 +7035,7 @@ impl PrivilegedMessageType {
             Self::PublishWorkLoopProfile,
             Self::RecordWorkPrAssociation,
             Self::ResolveTicketAlias,
+            Self::WorkShow,
         ]
     }
 
@@ -7083,7 +7092,8 @@ impl PrivilegedMessageType {
             | Self::PublishWorkContextEntry
             | Self::PublishWorkLoopProfile
             | Self::RecordWorkPrAssociation
-            | Self::ResolveTicketAlias => true,
+            | Self::ResolveTicketAlias
+            | Self::WorkShow => true,
             // Server-to-client notification only — not a client request.
             Self::PulseEvent => false,
         }
@@ -7137,6 +7147,7 @@ impl PrivilegedMessageType {
             Self::PublishWorkLoopProfile => "hsi.work_loop_profile.publish",
             Self::RecordWorkPrAssociation => "hsi.work.record_pr_association",
             Self::ResolveTicketAlias => "hsi.work.resolve_ticket_alias",
+            Self::WorkShow => "hsi.work.show",
             Self::PulseEvent => "hsi.pulse.event",
         }
     }
@@ -7185,6 +7196,7 @@ impl PrivilegedMessageType {
             Self::PublishWorkLoopProfile => "PUBLISH_WORK_LOOP_PROFILE",
             Self::RecordWorkPrAssociation => "RECORD_WORK_PR_ASSOCIATION",
             Self::ResolveTicketAlias => "RESOLVE_TICKET_ALIAS",
+            Self::WorkShow => "WORK_SHOW",
             Self::PulseEvent => "PULSE_EVENT",
         }
     }
@@ -7233,6 +7245,7 @@ impl PrivilegedMessageType {
             Self::PublishWorkLoopProfile => "apm2.publish_work_loop_profile_request.v1",
             Self::RecordWorkPrAssociation => "apm2.record_work_pr_association_request.v1",
             Self::ResolveTicketAlias => "apm2.resolve_ticket_alias_request.v1",
+            Self::WorkShow => "apm2.work_show_request.v1",
             Self::PulseEvent => "apm2.pulse_event_request.v1",
         }
     }
@@ -7281,6 +7294,7 @@ impl PrivilegedMessageType {
             Self::PublishWorkLoopProfile => "apm2.publish_work_loop_profile_response.v1",
             Self::RecordWorkPrAssociation => "apm2.record_work_pr_association_response.v1",
             Self::ResolveTicketAlias => "apm2.resolve_ticket_alias_response.v1",
+            Self::WorkShow => "apm2.work_show_response.v1",
             Self::PulseEvent => "apm2.pulse_event_response.v1",
         }
     }
@@ -7377,6 +7391,8 @@ pub enum PrivilegedResponse {
     RecordWorkPrAssociation(RecordWorkPrAssociationResponse),
     /// Successful `ResolveTicketAlias` response (RFC-0032::REQ-0264).
     ResolveTicketAlias(ResolveTicketAliasResponse),
+    /// Successful `WorkShow` response (RFC-0032).
+    WorkShow(WorkShowResponse),
     /// Error response.
     Error(PrivilegedError),
 }
@@ -7601,6 +7617,10 @@ impl PrivilegedResponse {
             },
             Self::ResolveTicketAlias(resp) => {
                 buf.push(PrivilegedMessageType::ResolveTicketAlias.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::WorkShow(resp) => {
+                buf.push(PrivilegedMessageType::WorkShow.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::Error(err) => {
@@ -11638,6 +11658,8 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::ResolveTicketAlias => {
                 self.handle_resolve_ticket_alias(payload, ctx)
             },
+            // RFC-0032: WorkShow (read-only WorkSpec retrieval from CAS)
+            PrivilegedMessageType::WorkShow => self.handle_work_show(payload, ctx),
         };
 
         // RFC-0032::REQ-0084: Emit IPC request completion metrics
@@ -11706,6 +11728,8 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::RecordWorkPrAssociation => "RecordWorkPrAssociation",
                 // RFC-0032::REQ-0264
                 PrivilegedMessageType::ResolveTicketAlias => "ResolveTicketAlias",
+                // RFC-0032: WorkShow
+                PrivilegedMessageType::WorkShow => "WorkShow",
             };
             let status = match &result {
                 Ok(PrivilegedResponse::Error(_)) => "error",
@@ -15532,6 +15556,99 @@ impl PrivilegedDispatcher {
             },
             Err(error) => Ok(Self::map_work_authority_error(error)),
         }
+    }
+
+    /// Handles `WorkShow` requests (IPC-PRIV-081, RFC-0032).
+    ///
+    /// Returns the full `WorkSpecV1` JSON content for a given `work_id` by:
+    /// 1. Looking up the `spec_snapshot_hash` in the work authority projection
+    /// 2. Retrieving the canonical `WorkSpec` JSON from CAS
+    ///
+    /// This is a read-only query used by reviewer agents to access work scope,
+    /// requirements, and definition_of_done.
+    fn handle_work_show(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request =
+            WorkShowRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid WorkShowRequest: {e}"),
+                }
+            })?;
+
+        // CTR-1603: Validate work_id length to prevent DoS
+        if request.work_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("work_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        if request.work_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "work_id cannot be empty",
+            ));
+        }
+
+        debug!(
+            work_id = %request.work_id,
+            "Processing WorkShow request"
+        );
+
+        // 1. Look up the spec_snapshot_hash from the alias reconciliation gate.
+        let spec_hash = match self
+            .alias_reconciliation_gate
+            .get_spec_hash(&request.work_id)
+        {
+            Some(hash) => hash,
+            None => {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "WorkShow: no spec_snapshot_hash found for work_id '{}'",
+                        request.work_id,
+                    ),
+                ));
+            },
+        };
+
+        // 2. Retrieve the canonical WorkSpec JSON from CAS.
+        let cas = match &self.cas {
+            Some(cas) => cas,
+            None => {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "WorkShow: CAS not configured",
+                ));
+            },
+        };
+
+        let spec_bytes = match cas.retrieve(&spec_hash) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!(
+                    work_id = %request.work_id,
+                    error = %e,
+                    "WorkShow: failed to retrieve WorkSpec from CAS"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "WorkShow: failed to retrieve WorkSpec from CAS for work_id '{}': {e}",
+                        request.work_id,
+                    ),
+                ));
+            },
+        };
+
+        Ok(PrivilegedResponse::WorkShow(WorkShowResponse {
+            work_id: request.work_id,
+            work_spec_json: spec_bytes,
+            spec_snapshot_hash: spec_hash.to_vec(),
+        }))
     }
 
     /// Handles `OpenWork` requests (IPC-PRIV-076, RFC-0032::REQ-0263).
@@ -24353,6 +24470,16 @@ pub fn encode_record_work_pr_association_request(
 #[must_use]
 pub fn encode_resolve_ticket_alias_request(request: &ResolveTicketAliasRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::ResolveTicketAlias.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `WorkShow` request to bytes for sending (RFC-0032).
+///
+/// The format is: `[tag: u8][payload: protobuf]`
+#[must_use]
+pub fn encode_work_show_request(request: &WorkShowRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::WorkShow.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }

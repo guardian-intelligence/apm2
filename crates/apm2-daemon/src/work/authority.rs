@@ -686,6 +686,14 @@ pub trait AliasReconciliationGate: Send + Sync {
     ) -> Result<Option<String>, WorkAuthorityError> {
         Ok(None)
     }
+
+    /// Returns the `spec_snapshot_hash` for a given `work_id` if known.
+    ///
+    /// The default implementation returns `None`. The projection-backed
+    /// implementation overrides with a lookup in the ticket alias index.
+    fn get_spec_hash(&self, _work_id: &str) -> Option<[u8; 32]> {
+        None
+    }
 }
 
 /// Projection-backed alias reconciliation gate implementation.
@@ -1435,6 +1443,23 @@ impl AliasReconciliationGate for ProjectionAliasReconciliationGate {
                 })
             },
         }
+    }
+
+    /// Returns the `spec_snapshot_hash` for a given `work_id` from the
+    /// bounded ticket alias index (RFC-0032).
+    ///
+    /// Refreshes the projection before lookup to ensure freshness.
+    /// Returns `None` if the `work_id` is unknown, has no stored spec hash,
+    /// or if CAS is not configured.
+    fn get_spec_hash(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.cas.as_ref()?;
+
+        // Best-effort refresh: if projection refresh fails we still
+        // attempt the lookup against stale data.
+        let _ = self.refresh_projection();
+
+        let alias_index = self.ticket_alias_index.read().ok()?;
+        alias_index.spec_hash_by_work_id.get(work_id).copied()
     }
 }
 
