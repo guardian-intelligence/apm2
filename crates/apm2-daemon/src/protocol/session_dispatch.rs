@@ -122,7 +122,7 @@ use super::messages::{
     RequestToolResponse, SessionError, SessionErrorCode, SessionStatusRequest,
     SessionStatusResponse, StreamLogsRequest, StreamLogsResponse, StreamTelemetryRequest,
     StreamTelemetryResponse, SubscribePulseRequest, SubscribePulseResponse,
-    UnsubscribePulseRequest, UnsubscribePulseResponse,
+    UnsubscribePulseRequest, UnsubscribePulseResponse, WorkShowRequest, WorkShowResponse,
 };
 use super::pulse_acl::{
     AclDecision, AclError, PulseAclEvaluator, TopicAllowlist, validate_client_sub_id,
@@ -146,6 +146,7 @@ use crate::episode::{
 };
 use crate::gate::GateOrchestrator;
 use crate::htf::{ClockError, HolonicClock};
+use crate::work::authority::AliasReconciliationGate;
 
 const RESERVED_DAEMON_EVENT_TYPE_PREFIXES: &[&str] = &[
     "gate_",
@@ -196,6 +197,12 @@ pub enum SessionMessageType {
     StreamLogs       = 5,
     /// `SessionStatus` request (IPC-SESS-006, RFC-0032::REQ-0134)
     SessionStatus    = 6,
+    /// `WorkShow` request (IPC-SESS-007, RFC-0032).
+    ///
+    /// Read-only `WorkSpecV1` retrieval from CAS, accessible from session
+    /// socket so reviewer agents (BEH-CLI-005, BEH-DAEMON-010) can query
+    /// work scope without operator socket privilege.
+    WorkShow         = 7,
     // --- HEF Pulse Plane (CTR-PROTO-010, RFC-0018) ---
     /// `SubscribePulse` request (IPC-HEF-001)
     SubscribePulse   = 64,
@@ -216,6 +223,8 @@ impl SessionMessageType {
             4 => Some(Self::StreamTelemetry),
             5 => Some(Self::StreamLogs),
             6 => Some(Self::SessionStatus),
+            // RFC-0032: WorkShow (read-only WorkSpec retrieval)
+            7 => Some(Self::WorkShow),
             // HEF tags (64-68)
             64 => Some(Self::SubscribePulse),
             66 => Some(Self::UnsubscribePulse),
@@ -245,6 +254,7 @@ impl SessionMessageType {
             Self::StreamTelemetry,
             Self::StreamLogs,
             Self::SessionStatus,
+            Self::WorkShow,
             Self::SubscribePulse,
             Self::UnsubscribePulse,
         ]
@@ -270,6 +280,7 @@ impl SessionMessageType {
             | Self::StreamTelemetry
             | Self::StreamLogs
             | Self::SessionStatus
+            | Self::WorkShow
             | Self::SubscribePulse
             | Self::UnsubscribePulse => true,
             // Server-to-client notification only — not a client request.
@@ -291,6 +302,7 @@ impl SessionMessageType {
             Self::StreamTelemetry => "hsi.telemetry.stream",
             Self::StreamLogs => "hsi.logs.stream",
             Self::SessionStatus => "hsi.session.status",
+            Self::WorkShow => "hsi.work.show",
             Self::SubscribePulse => "hsi.pulse.subscribe",
             Self::UnsubscribePulse => "hsi.pulse.unsubscribe",
             Self::PulseEvent => "hsi.pulse.event",
@@ -307,6 +319,7 @@ impl SessionMessageType {
             Self::StreamTelemetry => "STREAM_TELEMETRY",
             Self::StreamLogs => "STREAM_LOGS",
             Self::SessionStatus => "SESSION_STATUS",
+            Self::WorkShow => "WORK_SHOW",
             Self::SubscribePulse => "SUBSCRIBE_PULSE",
             Self::UnsubscribePulse => "UNSUBSCRIBE_PULSE",
             Self::PulseEvent => "PULSE_EVENT",
@@ -323,6 +336,7 @@ impl SessionMessageType {
             Self::StreamTelemetry => "apm2.stream_telemetry_request.v1",
             Self::StreamLogs => "apm2.stream_logs_request.v1",
             Self::SessionStatus => "apm2.session_status_request.v1",
+            Self::WorkShow => "apm2.work_show_request.v1",
             Self::SubscribePulse => "apm2.subscribe_pulse_request.v1",
             Self::UnsubscribePulse => "apm2.unsubscribe_pulse_request.v1",
             Self::PulseEvent => "apm2.pulse_event_request.v1",
@@ -339,6 +353,7 @@ impl SessionMessageType {
             Self::StreamTelemetry => "apm2.stream_telemetry_response.v1",
             Self::StreamLogs => "apm2.stream_logs_response.v1",
             Self::SessionStatus => "apm2.session_status_response.v1",
+            Self::WorkShow => "apm2.work_show_response.v1",
             Self::SubscribePulse => "apm2.subscribe_pulse_response.v1",
             Self::UnsubscribePulse => "apm2.unsubscribe_pulse_response.v1",
             Self::PulseEvent => "apm2.pulse_event_response.v1",
@@ -367,6 +382,8 @@ pub enum SessionResponse {
     StreamLogs(StreamLogsResponse),
     /// Successful `SessionStatus` response (RFC-0032::REQ-0134).
     SessionStatus(SessionStatusResponse),
+    /// Successful `WorkShow` response (RFC-0032).
+    WorkShow(WorkShowResponse),
     /// Successful `SubscribePulse` response (RFC-0032::REQ-0098).
     SubscribePulse(SubscribePulseResponse),
     /// Successful `UnsubscribePulse` response (RFC-0032::REQ-0098).
@@ -437,6 +454,10 @@ impl SessionResponse {
             },
             Self::SessionStatus(resp) => {
                 buf.push(SessionMessageType::SessionStatus.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::WorkShow(resp) => {
+                buf.push(SessionMessageType::WorkShow.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::SubscribePulse(resp) => {
@@ -1317,6 +1338,13 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// fail-closed request. While open, fail-closed effects are denied until
     /// a pre-effect health probe confirms anchor commit health has recovered.
     fail_closed_anchor_circuit_open: AtomicBool,
+
+    /// RFC-0032: Alias reconciliation gate for `WorkShow` spec hash lookup.
+    ///
+    /// When set, the `WorkShow` handler looks up `spec_snapshot_hash` for a
+    /// given `work_id` via this gate. When `None`, `WorkShow` returns a
+    /// fail-closed error (gate not configured).
+    alias_reconciliation_gate: Option<Arc<dyn AliasReconciliationGate>>,
 }
 
 #[derive(Clone)]
@@ -1504,6 +1532,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             )),
             admission_kernel: None,
             fail_closed_anchor_circuit_open: AtomicBool::new(false),
+            alias_reconciliation_gate: None,
         }
     }
 
@@ -1541,6 +1570,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             )),
             admission_kernel: None,
             fail_closed_anchor_circuit_open: AtomicBool::new(false),
+            alias_reconciliation_gate: None,
         }
     }
 }
@@ -1583,6 +1613,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             )),
             admission_kernel: None,
             fail_closed_anchor_circuit_open: AtomicBool::new(false),
+            alias_reconciliation_gate: None,
         }
     }
 
@@ -1625,6 +1656,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             )),
             admission_kernel: None,
             fail_closed_anchor_circuit_open: AtomicBool::new(false),
+            alias_reconciliation_gate: None,
         }
     }
 
@@ -1683,6 +1715,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             )),
             admission_kernel: None,
             fail_closed_anchor_circuit_open: AtomicBool::new(false),
+            alias_reconciliation_gate: None,
         }
     }
 
@@ -1939,6 +1972,21 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     #[must_use]
     pub fn with_admission_kernel(mut self, kernel: Arc<AdmissionKernelV1>) -> Self {
         self.admission_kernel = Some(kernel);
+        self
+    }
+
+    /// Sets the alias reconciliation gate for `WorkShow` spec hash lookup
+    /// (RFC-0032).
+    ///
+    /// When configured, `WorkShow` can resolve `work_id` to
+    /// `spec_snapshot_hash` and retrieve the `WorkSpecV1` from CAS.
+    /// When `None`, `WorkShow` returns fail-closed error.
+    #[must_use]
+    pub fn with_alias_reconciliation_gate(
+        mut self,
+        gate: Arc<dyn AliasReconciliationGate>,
+    ) -> Self {
+        self.alias_reconciliation_gate = Some(gate);
         self
     }
 
@@ -2666,6 +2714,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             SessionMessageType::StreamLogs => self.handle_stream_logs(payload, ctx),
             // RFC-0032::REQ-0134: Session status query
             SessionMessageType::SessionStatus => self.handle_session_status(payload, ctx),
+            // RFC-0032: WorkShow (read-only WorkSpec retrieval from CAS)
+            SessionMessageType::WorkShow => self.handle_work_show(payload, ctx),
             // HEF Pulse Plane (RFC-0032::REQ-0098): Subscription handlers
             SessionMessageType::SubscribePulse => self.handle_subscribe_pulse(payload, ctx),
             SessionMessageType::UnsubscribePulse => self.handle_unsubscribe_pulse(payload, ctx),
@@ -12498,6 +12548,116 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             entries: vec![],
             has_more: false,
             process_name: request.process_name,
+        }))
+    }
+
+    // ========================================================================
+    // WorkShow Handler (RFC-0032, IPC-SESS-007)
+    // ========================================================================
+
+    /// Handles `WorkShow` requests (IPC-SESS-007, RFC-0032).
+    ///
+    /// Returns the full `WorkSpecV1` JSON content for a given `work_id` by:
+    /// 1. Looking up the `spec_snapshot_hash` in the alias reconciliation gate
+    /// 2. Retrieving the canonical `WorkSpec` JSON from CAS
+    ///
+    /// This is a read-only query accessible from the session socket so that
+    /// reviewer agents (BEH-CLI-005, BEH-DAEMON-010) can query work scope,
+    /// requirements, and definition of done.
+    ///
+    /// # INV-CQ-OK-003: No blocking I/O on async executor
+    ///
+    /// The alias reconciliation gate's `get_spec_hash()` calls
+    /// `refresh_projection()` which executes rusqlite queries. This is wrapped
+    /// in `tokio::task::spawn_blocking` to avoid blocking the tokio executor.
+    fn handle_work_show(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<SessionResponse> {
+        let request =
+            WorkShowRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid WorkShowRequest: {e}"),
+                }
+            })?;
+
+        // WorkShow is a read-only CAS retrieval query. Session socket
+        // connectivity is the access boundary — only agents with a session
+        // socket connection reach this handler. No session token is required
+        // because the query does not mutate state or access session-specific
+        // data, and reviewer agents may not have the same session_id as the
+        // work object they are reviewing.
+
+        // CTR-1603: Validate work_id length to prevent DoS
+        if request.work_id.len() > super::dispatch::MAX_ID_LENGTH {
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInvalid,
+                format!(
+                    "work_id exceeds maximum length of {} bytes",
+                    super::dispatch::MAX_ID_LENGTH,
+                ),
+            ));
+        }
+
+        if request.work_id.is_empty() {
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInvalid,
+                "work_id cannot be empty",
+            ));
+        }
+
+        debug!(
+            work_id = %request.work_id,
+            "Processing WorkShow request (session scope)"
+        );
+
+        // 1. Look up spec_snapshot_hash from the alias reconciliation gate.
+        let Some(gate) = &self.alias_reconciliation_gate else {
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInternal,
+                "WorkShow: alias reconciliation gate not configured",
+            ));
+        };
+
+        // INV-CQ-OK-003: The gate's get_spec_hash() calls refresh_projection()
+        // which executes rusqlite queries synchronously. Use block_in_place
+        // to signal the tokio runtime to move other tasks off this thread
+        // while the blocking I/O runs.
+        let gate = Arc::clone(gate);
+        let work_id = request.work_id;
+        let spec_hash = tokio::task::block_in_place(|| gate.get_spec_hash(&work_id));
+
+        let Some(spec_hash) = spec_hash else {
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInvalid,
+                format!("WorkShow: no spec_snapshot_hash found for work_id '{work_id}'",),
+            ));
+        };
+
+        // 2. Retrieve the canonical WorkSpec JSON from CAS.
+        let Some(cas) = &self.cas else {
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInternal,
+                "WorkShow: CAS not configured",
+            ));
+        };
+
+        let Some(spec_bytes) = cas.retrieve(&spec_hash) else {
+            warn!(
+                work_id = %work_id,
+                "WorkShow: failed to retrieve WorkSpec from CAS"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInternal,
+                format!("WorkShow: WorkSpec not found in CAS for work_id '{work_id}'",),
+            ));
+        };
+
+        Ok(SessionResponse::WorkShow(WorkShowResponse {
+            work_id,
+            work_spec_json: spec_bytes,
+            spec_snapshot_hash: spec_hash.to_vec(),
         }))
     }
 

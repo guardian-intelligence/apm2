@@ -15599,9 +15599,12 @@ impl PrivilegedDispatcher {
         );
 
         // 1. Look up the spec_snapshot_hash from the alias reconciliation gate.
-        let Some(spec_hash) = self
-            .alias_reconciliation_gate
-            .get_spec_hash(&request.work_id)
+        // INV-CQ-OK-003: get_spec_hash() calls refresh_projection() which
+        // executes rusqlite queries synchronously. Use block_in_place to
+        // signal the tokio runtime to move other tasks off this thread.
+        let gate = Arc::clone(&self.alias_reconciliation_gate);
+        let work_id_ref = request.work_id.clone();
+        let Some(spec_hash) = tokio::task::block_in_place(|| gate.get_spec_hash(&work_id_ref))
         else {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,

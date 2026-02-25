@@ -701,12 +701,15 @@ impl DispatcherState {
         // RFC-0032::REQ-0134: Wire session registry for SessionStatus queries
         // RFC-0032::REQ-0138: Wire telemetry store for counter updates and
         // SessionStatus queries
-        let session_dispatcher =
-            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+        let session_dispatcher = SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_channel_context_signer(channel_context_signer)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry)
-                .with_telemetry_store(telemetry_store);
+                .with_telemetry_store(telemetry_store)
+                // RFC-0032: Wire alias reconciliation gate for session-scoped WorkShow.
+                .with_alias_reconciliation_gate(
+                    Arc::clone(privileged_dispatcher.alias_reconciliation_gate()),
+                );
 
         Self {
             privileged_dispatcher,
@@ -800,12 +803,15 @@ impl DispatcherState {
         // RFC-0032::REQ-0134: Wire session registry for SessionStatus queries
         // RFC-0032::REQ-0138: Wire telemetry store for counter updates and
         // SessionStatus queries
-        let session_dispatcher =
-            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+        let session_dispatcher = SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_channel_context_signer(channel_context_signer)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry)
-                .with_telemetry_store(telemetry_store);
+                .with_telemetry_store(telemetry_store)
+                // RFC-0032: Wire alias reconciliation gate for session-scoped WorkShow.
+                .with_alias_reconciliation_gate(
+                    Arc::clone(privileged_dispatcher.alias_reconciliation_gate()),
+                );
 
         Self {
             privileged_dispatcher,
@@ -1094,8 +1100,7 @@ impl DispatcherState {
         // manifest store for scope enforcement RFC-0020::REQ-0045:
         // Authoritative persistence mode requires durable consume enforcement
         // and lifecycle gate wiring.
-        let mut session_dispatcher =
-            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+        let mut session_dispatcher = SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_channel_context_signer(channel_context_signer)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
@@ -1103,7 +1108,11 @@ impl DispatcherState {
                 .with_preactuation_gate(preactuation_gate)
                 .with_stop_authority(Arc::clone(&stop_authority))
                 .with_stop_conditions_store(stop_conditions_store)
-                .with_v1_manifest_store(v1_manifest_store);
+                .with_v1_manifest_store(v1_manifest_store)
+                // RFC-0032: Wire alias reconciliation gate for session-scoped WorkShow.
+                .with_alias_reconciliation_gate(
+                    Arc::clone(privileged_dispatcher.alias_reconciliation_gate()),
+                );
         let mut anti_entropy_pcac_gate: Option<Arc<crate::pcac::LifecycleGate>> = None;
 
         let sovereignty_trusted_signer_key = sovereignty_trusted_signer_key.unwrap_or([0u8; 32]);
@@ -1669,8 +1678,7 @@ impl DispatcherState {
         let anti_entropy_pcac_gate = Arc::clone(&pcac_gate);
         privileged_dispatcher =
             privileged_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
-        let mut session_dispatcher =
-            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+        let mut session_dispatcher = SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_channel_context_signer(channel_context_signer)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
@@ -1684,7 +1692,13 @@ impl DispatcherState {
                 .with_stop_authority(Arc::clone(&stop_authority))
                 .with_stop_conditions_store(stop_conditions_store)
                 .with_v1_manifest_store(v1_manifest_store)
-                .with_pcac_lifecycle_gate(pcac_gate);
+                .with_pcac_lifecycle_gate(pcac_gate)
+                // RFC-0032: Wire alias reconciliation gate from privileged dispatcher
+                // so that WorkShow on the session socket can resolve work_id ->
+                // spec_snapshot_hash for reviewer agents (BEH-CLI-005).
+                .with_alias_reconciliation_gate(
+                    Arc::clone(privileged_dispatcher.alias_reconciliation_gate()),
+                );
 
         // RFC-0032::REQ-0172: Wire AdmissionKernel for plan/execute-gated admission.
         // This is the CAS-backed production path — authoritative mode with

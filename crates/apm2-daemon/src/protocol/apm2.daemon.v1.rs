@@ -2103,11 +2103,12 @@ pub struct ResolveTicketAliasResponse {
     #[prost(string, tag = "3")]
     pub ticket_alias: ::prost::alloc::string::String,
 }
-/// IPC-PRIV-081: WorkShow (RFC-0032)
+/// IPC-PRIV-081 / IPC-SESS-007: WorkShow (RFC-0032)
 /// Returns the full WorkSpecV1 content for a given work_id by looking up
 /// the spec_snapshot_hash in the work authority and retrieving from CAS.
 /// This is a read-only query used by reviewer agents to access work scope,
-/// requirements, and definition_of_done.
+/// requirements, and definition_of_done. Available on both operator socket
+/// (IPC-PRIV-081) and session socket (IPC-SESS-007) per BEH-CLI-005.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WorkShowRequest {
     /// Canonical work identifier to query (W-...).
